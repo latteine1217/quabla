@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "nabla"
+version = "0.1.0"
+description = "Rust-backed SciML runtime experiment exposed to Python"
+requires-python = ">=3.10"
+
+[tool.maturin]
+manifest-path = "crates/nabla-python/Cargo.toml"
+features = ["extension-module"]
+module-name = "nabla"
