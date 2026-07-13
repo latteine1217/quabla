@@ -32,6 +32,15 @@ enum TensorOp {
         lhs: TensorNodeId,
         rhs: TensorNodeId,
     },
+    Greater {
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    },
+    Where {
+        condition: TensorNodeId,
+        on_true: TensorNodeId,
+        on_false: TensorNodeId,
+    },
     Sum {
         input: TensorNodeId,
     },
@@ -252,6 +261,35 @@ impl DynamicTensor {
             return Err("division by zero is not supported".to_string());
         }
         self.elementwise(rhs, |lhs, rhs| lhs / rhs)
+    }
+
+    fn greater(&self, rhs: &Self) -> Result<Self, String> {
+        self.elementwise(rhs, |lhs, rhs| f64::from(lhs > rhs))
+    }
+
+    fn where_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
+        let shape = broadcast_shape(
+            &broadcast_shape(&self.shape, &on_true.shape)?,
+            &on_false.shape,
+        )?;
+        let count = element_count(&shape)?;
+        let condition_strides = contiguous_strides(&self.shape);
+        let true_strides = contiguous_strides(&on_true.shape);
+        let false_strides = contiguous_strides(&on_false.shape);
+        let mut data = Vec::with_capacity(count);
+
+        for index in 0..count {
+            let condition_index = broadcast_offset(index, &shape, &self.shape, &condition_strides);
+            let true_index = broadcast_offset(index, &shape, &on_true.shape, &true_strides);
+            let false_index = broadcast_offset(index, &shape, &on_false.shape, &false_strides);
+            data.push(if self.data[condition_index] != 0.0 {
+                on_true.data[true_index]
+            } else {
+                on_false.data[false_index]
+            });
+        }
+
+        Self::new(shape, data)
     }
 
     fn reciprocal(&self) -> Result<Self, String> {
@@ -647,6 +685,26 @@ impl TensorIr {
                         transformed.add(left_term, right_term)?,
                     )
                 }
+                TensorOp::Greater { lhs, rhs } => {
+                    let (lhs_value, _) = pairs[*lhs];
+                    let (rhs_value, _) = pairs[*rhs];
+                    let value = transformed.greater(lhs_value, rhs_value)?;
+                    let tangent = transformed.scalar_constant(0.0);
+                    (value, tangent)
+                }
+                TensorOp::Where {
+                    condition,
+                    on_true,
+                    on_false,
+                } => {
+                    let (condition_value, _) = pairs[*condition];
+                    let (true_value, true_tangent) = pairs[*on_true];
+                    let (false_value, false_tangent) = pairs[*on_false];
+                    (
+                        transformed.where_select(condition_value, true_value, false_value)?,
+                        transformed.where_select(condition_value, true_tangent, false_tangent)?,
+                    )
+                }
                 TensorOp::Tanh { input } => {
                     let (input_value, input_tangent) = pairs[*input];
                     let value = transformed.tanh(input_value)?;
@@ -800,6 +858,39 @@ impl TensorIr {
 
     pub fn div(&mut self, lhs: TensorNodeId, rhs: TensorNodeId) -> Result<TensorNodeId, String> {
         self.binary(TensorOp::Div { lhs, rhs }, lhs, rhs)
+    }
+
+    pub fn greater(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, String> {
+        self.binary(TensorOp::Greater { lhs, rhs }, lhs, rhs)
+    }
+
+    pub fn where_select(
+        &mut self,
+        condition: TensorNodeId,
+        on_true: TensorNodeId,
+        on_false: TensorNodeId,
+    ) -> Result<TensorNodeId, String> {
+        let condition_shape = self.node(condition)?.shape.clone();
+        let true_shape = self.node(on_true)?.shape.clone();
+        let false_shape = self.node(on_false)?.shape.clone();
+        let shape = broadcast_shape(
+            &broadcast_shape(&condition_shape, &true_shape)?,
+            &false_shape,
+        )?;
+        let id = self.nodes.len();
+        self.nodes.push(TensorNode {
+            op: TensorOp::Where {
+                condition,
+                on_true,
+                on_false,
+            },
+            shape,
+        });
+        Ok(id)
     }
 
     pub fn sum(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
@@ -1109,6 +1200,25 @@ impl TensorIr {
                     accumulate(&mut cotangents[*lhs], lhs_contribution)?;
                     accumulate(&mut cotangents[*rhs], rhs_contribution)?;
                 }
+                TensorOp::Greater { .. } => {}
+                TensorOp::Where {
+                    condition,
+                    on_true,
+                    on_false,
+                } => {
+                    let condition_value = values
+                        .get(*condition)
+                        .ok_or_else(|| format!("node {condition} has no evaluated value"))?;
+                    let zero = DynamicTensor::filled(vec![], 0.0)?;
+                    let true_contribution = condition_value
+                        .where_select(&cotangent, &zero)?
+                        .reduce_to_shape(&self.node(*on_true)?.shape)?;
+                    let false_contribution = condition_value
+                        .where_select(&zero, &cotangent)?
+                        .reduce_to_shape(&self.node(*on_false)?.shape)?;
+                    accumulate(&mut cotangents[*on_true], true_contribution)?;
+                    accumulate(&mut cotangents[*on_false], false_contribution)?;
+                }
                 TensorOp::Sum { input } => {
                     let contribution = cotangent.broadcast_to_shape(&self.node(*input)?.shape)?;
                     accumulate(&mut cotangents[*input], contribution)?;
@@ -1311,6 +1421,22 @@ impl TensorIr {
                         .mul(rhs_value)?
                         .add(&lhs_value.mul(rhs_tangent)?)?
                 }
+                TensorOp::Greater { .. } => DynamicTensor::filled(node.shape.clone(), 0.0)?,
+                TensorOp::Where {
+                    condition,
+                    on_true,
+                    on_false,
+                } => values
+                    .get(*condition)
+                    .ok_or_else(|| format!("node {condition} has no evaluated value"))?
+                    .where_select(
+                        tangents
+                            .get(*on_true)
+                            .ok_or_else(|| format!("node {on_true} has no evaluated tangent"))?,
+                        tangents
+                            .get(*on_false)
+                            .ok_or_else(|| format!("node {on_false} has no evaluated tangent"))?,
+                    )?,
                 TensorOp::Sum { input } => tangents
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
@@ -1541,6 +1667,18 @@ impl TensorIr {
                     "%{id} = mul(%{lhs}, %{rhs}) : {}",
                     format_shape(&node.shape)
                 ),
+                TensorOp::Greater { lhs, rhs } => format!(
+                    "%{id} = greater(%{lhs}, %{rhs}) : {}",
+                    format_shape(&node.shape)
+                ),
+                TensorOp::Where {
+                    condition,
+                    on_true,
+                    on_false,
+                } => format!(
+                    "%{id} = where(%{condition}, %{on_true}, %{on_false}) : {}",
+                    format_shape(&node.shape)
+                ),
                 TensorOp::Sum { input } => {
                     format!("%{id} = sum(%{input}) : {}", format_shape(&node.shape))
                 }
@@ -1661,6 +1799,29 @@ impl TensorIr {
                         values
                             .get(*rhs)
                             .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
+                    )?,
+                TensorOp::Greater { lhs, rhs } => values
+                    .get(*lhs)
+                    .ok_or_else(|| format!("node {lhs} has no evaluated value"))?
+                    .greater(
+                        values
+                            .get(*rhs)
+                            .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
+                    )?,
+                TensorOp::Where {
+                    condition,
+                    on_true,
+                    on_false,
+                } => values
+                    .get(*condition)
+                    .ok_or_else(|| format!("node {condition} has no evaluated value"))?
+                    .where_select(
+                        values
+                            .get(*on_true)
+                            .ok_or_else(|| format!("node {on_true} has no evaluated value"))?,
+                        values
+                            .get(*on_false)
+                            .ok_or_else(|| format!("node {on_false} has no evaluated value"))?,
                     )?,
                 TensorOp::Sum { input } => values
                     .get(*input)
@@ -1982,6 +2143,49 @@ impl TensorIr {
                             .add(&lhs.value.mul(&rhs.mixed)?)?,
                     }
                 }
+                TensorOp::Greater { lhs, rhs } => {
+                    let lhs = values
+                        .get(*lhs)
+                        .ok_or_else(|| format!("node {lhs} has no evaluated value"))?;
+                    let rhs = values
+                        .get(*rhs)
+                        .ok_or_else(|| format!("node {rhs} has no evaluated value"))?;
+                    MixedTangent {
+                        value: lhs.value.greater(&rhs.value)?,
+                        first: DynamicTensor::filled(node.shape.clone(), 0.0)?,
+                        second: DynamicTensor::filled(node.shape.clone(), 0.0)?,
+                        mixed: DynamicTensor::filled(node.shape.clone(), 0.0)?,
+                    }
+                }
+                TensorOp::Where {
+                    condition,
+                    on_true,
+                    on_false,
+                } => {
+                    let condition = values
+                        .get(*condition)
+                        .ok_or_else(|| format!("node {condition} has no evaluated value"))?;
+                    let on_true = values
+                        .get(*on_true)
+                        .ok_or_else(|| format!("node {on_true} has no evaluated value"))?;
+                    let on_false = values
+                        .get(*on_false)
+                        .ok_or_else(|| format!("node {on_false} has no evaluated value"))?;
+                    MixedTangent {
+                        value: condition
+                            .value
+                            .where_select(&on_true.value, &on_false.value)?,
+                        first: condition
+                            .value
+                            .where_select(&on_true.first, &on_false.first)?,
+                        second: condition
+                            .value
+                            .where_select(&on_true.second, &on_false.second)?,
+                        mixed: condition
+                            .value
+                            .where_select(&on_true.mixed, &on_false.mixed)?,
+                    }
+                }
                 TensorOp::Sum { input } => {
                     let input = values
                         .get(*input)
@@ -2158,9 +2362,15 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         | TensorOp::Sub { lhs, rhs }
         | TensorOp::Div { lhs, rhs }
         | TensorOp::Mul { lhs, rhs }
+        | TensorOp::Greater { lhs, rhs }
         | TensorOp::Matmul { lhs, rhs } => {
             vec![*lhs, *rhs]
         }
+        TensorOp::Where {
+            condition,
+            on_true,
+            on_false,
+        } => vec![*condition, *on_true, *on_false],
         TensorOp::Sum { input }
         | TensorOp::SumAxis { input, .. }
         | TensorOp::Tanh { input }
@@ -2186,6 +2396,8 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Sub { .. } => "sub",
         TensorOp::Div { .. } => "div",
         TensorOp::Mul { .. } => "mul",
+        TensorOp::Greater { .. } => "greater",
+        TensorOp::Where { .. } => "where",
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::Matmul { .. } => "matmul",
@@ -2210,6 +2422,12 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<String> {
         TensorOp::Sub { lhs, rhs } => format!("sub:{lhs}:{rhs}:{shape:?}"),
         TensorOp::Div { lhs, rhs } => format!("div:{lhs}:{rhs}:{shape:?}"),
         TensorOp::Mul { lhs, rhs } => format!("mul:{lhs}:{rhs}:{shape:?}"),
+        TensorOp::Greater { lhs, rhs } => format!("greater:{lhs}:{rhs}:{shape:?}"),
+        TensorOp::Where {
+            condition,
+            on_true,
+            on_false,
+        } => format!("where:{condition}:{on_true}:{on_false}:{shape:?}"),
         TensorOp::Sum { input } => format!("sum:{input}:{shape:?}"),
         TensorOp::SumAxis { input, axis } => format!("sum_axis:{input}:{axis}:{shape:?}"),
         TensorOp::Matmul { lhs, rhs } => format!("matmul:{lhs}:{rhs}:{shape:?}"),
@@ -2255,6 +2473,19 @@ fn remap_tensor_op(
         TensorOp::Mul { lhs, rhs } => Ok(TensorOp::Mul {
             lhs: remap_node(*lhs)?,
             rhs: remap_node(*rhs)?,
+        }),
+        TensorOp::Greater { lhs, rhs } => Ok(TensorOp::Greater {
+            lhs: remap_node(*lhs)?,
+            rhs: remap_node(*rhs)?,
+        }),
+        TensorOp::Where {
+            condition,
+            on_true,
+            on_false,
+        } => Ok(TensorOp::Where {
+            condition: remap_node(*condition)?,
+            on_true: remap_node(*on_true)?,
+            on_false: remap_node(*on_false)?,
         }),
         TensorOp::Sum { input } => Ok(TensorOp::Sum {
             input: remap_node(*input)?,

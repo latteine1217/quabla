@@ -456,6 +456,34 @@ def test_trace_tensor_sqrt_supports_jvp_and_vjp():
     assert abs(tangent.to_flat_list()[0] - sum(expected)) <= 1e-12
 
 
+def test_trace_tensor_where_routes_gradients_and_masks_condition_derivatives():
+    def loss(x):
+        condition = x.gt(0.0)
+        return nabla.where(condition, x.powi(2), x * 3.0).sum()
+
+    traced = nabla.trace_tensor(loss, [("x", [4])])
+    inputs = {"x": nabla.Tensor([4], [-2.0, -1.0, 0.0, 2.0])}
+    value, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([4], [1.0] * 4)}
+    )
+    transformed = traced.symbolic_jvp("x")
+    transformed_value = transformed.graph.evaluate(transformed.output.node_id, inputs)
+    plan = traced.output.compile_cpu()
+    plan_value, plan_gradients = plan.evaluate_value_and_vjp(
+        inputs, nabla.Tensor([], [1.0])
+    )
+
+    assert value.to_flat_list() == [-5.0]
+    assert gradients["x"].to_flat_list() == [3.0, 3.0, 3.0, 4.0]
+    assert tangent.to_flat_list() == [13.0]
+    assert transformed_value.to_flat_list() == [13.0]
+    assert plan_value.to_flat_list() == value.to_flat_list()
+    assert plan_gradients["x"].to_flat_list() == gradients["x"].to_flat_list()
+
+
 def test_trace_tensor_log_supports_jvp_and_vjp():
     def loss(x):
         return x.log().sum()
@@ -2395,6 +2423,7 @@ if __name__ == "__main__":
     test_trace_tensor_mean_supports_jvp_and_vjp()
     test_trace_tensor_sin_supports_jvp_and_vjp()
     test_trace_tensor_sqrt_supports_jvp_and_vjp()
+    test_trace_tensor_where_routes_gradients_and_masks_condition_derivatives()
     test_trace_tensor_log_supports_jvp_and_vjp()
     test_trace_tensor_cos_supports_jvp_and_vjp()
     test_trace_tensor_powi_supports_second_order_ad()

@@ -55,7 +55,7 @@ Measure the frozen CPU plan in an optimized extension build:
 - `tensor_jacobian_fn(fn, input_specs, input_name)` freezes one rank-N trace
   and returns an output-flat by input-flat dense Jacobian for the selected input.
   Its `TraceTensor` values currently support broadcasted add/subtract/multiply/divide,
-  batched `matmul`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `log`, reshape, and global or single-axis `sum`/`mean`; `TensorTraceGraph.evaluate_vjp(...)` and
+  batched `matmul`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `log`, reshape, global or single-axis `sum`/`mean`, and `gt`/`where` masks. Comparisons are explicitly non-differentiable; `where` routes VJP/JVP contributions only through the selected data branch. `TensorTraceGraph.evaluate_vjp(...)` and
   `TensorTraceGraph.evaluate_jvp(...)` execute the corresponding rank-N CPU
   reverse and forward transforms. `TensorTraceGraph.hessian_scalar(...)`
   computes an exact dense Hessian for one named input and a scalar output using

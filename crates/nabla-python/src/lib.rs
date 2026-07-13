@@ -47,8 +47,19 @@ fn py_where(
         return Ok(output.into_pyobject(py)?.into_any().unbind());
     }
 
+    if let (Ok(mask), Ok(on_true), Ok(on_false)) = (
+        mask.extract::<PyRef<'_, TraceTensor>>(),
+        on_true.extract::<PyRef<'_, TraceTensor>>(),
+        on_false.extract::<PyRef<'_, TraceTensor>>(),
+    ) {
+        let output = mask
+            .where_tensor(&on_true, &on_false)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        return Ok(output.into_pyobject(py)?.into_any().unbind());
+    }
+
     Err(pyo3::exceptions::PyTypeError::new_err(
-        "where expects either three Matrix operands or three TraceMatrix operands",
+        "where expects three Matrix, TraceMatrix, or TraceTensor operands",
     ))
 }
 

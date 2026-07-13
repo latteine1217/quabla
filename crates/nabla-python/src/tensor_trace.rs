@@ -216,6 +216,7 @@ impl TraceTensor {
             "sub" => ir.sub(self.node_id, rhs.node_id)?,
             "div" => ir.div(self.node_id, rhs.node_id)?,
             "mul" => ir.mul(self.node_id, rhs.node_id)?,
+            "greater" => ir.greater(self.node_id, rhs.node_id)?,
             _ => return Err(format!("unsupported trace tensor binary op {op}")),
         };
         let shape = ir.node_shape(node_id)?;
@@ -238,6 +239,7 @@ impl TraceTensor {
             "sub" => ir.sub(self.node_id, scalar)?,
             "div" => ir.div(self.node_id, scalar)?,
             "mul" => ir.mul(self.node_id, scalar)?,
+            "greater" => ir.greater(self.node_id, scalar)?,
             _ => return Err(format!("unsupported trace tensor scalar op {op}")),
         };
         let shape = ir.node_shape(node_id)?;
@@ -260,6 +262,7 @@ impl TraceTensor {
             "sub" => ir.sub(scalar, self.node_id)?,
             "div" => ir.div(scalar, self.node_id)?,
             "mul" => ir.mul(scalar, self.node_id)?,
+            "greater" => ir.greater(scalar, self.node_id)?,
             _ => return Err(format!("unsupported left scalar trace op {op}")),
         };
         let shape = ir.node_shape(node_id)?;
@@ -296,6 +299,23 @@ impl TraceTensor {
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
         let node_id = ir.matmul(self.node_id, rhs.node_id)?;
+        let shape = ir.node_shape(node_id)?;
+        Ok(Self {
+            graph: self.graph.clone(),
+            node_id,
+            shape,
+        })
+    }
+
+    pub fn where_tensor(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
+        self.same_graph(on_true)?;
+        self.same_graph(on_false)?;
+        let mut ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let node_id = ir.where_select(self.node_id, on_true.node_id, on_false.node_id)?;
         let shape = ir.node_shape(node_id)?;
         Ok(Self {
             graph: self.graph.clone(),
@@ -675,6 +695,15 @@ impl TraceTensor {
 
     fn matmul(&self, rhs: &Self) -> PyResult<Self> {
         self.__matmul__(rhs)
+    }
+
+    fn gt(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        trace_tensor_or_scalar_operand(self, rhs, "greater")
+    }
+
+    fn where_select(&self, on_true: &Self, on_false: &Self) -> PyResult<Self> {
+        self.where_tensor(on_true, on_false)
+            .map_err(PyValueError::new_err)
     }
 
     fn tanh(&self) -> PyResult<Self> {

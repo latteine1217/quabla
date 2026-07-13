@@ -105,6 +105,42 @@ fn tensor_ir_sum_builds_a_scalar_loss_with_vjp_and_jvp() {
 }
 
 #[test]
+fn tensor_ir_where_routes_gradients_without_differentiating_the_condition() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![4]));
+    let zero = graph.scalar_constant(0.0);
+    let condition = must!(graph.greater(x, zero));
+    let squared = must!(graph.mul(x, x));
+    let triple = graph.scalar_constant(3.0);
+    let scaled = must!(graph.mul(x, triple));
+    let selected = must!(graph.where_select(condition, squared, scaled));
+    let loss = must!(graph.sum(selected));
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![4], vec![-2.0, -1.0, 0.0, 2.0])),
+    )]);
+
+    assert_eq!(
+        must!(graph.evaluate(selected, &inputs)).data(),
+        &[-6.0, -3.0, 0.0, 4.0]
+    );
+    let gradients = must!(graph.vjp(loss, &inputs, must!(DynamicTensor::filled(vec![], 1.0)),));
+    assert_eq!(gradients["x"].data(), &[3.0, 3.0, 3.0, 4.0]);
+    let (_, tangent) = must!(graph.jvp(
+        loss,
+        &inputs,
+        &BTreeMap::from([("x".to_string(), must!(DynamicTensor::filled(vec![4], 1.0)))]),
+    ));
+    assert_eq!(tangent.data(), &[13.0]);
+
+    let transformed = must!(graph.symbolic_jvp(loss, "x"));
+    assert_eq!(
+        must!(transformed.graph.evaluate(transformed.tangent, &inputs)).data(),
+        &[13.0]
+    );
+}
+
+#[test]
 fn cpu_backend_executes_a_frozen_tensor_plan() {
     let mut graph = TensorIr::new();
     let x = must!(graph.input("x", vec![2, 2]));
