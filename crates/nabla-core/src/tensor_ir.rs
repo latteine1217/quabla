@@ -477,14 +477,14 @@ impl DynamicTensor {
                 &rhs_batch_strides,
             );
             for row in 0..lhs_rows {
-                for col in 0..rhs_cols {
-                    let mut value = 0.0;
-                    for inner in 0..lhs_inner {
-                        let lhs_index = lhs_batch * lhs_rows * lhs_inner + row * lhs_inner + inner;
-                        let rhs_index = rhs_batch * lhs_inner * rhs_cols + inner * rhs_cols + col;
-                        value += self.data[lhs_index] * rhs.data[rhs_index];
+                let lhs_row_start = lhs_batch * lhs_rows * lhs_inner + row * lhs_inner;
+                let output_row_start = batch_index * lhs_rows * rhs_cols + row * rhs_cols;
+                for inner in 0..lhs_inner {
+                    let lhs_value = self.data[lhs_row_start + inner];
+                    let rhs_row_start = rhs_batch * lhs_inner * rhs_cols + inner * rhs_cols;
+                    for col in 0..rhs_cols {
+                        data[output_row_start + col] += lhs_value * rhs.data[rhs_row_start + col];
                     }
-                    data[batch_index * lhs_rows * rhs_cols + row * rhs_cols + col] = value;
                 }
             }
         }
