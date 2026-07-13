@@ -2,9 +2,18 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PySequence};
 
 mod matrix;
+mod optim;
+mod tensor;
+mod tensor_trace;
 mod trace;
 
 pub use matrix::PyMatrix;
+pub use optim::{sum_gradients, PyAdam};
+pub use tensor::{PyTensor, PyTensorView};
+pub use tensor_trace::{
+    TensorCpuExecutionPlan, TensorGradScalarFunction, TensorJacobianFunction, TensorJitFunction,
+    TensorJvpFunction, TensorTraceGraph, TensorTraceResult, TensorVjpFunction, TraceTensor,
+};
 pub use trace::{
     CpuExecutionPlan, GradFunction, GradScalarFunction, GradScalarTransform, IrAttrValue,
     JacobianFunction, JacobiansFunction, JitFunction, JitTransform, JvpFunction, TraceGraph,
@@ -86,6 +95,19 @@ fn py_concat(py: Python<'_>, matrices: &Bound<'_, PySequence>, axis: usize) -> P
 #[pymodule]
 fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMatrix>()?;
+    m.add_class::<PyAdam>()?;
+    m.add_function(wrap_pyfunction!(optim::sum_gradients, m)?)?;
+    m.add_class::<PyTensor>()?;
+    m.add_class::<PyTensorView>()?;
+    m.add_class::<TensorTraceGraph>()?;
+    m.add_class::<TraceTensor>()?;
+    m.add_class::<TensorTraceResult>()?;
+    m.add_class::<TensorCpuExecutionPlan>()?;
+    m.add_class::<TensorGradScalarFunction>()?;
+    m.add_class::<TensorJitFunction>()?;
+    m.add_class::<TensorVjpFunction>()?;
+    m.add_class::<TensorJvpFunction>()?;
+    m.add_class::<TensorJacobianFunction>()?;
     m.add_class::<TraceGraph>()?;
     m.add_class::<TraceMatrix>()?;
     m.add_class::<TraceResult>()?;
@@ -111,6 +133,12 @@ fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(trace::jvp_fn, m)?)?;
     m.add_function(wrap_pyfunction!(trace::grad_scalar, m)?)?;
     m.add_function(wrap_pyfunction!(trace::jit, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::trace_tensor, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_grad_scalar_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vjp_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_jvp_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_jacobian_fn, m)?)?;
     m.add_function(wrap_pyfunction!(py_where, m)?)?;
     m.add_function(wrap_pyfunction!(py_concat, m)?)?;
     Ok(())

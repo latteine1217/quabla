@@ -16,6 +16,10 @@ Current state:
 
 - Scalar forward-mode AD with `Dual`.
 - Model gradients are computed by seeding one parameter at a time.
+- `nabla-core::tensor_ir::TensorIr` now provides a pure-Rust dynamic rank-N IR
+  for input, broadcasted add/multiply, and scalar sum; it evaluates on CPU and
+  generates both direct JVPs and VJPs that reduce cotangents over broadcast
+  axes.
 
 Target direction:
 
@@ -35,8 +39,8 @@ Key risk:
 
 Near-term milestone:
 
-- Add a tiny expression/IR layer for pure tensor expressions.
-- Generate forward-mode and reverse-mode transforms from that IR.
+- Extend `TensorIr` with reductions, reshape, matmul, and unary primitives.
+- Generate forward-mode transforms from the same IR.
 - Compare generated derivatives against finite differences.
 
 ## Layer 2: Typed Arrays And Layout
@@ -46,6 +50,12 @@ Current state:
 - `Tensor2<ROWS, COLS>` stores row-major `f64` data.
 - Matrix multiplication enforces the inner dimension at compile time:
   `(M, K) x (K, N) -> (M, N)`.
+- Python-facing `Tensor` provides eager rank-N contiguous row-major storage,
+  positive runtime shape validation, trailing-axis broadcasting for
+  add/subtract/multiply/divide, NumPy-style batched matmul, and
+  element-count-preserving reshape. `Tensor.slice(...)` creates a zero-copy,
+  read-only `TensorView` with explicit stride and offset metadata; the shared
+  backing allocation is immutable, so no mutable aliasing is exposed.
 
 Target direction:
 
@@ -63,9 +73,11 @@ Key risk:
 
 Near-term milestone:
 
-- Add a `TensorView2` with explicit row and column strides.
+- Carry rank-N tensor operations and stride-aware views into a generic trace
+  representation without weakening their shape and aliasing invariants.
 - Add compile-time checked `matmul` for static tensors.
-- Add runtime checked matmul for dynamic tensors.
+- Extend dynamic tensor operations with reductions and explicit stride-aware
+  views before carrying them into the trace IR.
 
 ## Layer 3: Backend, Compilation, And Sharding
 
@@ -126,7 +138,71 @@ Current state:
   shape. Concat accepts `axis=0` or `axis=1`, validates non-concatenated
   dimensions, and splits reverse-mode cotangents back to each input. Reshape
   preserves row-major storage order and requires element count to stay unchanged.
-  General rank-N tensor broadcasting is not yet implemented.
+  Eager `Tensor` supports general rank-N trailing-axis broadcasting and
+  NumPy-style batched matmul, but it is intentionally not part of the legacy
+  `TraceGraph`, AD transforms, or CPU plan lowering; those paths remain 2D
+  `Matrix`-based. The separate `TensorTraceGraph` provides a rank-N
+  add/multiply/sum AD subset.
+- `nabla-core::TensorIr` is the rank-N compiler-core path, but it is not yet
+  exposed through the legacy Python tracer. `trace_tensor(...)` now exposes its
+  add/subtract/multiply/divide/matmul/rank-N-transpose/tanh/exp/sin/cos/sqrt/non-negative-integer-powi/log/reshape/global-or-single-axis-sum/mean subset through separate `TensorTraceGraph` and
+  `TraceTensor` classes, with Python-facing CPU VJP and JVP evaluation. This
+  preserves the established 2D Python transform API while migration proceeds
+  operation by operation.
+- `TraceTensor` add/subtract/multiply/divide accept numeric scalar literals on either
+  side; these lower to rank-0 constant nodes with zero JVP tangent and no VJP
+  input gradient.
+- `TraceTensor.reshape(shape)` preserves row-major element order, validates the
+  element count at trace time, and reshapes primal values and every AD tangent
+  or cotangent consistently.
+- `TraceTensor.mean()` performs a global mean reduction to a rank-0 scalar;
+  its VJP broadcasts the scalar cotangent back over the input with `1/N`
+  scaling.
+- `TraceTensor.sum(axis=...)` and `TraceTensor.mean(axis=...)` reduce one
+  normalized axis (including negative Python-style indices), remove that axis
+  from the result shape, and expand cotangents back over the reduced axis.
+- `TraceTensor.transpose(axes=None)` permutes every rank-N axis; omitting
+  `axes` reverses the axis order, while a provided list must be a complete
+  permutation. VJP uses the inverse permutation to restore input layout.
+- `TraceTensor.log()` requires strictly positive runtime tensor values and
+  returns a domain error instead of producing NaN for non-positive inputs.
+- `TensorTraceGraph.hessian_scalar(output, input_name, inputs)` computes an
+  exact dense Hessian for a scalar output and one named input using a mixed
+  second-direction forward transform. Its O(n^2) basis evaluation is a
+  correctness-oriented implementation, not yet an optimized HVP API.
+- `TensorTraceGraph.hvp_scalar(...)` reuses the same exact mixed transform to
+  compute a Hessian-vector product in O(n) basis evaluations without allocating
+  the dense Hessian.
+- `TensorTraceResult.symbolic_jvp(input_name)` is the composable coordinate
+  derivative path: it constructs a new IR with primal/tangent pairs rather than
+  returning a runtime tensor. Reapplying it constructs higher coordinate
+  derivatives while leaving parameter inputs available to downstream VJP.
+- `tensor_grad_scalar_fn(fn, input_specs)` traces and compiles a rank-N scalar
+  loss once, returning a reusable Python gradient callable backed by the frozen
+  plan rather than retracing on every invocation.
+- `tensor_jit_fn(fn, input_specs)` traces and compiles a rank-N function once,
+  returning a reusable primal callable backed by that same frozen-plan boundary.
+- `tensor_vjp_fn(fn, input_specs)` traces and compiles once, returning a
+  reusable rank-N VJP callable whose output cotangent is supplied at invocation
+  time.
+- `tensor_jvp_fn(fn, input_specs)` traces and compiles once, returning a
+  reusable rank-N JVP callable whose input tangents are supplied at invocation
+  time.
+- `tensor_jacobian_fn(fn, input_specs, input_name)` traces and compiles once,
+  then constructs a dense Jacobian for one named input using direct JVP basis
+  directions. It is correctness-oriented rather than a large-scale Jacobian
+  materialization strategy.
+- `TensorTraceGraph.compile_cpu(output_node_id)` produces an immutable
+  `TensorCpuExecutionPlan` after output-reachability DCE, operand-id remap, and
+  exact structural CSE for pure nodes. It provides the rank-N CPU execution
+  boundary for later native code lowering; it does not yet generate machine
+  code. Its `lower_text()` is the deterministic optimized artifact to map onto
+  a later kernel IR. The same immutable plan
+  now exposes CPU primal, VJP, and JVP evaluation. `kernel_ir()` exposes
+  structured op, operand, shape, and input-name records without parsing text.
+- `TensorBackend` is the new rank-N execution contract and `CpuBackend` is its
+  current implementation. This separates plan execution from future LLVM,
+  MLIR, GPU, or sharded backends without changing the Python tracing API.
 - `trace(fn, input_specs)` can execute a Python function with traced inputs and
   return a `TraceResult`.
 - `TraceGraph.ir()` exposes structured node dictionaries with ids, ops, shapes,

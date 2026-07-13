@@ -130,6 +130,968 @@ def test_matrix_broadcasts_row_and_column_matrices_for_elementwise_ops():
     assert (a / column).to_list() == [[0.5, 1.0, 1.5], [4.0 / 3.0, 5.0 / 3.0, 2.0]]
 
 
+def test_tensor_broadcasts_trailing_axes_and_reshapes():
+    a = nabla.Tensor([2, 1, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    b = nabla.Tensor([1, 4, 1], [10.0, 20.0, 30.0, 40.0])
+
+    output = a + b
+
+    assert output.shape == [2, 4, 3]
+    assert output.to_flat_list() == [
+        11.0,
+        12.0,
+        13.0,
+        21.0,
+        22.0,
+        23.0,
+        31.0,
+        32.0,
+        33.0,
+        41.0,
+        42.0,
+        43.0,
+        14.0,
+        15.0,
+        16.0,
+        24.0,
+        25.0,
+        26.0,
+        34.0,
+        35.0,
+        36.0,
+        44.0,
+        45.0,
+        46.0,
+    ]
+    assert output.reshape([3, 2, 4]).shape == [3, 2, 4]
+
+
+def test_tensor_rejects_data_with_the_wrong_size():
+    try:
+        nabla.Tensor([2, 2], [1.0, 2.0, 3.0])
+    except ValueError as exc:
+        assert "data length" in str(exc)
+    else:
+        raise AssertionError("expected tensor data size mismatch to fail")
+
+
+def test_tensor_matmul_broadcasts_batch_axes():
+    lhs = nabla.Tensor(
+        [2, 2, 3],
+        [
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0,
+            6.0,
+            2.0,
+            0.0,
+            1.0,
+            1.0,
+            3.0,
+            2.0,
+        ],
+    )
+    rhs = nabla.Tensor([1, 3, 2], [7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+
+    output = lhs.matmul(rhs)
+
+    assert output.shape == [2, 2, 2]
+    assert output.to_flat_list() == [58.0, 64.0, 139.0, 154.0, 25.0, 28.0, 56.0, 62.0]
+
+
+def test_tensor_slice_creates_a_strided_read_only_view():
+    tensor = nabla.Tensor([3, 4], [float(value) for value in range(12)])
+
+    view = tensor.slice(axis=1, start=1, length=2, step=2)
+
+    assert view.shape == [3, 2]
+    assert view.strides == [4, 2]
+    assert view.offset == 1
+    assert view.to_flat_list() == [1.0, 3.0, 5.0, 7.0, 9.0, 11.0]
+    assert view.to_tensor().to_flat_list() == [1.0, 3.0, 5.0, 7.0, 9.0, 11.0]
+
+
+def test_trace_tensor_evaluates_rank_n_scalar_loss_vjp():
+    def loss(x, y):
+        return (x * y + x).sum()
+
+    traced = nabla.trace_tensor(loss, [("x", [2, 1, 3]), ("y", [1, 4, 1])])
+    inputs = {
+        "x": nabla.Tensor([2, 1, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        "y": nabla.Tensor([1, 4, 1], [10.0, 20.0, 30.0, 40.0]),
+    }
+
+    value, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+
+    assert traced.output.shape == []
+    assert value.to_flat_list() == [2184.0]
+    assert gradients["x"].shape == [2, 1, 3]
+    assert gradients["x"].to_flat_list() == [104.0] * 6
+    assert gradients["y"].shape == [1, 4, 1]
+    assert gradients["y"].to_flat_list() == [21.0] * 4
+
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id,
+        inputs,
+        {
+            "x": nabla.Tensor([2, 1, 3], [1.0] * 6),
+            "y": nabla.Tensor([1, 4, 1], [1.0] * 4),
+        },
+    )
+    assert tangent.shape == []
+    assert tangent.to_flat_list() == [708.0]
+
+
+def test_trace_tensor_batched_matmul_scalar_loss_vjp():
+    def loss(x, y):
+        return x.matmul(y).sum()
+
+    traced = nabla.trace_tensor(loss, [("x", [2, 2, 3]), ("y", [1, 3, 2])])
+    inputs = {
+        "x": nabla.Tensor(
+            [2, 2, 3],
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 2.0, 0.0, 1.0, 1.0, 3.0, 2.0],
+        ),
+        "y": nabla.Tensor([1, 3, 2], [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
+    }
+
+    value, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+
+    assert value.to_flat_list() == [586.0]
+    assert gradients["x"].to_flat_list() == [15.0, 19.0, 23.0] * 4
+    assert gradients["y"].to_flat_list() == [8.0, 8.0, 10.0, 10.0, 12.0, 12.0]
+
+
+def test_trace_tensor_symbolic_jvp_keeps_parameter_gradients():
+    traced = nabla.trace_tensor(
+        lambda x, weight, forcing: (x * weight).tanh(),
+        [("x", [1]), ("weight", [1]), ("forcing", [1])],
+    )
+    second_derivative = traced.symbolic_jvp("x").symbolic_jvp("x")
+    assert second_derivative.output.shape == [1]
+    residual = second_derivative.output + second_derivative.graph.input("forcing")
+    residual_loss = (residual * residual).sum()
+    inputs = {
+        "x": nabla.Tensor([1], [0.3]),
+        "weight": nabla.Tensor([1], [1.2]),
+        "forcing": nabla.Tensor([1], [0.5]),
+    }
+    _, gradients = second_derivative.graph.evaluate_value_and_vjp(
+        residual_loss.node_id,
+        inputs,
+        nabla.Tensor([], [1.0]),
+    )
+    assert abs(gradients["weight"].to_flat_list()[0]) > 1e-8
+
+
+def test_trace_tensor_tanh_scalar_loss_supports_jvp_and_vjp():
+    def loss(x):
+        return x.tanh().sum()
+
+    values = [0.0, 1.0, -1.0, 0.5]
+    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": nabla.Tensor([2, 2], values)}
+    value, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+    )
+
+    expected_derivative = [1.0 - math.tanh(item) ** 2 for item in values]
+    assert abs(value.to_flat_list()[0] - sum(math.tanh(item) for item in values)) <= 1e-12
+    assert_close_rows([gradients["x"].to_flat_list()], [expected_derivative])
+    assert abs(tangent.to_flat_list()[0] - sum(expected_derivative)) <= 1e-12
+
+    hessian = traced.graph.hessian_scalar(traced.output.node_id, "x", inputs)
+    expected_second = [-2.0 * math.tanh(item) * derivative for item, derivative in zip(values, expected_derivative)]
+    assert len(hessian) == 4
+    for row in range(4):
+        for col in range(4):
+            expected = expected_second[row] if row == col else 0.0
+            assert abs(hessian[row][col] - expected) <= 1e-12
+
+    direction = [1.0, 2.0, 3.0, 4.0]
+    hvp = traced.graph.hvp_scalar(
+        traced.output.node_id, "x", inputs, nabla.Tensor([2, 2], direction)
+    )
+    assert_close_rows([hvp.to_flat_list()], [[second * direction_item for second, direction_item in zip(expected_second, direction)]])
+
+
+def test_trace_tensor_subtraction_supports_jvp_and_vjp():
+    def loss(x):
+        return (x.tanh() - x).sum()
+
+    values = [0.0, 1.0, -1.0, 0.5]
+    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": nabla.Tensor([2, 2], values)}
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+    )
+
+    expected = [-math.tanh(item) ** 2 for item in values]
+    assert_close_rows([gradients["x"].to_flat_list()], [expected])
+    assert abs(tangent.to_flat_list()[0] - sum(expected)) <= 1e-12
+
+
+def test_trace_tensor_supports_numeric_scalar_literals():
+    def loss(x):
+        return (2.0 * x + 1.0).sum()
+
+    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])}
+    value, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+    )
+
+    assert value.to_flat_list() == [24.0]
+    assert gradients["x"].to_flat_list() == [2.0] * 4
+    assert tangent.to_flat_list() == [8.0]
+
+
+def test_trace_tensor_division_supports_jvp_and_vjp():
+    def loss(x):
+        return (x / (x + 2.0)).sum()
+
+    values = [1.0, 2.0, 3.0, 4.0]
+    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": nabla.Tensor([2, 2], values)}
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+    )
+
+    expected = [2.0 / (value + 2.0) ** 2 for value in values]
+    assert_close_rows([gradients["x"].to_flat_list()], [expected])
+    assert abs(tangent.to_flat_list()[0] - sum(expected)) <= 1e-12
+
+
+def test_trace_tensor_exp_supports_jvp_and_vjp():
+    def loss(x):
+        return x.exp().sum()
+
+    values = [0.0, 1.0, -1.0, 0.5]
+    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": nabla.Tensor([2, 2], values)}
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+    )
+
+    expected = [math.exp(value) for value in values]
+    assert_close_rows([gradients["x"].to_flat_list()], [expected])
+    assert abs(tangent.to_flat_list()[0] - sum(expected)) <= 1e-12
+
+
+def test_trace_tensor_mean_supports_jvp_and_vjp():
+    def loss(x):
+        return x.exp().mean()
+
+    values = [0.0, 1.0, -1.0, 0.5]
+    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": nabla.Tensor([2, 2], values)}
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+    )
+
+    expected = [math.exp(value) / 4.0 for value in values]
+    assert_close_rows([gradients["x"].to_flat_list()], [expected])
+    assert abs(tangent.to_flat_list()[0] - sum(expected)) <= 1e-12
+
+
+def test_trace_tensor_sin_supports_jvp_and_vjp():
+    def loss(x):
+        return x.sin().sum()
+
+    values = [0.0, 1.0, -1.0, 0.5]
+    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": nabla.Tensor([2, 2], values)}
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+    )
+
+    expected = [math.cos(value) for value in values]
+    assert_close_rows([gradients["x"].to_flat_list()], [expected])
+    assert abs(tangent.to_flat_list()[0] - sum(expected)) <= 1e-12
+
+
+def test_trace_tensor_sqrt_supports_jvp_and_vjp():
+    def loss(x):
+        return x.sqrt().sum()
+
+    values = [1.0, 4.0, 9.0, 16.0]
+    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": nabla.Tensor([2, 2], values)}
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+    )
+
+    expected = [0.5, 0.25, 1.0 / 6.0, 0.125]
+    assert_close_rows([gradients["x"].to_flat_list()], [expected])
+    assert abs(tangent.to_flat_list()[0] - sum(expected)) <= 1e-12
+
+
+def test_trace_tensor_log_supports_jvp_and_vjp():
+    def loss(x):
+        return x.log().sum()
+
+    values = [1.0, 2.0, 3.0, 4.0]
+    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": nabla.Tensor([2, 2], values)}
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+    )
+
+    expected = [1.0 / value for value in values]
+    assert_close_rows([gradients["x"].to_flat_list()], [expected])
+    assert abs(tangent.to_flat_list()[0] - sum(expected)) <= 1e-12
+
+
+def test_trace_tensor_cos_supports_jvp_and_vjp():
+    def loss(x):
+        return x.cos().sum()
+
+    values = [0.0, 1.0, -1.0, 0.5]
+    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": nabla.Tensor([2, 2], values)}
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+    )
+    hessian = traced.graph.hessian_scalar(traced.output.node_id, "x", inputs)
+    hvp = traced.graph.hvp_scalar(
+        traced.output.node_id,
+        "x",
+        inputs,
+        nabla.Tensor([2, 2], [1.0, 2.0, -1.0, 0.5]),
+    )
+
+    expected = [-math.sin(value) for value in values]
+    assert_close_rows([gradients["x"].to_flat_list()], [expected])
+    assert abs(tangent.to_flat_list()[0] - sum(expected)) <= 1e-12
+    expected_diagonal = [-math.cos(value) for value in values]
+    assert_close_rows(
+        hessian,
+        [
+            [expected_diagonal[row] if row == column else 0.0 for column in range(4)]
+            for row in range(4)
+        ],
+    )
+    assert_close_rows(
+        [hvp.to_flat_list()],
+        [[expected_diagonal[index] * value for index, value in enumerate([1.0, 2.0, -1.0, 0.5])]],
+    )
+
+
+def test_trace_tensor_powi_supports_second_order_ad():
+    def loss(x):
+        return x.powi(3).sum()
+
+    values = [0.0, 1.0, -2.0, 0.5]
+    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": nabla.Tensor([2, 2], values)}
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+    )
+    hessian = traced.graph.hessian_scalar(traced.output.node_id, "x", inputs)
+
+    expected_gradient = [3.0 * value * value for value in values]
+    expected_diagonal = [6.0 * value for value in values]
+    assert_close_rows([gradients["x"].to_flat_list()], [expected_gradient])
+    assert abs(tangent.to_flat_list()[0] - sum(expected_gradient)) <= 1e-12
+    assert_close_rows(
+        hessian,
+        [
+            [expected_diagonal[row] if row == column else 0.0 for column in range(4)]
+            for row in range(4)
+        ],
+    )
+
+
+def test_trace_tensor_axis_reductions_support_ad():
+    def loss(x):
+        return x.mean(axis=0).powi(2).sum()
+
+    values = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    traced = nabla.trace_tensor(loss, [("x", [2, 3])])
+    inputs = {"x": nabla.Tensor([2, 3], values)}
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 3], [1.0] * 6)}
+    )
+    hessian = traced.graph.hessian_scalar(traced.output.node_id, "x", inputs)
+
+    expected_gradient = [2.5, 3.5, 4.5, 2.5, 3.5, 4.5]
+    assert_close_rows([gradients["x"].to_flat_list()], [expected_gradient])
+    assert abs(tangent.to_flat_list()[0] - 21.0) <= 1e-12
+    assert_close_rows(
+        hessian,
+        [
+            [0.5 if row % 3 == column % 3 else 0.0 for column in range(6)]
+            for row in range(6)
+        ],
+    )
+
+    output = nabla.trace_tensor(lambda x: x.sum(axis=1), [("x", [2, 3])])
+    value, output_tangent = output.graph.evaluate_jvp(
+        output.output.node_id,
+        inputs,
+        {"x": nabla.Tensor([2, 3], [1.0] * 6)},
+    )
+    _, output_gradients = output.graph.evaluate_value_and_vjp(
+        output.output.node_id, inputs, nabla.Tensor([2], [2.0, 3.0])
+    )
+    assert value.shape == [2]
+    assert value.to_flat_list() == [6.0, 15.0]
+    assert output_tangent.to_flat_list() == [3.0, 3.0]
+    assert output_gradients["x"].to_flat_list() == [2.0, 2.0, 2.0, 3.0, 3.0, 3.0]
+
+    last_axis = nabla.trace_tensor(lambda x: x.mean(axis=-1), [("x", [2, 3])])
+    last_axis_value = last_axis.graph.evaluate(last_axis.output.node_id, inputs)
+    assert last_axis_value.shape == [2]
+    assert last_axis_value.to_flat_list() == [2.0, 5.0]
+
+
+def test_trace_tensor_transpose_supports_rank_n_ad():
+    def loss(x):
+        return x.transpose([2, 0, 1]).powi(2).sum()
+
+    values = [float(value) for value in range(1, 13)]
+    traced = nabla.trace_tensor(loss, [("x", [2, 2, 3])])
+    inputs = {"x": nabla.Tensor([2, 2, 3], values)}
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2, 3], [1.0] * 12)}
+    )
+
+    expected = [2.0 * value for value in values]
+    assert_close_rows([gradients["x"].to_flat_list()], [expected])
+    assert abs(tangent.to_flat_list()[0] - sum(expected)) <= 1e-12
+
+    output = nabla.trace_tensor(lambda x: x.transpose(), [("x", [2, 2, 3])])
+    value = output.graph.evaluate(output.output.node_id, inputs)
+    assert value.shape == [3, 2, 2]
+    assert value.to_flat_list() == [1.0, 7.0, 4.0, 10.0, 2.0, 8.0, 5.0, 11.0, 3.0, 9.0, 6.0, 12.0]
+
+
+def test_trace_tensor_reshape_supports_jvp_and_vjp():
+    def loss(x):
+        return x.reshape([4]).exp().sum()
+
+    values = [0.0, 1.0, -1.0, 0.5]
+    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": nabla.Tensor([2, 2], values)}
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+    )
+
+    expected = [math.exp(value) for value in values]
+    assert gradients["x"].shape == [2, 2]
+    assert_close_rows([gradients["x"].to_flat_list()], [expected])
+    assert abs(tangent.to_flat_list()[0] - sum(expected)) <= 1e-12
+
+
+def test_tensor_grad_scalar_fn_reuses_a_compiled_plan():
+    gradient = nabla.tensor_grad_scalar_fn(
+        lambda x: (2.0 * x).sum(), [("x", [2, 2])]
+    )
+
+    first = gradient({"x": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])})
+    second = gradient({"x": nabla.Tensor([2, 2], [5.0, 6.0, 7.0, 8.0])})
+
+    assert first["x"].to_flat_list() == [2.0] * 4
+    assert second["x"].to_flat_list() == [2.0] * 4
+
+
+def test_tensor_jit_fn_reuses_a_compiled_plan():
+    compiled = nabla.tensor_jit_fn(
+        lambda x, y: (x.matmul(y)).tanh(),
+        [("x", [2, 2]), ("y", [2, 2])],
+    )
+
+    first = compiled(
+        {
+            "x": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+            "y": nabla.Tensor([2, 2], [1.0, 0.0, 0.0, 1.0]),
+        }
+    )
+    second = compiled(
+        {
+            "x": nabla.Tensor([2, 2], [0.0, 1.0, -1.0, 0.5]),
+            "y": nabla.Tensor([2, 2], [2.0, 0.0, 0.0, 2.0]),
+        }
+    )
+
+    assert_close_rows(
+        [first.to_flat_list()],
+        [[math.tanh(1.0), math.tanh(2.0), math.tanh(3.0), math.tanh(4.0)]],
+    )
+    assert_close_rows(
+        [second.to_flat_list()],
+        [[0.0, math.tanh(2.0), math.tanh(-2.0), math.tanh(1.0)]],
+    )
+
+
+def test_tensor_vjp_fn_reuses_a_compiled_plan_with_runtime_cotangent():
+    vjp = nabla.tensor_vjp_fn(lambda x: x.tanh(), [("x", [2, 2])])
+    values = [0.0, 1.0, -1.0, 0.5]
+    cotangent = [1.0, 2.0, 3.0, 4.0]
+
+    output, gradients = vjp(
+        {"x": nabla.Tensor([2, 2], values)},
+        nabla.Tensor([2, 2], cotangent),
+    )
+
+    assert_close_rows([output.to_flat_list()], [[math.tanh(value) for value in values]])
+    assert_close_rows(
+        [gradients["x"].to_flat_list()],
+        [[cot * (1.0 - math.tanh(value) ** 2) for value, cot in zip(values, cotangent)]],
+    )
+
+
+def test_tensor_jvp_fn_reuses_a_compiled_plan_with_runtime_tangent():
+    jvp = nabla.tensor_jvp_fn(lambda x: x.tanh(), [("x", [2, 2])])
+    values = [0.0, 1.0, -1.0, 0.5]
+    tangent = [1.0, 2.0, 3.0, 4.0]
+
+    output, output_tangent = jvp(
+        {"x": nabla.Tensor([2, 2], values)},
+        {"x": nabla.Tensor([2, 2], tangent)},
+    )
+
+    assert_close_rows([output.to_flat_list()], [[math.tanh(value) for value in values]])
+    assert_close_rows(
+        [output_tangent.to_flat_list()],
+        [[direction * (1.0 - math.tanh(value) ** 2) for value, direction in zip(values, tangent)]],
+    )
+
+
+def test_tensor_jacobian_fn_reuses_a_compiled_plan():
+    jacobian = nabla.tensor_jacobian_fn(
+        lambda x: x.powi(2), [("x", [2, 2])], "x"
+    )
+    result = jacobian({"x": nabla.Tensor([2, 2], [1.0, 2.0, -3.0, 0.5])})
+
+    assert_close_rows(
+        result,
+        [
+            [2.0, 0.0, 0.0, 0.0],
+            [0.0, 4.0, 0.0, 0.0],
+            [0.0, 0.0, -6.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+    )
+
+
+def test_adam_updates_tensor_parameters_with_persistent_moments():
+    optimizer = nabla.Adam(learning_rate=0.1)
+    parameters = {"weight": nabla.Tensor([2], [1.0, 2.0])}
+    gradients = {"weight": nabla.Tensor([2], [0.5, -0.5])}
+
+    first = optimizer.step(parameters, gradients)
+    second = optimizer.step(first, gradients)
+
+    assert_close_rows([first["weight"].to_flat_list()], [[0.9, 2.1]], tol=1e-7)
+    assert_close_rows([second["weight"].to_flat_list()], [[0.8, 2.2]], tol=1e-7)
+
+
+def test_adam_invalid_step_does_not_advance_optimizer_state():
+    parameters = {"weight": nabla.Tensor([1], [1.0])}
+    gradients = {"weight": nabla.Tensor([1], [0.5])}
+    reference = nabla.Adam(learning_rate=0.1)
+    expected = reference.step(reference.step(parameters, gradients), gradients)
+
+    optimizer = nabla.Adam(learning_rate=0.1)
+    first = optimizer.step(parameters, gradients)
+    try:
+        optimizer.step(first, {})
+        assert False, "expected Adam to reject a missing gradient"
+    except ValueError:
+        pass
+    actual = optimizer.step(first, gradients)
+
+    assert_close_rows(
+        [actual["weight"].to_flat_list()],
+        [expected["weight"].to_flat_list()],
+        tol=1e-12,
+    )
+
+
+def test_sum_gradients_combines_named_tensors():
+    combined = nabla.sum_gradients(
+        [
+            {"weight": nabla.Tensor([2], [1.0, -2.0])},
+            {"weight": nabla.Tensor([2], [0.5, 3.0])},
+        ]
+    )
+
+    assert combined["weight"].to_flat_list() == [1.5, 1.0]
+    filtered = nabla.sum_gradients(
+        [
+            {"weight": nabla.Tensor([1], [1.0]), "forcing": nabla.Tensor([1], [5.0])},
+            {"weight": nabla.Tensor([1], [2.0]), "target": nabla.Tensor([1], [7.0])},
+        ],
+        ["weight"],
+    )
+    assert filtered["weight"].to_flat_list() == [3.0]
+
+
+def test_poisson_residual_training_converges_with_symbolic_jvp_and_adam():
+    coordinate = 0.5
+    target_weight = 1.0
+    target_value = math.tanh(target_weight * coordinate)
+    forcing = 2.0 * target_weight**2 * target_value * (1.0 - target_value**2)
+    traced = nabla.trace_tensor(
+        lambda x, weight, forcing: (x * weight).tanh(),
+        [("x", [1]), ("weight", [1]), ("forcing", [1])],
+    )
+    second_derivative = traced.symbolic_jvp("x").symbolic_jvp("x")
+    residual = second_derivative.output + second_derivative.graph.input("forcing")
+    loss = (residual * residual).sum()
+    parameters = {"weight": nabla.Tensor([1], [0.3])}
+    optimizer = nabla.Adam(learning_rate=0.03)
+
+    def value_and_grad(current):
+        return second_derivative.graph.evaluate_value_and_vjp(
+            loss.node_id,
+            {
+                "x": nabla.Tensor([1], [coordinate]),
+                "forcing": nabla.Tensor([1], [forcing]),
+                **current,
+            },
+            nabla.Tensor([], [1.0]),
+        )
+
+    initial_loss, _ = value_and_grad(parameters)
+    for _ in range(500):
+        _, gradients = value_and_grad(parameters)
+        parameters = optimizer.step(parameters, {"weight": gradients["weight"]})
+    final_loss, _ = value_and_grad(parameters)
+
+    assert final_loss.to_flat_list()[0] < initial_loss.to_flat_list()[0] * 1e-12
+    assert abs(parameters["weight"].to_flat_list()[0] - target_weight) < 1e-5
+
+
+def test_batched_poisson_collocation_training_converges():
+    coordinates = [0.2, 0.4, 0.6, 0.8]
+    target_weight = 1.0
+    forcing_values = [
+        2.0
+        * target_weight**2
+        * math.tanh(target_weight * coordinate)
+        * (1.0 - math.tanh(target_weight * coordinate) ** 2)
+        for coordinate in coordinates
+    ]
+    traced = nabla.trace_tensor(
+        lambda x, weight, forcing: (x * weight).tanh(),
+        [("x", [4, 1]), ("weight", [1, 1]), ("forcing", [4, 1])],
+    )
+    second_derivative = traced.symbolic_jvp("x").symbolic_jvp("x")
+    residual = second_derivative.output + second_derivative.graph.input("forcing")
+    loss = (residual * residual).mean()
+    parameters = {"weight": nabla.Tensor([1, 1], [0.3])}
+    optimizer = nabla.Adam(learning_rate=0.03)
+
+    def value_and_grad(current):
+        return second_derivative.graph.evaluate_value_and_vjp(
+            loss.node_id,
+            {
+                "x": nabla.Tensor([4, 1], coordinates),
+                "forcing": nabla.Tensor([4, 1], forcing_values),
+                **current,
+            },
+            nabla.Tensor([], [1.0]),
+        )
+
+    initial_loss, _ = value_and_grad(parameters)
+    for _ in range(500):
+        _, gradients = value_and_grad(parameters)
+        parameters = optimizer.step(parameters, {"weight": gradients["weight"]})
+    final_loss, _ = value_and_grad(parameters)
+
+    assert final_loss.to_flat_list()[0] < initial_loss.to_flat_list()[0] * 1e-12
+    assert abs(parameters["weight"].to_flat_list()[0] - target_weight) < 1e-5
+
+
+def test_poisson_training_aggregates_boundary_and_residual_gradients():
+    coordinates = [0.2, 0.4, 0.6, 0.8]
+    target_weight = 1.0
+    forcing_values = [
+        2.0
+        * math.tanh(coordinate)
+        * (1.0 - math.tanh(coordinate) ** 2)
+        for coordinate in coordinates
+    ]
+    residual_trace = nabla.trace_tensor(
+        lambda x, weight, forcing: (x * weight).tanh(),
+        [("x", [4, 1]), ("weight", [1, 1]), ("forcing", [4, 1])],
+    )
+    second_derivative = residual_trace.symbolic_jvp("x").symbolic_jvp("x")
+    residual = second_derivative.output + second_derivative.graph.input("forcing")
+    residual_loss = (residual * residual).mean()
+    residual_plan = second_derivative.graph.compile_cpu(residual_loss.node_id)
+    boundary_trace = nabla.trace_tensor(
+        lambda x, weight, target: (x * weight).tanh(),
+        [("x", [4, 1]), ("weight", [1, 1]), ("target", [4, 1])],
+    )
+    boundary_error = boundary_trace.output - boundary_trace.graph.input("target")
+    boundary_loss = (boundary_error * boundary_error).mean()
+    boundary_plan = boundary_trace.graph.compile_cpu(boundary_loss.node_id)
+    parameters = {"weight": nabla.Tensor([1, 1], [0.3])}
+    optimizer = nabla.Adam(learning_rate=0.03)
+
+    def loss_and_gradient(current):
+        residual_value, residual_gradients = residual_plan.evaluate_vjp(
+            {"x": nabla.Tensor([4, 1], coordinates), "forcing": nabla.Tensor([4, 1], forcing_values), **current},
+            nabla.Tensor([], [1.0]),
+        )
+        boundary_value, boundary_gradients = boundary_plan.evaluate_vjp(
+            {"x": nabla.Tensor([4, 1], [1.0] * 4), "target": nabla.Tensor([4, 1], [math.tanh(1.0)] * 4), **current},
+            nabla.Tensor([], [1.0]),
+        )
+        return residual_value.to_flat_list()[0] + boundary_value.to_flat_list()[0], {
+            "weight": residual_gradients["weight"] + boundary_gradients["weight"]
+        }
+
+    initial_loss, _ = loss_and_gradient(parameters)
+    for _ in range(500):
+        _, gradients = loss_and_gradient(parameters)
+        parameters = optimizer.step(parameters, gradients)
+    final_loss, _ = loss_and_gradient(parameters)
+
+    assert final_loss < initial_loss * 1e-12
+    assert abs(parameters["weight"].to_flat_list()[0] - target_weight) < 1e-5
+
+
+def test_symbolic_jvp_residual_backpropagates_through_two_layer_mlp():
+    traced = nabla.trace_tensor(
+        lambda x, w1, b1, w2, b2, forcing: (x.matmul(w1) + b1).tanh().matmul(w2)
+        + b2,
+        [
+            ("x", [4, 1]),
+            ("w1", [1, 2]),
+            ("b1", [1, 2]),
+            ("w2", [2, 1]),
+            ("b2", [1, 1]),
+            ("forcing", [4, 1]),
+        ],
+    )
+    second_derivative = traced.symbolic_jvp("x").symbolic_jvp("x")
+    residual = second_derivative.output + second_derivative.graph.input("forcing")
+    loss = (residual * residual).mean()
+    _, gradients = second_derivative.graph.evaluate_value_and_vjp(
+        loss.node_id,
+        {
+            "x": nabla.Tensor([4, 1], [0.2, 0.4, 0.6, 0.8]),
+            "w1": nabla.Tensor([1, 2], [0.7, -0.4]),
+            "b1": nabla.Tensor([1, 2], [0.1, -0.2]),
+            "w2": nabla.Tensor([2, 1], [0.5, -0.3]),
+            "b2": nabla.Tensor([1, 1], [0.05]),
+            "forcing": nabla.Tensor([4, 1], [0.2, -0.1, 0.3, -0.2]),
+        },
+        nabla.Tensor([], [1.0]),
+    )
+
+    for name in ["w1", "b1", "w2"]:
+        assert any(abs(value) > 1e-8 for value in gradients[name].to_flat_list())
+
+
+def test_two_layer_mlp_poisson_training_converges():
+    coordinates = [0.2, 0.4, 0.6, 0.8]
+    parameter_specs = [
+        ("x", [4, 1]), ("w1", [1, 2]), ("b1", [1, 2]),
+        ("w2", [2, 1]), ("b2", [1, 1]), ("forcing", [4, 1]),
+    ]
+    model = lambda x, w1, b1, w2, b2, forcing: (x.matmul(w1) + b1).tanh().matmul(w2) + b2
+    residual_trace = nabla.trace_tensor(model, parameter_specs)
+    second_derivative = residual_trace.symbolic_jvp("x").symbolic_jvp("x")
+    residual = second_derivative.output + second_derivative.graph.input("forcing")
+    residual_loss = (residual * residual).mean()
+    boundary_trace = nabla.trace_tensor(
+        lambda x, w1, b1, w2, b2, target: (x.matmul(w1) + b1).tanh().matmul(w2) + b2,
+        [
+            ("x", [4, 1]), ("w1", [1, 2]), ("b1", [1, 2]),
+            ("w2", [2, 1]), ("b2", [1, 1]), ("target", [4, 1]),
+        ],
+    )
+    boundary_error = boundary_trace.output - boundary_trace.graph.input("target")
+    boundary_loss = (boundary_error * boundary_error).mean()
+    teacher = {
+        "w1": nabla.Tensor([1, 2], [1.2, -0.7]), "b1": nabla.Tensor([1, 2], [0.1, -0.2]),
+        "w2": nabla.Tensor([2, 1], [0.8, 0.5]), "b2": nabla.Tensor([1, 1], [0.05]),
+    }
+    forcing = second_derivative.graph.evaluate(
+        second_derivative.output.node_id,
+        {"x": nabla.Tensor([4, 1], coordinates), "forcing": nabla.Tensor([4, 1], [0.0] * 4), **teacher},
+    )
+    boundary_coordinates = [0.0, 0.0, 1.0, 1.0]
+    boundary_target = boundary_trace.graph.evaluate(
+        boundary_trace.output.node_id,
+        {"x": nabla.Tensor([4, 1], boundary_coordinates), "target": nabla.Tensor([4, 1], [0.0] * 4), **teacher},
+    )
+    parameters = {
+        "w1": nabla.Tensor([1, 2], [0.3, -0.1]), "b1": nabla.Tensor([1, 2], [0.0, 0.0]),
+        "w2": nabla.Tensor([2, 1], [0.2, 0.1]), "b2": nabla.Tensor([1, 1], [0.0]),
+    }
+    optimizer = nabla.Adam(learning_rate=0.02)
+
+    def loss_and_grad(current):
+        residual_value, residual_gradients = second_derivative.graph.evaluate_value_and_vjp(
+            residual_loss.node_id,
+            {"x": nabla.Tensor([4, 1], coordinates), "forcing": nabla.Tensor([4, 1], [-value for value in forcing.to_flat_list()]), **current},
+            nabla.Tensor([], [1.0]),
+        )
+        boundary_value, boundary_gradients = boundary_trace.graph.evaluate_value_and_vjp(
+            boundary_loss.node_id,
+            {"x": nabla.Tensor([4, 1], boundary_coordinates), "target": boundary_target, **current},
+            nabla.Tensor([], [1.0]),
+        )
+        return residual_value.to_flat_list()[0] + boundary_value.to_flat_list()[0], {
+            name: residual_gradients[name] + boundary_gradients[name] for name in current
+        }
+
+    initial_loss, _ = loss_and_grad(parameters)
+    for _ in range(2000):
+        _, gradients = loss_and_grad(parameters)
+        parameters = optimizer.step(parameters, gradients)
+    final_loss, _ = loss_and_grad(parameters)
+
+    assert final_loss < initial_loss * 1e-5
+
+
+def test_standard_sine_poisson_training_recovers_pi():
+    coordinates = [0.15, 0.35, 0.55, 0.75, 0.9]
+    forcing = [math.pi**2 * math.sin(math.pi * coordinate) for coordinate in coordinates]
+    residual_trace = nabla.trace_tensor(
+        lambda x, weight, forcing: (x * weight).sin(),
+        [("x", [5, 1]), ("weight", [1, 1]), ("forcing", [5, 1])],
+    )
+    second_derivative = residual_trace.symbolic_jvp("x").symbolic_jvp("x")
+    residual = second_derivative.output + second_derivative.graph.input("forcing")
+    residual_loss = (residual * residual).mean()
+    boundary_trace = nabla.trace_tensor(
+        lambda x, weight, target: (x * weight).sin(),
+        [("x", [2, 1]), ("weight", [1, 1]), ("target", [2, 1])],
+    )
+    boundary_error = boundary_trace.output - boundary_trace.graph.input("target")
+    boundary_loss = (boundary_error * boundary_error).mean()
+    parameters = {"weight": nabla.Tensor([1, 1], [2.5])}
+    optimizer = nabla.Adam(learning_rate=0.01)
+
+    def loss_and_grad(current):
+        residual_value, residual_gradients = second_derivative.graph.evaluate_value_and_vjp(
+            residual_loss.node_id,
+            {"x": nabla.Tensor([5, 1], coordinates), "forcing": nabla.Tensor([5, 1], forcing), **current},
+            nabla.Tensor([], [1.0]),
+        )
+        boundary_value, boundary_gradients = boundary_trace.graph.evaluate_value_and_vjp(
+            boundary_loss.node_id,
+            {"x": nabla.Tensor([2, 1], [0.0, 1.0]), "target": nabla.Tensor([2, 1], [0.0, 0.0]), **current},
+            nabla.Tensor([], [1.0]),
+        )
+        return residual_value.to_flat_list()[0] + boundary_value.to_flat_list()[0], {
+            "weight": residual_gradients["weight"] + boundary_gradients["weight"]
+        }
+
+    initial_loss, _ = loss_and_grad(parameters)
+    for _ in range(2000):
+        _, gradients = loss_and_grad(parameters)
+        parameters = optimizer.step(parameters, gradients)
+    final_loss, _ = loss_and_grad(parameters)
+
+    assert final_loss < initial_loss * 1e-12
+    assert abs(parameters["weight"].to_flat_list()[0] - math.pi) < 1e-8
+
+
+def test_trace_tensor_compile_cpu_eliminates_unreachable_nodes():
+    def model(x):
+        x.tanh()
+        return x + x
+
+    traced = nabla.trace_tensor(model, [("x", [2, 2])])
+    plan = traced.graph.compile_cpu(traced.output.node_id)
+    direct_plan = traced.output.compile_cpu()
+
+    assert plan.node_count == 2
+    assert direct_plan.node_count == plan.node_count
+    assert plan.lower_text() == "\n".join(
+        [
+            "%0 = input[name=x] : tensor<2x2xf64>",
+            "%1 = add(%0, %0) : tensor<2x2xf64>",
+        ]
+    )
+    assert plan.kernel_ir() == [
+        {"id": 0, "op": "input", "shape": [2, 2], "inputs": [], "name": "x"},
+        {"id": 1, "op": "add", "shape": [2, 2], "inputs": [0, 0]},
+    ]
+    plan.validate_kernel_ir()
+    inputs = {"x": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])}
+    assert plan.evaluate(inputs).to_flat_list() == [2.0, 4.0, 6.0, 8.0]
+    _, gradients = plan.evaluate_vjp(inputs, nabla.Tensor([2, 2], [1.0] * 4))
+    assert gradients["x"].to_flat_list() == [2.0] * 4
+    _, alias_gradients = plan.evaluate_value_and_vjp(
+        inputs, nabla.Tensor([2, 2], [1.0] * 4)
+    )
+    assert alias_gradients["x"].to_flat_list() == [2.0] * 4
+    _, tangent = plan.evaluate_jvp(inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)})
+    assert tangent.to_flat_list() == [2.0] * 4
+
+
+def test_trace_tensor_compile_cpu_commons_identical_pure_nodes():
+    def model(x):
+        return x.tanh() + x.tanh()
+
+    traced = nabla.trace_tensor(model, [("x", [2, 2])])
+    plan = traced.graph.compile_cpu(traced.output.node_id)
+
+    assert plan.node_count == 3
+    assert plan.kernel_ir()[2]["inputs"] == [1, 1]
+    assert_close_rows(
+        [plan.evaluate({"x": nabla.Tensor([2, 2], [0.0, 1.0, -1.0, 0.5])}).to_flat_list()],
+        [[0.0, 2.0 * math.tanh(1.0), -2.0 * math.tanh(1.0), 2.0 * math.tanh(0.5)]],
+    )
+
+
 def test_matrix_neg_and_scalar_div():
     a = nabla.Matrix([[1.0, -2.0], [3.0, -4.0]])
 
@@ -1418,6 +2380,43 @@ if __name__ == "__main__":
     test_matrix_supports_scalar_literals()
     test_matrix_broadcasts_scalar_matrix_for_elementwise_ops()
     test_matrix_broadcasts_row_and_column_matrices_for_elementwise_ops()
+    test_tensor_broadcasts_trailing_axes_and_reshapes()
+    test_tensor_rejects_data_with_the_wrong_size()
+    test_tensor_matmul_broadcasts_batch_axes()
+    test_tensor_slice_creates_a_strided_read_only_view()
+    test_trace_tensor_evaluates_rank_n_scalar_loss_vjp()
+    test_trace_tensor_batched_matmul_scalar_loss_vjp()
+    test_trace_tensor_symbolic_jvp_keeps_parameter_gradients()
+    test_trace_tensor_tanh_scalar_loss_supports_jvp_and_vjp()
+    test_trace_tensor_subtraction_supports_jvp_and_vjp()
+    test_trace_tensor_supports_numeric_scalar_literals()
+    test_trace_tensor_division_supports_jvp_and_vjp()
+    test_trace_tensor_exp_supports_jvp_and_vjp()
+    test_trace_tensor_mean_supports_jvp_and_vjp()
+    test_trace_tensor_sin_supports_jvp_and_vjp()
+    test_trace_tensor_sqrt_supports_jvp_and_vjp()
+    test_trace_tensor_log_supports_jvp_and_vjp()
+    test_trace_tensor_cos_supports_jvp_and_vjp()
+    test_trace_tensor_powi_supports_second_order_ad()
+    test_trace_tensor_axis_reductions_support_ad()
+    test_trace_tensor_transpose_supports_rank_n_ad()
+    test_trace_tensor_reshape_supports_jvp_and_vjp()
+    test_tensor_grad_scalar_fn_reuses_a_compiled_plan()
+    test_tensor_jit_fn_reuses_a_compiled_plan()
+    test_tensor_vjp_fn_reuses_a_compiled_plan_with_runtime_cotangent()
+    test_tensor_jvp_fn_reuses_a_compiled_plan_with_runtime_tangent()
+    test_tensor_jacobian_fn_reuses_a_compiled_plan()
+    test_adam_updates_tensor_parameters_with_persistent_moments()
+    test_adam_invalid_step_does_not_advance_optimizer_state()
+    test_sum_gradients_combines_named_tensors()
+    test_poisson_residual_training_converges_with_symbolic_jvp_and_adam()
+    test_batched_poisson_collocation_training_converges()
+    test_poisson_training_aggregates_boundary_and_residual_gradients()
+    test_symbolic_jvp_residual_backpropagates_through_two_layer_mlp()
+    test_two_layer_mlp_poisson_training_converges()
+    test_standard_sine_poisson_training_recovers_pi()
+    test_trace_tensor_compile_cpu_eliminates_unreachable_nodes()
+    test_trace_tensor_compile_cpu_commons_identical_pure_nodes()
     test_matrix_neg_and_scalar_div()
     test_matrix_elementwise_division()
     test_matrix_integer_power()

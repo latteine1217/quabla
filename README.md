@@ -21,10 +21,76 @@ cached graph on later calls. It does not yet have
 source-to-source AD, compiled JIT lowering, GPU execution, or distributed
 sharding.
 
+Run the verified one-dimensional Poisson PINN example after `maturin develop`:
+
+```sh
+.venv/bin/python examples/pinn_poisson.py
+```
+
 ## Current Capabilities
 
 - Scalar forward-mode automatic differentiation with `Dual`.
 - Compile-time shaped `Tensor2<ROWS, COLS>` with shape-checked matmul.
+- Pure-Rust `TensorIr` compiler core for dynamic rank-N input tensors with
+  broadcasted add/multiply, scalar `sum`, CPU evaluation, direct JVP and
+  reverse-mode VJP with cotangent reduction back through broadcast axes, and
+  deterministic lowering text. It is deliberately independent of the current
+  PyO3 2D `TraceGraph` while that bridge is migrated incrementally.
+- Python-facing eager `Tensor` class backed by contiguous row-major Rust storage,
+  with positive runtime shape validation, rank-N trailing-axis broadcasting for
+  add/subtract/multiply/divide, NumPy-style batched `matmul`, and
+  element-count-preserving reshape. `Tensor` is not yet traceable,
+  differentiable, or part of the CPU plan. `Tensor.slice(...)` returns a
+  zero-copy, read-only `TensorView` with explicit shape, strides, and offset;
+  source tensors and views share immutable storage, while every arithmetic
+  operation returns a new contiguous allocation.
+- Python `trace_tensor(fn, input_specs)` bridge for the rank-N `TensorIr` core.
+- `tensor_jacobian_fn(fn, input_specs, input_name)` freezes one rank-N trace
+  and returns an output-flat by input-flat dense Jacobian for the selected input.
+  Its `TraceTensor` values currently support broadcasted add/subtract/multiply/divide,
+  batched `matmul`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `log`, reshape, and global or single-axis `sum`/`mean`; `TensorTraceGraph.evaluate_vjp(...)` and
+  `TensorTraceGraph.evaluate_jvp(...)` execute the corresponding rank-N CPU
+  reverse and forward transforms. `TensorTraceGraph.hessian_scalar(...)`
+  computes an exact dense Hessian for one named input and a scalar output using
+  mixed second-direction AD, not finite differences. The established 2D `trace`
+  API remains separate while its wider primitive set is migrated.
+  `TensorTraceGraph.hvp_scalar(...)` returns the corresponding exact
+  Hessian-vector product without materializing that dense matrix.
+  `TensorTraceResult.symbolic_jvp(input_name)` instead emits a new transformable
+  rank-N trace whose output is the coordinate JVP; it can be applied again for
+  second derivatives and then differentiated with VJP with respect to model
+  parameters. Its rules cover every current rank-N `TensorIr` primitive.
+  `tensor_grad_scalar_fn(fn, input_specs)` traces and compiles a rank-N
+  scalar-loss function once, then returns a reusable Python gradient callable
+  backed by its frozen CPU plan.
+  `tensor_jit_fn(fn, input_specs)` similarly returns a reusable rank-N primal
+  callable backed by a frozen CPU plan.
+  `tensor_vjp_fn(fn, input_specs)` returns a reusable rank-N VJP callable that
+  accepts an output cotangent at invocation time.
+  `tensor_jvp_fn(fn, input_specs)` returns a reusable rank-N JVP callable that
+  accepts input tangents at invocation time.
+  `TraceTensor` add/subtract/multiply/divide accept numeric scalar literals on either
+  side, lowered as broadcastable rank-0 constant IR nodes.
+- `TensorTraceGraph.compile_cpu(output_node_id)` freezes an immutable
+  `TensorCpuExecutionPlan` containing only output-reachable rank-N IR nodes.
+  The plan remaps operands after dead-code elimination, commons structurally
+  identical pure nodes, and evaluates without accessing the mutable trace graph;
+  it is a CPU execution boundary, not yet a machine-code JIT.
+  `plan.lower_text()` emits its optimized deterministic rank-N lowering artifact.
+  `plan.evaluate_vjp(...)` and
+  `plan.evaluate_jvp(...)` execute cached-plan AD transforms without returning
+  to the mutable tracer. `plan.kernel_ir()` exposes the same plan as structured
+  op, operand, shape, and input-name records for later backend lowering.
+- `TensorBackend` defines the rank-N plan execution contract; `CpuBackend` is
+  the current implementation used by `plan.evaluate(...)`. LLVM, MLIR, GPU, and
+  distributed backends are future implementations of this boundary.
+- Python `Adam` updates immutable dictionaries of named rank-N `Tensor`
+  parameters from VJP gradients. The test suite includes a manufactured 1D
+  Poisson residual in which two symbolic coordinate JVP transforms form
+  `u_xx`, then VJP and Adam recover one scalar MLP weight. This is a
+  vertical-slice correctness proof. It includes batched collocation points and
+  explicitly aggregated boundary/residual VJPs, but is not yet a general PINN
+  framework.
 - Python-facing `Matrix` class backed by Rust storage, elementwise add/subtract,
   elementwise multiply/divide, numeric scalar add/subtract/multiply/divide,
   elementwise tanh/exp/log/sqrt/sin/cos, greater-than masks, `where` select,
@@ -46,7 +112,9 @@ sharding.
   shape. Concat accepts `axis=0` or `axis=1`, validates non-concatenated
   dimensions, and splits reverse-mode cotangents back to each input. Reshape
   preserves row-major storage order and requires element count to stay unchanged.
-  General rank-N tensor broadcasting is not yet implemented.
+  General rank-N broadcasting is available on eager `Tensor` and the separate
+  `TraceTensor` add/multiply/sum path; `Matrix` and the legacy `TraceGraph`
+  transforms remain deliberately 2D.
 - Python `trace(fn, input_specs)` function that runs user code with traced
   inputs.
 - Structured `graph.ir()` output for AD and backend lowering experiments,

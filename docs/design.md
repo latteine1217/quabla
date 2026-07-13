@@ -23,6 +23,7 @@ The current crate focuses on:
 
 - scalar forward-mode automatic differentiation with `Dual`,
 - a compile-time shaped `Tensor2<ROWS, COLS>` with shape-checked matmul,
+- a dynamic rank-N `TensorIr` with broadcast-aware CPU evaluation and VJP,
 - a generic fixed-step RK4 ODE integrator,
 - a final-state RK4 path for scalar losses that do not need full trajectories,
 - a Lotka-Volterra parameter-inference example,
@@ -67,11 +68,38 @@ The tests should cover:
 After the first milestone passes, the next design decision should be made from
 evidence:
 
-- If shape-safe tensor ergonomics are weak, add dynamic tensors and explicit
-  views/strides.
+- Dynamic rank-N eager tensors now exist with contiguous storage, runtime shape
+  validation, trailing-axis broadcasting, reshape, batched matmul, and
+  zero-copy read-only views with explicit strides. Views share immutable storage
+  through `Arc`, so the current API has no mutable-aliasing state. Tracing and
+  AD remain 2D at the Python bridge. `TensorIr` is the independently tested
+  compiler-core migration target for rank-N tracing and transforms.
 - If operator-overloading AD is too limiting, add a tensor expression IR and
   generated AD transforms.
 - If inverse-problem examples are too small, add observation time series and
   batching.
 - If execution becomes the bottleneck, define backend traits before adding GPU
   or sharding.
+
+## Composable Coordinate Derivatives
+
+PINN residuals require coordinate derivatives to remain differentiable with
+respect to model parameters. A runtime Jacobian, Hessian, or HVP cannot become
+an operand of a later parameter VJP.
+
+The next `TensorIr` transform is a symbolic JVP pass. Given source IR inputs
+and tangent inputs, it emits a new IR containing primal and tangent nodes for
+each source node. The first supported subset is scalar constants,
+add/subtract/multiply, batched matmul, tanh, and sum/mean reductions. Applying
+the transform again to the tangent output will produce coordinate second
+derivatives while retaining the original parameter inputs.
+
+The acceptance test is a scalar loss built from `u_xx` whose VJP yields a
+non-zero MLP-weight gradient. Only after that invariant is proven should the
+Python API add `jacfwd`/`jacrev` wrappers or a PINN training loop.
+
+The initial vertical slice now evaluates a manufactured one-point 1D Poisson
+residual, obtains its weight VJP through two symbolic JVP transforms, and
+optimizes the weight with Python-facing Adam. It intentionally does not yet
+claim support for boundary-condition composition, multiple collocation points,
+or general neural-network parameter containers.
