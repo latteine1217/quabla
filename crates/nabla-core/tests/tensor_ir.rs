@@ -141,6 +141,35 @@ fn tensor_ir_where_routes_gradients_without_differentiating_the_condition() {
 }
 
 #[test]
+fn cpu_plan_fuses_pure_elementwise_broadcast_and_mask_chains() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 1]));
+    let bias = must!(graph.input("bias", vec![1, 3]));
+    let zero = graph.scalar_constant(0.0);
+    let condition = must!(graph.greater(x, zero));
+    let shifted = must!(graph.add(x, bias));
+    let activated = must!(graph.tanh(shifted));
+    let output = must!(graph.where_select(condition, activated, zero));
+    let plan = must!(graph.compile_cpu(output));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2, 1], vec![-1.0, 2.0])),
+        ),
+        (
+            "bias".to_string(),
+            must!(DynamicTensor::new(vec![1, 3], vec![0.0, 1.0, -1.0])),
+        ),
+    ]);
+
+    assert!(plan.uses_fused_elementwise_kernel());
+    assert_eq!(
+        must!(plan.evaluate(&inputs)),
+        must!(graph.evaluate(output, &inputs))
+    );
+}
+
+#[test]
 fn cpu_backend_executes_a_frozen_tensor_plan() {
     let mut graph = TensorIr::new();
     let x = must!(graph.input("x", vec![2, 2]));

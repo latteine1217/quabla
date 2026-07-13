@@ -109,6 +109,7 @@ pub struct SymbolicJvp {
 pub struct TensorExecutionPlan {
     nodes: Vec<TensorNode>,
     output_node_id: TensorNodeId,
+    fused_elementwise_output: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1106,9 +1107,11 @@ impl TensorIr {
             .get(&output)
             .copied()
             .ok_or_else(|| format!("output node {output} is not reachable"))?;
+        let fused_elementwise_output = is_fusable_elementwise_subgraph(&nodes, output_node_id);
         Ok(TensorExecutionPlan {
             nodes,
             output_node_id,
+            fused_elementwise_output,
         })
     }
 
@@ -2272,6 +2275,10 @@ impl TensorExecutionPlan {
         self.nodes.len()
     }
 
+    pub fn uses_fused_elementwise_kernel(&self) -> bool {
+        self.fused_elementwise_output
+    }
+
     pub fn output_shape(&self) -> Result<Vec<usize>, String> {
         self.nodes
             .get(self.output_node_id)
@@ -2315,6 +2322,9 @@ impl TensorExecutionPlan {
         &self,
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<DynamicTensor, String> {
+        if self.fused_elementwise_output {
+            return evaluate_fused_elementwise(&self.nodes, self.output_node_id, inputs);
+        }
         TensorIr::evaluate_tensor_nodes(&self.nodes, inputs)?
             .get(self.output_node_id)
             .cloned()
@@ -2352,6 +2362,152 @@ impl TensorExecutionPlan {
         TensorIr {
             nodes: self.nodes.clone(),
         }
+    }
+}
+
+fn is_fusable_elementwise_subgraph(nodes: &[TensorNode], node_id: TensorNodeId) -> bool {
+    let Some(node) = nodes.get(node_id) else {
+        return false;
+    };
+    match &node.op {
+        TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } => true,
+        TensorOp::Add { lhs, rhs }
+        | TensorOp::Sub { lhs, rhs }
+        | TensorOp::Div { lhs, rhs }
+        | TensorOp::Mul { lhs, rhs }
+        | TensorOp::Greater { lhs, rhs } => {
+            is_fusable_elementwise_subgraph(nodes, *lhs)
+                && is_fusable_elementwise_subgraph(nodes, *rhs)
+        }
+        TensorOp::Where {
+            condition,
+            on_true,
+            on_false,
+        } => {
+            is_fusable_elementwise_subgraph(nodes, *condition)
+                && is_fusable_elementwise_subgraph(nodes, *on_true)
+                && is_fusable_elementwise_subgraph(nodes, *on_false)
+        }
+        TensorOp::Tanh { input }
+        | TensorOp::Exp { input }
+        | TensorOp::Sin { input }
+        | TensorOp::Cos { input }
+        | TensorOp::Powi { input, .. }
+        | TensorOp::Log { input } => is_fusable_elementwise_subgraph(nodes, *input),
+        TensorOp::Sum { .. }
+        | TensorOp::SumAxis { .. }
+        | TensorOp::Matmul { .. }
+        | TensorOp::Reshape { .. }
+        | TensorOp::Mean { .. }
+        | TensorOp::MeanAxis { .. }
+        | TensorOp::Transpose { .. } => false,
+    }
+}
+
+fn evaluate_fused_elementwise(
+    nodes: &[TensorNode],
+    output_node_id: TensorNodeId,
+    inputs: &BTreeMap<String, DynamicTensor>,
+) -> Result<DynamicTensor, String> {
+    let output = nodes
+        .get(output_node_id)
+        .ok_or_else(|| format!("output node {output_node_id} does not exist"))?;
+    for node in nodes {
+        if let TensorOp::Input { name } = &node.op {
+            let input = inputs
+                .get(name)
+                .ok_or_else(|| format!("missing input {name:?}"))?;
+            if input.shape != node.shape {
+                return Err(format!(
+                    "input {name:?} has shape {:?}, expected {:?}",
+                    input.shape, node.shape
+                ));
+            }
+        }
+    }
+
+    let count = element_count(&output.shape)?;
+    let mut data = Vec::with_capacity(count);
+    for index in 0..count {
+        data.push(evaluate_fused_element(
+            nodes,
+            output_node_id,
+            index,
+            &output.shape,
+            inputs,
+        )?);
+    }
+    DynamicTensor::new(output.shape.clone(), data)
+}
+
+fn evaluate_fused_element(
+    nodes: &[TensorNode],
+    node_id: TensorNodeId,
+    output_index: usize,
+    output_shape: &[usize],
+    inputs: &BTreeMap<String, DynamicTensor>,
+) -> Result<f64, String> {
+    let node = nodes
+        .get(node_id)
+        .ok_or_else(|| format!("node {node_id} does not exist"))?;
+    let child =
+        |child_id| evaluate_fused_element(nodes, child_id, output_index, output_shape, inputs);
+    match &node.op {
+        TensorOp::Input { name } => {
+            let input = inputs
+                .get(name)
+                .ok_or_else(|| format!("missing input {name:?}"))?;
+            let strides = contiguous_strides(&node.shape);
+            Ok(input.data[broadcast_offset(output_index, output_shape, &node.shape, &strides)])
+        }
+        TensorOp::ScalarConstant { value } => Ok(*value),
+        TensorOp::Add { lhs, rhs } => Ok(child(*lhs)? + child(*rhs)?),
+        TensorOp::Sub { lhs, rhs } => Ok(child(*lhs)? - child(*rhs)?),
+        TensorOp::Div { lhs, rhs } => {
+            let denominator = child(*rhs)?;
+            if denominator == 0.0 {
+                return Err("division by zero is not supported".to_string());
+            }
+            Ok(child(*lhs)? / denominator)
+        }
+        TensorOp::Mul { lhs, rhs } => Ok(child(*lhs)? * child(*rhs)?),
+        TensorOp::Greater { lhs, rhs } => Ok(f64::from(child(*lhs)? > child(*rhs)?)),
+        TensorOp::Where {
+            condition,
+            on_true,
+            on_false,
+        } => {
+            if child(*condition)? != 0.0 {
+                child(*on_true)
+            } else {
+                child(*on_false)
+            }
+        }
+        TensorOp::Tanh { input } => Ok(child(*input)?.tanh()),
+        TensorOp::Exp { input } => Ok(child(*input)?.exp()),
+        TensorOp::Sin { input } => Ok(child(*input)?.sin()),
+        TensorOp::Cos { input } => Ok(child(*input)?.cos()),
+        TensorOp::Powi { input, exponent } => {
+            let exponent = i32::try_from(*exponent)
+                .map_err(|_| "powi exponent must fit in a signed 32-bit integer".to_string())?;
+            Ok(child(*input)?.powi(exponent))
+        }
+        TensorOp::Log { input } => {
+            let value = child(*input)?;
+            if value <= 0.0 {
+                return Err("log requires strictly positive tensor values".to_string());
+            }
+            Ok(value.ln())
+        }
+        TensorOp::Sum { .. }
+        | TensorOp::SumAxis { .. }
+        | TensorOp::Matmul { .. }
+        | TensorOp::Reshape { .. }
+        | TensorOp::Mean { .. }
+        | TensorOp::MeanAxis { .. }
+        | TensorOp::Transpose { .. } => Err(format!(
+            "node {node_id} is not supported by the fused elementwise evaluator"
+        )),
     }
 }
 
