@@ -842,11 +842,11 @@ impl TensorCpuExecutionPlan {
         let output_cotangent = output_cotangent
             .to_dynamic_tensor()
             .map_err(PyValueError::new_err)?;
-        let value = self.plan.evaluate(&inputs).map_err(PyValueError::new_err)?;
-        let gradients = self
+        let (value, gradients) = self
             .plan
-            .vjp(&inputs, output_cotangent)
-            .map_err(PyValueError::new_err)?
+            .value_and_vjp(&inputs, output_cotangent)
+            .map_err(PyValueError::new_err)?;
+        let gradients = gradients
             .into_iter()
             .map(|(name, tensor)| {
                 PyTensor::from_dynamic_tensor(tensor).map(|tensor| (name, tensor))

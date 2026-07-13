@@ -27,6 +27,13 @@ Run the verified one-dimensional Poisson PINN example after `maturin develop`:
 .venv/bin/python examples/pinn_poisson.py
 ```
 
+Measure the frozen CPU plan in an optimized extension build:
+
+```sh
+.venv/bin/maturin develop --release
+.venv/bin/python examples/benchmark_tensor_cpu.py
+```
+
 ## Current Capabilities
 
 - Scalar forward-mode automatic differentiation with `Dual`.

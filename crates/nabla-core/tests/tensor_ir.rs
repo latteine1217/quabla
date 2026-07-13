@@ -120,6 +120,10 @@ fn cpu_backend_executes_a_frozen_tensor_plan() {
 
     assert_eq!(backend.name(), "cpu");
     assert_eq!(value.data(), &[2.0, 4.0, 6.0, 8.0]);
+    let (value, gradients) =
+        must!(plan.value_and_vjp(&inputs, must!(DynamicTensor::filled(vec![2, 2], 1.0)),));
+    assert_eq!(value.data(), &[2.0, 4.0, 6.0, 8.0]);
+    assert_eq!(gradients["x"].data(), &[2.0, 2.0, 2.0, 2.0]);
     let kernel = must!(graph.compile_cpu(output)).kernel_ir();
     must!(kernel.validate());
 }

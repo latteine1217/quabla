@@ -1027,6 +1027,16 @@ impl TensorIr {
         inputs: &BTreeMap<String, DynamicTensor>,
         output_cotangent: DynamicTensor,
     ) -> Result<BTreeMap<String, DynamicTensor>, String> {
+        self.value_and_vjp(output, inputs, output_cotangent)
+            .map(|(_, gradients)| gradients)
+    }
+
+    pub fn value_and_vjp(
+        &self,
+        output: TensorNodeId,
+        inputs: &BTreeMap<String, DynamicTensor>,
+        output_cotangent: DynamicTensor,
+    ) -> Result<(DynamicTensor, BTreeMap<String, DynamicTensor>), String> {
         let output_node = self.node(output)?;
         if output_cotangent.shape != output_node.shape {
             return Err(format!(
@@ -1036,6 +1046,10 @@ impl TensorIr {
         }
 
         let values = self.evaluate_all(inputs)?;
+        let output_value = values
+            .get(output)
+            .cloned()
+            .ok_or_else(|| format!("output node {output} has no value"))?;
         let mut cotangents = vec![None; self.nodes.len()];
         cotangents[output] = Some(output_cotangent);
 
@@ -1216,7 +1230,7 @@ impl TensorIr {
                 gradients.insert(name.clone(), gradient);
             }
         }
-        Ok(gradients)
+        Ok((output_value, gradients))
     }
 
     pub fn jvp(
@@ -1592,8 +1606,16 @@ impl TensorIr {
         &self,
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<Vec<DynamicTensor>, String> {
-        let mut values: Vec<DynamicTensor> = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
+        Self::evaluate_tensor_nodes(&self.nodes, inputs)
+    }
+
+    fn evaluate_tensor_nodes(
+        nodes: &[TensorNode],
+        inputs: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<Vec<DynamicTensor>, String> {
+        let mut values: Vec<DynamicTensor> = Vec::with_capacity(nodes.len());
+
+        for node in nodes {
             let value = match &node.op {
                 TensorOp::Input { name } => {
                     let input = inputs
@@ -1675,7 +1697,7 @@ impl TensorIr {
                 TensorOp::MeanAxis { input, axis } => values
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
-                    .reduce_axis(*axis, 1.0 / self.node(*input)?.shape[*axis] as f64)?,
+                    .reduce_axis(*axis, 1.0 / nodes[*input].shape[*axis] as f64)?,
                 TensorOp::Sin { input } => values
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
@@ -2089,7 +2111,10 @@ impl TensorExecutionPlan {
         &self,
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<DynamicTensor, String> {
-        self.as_ir().evaluate(self.output_node_id, inputs)
+        TensorIr::evaluate_tensor_nodes(&self.nodes, inputs)?
+            .get(self.output_node_id)
+            .cloned()
+            .ok_or_else(|| format!("output node {} has no value", self.output_node_id))
     }
 
     pub fn vjp(
@@ -2099,6 +2124,15 @@ impl TensorExecutionPlan {
     ) -> Result<BTreeMap<String, DynamicTensor>, String> {
         self.as_ir()
             .vjp(self.output_node_id, inputs, output_cotangent)
+    }
+
+    pub fn value_and_vjp(
+        &self,
+        inputs: &BTreeMap<String, DynamicTensor>,
+        output_cotangent: DynamicTensor,
+    ) -> Result<(DynamicTensor, BTreeMap<String, DynamicTensor>), String> {
+        self.as_ir()
+            .value_and_vjp(self.output_node_id, inputs, output_cotangent)
     }
 
     pub fn jvp(
