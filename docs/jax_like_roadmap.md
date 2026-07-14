@@ -453,8 +453,11 @@ inverse problems without attempting full NumPy compatibility.
 Implementation status (2026-07-15): multi-axis `sum`/`mean` and `keepdims`
 are available for eager and traced tensors. They preserve symbolic AD and
 lower through the existing CPU, CUDA, and MLX reduction/reshape paths. Extrema,
-norms, indexing/views, gather/scatter, linear algebra extensions, neural
-primitives, and dtype/device APIs remain pending.
+norms, gather/scatter, linear algebra extensions, neural primitives, and
+dtype/device APIs remain pending. Eager and traced tensors now share a
+differentiable integer/contiguous-slice indexing subset; it lowers through
+Slice/PadSlice on CPU, CUDA, and MLX. Strided/empty slices, ellipsis, and
+advanced indexing remain pending the explicit gather/scatter design.
 
 Acceptance checks:
 

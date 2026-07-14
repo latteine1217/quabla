@@ -138,6 +138,12 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
   single integer axis or a sequence of normalized axes. Trace tensors expose
   the same contract; multi-axis reductions lower to existing axis-reduction
   and reshape nodes, preserving CPU, CUDA, MLX, JVP, and VJP behavior.
+- `Tensor` and `TraceTensor` support `__getitem__` with integer and
+  contiguous unit-step slice tuples, including negative indices. Integer
+  indices lower to a length-one slice plus reshape, so reverse-mode AD and
+  CUDA/MLX lowering preserve the same semantics. Empty/strided slices,
+  ellipsis, and fancy indexing remain intentionally unsupported pending the
+  gather/scatter API.
 - `tensor_hessian_scalar_fn(fn, input_specs, input_name)` and
   `tensor_hvp_scalar_fn(fn, input_specs, input_name)` freeze a scalar rank-N
   trace for dense Hessian or Hessian-vector-product evaluation. They are

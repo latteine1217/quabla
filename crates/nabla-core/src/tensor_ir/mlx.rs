@@ -153,8 +153,30 @@ impl TensorBackend for MlxBackend {
                     &stream,
                 )
                 .map_err(|error| error.to_string()),
-                TensorOp::Slice { .. } => {
-                    return Err("MLX backend does not yet support slice".to_string())
+                TensorOp::Slice {
+                    input,
+                    axis,
+                    start,
+                    length,
+                } => {
+                    let start = i32::try_from(*start)
+                        .map_err(|_| "MLX slice start exceeds i32".to_string())?;
+                    let length = i32::try_from(*length)
+                        .map_err(|_| "MLX slice length exceeds i32".to_string())?;
+                    let indices = (start
+                        ..start
+                            .checked_add(length)
+                            .ok_or_else(|| "MLX slice index range overflows i32".to_string())?)
+                        .collect::<Vec<_>>();
+                    let indices = Array::from_slice(&indices, &[length]);
+                    mlx_value(&values, *input)?
+                        .take_axis_device(
+                            &indices,
+                            i32::try_from(*axis)
+                                .map_err(|_| "MLX slice axis exceeds i32".to_string())?,
+                            &stream,
+                        )
+                        .map_err(|error| error.to_string())
                 }
                 TensorOp::PadSlice { input, axis, start } => {
                     let rank = node.shape.len();

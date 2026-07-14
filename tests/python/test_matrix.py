@@ -426,6 +426,25 @@ def test_tensor_slice_creates_a_strided_read_only_view():
     assert view.to_tensor().to_flat_list() == [1.0, 3.0, 5.0, 7.0, 9.0, 11.0]
 
 
+def test_tensor_getitem_supports_contiguous_slices_and_negative_indices():
+    tensor = nabla.Tensor([3, 4], [float(value) for value in range(12)])
+
+    assert tensor[1, 1:3].shape == [2]
+    assert tensor[1, 1:3].to_flat_list() == [5.0, 6.0]
+    assert tensor[:, -3:-1].shape == [3, 2]
+    assert tensor[:, -3:-1].to_flat_list() == [1.0, 2.0, 5.0, 6.0, 9.0, 10.0]
+    assert tensor[-1, -1].shape == []
+    assert tensor[-1, -1].to_flat_list() == [11.0]
+
+    for index in (slice(None, None, 2), slice(1, 1), (0, 1, 2)):
+        try:
+            tensor[index]
+        except (IndexError, ValueError):
+            pass
+        else:
+            raise AssertionError(f"Tensor accepted unsupported index {index!r}")
+
+
 def test_tensor_stack_supports_negative_axes():
     first = nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])
     second = nabla.Tensor([2, 2], [5.0, 6.0, 7.0, 8.0])
@@ -634,6 +653,31 @@ def test_trace_tensor_slice_supports_rank_n_ad_and_symbolic_transforms():
         symbolic_gradient.output.node_id,
         {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])},
     ).to_flat_list() == gradients["x"].to_flat_list()
+
+
+def test_trace_tensor_getitem_preserves_slice_ad_and_backend_parity():
+    traced = nabla.trace_tensor(lambda x: x[1, 1:3].powi(2).sum(), [("x", [3, 4])])
+    inputs = {"x": nabla.Tensor([3, 4], [float(value) for value in range(12)])}
+    value, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    assert value.to_flat_list() == [61.0]
+    assert gradients["x"].to_flat_list() == [0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 12.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    symbolic = traced.symbolic_vjp("loss_cotangent")["x"]
+    symbolic_value = symbolic.graph.evaluate(
+        symbolic.output.node_id,
+        {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])},
+    )
+    assert symbolic_value.to_flat_list() == gradients["x"].to_flat_list()
+
+    cpu = traced.output.compile_cpu().evaluate(inputs)
+    if os.environ.get("NABLA_MLX_TEST") is not None:
+        mlx = traced.output.compile_mlx().evaluate(inputs)
+        assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
+    if os.environ.get("NABLA_CUDA_TEST") is not None:
+        cuda = traced.output.compile_cuda().evaluate(inputs)
+        assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
 
 def test_trace_tensor_slice_rejects_invalid_ranges():
@@ -3736,6 +3780,7 @@ if __name__ == "__main__":
     test_tensor_matmul_broadcasts_batch_axes()
     test_tensor_concat_supports_rank_n_axes_and_validates_shapes()
     test_tensor_slice_creates_a_strided_read_only_view()
+    test_tensor_getitem_supports_contiguous_slices_and_negative_indices()
     test_tensor_stack_supports_negative_axes()
     test_trace_tensor_evaluates_rank_n_scalar_loss_vjp()
     test_trace_tensor_batched_matmul_scalar_loss_vjp()
@@ -3744,6 +3789,7 @@ if __name__ == "__main__":
     test_trace_tensor_symbolic_vjp_supports_composed_loss_nodes()
     test_trace_tensor_concat_supports_rank_n_ad_and_symbolic_transforms()
     test_trace_tensor_slice_supports_rank_n_ad_and_symbolic_transforms()
+    test_trace_tensor_getitem_preserves_slice_ad_and_backend_parity()
     test_trace_tensor_slice_rejects_invalid_ranges()
     test_trace_tensor_broadcast_to_supports_rank_n_ad_and_symbolic_transforms()
     test_trace_tensor_stack_supports_symbolic_vjp()

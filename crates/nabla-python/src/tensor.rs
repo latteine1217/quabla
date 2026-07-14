@@ -1,6 +1,6 @@
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use pyo3::types::{PyAny, PySlice, PySliceMethods, PyTuple};
 use std::sync::Arc;
 
 #[pyclass(name = "Tensor", skip_from_py_object)]
@@ -17,6 +17,78 @@ pub struct PyTensorView {
     shape: Vec<usize>,
     strides: Vec<usize>,
     offset: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum TensorIndex {
+    Integer(usize),
+    Slice { start: usize, stop: usize },
+}
+
+pub fn parse_tensor_indices(
+    index: &Bound<'_, PyAny>,
+    rank: usize,
+    shape: &[usize],
+) -> PyResult<Vec<TensorIndex>> {
+    let items = if let Ok(tuple) = index.cast::<PyTuple>() {
+        tuple.iter().collect::<Vec<_>>()
+    } else {
+        vec![index.clone()]
+    };
+    if items.len() > rank {
+        return Err(PyIndexError::new_err(format!(
+            "too many indices for tensor of rank {rank}: got {}",
+            items.len()
+        )));
+    }
+    let mut result = Vec::with_capacity(items.len());
+    let mut axis = 0;
+    for item in items {
+        let extent = *shape.get(axis).ok_or_else(|| {
+            PyIndexError::new_err(format!("too many indices for tensor of rank {rank}"))
+        })?;
+        if let Ok(value) = item.extract::<isize>() {
+            let normalized = if value < 0 {
+                extent as isize + value
+            } else {
+                value
+            };
+            let value = usize::try_from(normalized)
+                .ok()
+                .filter(|value| *value < extent)
+                .ok_or_else(|| {
+                    PyIndexError::new_err(format!(
+                        "index {value} is out of bounds for axis {axis} with extent {extent}"
+                    ))
+                })?;
+            result.push(TensorIndex::Integer(value));
+            axis += 1;
+            continue;
+        }
+        if let Ok(slice) = item.cast::<PySlice>() {
+            let indices = slice.indices(extent as isize)?;
+            if indices.step != 1 {
+                return Err(PyValueError::new_err(
+                    "Tensor indexing currently requires slice step == 1; use Tensor.slice for eager strided views",
+                ));
+            }
+            if indices.slicelength == 0 {
+                return Err(PyValueError::new_err(
+                    "Tensor indexing currently rejects empty slices",
+                ));
+            }
+            result.push(TensorIndex::Slice {
+                start: indices.start as usize,
+                stop: indices.stop as usize,
+            });
+            axis += 1;
+            continue;
+        }
+        return Err(PyTypeError::new_err(
+            "Tensor indexing supports integers and contiguous slices only",
+        ));
+    }
+    Ok(result)
 }
 
 fn element_count(shape: &[usize]) -> Result<usize, String> {
@@ -711,6 +783,28 @@ impl PyTensor {
             offset,
         })
     }
+
+    pub fn try_index(&self, indices: &[TensorIndex]) -> Result<Self, String> {
+        let mut output = self.clone();
+        let mut axis = 0;
+        for index in indices {
+            match *index {
+                TensorIndex::Slice { start, stop } => {
+                    output = output
+                        .try_slice(axis, start, stop - start, 1)?
+                        .materialize()?;
+                    axis += 1;
+                }
+                TensorIndex::Integer(index) => {
+                    output = output.try_slice(axis, index, 1, 1)?.materialize()?;
+                    let mut shape = output.shape.clone();
+                    shape.remove(axis);
+                    output = output.try_reshape(shape)?;
+                }
+            }
+        }
+        Ok(output)
+    }
 }
 
 #[pymethods]
@@ -935,6 +1029,11 @@ impl PyTensor {
             .map_err(PyValueError::new_err)
     }
 
+    fn __getitem__(&self, index: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let indices = parse_tensor_indices(index, self.shape.len(), &self.shape)?;
+        self.try_index(&indices).map_err(PyValueError::new_err)
+    }
+
     fn __add__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
         if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
             return self.try_add(&rhs).map_err(PyValueError::new_err);
@@ -1111,6 +1210,10 @@ impl PyTensorView {
             .map(|index| self.data[view_offset(index, &self.shape, &self.strides, self.offset)])
             .collect())
     }
+
+    fn materialize(&self) -> Result<PyTensor, String> {
+        PyTensor::from_shape_data(self.shape.clone(), self.to_flat_vec()?)
+    }
 }
 
 #[pymethods]
@@ -1140,10 +1243,7 @@ impl PyTensorView {
     }
 
     fn to_tensor(&self) -> PyResult<PyTensor> {
-        Ok(PyTensor {
-            shape: self.shape.clone(),
-            data: Arc::new(self.to_flat_vec().map_err(PyValueError::new_err)?),
-        })
+        self.materialize().map_err(PyValueError::new_err)
     }
 
     #[pyo3(signature = (axis, start, length, step = 1))]

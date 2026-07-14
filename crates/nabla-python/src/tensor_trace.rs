@@ -10,7 +10,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyString, PyTuple};
 
-use crate::tensor::PyTensor;
+use crate::tensor::{parse_tensor_indices, PyTensor, TensorIndex};
 
 fn normalize_reduction_axes(axes: Vec<isize>, rank: usize) -> Result<Vec<usize>, String> {
     let rank = isize::try_from(rank).map_err(|_| "tensor rank exceeds isize".to_string())?;
@@ -710,6 +710,27 @@ impl TraceTensor {
         ))
     }
 
+    fn index_tensor(&self, indices: &[TensorIndex]) -> Result<Self, String> {
+        let mut output = self.clone();
+        let mut axis = 0;
+        for index in indices {
+            match *index {
+                TensorIndex::Slice { start, stop } => {
+                    output = output.slice_tensor(axis as isize, start, stop)?;
+                    axis += 1;
+                }
+                TensorIndex::Integer(index) => {
+                    output = output.slice_tensor(axis as isize, index, index + 1)?;
+                    let batch_offset = usize::from(output.batch_axis.is_some());
+                    let mut shape = output.shape[batch_offset..].to_vec();
+                    shape.remove(axis);
+                    output = output.reshape_tensor(shape)?;
+                }
+            }
+        }
+        Ok(output)
+    }
+
     fn broadcast_to_tensor(&self, shape: Vec<usize>) -> Result<Self, String> {
         let mut ir = self
             .graph
@@ -1221,6 +1242,13 @@ impl TraceTensor {
     fn slice(&self, axis: isize, start: usize, stop: usize) -> PyResult<Self> {
         self.slice_tensor(axis, start, stop)
             .map_err(PyValueError::new_err)
+    }
+
+    fn __getitem__(&self, index: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let batch_offset = usize::from(self.batch_axis.is_some());
+        let shape = &self.shape[batch_offset..];
+        let indices = parse_tensor_indices(index, shape.len(), shape)?;
+        self.index_tensor(&indices).map_err(PyValueError::new_err)
     }
 
     fn broadcast_to(&self, shape: Vec<usize>) -> PyResult<Self> {
