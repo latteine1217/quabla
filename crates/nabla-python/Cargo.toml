@@ -11,6 +11,8 @@ path = "src/lib.rs"
 
 [features]
 extension-module = ["pyo3/extension-module"]
+cuda = ["nabla-core/cuda"]
+mlx = ["nabla-core/mlx"]
 
 [dependencies]
 pyo3 = "0.29"

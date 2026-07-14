@@ -98,8 +98,9 @@ The acceptance test is a scalar loss built from `u_xx` whose VJP yields a
 non-zero MLP-weight gradient. Only after that invariant is proven should the
 Python API add `jacfwd`/`jacrev` wrappers or a PINN training loop.
 
-The initial vertical slice now evaluates a manufactured one-point 1D Poisson
-residual, obtains its weight VJP through two symbolic JVP transforms, and
-optimizes the weight with Python-facing Adam. It intentionally does not yet
-claim support for boundary-condition composition, multiple collocation points,
-or general neural-network parameter containers.
+The initial vertical slice now evaluates manufactured 1D Poisson residuals,
+obtains parameter VJPs through two symbolic JVP transforms, and optimizes with
+Python-facing Adam. CUDA examples cover batched collocation, a two-layer
+four-parameter MLP, and a residual-plus-boundary loss assembled into one
+symbolic graph. General neural-network module containers and automatic loss
+composition remain outside this vertical slice.

@@ -51,9 +51,13 @@ Current state:
 - Matrix multiplication enforces the inner dimension at compile time:
   `(M, K) x (K, N) -> (M, N)`.
 - Python-facing `Tensor` provides eager rank-N contiguous row-major storage,
+  `zeros`/`ones`/`full`/`arange`/`linspace`/`eye` creation, rank-N concat,
   positive runtime shape validation, trailing-axis broadcasting for
-  add/subtract/multiply/divide, NumPy-style batched matmul, and
-  element-count-preserving reshape. `Tensor.slice(...)` creates a zero-copy,
+  add/subtract/multiply/divide and scalar powers, NumPy-style batched matmul,
+  permutation-validated transpose, global or single-axis sum/mean, and
+  common elementwise math, `gt(...)` masks, broadcasted `where`, and
+  materialized `broadcast_to`, and element-count-preserving reshape.
+  `Tensor.slice(...)` creates a zero-copy,
   read-only `TensorView` with explicit stride and offset metadata; the shared
   backing allocation is immutable, so no mutable aliasing is exposed.
 
@@ -83,8 +87,14 @@ Near-term milestone:
 
 Current state:
 
-- CPU-only Rust loops, with frozen execution plans but no machine-code JIT.
-- No compiled JIT, no GPU, no distributed runtime.
+- CPU loops remain the default execution path, with frozen execution plans but
+  no general machine-code JIT.
+- Linux has an NVRTC CUDA path for rank-N plans, including device-resident
+  symbolic VJP/JVP evaluation and parameter updates.
+- Apple silicon has an experimental MLX primal-plan backend. It executes
+  supported frozen Tensor IR nodes on `StreamOrDevice::gpu()` and deliberately
+  reports unsupported reverse-only nodes rather than falling back to CPU.
+- There is no distributed runtime.
 
 Target direction:
 
@@ -145,7 +155,7 @@ Current state:
   add/multiply/sum AD subset.
 - `nabla-core::TensorIr` is the rank-N compiler-core path, but it is not yet
   exposed through the legacy Python tracer. `trace_tensor(...)` now exposes its
-  add/subtract/multiply/divide/matmul/rank-N-transpose/tanh/exp/sin/cos/sqrt/non-negative-integer-powi/log/reshape/global-or-single-axis-sum/mean subset through separate `TensorTraceGraph` and
+  add/subtract/multiply/divide/matmul/rank-N-concat/rank-N-transpose/tanh/exp/sin/cos/sqrt/non-negative-integer-powi/log/reshape/global-or-single-axis-sum/mean subset through separate `TensorTraceGraph` and
   `TraceTensor` classes, with Python-facing CPU VJP and JVP evaluation. This
   preserves the established 2D Python transform API while migration proceeds
   operation by operation.
@@ -155,6 +165,13 @@ Current state:
 - `TraceTensor.reshape(shape)` preserves row-major element order, validates the
   element count at trace time, and reshapes primal values and every AD tangent
   or cotangent consistently.
+- `TraceTensor.slice(axis, start, stop)` selects one contiguous rank-N range.
+  Negative axes are normalized at trace time; VJP reconstructs the original
+  shape with a zero-padded internal node, so CPU and CUDA reverse graphs remain
+  differentiable without host fallback.
+- `TraceTensor.broadcast_to(shape)` records shape expansion instead of
+  materializing it in Python. Its reverse transform reduces broadcast axes to
+  the original shape; the CUDA backend lowers it to a rank-N indexed copy.
 - `TraceTensor.mean()` performs a global mean reduction to a rank-0 scalar;
   its VJP broadcasts the scalar cotangent back over the input with `1/N`
   scaling.
@@ -180,8 +197,17 @@ Current state:
 - `tensor_grad_scalar_fn(fn, input_specs)` traces and compiles a rank-N scalar
   loss once, returning a reusable Python gradient callable backed by the frozen
   plan rather than retracing on every invocation.
+- `tensor_value_and_grad_fn(fn, input_specs)` traces and compiles a rank-N
+  scalar loss once, returning its scalar value and named VJP gradients from one
+  frozen-plan execution.
 - `tensor_jit_fn(fn, input_specs)` traces and compiles a rank-N function once,
   returning a reusable primal callable backed by that same frozen-plan boundary.
+- `tensor_jit_cuda_fn(fn, input_specs, device_ordinal=0)` traces and compiles
+  a fixed-shape rank-N function to a reusable callable CUDA plan on Linux.
+- `tensor_hessian_scalar_fn(fn, input_specs, input_name)` and
+  `tensor_hvp_scalar_fn(fn, input_specs, input_name)` freeze a scalar rank-N
+  trace for dense Hessian or Hessian-vector-product evaluation. Dense Hessian
+  materialization remains a correctness-first O(n^2) CPU path.
 - `tensor_vjp_fn(fn, input_specs)` traces and compiles once, returning a
   reusable rank-N VJP callable whose output cotangent is supplied at invocation
   time.
@@ -200,9 +226,35 @@ Current state:
   a later kernel IR. The same immutable plan
   now exposes CPU primal, VJP, and JVP evaluation. `kernel_ir()` exposes
   structured op, operand, shape, and input-name records without parsing text.
-- `TensorBackend` is the new rank-N execution contract and `CpuBackend` is its
-  current implementation. This separates plan execution from future LLVM,
-  MLIR, GPU, or sharded backends without changing the Python tracing API.
+- `TensorBackend` is the rank-N execution contract and `CpuBackend` is its
+  default implementation. The Linux-only `cuda` feature adds an
+  NVRTC-compiled FP32 `CudaBackend` plus an immutable `CudaExecutionPlan` used
+  by Python `compile_cuda()`. The retained context/module remove repeated NVRTC
+  compilation across evaluations. Current lowering covers rank-two and
+  broadcast-batched matmul,
+  rank-N concat with GPU-resident slice/pad-slice reverse nodes, global and axis reductions, transpose, broadcasting, `where`, `div`, `log`,
+  and the supported unary primitives. Pure elementwise graphs use one fused
+  CUDA kernel; general graphs still lower per operation. It is still preview
+  infrastructure: host inputs and outputs transfer per general evaluation. A
+  gradient-output plan can retain one input and apply device-side SGD or Adam
+  updates without materializing that parameter, gradient, or Adam moments on
+  the host. Separate gradient plans can synchronize retained inputs through
+  same-device GPU-to-GPU copies after each update. Python
+  `cuda_adam_step(...)` batches the per-parameter update and synchronization
+  sequence, while leaving symbolic gradient-plan construction explicit.
+  `cuda_adam_optimizer(...)` stores inputs across steps; passing a dictionary
+  to `step(...)` refreshes only mini-batch tensors without rebuilding plans or
+  resetting GPU-resident parameter and Adam state. For symbolic VJP results
+  from one graph, `cuda_adam_vjp_optimizer(...)` constructs one union plan,
+  executes shared forward/reverse nodes once, and updates every parameter from
+  that one device-resident gradient snapshot. It still lacks fused GEMM and
+  distributed AD.
+- `TensorIr.symbolic_vjp(output, cotangent_name)` now emits a transformable
+  reverse graph with explicit cotangent input and one output node per original
+  input gradient. `TensorTraceResult.symbolic_vjp(cotangent_name)` and
+  `TraceTensor.symbolic_vjp(cotangent_name)` expose that graph to Python as
+  named gradient trace results. This gives backend lowering
+  an AD graph instead of a CPU-only reverse evaluator.
 - `trace(fn, input_specs)` can execute a Python function with traced inputs and
   return a `TraceResult`.
 - `TraceGraph.ir()` exposes structured node dictionaries with ids, ops, shapes,
@@ -251,7 +303,13 @@ as scalar constants, `powf` exponents, reduction axes, and concat axes.
 - `jit(specs)` can be used as a decorator factory that traces a function once
   when the decorator is applied, then evaluates a frozen CPU execution plan for
   value dictionaries.
-- The Python bridge does not yet provide compiled JIT lowering.
+- `TensorTraceGraph.compile_mlx()`, `TraceTensor.compile_mlx()`, and
+  `TensorTraceResult.compile_mlx()` expose the experimental MLX primal backend
+  to Python. It supports elementwise arithmetic, unary math, matmul, global
+  sum/mean, reshape, transpose, concat, and broadcast. Axis reductions,
+  comparisons/`where`, slice, and internal zero-padding are rejected explicitly
+  when a plan uses them.
+- The Python bridge does not yet provide general compiled JIT lowering.
 
 Target direction:
 

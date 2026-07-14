@@ -17,9 +17,8 @@ reverse-mode graph VJP path for the current primitive set through `grad(...)` /
 Reusable `grad_*`, `value_and_grad_fn(...)`, `vjp_fn(...)`,
 `jacobian_fn(...)`, `jacobians_fn(...)`, `jvp_fn(...)`, and `jit(...)`
 transforms trace once when the callable/decorator is created, then evaluate the
-cached graph on later calls. It does not yet have
-source-to-source AD, compiled JIT lowering, GPU execution, or distributed
-sharding.
+cached graph on later calls. It does not yet have source-to-source AD, a
+general compiled JIT, or distributed sharding.
 
 Run the verified one-dimensional Poisson PINN example after `maturin develop`:
 
@@ -27,11 +26,37 @@ Run the verified one-dimensional Poisson PINN example after `maturin develop`:
 .venv/bin/python examples/pinn_poisson.py
 ```
 
+On Linux with the `cuda` feature, run the verified two-point batched Poisson
+PINN, whose Adam optimizer state and collocation tensors stay on the GPU:
+
+```sh
+maturin develop --features cuda
+python examples/pinn_poisson_cuda.py
+```
+
+Run the verified two-layer, four-parameter CUDA Poisson PINN with combined
+residual and boundary losses:
+
+```sh
+python examples/pinn_mlp_cuda.py
+```
+
 Measure the frozen CPU plan in an optimized extension build:
 
 ```sh
 .venv/bin/maturin develop --release
 .venv/bin/python examples/benchmark_tensor_cpu.py
+```
+
+On Linux with the `cuda` feature, measure end-to-end broadcast-batched matmul
+or fused elementwise-chain throughput (including the current host/device
+transfers):
+
+```sh
+maturin develop --release --features cuda
+python examples/benchmark_tensor_cuda.py
+python examples/benchmark_tensor_cuda.py --elementwise --rows 1024 --inner 1024
+python examples/benchmark_tensor_cuda.py --rank-two --device-resident
 ```
 
 ## Current Capabilities
@@ -44,9 +69,16 @@ Measure the frozen CPU plan in an optimized extension build:
   deterministic lowering text. It is deliberately independent of the current
   PyO3 2D `TraceGraph` while that bridge is migrated incrementally.
 - Python-facing eager `Tensor` class backed by contiguous row-major Rust storage,
-  with positive runtime shape validation, rank-N trailing-axis broadcasting for
-  add/subtract/multiply/divide, NumPy-style batched `matmul`, and
-  element-count-preserving reshape. `Tensor` is not yet traceable,
+  with `zeros`/`ones`/`full`/`arange`/`linspace`/`eye` creation, positive runtime
+  shape validation, rank-N trailing-axis broadcasting for add/subtract/multiply/divide,
+  numeric scalars on either side of those arithmetic operations,
+  scalar `**` exponents,
+  NumPy-style batched `matmul`, rank-N `nabla.concat([...], axis=...)`,
+  permutation-validated `transpose(axes=None)`, global or single-axis `sum`/`mean`,
+  common elementwise math (`tanh`, `exp`, `log`, `sqrt`, `sin`, `cos`, `powi`),
+  `gt(...)` masks, broadcasted `nabla.where(...)`, materialized `broadcast_to(shape)`,
+  and element-count-preserving reshape.
+  `Tensor` is not yet traceable,
   differentiable, or part of the CPU plan. `Tensor.slice(...)` returns a
   zero-copy, read-only `TensorView` with explicit shape, strides, and offset;
   source tensors and views share immutable storage, while every arithmetic
@@ -55,7 +87,7 @@ Measure the frozen CPU plan in an optimized extension build:
 - `tensor_jacobian_fn(fn, input_specs, input_name)` freezes one rank-N trace
   and returns an output-flat by input-flat dense Jacobian for the selected input.
   Its `TraceTensor` values currently support broadcasted add/subtract/multiply/divide,
-  batched `matmul`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `log`, reshape, global or single-axis `sum`/`mean`, and `gt`/`where` masks. Comparisons are explicitly non-differentiable; `where` routes VJP/JVP contributions only through the selected data branch. `TensorTraceGraph.evaluate_vjp(...)` and
+  batched `matmul`, rank-N `concat`, `stack([...], axis=...)`, `slice(axis, start, stop)`, `broadcast_to(shape)`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `log`, reshape, global or single-axis `sum`/`mean`, and `gt`/`where` masks. `stack` is composed from reshape plus concat, so it inherits the same direct and symbolic CPU/CUDA AD rules. `concat` is linear: direct and symbolic VJP split the upstream cotangent with internal slice nodes, while its JVP and mixed second-direction transform concatenate the corresponding tangents. `slice` supports normalized negative axes and uses a zero-padded internal reverse node, keeping direct and symbolic gradients on the selected original coordinates. `broadcast_to` is a dedicated shape node whose VJP reduces repeated axes back to the input shape. Comparisons are explicitly non-differentiable; `where` routes VJP/JVP contributions only through the selected data branch. `TensorTraceGraph.evaluate_vjp(...)` and
   `TensorTraceGraph.evaluate_jvp(...)` execute the corresponding rank-N CPU
   reverse and forward transforms. `TensorTraceGraph.hessian_scalar(...)`
   computes an exact dense Hessian for one named input and a scalar output using
@@ -67,9 +99,23 @@ Measure the frozen CPU plan in an optimized extension build:
   rank-N trace whose output is the coordinate JVP; it can be applied again for
   second derivatives and then differentiated with VJP with respect to model
   parameters. Its rules cover every current rank-N `TensorIr` primitive.
+  `TensorTraceResult.symbolic_vjp(cotangent_name)` and
+  `TraceTensor.symbolic_vjp(cotangent_name)` emit one transformable
+  gradient trace per original input, all sharing a graph with the explicit
+  output-cotangent input. This is the reverse graph needed for backend lowering;
+  the established eager VJP evaluators remain available.
   `tensor_grad_scalar_fn(fn, input_specs)` traces and compiles a rank-N
   scalar-loss function once, then returns a reusable Python gradient callable
   backed by its frozen CPU plan.
+- `tensor_value_and_grad_fn(fn, input_specs)` traces and compiles a rank-N
+  scalar-loss function once, then returns its scalar value and named VJP
+  gradients from one frozen-plan execution.
+- `tensor_jit_cuda_fn(fn, input_specs, device_ordinal=0)` traces and compiles
+  a fixed-shape rank-N function to a reusable callable CUDA plan on Linux.
+- `tensor_hessian_scalar_fn(fn, input_specs, input_name)` and
+  `tensor_hvp_scalar_fn(fn, input_specs, input_name)` freeze a scalar rank-N
+  trace for dense Hessian or Hessian-vector-product evaluation. They are
+  correctness-first CPU transforms; dense Hessian materialization is O(n^2).
   `tensor_jit_fn(fn, input_specs)` similarly returns a reusable rank-N primal
   callable backed by a frozen CPU plan.
   `tensor_vjp_fn(fn, input_specs)` returns a reusable rank-N VJP callable that
@@ -88,9 +134,62 @@ Measure the frozen CPU plan in an optimized extension build:
   `plan.evaluate_jvp(...)` execute cached-plan AD transforms without returning
   to the mutable tracer. `plan.kernel_ir()` exposes the same plan as structured
   op, operand, shape, and input-name records for later backend lowering.
-- `TensorBackend` defines the rank-N plan execution contract; `CpuBackend` is
-  the current implementation used by `plan.evaluate(...)`. LLVM, MLIR, GPU, and
-  distributed backends are future implementations of this boundary.
+- `TensorBackend` defines the rank-N plan execution contract. `CpuBackend` is
+  the default implementation. On Linux, the optional `cuda` feature adds an
+  NVRTC-compiled FP32 `CudaBackend` and immutable `TensorCudaExecutionPlan`.
+  It lowers rank-two and broadcast-batched matmul, rank-N concat plus the internal slice/pad-slice reverse nodes, global and single-axis reductions, transpose,
+  broadcasting, `where`, `div`, `log`, and the current differentiable unary
+  primitives. Global sum/mean use a block-parallel reduction with atomic scalar
+  accumulation. `compile_cuda()` retains its CUDA context and loaded module, so
+  repeated `evaluate()` calls do not recompile NVRTC code. Pure elementwise
+  graphs use one fused CUDA kernel; `div` and `log` retain their checked-domain
+  semantics through general per-operation lowering.
+  It requires a CUDA driver plus `libnvrtc.so` at runtime. Host inputs and
+  outputs still cross the device boundary on every `evaluate()`, while plan
+  buffers and optimizer state are retained by the immutable plan.
+  `TensorCudaExecutionPlan.evaluate_device(inputs, retained_input_names=...)`
+  executes without materializing an output; supplied retained inputs upload on
+  the first call and remain device-resident for subsequent static evaluations.
+  Call `synchronize()` before timing asynchronous device-only evaluations, or
+  use `benchmark_device(...)` to repeat and synchronize static evaluations in
+  Rust without per-iteration Python dispatch. Rank-two FP32 GEMM automatically
+  uses cuBLAS when `libcublas` is available; otherwise it uses the NVRTC tiled
+  fallback. Inspect `plan.backend` to report the selected backend in a run log.
+  A CUDA plan whose output is a gradient for one retained input can call
+  `sgd_step(inputs, parameter_name, learning_rate, retained_input_names)` or
+  `adam_step(inputs, parameter_name, learning_rate, retained_input_names,
+  beta1=0.9, beta2=0.999, epsilon=1e-8)` to update that parameter on the
+  device, then `retained_input(name)` to read it back after training. Adam
+  keeps its first and second moments in device memory. Separate gradient plans
+  can share retained parameters with
+  `sync_retained_input_to(source_name, target_plan, target_name=None)`, which
+  performs a same-device GPU-to-GPU copy after each participating update.
+  `cuda_adam_step({parameter_name: gradient_plan, ...}, inputs, learning_rate,
+  retained_input_names=...)` performs those Adam updates and cross-plan
+  parameter synchronizations as one Python call while retaining every mapped
+  parameter automatically. It still requires the caller to construct the
+  symbolic gradient plans explicitly. For static collocation tensors,
+  `cuda_adam_optimizer(...)` stores the Rust input tensors once and exposes
+  `step()` plus `parameters()`. Calling `step({"batch_input": tensor, ...})`
+  refreshes only the supplied mini-batch tensors without rebuilding plans or
+  resetting GPU-resident parameter and Adam state.
+  `cuda_adam_vjp_optimizer({parameter_name: symbolic_vjp_result, ...}, ...)`
+  is the preferred multi-parameter path: it compiles all outputs from one
+  symbolic VJP graph into one union plan, computes every gradient from the
+  same parameter snapshot, and updates them without any gradient D2H copy.
+  Fused GEMM and distributed backends remain future work.
+- On Apple silicon, the experimental `mlx` feature executes supported frozen
+  Tensor IR plans as MLX arrays on `StreamOrDevice::gpu()`. Python exposes this
+  through `TensorTraceGraph.compile_mlx()`, `TraceTensor.compile_mlx()`, and
+  `TensorTraceResult.compile_mlx()`. The backend has CPU-parity coverage for
+  elementwise operations, matmul, global reductions, reshape, transpose,
+  concat, and broadcast. It is a primal execution backend, not a JIT: reverse
+  graphs that contain unsupported operations such as axis reductions, `where`,
+  `greater`, `slice`, or internal zero-padding return an explicit error rather
+  than falling back to the host. Building the native MLX dependency requires
+  Xcode's Metal Toolchain in addition to CMake:
+  `xcodebuild -downloadComponent MetalToolchain`. The Python MLX wheel is not
+  used by this Rust backend.
 - Python `Adam` updates immutable dictionaries of named rank-N `Tensor`
   parameters from VJP gradients. The test suite includes a manufactured 1D
   Poisson residual in which two symbolic coordinate JVP transforms form
@@ -219,7 +318,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 1. Expand typed tensors: static shapes, dynamic shapes, explicit strides/views.
 2. Add compiled lowering behind the current Python-facing `jit` wrapper.
 3. Expand reverse-mode AD transforms beyond the current primitive set.
-4. Define backend traits, then add CPU lowering and later GPU/sharding paths.
+4. Add buffer planning, fused GEMM, and GPU-resident optimizer execution to
+   eliminate per-step host transfers and allocations.
 
 See [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md) for the architecture
 direction.

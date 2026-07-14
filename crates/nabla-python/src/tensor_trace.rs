@@ -1,7 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-use nabla_core::tensor_ir::{DynamicTensor, TensorExecutionPlan, TensorIr, TensorNodeId};
+use nabla_core::tensor_ir::{
+    CudaBackend, CudaExecutionPlan, DynamicTensor, MlxBackend, TensorBackend, TensorExecutionPlan,
+    TensorIr, TensorNodeId,
+};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyString, PyTuple};
@@ -35,9 +39,57 @@ pub struct TensorCpuExecutionPlan {
     plan: TensorExecutionPlan,
 }
 
+#[pyclass(name = "TensorCudaExecutionPlan", skip_from_py_object)]
+#[derive(Clone, Debug)]
+pub struct TensorCudaExecutionPlan {
+    plan: CudaExecutionPlan,
+}
+
+#[pyclass(name = "TensorMlxExecutionPlan", skip_from_py_object)]
+#[derive(Clone, Debug)]
+pub struct TensorMlxExecutionPlan {
+    plan: TensorExecutionPlan,
+}
+
+#[pyclass(name = "TensorCudaAdamOptimizer", skip_from_py_object)]
+pub struct TensorCudaAdamOptimizer {
+    parameter_plans: Vec<(String, TensorCudaExecutionPlan)>,
+    shared_plan: Option<SharedCudaAdamPlan>,
+    parameter_names: BTreeSet<String>,
+    inputs: BTreeMap<String, DynamicTensor>,
+    retained_inputs: BTreeSet<String>,
+    learning_rate: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+}
+
+#[derive(Clone, Debug)]
+struct SharedCudaAdamPlan {
+    plan: TensorCudaExecutionPlan,
+    gradient_node_ids: BTreeMap<String, TensorNodeId>,
+}
+
 #[pyclass(name = "TensorGradScalarFunction", skip_from_py_object)]
 pub struct TensorGradScalarFunction {
     plan: TensorExecutionPlan,
+}
+
+#[pyclass(name = "TensorValueAndGradFunction", skip_from_py_object)]
+pub struct TensorValueAndGradFunction {
+    plan: TensorExecutionPlan,
+}
+
+#[pyclass(name = "TensorHessianScalarFunction", skip_from_py_object)]
+pub struct TensorHessianScalarFunction {
+    plan: TensorExecutionPlan,
+    input_name: String,
+}
+
+#[pyclass(name = "TensorHvpScalarFunction", skip_from_py_object)]
+pub struct TensorHvpScalarFunction {
+    plan: TensorExecutionPlan,
+    input_name: String,
 }
 
 #[pyclass(name = "TensorJitFunction", skip_from_py_object)]
@@ -193,6 +245,48 @@ impl TensorTraceGraph {
             plan: ir.compile_cpu(output_node_id)?,
         })
     }
+
+    fn compile_cuda_plan(
+        &self,
+        output_node_id: TensorNodeId,
+        device_ordinal: usize,
+    ) -> Result<TensorCudaExecutionPlan, String> {
+        let plan = self
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+            .compile_cpu(output_node_id)?;
+        CudaBackend::new(device_ordinal)
+            .compile(plan)
+            .map(|plan| TensorCudaExecutionPlan { plan })
+    }
+
+    fn compile_mlx_plan(
+        &self,
+        output_node_id: TensorNodeId,
+    ) -> Result<TensorMlxExecutionPlan, String> {
+        let plan = self
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+            .compile_cpu(output_node_id)?;
+        Ok(TensorMlxExecutionPlan { plan })
+    }
+
+    fn compile_cuda_multi_plan(
+        &self,
+        output_node_ids: &[TensorNodeId],
+        device_ordinal: usize,
+    ) -> Result<(TensorCudaExecutionPlan, Vec<TensorNodeId>), String> {
+        let (plan, output_node_ids) = self
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+            .compile_cpu_many(output_node_ids)?;
+        CudaBackend::new(device_ordinal)
+            .compile(plan)
+            .map(|plan| (TensorCudaExecutionPlan { plan }, output_node_ids))
+    }
 }
 
 impl TraceTensor {
@@ -202,6 +296,54 @@ impl TraceTensor {
         } else {
             Err("cannot combine TraceTensor values from different graphs".to_string())
         }
+    }
+
+    pub fn try_concat(tensors: &[Self], axis: usize) -> Result<Self, String> {
+        let first = tensors
+            .first()
+            .ok_or_else(|| "concat requires at least one TraceTensor".to_string())?;
+        for tensor in &tensors[1..] {
+            first.same_graph(tensor)?;
+        }
+        let mut ir = first
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let node_id = ir.concat(
+            tensors.iter().map(|tensor| tensor.node_id).collect(),
+            axis as isize,
+        )?;
+        let shape = ir.node_shape(node_id)?;
+        Ok(Self {
+            graph: first.graph.clone(),
+            node_id,
+            shape,
+        })
+    }
+
+    pub fn try_stack(tensors: &[Self], axis: isize) -> Result<Self, String> {
+        let first = tensors
+            .first()
+            .ok_or_else(|| "stack requires at least one TraceTensor".to_string())?;
+        if tensors.iter().any(|tensor| tensor.shape != first.shape) {
+            return Err("stack requires TraceTensor values with identical shapes".to_string());
+        }
+        let rank = first.shape.len() + 1;
+        let normalized_axis = if axis < 0 { axis + rank as isize } else { axis };
+        let axis = usize::try_from(normalized_axis)
+            .ok()
+            .filter(|axis| *axis < rank)
+            .ok_or_else(|| format!("axis {axis} is out of bounds for rank {rank}"))?;
+        let reshaped = tensors
+            .iter()
+            .map(|tensor| {
+                let mut shape = tensor.shape.clone();
+                shape.insert(axis, 1);
+                tensor.reshape_tensor(shape)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_concat(&reshaped, axis)
     }
 
     fn binary(&self, rhs: &Self, op: &str) -> Result<Self, String> {
@@ -369,6 +511,36 @@ impl TraceTensor {
         })
     }
 
+    fn slice_tensor(&self, axis: isize, start: usize, stop: usize) -> Result<Self, String> {
+        let mut ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let node_id = ir.slice_axis(self.node_id, axis, start, stop)?;
+        let shape = ir.node_shape(node_id)?;
+        Ok(Self {
+            graph: self.graph.clone(),
+            node_id,
+            shape,
+        })
+    }
+
+    fn broadcast_to_tensor(&self, shape: Vec<usize>) -> Result<Self, String> {
+        let mut ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let node_id = ir.broadcast_to(self.node_id, shape)?;
+        let shape = ir.node_shape(node_id)?;
+        Ok(Self {
+            graph: self.graph.clone(),
+            node_id,
+            shape,
+        })
+    }
+
     fn mean_tensor(&self, axis: Option<isize>) -> Result<Self, String> {
         let mut ir = self
             .graph
@@ -510,6 +682,40 @@ impl TensorTraceResult {
             },
         ))
     }
+
+    fn symbolic_vjp_results(&self, cotangent_name: &str) -> Result<BTreeMap<String, Self>, String> {
+        let ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let transformed = ir.symbolic_vjp(self.output.node_id, cotangent_name)?;
+        let graph = TensorTraceGraph {
+            ir: Arc::new(Mutex::new(transformed.graph)),
+        };
+        let ir = graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        transformed
+            .gradients
+            .into_iter()
+            .map(|(name, node_id)| {
+                let shape = ir.node_shape(node_id)?;
+                Ok((
+                    name,
+                    Self::new(
+                        graph.clone(),
+                        TraceTensor {
+                            graph: graph.clone(),
+                            node_id,
+                            shape,
+                        },
+                    ),
+                ))
+            })
+            .collect()
+    }
 }
 
 #[pymethods]
@@ -601,6 +807,21 @@ impl TensorTraceGraph {
 
     fn compile_cpu(&self, output_node_id: TensorNodeId) -> PyResult<TensorCpuExecutionPlan> {
         self.compile_cpu_plan(output_node_id)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (output_node_id, device_ordinal = 0))]
+    fn compile_cuda(
+        &self,
+        output_node_id: TensorNodeId,
+        device_ordinal: usize,
+    ) -> PyResult<TensorCudaExecutionPlan> {
+        self.compile_cuda_plan(output_node_id, device_ordinal)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn compile_mlx(&self, output_node_id: TensorNodeId) -> PyResult<TensorMlxExecutionPlan> {
+        self.compile_mlx_plan(output_node_id)
             .map_err(PyValueError::new_err)
     }
 
@@ -718,6 +939,16 @@ impl TraceTensor {
         self.reshape_tensor(shape).map_err(PyValueError::new_err)
     }
 
+    fn slice(&self, axis: isize, start: usize, stop: usize) -> PyResult<Self> {
+        self.slice_tensor(axis, start, stop)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn broadcast_to(&self, shape: Vec<usize>) -> PyResult<Self> {
+        self.broadcast_to_tensor(shape)
+            .map_err(PyValueError::new_err)
+    }
+
     #[pyo3(signature = (axis = None))]
     fn mean(&self, axis: Option<isize>) -> PyResult<Self> {
         self.mean_tensor(axis).map_err(PyValueError::new_err)
@@ -759,6 +990,31 @@ impl TraceTensor {
             "TraceTensor(node_id={}, shape={:?})",
             self.node_id, self.shape
         )
+    }
+
+    #[pyo3(signature = (device_ordinal = 0))]
+    fn compile_cuda(&self, device_ordinal: usize) -> PyResult<TensorCudaExecutionPlan> {
+        self.graph
+            .compile_cuda_plan(self.node_id, device_ordinal)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn compile_mlx(&self) -> PyResult<TensorMlxExecutionPlan> {
+        self.graph
+            .compile_mlx_plan(self.node_id)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn symbolic_jvp(&self, input_name: &str) -> PyResult<TensorTraceResult> {
+        TensorTraceResult::new(self.graph.clone(), self.clone())
+            .symbolic_jvp_result(input_name)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn symbolic_vjp(&self, cotangent_name: &str) -> PyResult<BTreeMap<String, TensorTraceResult>> {
+        TensorTraceResult::new(self.graph.clone(), self.clone())
+            .symbolic_vjp_results(cotangent_name)
+            .map_err(PyValueError::new_err)
     }
 }
 
@@ -807,9 +1063,20 @@ impl TensorTraceResult {
             .map_err(PyValueError::new_err)
     }
 
+    fn symbolic_vjp(&self, cotangent_name: &str) -> PyResult<BTreeMap<String, Self>> {
+        self.symbolic_vjp_results(cotangent_name)
+            .map_err(PyValueError::new_err)
+    }
+
     fn compile_cpu(&self) -> PyResult<TensorCpuExecutionPlan> {
         self.graph
             .compile_cpu_plan(self.output.node_id)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn compile_mlx(&self) -> PyResult<TensorMlxExecutionPlan> {
+        self.graph
+            .compile_mlx_plan(self.output.node_id)
             .map_err(PyValueError::new_err)
     }
 }
@@ -923,6 +1190,204 @@ impl TensorCpuExecutionPlan {
 }
 
 #[pymethods]
+impl TensorMlxExecutionPlan {
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.plan.node_count()
+    }
+
+    #[getter]
+    fn backend(&self) -> &'static str {
+        "mlx"
+    }
+
+    fn evaluate(&self, inputs: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
+        let value = MlxBackend
+            .execute(&self.plan, &extract_tensor_map(inputs)?)
+            .map_err(PyValueError::new_err)?;
+        PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)
+    }
+
+    fn __call__(&self, inputs: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
+        self.evaluate(inputs)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorMlxExecutionPlan(node_count={})",
+            self.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
+impl TensorCudaExecutionPlan {
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.plan.node_count()
+    }
+
+    #[getter]
+    fn device_ordinal(&self) -> usize {
+        self.plan.device_ordinal()
+    }
+
+    #[getter]
+    fn backend(&self) -> &'static str {
+        if self.plan.uses_cublas() {
+            "cublas"
+        } else {
+            "nvrtc"
+        }
+    }
+
+    fn evaluate(&self, inputs: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
+        let value = self
+            .plan
+            .execute(&extract_tensor_map(inputs)?)
+            .map_err(PyValueError::new_err)?;
+        PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)
+    }
+
+    fn __call__(&self, inputs: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
+        self.evaluate(inputs)
+    }
+
+    #[pyo3(signature = (inputs, retained_input_names = None))]
+    fn evaluate_device(
+        &self,
+        inputs: &Bound<'_, PyDict>,
+        retained_input_names: Option<Vec<String>>,
+    ) -> PyResult<()> {
+        let retained_inputs = retained_input_names
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        self.plan
+            .execute_retaining_without_output(&extract_tensor_map(inputs)?, &retained_inputs)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn synchronize(&self) -> PyResult<()> {
+        self.plan.synchronize().map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (inputs, iterations, retained_input_names = None))]
+    fn benchmark_device(
+        &self,
+        inputs: &Bound<'_, PyDict>,
+        iterations: usize,
+        retained_input_names: Option<Vec<String>>,
+    ) -> PyResult<f64> {
+        if iterations == 0 {
+            return Err(PyValueError::new_err(
+                "CUDA device benchmark iterations must be positive",
+            ));
+        }
+        let inputs = extract_tensor_map(inputs)?;
+        let retained_inputs = retained_input_names
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        self.plan
+            .execute_retaining_without_output(&inputs, &retained_inputs)
+            .map_err(PyValueError::new_err)?;
+        self.plan.synchronize().map_err(PyValueError::new_err)?;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            self.plan
+                .execute_retaining_without_output(&inputs, &retained_inputs)
+                .map_err(PyValueError::new_err)?;
+        }
+        self.plan.synchronize().map_err(PyValueError::new_err)?;
+        Ok(start.elapsed().as_secs_f64())
+    }
+
+    #[pyo3(signature = (inputs, parameter_name, learning_rate, retained_input_names = None))]
+    fn sgd_step(
+        &self,
+        inputs: &Bound<'_, PyDict>,
+        parameter_name: &str,
+        learning_rate: f32,
+        retained_input_names: Option<Vec<String>>,
+    ) -> PyResult<()> {
+        let mut retained = retained_input_names
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        retained.insert(parameter_name.to_string());
+        self.plan
+            .execute_retaining(&extract_tensor_map(inputs)?, &retained)
+            .map_err(PyValueError::new_err)?;
+        self.plan
+            .sgd_step_input_from_output(parameter_name, learning_rate)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (inputs, parameter_name, learning_rate, retained_input_names = None, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8))]
+    #[allow(clippy::too_many_arguments)]
+    fn adam_step(
+        &self,
+        inputs: &Bound<'_, PyDict>,
+        parameter_name: &str,
+        learning_rate: f32,
+        retained_input_names: Option<Vec<String>>,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+    ) -> PyResult<()> {
+        let mut retained = retained_input_names
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        retained.insert(parameter_name.to_string());
+        self.plan
+            .execute_retaining(&extract_tensor_map(inputs)?, &retained)
+            .map_err(PyValueError::new_err)?;
+        self.plan
+            .adam_step_input_from_output(parameter_name, learning_rate, beta1, beta2, epsilon)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn retained_input(&self, name: &str) -> PyResult<PyTensor> {
+        let value = self
+            .plan
+            .retained_input_to_host(name)
+            .map_err(PyValueError::new_err)?;
+        PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (source_name, target, target_name = None))]
+    fn sync_retained_input_to(
+        &self,
+        source_name: &str,
+        target: PyRef<'_, TensorCudaExecutionPlan>,
+        target_name: Option<&str>,
+    ) -> PyResult<()> {
+        self.plan
+            .sync_retained_input_to(
+                source_name,
+                &target.plan,
+                target_name.unwrap_or(source_name),
+            )
+            .map_err(PyValueError::new_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorCudaExecutionPlan(node_count={}, device_ordinal={}, backend={})",
+            self.plan.node_count(),
+            self.plan.device_ordinal(),
+            if self.plan.uses_cublas() {
+                "cublas"
+            } else {
+                "nvrtc"
+            }
+        )
+    }
+}
+
+#[pymethods]
 impl TensorGradScalarFunction {
     fn __call__(&self, values: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, PyTensor>> {
         let inputs = extract_tensor_map(values)?;
@@ -943,6 +1408,79 @@ impl TensorGradScalarFunction {
     fn __repr__(&self) -> String {
         format!(
             "TensorGradScalarFunction(node_count={})",
+            self.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
+impl TensorValueAndGradFunction {
+    fn __call__(
+        &self,
+        values: &Bound<'_, PyDict>,
+    ) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+        let (value, gradients) = self
+            .plan
+            .value_and_vjp(
+                &extract_tensor_map(values)?,
+                DynamicTensor::filled(vec![], 1.0).map_err(PyValueError::new_err)?,
+            )
+            .map_err(PyValueError::new_err)?;
+        let gradients = gradients
+            .into_iter()
+            .map(|(name, tensor)| {
+                PyTensor::from_dynamic_tensor(tensor).map(|tensor| (name, tensor))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)?,
+            gradients,
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorValueAndGradFunction(node_count={})",
+            self.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
+impl TensorHessianScalarFunction {
+    fn __call__(&self, values: &Bound<'_, PyDict>) -> PyResult<Vec<Vec<f64>>> {
+        self.plan
+            .hessian_scalar(&self.input_name, &extract_tensor_map(values)?)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorHessianScalarFunction(input_name={:?}, node_count={})",
+            self.input_name,
+            self.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
+impl TensorHvpScalarFunction {
+    fn __call__(&self, values: &Bound<'_, PyDict>, input_tangent: &PyTensor) -> PyResult<PyTensor> {
+        let tangent = input_tangent
+            .to_dynamic_tensor()
+            .map_err(PyValueError::new_err)?;
+        let value = self
+            .plan
+            .hvp_scalar(&self.input_name, &extract_tensor_map(values)?, tangent)
+            .map_err(PyValueError::new_err)?;
+        PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorHvpScalarFunction(input_name={:?}, node_count={})",
+            self.input_name,
             self.plan.node_count()
         )
     }
@@ -1131,6 +1669,75 @@ pub fn tensor_grad_scalar_fn(
 }
 
 #[pyfunction]
+pub fn tensor_value_and_grad_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+) -> PyResult<TensorValueAndGradFunction> {
+    let traced = trace_tensor_python_function(py, function, input_specs)?;
+    if !traced.output.shape.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "tensor_value_and_grad_fn requires a scalar output, got shape {:?}",
+            traced.output.shape
+        )));
+    }
+    let plan = traced
+        .graph
+        .compile_cpu_plan(traced.output.node_id)
+        .map_err(PyValueError::new_err)?
+        .plan;
+    Ok(TensorValueAndGradFunction { plan })
+}
+
+#[pyfunction]
+pub fn tensor_hessian_scalar_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    input_name: String,
+) -> PyResult<TensorHessianScalarFunction> {
+    let traced = trace_tensor_python_function(py, function, input_specs)?;
+    if !traced.output.shape.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "tensor_hessian_scalar_fn requires a scalar output, got shape {:?}",
+            traced.output.shape
+        )));
+    }
+    let plan = traced
+        .graph
+        .compile_cpu_plan(traced.output.node_id)
+        .map_err(PyValueError::new_err)?
+        .plan;
+    plan.input_shape(&input_name)
+        .map_err(PyValueError::new_err)?;
+    Ok(TensorHessianScalarFunction { plan, input_name })
+}
+
+#[pyfunction]
+pub fn tensor_hvp_scalar_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    input_name: String,
+) -> PyResult<TensorHvpScalarFunction> {
+    let traced = trace_tensor_python_function(py, function, input_specs)?;
+    if !traced.output.shape.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "tensor_hvp_scalar_fn requires a scalar output, got shape {:?}",
+            traced.output.shape
+        )));
+    }
+    let plan = traced
+        .graph
+        .compile_cpu_plan(traced.output.node_id)
+        .map_err(PyValueError::new_err)?
+        .plan;
+    plan.input_shape(&input_name)
+        .map_err(PyValueError::new_err)?;
+    Ok(TensorHvpScalarFunction { plan, input_name })
+}
+
+#[pyfunction]
 pub fn tensor_jit_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
@@ -1143,6 +1750,21 @@ pub fn tensor_jit_fn(
         .map_err(PyValueError::new_err)?
         .plan;
     Ok(TensorJitFunction { plan })
+}
+
+#[pyfunction]
+#[pyo3(signature = (function, input_specs, device_ordinal = 0))]
+pub fn tensor_jit_cuda_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    device_ordinal: usize,
+) -> PyResult<TensorCudaExecutionPlan> {
+    let traced = trace_tensor_python_function(py, function, input_specs)?;
+    traced
+        .graph
+        .compile_cuda_plan(traced.output.node_id, device_ordinal)
+        .map_err(PyValueError::new_err)
 }
 
 #[pyfunction]
@@ -1195,6 +1817,318 @@ pub fn tensor_jacobian_fn(
         .map_err(PyValueError::new_err)?
         .plan;
     Ok(TensorJacobianFunction { plan, input_name })
+}
+
+fn extract_cuda_parameter_plans(
+    plans: &Bound<'_, PyDict>,
+) -> PyResult<Vec<(String, TensorCudaExecutionPlan)>> {
+    if plans.is_empty() {
+        return Err(PyValueError::new_err(
+            "cuda_adam_step requires at least one parameter gradient plan",
+        ));
+    }
+    let mut parameter_plans = Vec::with_capacity(plans.len());
+    for (key, value) in plans.iter() {
+        let parameter_name = key.cast::<PyString>()?.to_str()?.to_string();
+        let plan = value
+            .extract::<PyRef<'_, TensorCudaExecutionPlan>>()
+            .map_err(|_| {
+                PyTypeError::new_err(
+                "cuda_adam_step plans must map parameter names to TensorCudaExecutionPlan values",
+            )
+            })?;
+        parameter_plans.push((parameter_name, plan.clone()));
+    }
+    Ok(parameter_plans)
+}
+
+fn retained_cuda_inputs(
+    parameter_plans: &[(String, TensorCudaExecutionPlan)],
+    retained_input_names: Option<Vec<String>>,
+) -> BTreeSet<String> {
+    let mut retained = retained_input_names
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    retained.extend(parameter_plans.iter().map(|(name, _)| name.clone()));
+    retained
+}
+
+fn extract_cuda_vjp_outputs(
+    gradients: &Bound<'_, PyDict>,
+) -> PyResult<(TensorTraceGraph, Vec<(String, TensorNodeId)>)> {
+    if gradients.is_empty() {
+        return Err(PyValueError::new_err(
+            "cuda_adam_vjp_optimizer requires at least one symbolic VJP result",
+        ));
+    }
+    let mut graph: Option<TensorTraceGraph> = None;
+    let mut outputs = Vec::with_capacity(gradients.len());
+    for (key, value) in gradients.iter() {
+        let parameter_name = key.cast::<PyString>()?.to_str()?.to_string();
+        let result = value.extract::<PyRef<'_, TensorTraceResult>>().map_err(|_| {
+            PyTypeError::new_err(
+                "cuda_adam_vjp_optimizer gradients must map parameter names to TensorTraceResult values",
+            )
+        })?;
+        if let Some(existing) = &graph {
+            if !Arc::ptr_eq(&existing.ir, &result.graph.ir) {
+                return Err(PyValueError::new_err(
+                    "cuda_adam_vjp_optimizer gradients must originate from one symbolic VJP graph",
+                ));
+            }
+        } else {
+            graph = Some(result.graph.clone());
+        }
+        outputs.push((parameter_name, result.output.node_id));
+    }
+    Ok((
+        graph.ok_or_else(|| PyValueError::new_err("missing symbolic VJP graph"))?,
+        outputs,
+    ))
+}
+
+fn execute_cuda_adam_step(
+    parameter_plans: &[(String, TensorCudaExecutionPlan)],
+    values: &BTreeMap<String, DynamicTensor>,
+    retained: &BTreeSet<String>,
+    learning_rate: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+) -> Result<(), String> {
+    for (parameter_name, plan) in parameter_plans {
+        plan.plan.execute_retaining(values, retained)?;
+        plan.plan.adam_step_input_from_output(
+            parameter_name,
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+        )?;
+    }
+    for (source_name, source_plan) in parameter_plans {
+        for (_, target_plan) in parameter_plans {
+            source_plan
+                .plan
+                .sync_retained_input_to(source_name, &target_plan.plan, source_name)?;
+        }
+    }
+    Ok(())
+}
+
+fn execute_shared_cuda_adam_step(
+    shared_plan: &SharedCudaAdamPlan,
+    values: &BTreeMap<String, DynamicTensor>,
+    retained: &BTreeSet<String>,
+    learning_rate: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+) -> Result<(), String> {
+    shared_plan
+        .plan
+        .plan
+        .execute_retaining_without_output(values, retained)?;
+    for (parameter_name, gradient_node_id) in &shared_plan.gradient_node_ids {
+        shared_plan.plan.plan.adam_step_input_from_node(
+            parameter_name,
+            *gradient_node_id,
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+        )?;
+    }
+    Ok(())
+}
+
+#[pymethods]
+impl TensorCudaAdamOptimizer {
+    #[pyo3(signature = (inputs = None))]
+    fn step(&mut self, inputs: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+        let mut retained_inputs = self.retained_inputs.clone();
+        if let Some(inputs) = inputs {
+            for (name, tensor) in extract_tensor_map(inputs)? {
+                self.inputs.insert(name.clone(), tensor);
+                if !self.parameter_names.contains(&name) {
+                    retained_inputs.remove(&name);
+                }
+            }
+        }
+        retained_inputs.extend(self.parameter_names.iter().cloned());
+        let result = if let Some(shared_plan) = &self.shared_plan {
+            execute_shared_cuda_adam_step(
+                shared_plan,
+                &self.inputs,
+                &retained_inputs,
+                self.learning_rate,
+                self.beta1,
+                self.beta2,
+                self.epsilon,
+            )
+        } else {
+            execute_cuda_adam_step(
+                &self.parameter_plans,
+                &self.inputs,
+                &retained_inputs,
+                self.learning_rate,
+                self.beta1,
+                self.beta2,
+                self.epsilon,
+            )
+        };
+        result.map_err(PyValueError::new_err)
+    }
+
+    fn parameters(&self) -> PyResult<BTreeMap<String, PyTensor>> {
+        if let Some(shared_plan) = &self.shared_plan {
+            return self
+                .parameter_names
+                .iter()
+                .map(|name| {
+                    let value = shared_plan
+                        .plan
+                        .plan
+                        .retained_input_to_host(name)
+                        .map_err(PyValueError::new_err)?;
+                    Ok((
+                        name.clone(),
+                        PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)?,
+                    ))
+                })
+                .collect();
+        }
+        self.parameter_plans
+            .iter()
+            .map(|(name, plan)| {
+                let value = plan
+                    .plan
+                    .retained_input_to_host(name)
+                    .map_err(PyValueError::new_err)?;
+                Ok((
+                    name.clone(),
+                    PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)?,
+                ))
+            })
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorCudaAdamOptimizer(parameter_count={}, retained_input_count={})",
+            self.parameter_names.len(),
+            self.retained_inputs.len()
+        )
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (plans, inputs, learning_rate, retained_input_names = None, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8))]
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_adam_optimizer(
+    plans: &Bound<'_, PyDict>,
+    inputs: &Bound<'_, PyDict>,
+    learning_rate: f32,
+    retained_input_names: Option<Vec<String>>,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+) -> PyResult<TensorCudaAdamOptimizer> {
+    let parameter_plans = extract_cuda_parameter_plans(plans)?;
+    let parameter_names = parameter_plans
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    Ok(TensorCudaAdamOptimizer {
+        retained_inputs: retained_cuda_inputs(&parameter_plans, retained_input_names),
+        parameter_plans,
+        shared_plan: None,
+        parameter_names,
+        inputs: extract_tensor_map(inputs)?,
+        learning_rate,
+        beta1,
+        beta2,
+        epsilon,
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (gradients, inputs, learning_rate, retained_input_names = None, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8, device_ordinal = 0))]
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_adam_vjp_optimizer(
+    gradients: &Bound<'_, PyDict>,
+    inputs: &Bound<'_, PyDict>,
+    learning_rate: f32,
+    retained_input_names: Option<Vec<String>>,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    device_ordinal: usize,
+) -> PyResult<TensorCudaAdamOptimizer> {
+    let (graph, outputs) = extract_cuda_vjp_outputs(gradients)?;
+    let parameter_names = outputs
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    let output_node_ids = outputs
+        .iter()
+        .map(|(_, node_id)| *node_id)
+        .collect::<Vec<_>>();
+    let (plan, remapped_output_node_ids) = graph
+        .compile_cuda_multi_plan(&output_node_ids, device_ordinal)
+        .map_err(PyValueError::new_err)?;
+    let gradient_node_ids = outputs
+        .into_iter()
+        .map(|(name, _)| name)
+        .zip(remapped_output_node_ids)
+        .collect::<BTreeMap<_, _>>();
+    let mut retained_inputs = retained_input_names
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    retained_inputs.extend(parameter_names.iter().cloned());
+    Ok(TensorCudaAdamOptimizer {
+        parameter_plans: Vec::new(),
+        shared_plan: Some(SharedCudaAdamPlan {
+            plan,
+            gradient_node_ids,
+        }),
+        parameter_names,
+        inputs: extract_tensor_map(inputs)?,
+        retained_inputs,
+        learning_rate,
+        beta1,
+        beta2,
+        epsilon,
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (plans, inputs, learning_rate, retained_input_names = None, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8))]
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_adam_step(
+    plans: &Bound<'_, PyDict>,
+    inputs: &Bound<'_, PyDict>,
+    learning_rate: f32,
+    retained_input_names: Option<Vec<String>>,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+) -> PyResult<()> {
+    let parameter_plans = extract_cuda_parameter_plans(plans)?;
+    let retained = retained_cuda_inputs(&parameter_plans, retained_input_names);
+    let values = extract_tensor_map(inputs)?;
+    execute_cuda_adam_step(
+        &parameter_plans,
+        &values,
+        &retained,
+        learning_rate,
+        beta1,
+        beta2,
+        epsilon,
+    )
+    .map_err(PyValueError::new_err)
 }
 
 fn extract_tensor_map(inputs: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, DynamicTensor>> {

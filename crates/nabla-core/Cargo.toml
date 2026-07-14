@@ -7,3 +7,15 @@ license.workspace = true
 [lib]
 name = "nabla_core"
 path = "src/lib.rs"
+
+[features]
+cuda = ["dep:cudarc", "dep:libloading"]
+mlx = ["dep:mlx-rs"]
+mlx-metal = ["mlx", "mlx-rs/metal", "mlx-rs/accelerate"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cudarc = { version = "0.19.8", default-features = false, features = ["driver", "nvrtc", "cublas", "fallback-dynamic-loading", "cuda-12000"], optional = true }
+libloading = { version = "0.8.9", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mlx-rs = { version = "0.25.3", default-features = false, optional = true }

@@ -2,6 +2,12 @@ use std::collections::BTreeMap;
 
 use nabla_core::tensor_ir::{CpuBackend, DynamicTensor, TensorBackend, TensorIr};
 
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+use nabla_core::tensor_ir::CudaBackend;
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+use nabla_core::tensor_ir::MlxBackend;
+
 macro_rules! must {
     ($result:expr) => {
         match $result {
@@ -89,7 +95,7 @@ fn tensor_ir_sum_builds_a_scalar_loss_with_vjp_and_jvp() {
     )]);
 
     let value = must!(graph.evaluate(loss, &inputs));
-    assert_eq!(value.shape(), &[]);
+    assert_eq!(value.shape(), &[] as &[usize]);
     assert_eq!(value.data(), &[30.0]);
 
     let gradients = must!(graph.vjp(loss, &inputs, must!(DynamicTensor::filled(vec![], 1.0)),));
@@ -100,7 +106,7 @@ fn tensor_ir_sum_builds_a_scalar_loss_with_vjp_and_jvp() {
         must!(DynamicTensor::filled(vec![2, 2], 1.0)),
     )]);
     let (_, tangent) = must!(graph.jvp(loss, &inputs, &tangents));
-    assert_eq!(tangent.shape(), &[]);
+    assert_eq!(tangent.shape(), &[] as &[usize]);
     assert_eq!(tangent.data(), &[20.0]);
 }
 
@@ -141,6 +147,74 @@ fn tensor_ir_where_routes_gradients_without_differentiating_the_condition() {
 }
 
 #[test]
+fn symbolic_vjp_matches_direct_vjp_for_broadcasted_scalar_loss() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 1]));
+    let bias = must!(graph.input("bias", vec![1, 3]));
+    let shifted = must!(graph.add(x, bias));
+    let activation = must!(graph.tanh(shifted));
+    let loss = must!(graph.sum(activation));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2, 1], vec![-1.0, 2.0])),
+        ),
+        (
+            "bias".to_string(),
+            must!(DynamicTensor::new(vec![1, 3], vec![0.0, 1.0, -1.0])),
+        ),
+    ]);
+    let cotangent = must!(DynamicTensor::filled(vec![], 1.0));
+    let direct = must!(graph.vjp(loss, &inputs, cotangent.clone()));
+    let transformed = must!(graph.symbolic_vjp(loss, "loss_cotangent"));
+    let mut transformed_inputs = inputs;
+    transformed_inputs.insert("loss_cotangent".to_string(), cotangent);
+
+    for (name, gradient) in &transformed.gradients {
+        assert_eq!(
+            must!(transformed.graph.evaluate(*gradient, &transformed_inputs)),
+            direct[name]
+        );
+    }
+}
+
+#[test]
+fn symbolic_vjp_matches_direct_vjp_for_matmul_and_mean_axis() {
+    let mut graph = TensorIr::new();
+    let inputs_node = must!(graph.input("inputs", vec![2, 2]));
+    let weights = must!(graph.input("weights", vec![2, 3]));
+    let linear = must!(graph.matmul(inputs_node, weights));
+    let activations = must!(graph.tanh(linear));
+    let loss = must!(graph.mean_axis(activations, 0));
+    let inputs = BTreeMap::from([
+        (
+            "inputs".to_string(),
+            must!(DynamicTensor::new(vec![2, 2], vec![1.0, -2.0, 0.5, 3.0])),
+        ),
+        (
+            "weights".to_string(),
+            must!(DynamicTensor::new(
+                vec![2, 3],
+                vec![0.2, -0.4, 0.6, -0.1, 0.3, 0.5],
+            )),
+        ),
+    ]);
+    let cotangent = must!(DynamicTensor::new(vec![3], vec![1.0, -0.5, 2.0]));
+    let direct = must!(graph.vjp(loss, &inputs, cotangent.clone()));
+    let transformed = must!(graph.symbolic_vjp(loss, "loss_cotangent"));
+    let mut transformed_inputs = inputs;
+    transformed_inputs.insert("loss_cotangent".to_string(), cotangent);
+
+    for (name, gradient) in &transformed.gradients {
+        let symbolic = must!(transformed.graph.evaluate(*gradient, &transformed_inputs));
+        assert_eq!(symbolic.shape(), direct[name].shape());
+        for (actual, expected) in symbolic.data().iter().zip(direct[name].data()) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+    }
+}
+
+#[test]
 fn cpu_plan_fuses_pure_elementwise_broadcast_and_mask_chains() {
     let mut graph = TensorIr::new();
     let x = must!(graph.input("x", vec![2, 1]));
@@ -167,6 +241,12 @@ fn cpu_plan_fuses_pure_elementwise_broadcast_and_mask_chains() {
         must!(plan.evaluate(&inputs)),
         must!(graph.evaluate(output, &inputs))
     );
+
+    let source = must!(plan.cuda_source());
+    assert!(source.contains("nabla_fused_elementwise"));
+    assert!(source.contains("input_0[nabla_offset_0(index)]"));
+    assert!(source.contains("input_1[nabla_offset_1(index)]"));
+    assert!(source.contains("tanhf("));
 }
 
 #[test]
@@ -191,6 +271,621 @@ fn cpu_backend_executes_a_frozen_tensor_plan() {
     assert_eq!(gradients["x"].data(), &[2.0, 2.0, 2.0, 2.0]);
     let kernel = must!(graph.compile_cpu(output)).kernel_ir();
     must!(kernel.validate());
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_fused_elementwise_plan_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 1]));
+    let bias = must!(graph.input("bias", vec![1, 3]));
+    let shifted = must!(graph.add(x, bias));
+    let output = must!(graph.tanh(shifted));
+    let plan = must!(graph.compile_cpu(output));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2, 1], vec![-1.0, 2.0])),
+        ),
+        (
+            "bias".to_string(),
+            must!(DynamicTensor::new(vec![1, 3], vec![0.0, 1.0, -1.0])),
+        ),
+    ]);
+
+    let cpu = must!(plan.evaluate(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_eq!(cuda.shape(), cpu.shape());
+    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+        assert!((actual - expected).abs() < 1e-5);
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_execution_plan_reuses_buffers_for_updated_inputs_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 1]));
+    let bias = must!(graph.input("bias", vec![1, 2]));
+    let shifted = must!(graph.add(x, bias));
+    let output = must!(graph.tanh(shifted));
+    let plan = must!(graph.compile_cpu(output));
+    let cuda = must!(CudaBackend::new(0).compile(plan.clone()));
+    let first_inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2, 1], vec![-1.0, 2.0])),
+        ),
+        (
+            "bias".to_string(),
+            must!(DynamicTensor::new(vec![1, 2], vec![0.0, 1.0])),
+        ),
+    ]);
+    let second_inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2, 1], vec![0.5, -0.25])),
+        ),
+        (
+            "bias".to_string(),
+            must!(DynamicTensor::new(vec![1, 2], vec![0.2, -0.4])),
+        ),
+    ]);
+
+    for inputs in [&first_inputs, &second_inputs] {
+        let expected = must!(plan.evaluate(inputs));
+        let actual = must!(cuda.execute(inputs));
+        assert_eq!(actual.shape(), expected.shape());
+        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+            assert!((actual - expected).abs() < 1e-5);
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_execution_plan_updates_a_retained_parameter_with_device_sgd_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![1]));
+    let weight = must!(graph.input("weight", vec![1]));
+    let target = must!(graph.input("target", vec![1]));
+    let prediction = must!(graph.mul(x, weight));
+    let error = must!(graph.sub(prediction, target));
+    let squared_error = must!(graph.mul(error, error));
+    let loss = must!(graph.sum(squared_error));
+    let transformed = must!(graph.symbolic_vjp(loss, "loss_cotangent"));
+    let gradient_plan = must!(transformed
+        .graph
+        .compile_cpu(transformed.gradients["weight"]));
+    let cuda = must!(CudaBackend::new(0).compile(gradient_plan));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![1], vec![2.0])),
+        ),
+        (
+            "weight".to_string(),
+            must!(DynamicTensor::new(vec![1], vec![0.0])),
+        ),
+        (
+            "target".to_string(),
+            must!(DynamicTensor::new(vec![1], vec![6.0])),
+        ),
+        (
+            "loss_cotangent".to_string(),
+            must!(DynamicTensor::filled(vec![], 1.0)),
+        ),
+    ]);
+    let retained = std::collections::BTreeSet::from(["weight".to_string()]);
+
+    for _ in 0..20 {
+        must!(cuda.execute_retaining(&inputs, &retained));
+        must!(cuda.sgd_step_input_from_output("weight", 0.1));
+    }
+
+    let weight = must!(cuda.retained_input_to_host("weight"));
+    assert!((weight.data()[0] - 3.0).abs() < 1e-5);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_execution_plan_updates_a_retained_parameter_with_device_adam_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![1]));
+    let weight = must!(graph.input("weight", vec![1]));
+    let target = must!(graph.input("target", vec![1]));
+    let prediction = must!(graph.mul(x, weight));
+    let error = must!(graph.sub(prediction, target));
+    let squared_error = must!(graph.mul(error, error));
+    let loss = must!(graph.sum(squared_error));
+    let transformed = must!(graph.symbolic_vjp(loss, "loss_cotangent"));
+    let plan = must!(transformed
+        .graph
+        .compile_cpu(transformed.gradients["weight"]));
+    let cuda = must!(CudaBackend::new(0).compile(plan));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![1], vec![2.0])),
+        ),
+        (
+            "weight".to_string(),
+            must!(DynamicTensor::new(vec![1], vec![0.0])),
+        ),
+        (
+            "target".to_string(),
+            must!(DynamicTensor::new(vec![1], vec![6.0])),
+        ),
+        (
+            "loss_cotangent".to_string(),
+            must!(DynamicTensor::filled(vec![], 1.0)),
+        ),
+    ]);
+    let retained = std::collections::BTreeSet::from(["weight".to_string()]);
+
+    for _ in 0..2 {
+        must!(cuda.execute_retaining(&inputs, &retained));
+        must!(cuda.adam_step_input_from_output("weight", 0.1, 0.9, 0.999, 1e-8));
+    }
+
+    let weight = must!(cuda.retained_input_to_host("weight"));
+    assert!(weight.data()[0] > 0.19 && weight.data()[0] < 0.21);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_execution_plans_synchronize_multi_parameter_device_sgd_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let weight = must!(graph.input("weight", vec![1]));
+    let bias = must!(graph.input("bias", vec![1]));
+    let target = must!(graph.input("target", vec![2]));
+    let weighted = must!(graph.mul(x, weight));
+    let linear = must!(graph.add(weighted, bias));
+    let error = must!(graph.sub(linear, target));
+    let squared_error = must!(graph.mul(error, error));
+    let loss = must!(graph.sum(squared_error));
+    let transformed = must!(graph.symbolic_vjp(loss, "loss_cotangent"));
+    let weight_plan = must!(transformed
+        .graph
+        .compile_cpu(transformed.gradients["weight"]));
+    let bias_plan = must!(transformed.graph.compile_cpu(transformed.gradients["bias"]));
+    let weight_cuda = must!(CudaBackend::new(0).compile(weight_plan));
+    let bias_cuda = must!(CudaBackend::new(0).compile(bias_plan));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![-1.0, 1.0])),
+        ),
+        (
+            "weight".to_string(),
+            must!(DynamicTensor::new(vec![1], vec![0.0])),
+        ),
+        (
+            "bias".to_string(),
+            must!(DynamicTensor::new(vec![1], vec![0.0])),
+        ),
+        (
+            "target".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![-1.0, 3.0])),
+        ),
+        (
+            "loss_cotangent".to_string(),
+            must!(DynamicTensor::filled(vec![], 1.0)),
+        ),
+    ]);
+    let retained = std::collections::BTreeSet::from(["weight".to_string(), "bias".to_string()]);
+
+    for _ in 0..100 {
+        must!(weight_cuda.execute_retaining(&inputs, &retained));
+        must!(bias_cuda.execute_retaining(&inputs, &retained));
+        must!(weight_cuda.sgd_step_input_from_output("weight", 0.05));
+        must!(bias_cuda.sgd_step_input_from_output("bias", 0.05));
+        must!(weight_cuda.sync_retained_input_to("weight", &bias_cuda, "weight"));
+        must!(bias_cuda.sync_retained_input_to("bias", &weight_cuda, "bias"));
+    }
+
+    let weight = must!(weight_cuda.retained_input_to_host("weight"));
+    let bias = must!(bias_cuda.retained_input_to_host("bias"));
+    assert!((weight.data()[0] - 2.0).abs() < 1e-4);
+    assert!((bias.data()[0] - 1.0).abs() < 1e-4);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_execution_plans_synchronize_multi_parameter_device_adam_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let weight = must!(graph.input("weight", vec![1]));
+    let bias = must!(graph.input("bias", vec![1]));
+    let target = must!(graph.input("target", vec![2]));
+    let weighted = must!(graph.mul(x, weight));
+    let prediction = must!(graph.add(weighted, bias));
+    let error = must!(graph.sub(prediction, target));
+    let squared_error = must!(graph.mul(error, error));
+    let loss = must!(graph.sum(squared_error));
+    let transformed = must!(graph.symbolic_vjp(loss, "loss_cotangent"));
+    let weight_plan = must!(transformed
+        .graph
+        .compile_cpu(transformed.gradients["weight"]));
+    let bias_plan = must!(transformed.graph.compile_cpu(transformed.gradients["bias"]));
+    let weight_cuda = must!(CudaBackend::new(0).compile(weight_plan));
+    let bias_cuda = must!(CudaBackend::new(0).compile(bias_plan));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![-1.0, 1.0])),
+        ),
+        (
+            "weight".to_string(),
+            must!(DynamicTensor::new(vec![1], vec![0.0])),
+        ),
+        (
+            "bias".to_string(),
+            must!(DynamicTensor::new(vec![1], vec![0.0])),
+        ),
+        (
+            "target".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![-1.0, 3.0])),
+        ),
+        (
+            "loss_cotangent".to_string(),
+            must!(DynamicTensor::filled(vec![], 1.0)),
+        ),
+    ]);
+    let retained = std::collections::BTreeSet::from([
+        "x".to_string(),
+        "weight".to_string(),
+        "bias".to_string(),
+        "target".to_string(),
+        "loss_cotangent".to_string(),
+    ]);
+
+    for _ in 0..200 {
+        must!(weight_cuda.execute_retaining(&inputs, &retained));
+        must!(bias_cuda.execute_retaining(&inputs, &retained));
+        must!(weight_cuda.adam_step_input_from_output("weight", 0.05, 0.9, 0.999, 1e-8));
+        must!(bias_cuda.adam_step_input_from_output("bias", 0.05, 0.9, 0.999, 1e-8));
+        must!(weight_cuda.sync_retained_input_to("weight", &bias_cuda, "weight"));
+        must!(bias_cuda.sync_retained_input_to("bias", &weight_cuda, "bias"));
+    }
+
+    let weight = must!(weight_cuda.retained_input_to_host("weight"));
+    let bias = must!(bias_cuda.retained_input_to_host("bias"));
+    assert!((weight.data()[0] - 2.0).abs() < 1e-3);
+    assert!((bias.data()[0] - 1.0).abs() < 1e-3);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_direct_rank_two_matmul_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let lhs = must!(graph.input("lhs", vec![3, 2]));
+    let rhs = must!(graph.input("rhs", vec![2, 4]));
+    let output = must!(graph.matmul(lhs, rhs));
+    let plan = must!(graph.compile_cpu(output));
+    let inputs = BTreeMap::from([
+        (
+            "lhs".to_string(),
+            must!(DynamicTensor::new(
+                vec![3, 2],
+                vec![1.0, -2.0, 0.5, 3.0, -1.0, 4.0]
+            )),
+        ),
+        (
+            "rhs".to_string(),
+            must!(DynamicTensor::new(
+                vec![2, 4],
+                vec![0.2, -0.4, 0.6, 0.8, -0.1, 0.3, 0.5, -0.7],
+            )),
+        ),
+    ]);
+
+    let cpu = must!(plan.evaluate(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_eq!(cuda.shape(), cpu.shape());
+    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+        assert!((actual - expected).abs() < 1e-5);
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_tiled_rank_two_matmul_inside_generic_plan_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let lhs = must!(graph.input("lhs", vec![32, 32]));
+    let rhs = must!(graph.input("rhs", vec![32, 32]));
+    let matmul = must!(graph.matmul(lhs, rhs));
+    let output = must!(graph.tanh(matmul));
+    let plan = must!(graph.compile_cpu(output));
+    let inputs = BTreeMap::from([
+        (
+            "lhs".to_string(),
+            must!(DynamicTensor::new(
+                vec![32, 32],
+                (0..32 * 32)
+                    .map(|index| (index % 13) as f64 * 0.05 - 0.3)
+                    .collect(),
+            )),
+        ),
+        (
+            "rhs".to_string(),
+            must!(DynamicTensor::new(
+                vec![32, 32],
+                (0..32 * 32)
+                    .map(|index| (index % 17) as f64 * -0.04 + 0.28)
+                    .collect(),
+            )),
+        ),
+    ]);
+
+    let cpu = must!(plan.evaluate(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_eq!(cuda.shape(), cpu.shape());
+    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+        assert!((actual - expected).abs() < 1e-5);
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_broadcast_batched_matmul_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let lhs = must!(graph.input("lhs", vec![2, 3, 2]));
+    let rhs = must!(graph.input("rhs", vec![1, 2, 4]));
+    let output = must!(graph.matmul(lhs, rhs));
+    let plan = must!(graph.compile_cpu(output));
+    let inputs = BTreeMap::from([
+        (
+            "lhs".to_string(),
+            must!(DynamicTensor::new(
+                vec![2, 3, 2],
+                vec![1.0, -2.0, 0.5, 3.0, -1.0, 4.0, 2.0, 1.0, -3.0, 0.25, 0.75, -2.0,],
+            )),
+        ),
+        (
+            "rhs".to_string(),
+            must!(DynamicTensor::new(
+                vec![1, 2, 4],
+                vec![0.2, -0.4, 0.6, 0.8, -0.1, 0.3, 0.5, -0.7],
+            )),
+        ),
+    ]);
+
+    let cpu = must!(plan.evaluate(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_eq!(cuda.shape(), &[2, 3, 4]);
+    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+        assert!((actual - expected).abs() < 1e-5);
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_broadcast_batched_matmul_vjp_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let lhs = must!(graph.input("lhs", vec![2, 3, 2]));
+    let rhs = must!(graph.input("rhs", vec![1, 2, 4]));
+    let output = must!(graph.matmul(lhs, rhs));
+    let loss = must!(graph.sum(output));
+    let inputs = BTreeMap::from([
+        (
+            "lhs".to_string(),
+            must!(DynamicTensor::new(
+                vec![2, 3, 2],
+                vec![1.0, -2.0, 0.5, 3.0, -1.0, 4.0, 2.0, 1.0, -3.0, 0.25, 0.75, -2.0,],
+            )),
+        ),
+        (
+            "rhs".to_string(),
+            must!(DynamicTensor::new(
+                vec![1, 2, 4],
+                vec![0.2, -0.4, 0.6, 0.8, -0.1, 0.3, 0.5, -0.7],
+            )),
+        ),
+    ]);
+    let cotangent = must!(DynamicTensor::filled(vec![], 1.0));
+    let cpu = must!(graph.vjp(loss, &inputs, cotangent.clone()));
+    let transformed = must!(graph.symbolic_vjp(loss, "loss_cotangent"));
+    let mut cuda_inputs = inputs;
+    cuda_inputs.insert("loss_cotangent".to_string(), cotangent);
+
+    for name in ["lhs", "rhs"] {
+        let plan = must!(transformed.graph.compile_cpu(transformed.gradients[name]));
+        let cuda = must!(CudaBackend::new(0).execute(&plan, &cuda_inputs));
+        assert_eq!(cuda.shape(), cpu[name].shape());
+        for (actual, expected) in cuda.data().iter().zip(cpu[name].data()) {
+            assert!((actual - expected).abs() < 1e-5);
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_broadcast_batched_matmul_trains_with_retained_adam_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let lhs = must!(graph.input("lhs", vec![2, 1, 1]));
+    let weight = must!(graph.input("weight", vec![1, 1, 1]));
+    let target = must!(graph.input("target", vec![2, 1, 1]));
+    let prediction = must!(graph.matmul(lhs, weight));
+    let error = must!(graph.sub(prediction, target));
+    let squared_error = must!(graph.mul(error, error));
+    let loss = must!(graph.mean(squared_error));
+    let transformed = must!(graph.symbolic_vjp(loss, "loss_cotangent"));
+    let plan = must!(transformed
+        .graph
+        .compile_cpu(transformed.gradients["weight"]));
+    let cuda = must!(CudaBackend::new(0).compile(plan));
+    let inputs = BTreeMap::from([
+        (
+            "lhs".to_string(),
+            must!(DynamicTensor::new(vec![2, 1, 1], vec![1.0, 2.0])),
+        ),
+        (
+            "weight".to_string(),
+            must!(DynamicTensor::new(vec![1, 1, 1], vec![0.0])),
+        ),
+        (
+            "target".to_string(),
+            must!(DynamicTensor::new(vec![2, 1, 1], vec![2.0, 4.0])),
+        ),
+        (
+            "loss_cotangent".to_string(),
+            must!(DynamicTensor::filled(vec![], 1.0)),
+        ),
+    ]);
+    let retained = std::collections::BTreeSet::from([
+        "lhs".to_string(),
+        "target".to_string(),
+        "loss_cotangent".to_string(),
+        "weight".to_string(),
+    ]);
+
+    for _ in 0..150 {
+        must!(cuda.execute_retaining(&inputs, &retained));
+        must!(cuda.adam_step_input_from_output("weight", 0.05, 0.9, 0.999, 1e-8));
+    }
+
+    let weight = must!(cuda.retained_input_to_host("weight"));
+    assert!((weight.data()[0] - 2.0).abs() < 1e-3);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_two_layer_mlp_scalar_loss_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3, 1]));
+    let weight_one = must!(graph.input("weight_one", vec![1, 4]));
+    let bias_one = must!(graph.input("bias_one", vec![1, 4]));
+    let weight_two = must!(graph.input("weight_two", vec![4, 1]));
+    let hidden_linear = must!(graph.matmul(x, weight_one));
+    let hidden_shifted = must!(graph.add(hidden_linear, bias_one));
+    let hidden = must!(graph.tanh(hidden_shifted));
+    let output = must!(graph.matmul(hidden, weight_two));
+    let squared = must!(graph.mul(output, output));
+    let loss = must!(graph.sum(squared));
+    let plan = must!(graph.compile_cpu(loss));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![3, 1], vec![-1.0, 0.5, 2.0])),
+        ),
+        (
+            "weight_one".to_string(),
+            must!(DynamicTensor::new(vec![1, 4], vec![0.2, -0.4, 0.6, 0.8])),
+        ),
+        (
+            "bias_one".to_string(),
+            must!(DynamicTensor::new(vec![1, 4], vec![0.1, 0.3, -0.2, 0.5])),
+        ),
+        (
+            "weight_two".to_string(),
+            must!(DynamicTensor::new(vec![4, 1], vec![0.7, -0.5, 0.9, 0.2])),
+        ),
+    ]);
+
+    let cpu = must!(plan.evaluate(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_eq!(cuda.shape(), cpu.shape());
+    assert!((cuda.data()[0] - cpu.data()[0]).abs() < 1e-5);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_symbolic_vjp_for_broadcast_bias_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3, 1]));
+    let weight = must!(graph.input("weight", vec![1, 2]));
+    let bias = must!(graph.input("bias", vec![1, 2]));
+    let linear = must!(graph.matmul(x, weight));
+    let shifted = must!(graph.add(linear, bias));
+    let output = must!(graph.tanh(shifted));
+    let squared = must!(graph.mul(output, output));
+    let loss = must!(graph.sum(squared));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![3, 1], vec![-1.0, 0.5, 2.0])),
+        ),
+        (
+            "weight".to_string(),
+            must!(DynamicTensor::new(vec![1, 2], vec![0.2, -0.4])),
+        ),
+        (
+            "bias".to_string(),
+            must!(DynamicTensor::new(vec![1, 2], vec![0.1, 0.3])),
+        ),
+    ]);
+    let cotangent = must!(DynamicTensor::filled(vec![], 1.0));
+    let direct = must!(graph.vjp(loss, &inputs, cotangent.clone()));
+    let transformed = must!(graph.symbolic_vjp(loss, "loss_cotangent"));
+    let mut transformed_inputs = inputs;
+    transformed_inputs.insert("loss_cotangent".to_string(), cotangent);
+
+    for name in ["weight", "bias"] {
+        let gradient = transformed.gradients[name];
+        let plan = must!(transformed.graph.compile_cpu(gradient));
+        let cuda = must!(CudaBackend::new(0).execute(&plan, &transformed_inputs));
+        assert_eq!(cuda.shape(), direct[name].shape());
+        for (actual, expected) in cuda.data().iter().zip(direct[name].data()) {
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "gradient mismatch for {name}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -318,7 +1013,7 @@ fn symbolic_jvp_preserves_transpose_reshape_and_axis_reduction() {
     )]);
 
     let tangent = must!(transformed.graph.evaluate(transformed.tangent, &inputs));
-    assert_eq!(tangent.shape(), &[]);
+    assert_eq!(tangent.shape(), &[] as &[usize]);
     assert_eq!(tangent.data(), &[1.0]);
 }
 
@@ -383,4 +1078,42 @@ fn symbolic_jvp_supports_log_and_parameter_vjp() {
             .graph
             .vjp(loss, &inputs, must!(DynamicTensor::filled(vec![], 1.0)),));
     assert!((gradients["weight"].data()[0] + 2.0 / 125.0).abs() < 1e-12);
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_backend_matches_cpu_for_concat_broadcast_and_tanh() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![1, 2]));
+    let y = must!(graph.input("y", vec![1, 2]));
+    let bias = must!(graph.input("bias", vec![1, 2]));
+    let joined = must!(graph.concat(vec![x, y], 0));
+    let bias = must!(graph.broadcast_to(bias, vec![2, 2]));
+    let shifted = must!(graph.add(joined, bias));
+    let activated = must!(graph.tanh(shifted));
+    let output = must!(graph.sum(activated));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![1, 2], vec![-1.0, 2.0])),
+        ),
+        (
+            "y".to_string(),
+            must!(DynamicTensor::new(vec![1, 2], vec![0.5, -0.25])),
+        ),
+        (
+            "bias".to_string(),
+            must!(DynamicTensor::new(vec![1, 2], vec![0.25, -0.5])),
+        ),
+    ]);
+    let plan = must!(graph.compile_cpu(output));
+    let cpu = must!(CpuBackend.execute(&plan, &inputs));
+    let mlx = must!(MlxBackend.execute(&plan, &inputs));
+    assert_eq!(mlx.shape(), cpu.shape());
+    for (actual, expected) in mlx.data().iter().zip(cpu.data()) {
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "actual={actual}, expected={expected}"
+        );
+    }
 }

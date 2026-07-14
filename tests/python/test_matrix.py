@@ -1,4 +1,5 @@
 import math
+import os
 
 import nabla
 
@@ -175,6 +176,170 @@ def test_tensor_rejects_data_with_the_wrong_size():
         raise AssertionError("expected tensor data size mismatch to fail")
 
 
+def test_tensor_ones_and_full_validate_rank_n_shapes():
+    assert nabla.Tensor.ones([2, 3]).to_flat_list() == [1.0] * 6
+    assert nabla.Tensor.full([2, 1, 2], -0.25).to_flat_list() == [-0.25] * 4
+
+
+def test_tensor_arange_creates_coordinate_vectors_and_rejects_invalid_ranges():
+    assert nabla.Tensor.arange(0.0, 1.0, 0.25).to_flat_list() == [0.0, 0.25, 0.5, 0.75]
+    assert nabla.Tensor.arange(1.0, -0.5, -0.5).to_flat_list() == [1.0, 0.5, 0.0]
+    for arguments in [(0.0, 1.0, 0.0), (1.0, 0.0, 1.0)]:
+        try:
+            nabla.Tensor.arange(*arguments)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"arange accepted invalid arguments {arguments}")
+
+
+def test_tensor_linspace_includes_endpoints_for_collocation_grids():
+    assert nabla.Tensor.linspace(-1.0, 1.0, 5).to_flat_list() == [-1.0, -0.5, 0.0, 0.5, 1.0]
+    assert nabla.Tensor.linspace(2.0, 5.0, 1).to_flat_list() == [2.0]
+    try:
+        nabla.Tensor.linspace(0.0, 1.0, 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("linspace accepted num=0")
+
+
+def test_tensor_eye_creates_square_and_rectangular_identity_arrays():
+    assert nabla.Tensor.eye(3).to_flat_list() == [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    assert nabla.Tensor.eye(2, 3).to_flat_list() == [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    try:
+        nabla.Tensor.eye(0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("eye accepted zero rows")
+
+
+def test_tensor_transpose_reorders_rank_n_axes_and_validates_permutations():
+    tensor = nabla.Tensor([2, 3, 2], [float(value) for value in range(12)])
+
+    reversed_axes = tensor.transpose()
+    assert reversed_axes.shape == [2, 3, 2]
+    assert reversed_axes.to_flat_list() == [0.0, 6.0, 2.0, 8.0, 4.0, 10.0, 1.0, 7.0, 3.0, 9.0, 5.0, 11.0]
+
+    permuted = tensor.transpose([1, -1, 0])
+    assert permuted.shape == [3, 2, 2]
+    assert permuted.to_flat_list() == [0.0, 6.0, 1.0, 7.0, 2.0, 8.0, 3.0, 9.0, 4.0, 10.0, 5.0, 11.0]
+
+    for axes in ([0, 0, 1], [0, 1], [0, 1, 3]):
+        try:
+            tensor.transpose(axes)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"transpose accepted invalid axes {axes}")
+
+
+def test_tensor_reductions_match_trace_tensor_axis_semantics():
+    tensor = nabla.Tensor([2, 3, 2], [float(value) for value in range(1, 13)])
+
+    assert tensor.sum().shape == []
+    assert tensor.sum().to_flat_list() == [78.0]
+    assert tensor.mean().to_flat_list() == [6.5]
+
+    axis_one = tensor.sum(axis=1)
+    assert axis_one.shape == [2, 2]
+    assert axis_one.to_flat_list() == [9.0, 12.0, 27.0, 30.0]
+
+    last_axis = tensor.mean(axis=-1)
+    assert last_axis.shape == [2, 3]
+    assert last_axis.to_flat_list() == [1.5, 3.5, 5.5, 7.5, 9.5, 11.5]
+
+    for axis in (3, -4):
+        try:
+            tensor.sum(axis=axis)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"sum accepted invalid axis {axis}")
+
+
+def test_tensor_elementwise_math_matches_python_math():
+    tensor = nabla.Tensor([2, 2], [0.0, 1.0, -1.0, 4.0])
+
+    assert_close_rows([tensor.tanh().to_flat_list()], [[math.tanh(value) for value in tensor.to_flat_list()]])
+    assert_close_rows([tensor.exp().to_flat_list()], [[math.exp(value) for value in tensor.to_flat_list()]])
+    assert_close_rows([tensor.sin().to_flat_list()], [[math.sin(value) for value in tensor.to_flat_list()]])
+    assert_close_rows([tensor.cos().to_flat_list()], [[math.cos(value) for value in tensor.to_flat_list()]])
+    assert tensor.powi(2).to_flat_list() == [0.0, 1.0, 1.0, 16.0]
+
+    positive = nabla.Tensor([2], [1.0, math.e**2])
+    assert_close_rows([positive.log().to_flat_list()], [[0.0, 2.0]])
+    assert positive.sqrt().to_flat_list() == [1.0, math.e]
+
+
+def test_tensor_supports_numeric_scalars_on_both_sides():
+    tensor = nabla.Tensor([2, 2], [1.0, -2.0, 3.0, 4.0])
+
+    assert (tensor + 2.0).to_flat_list() == [3.0, 0.0, 5.0, 6.0]
+    assert (2.0 + tensor).to_flat_list() == [3.0, 0.0, 5.0, 6.0]
+    assert (tensor - 2.0).to_flat_list() == [-1.0, -4.0, 1.0, 2.0]
+    assert (2.0 - tensor).to_flat_list() == [1.0, 4.0, -1.0, -2.0]
+    assert (tensor * -0.5).to_flat_list() == [-0.5, 1.0, -1.5, -2.0]
+    assert (-0.5 * tensor).to_flat_list() == [-0.5, 1.0, -1.5, -2.0]
+    assert (tensor / 2.0).to_flat_list() == [0.5, -1.0, 1.5, 2.0]
+    assert (12.0 / tensor).to_flat_list() == [12.0, -6.0, 4.0, 3.0]
+    assert (-tensor).to_flat_list() == [-1.0, 2.0, -3.0, -4.0]
+
+    try:
+        tensor / 0.0
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("tensor division accepted a zero scalar")
+
+
+def test_tensor_power_supports_integer_and_float_exponents():
+    tensor = nabla.Tensor([2], [4.0, 9.0])
+
+    assert (tensor ** 2).to_flat_list() == [16.0, 81.0]
+    assert_close_rows([(tensor ** 0.5).to_flat_list()], [[2.0, 3.0]])
+
+    try:
+        pow(tensor, 2, 3)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("tensor power accepted a modulo argument")
+
+
+def test_tensor_comparisons_and_where_support_rank_n_broadcasting():
+    values = nabla.Tensor([2, 1, 3], [-1.0, 0.0, 1.0, 2.0, -2.0, 3.0])
+    mask = values.gt(0.0)
+    on_true = nabla.Tensor([1, 4, 1], [10.0, 20.0, 30.0, 40.0])
+    on_false = nabla.Tensor.full([2, 1, 3], -1.0)
+
+    assert mask.shape == [2, 1, 3]
+    assert mask.to_flat_list() == [0.0, 0.0, 1.0, 1.0, 0.0, 1.0]
+
+    selected = nabla.where(mask, on_true, on_false)
+    assert selected.shape == [2, 4, 3]
+    assert selected.to_flat_list() == [
+        -1.0, -1.0, 10.0, -1.0, -1.0, 20.0, -1.0, -1.0, 30.0, -1.0, -1.0, 40.0,
+        10.0, -1.0, 10.0, 20.0, -1.0, 20.0, 30.0, -1.0, 30.0, 40.0, -1.0, 40.0,
+    ]
+
+
+def test_tensor_broadcast_to_materializes_rank_n_contiguous_storage():
+    tensor = nabla.Tensor([1, 2, 1], [2.0, -3.0])
+    output = tensor.broadcast_to([3, 2, 4])
+
+    assert output.shape == [3, 2, 4]
+    assert output.to_flat_list() == [2.0] * 4 + [-3.0] * 4 + [2.0] * 4 + [-3.0] * 4 + [2.0] * 4 + [-3.0] * 4
+
+    try:
+        tensor.broadcast_to([3, 3, 4])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("broadcast_to accepted incompatible shape")
+
+
 def test_tensor_matmul_broadcasts_batch_axes():
     lhs = nabla.Tensor(
         [2, 2, 3],
@@ -201,6 +366,21 @@ def test_tensor_matmul_broadcasts_batch_axes():
     assert output.to_flat_list() == [58.0, 64.0, 139.0, 154.0, 25.0, 28.0, 56.0, 62.0]
 
 
+def test_tensor_concat_supports_rank_n_axes_and_validates_shapes():
+    lhs = nabla.Tensor([2, 1, 2], [1.0, 2.0, 5.0, 6.0])
+    rhs = nabla.Tensor([2, 2, 2], [3.0, 4.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+    result = nabla.concat([lhs, rhs], axis=1)
+
+    assert result.shape == [2, 3, 2]
+    assert result.to_flat_list() == [1.0, 2.0, 3.0, 4.0, 7.0, 8.0, 5.0, 6.0, 9.0, 10.0, 11.0, 12.0]
+    try:
+        nabla.concat([lhs, nabla.Tensor([2, 2, 3], [0.0] * 12)], axis=1)
+    except ValueError as error:
+        assert "cannot concatenate" in str(error)
+    else:
+        raise AssertionError("concat accepted incompatible Tensor shapes")
+
+
 def test_tensor_slice_creates_a_strided_read_only_view():
     tensor = nabla.Tensor([3, 4], [float(value) for value in range(12)])
 
@@ -211,6 +391,14 @@ def test_tensor_slice_creates_a_strided_read_only_view():
     assert view.offset == 1
     assert view.to_flat_list() == [1.0, 3.0, 5.0, 7.0, 9.0, 11.0]
     assert view.to_tensor().to_flat_list() == [1.0, 3.0, 5.0, 7.0, 9.0, 11.0]
+
+
+def test_tensor_stack_supports_negative_axes():
+    first = nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])
+    second = nabla.Tensor([2, 2], [5.0, 6.0, 7.0, 8.0])
+    stacked = nabla.stack([first, second], axis=-1)
+    assert stacked.shape == [2, 2, 2]
+    assert stacked.to_flat_list() == [1.0, 5.0, 2.0, 6.0, 3.0, 7.0, 4.0, 8.0]
 
 
 def test_trace_tensor_evaluates_rank_n_scalar_loss_vjp():
@@ -288,6 +476,524 @@ def test_trace_tensor_symbolic_jvp_keeps_parameter_gradients():
         nabla.Tensor([], [1.0]),
     )
     assert abs(gradients["weight"].to_flat_list()[0]) > 1e-8
+
+
+def test_trace_tensor_symbolic_vjp_matches_cpu_vjp():
+    traced = nabla.trace_tensor(
+        lambda x, bias: (x + bias).tanh().sum(),
+        [("x", [2, 1]), ("bias", [1, 3])],
+    )
+    inputs = {
+        "x": nabla.Tensor([2, 1], [-1.0, 2.0]),
+        "bias": nabla.Tensor([1, 3], [0.0, 1.0, -1.0]),
+    }
+    cotangent = nabla.Tensor([], [1.0])
+    _, direct = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, cotangent
+    )
+    gradients = traced.symbolic_vjp("loss_cotangent")
+    transformed_inputs = {**inputs, "loss_cotangent": cotangent}
+
+    assert set(gradients) == {"x", "bias"}
+    for name, gradient_trace in gradients.items():
+        value = gradient_trace.graph.evaluate(
+            gradient_trace.output.node_id, transformed_inputs
+        )
+        assert value.shape == direct[name].shape
+        assert value.to_flat_list() == direct[name].to_flat_list()
+
+
+def test_trace_tensor_symbolic_vjp_supports_composed_loss_nodes():
+    traced = nabla.trace_tensor(
+        lambda x, weight: (x * weight).tanh(),
+        [("x", [1]), ("weight", [1])],
+    )
+    second_derivative = traced.symbolic_jvp("x").symbolic_jvp("x")
+    loss = second_derivative.output.powi(2).sum()
+    gradients = loss.symbolic_vjp("loss_cotangent")
+    inputs = {
+        "x": nabla.Tensor([1], [0.5]),
+        "weight": nabla.Tensor([1], [0.3]),
+        "loss_cotangent": nabla.Tensor([], [1.0]),
+    }
+    gradient = gradients["weight"].graph.evaluate(
+        gradients["weight"].output.node_id, inputs
+    )
+
+    assert abs(gradient.to_flat_list()[0]) > 1e-8
+
+
+def test_trace_tensor_concat_supports_rank_n_ad_and_symbolic_transforms():
+    traced = nabla.trace_tensor(
+        lambda left, right: nabla.concat([left, right], axis=1).powi(2).sum(),
+        [("left", [2, 1, 2]), ("right", [2, 2, 2])],
+    )
+    inputs = {
+        "left": nabla.Tensor([2, 1, 2], [1.0, 2.0, 3.0, 4.0]),
+        "right": nabla.Tensor([2, 2, 2], [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
+    }
+    cotangent = nabla.Tensor([], [1.0])
+    value, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, cotangent
+    )
+    assert value.to_flat_list() == [650.0]
+    assert gradients["left"].to_flat_list() == [2.0, 4.0, 6.0, 8.0]
+    assert gradients["right"].to_flat_list() == [
+        10.0,
+        12.0,
+        14.0,
+        16.0,
+        18.0,
+        20.0,
+        22.0,
+        24.0,
+    ]
+
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id,
+        inputs,
+        {
+            "left": nabla.Tensor.ones([2, 1, 2]),
+            "right": nabla.Tensor.zeros([2, 2, 2]),
+        },
+    )
+    assert tangent.to_flat_list() == [20.0]
+
+    symbolic_gradients = traced.symbolic_vjp("loss_cotangent")
+    transformed_inputs = {**inputs, "loss_cotangent": cotangent}
+    for name, gradient in symbolic_gradients.items():
+        assert gradient.graph.evaluate(gradient.output.node_id, transformed_inputs).to_flat_list() == gradients[name].to_flat_list()
+
+    first_derivative = traced.symbolic_jvp("left")
+    assert first_derivative.graph.evaluate(first_derivative.output.node_id, inputs).to_flat_list() == [20.0]
+
+
+def test_trace_tensor_slice_supports_rank_n_ad_and_symbolic_transforms():
+    traced = nabla.trace_tensor(
+        lambda x: x.slice(-2, 1, 3).powi(2).sum(),
+        [("x", [2, 4, 2])],
+    )
+    inputs = {"x": nabla.Tensor([2, 4, 2], [float(value) for value in range(1, 17)])}
+    value, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    assert value.to_flat_list() == [716.0]
+    assert gradients["x"].to_flat_list() == [
+        0.0,
+        0.0,
+        6.0,
+        8.0,
+        10.0,
+        12.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        22.0,
+        24.0,
+        26.0,
+        28.0,
+        0.0,
+        0.0,
+    ]
+    symbolic_gradient = traced.symbolic_vjp("loss_cotangent")["x"]
+    assert symbolic_gradient.graph.evaluate(
+        symbolic_gradient.output.node_id,
+        {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])},
+    ).to_flat_list() == gradients["x"].to_flat_list()
+
+
+def test_trace_tensor_slice_rejects_invalid_ranges():
+    traced = nabla.trace_tensor(lambda x: x, [("x", [2, 3])])
+    for args in ((0, 3, 2), (1, 0, 4), (2, 0, 1)):
+        try:
+            traced.output.slice(*args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"slice{args} should reject an invalid range")
+
+
+def test_trace_tensor_broadcast_to_supports_rank_n_ad_and_symbolic_transforms():
+    traced = nabla.trace_tensor(
+        lambda x: x.broadcast_to([2, 3, 2]).powi(2).sum(), [("x", [1, 3, 1])]
+    )
+    inputs = {"x": nabla.Tensor([1, 3, 1], [1.0, 2.0, 3.0])}
+    value, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    assert value.to_flat_list() == [56.0]
+    assert gradients["x"].to_flat_list() == [8.0, 16.0, 24.0]
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id,
+        inputs,
+        {"x": nabla.Tensor.ones([1, 3, 1])},
+    )
+    assert tangent.to_flat_list() == [48.0]
+    symbolic_gradient = traced.symbolic_vjp("loss_cotangent")["x"]
+    assert symbolic_gradient.graph.evaluate(
+        symbolic_gradient.output.node_id,
+        {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])},
+    ).to_flat_list() == gradients["x"].to_flat_list()
+
+
+def test_trace_tensor_stack_supports_symbolic_vjp():
+    traced = nabla.trace_tensor(
+        lambda left, right: nabla.stack([left, right], axis=-1).powi(2).sum(),
+        [("left", [2, 2]), ("right", [2, 2])],
+    )
+    inputs = {
+        "left": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+        "right": nabla.Tensor([2, 2], [5.0, 6.0, 7.0, 8.0]),
+    }
+    gradient = traced.symbolic_vjp("loss_cotangent")["right"]
+    result = gradient.graph.evaluate(
+        gradient.output.node_id,
+        {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])},
+    )
+    assert result.to_flat_list() == [10.0, 12.0, 14.0, 16.0]
+
+
+def test_cuda_trace_tensor_concat_keeps_primal_and_symbolic_vjp_on_device():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda left, right: nabla.concat([left, right], axis=1).powi(2).sum(),
+        [("left", [2, 1, 2]), ("right", [2, 2, 2])],
+    )
+    inputs = {
+        "left": nabla.Tensor([2, 1, 2], [1.0, 2.0, 3.0, 4.0]),
+        "right": nabla.Tensor([2, 2, 2], [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
+    }
+    assert_close_rows([traced.output.compile_cuda().evaluate(inputs).to_flat_list()], [[650.0]], tol=1e-5)
+
+    gradient = traced.symbolic_vjp("loss_cotangent")["right"].output.compile_cuda()
+    result = gradient.evaluate({**inputs, "loss_cotangent": nabla.Tensor([], [1.0])})
+    assert_close_rows(
+        [result.to_flat_list()],
+        [[10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0]],
+        tol=1e-5,
+    )
+
+
+def test_mlx_trace_tensor_compiles_and_matches_cpu():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, y, bias: nabla.concat([x, y], axis=0)
+        .add(bias.broadcast_to([2, 2]))
+        .tanh()
+        .sum(),
+        [("x", [1, 2]), ("y", [1, 2]), ("bias", [1, 2])],
+    )
+    inputs = {
+        "x": nabla.Tensor([1, 2], [-1.0, 2.0]),
+        "y": nabla.Tensor([1, 2], [0.5, -0.25]),
+        "bias": nabla.Tensor([1, 2], [0.25, -0.5]),
+    }
+    cpu = traced.output.compile_cpu().evaluate(inputs)
+    plan = traced.output.compile_mlx()
+    assert plan.backend == "mlx"
+    assert_close_rows([plan.evaluate(inputs).to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
+
+
+def test_cuda_trace_tensor_slice_keeps_primal_and_symbolic_vjp_on_device():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x: x.slice(1, 1, 3).powi(2).sum(), [("x", [2, 4, 2])]
+    )
+    inputs = {"x": nabla.Tensor([2, 4, 2], [float(value) for value in range(1, 17)])}
+    assert_close_rows([traced.output.compile_cuda().evaluate(inputs).to_flat_list()], [[716.0]], tol=1e-5)
+    gradient = traced.symbolic_vjp("loss_cotangent")["x"].output.compile_cuda()
+    result = gradient.evaluate({**inputs, "loss_cotangent": nabla.Tensor([], [1.0])})
+    assert_close_rows(
+        [result.to_flat_list()],
+        [[0.0, 0.0, 6.0, 8.0, 10.0, 12.0, 0.0, 0.0, 0.0, 0.0, 22.0, 24.0, 26.0, 28.0, 0.0, 0.0]],
+        tol=1e-5,
+    )
+
+
+def test_cuda_trace_tensor_broadcast_to_keeps_primal_and_symbolic_vjp_on_device():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x: x.broadcast_to([2, 3, 2]).powi(2).sum(), [("x", [1, 3, 1])]
+    )
+    inputs = {"x": nabla.Tensor([1, 3, 1], [1.0, 2.0, 3.0])}
+    assert_close_rows([traced.output.compile_cuda().evaluate(inputs).to_flat_list()], [[56.0]], tol=1e-5)
+    gradient = traced.symbolic_vjp("loss_cotangent")["x"].output.compile_cuda()
+    result = gradient.evaluate({**inputs, "loss_cotangent": nabla.Tensor([], [1.0])})
+    assert_close_rows([result.to_flat_list()], [[8.0, 16.0, 24.0]], tol=1e-5)
+
+
+def test_cuda_multi_parameter_sgd_keeps_gradient_plans_synchronized():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, weight, bias: (x * weight) + bias,
+        [("x", [2]), ("weight", [1]), ("bias", [1])],
+    )
+    target = traced.graph.input("target", [2])
+    loss = (traced.output - target).powi(2).sum()
+    gradients = loss.symbolic_vjp("loss_cotangent")
+    weight_gradient = gradients["weight"].output.compile_cuda()
+    bias_gradient = gradients["bias"].output.compile_cuda()
+    inputs = {
+        "x": nabla.Tensor([2], [-1.0, 1.0]),
+        "target": nabla.Tensor([2], [-1.0, 3.0]),
+        "loss_cotangent": nabla.Tensor([], [1.0]),
+        "weight": nabla.Tensor([1], [0.0]),
+        "bias": nabla.Tensor([1], [0.0]),
+    }
+    retained = ["x", "target", "loss_cotangent", "weight", "bias"]
+
+    for _ in range(100):
+        weight_gradient.sgd_step(inputs, "weight", 0.05, retained)
+        bias_gradient.sgd_step(inputs, "bias", 0.05, retained)
+        weight_gradient.sync_retained_input_to("weight", bias_gradient)
+        bias_gradient.sync_retained_input_to("bias", weight_gradient)
+
+    assert abs(weight_gradient.retained_input("weight").to_flat_list()[0] - 2.0) < 1e-4
+    assert abs(bias_gradient.retained_input("bias").to_flat_list()[0] - 1.0) < 1e-4
+
+
+def test_cuda_adam_keeps_optimizer_state_on_device():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, weight: x * weight,
+        [("x", [1]), ("weight", [1])],
+    )
+    target = traced.graph.input("target", [1])
+    loss = (traced.output - target).powi(2).sum()
+    gradient = loss.symbolic_vjp("loss_cotangent")["weight"].output.compile_cuda()
+    inputs = {
+        "x": nabla.Tensor([1], [2.0]),
+        "weight": nabla.Tensor([1], [0.0]),
+        "target": nabla.Tensor([1], [6.0]),
+        "loss_cotangent": nabla.Tensor([], [1.0]),
+    }
+
+    for _ in range(2):
+        gradient.adam_step(inputs, "weight", 0.1, ["x", "target", "loss_cotangent"])
+
+    weight = gradient.retained_input("weight").to_flat_list()[0]
+    assert 0.19 < weight < 0.21
+
+
+def test_cuda_plan_evaluates_with_static_inputs_retained_on_device():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, bias: (x + bias).tanh(),
+        [("x", [2, 1]), ("bias", [1, 2])],
+    )
+    plan = traced.output.compile_cuda()
+    inputs = {
+        "x": nabla.Tensor([2, 1], [-1.0, 2.0]),
+        "bias": nabla.Tensor([1, 2], [0.0, 1.0]),
+    }
+    plan.evaluate_device(inputs, ["x", "bias"])
+    plan.evaluate_device(inputs, ["x", "bias"])
+    plan.synchronize()
+    assert plan.backend in {"cublas", "nvrtc"}
+    assert plan.benchmark_device(inputs, 2, ["x", "bias"]) > 0.0
+    actual = plan.evaluate(inputs).to_flat_list()
+    expected = [math.tanh(-1.0), 0.0, math.tanh(2.0), math.tanh(3.0)]
+    for value, target in zip(actual, expected):
+        assert abs(value - target) < 1e-5
+
+
+def test_cuda_multi_parameter_adam_keeps_gradient_plans_synchronized():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, weight, bias: (x * weight) + bias,
+        [("x", [2]), ("weight", [1]), ("bias", [1])],
+    )
+    target = traced.graph.input("target", [2])
+    loss = (traced.output - target).powi(2).sum()
+    gradients = loss.symbolic_vjp("loss_cotangent")
+    weight_gradient = gradients["weight"].output.compile_cuda()
+    bias_gradient = gradients["bias"].output.compile_cuda()
+    inputs = {
+        "x": nabla.Tensor([2], [-1.0, 1.0]),
+        "target": nabla.Tensor([2], [-1.0, 3.0]),
+        "loss_cotangent": nabla.Tensor([], [1.0]),
+        "weight": nabla.Tensor([1], [0.0]),
+        "bias": nabla.Tensor([1], [0.0]),
+    }
+    retained = ["x", "target", "loss_cotangent", "weight", "bias"]
+    optimizer = nabla.cuda_adam_optimizer(
+        {"weight": weight_gradient, "bias": bias_gradient},
+        inputs,
+        0.05,
+        retained,
+    )
+
+    for _ in range(200):
+        optimizer.step()
+
+    trained = optimizer.parameters()
+    assert abs(trained["weight"].to_flat_list()[0] - 2.0) < 1e-3
+    assert abs(trained["bias"].to_flat_list()[0] - 1.0) < 1e-3
+
+
+def test_cuda_adam_optimizer_updates_minibatch_inputs_without_resetting_state():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, weight: x * weight,
+        [("x", [1]), ("weight", [1])],
+    )
+    target = traced.graph.input("target", [1])
+    loss = (traced.output - target).powi(2).sum()
+    gradient = loss.symbolic_vjp("loss_cotangent")["weight"].output
+
+    def make_optimizer() -> object:
+        return nabla.cuda_adam_optimizer(
+            {"weight": gradient.compile_cuda()},
+            {
+                "x": nabla.Tensor([1], [1.0]),
+                "target": nabla.Tensor([1], [1.0]),
+                "loss_cotangent": nabla.Tensor([], [1.0]),
+                "weight": nabla.Tensor([1], [0.0]),
+            },
+            0.1,
+            ["x", "target", "loss_cotangent", "weight"],
+        )
+
+    static = make_optimizer()
+    dynamic = make_optimizer()
+    static.step()
+    dynamic.step()
+    static.step()
+    dynamic.step({"target": nabla.Tensor([1], [-10.0])})
+
+    static_weight = static.parameters()["weight"].to_flat_list()[0]
+    dynamic_weight = dynamic.parameters()["weight"].to_flat_list()[0]
+    assert abs(static_weight - dynamic_weight) > 1e-4
+
+
+def test_cuda_adam_vjp_optimizer_updates_parameters_from_one_shared_graph():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, weight, bias: (x * weight) + bias,
+        [("x", [2]), ("weight", [1]), ("bias", [1])],
+    )
+    target = traced.graph.input("target", [2])
+    loss = (traced.output - target).powi(2).sum()
+    gradients = loss.symbolic_vjp("loss_cotangent")
+    optimizer = nabla.cuda_adam_vjp_optimizer(
+        {"weight": gradients["weight"], "bias": gradients["bias"]},
+        {
+            "x": nabla.Tensor([2], [-1.0, 1.0]),
+            "target": nabla.Tensor([2], [-1.0, 3.0]),
+            "loss_cotangent": nabla.Tensor([], [1.0]),
+            "weight": nabla.Tensor([1], [0.0]),
+            "bias": nabla.Tensor([1], [0.0]),
+        },
+        0.05,
+        ["x", "target", "loss_cotangent", "weight", "bias"],
+    )
+
+    for _ in range(200):
+        optimizer.step()
+
+    trained = optimizer.parameters()
+    assert abs(trained["weight"].to_flat_list()[0] - 2.0) < 1e-3
+    assert abs(trained["bias"].to_flat_list()[0] - 1.0) < 1e-3
+
+
+def test_cuda_batched_matmul_vjp_matches_cpu_trace_evaluation():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda lhs, rhs: lhs @ rhs,
+        [("lhs", [2, 3, 2]), ("rhs", [1, 2, 4])],
+    )
+    loss = traced.output.sum()
+    gradients = loss.symbolic_vjp("loss_cotangent")
+    inputs = {
+        "lhs": nabla.Tensor(
+            [2, 3, 2],
+            [1.0, -2.0, 0.5, 3.0, -1.0, 4.0, 2.0, 1.0, -3.0, 0.25, 0.75, -2.0],
+        ),
+        "rhs": nabla.Tensor(
+            [1, 2, 4], [0.2, -0.4, 0.6, 0.8, -0.1, 0.3, 0.5, -0.7]
+        ),
+        "loss_cotangent": nabla.Tensor([], [1.0]),
+    }
+
+    for name, gradient_trace in gradients.items():
+        cpu = gradient_trace.graph.evaluate(gradient_trace.output.node_id, inputs)
+        cuda = gradient_trace.output.compile_cuda().evaluate(inputs)
+        assert cuda.shape == cpu.shape
+        for actual, expected in zip(cuda.to_flat_list(), cpu.to_flat_list()):
+            assert abs(actual - expected) < 1e-5
+
+
+def test_cuda_global_reductions_match_cpu_and_reset_output_buffers():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    values = [0.125 * (index % 13) for index in range(8192)]
+    inputs = {"x": nabla.Tensor([128, 64], values)}
+
+    for fn in (lambda x: x.sum(), lambda x: x.mean()):
+        traced = nabla.trace_tensor(fn, [("x", [128, 64])])
+        cpu = traced.graph.evaluate(traced.output.node_id, inputs).to_flat_list()[0]
+        cuda = traced.output.compile_cuda()
+        first = cuda.evaluate(inputs).to_flat_list()[0]
+        second = cuda.evaluate(inputs).to_flat_list()[0]
+
+        assert abs(first - cpu) <= 1e-3
+        assert abs(second - cpu) <= 1e-3
+
+
+def test_cuda_sqrt_composite_lowering_matches_cpu():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(lambda x: x.sqrt(), [("x", [2, 2])])
+    inputs = {"x": nabla.Tensor([2, 2], [0.25, 1.0, 4.0, 9.0])}
+    cpu = traced.graph.evaluate(traced.output.node_id, inputs)
+    cuda = traced.output.compile_cuda().evaluate(inputs)
+
+    for actual, expected in zip(cuda.to_flat_list(), cpu.to_flat_list()):
+        assert abs(actual - expected) <= 1e-5
+
+
+def test_cuda_checked_div_and_log_lowering_matches_cpu():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, scale: (x / scale).log(),
+        [("x", [2, 2]), ("scale", [])],
+    )
+    inputs = {
+        "x": nabla.Tensor([2, 2], [0.5, 1.0, 2.0, 8.0]),
+        "scale": nabla.Tensor([], [0.5]),
+    }
+    cpu = traced.graph.evaluate(traced.output.node_id, inputs)
+    cuda = traced.output.compile_cuda().evaluate(inputs)
+
+    for actual, expected in zip(cuda.to_flat_list(), cpu.to_flat_list()):
+        assert abs(actual - expected) <= 1e-5
 
 
 def test_trace_tensor_tanh_scalar_loss_supports_jvp_and_vjp():
@@ -671,6 +1377,66 @@ def test_tensor_grad_scalar_fn_reuses_a_compiled_plan():
     assert second["x"].to_flat_list() == [2.0] * 4
 
 
+def test_tensor_value_and_grad_fn_returns_scalar_value_and_gradients():
+    value_and_grad = nabla.tensor_value_and_grad_fn(
+        lambda x, scale: ((x * scale).sin()).sum(),
+        [("x", [2, 2]), ("scale", [])],
+    )
+    first_value, first_gradients = value_and_grad(
+        {
+            "x": nabla.Tensor([2, 2], [0.0, 0.5, 1.0, -0.25]),
+            "scale": nabla.Tensor([], [2.0]),
+        }
+    )
+    second_value, second_gradients = value_and_grad(
+        {
+            "x": nabla.Tensor([2, 2], [0.0, 0.5, 1.0, -0.25]),
+            "scale": nabla.Tensor([], [1.0]),
+        }
+    )
+
+    values = [0.0, 0.5, 1.0, -0.25]
+    assert abs(first_value.to_flat_list()[0] - sum(math.sin(2.0 * value) for value in values)) < 1e-12
+    assert_close_rows(
+        [first_gradients["x"].to_flat_list()],
+        [[2.0 * math.cos(2.0 * value) for value in values]],
+    )
+    assert abs(
+        first_gradients["scale"].to_flat_list()[0]
+        - sum(value * math.cos(2.0 * value) for value in values)
+    ) < 1e-12
+    assert abs(second_value.to_flat_list()[0] - sum(math.sin(value) for value in values)) < 1e-12
+    assert_close_rows(
+        [second_gradients["x"].to_flat_list()],
+        [[math.cos(value) for value in values]],
+    )
+
+
+def test_tensor_hessian_and_hvp_scalar_fn_reuse_a_compiled_plan():
+    hessian = nabla.tensor_hessian_scalar_fn(
+        lambda x: x.powi(3).sum(), [("x", [2, 2])], "x"
+    )
+    hvp = nabla.tensor_hvp_scalar_fn(
+        lambda x: x.powi(3).sum(), [("x", [2, 2])], "x"
+    )
+    values = [0.5, -1.0, 2.0, 0.25]
+    direction = [1.0, 2.0, -0.5, 3.0]
+    inputs = {"x": nabla.Tensor([2, 2], values)}
+
+    actual_hessian = hessian(inputs)
+    actual_hvp = hvp(inputs, nabla.Tensor([2, 2], direction))
+
+    assert len(actual_hessian) == len(values)
+    for row, value in enumerate(values):
+        for column in range(len(values)):
+            expected = 6.0 * value if row == column else 0.0
+            assert abs(actual_hessian[row][column] - expected) <= 1e-12
+    assert_close_rows(
+        [actual_hvp.to_flat_list()],
+        [[6.0 * value * tangent for value, tangent in zip(values, direction)]],
+    )
+
+
 def test_tensor_jit_fn_reuses_a_compiled_plan():
     compiled = nabla.tensor_jit_fn(
         lambda x, y: (x.matmul(y)).tanh(),
@@ -698,6 +1464,38 @@ def test_tensor_jit_fn_reuses_a_compiled_plan():
         [second.to_flat_list()],
         [[0.0, math.tanh(2.0), math.tanh(-2.0), math.tanh(1.0)]],
     )
+
+
+def test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    compiled = nabla.tensor_jit_cuda_fn(
+        lambda x, weight, bias: (x @ weight + bias).tanh(),
+        [("x", [2, 2]), ("weight", [2, 2]), ("bias", [1, 2])],
+    )
+    first = compiled(
+        {
+            "x": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+            "weight": nabla.Tensor([2, 2], [1.0, 0.0, 0.0, 1.0]),
+            "bias": nabla.Tensor([1, 2], [0.0, 1.0]),
+        }
+    )
+    second = compiled(
+        {
+            "x": nabla.Tensor([2, 2], [0.0, 1.0, -1.0, 0.5]),
+            "weight": nabla.Tensor([2, 2], [2.0, 0.0, 0.0, 2.0]),
+            "bias": nabla.Tensor([1, 2], [1.0, -1.0]),
+        }
+    )
+
+    assert compiled.backend in {"cublas", "nvrtc"}
+    expected_first = [math.tanh(1.0), math.tanh(3.0), math.tanh(3.0), math.tanh(5.0)]
+    expected_second = [math.tanh(1.0), math.tanh(1.0), math.tanh(-1.0), math.tanh(0.0)]
+    for actual, expected in zip(first.to_flat_list(), expected_first):
+        assert abs(actual - expected) <= 1e-5
+    for actual, expected in zip(second.to_flat_list(), expected_second):
+        assert abs(actual - expected) <= 1e-5
 
 
 def test_tensor_vjp_fn_reuses_a_compiled_plan_with_runtime_cotangent():
@@ -2410,11 +3208,45 @@ if __name__ == "__main__":
     test_matrix_broadcasts_row_and_column_matrices_for_elementwise_ops()
     test_tensor_broadcasts_trailing_axes_and_reshapes()
     test_tensor_rejects_data_with_the_wrong_size()
+    test_tensor_ones_and_full_validate_rank_n_shapes()
+    test_tensor_arange_creates_coordinate_vectors_and_rejects_invalid_ranges()
+    test_tensor_linspace_includes_endpoints_for_collocation_grids()
+    test_tensor_eye_creates_square_and_rectangular_identity_arrays()
+    test_tensor_transpose_reorders_rank_n_axes_and_validates_permutations()
+    test_tensor_reductions_match_trace_tensor_axis_semantics()
+    test_tensor_elementwise_math_matches_python_math()
+    test_tensor_supports_numeric_scalars_on_both_sides()
+    test_tensor_power_supports_integer_and_float_exponents()
+    test_tensor_comparisons_and_where_support_rank_n_broadcasting()
+    test_tensor_broadcast_to_materializes_rank_n_contiguous_storage()
     test_tensor_matmul_broadcasts_batch_axes()
+    test_tensor_concat_supports_rank_n_axes_and_validates_shapes()
     test_tensor_slice_creates_a_strided_read_only_view()
+    test_tensor_stack_supports_negative_axes()
     test_trace_tensor_evaluates_rank_n_scalar_loss_vjp()
     test_trace_tensor_batched_matmul_scalar_loss_vjp()
     test_trace_tensor_symbolic_jvp_keeps_parameter_gradients()
+    test_trace_tensor_symbolic_vjp_matches_cpu_vjp()
+    test_trace_tensor_symbolic_vjp_supports_composed_loss_nodes()
+    test_trace_tensor_concat_supports_rank_n_ad_and_symbolic_transforms()
+    test_trace_tensor_slice_supports_rank_n_ad_and_symbolic_transforms()
+    test_trace_tensor_slice_rejects_invalid_ranges()
+    test_trace_tensor_broadcast_to_supports_rank_n_ad_and_symbolic_transforms()
+    test_trace_tensor_stack_supports_symbolic_vjp()
+    test_cuda_trace_tensor_concat_keeps_primal_and_symbolic_vjp_on_device()
+    test_mlx_trace_tensor_compiles_and_matches_cpu()
+    test_cuda_trace_tensor_slice_keeps_primal_and_symbolic_vjp_on_device()
+    test_cuda_trace_tensor_broadcast_to_keeps_primal_and_symbolic_vjp_on_device()
+    test_cuda_multi_parameter_sgd_keeps_gradient_plans_synchronized()
+    test_cuda_adam_keeps_optimizer_state_on_device()
+    test_cuda_plan_evaluates_with_static_inputs_retained_on_device()
+    test_cuda_multi_parameter_adam_keeps_gradient_plans_synchronized()
+    test_cuda_adam_optimizer_updates_minibatch_inputs_without_resetting_state()
+    test_cuda_adam_vjp_optimizer_updates_parameters_from_one_shared_graph()
+    test_cuda_batched_matmul_vjp_matches_cpu_trace_evaluation()
+    test_cuda_global_reductions_match_cpu_and_reset_output_buffers()
+    test_cuda_sqrt_composite_lowering_matches_cpu()
+    test_cuda_checked_div_and_log_lowering_matches_cpu()
     test_trace_tensor_tanh_scalar_loss_supports_jvp_and_vjp()
     test_trace_tensor_subtraction_supports_jvp_and_vjp()
     test_trace_tensor_supports_numeric_scalar_literals()
@@ -2431,7 +3263,10 @@ if __name__ == "__main__":
     test_trace_tensor_transpose_supports_rank_n_ad()
     test_trace_tensor_reshape_supports_jvp_and_vjp()
     test_tensor_grad_scalar_fn_reuses_a_compiled_plan()
+    test_tensor_value_and_grad_fn_returns_scalar_value_and_gradients()
+    test_tensor_hessian_and_hvp_scalar_fn_reuse_a_compiled_plan()
     test_tensor_jit_fn_reuses_a_compiled_plan()
+    test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan()
     test_tensor_vjp_fn_reuses_a_compiled_plan_with_runtime_cotangent()
     test_tensor_jvp_fn_reuses_a_compiled_plan_with_runtime_tangent()
     test_tensor_jacobian_fn_reuses_a_compiled_plan()

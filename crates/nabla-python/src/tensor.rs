@@ -1,5 +1,6 @@
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyAny;
 use std::sync::Arc;
 
 #[pyclass(name = "Tensor", skip_from_py_object)]
@@ -38,6 +39,42 @@ fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
     }
 
     strides
+}
+
+fn normalize_axis(axis: isize, rank: usize) -> Result<usize, String> {
+    let rank = isize::try_from(rank).map_err(|_| "tensor rank exceeds isize".to_string())?;
+    let normalized = if axis < 0 { rank + axis } else { axis };
+    if normalized < 0 || normalized >= rank {
+        return Err(format!("axis {axis} is out of bounds for rank {rank}"));
+    }
+
+    Ok(normalized as usize)
+}
+
+fn normalize_permutation(axes: Option<Vec<isize>>, rank: usize) -> Result<Vec<usize>, String> {
+    let axes = axes.unwrap_or_else(|| (0..rank).rev().map(|axis| axis as isize).collect());
+    if axes.len() != rank {
+        return Err(format!(
+            "transpose axes must have length {rank}, got {}",
+            axes.len()
+        ));
+    }
+
+    let axes = axes
+        .into_iter()
+        .map(|axis| normalize_axis(axis, rank))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut seen = vec![false; rank];
+    for axis in &axes {
+        if std::mem::replace(&mut seen[*axis], true) {
+            return Err(format!(
+                "transpose axes {:?} are not a permutation of 0..{rank}",
+                axes
+            ));
+        }
+    }
+
+    Ok(axes)
 }
 
 fn broadcast_shape(lhs: &[usize], rhs: &[usize]) -> Result<Vec<usize>, String> {
@@ -212,16 +249,39 @@ impl PyTensor {
         })
     }
 
+    fn try_map(&self, f: impl Fn(f64) -> f64) -> Result<Self, String> {
+        Self::from_shape_data(
+            self.shape.clone(),
+            self.data.iter().copied().map(f).collect(),
+        )
+    }
+
     pub fn try_add(&self, rhs: &Self) -> Result<Self, String> {
         self.try_elementwise(rhs, "+", |lhs, rhs| Ok(lhs + rhs))
+    }
+
+    pub fn try_add_scalar(&self, rhs: f64) -> Result<Self, String> {
+        self.try_map(|lhs| lhs + rhs)
     }
 
     pub fn try_sub(&self, rhs: &Self) -> Result<Self, String> {
         self.try_elementwise(rhs, "-", |lhs, rhs| Ok(lhs - rhs))
     }
 
+    pub fn try_sub_scalar(&self, rhs: f64) -> Result<Self, String> {
+        self.try_map(|lhs| lhs - rhs)
+    }
+
+    pub fn try_scalar_sub(&self, lhs: f64) -> Result<Self, String> {
+        self.try_map(|rhs| lhs - rhs)
+    }
+
     pub fn try_mul(&self, rhs: &Self) -> Result<Self, String> {
         self.try_elementwise(rhs, "*", |lhs, rhs| Ok(lhs * rhs))
+    }
+
+    pub fn try_mul_scalar(&self, rhs: f64) -> Result<Self, String> {
+        self.try_map(|lhs| lhs * rhs)
     }
 
     pub fn try_div(&self, rhs: &Self) -> Result<Self, String> {
@@ -232,6 +292,51 @@ impl PyTensor {
 
             Ok(lhs / rhs)
         })
+    }
+
+    pub fn try_div_scalar(&self, rhs: f64) -> Result<Self, String> {
+        if rhs == 0.0 {
+            return Err("division by zero scalar is not supported".to_string());
+        }
+        self.try_map(|lhs| lhs / rhs)
+    }
+
+    pub fn try_scalar_div(&self, lhs: f64) -> Result<Self, String> {
+        if self.data.contains(&0.0) {
+            return Err("division by zero is not supported".to_string());
+        }
+        self.try_map(|rhs| lhs / rhs)
+    }
+
+    pub fn try_gt(&self, rhs: &Self) -> Result<Self, String> {
+        self.try_elementwise(rhs, "gt", |lhs, rhs| Ok(if lhs > rhs { 1.0 } else { 0.0 }))
+    }
+
+    pub fn try_gt_scalar(&self, rhs: f64) -> Result<Self, String> {
+        self.try_map(|lhs| if lhs > rhs { 1.0 } else { 0.0 })
+    }
+
+    pub fn try_where(mask: &Self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
+        let value_shape = broadcast_shape(&on_true.shape, &on_false.shape)?;
+        let shape = broadcast_shape(&mask.shape, &value_shape)?;
+        let count = element_count(&shape)?;
+        let mask_strides = contiguous_strides(&mask.shape);
+        let true_strides = contiguous_strides(&on_true.shape);
+        let false_strides = contiguous_strides(&on_false.shape);
+        let mut data = Vec::with_capacity(count);
+
+        for index in 0..count {
+            let mask_index = broadcast_offset(index, &shape, &mask.shape, &mask_strides);
+            let true_index = broadcast_offset(index, &shape, &on_true.shape, &true_strides);
+            let false_index = broadcast_offset(index, &shape, &on_false.shape, &false_strides);
+            data.push(if mask.data[mask_index] != 0.0 {
+                on_true.data[true_index]
+            } else {
+                on_false.data[false_index]
+            });
+        }
+
+        Self::from_shape_data(shape, data)
     }
 
     pub fn try_matmul(&self, rhs: &Self) -> Result<Self, String> {
@@ -315,6 +420,189 @@ impl PyTensor {
         })
     }
 
+    pub fn try_broadcast_to(&self, shape: Vec<usize>) -> Result<Self, String> {
+        if broadcast_shape(&self.shape, &shape)? != shape {
+            return Err(format!(
+                "cannot broadcast tensor shape {:?} to {:?}",
+                self.shape, shape
+            ));
+        }
+        let count = element_count(&shape)?;
+        let strides = contiguous_strides(&self.shape);
+        let data = (0..count)
+            .map(|index| self.data[broadcast_offset(index, &shape, &self.shape, &strides)])
+            .collect();
+        Self::from_shape_data(shape, data)
+    }
+
+    pub fn try_transpose(&self, axes: Option<Vec<isize>>) -> Result<Self, String> {
+        let axes = normalize_permutation(axes, self.shape.len())?;
+        let shape = axes
+            .iter()
+            .map(|axis| self.shape[*axis])
+            .collect::<Vec<_>>();
+        let input_strides = contiguous_strides(&self.shape);
+        let mut data = vec![0.0; self.data.len()];
+
+        for (output_index, output_value) in data.iter_mut().enumerate() {
+            let mut remaining = output_index;
+            let mut input_index = 0;
+            for output_axis in (0..shape.len()).rev() {
+                let coordinate = remaining % shape[output_axis];
+                remaining /= shape[output_axis];
+                input_index += coordinate * input_strides[axes[output_axis]];
+            }
+            *output_value = self.data[input_index];
+        }
+
+        Self::from_shape_data(shape, data)
+    }
+
+    fn try_reduce(&self, axis: Option<isize>, scale: f64) -> Result<Self, String> {
+        let Some(axis) = axis else {
+            return Self::from_shape_data(vec![], vec![self.data.iter().sum::<f64>() * scale]);
+        };
+        let axis = normalize_axis(axis, self.shape.len())?;
+        let mut shape = self.shape.clone();
+        shape.remove(axis);
+        let output_strides = contiguous_strides(&shape);
+        let mut data = vec![0.0; element_count(&shape)?];
+
+        for (source_index, value) in self.data.iter().enumerate() {
+            let mut remaining = source_index;
+            let mut output_index = 0;
+            for source_axis in (0..self.shape.len()).rev() {
+                let coordinate = remaining % self.shape[source_axis];
+                remaining /= self.shape[source_axis];
+                if source_axis != axis {
+                    let output_axis = if source_axis < axis {
+                        source_axis
+                    } else {
+                        source_axis - 1
+                    };
+                    output_index += coordinate * output_strides[output_axis];
+                }
+            }
+            data[output_index] += value * scale;
+        }
+
+        Self::from_shape_data(shape, data)
+    }
+
+    pub fn try_sum(&self, axis: Option<isize>) -> Result<Self, String> {
+        self.try_reduce(axis, 1.0)
+    }
+
+    pub fn try_mean(&self, axis: Option<isize>) -> Result<Self, String> {
+        let scale = match axis {
+            Some(axis) => 1.0 / self.shape[normalize_axis(axis, self.shape.len())?] as f64,
+            None => 1.0 / self.data.len() as f64,
+        };
+        self.try_reduce(axis, scale)
+    }
+
+    pub fn try_tanh(&self) -> Result<Self, String> {
+        self.try_map(f64::tanh)
+    }
+
+    pub fn try_exp(&self) -> Result<Self, String> {
+        self.try_map(f64::exp)
+    }
+
+    pub fn try_log(&self) -> Result<Self, String> {
+        self.try_map(f64::ln)
+    }
+
+    pub fn try_sqrt(&self) -> Result<Self, String> {
+        self.try_map(f64::sqrt)
+    }
+
+    pub fn try_sin(&self) -> Result<Self, String> {
+        self.try_map(f64::sin)
+    }
+
+    pub fn try_cos(&self) -> Result<Self, String> {
+        self.try_map(f64::cos)
+    }
+
+    pub fn try_powi(&self, exponent: u32) -> Result<Self, String> {
+        self.try_map(|value| value.powf(exponent as f64))
+    }
+
+    pub fn try_powf(&self, exponent: f64) -> Result<Self, String> {
+        self.try_map(|value| value.powf(exponent))
+    }
+
+    pub fn try_concat(tensors: &[PyTensor], axis: usize) -> Result<Self, String> {
+        let first = tensors
+            .first()
+            .ok_or_else(|| "concat requires at least one tensor".to_string())?;
+        if axis >= first.shape.len() {
+            return Err(format!(
+                "concat axis {axis} is out of bounds for rank {}",
+                first.shape.len()
+            ));
+        }
+        let mut shape = first.shape.clone();
+        let mut axis_extent = 0usize;
+        for tensor in tensors {
+            if tensor.shape.len() != shape.len() {
+                return Err(format!(
+                    "concat requires tensors with the same rank, got {:?} and {:?}",
+                    shape, tensor.shape
+                ));
+            }
+            for (dimension, (&expected, &actual)) in shape.iter().zip(&tensor.shape).enumerate() {
+                if dimension != axis && expected != actual {
+                    return Err(format!(
+                        "cannot concatenate shapes {:?} and {:?} along axis {axis}",
+                        shape, tensor.shape
+                    ));
+                }
+            }
+            axis_extent = axis_extent
+                .checked_add(tensor.shape[axis])
+                .ok_or_else(|| "concat axis extent overflows usize".to_string())?;
+        }
+        shape[axis] = axis_extent;
+
+        let outer = first.shape[..axis].iter().product::<usize>();
+        let inner = first.shape[axis + 1..].iter().product::<usize>();
+        let mut data = Vec::with_capacity(element_count(&shape)?);
+        for outer_index in 0..outer {
+            for tensor in tensors {
+                let block = tensor.shape[axis]
+                    .checked_mul(inner)
+                    .ok_or_else(|| "concat block size overflows usize".to_string())?;
+                let start = outer_index
+                    .checked_mul(block)
+                    .ok_or_else(|| "concat offset overflows usize".to_string())?;
+                data.extend_from_slice(&tensor.data[start..start + block]);
+            }
+        }
+        Self::from_shape_data(shape, data)
+    }
+
+    pub fn try_stack(tensors: &[PyTensor], axis: isize) -> Result<Self, String> {
+        let first = tensors
+            .first()
+            .ok_or_else(|| "stack requires at least one tensor".to_string())?;
+        if tensors.iter().any(|tensor| tensor.shape != first.shape) {
+            return Err("stack requires tensors with identical shapes".to_string());
+        }
+        let rank = first.shape.len() + 1;
+        let axis = normalize_axis(axis, rank)?;
+        let reshaped = tensors
+            .iter()
+            .map(|tensor| {
+                let mut shape = tensor.shape.clone();
+                shape.insert(axis, 1);
+                tensor.try_reshape(shape)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_concat(&reshaped, axis)
+    }
+
     pub fn try_slice(
         &self,
         axis: usize,
@@ -352,6 +640,92 @@ impl PyTensor {
         })
     }
 
+    #[staticmethod]
+    fn ones(shape: Vec<usize>) -> PyResult<Self> {
+        Self::full(shape, 1.0)
+    }
+
+    #[staticmethod]
+    fn full(shape: Vec<usize>, value: f64) -> PyResult<Self> {
+        let size = element_count(&shape).map_err(PyValueError::new_err)?;
+        Ok(Self {
+            shape,
+            data: Arc::new(vec![value; size]),
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (start, stop, step = 1.0))]
+    fn arange(start: f64, stop: f64, step: f64) -> PyResult<Self> {
+        if !(start.is_finite() && stop.is_finite() && step.is_finite()) {
+            return Err(PyValueError::new_err(
+                "arange start, stop, and step must be finite",
+            ));
+        }
+        if step == 0.0 {
+            return Err(PyValueError::new_err("arange step must not be zero"));
+        }
+        if (step > 0.0 && start >= stop) || (step < 0.0 && start <= stop) {
+            return Err(PyValueError::new_err(
+                "arange start, stop, and step do not define a non-empty range",
+            ));
+        }
+        let mut data = Vec::new();
+        let mut value = start;
+        if step > 0.0 {
+            while value < stop {
+                data.push(value);
+                value += step;
+            }
+        } else {
+            while value > stop {
+                data.push(value);
+                value += step;
+            }
+        }
+        Self::from_shape_data(vec![data.len()], data).map_err(PyValueError::new_err)
+    }
+
+    #[staticmethod]
+    fn linspace(start: f64, stop: f64, num: usize) -> PyResult<Self> {
+        if !(start.is_finite() && stop.is_finite()) {
+            return Err(PyValueError::new_err(
+                "linspace start and stop must be finite",
+            ));
+        }
+        if num == 0 {
+            return Err(PyValueError::new_err("linspace num must be positive"));
+        }
+        if num == 1 {
+            return Self::from_shape_data(vec![1], vec![start]).map_err(PyValueError::new_err);
+        }
+        let denominator = (num - 1) as f64;
+        let data = (0..num)
+            .map(|index| start + (stop - start) * index as f64 / denominator)
+            .collect();
+        Self::from_shape_data(vec![num], data).map_err(PyValueError::new_err)
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (rows, cols = None))]
+    fn eye(rows: usize, cols: Option<usize>) -> PyResult<Self> {
+        if rows == 0 {
+            return Err(PyValueError::new_err("eye rows must be positive"));
+        }
+        let cols = cols.unwrap_or(rows);
+        if cols == 0 {
+            return Err(PyValueError::new_err("eye cols must be positive"));
+        }
+        let count = rows
+            .checked_mul(cols)
+            .ok_or_else(|| PyValueError::new_err("eye element count overflows usize"))?;
+        let mut data = vec![0.0; count];
+        for diagonal in 0..rows.min(cols) {
+            data[diagonal * cols + diagonal] = 1.0;
+        }
+        Self::from_shape_data(vec![rows, cols], data).map_err(PyValueError::new_err)
+    }
+
     #[getter]
     fn shape(&self) -> Vec<usize> {
         self.shape.clone()
@@ -370,6 +744,53 @@ impl PyTensor {
         self.try_reshape(shape).map_err(PyValueError::new_err)
     }
 
+    fn broadcast_to(&self, shape: Vec<usize>) -> PyResult<Self> {
+        self.try_broadcast_to(shape).map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axes = None))]
+    fn transpose(&self, axes: Option<Vec<isize>>) -> PyResult<Self> {
+        self.try_transpose(axes).map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None))]
+    fn sum(&self, axis: Option<isize>) -> PyResult<Self> {
+        self.try_sum(axis).map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None))]
+    fn mean(&self, axis: Option<isize>) -> PyResult<Self> {
+        self.try_mean(axis).map_err(PyValueError::new_err)
+    }
+
+    fn tanh(&self) -> PyResult<Self> {
+        self.try_tanh().map_err(PyValueError::new_err)
+    }
+
+    fn exp(&self) -> PyResult<Self> {
+        self.try_exp().map_err(PyValueError::new_err)
+    }
+
+    fn log(&self) -> PyResult<Self> {
+        self.try_log().map_err(PyValueError::new_err)
+    }
+
+    fn sqrt(&self) -> PyResult<Self> {
+        self.try_sqrt().map_err(PyValueError::new_err)
+    }
+
+    fn sin(&self) -> PyResult<Self> {
+        self.try_sin().map_err(PyValueError::new_err)
+    }
+
+    fn cos(&self) -> PyResult<Self> {
+        self.try_cos().map_err(PyValueError::new_err)
+    }
+
+    fn powi(&self, exponent: u32) -> PyResult<Self> {
+        self.try_powi(exponent).map_err(PyValueError::new_err)
+    }
+
     #[pyo3(signature = (axis, start, length, step = 1))]
     fn slice(
         &self,
@@ -382,36 +803,135 @@ impl PyTensor {
             .map_err(PyValueError::new_err)
     }
 
-    fn __add__(&self, rhs: &Self) -> PyResult<Self> {
-        self.try_add(rhs).map_err(PyValueError::new_err)
+    fn __add__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
+            return self.try_add(&rhs).map_err(PyValueError::new_err);
+        }
+        if let Ok(rhs) = rhs.extract::<f64>() {
+            return self.try_add_scalar(rhs).map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected Tensor or numeric scalar operand",
+        ))
     }
 
-    fn add(&self, rhs: &Self) -> PyResult<Self> {
+    fn add(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
         self.__add__(rhs)
     }
 
-    fn __sub__(&self, rhs: &Self) -> PyResult<Self> {
-        self.try_sub(rhs).map_err(PyValueError::new_err)
+    fn __radd__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.__add__(lhs)
     }
 
-    fn sub(&self, rhs: &Self) -> PyResult<Self> {
+    fn __sub__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
+            return self.try_sub(&rhs).map_err(PyValueError::new_err);
+        }
+        if let Ok(rhs) = rhs.extract::<f64>() {
+            return self.try_sub_scalar(rhs).map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected Tensor or numeric scalar operand",
+        ))
+    }
+
+    fn sub(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
         self.__sub__(rhs)
     }
 
-    fn __mul__(&self, rhs: &Self) -> PyResult<Self> {
-        self.try_mul(rhs).map_err(PyValueError::new_err)
+    fn __rsub__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(lhs) = lhs.extract::<PyRef<'_, PyTensor>>() {
+            return lhs.try_sub(self).map_err(PyValueError::new_err);
+        }
+        if let Ok(lhs) = lhs.extract::<f64>() {
+            return self.try_scalar_sub(lhs).map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected Tensor or numeric scalar operand",
+        ))
     }
 
-    fn mul(&self, rhs: &Self) -> PyResult<Self> {
+    fn __mul__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
+            return self.try_mul(&rhs).map_err(PyValueError::new_err);
+        }
+        if let Ok(rhs) = rhs.extract::<f64>() {
+            return self.try_mul_scalar(rhs).map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected Tensor or numeric scalar operand",
+        ))
+    }
+
+    fn mul(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
         self.__mul__(rhs)
     }
 
-    fn __truediv__(&self, rhs: &Self) -> PyResult<Self> {
-        self.try_div(rhs).map_err(PyValueError::new_err)
+    fn __rmul__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.__mul__(lhs)
     }
 
-    fn div(&self, rhs: &Self) -> PyResult<Self> {
+    fn __truediv__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
+            return self.try_div(&rhs).map_err(PyValueError::new_err);
+        }
+        if let Ok(rhs) = rhs.extract::<f64>() {
+            return self.try_div_scalar(rhs).map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected Tensor or numeric scalar divisor",
+        ))
+    }
+
+    fn div(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
         self.__truediv__(rhs)
+    }
+
+    fn __rtruediv__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(lhs) = lhs.extract::<PyRef<'_, PyTensor>>() {
+            return lhs.try_div(self).map_err(PyValueError::new_err);
+        }
+        if let Ok(lhs) = lhs.extract::<f64>() {
+            return self.try_scalar_div(lhs).map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected Tensor or numeric scalar dividend",
+        ))
+    }
+
+    fn __neg__(&self) -> PyResult<Self> {
+        self.try_mul_scalar(-1.0).map_err(PyValueError::new_err)
+    }
+
+    fn __pow__(
+        &self,
+        exponent: &Bound<'_, PyAny>,
+        modulo: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        if modulo.is_some() {
+            return Err(PyTypeError::new_err(
+                "modulo argument is not supported for Tensor power",
+            ));
+        }
+        if let Ok(exponent) = exponent.extract::<u32>() {
+            return self.try_powi(exponent).map_err(PyValueError::new_err);
+        }
+        let exponent = exponent
+            .extract::<f64>()
+            .map_err(|_| PyTypeError::new_err("expected numeric scalar exponent"))?;
+        self.try_powf(exponent).map_err(PyValueError::new_err)
+    }
+
+    fn gt(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
+            return self.try_gt(&rhs).map_err(PyValueError::new_err);
+        }
+        if let Ok(rhs) = rhs.extract::<f64>() {
+            return self.try_gt_scalar(rhs).map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected Tensor or numeric scalar operand",
+        ))
     }
 
     fn __matmul__(&self, rhs: &Self) -> PyResult<Self> {
