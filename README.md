@@ -134,6 +134,10 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
   aggregate over the mapped batch as required by reverse-mode AD.
   `tensor_vmap_vjp_cuda_fn(...)` lowers the primal plus all requested VJP
   outputs into one CUDA union plan.
+- `Tensor.sum(axis=None, keepdims=False)` and `Tensor.mean(...)` accept a
+  single integer axis or a sequence of normalized axes. Trace tensors expose
+  the same contract; multi-axis reductions lower to existing axis-reduction
+  and reshape nodes, preserving CPU, CUDA, MLX, JVP, and VJP behavior.
 - `tensor_hessian_scalar_fn(fn, input_specs, input_name)` and
   `tensor_hvp_scalar_fn(fn, input_specs, input_name)` freeze a scalar rank-N
   trace for dense Hessian or Hessian-vector-product evaluation. They are

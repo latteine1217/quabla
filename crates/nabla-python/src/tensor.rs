@@ -96,6 +96,33 @@ fn normalize_permutation(axes: Option<Vec<isize>>, rank: usize) -> Result<Vec<us
     Ok(axes)
 }
 
+fn normalize_reduction_axes(axes: Vec<isize>, rank: usize) -> Result<Vec<usize>, String> {
+    let mut axes = axes
+        .into_iter()
+        .map(|axis| normalize_axis(axis, rank))
+        .collect::<Result<Vec<_>, _>>()?;
+    axes.sort_unstable();
+    if axes.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("reduction axes must be unique".to_string());
+    }
+    Ok(axes)
+}
+
+fn extract_reduction_axes(axis: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<isize>>> {
+    let Some(axis) = axis else {
+        return Ok(None);
+    };
+    if axis.is_none() {
+        return Ok(None);
+    }
+    if let Ok(axis) = axis.extract::<isize>() {
+        return Ok(Some(vec![axis]));
+    }
+    axis.extract::<Vec<isize>>().map(Some).map_err(|_| {
+        PyTypeError::new_err("axis must be None, an integer, or a sequence of integers")
+    })
+}
+
 fn broadcast_shape(lhs: &[usize], rhs: &[usize]) -> Result<Vec<usize>, String> {
     let rank = lhs.len().max(rhs.len());
     let mut shape = Vec::with_capacity(rank);
@@ -520,6 +547,50 @@ impl PyTensor {
         self.try_reduce(axis, scale)
     }
 
+    pub fn try_sum_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        self.try_reduce_axes(axes, keepdims, false)
+    }
+
+    pub fn try_mean_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        self.try_reduce_axes(axes, keepdims, true)
+    }
+
+    fn try_reduce_axes(
+        &self,
+        axes: Option<Vec<isize>>,
+        keepdims: bool,
+        mean: bool,
+    ) -> Result<Self, String> {
+        let Some(axes) = axes else {
+            let reduced = if mean {
+                self.try_mean(None)?
+            } else {
+                self.try_sum(None)?
+            };
+            return if keepdims {
+                reduced.try_reshape(vec![1; self.shape.len()])
+            } else {
+                Ok(reduced)
+            };
+        };
+        let mut axes = normalize_reduction_axes(axes, self.shape.len())?;
+        axes.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+        let mut reduced = self.clone();
+        for axis in axes {
+            reduced = if mean {
+                reduced.try_mean(Some(axis as isize))?
+            } else {
+                reduced.try_sum(Some(axis as isize))?
+            };
+            if keepdims {
+                let mut shape = reduced.shape.clone();
+                shape.insert(axis, 1);
+                reduced = reduced.try_reshape(shape)?;
+            }
+        }
+        Ok(reduced)
+    }
+
     pub fn try_tanh(&self) -> Result<Self, String> {
         self.try_map(f64::tanh)
     }
@@ -812,14 +883,16 @@ impl PyTensor {
         self.try_transpose(axes).map_err(PyValueError::new_err)
     }
 
-    #[pyo3(signature = (axis = None))]
-    fn sum(&self, axis: Option<isize>) -> PyResult<Self> {
-        self.try_sum(axis).map_err(PyValueError::new_err)
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn sum(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.try_sum_axes(extract_reduction_axes(axis)?, keepdims)
+            .map_err(PyValueError::new_err)
     }
 
-    #[pyo3(signature = (axis = None))]
-    fn mean(&self, axis: Option<isize>) -> PyResult<Self> {
-        self.try_mean(axis).map_err(PyValueError::new_err)
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn mean(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.try_mean_axes(extract_reduction_axes(axis)?, keepdims)
+            .map_err(PyValueError::new_err)
     }
 
     fn tanh(&self) -> PyResult<Self> {

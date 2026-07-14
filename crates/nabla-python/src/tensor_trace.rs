@@ -12,6 +12,40 @@ use pyo3::types::{PyAny, PyDict, PyList, PyString, PyTuple};
 
 use crate::tensor::PyTensor;
 
+fn normalize_reduction_axes(axes: Vec<isize>, rank: usize) -> Result<Vec<usize>, String> {
+    let rank = isize::try_from(rank).map_err(|_| "tensor rank exceeds isize".to_string())?;
+    let mut axes = axes
+        .into_iter()
+        .map(|axis| {
+            let normalized = if axis < 0 { rank + axis } else { axis };
+            if !(0..rank).contains(&normalized) {
+                return Err(format!("axis {axis} is out of bounds for rank {rank}"));
+            }
+            Ok(normalized as usize)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    axes.sort_unstable();
+    if axes.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("reduction axes must be unique".to_string());
+    }
+    Ok(axes)
+}
+
+fn extract_reduction_axes(axis: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<isize>>> {
+    let Some(axis) = axis else {
+        return Ok(None);
+    };
+    if axis.is_none() {
+        return Ok(None);
+    }
+    if let Ok(axis) = axis.extract::<isize>() {
+        return Ok(Some(vec![axis]));
+    }
+    axis.extract::<Vec<isize>>().map(Some).map_err(|_| {
+        PyTypeError::new_err("axis must be None, an integer, or a sequence of integers")
+    })
+}
+
 #[pyclass(name = "TensorTraceGraph", skip_from_py_object)]
 #[derive(Clone, Debug, Default)]
 pub struct TensorTraceGraph {
@@ -718,6 +752,44 @@ impl TraceTensor {
         ))
     }
 
+    fn reduce_axes_tensor(
+        &self,
+        axes: Option<Vec<isize>>,
+        keepdims: bool,
+        mean: bool,
+    ) -> Result<Self, String> {
+        let example_rank = self.shape.len() - usize::from(self.batch_axis.is_some());
+        let Some(axes) = axes else {
+            let reduced = if mean {
+                self.mean_tensor(None)?
+            } else {
+                self.sum_tensor(None)?
+            };
+            return if keepdims {
+                reduced.reshape_tensor(vec![1; example_rank])
+            } else {
+                Ok(reduced)
+            };
+        };
+        let mut axes = normalize_reduction_axes(axes, example_rank)?;
+        axes.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+        let mut reduced = self.clone();
+        for axis in axes {
+            reduced = if mean {
+                reduced.mean_tensor(Some(axis as isize))?
+            } else {
+                reduced.sum_tensor(Some(axis as isize))?
+            };
+            if keepdims {
+                let batch_offset = usize::from(reduced.batch_axis.is_some());
+                let mut shape = reduced.shape[batch_offset..].to_vec();
+                shape.insert(axis, 1);
+                reduced = reduced.reshape_tensor(shape)?;
+            }
+        }
+        Ok(reduced)
+    }
+
     fn sin_tensor(&self) -> Result<Self, String> {
         let mut ir = self
             .graph
@@ -1111,9 +1183,10 @@ impl TraceTensor {
         trace_scalar_left_operand(self, lhs, "div")
     }
 
-    #[pyo3(signature = (axis = None))]
-    fn sum(&self, axis: Option<isize>) -> PyResult<Self> {
-        self.sum_tensor(axis).map_err(PyValueError::new_err)
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn sum(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.reduce_axes_tensor(extract_reduction_axes(axis)?, keepdims, false)
+            .map_err(PyValueError::new_err)
     }
 
     fn __matmul__(&self, rhs: &Self) -> PyResult<Self> {
@@ -1155,9 +1228,10 @@ impl TraceTensor {
             .map_err(PyValueError::new_err)
     }
 
-    #[pyo3(signature = (axis = None))]
-    fn mean(&self, axis: Option<isize>) -> PyResult<Self> {
-        self.mean_tensor(axis).map_err(PyValueError::new_err)
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn mean(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.reduce_axes_tensor(extract_reduction_axes(axis)?, keepdims, true)
+            .map_err(PyValueError::new_err)
     }
 
     fn sin(&self) -> PyResult<Self> {

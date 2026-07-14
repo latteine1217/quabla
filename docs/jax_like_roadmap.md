@@ -450,6 +450,12 @@ inverse problems without attempting full NumPy compatibility.
 - Add dtype and device-placement APIs. Implicit cross-device copies are an
   error.
 
+Implementation status (2026-07-15): multi-axis `sum`/`mean` and `keepdims`
+are available for eager and traced tensors. They preserve symbolic AD and
+lower through the existing CPU, CUDA, and MLX reduction/reshape paths. Extrema,
+norms, indexing/views, gather/scatter, linear algebra extensions, neural
+primitives, and dtype/device APIs remain pending.
+
 Acceptance checks:
 
 - Reference SciML examples use no NumPy operation inside the differentiated

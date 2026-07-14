@@ -268,7 +268,22 @@ def test_tensor_reductions_match_trace_tensor_axis_semantics():
     assert last_axis.shape == [2, 3]
     assert last_axis.to_flat_list() == [1.5, 3.5, 5.5, 7.5, 9.5, 11.5]
 
-    for axis in (3, -4):
+    multiple_axes = tensor.sum(axis=[0, -1])
+    assert multiple_axes.shape == [3]
+    assert multiple_axes.to_flat_list() == [18.0, 26.0, 34.0]
+
+    kept_axes = tensor.mean(axis=(0, 2), keepdims=True)
+    assert kept_axes.shape == [1, 3, 1]
+    assert kept_axes.to_flat_list() == [4.5, 6.5, 8.5]
+
+    all_kept = tensor.sum(keepdims=True)
+    assert all_kept.shape == [1, 1, 1]
+    assert all_kept.to_flat_list() == [78.0]
+
+    assert tensor.sum(axis=[]).shape == [2, 3, 2]
+    assert tensor.sum(axis=[]).to_flat_list() == tensor.to_flat_list()
+
+    for axis in (3, -4, [0, 0]):
         try:
             tensor.sum(axis=axis)
         except ValueError:
@@ -1086,6 +1101,25 @@ def test_cuda_global_reductions_match_cpu_and_reset_output_buffers():
         assert abs(second - cpu) <= 1e-3
 
 
+def test_multi_axis_keepdims_reductions_match_cpu_on_mlx_and_cuda():
+    if os.environ.get("NABLA_MLX_TEST") is None and os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x: x.mean(axis=[0, 2], keepdims=True), [("x", [2, 3, 2])]
+    )
+    inputs = {"x": nabla.Tensor([2, 3, 2], [float(value) for value in range(1, 13)])}
+    cpu = traced.output.compile_cpu().evaluate(inputs)
+
+    if os.environ.get("NABLA_MLX_TEST") is not None:
+        mlx = traced.output.compile_mlx().evaluate(inputs)
+        assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
+
+    if os.environ.get("NABLA_CUDA_TEST") is not None:
+        cuda = traced.output.compile_cuda().evaluate(inputs)
+        assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
+
+
 def test_cuda_sqrt_composite_lowering_matches_cpu():
     if os.environ.get("NABLA_CUDA_TEST") is None:
         return
@@ -1436,6 +1470,32 @@ def test_trace_tensor_axis_reductions_support_ad():
     assert value.to_flat_list() == [6.0, 15.0]
     assert output_tangent.to_flat_list() == [3.0, 3.0]
     assert output_gradients["x"].to_flat_list() == [2.0, 2.0, 2.0, 3.0, 3.0, 3.0]
+
+    multi_axis = nabla.trace_tensor(
+        lambda x: x.mean(axis=[0, 2], keepdims=True), [("x", [2, 3, 2])]
+    )
+    multi_inputs = {"x": nabla.Tensor([2, 3, 2], [float(value) for value in range(1, 13)])}
+    multi_value, multi_gradients = multi_axis.graph.evaluate_value_and_vjp(
+        multi_axis.output.node_id,
+        multi_inputs,
+        nabla.Tensor([1, 3, 1], [2.0, 3.0, 4.0]),
+    )
+    assert multi_value.shape == [1, 3, 1]
+    assert multi_value.to_flat_list() == [4.5, 6.5, 8.5]
+    assert multi_gradients["x"].to_flat_list() == [
+        0.5,
+        0.5,
+        0.75,
+        0.75,
+        1.0,
+        1.0,
+        0.5,
+        0.5,
+        0.75,
+        0.75,
+        1.0,
+        1.0,
+    ]
 
     last_axis = nabla.trace_tensor(lambda x: x.mean(axis=-1), [("x", [2, 3])])
     last_axis_value = last_axis.graph.evaluate(last_axis.output.node_id, inputs)
@@ -3704,6 +3764,7 @@ if __name__ == "__main__":
     test_cuda_adam_vjp_optimizer_updates_parameters_from_one_shared_graph()
     test_cuda_batched_matmul_vjp_matches_cpu_trace_evaluation()
     test_cuda_global_reductions_match_cpu_and_reset_output_buffers()
+    test_multi_axis_keepdims_reductions_match_cpu_on_mlx_and_cuda()
     test_cuda_sqrt_composite_lowering_matches_cpu()
     test_cuda_checked_div_and_log_lowering_matches_cpu()
     test_trace_tensor_tanh_scalar_loss_supports_jvp_and_vjp()
