@@ -432,8 +432,9 @@ Acceptance checks:
 Implementation status (2026-07-15): batch-axis propagation and public
 `in_axes`/`out_axis`/`None` layout normalization are implemented for the
 existing primitive surface. CPU coverage validates non-leading axes, unmapped
-arguments, reductions, and transpose. AD-transform composition and backend
-per-example gradient checks remain pending.
+arguments, reductions, transpose, batched JVP, and batched VJP. CUDA now
+lowers batched VJP primal and gradient outputs into one union plan; CPU and
+CUDA tests compare per-example gradients of a batched MLP with a loop reference.
 
 ### P3. SciML Array And Linear-Algebra Surface
 

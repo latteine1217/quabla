@@ -126,6 +126,27 @@ pub struct TensorVmapMlxFunction {
     signature: VmapSignature,
 }
 
+#[pyclass(name = "TensorVmapVjpFunction", skip_from_py_object)]
+pub struct TensorVmapVjpFunction {
+    plan: TensorExecutionPlan,
+    signature: VmapSignature,
+}
+
+#[pyclass(name = "TensorVmapJvpFunction", skip_from_py_object)]
+pub struct TensorVmapJvpFunction {
+    plan: TensorExecutionPlan,
+    signature: VmapSignature,
+}
+
+#[pyclass(name = "TensorVmapCudaVjpFunction", skip_from_py_object)]
+pub struct TensorVmapCudaVjpFunction {
+    plan: TensorCudaExecutionPlan,
+    output_node_id: TensorNodeId,
+    gradient_node_ids: BTreeMap<String, TensorNodeId>,
+    signature: VmapSignature,
+    cotangent_name: String,
+}
+
 #[pyclass(name = "TensorCudaValueAndGradFunction", skip_from_py_object)]
 pub struct TensorCudaValueAndGradFunction {
     plan: TensorCudaExecutionPlan,
@@ -1645,6 +1666,71 @@ impl TensorVmapCudaFunction {
 }
 
 #[pymethods]
+impl TensorVmapCudaVjpFunction {
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.plan.plan.node_count()
+    }
+
+    #[getter]
+    fn backend(&self) -> &'static str {
+        if self.plan.plan.uses_cublas() {
+            "cublas"
+        } else {
+            "nvrtc"
+        }
+    }
+
+    fn __call__(
+        &self,
+        values: &Bound<'_, PyDict>,
+        output_cotangent: &PyTensor,
+    ) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+        let mut inputs = vmap_inputs(&self.signature, values)?;
+        let cotangent = move_axis(
+            output_cotangent
+                .to_dynamic_tensor()
+                .map_err(PyValueError::new_err)?,
+            self.signature.out_axis,
+            0,
+        )
+        .map_err(PyValueError::new_err)?;
+        inputs.insert(self.cotangent_name.clone(), cotangent);
+        self.plan
+            .plan
+            .execute_retaining_without_output(&inputs, &BTreeSet::new())
+            .map_err(PyValueError::new_err)?;
+        let output = self
+            .plan
+            .plan
+            .computed_node_to_host(self.output_node_id)
+            .map_err(PyValueError::new_err)?;
+        let gradients = self
+            .gradient_node_ids
+            .iter()
+            .map(|(name, node_id)| {
+                self.plan
+                    .plan
+                    .computed_node_to_host(*node_id)
+                    .map(|gradient| (name.clone(), gradient))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            vmap_output(&self.signature, output)?,
+            vmap_gradient_outputs(&self.signature, gradients)?,
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorVmapCudaVjpFunction(node_count={})",
+            self.plan.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
 impl TensorGradScalarFunction {
     fn __call__(&self, values: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, PyTensor>> {
         let inputs = extract_tensor_map(values)?;
@@ -1775,6 +1861,76 @@ impl TensorVmapFunction {
 
     fn __repr__(&self) -> String {
         format!("TensorVmapFunction(node_count={})", self.plan.node_count())
+    }
+}
+
+#[pymethods]
+impl TensorVmapVjpFunction {
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.plan.node_count()
+    }
+
+    fn __call__(
+        &self,
+        values: &Bound<'_, PyDict>,
+        output_cotangent: &PyTensor,
+    ) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+        let inputs = vmap_inputs(&self.signature, values)?;
+        let output_cotangent = move_axis(
+            output_cotangent
+                .to_dynamic_tensor()
+                .map_err(PyValueError::new_err)?,
+            self.signature.out_axis,
+            0,
+        )
+        .map_err(PyValueError::new_err)?;
+        let (value, gradients) = self
+            .plan
+            .value_and_vjp(&inputs, output_cotangent)
+            .map_err(PyValueError::new_err)?;
+        let gradients = vmap_gradient_outputs(&self.signature, gradients)?;
+        Ok((vmap_output(&self.signature, value)?, gradients))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorVmapVjpFunction(node_count={})",
+            self.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
+impl TensorVmapJvpFunction {
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.plan.node_count()
+    }
+
+    fn __call__(
+        &self,
+        values: &Bound<'_, PyDict>,
+        input_tangents: &Bound<'_, PyDict>,
+    ) -> PyResult<(PyTensor, PyTensor)> {
+        let (value, tangent) = self
+            .plan
+            .jvp(
+                &vmap_inputs(&self.signature, values)?,
+                &vmap_inputs(&self.signature, input_tangents)?,
+            )
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            vmap_output(&self.signature, value)?,
+            vmap_output(&self.signature, tangent)?,
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorVmapJvpFunction(node_count={})",
+            self.plan.node_count()
+        )
     }
 }
 
@@ -2225,6 +2381,29 @@ fn vmap_output(signature: &VmapSignature, output: DynamicTensor) -> PyResult<PyT
     PyTensor::from_dynamic_tensor(output).map_err(PyValueError::new_err)
 }
 
+fn vmap_gradient_outputs(
+    signature: &VmapSignature,
+    gradients: BTreeMap<String, DynamicTensor>,
+) -> PyResult<BTreeMap<String, PyTensor>> {
+    gradients
+        .into_iter()
+        .map(|(name, gradient)| {
+            let axis = signature
+                .input_names
+                .iter()
+                .position(|candidate| candidate == &name)
+                .and_then(|index| signature.in_axes[index]);
+            let gradient = match axis {
+                Some(axis) => move_axis(gradient, 0, axis).map_err(PyValueError::new_err)?,
+                None => gradient,
+            };
+            PyTensor::from_dynamic_tensor(gradient)
+                .map(|gradient| (name, gradient))
+                .map_err(PyValueError::new_err)
+        })
+        .collect()
+}
+
 /// Trace a fixed-size vectorized function into one reusable CPU plan.
 ///
 /// `input_specs` describes one example. Mapped inputs are canonicalized to a
@@ -2403,6 +2582,116 @@ pub fn tensor_vmap_mlx_fn(
         .compile_mlx_plan(traced.output.node_id)
         .map_err(PyValueError::new_err)?;
     Ok(TensorVmapMlxFunction { plan, signature })
+}
+
+#[pyfunction]
+#[pyo3(signature = (function, input_specs, batch_size, in_axes = None, out_axis = 0))]
+pub fn tensor_vmap_vjp_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    batch_size: usize,
+    in_axes: Option<Vec<Option<isize>>>,
+    out_axis: isize,
+) -> PyResult<TensorVmapVjpFunction> {
+    let (traced, signature) = trace_tensor_vmap_python_function(
+        py,
+        function,
+        input_specs,
+        batch_size,
+        in_axes,
+        out_axis,
+    )?;
+    let plan = traced
+        .graph
+        .compile_cpu_plan(traced.output.node_id)
+        .map_err(PyValueError::new_err)?
+        .plan;
+    Ok(TensorVmapVjpFunction { plan, signature })
+}
+
+const CUDA_VMAP_COTANGENT_NAME: &str = "__nabla_vmap_cotangent";
+
+#[pyfunction]
+#[pyo3(signature = (function, input_specs, batch_size, in_axes = None, out_axis = 0, device_ordinal = 0))]
+pub fn tensor_vmap_vjp_cuda_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    batch_size: usize,
+    in_axes: Option<Vec<Option<isize>>>,
+    out_axis: isize,
+    device_ordinal: usize,
+) -> PyResult<TensorVmapCudaVjpFunction> {
+    if input_specs
+        .iter()
+        .any(|(name, _)| name == CUDA_VMAP_COTANGENT_NAME)
+    {
+        return Err(PyValueError::new_err(format!(
+            "tensor_vmap_vjp_cuda_fn reserves input name {CUDA_VMAP_COTANGENT_NAME:?}"
+        )));
+    }
+    let (traced, signature) = trace_tensor_vmap_python_function(
+        py,
+        function,
+        input_specs,
+        batch_size,
+        in_axes,
+        out_axis,
+    )?;
+    let (graph, value_node_id, gradients) = traced
+        .symbolic_vjp_graph(CUDA_VMAP_COTANGENT_NAME)
+        .map_err(PyValueError::new_err)?;
+    let mut output_node_ids = vec![value_node_id];
+    let mut gradient_names = Vec::with_capacity(signature.input_names.len());
+    for name in &signature.input_names {
+        let node_id = gradients.get(name).copied().ok_or_else(|| {
+            PyValueError::new_err(format!("vmap VJP input {name:?} is absent from the trace"))
+        })?;
+        gradient_names.push(name.clone());
+        output_node_ids.push(node_id);
+    }
+    let (plan, output_node_ids) = graph
+        .compile_cuda_multi_plan(&output_node_ids, device_ordinal)
+        .map_err(PyValueError::new_err)?;
+    let output_node_id = output_node_ids[0];
+    let gradient_node_ids = gradient_names
+        .into_iter()
+        .zip(output_node_ids.into_iter().skip(1))
+        .collect();
+    Ok(TensorVmapCudaVjpFunction {
+        plan,
+        output_node_id,
+        gradient_node_ids,
+        signature,
+        cotangent_name: CUDA_VMAP_COTANGENT_NAME.to_string(),
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (function, input_specs, batch_size, in_axes = None, out_axis = 0))]
+pub fn tensor_vmap_jvp_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    batch_size: usize,
+    in_axes: Option<Vec<Option<isize>>>,
+    out_axis: isize,
+) -> PyResult<TensorVmapJvpFunction> {
+    let (traced, signature) = trace_tensor_vmap_python_function(
+        py,
+        function,
+        input_specs,
+        batch_size,
+        in_axes,
+        out_axis,
+    )?;
+    let plan = traced
+        .graph
+        .compile_cpu_plan(traced.output.node_id)
+        .map_err(PyValueError::new_err)?
+        .plan;
+    Ok(TensorVmapJvpFunction { plan, signature })
 }
 
 #[pyfunction]

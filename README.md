@@ -128,6 +128,12 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
   reductions, transpose, reshape, broadcast, concat, slice, and `where`.
   `tensor_vmap_cuda_fn(...)` and `tensor_vmap_mlx_fn(...)` lower the same
   canonical trace for CUDA and MLX. Batch extent remains static.
+- `tensor_vmap_jvp_fn(...)` and `tensor_vmap_vjp_fn(...)` apply the same
+  batch-layout contract to runtime tangents and cotangents. Mapped input
+  gradients are restored to their declared `in_axes`; unmapped input gradients
+  aggregate over the mapped batch as required by reverse-mode AD.
+  `tensor_vmap_vjp_cuda_fn(...)` lowers the primal plus all requested VJP
+  outputs into one CUDA union plan.
 - `tensor_hessian_scalar_fn(fn, input_specs, input_name)` and
   `tensor_hvp_scalar_fn(fn, input_specs, input_name)` freeze a scalar rank-N
   trace for dense Hessian or Hessian-vector-product evaluation. They are

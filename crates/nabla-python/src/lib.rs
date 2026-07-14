@@ -15,8 +15,8 @@ pub use tensor_trace::{
     TensorCudaValueAndGradFunction, TensorGradScalarFunction, TensorHessianScalarFunction,
     TensorHvpScalarFunction, TensorJacobianFunction, TensorJitFunction, TensorJvpFunction,
     TensorMlxExecutionPlan, TensorTraceGraph, TensorTraceResult, TensorValueAndGradFunction,
-    TensorVjpFunction, TensorVmapCudaFunction, TensorVmapFunction, TensorVmapMlxFunction,
-    TraceTensor,
+    TensorVjpFunction, TensorVmapCudaFunction, TensorVmapCudaVjpFunction, TensorVmapFunction,
+    TensorVmapJvpFunction, TensorVmapMlxFunction, TensorVmapVjpFunction, TraceTensor,
 };
 pub use trace::{
     CpuExecutionPlan, GradFunction, GradScalarFunction, GradScalarTransform, IrAttrValue,
@@ -250,6 +250,9 @@ fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TensorVmapFunction>()?;
     m.add_class::<TensorVmapCudaFunction>()?;
     m.add_class::<TensorVmapMlxFunction>()?;
+    m.add_class::<TensorVmapVjpFunction>()?;
+    m.add_class::<TensorVmapJvpFunction>()?;
+    m.add_class::<TensorVmapCudaVjpFunction>()?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_cuda_fn, m)?)?;
     m.add_function(wrap_pyfunction!(
@@ -258,6 +261,9 @@ fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_cuda_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_mlx_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_vjp_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_vjp_cuda_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_jvp_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_vjp_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_jvp_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_jacobian_fn, m)?)?;

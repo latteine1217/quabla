@@ -1403,9 +1403,13 @@ impl TensorIr {
                     )?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
                 }
-                TensorOp::SumAxis { input, .. } => {
-                    let contribution =
-                        symbolic_broadcast_like(&mut transformed, upstream, values[*input])?;
+                TensorOp::SumAxis { input, axis } => {
+                    let contribution = symbolic_expand_reduced_axis(
+                        &mut transformed,
+                        upstream,
+                        values[*input],
+                        *axis,
+                    )?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
                 }
                 TensorOp::Matmul { lhs, rhs } => {
@@ -1475,8 +1479,12 @@ impl TensorIr {
                     symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
                 }
                 TensorOp::MeanAxis { input, axis } => {
-                    let contribution =
-                        symbolic_broadcast_like(&mut transformed, upstream, values[*input])?;
+                    let contribution = symbolic_expand_reduced_axis(
+                        &mut transformed,
+                        upstream,
+                        values[*input],
+                        *axis,
+                    )?;
                     let scale =
                         transformed.scalar_constant(1.0 / self.node(*input)?.shape[*axis] as f64);
                     let contribution = transformed.mul(contribution, scale)?;
@@ -3391,6 +3399,31 @@ fn symbolic_broadcast_like(
     let zero = symbolic_zero_like(graph, target)?;
     let ones = graph.powi(zero, 0)?;
     graph.mul(value, ones)
+}
+
+fn symbolic_expand_reduced_axis(
+    graph: &mut TensorIr,
+    value: TensorNodeId,
+    target: TensorNodeId,
+    axis: usize,
+) -> Result<TensorNodeId, String> {
+    let target_shape = graph.node_shape(target)?;
+    if axis >= target_shape.len() {
+        return Err(format!(
+            "cannot expand symbolic reduced axis {axis} for shape {target_shape:?}"
+        ));
+    }
+    let mut expanded_shape = target_shape.clone();
+    expanded_shape[axis] = 1;
+    let value_shape = graph.node_shape(value)?;
+    let expected_shape = reduced_shape(&target_shape, axis)?;
+    if value_shape != expected_shape {
+        return Err(format!(
+            "cannot expand symbolic reduced tensor shape {value_shape:?} along axis {axis} to {target_shape:?}"
+        ));
+    }
+    let expanded = graph.reshape(value, expanded_shape)?;
+    graph.broadcast_to(expanded, target_shape)
 }
 
 fn symbolic_reduce_to_shape(

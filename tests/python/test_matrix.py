@@ -1701,6 +1701,152 @@ def test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace():
         )
 
 
+def test_tensor_vmap_vjp_matches_per_example_loop_and_aggregates_unmapped_gradient():
+    vjp = nabla.tensor_vmap_vjp_fn(
+        lambda x, weight: (x * weight).tanh().sum(),
+        [("x", [2]), ("weight", [2])],
+        3,
+        in_axes=[1, None],
+    )
+    x_values = [0.0, 0.5, -1.0, 1.0, -0.5, 2.0]
+    weight_values = [2.0, -1.0]
+    cotangent_values = [1.0, 2.0, -0.5]
+    output, gradients = vjp(
+        {
+            "x": nabla.Tensor([2, 3], x_values),
+            "weight": nabla.Tensor([2], weight_values),
+        },
+        nabla.Tensor([3], cotangent_values),
+    )
+
+    per_example = [
+        [x_values[row * 3 + batch] for row in range(2)] for batch in range(3)
+    ]
+    expected_output = [
+        sum(math.tanh(value * weight) for value, weight in zip(example, weight_values))
+        for example in per_example
+    ]
+    expected_x = [
+        cotangent_values[batch]
+        * weight_values[row]
+        * (1.0 - math.tanh(x_values[row * 3 + batch] * weight_values[row]) ** 2)
+        for row in range(2)
+        for batch in range(3)
+    ]
+    expected_weight = [
+        sum(
+            cotangent_values[batch]
+            * x_values[row * 3 + batch]
+            * (1.0 - math.tanh(x_values[row * 3 + batch] * weight_values[row]) ** 2)
+            for batch in range(3)
+        )
+        for row in range(2)
+    ]
+
+    assert vjp.node_count > 0
+    assert_close_rows([output.to_flat_list()], [expected_output])
+    assert_close_rows([gradients["x"].to_flat_list()], [expected_x])
+    assert_close_rows([gradients["weight"].to_flat_list()], [expected_weight])
+
+
+def test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes():
+    jvp = nabla.tensor_vmap_jvp_fn(
+        lambda x: x.tanh(),
+        [("x", [2])],
+        3,
+        in_axes=[1],
+        out_axis=1,
+    )
+    values = [0.0, 0.5, -1.0, 1.0, -0.5, 2.0]
+    tangents = [1.0, 2.0, 3.0, -1.0, 0.5, 2.0]
+    output, output_tangent = jvp(
+        {"x": nabla.Tensor([2, 3], values)},
+        {"x": nabla.Tensor([2, 3], tangents)},
+    )
+
+    assert jvp.node_count > 0
+    assert_close_rows([output.to_flat_list()], [[math.tanh(value) for value in values]])
+    assert_close_rows(
+        [output_tangent.to_flat_list()],
+        [[direction * (1.0 - math.tanh(value) ** 2) for value, direction in zip(values, tangents)]],
+    )
+
+
+def test_tensor_vmap_cuda_vjp_matches_cpu_single_batched_plan():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    function = lambda x, weight: (x * weight).tanh().sum()
+    input_specs = [("x", [2]), ("weight", [2])]
+    values = {
+        "x": nabla.Tensor([2, 3], [0.0, 0.5, -1.0, 1.0, -0.5, 2.0]),
+        "weight": nabla.Tensor([2], [2.0, -1.0]),
+    }
+    cotangent = nabla.Tensor([3], [1.0, 2.0, -0.5])
+    cpu = nabla.tensor_vmap_vjp_fn(function, input_specs, 3, in_axes=[1, None])
+    cuda = nabla.tensor_vmap_vjp_cuda_fn(function, input_specs, 3, in_axes=[1, None])
+
+    expected_value, expected_gradients = cpu(values, cotangent)
+    value, gradients = cuda(values, cotangent)
+
+    assert cuda.node_count > 0
+    assert cuda.backend in {"cublas", "nvrtc"}
+    assert_close_rows([value.to_flat_list()], [expected_value.to_flat_list()], tol=2e-5)
+    assert_close_rows(
+        [gradients["x"].to_flat_list()], [expected_gradients["x"].to_flat_list()], tol=2e-5
+    )
+    assert_close_rows(
+        [gradients["weight"].to_flat_list()],
+        [expected_gradients["weight"].to_flat_list()],
+        tol=2e-5,
+    )
+
+
+def test_tensor_vmap_batched_mlp_gradients_match_loop_on_cpu_and_cuda():
+    function = lambda x, weight: (x.matmul(weight).tanh()).sum()
+    input_specs = [("x", [2]), ("weight", [2, 1])]
+    values = {
+        "x": nabla.Tensor([3, 2], [1.0, 2.0, -1.0, 0.5, 0.25, -2.0]),
+        "weight": nabla.Tensor([2, 1], [0.75, -0.5]),
+    }
+    cotangent = nabla.Tensor([3], [1.0, -0.25, 2.0])
+    cpu = nabla.tensor_vmap_vjp_fn(function, input_specs, 3, in_axes=[0, None])
+    value, gradients = cpu(values, cotangent)
+
+    examples = [[1.0, 2.0], [-1.0, 0.5], [0.25, -2.0]]
+    weights = [0.75, -0.5]
+    cotangents = [1.0, -0.25, 2.0]
+    activations = [sum(x * weight for x, weight in zip(example, weights)) for example in examples]
+    expected_value = [math.tanh(activation) for activation in activations]
+    expected_x = [
+        cotangents[batch] * weights[column] * (1.0 - math.tanh(activations[batch]) ** 2)
+        for batch in range(3)
+        for column in range(2)
+    ]
+    expected_weight = [
+        sum(
+            cotangents[batch]
+            * examples[batch][column]
+            * (1.0 - math.tanh(activations[batch]) ** 2)
+            for batch in range(3)
+        )
+        for column in range(2)
+    ]
+
+    assert_close_rows([value.to_flat_list()], [expected_value])
+    assert_close_rows([gradients["x"].to_flat_list()], [expected_x])
+    assert_close_rows([gradients["weight"].to_flat_list()], [expected_weight])
+
+    if os.environ.get("NABLA_CUDA_TEST") is not None:
+        cuda = nabla.tensor_vmap_vjp_cuda_fn(function, input_specs, 3, in_axes=[0, None])
+        cuda_value, cuda_gradients = cuda(values, cotangent)
+        assert_close_rows([cuda_value.to_flat_list()], [expected_value], tol=2e-5)
+        assert_close_rows([cuda_gradients["x"].to_flat_list()], [expected_x], tol=2e-5)
+        assert_close_rows(
+            [cuda_gradients["weight"].to_flat_list()], [expected_weight], tol=2e-5
+        )
+
+
 def test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan():
     if os.environ.get("NABLA_CUDA_TEST") is None:
         return
@@ -3583,6 +3729,10 @@ if __name__ == "__main__":
     test_tensor_vmap_fn_supports_in_axes_out_axis_and_unmapped_inputs()
     test_tensor_vmap_fn_reductions_and_transpose_preserve_batch_axis()
     test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace()
+    test_tensor_vmap_vjp_matches_per_example_loop_and_aggregates_unmapped_gradient()
+    test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes()
+    test_tensor_vmap_cuda_vjp_matches_cpu_single_batched_plan()
+    test_tensor_vmap_batched_mlp_gradients_match_loop_on_cpu_and_cuda()
     test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan()
     test_tensor_value_and_grad_cuda_fn_uses_one_callable_plan()
     test_cuda_adam_loss_optimizer_owns_scalar_loss_and_parameters()
