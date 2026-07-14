@@ -1241,6 +1241,18 @@ impl TensorCudaExecutionPlan {
         }
     }
 
+    #[getter]
+    fn device_buffer_count(&self) -> PyResult<usize> {
+        self.plan
+            .device_buffer_count()
+            .map_err(PyValueError::new_err)
+    }
+
+    #[getter]
+    fn fused_matmul_bias_tanh(&self) -> bool {
+        self.plan.uses_fused_matmul_bias_tanh()
+    }
+
     fn evaluate(&self, inputs: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
         let value = self
             .plan
@@ -1752,6 +1764,42 @@ pub fn tensor_jit_fn(
     Ok(TensorJitFunction { plan })
 }
 
+fn batched_input_specs(
+    input_specs: Vec<(String, Vec<usize>)>,
+    batch_size: usize,
+) -> PyResult<Vec<(String, Vec<usize>)>> {
+    if batch_size == 0 {
+        return Err(PyValueError::new_err(
+            "tensor_vmap_fn requires batch_size > 0",
+        ));
+    }
+
+    Ok(input_specs
+        .into_iter()
+        .map(|(name, shape)| {
+            let mut batched_shape = Vec::with_capacity(shape.len() + 1);
+            batched_shape.push(batch_size);
+            batched_shape.extend(shape);
+            (name, batched_shape)
+        })
+        .collect())
+}
+
+/// Trace a fixed-size axis-0 vectorized function into one reusable CPU plan.
+///
+/// Every argument is mapped over its leading dimension. The supplied input
+/// shapes describe one example; the compiled plan expects `[batch_size, ..shape]`
+/// inputs and returns an output with the same leading batch dimension.
+#[pyfunction]
+pub fn tensor_vmap_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    batch_size: usize,
+) -> PyResult<TensorJitFunction> {
+    tensor_jit_fn(py, function, batched_input_specs(input_specs, batch_size)?)
+}
+
 #[pyfunction]
 #[pyo3(signature = (function, input_specs, device_ordinal = 0))]
 pub fn tensor_jit_cuda_fn(
@@ -1764,6 +1812,40 @@ pub fn tensor_jit_cuda_fn(
     traced
         .graph
         .compile_cuda_plan(traced.output.node_id, device_ordinal)
+        .map_err(PyValueError::new_err)
+}
+
+/// Trace a fixed-size axis-0 vectorized function into one reusable CUDA plan.
+#[pyfunction]
+#[pyo3(signature = (function, input_specs, batch_size, device_ordinal = 0))]
+pub fn tensor_vmap_cuda_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    batch_size: usize,
+    device_ordinal: usize,
+) -> PyResult<TensorCudaExecutionPlan> {
+    tensor_jit_cuda_fn(
+        py,
+        function,
+        batched_input_specs(input_specs, batch_size)?,
+        device_ordinal,
+    )
+}
+
+/// Trace a fixed-size axis-0 vectorized function into one reusable MLX plan.
+#[pyfunction]
+pub fn tensor_vmap_mlx_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    batch_size: usize,
+) -> PyResult<TensorMlxExecutionPlan> {
+    let traced =
+        trace_tensor_python_function(py, function, batched_input_specs(input_specs, batch_size)?)?;
+    traced
+        .graph
+        .compile_mlx_plan(traced.output.node_id)
         .map_err(PyValueError::new_err)
 }
 

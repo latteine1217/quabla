@@ -10,6 +10,8 @@ not claim kernel-only throughput.
 """
 
 import argparse
+import json
+import platform
 import time
 
 import nabla
@@ -50,19 +52,41 @@ def benchmark(
     compile_start = time.perf_counter()
     plan = traced.output.compile_cuda()
     compile_seconds = time.perf_counter() - compile_start
+    warmup_iterations = 0 if device_resident else 5
 
     if device_resident:
         retained = list(inputs)
         seconds = plan.benchmark_device(inputs, iterations, retained)
         checksum = None
     else:
-        for _ in range(5):
+        for _ in range(warmup_iterations):
             plan.evaluate(inputs)
         start = time.perf_counter()
         checksum = 0.0
         for _ in range(iterations):
             checksum += plan.evaluate(inputs).to_flat_list()[0]
         seconds = time.perf_counter() - start
+    print(
+        "metadata="
+        + json.dumps(
+            {
+                "backend": plan.backend,
+                "compile_seconds": compile_seconds,
+                "device_ordinal": plan.device_ordinal,
+                "dtype": "f32",
+                "host": platform.platform(),
+                "iterations": iterations,
+                "synchronization_policy": "benchmark_device synchronizes each run"
+                if device_resident
+                else "evaluate synchronizes before host result materialization",
+                "transfer_policy": "retained-device-inputs"
+                if device_resident
+                else "host-to-device inputs and device-to-host output per evaluation",
+                "warmup_iterations": warmup_iterations,
+            },
+            sort_keys=True,
+        )
+    )
     if elementwise:
         elements = iterations
         for extent in lhs_shape:

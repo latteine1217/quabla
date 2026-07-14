@@ -1090,8 +1090,12 @@ fn mlx_backend_matches_cpu_for_concat_broadcast_and_tanh() {
     let joined = must!(graph.concat(vec![x, y], 0));
     let bias = must!(graph.broadcast_to(bias, vec![2, 2]));
     let shifted = must!(graph.add(joined, bias));
-    let activated = must!(graph.tanh(shifted));
-    let output = must!(graph.sum(activated));
+    let zero = graph.scalar_constant(0.0);
+    let mask = must!(graph.greater(shifted, zero));
+    let tanh = must!(graph.tanh(shifted));
+    let activated = must!(graph.where_select(mask, tanh, shifted));
+    let reduced = must!(graph.sum_axis(activated, 0));
+    let output = must!(graph.sum(reduced));
     let inputs = BTreeMap::from([
         (
             "x".to_string(),

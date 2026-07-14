@@ -699,6 +699,56 @@ def test_mlx_trace_tensor_compiles_and_matches_cpu():
     assert_close_rows([plan.evaluate(inputs).to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
 
+def test_mlx_symbolic_vjp_executes_mlp_bias_gradient():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, weight, bias: (x.matmul(weight) + bias).tanh().sum(),
+        [("x", [2, 2]), ("weight", [2, 3]), ("bias", [1, 3])],
+    )
+    inputs = {
+        "x": nabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
+        "weight": nabla.Tensor([2, 3], [1.0, -1.0, 2.0, 0.5, 1.5, -0.5]),
+        "bias": nabla.Tensor([1, 3], [0.25, -0.5, 1.0]),
+        "loss_cotangent": nabla.Tensor([], [1.0]),
+    }
+    gradient = traced.symbolic_vjp("loss_cotangent")["bias"].output
+    cpu = gradient.compile_cpu().evaluate(inputs)
+    mlx = gradient.compile_mlx().evaluate(inputs)
+    assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
+
+
+def test_mlx_trace_tensor_executes_masked_loss():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x: nabla.where(x.gt(0.0), x.powi(2), x).sum(), [("x", [2, 2])]
+    )
+    inputs = {"x": nabla.Tensor([2, 2], [-2.0, -1.0, 1.0, 3.0])}
+    cpu = traced.output.compile_cpu().evaluate(inputs)
+    mlx = traced.output.compile_mlx().evaluate(inputs)
+    assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
+
+
+def test_mlx_symbolic_vjp_executes_masked_loss_gradient():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x: nabla.where(x.gt(0.0), x.powi(2), x).sum(), [("x", [2, 2])]
+    )
+    inputs = {
+        "x": nabla.Tensor([2, 2], [-2.0, -1.0, 1.0, 3.0]),
+        "loss_cotangent": nabla.Tensor([], [1.0]),
+    }
+    gradient = traced.symbolic_vjp("loss_cotangent")["x"].output
+    cpu = gradient.compile_cpu().evaluate(inputs)
+    mlx = gradient.compile_mlx().evaluate(inputs)
+    assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
+
+
 def test_cuda_trace_tensor_slice_keeps_primal_and_symbolic_vjp_on_device():
     if os.environ.get("NABLA_CUDA_TEST") is None:
         return
@@ -808,6 +858,60 @@ def test_cuda_plan_evaluates_with_static_inputs_retained_on_device():
     assert plan.benchmark_device(inputs, 2, ["x", "bias"]) > 0.0
     actual = plan.evaluate(inputs).to_flat_list()
     expected = [math.tanh(-1.0), 0.0, math.tanh(2.0), math.tanh(3.0)]
+    for value, target in zip(actual, expected):
+        assert abs(value - target) < 1e-5
+
+
+def test_cuda_plan_reuses_dead_temporary_buffers():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, weight, bias: ((x.matmul(weight) + bias).tanh() + bias),
+        [("x", [2, 2]), ("weight", [2, 2]), ("bias", [1, 2])],
+    )
+    plan = traced.output.compile_cuda()
+    inputs = {
+        "x": nabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
+        "weight": nabla.Tensor([2, 2], [1.0, 2.0, -1.0, 1.0]),
+        "bias": nabla.Tensor([1, 2], [0.25, -0.5]),
+    }
+
+    plan.evaluate(inputs)
+    first = plan.evaluate(inputs).to_flat_list()
+    first_buffer_count = plan.device_buffer_count
+    second = plan.evaluate(inputs).to_flat_list()
+
+    assert first == second
+    assert first_buffer_count == plan.device_buffer_count
+    assert first_buffer_count < plan.node_count
+
+
+def test_cuda_fuses_rank_two_matmul_bias_tanh_epilogue():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, weight, bias: (x.matmul(weight) + bias).tanh(),
+        [("x", [2, 2]), ("weight", [2, 3]), ("bias", [1, 3])],
+    )
+    plan = traced.output.compile_cuda()
+    inputs = {
+        "x": nabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
+        "weight": nabla.Tensor([2, 3], [1.0, -1.0, 2.0, 0.5, 1.5, -0.5]),
+        "bias": nabla.Tensor([1, 3], [0.25, -0.5, 1.0]),
+    }
+
+    actual = plan.evaluate(inputs).to_flat_list()
+    expected = [
+        math.tanh(-0.75),
+        math.tanh(0.5),
+        math.tanh(-1.0),
+        math.tanh(2.25),
+        math.tanh(1.5),
+        math.tanh(2.0),
+    ]
+    assert plan.fused_matmul_bias_tanh
     for value, target in zip(actual, expected):
         assert abs(value - target) < 1e-5
 
@@ -1464,6 +1568,63 @@ def test_tensor_jit_fn_reuses_a_compiled_plan():
         [second.to_flat_list()],
         [[0.0, math.tanh(2.0), math.tanh(-2.0), math.tanh(1.0)]],
     )
+
+
+def test_tensor_vmap_fn_traces_one_batched_plan():
+    mapped = nabla.tensor_vmap_fn(
+        lambda x, weight: x.matmul(weight).tanh(),
+        [("x", [2, 2]), ("weight", [2, 1])],
+        3,
+    )
+
+    result = mapped(
+        {
+            "x": nabla.Tensor(
+                [3, 2, 2],
+                [1.0, 0.0, 0.0, 1.0, 2.0, 1.0, 1.0, 2.0, 3.0, 0.0, 0.0, 3.0],
+            ),
+            "weight": nabla.Tensor([3, 2, 1], [1.0, -1.0, 1.0, 0.5, 2.0, 1.0]),
+        }
+    )
+
+    assert result.shape == [3, 2, 1]
+    assert_close_rows(
+        [result.to_flat_list()],
+        [[math.tanh(value) for value in [1.0, -1.0, 2.5, 2.0, 6.0, 3.0]]],
+    )
+
+    try:
+        nabla.tensor_vmap_fn(lambda x: x, [("x", [2])], 0)
+    except ValueError as error:
+        assert "batch_size" in str(error)
+    else:
+        raise AssertionError("tensor_vmap_fn accepted a zero batch size")
+
+
+def test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace():
+    input_specs = [("x", [2, 2]), ("weight", [2, 1])]
+    values = {
+        "x": nabla.Tensor(
+            [3, 2, 2],
+            [1.0, 0.0, 0.0, 1.0, 2.0, 1.0, 1.0, 2.0, 3.0, 0.0, 0.0, 3.0],
+        ),
+        "weight": nabla.Tensor([3, 2, 1], [1.0, -1.0, 1.0, 0.5, 2.0, 1.0]),
+    }
+    expected = [[math.tanh(value) for value in [1.0, -1.0, 2.5, 2.0, 6.0, 3.0]]]
+
+    if os.environ.get("NABLA_MLX_TEST") is not None:
+        mlx_compiled = nabla.tensor_vmap_mlx_fn(
+            lambda x, weight: x.matmul(weight).tanh(), input_specs, 3
+        )
+        assert mlx_compiled.backend == "mlx"
+        assert_close_rows([mlx_compiled(values).to_flat_list()], expected, tol=1e-5)
+
+    if os.environ.get("NABLA_CUDA_TEST") is not None:
+        cuda_compiled = nabla.tensor_vmap_cuda_fn(
+            lambda x, weight: x.matmul(weight).tanh(), input_specs, 3
+        )
+        assert cuda_compiled.backend in {"cublas", "nvrtc"}
+        assert_close_rows([cuda_compiled(values).to_flat_list()], expected, tol=1e-5)
 
 
 def test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan():
@@ -3235,11 +3396,16 @@ if __name__ == "__main__":
     test_trace_tensor_stack_supports_symbolic_vjp()
     test_cuda_trace_tensor_concat_keeps_primal_and_symbolic_vjp_on_device()
     test_mlx_trace_tensor_compiles_and_matches_cpu()
+    test_mlx_symbolic_vjp_executes_mlp_bias_gradient()
+    test_mlx_trace_tensor_executes_masked_loss()
+    test_mlx_symbolic_vjp_executes_masked_loss_gradient()
     test_cuda_trace_tensor_slice_keeps_primal_and_symbolic_vjp_on_device()
     test_cuda_trace_tensor_broadcast_to_keeps_primal_and_symbolic_vjp_on_device()
     test_cuda_multi_parameter_sgd_keeps_gradient_plans_synchronized()
     test_cuda_adam_keeps_optimizer_state_on_device()
     test_cuda_plan_evaluates_with_static_inputs_retained_on_device()
+    test_cuda_plan_reuses_dead_temporary_buffers()
+    test_cuda_fuses_rank_two_matmul_bias_tanh_epilogue()
     test_cuda_multi_parameter_adam_keeps_gradient_plans_synchronized()
     test_cuda_adam_optimizer_updates_minibatch_inputs_without_resetting_state()
     test_cuda_adam_vjp_optimizer_updates_parameters_from_one_shared_graph()
@@ -3266,6 +3432,8 @@ if __name__ == "__main__":
     test_tensor_value_and_grad_fn_returns_scalar_value_and_gradients()
     test_tensor_hessian_and_hvp_scalar_fn_reuse_a_compiled_plan()
     test_tensor_jit_fn_reuses_a_compiled_plan()
+    test_tensor_vmap_fn_traces_one_batched_plan()
+    test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace()
     test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan()
     test_tensor_vjp_fn_reuses_a_compiled_plan_with_runtime_cotangent()
     test_tensor_jvp_fn_reuses_a_compiled_plan_with_runtime_tangent()

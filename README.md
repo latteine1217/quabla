@@ -112,6 +112,12 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
   gradients from one frozen-plan execution.
 - `tensor_jit_cuda_fn(fn, input_specs, device_ordinal=0)` traces and compiles
   a fixed-shape rank-N function to a reusable callable CUDA plan on Linux.
+- `tensor_vmap_fn(fn, input_specs, batch_size)` traces one fixed-size axis-0
+  batched plan. `input_specs` describe one example; every input is supplied as
+  `[batch_size, ...example_shape]` at invocation. `tensor_vmap_cuda_fn(...)`
+  and `tensor_vmap_mlx_fn(...)` compile the same vectorized trace for CUDA and
+  MLX. This first transform deliberately supports only mapped leading axes and
+  a static batch size.
 - `tensor_hessian_scalar_fn(fn, input_specs, input_name)` and
   `tensor_hvp_scalar_fn(fn, input_specs, input_name)` freeze a scalar rank-N
   trace for dense Hessian or Hessian-vector-product evaluation. They are
@@ -145,8 +151,11 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
   graphs use one fused CUDA kernel; `div` and `log` retain their checked-domain
   semantics through general per-operation lowering.
   It requires a CUDA driver plus `libnvrtc.so` at runtime. Host inputs and
-  outputs still cross the device boundary on every `evaluate()`, while plan
-  buffers and optimizer state are retained by the immutable plan.
+  outputs still cross the device boundary on every `evaluate()`. Intermediate
+  device buffers are reclaimed after their final consumer and reused by later
+  nodes; retained inputs, the output buffer, and optimizer state keep stable
+  allocations. `plan.device_buffer_count` reports the plan's current retained
+  plus reusable device-buffer count for benchmark diagnostics.
   `TensorCudaExecutionPlan.evaluate_device(inputs, retained_input_names=...)`
   executes without materializing an output; supplied retained inputs upload on
   the first call and remain device-resident for subsequent static evaluations.
@@ -184,8 +193,8 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
   `TensorTraceResult.compile_mlx()`. The backend has CPU-parity coverage for
   elementwise operations, matmul, global reductions, reshape, transpose,
   concat, and broadcast. It is a primal execution backend, not a JIT: reverse
-  graphs that contain unsupported operations such as axis reductions, `where`,
-  `greater`, `slice`, or internal zero-padding return an explicit error rather
+  graphs that contain unsupported operations such as `slice` or internal
+  zero-padding return an explicit error rather
   than falling back to the host. Building the native MLX dependency requires
   Xcode's Metal Toolchain in addition to CMake:
   `xcodebuild -downloadComponent MetalToolchain`. The Python MLX wheel is not

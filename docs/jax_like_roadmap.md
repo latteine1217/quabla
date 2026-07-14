@@ -204,6 +204,12 @@ Current state:
   returning a reusable primal callable backed by that same frozen-plan boundary.
 - `tensor_jit_cuda_fn(fn, input_specs, device_ordinal=0)` traces and compiles
   a fixed-shape rank-N function to a reusable callable CUDA plan on Linux.
+- `tensor_vmap_fn(fn, input_specs, batch_size)` performs a compiler-level,
+  fixed-size axis-0 batch transform: it prepends `batch_size` to each
+  per-example input shape, traces once, and returns one reusable CPU plan.
+  `tensor_vmap_cuda_fn(...)` and `tensor_vmap_mlx_fn(...)` lower the same trace
+  to CUDA and MLX. This initial contract intentionally excludes `in_axes=None`,
+  nonzero/negative axes, `out_axes`, and dynamic batch sizes.
 - `tensor_hessian_scalar_fn(fn, input_specs, input_name)` and
   `tensor_hvp_scalar_fn(fn, input_specs, input_name)` freeze a scalar rank-N
   trace for dense Hessian or Hessian-vector-product evaluation. Dense Hessian
@@ -234,7 +240,10 @@ Current state:
   broadcast-batched matmul,
   rank-N concat with GPU-resident slice/pad-slice reverse nodes, global and axis reductions, transpose, broadcasting, `where`, `div`, `log`,
   and the supported unary primitives. Pure elementwise graphs use one fused
-  CUDA kernel; general graphs still lower per operation. It is still preview
+  CUDA kernel; general graphs still lower per operation. Intermediate CUDA
+  buffers are recycled by last-use liveness, while retained inputs, the output,
+  and Adam state stay allocated. `TensorCudaExecutionPlan.device_buffer_count`
+  exposes the current allocation count for diagnostics. It is still preview
   infrastructure: host inputs and outputs transfer per general evaluation. A
   gradient-output plan can retain one input and apply device-side SGD or Adam
   updates without materializing that parameter, gradient, or Adam moments on
@@ -306,8 +315,8 @@ as scalar constants, `powf` exponents, reduction axes, and concat axes.
 - `TensorTraceGraph.compile_mlx()`, `TraceTensor.compile_mlx()`, and
   `TensorTraceResult.compile_mlx()` expose the experimental MLX primal backend
   to Python. It supports elementwise arithmetic, unary math, matmul, global
-  sum/mean, reshape, transpose, concat, and broadcast. Axis reductions,
-  comparisons/`where`, slice, and internal zero-padding are rejected explicitly
+  sum/mean, axis reductions, reshape, transpose, concat, and broadcast.
+  Slice and internal zero-padding are rejected explicitly
   when a plan uses them.
 - The Python bridge does not yet provide general compiled JIT lowering.
 
@@ -325,3 +334,177 @@ Near-term milestone:
 - Add compiled lowering behind the current Python `jit` decorator factory.
 - Expand IR-to-AD beyond the current primitive set.
 - Add IR-to-backend lowering passes.
+
+## Execution Roadmap
+
+This section is the implementation order. A phase is not complete until its
+acceptance checks pass on every backend it claims to support. The sequence
+prioritizes a usable GPU-resident PINN training path before broader API surface
+area, distributed execution, or source-to-source AD research.
+
+### P0. Numerical Contract And Reproducible Baseline
+
+Goal: make backend correctness and performance regressions observable before
+adding new compiler behavior.
+
+- Define the public precision contract: CPU may retain its `f64` reference
+  behavior while CUDA and MLX execute `f32`; backend comparison tests must use
+  documented, operation-appropriate tolerances.
+- Maintain differential tests for CPU, CUDA, and MLX primal execution, JVP,
+  VJP, and the supported higher-order transforms.
+- Keep reproducible benchmarks for batched MLP forward, `value_and_grad`, a
+  Poisson residual, batched matmul, and an optimizer step. Record device,
+  dtype, shapes, warm-up policy, synchronization policy, and transfer policy.
+- Preserve explicit failure for unsupported backend operations. No backend may
+  silently fall back to host execution.
+
+Acceptance checks:
+
+- `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  and the Python test suite pass on the default build.
+- The MLX feature passes its Rust and Python suites on Apple silicon.
+- The CUDA feature passes its Rust and Python suites on the configured Linux
+  GPU, including a retained-device execution check.
+- `git diff --check` passes and benchmark artifacts report enough metadata to
+  reproduce a result.
+
+### P1. GPU-Resident Value-And-Grad Training Path
+
+Goal: make a small PINN train through one high-level CUDA API without copying
+parameters or gradients to the host on every step.
+
+- Add `tensor_value_and_grad_cuda_fn` for a scalar loss and named parameters.
+  It must compile a shared forward/reverse union plan rather than one plan per
+  parameter.
+- Expose a reusable CUDA training callable that owns parameter, optimizer, and
+  static collocation buffers. Dynamic mini-batch tensors may be refreshed
+  explicitly without retracing or resetting optimizer state.
+- Add a narrow, documented initializer and stateless random-key API needed to
+  construct MLP parameters reproducibly.
+- Provide a CUDA PINN integration example and test for Poisson/Helmholtz:
+  loss decreases, boundary residual is bounded, PDE residual is bounded, and
+  GPU allocation count stabilizes across training steps.
+- Measure and eliminate avoidable H2D/D2H copies in the training loop.
+
+Acceptance checks:
+
+- A Python example trains a two-layer PINN using only Nabla tensor APIs after
+  initialization.
+- Profiling confirms no per-step parameter or gradient device-to-host copy.
+- CPU reference and CUDA loss/gradient checks agree within the documented
+  `f32` tolerance.
+
+### P2. Composable `vmap`
+
+Goal: replace fixed axis-0 shape lifting with a transform that composes with
+AD and backend lowering.
+
+- Introduce per-primitive batching rules for elementwise operators, matmul,
+  reductions, transpose, broadcast, concat, slice, and `where`.
+- Support `in_axes`, `out_axes`, unmapped (`None`) arguments, and normalized
+  negative axes. Keep batch extent static until shape polymorphism exists.
+- Validate `vmap(grad)`, `grad(vmap)`, `vmap(jvp)`, and `vmap(vjp)` against a
+  loop reference while asserting that execution does not use a Python
+  per-example loop.
+- Include the batching signature in compilation cache identity.
+
+Acceptance checks:
+
+- Per-example gradients for a batched MLP agree with the loop reference on CPU
+  and CUDA.
+- CUDA and MLX execute one batched plan for their supported primitive subsets.
+
+### P3. SciML Array And Linear-Algebra Surface
+
+Goal: cover the array semantics required by PINNs, operator learning, and
+inverse problems without attempting full NumPy compatibility.
+
+- Add multi-axis reductions, `keepdims`, extrema, norms, gather/scatter, and
+  an explicit indexing/view model with differentiability rules.
+- Add a scoped `einsum` subset, `solve`, Cholesky, triangular solve, and their
+  AD rules where numerically well-defined.
+- Add common neural primitives: `relu`, `sigmoid`, `softplus`, `abs`,
+  `maximum`, and `minimum` with explicit subgradient policy.
+- Add dtype and device-placement APIs. Implicit cross-device copies are an
+  error.
+
+Acceptance checks:
+
+- Reference SciML examples use no NumPy operation inside the differentiated
+  model body.
+- Each new primitive has CPU finite-difference or analytic AD checks and
+  backend parity coverage.
+
+### P4. Compiler Passes And Kernel Performance
+
+Goal: turn the current frozen plan into a proper backend-neutral compilation
+pipeline.
+
+- Formalize `kernel_ir()` with typed shapes, dtypes, layouts, placements,
+  alias information, and effects.
+- Add canonicalization, constant folding, CSE, DCE, broadcast/layout
+  propagation, fusion partitioning, and buffer planning passes.
+- Prioritize CUDA fusion for GEMM+bias+activation, residual/loss reductions,
+  activation backward chains, and batched MLP blocks.
+- Evaluate CUDA Graphs for static training steps. Treat MLIR/StableHLO export
+  as an optional interoperability path, not a prerequisite for useful JIT.
+
+Acceptance checks:
+
+- Each pass has IR-level golden tests and preserves CPU reference results.
+- Benchmarks demonstrate an attributable speedup for at least one end-to-end
+  MLP/PINN training step, not only an isolated microkernel.
+
+### P5. Shape Polymorphism And Structured Control Flow
+
+Goal: support practical variable batch sizes and iterative differentiable
+programs without tracing arbitrary Python control flow.
+
+- Add symbolic dimensions and shape constraints with bounded specialization.
+- Add explicit IR operations analogous to `cond`, `scan`, and `fori_loop`.
+- Define JVP/VJP semantics for each control-flow operation and reject
+  data-dependent Python branches during tracing.
+
+Acceptance checks:
+
+- A time-stepping differentiable model and multiple collocation batch sizes run
+  with bounded recompilation and verified gradients.
+
+### P6. MLX Reverse-Mode Parity
+
+Goal: make the Apple backend a usable training backend rather than primal-only
+execution.
+
+- Lower rank-N `slice` and internal `pad_slice` correctly on MLX.
+- Add MLX device-resident parameters, gradients, and Adam state.
+- Expose MLX `value_and_grad` and training APIs with the same semantic contract
+  as CUDA for supported operations.
+
+Acceptance checks:
+
+- The P1 PINN example runs on MLX and agrees with CPU within its `f32`
+  tolerance.
+
+### P7. Distributed Sharding
+
+Goal: add multi-device execution only after single-device plans, layout, and
+memory contracts are stable.
+
+- Model mesh, placement, and partition specifications in IR metadata.
+- Implement data parallelism first, including deterministic gradient
+  all-reduce; add tensor parallel matmul only after that path is stable.
+- Lower collectives through NCCL on CUDA. Evaluate multi-node transport only
+  after single-node semantics and failure handling are tested.
+
+Acceptance checks:
+
+- Two-GPU data-parallel training matches the single-GPU reference within
+  documented tolerance and records collective timing separately.
+
+### Research Track: Rust Source-To-Source AD
+
+This track is intentionally not on the critical path. Start with a procedural
+macro over a pure, restricted Rust expression subset and compare it against
+Tensor IR AD and Enzyme. Do not claim support for arbitrary borrowing,
+mutation, dynamic dispatch, async code, or Python callbacks until their
+semantics are explicitly modeled and tested.

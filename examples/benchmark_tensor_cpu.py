@@ -6,6 +6,8 @@ Build the extension in release mode before running this benchmark:
 """
 
 import argparse
+import json
+import platform
 import time
 
 import nabla
@@ -40,9 +42,26 @@ def benchmark(iterations: int, batch: int, width: int) -> None:
     }
     cotangent = nabla.Tensor([], [1.0])
 
-    for _ in range(10):
+    warmup_iterations = 10
+    for _ in range(warmup_iterations):
         plan.evaluate(inputs)
         plan.evaluate_value_and_vjp(inputs, cotangent)
+
+    print(
+        "metadata="
+        + json.dumps(
+            {
+                "backend": "cpu",
+                "dtype": "f64",
+                "host": platform.platform(),
+                "iterations": iterations,
+                "shape": [batch, width],
+                "transfer_policy": "host-resident",
+                "warmup_iterations": warmup_iterations,
+            },
+            sort_keys=True,
+        )
+    )
 
     start = time.perf_counter()
     primal_checksum = 0.0

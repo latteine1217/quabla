@@ -245,7 +245,10 @@ fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_hessian_scalar_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_hvp_scalar_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_cuda_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_cuda_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_mlx_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_vjp_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_jvp_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_jacobian_fn, m)?)?;

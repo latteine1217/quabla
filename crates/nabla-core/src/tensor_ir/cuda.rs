@@ -10,7 +10,8 @@ use cudarc::driver::{
 use cudarc::nvrtc::compile_ptx;
 
 use super::{
-    contiguous_strides, element_count, DynamicTensor, TensorBackend, TensorExecutionPlan, TensorOp,
+    contiguous_strides, element_count, tensor_op_inputs, DynamicTensor, TensorBackend,
+    TensorExecutionPlan, TensorOp,
 };
 
 const CUDA_MATMUL_TILE: usize = 32;
@@ -30,12 +31,13 @@ pub struct CudaBackend {
 
 /// Immutable CUDA lowering with a retained CUDA context and loaded NVRTC module.
 ///
-/// Inputs and intermediate buffers are currently allocated per execution; retaining
-/// the compiled module removes repeated NVRTC compilation from training iterations.
+/// Intermediate buffers are recycled after their final consumer. Retained inputs,
+/// the plan output, and optimizer state keep stable device allocations.
 #[derive(Clone, Debug)]
 pub struct CudaExecutionPlan {
     plan: TensorExecutionPlan,
     fused_elementwise: bool,
+    matmul_bias_tanh: Option<CudaMatmulBiasTanhEpilogue>,
     device_ordinal: usize,
     context: Arc<CudaContext>,
     module: Arc<CudaModule>,
@@ -43,9 +45,20 @@ pub struct CudaExecutionPlan {
     state: Arc<Mutex<CudaExecutionState>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CudaMatmulBiasTanhEpilogue {
+    lhs: usize,
+    rhs: usize,
+    bias: usize,
+    rows: usize,
+    inner: usize,
+    cols: usize,
+}
+
 #[derive(Debug, Default)]
 struct CudaExecutionState {
     values: Vec<Option<CudaSlice<f32>>>,
+    free_buffers: BTreeMap<usize, Vec<CudaSlice<f32>>>,
     adam: BTreeMap<String, CudaAdamState>,
 }
 
@@ -66,6 +79,7 @@ impl CudaBackend {
     }
 
     pub fn compile(&self, plan: TensorExecutionPlan) -> Result<CudaExecutionPlan, String> {
+        let matmul_bias_tanh = cuda_matmul_bias_tanh_epilogue(&plan);
         let fused_candidate = plan.uses_fused_elementwise_kernel()
             && !matches!(&plan.nodes[plan.output_node_id].op, TensorOp::Input { .. });
         let (source, fused_elementwise) = if fused_candidate {
@@ -76,6 +90,10 @@ impl CudaBackend {
         } else {
             (cuda_program_source(&plan)?, false)
         };
+        let mut source = source;
+        if matmul_bias_tanh.is_some() {
+            source.push_str(CUDA_MATMUL_BIAS_TANH_SOURCE);
+        }
         let context = CudaContext::new(self.device_ordinal)
             .map_err(|error| format!("failed to create CUDA context: {error:?}"))?;
         let ptx = compile_ptx(source).map_err(|error| {
@@ -88,6 +106,7 @@ impl CudaBackend {
         Ok(CudaExecutionPlan {
             plan,
             fused_elementwise,
+            matmul_bias_tanh,
             device_ordinal: self.device_ordinal,
             context,
             module,
@@ -107,7 +126,22 @@ impl CudaExecutionPlan {
     }
 
     pub fn uses_cublas(&self) -> bool {
-        self.blas.is_some()
+        self.matmul_bias_tanh.is_none() && self.blas.is_some()
+    }
+
+    pub fn uses_fused_matmul_bias_tanh(&self) -> bool {
+        self.matmul_bias_tanh.is_some()
+    }
+
+    /// Number of allocated device buffers currently owned by this plan,
+    /// including reusable temporary buffers and retained values.
+    pub fn device_buffer_count(&self) -> Result<usize, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "CUDA execution plan state lock is poisoned".to_string())?;
+        Ok(state.values.iter().flatten().count()
+            + state.free_buffers.values().map(Vec::len).sum::<usize>())
     }
 
     pub fn synchronize(&self) -> Result<(), String> {
@@ -155,13 +189,31 @@ impl CudaExecutionPlan {
             .state
             .lock()
             .map_err(|_| "CUDA execution plan state lock is poisoned".to_string())?;
-        if self.fused_elementwise {
+        let CudaExecutionState {
+            values,
+            free_buffers,
+            ..
+        } = &mut *state;
+        if let Some(epilogue) = self.matmul_bias_tanh {
+            execute_cuda_matmul_bias_tanh_program(
+                &self.plan,
+                inputs,
+                &stream,
+                &self.module,
+                values,
+                free_buffers,
+                retained_inputs,
+                copy_output,
+                epilogue,
+            )
+        } else if self.fused_elementwise {
             execute_cuda_fused_elementwise_program(
                 &self.plan,
                 inputs,
                 &stream,
                 &self.module,
-                &mut state.values,
+                values,
+                free_buffers,
                 retained_inputs,
                 copy_output,
             )
@@ -174,7 +226,8 @@ impl CudaExecutionPlan {
                     module: &self.module,
                     blas: self.blas.as_ref(),
                 },
-                &mut state.values,
+                values,
+                free_buffers,
                 retained_inputs,
                 copy_output,
             )
@@ -316,6 +369,7 @@ impl CudaExecutionPlan {
         let CudaExecutionState {
             values,
             adam: adam_states,
+            ..
         } = &mut *state;
         let (before_output, output_and_after) = values.split_at_mut(gradient_node_id);
         let parameter = cuda_value_mut(before_output, parameter_node_id)?;
@@ -551,11 +605,145 @@ struct CudaProgramRuntime<'a> {
     blas: Option<&'a Arc<Mutex<CudaBlas>>>,
 }
 
+fn cuda_remaining_use_counts(plan: &TensorExecutionPlan) -> Vec<usize> {
+    let mut counts = vec![0; plan.nodes.len()];
+    for node in &plan.nodes {
+        for input in tensor_op_inputs(&node.op) {
+            counts[input] += 1;
+        }
+    }
+    counts
+}
+
+fn cuda_matmul_bias_tanh_epilogue(
+    plan: &TensorExecutionPlan,
+) -> Option<CudaMatmulBiasTanhEpilogue> {
+    let TensorOp::Tanh { input: add } = plan.nodes.get(plan.output_node_id)?.op else {
+        return None;
+    };
+    let TensorOp::Add { lhs, rhs } = plan.nodes.get(add)?.op else {
+        return None;
+    };
+    let (matmul, bias) = match (&plan.nodes.get(lhs)?.op, &plan.nodes.get(rhs)?.op) {
+        (TensorOp::Matmul { .. }, _) => (lhs, rhs),
+        (_, TensorOp::Matmul { .. }) => (rhs, lhs),
+        _ => return None,
+    };
+    let TensorOp::Matmul { lhs, rhs } = plan.nodes.get(matmul)?.op else {
+        return None;
+    };
+    let shape = &plan.nodes[plan.output_node_id].shape;
+    let lhs_shape = &plan.nodes[lhs].shape;
+    let rhs_shape = &plan.nodes[rhs].shape;
+    if shape.len() != 2
+        || lhs_shape.len() != 2
+        || rhs_shape.len() != 2
+        || plan.nodes[add].shape != *shape
+        || plan.nodes[matmul].shape != *shape
+        || plan.nodes[bias].shape != [1, shape[1]]
+    {
+        return None;
+    }
+    Some(CudaMatmulBiasTanhEpilogue {
+        lhs,
+        rhs,
+        bias,
+        rows: shape[0],
+        inner: lhs_shape[1],
+        cols: shape[1],
+    })
+}
+
+fn take_cuda_buffer(
+    stream: &Arc<CudaStream>,
+    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    count: usize,
+    node_id: usize,
+) -> Result<CudaSlice<f32>, String> {
+    if let Some(buffer) = free_buffers
+        .get_mut(&count)
+        .and_then(|buffers| buffers.pop())
+    {
+        return Ok(buffer);
+    }
+    stream
+        .alloc_zeros::<f32>(count)
+        .map_err(|error| format!("failed to allocate CUDA node {node_id}: {error:?}"))
+}
+
+fn upload_cuda_input(
+    stream: &Arc<CudaStream>,
+    slot: &mut Option<CudaSlice<f32>>,
+    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    host: &[f32],
+    name: &str,
+) -> Result<(), String> {
+    if slot.is_none() {
+        *slot = Some(take_cuda_buffer(
+            stream,
+            free_buffers,
+            host.len(),
+            usize::MAX,
+        )?);
+    }
+    stream
+        .memcpy_htod(
+            host,
+            slot.as_mut()
+                .expect("CUDA input buffer was allocated above"),
+        )
+        .map_err(|error| format!("failed to update CUDA input {name:?}: {error:?}"))
+}
+
+fn release_cuda_value(
+    values: &mut [Option<CudaSlice<f32>>],
+    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    node_id: usize,
+) -> Result<(), String> {
+    let slot = values
+        .get_mut(node_id)
+        .ok_or_else(|| format!("CUDA node {node_id} is missing its buffer slot"))?;
+    if let Some(buffer) = slot.take() {
+        free_buffers.entry(buffer.len()).or_default().push(buffer);
+    }
+    Ok(())
+}
+
+fn release_dead_cuda_values(
+    plan: &TensorExecutionPlan,
+    node_id: usize,
+    values: &mut [Option<CudaSlice<f32>>],
+    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    retained_inputs: &BTreeSet<String>,
+    remaining_uses: &mut [usize],
+) -> Result<(), String> {
+    for input_id in tensor_op_inputs(&plan.nodes[node_id].op) {
+        let remaining = remaining_uses
+            .get_mut(input_id)
+            .ok_or_else(|| format!("CUDA input node {input_id} does not exist"))?;
+        *remaining = remaining
+            .checked_sub(1)
+            .ok_or_else(|| format!("CUDA input node {input_id} has an invalid use count"))?;
+        if *remaining != 0 || input_id == plan.output_node_id {
+            continue;
+        }
+        if matches!(
+            &plan.nodes[input_id].op,
+            TensorOp::Input { name } if retained_inputs.contains(name)
+        ) {
+            continue;
+        }
+        release_cuda_value(values, free_buffers, input_id)?;
+    }
+    Ok(())
+}
+
 fn execute_cuda_device_program(
     plan: &TensorExecutionPlan,
     inputs: &BTreeMap<String, DynamicTensor>,
     runtime: CudaProgramRuntime<'_>,
     values: &mut Vec<Option<CudaSlice<f32>>>,
+    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
     retained_inputs: &BTreeSet<String>,
     copy_output: bool,
 ) -> Result<Option<DynamicTensor>, String> {
@@ -570,6 +758,7 @@ fn execute_cuda_device_program(
             .take(plan.nodes.len())
             .collect();
     }
+    let mut remaining_uses = cuda_remaining_use_counts(plan);
 
     for (node_id, node) in plan.nodes.iter().enumerate() {
         let count = element_count(&node.shape)?;
@@ -588,16 +777,7 @@ fn execute_cuda_device_program(
                 if retained_inputs.contains(name) && slot.is_some() {
                     continue;
                 }
-                match slot {
-                    Some(buffer) => stream.memcpy_htod(&host, buffer).map_err(|error| {
-                        format!("failed to update CUDA input {name:?}: {error:?}")
-                    })?,
-                    None => {
-                        *slot = Some(stream.clone_htod(&host).map_err(|error| {
-                            format!("failed to copy CUDA input {name:?}: {error:?}")
-                        })?);
-                    }
-                }
+                upload_cuda_input(stream, slot, free_buffers, &host, name)?;
                 continue;
             }
             TensorOp::ScalarConstant { .. }
@@ -628,9 +808,7 @@ fn execute_cuda_device_program(
                     .first_mut()
                     .ok_or_else(|| format!("CUDA node {node_id} is missing its buffer"))?;
                 if slot.is_none() {
-                    *slot = Some(stream.alloc_zeros::<f32>(count).map_err(|error| {
-                        format!("failed to allocate CUDA node {node_id}: {error:?}")
-                    })?);
+                    *slot = Some(take_cuda_buffer(stream, free_buffers, count, node_id)?);
                 }
                 let output = slot
                     .as_mut()
@@ -654,6 +832,14 @@ fn execute_cuda_device_program(
                         blas,
                     },
                 )?;
+                release_dead_cuda_values(
+                    plan,
+                    node_id,
+                    values,
+                    free_buffers,
+                    retained_inputs,
+                    &mut remaining_uses,
+                )?;
                 continue;
             }
             TensorOp::Reshape { input } => {
@@ -663,15 +849,21 @@ fn execute_cuda_device_program(
                     .first_mut()
                     .ok_or_else(|| format!("CUDA reshape node {node_id} is missing its buffer"))?;
                 if slot.is_none() {
-                    *slot = Some(stream.alloc_zeros::<f32>(count).map_err(|error| {
-                        format!("failed to allocate CUDA reshape node {node_id}: {error:?}")
-                    })?);
+                    *slot = Some(take_cuda_buffer(stream, free_buffers, count, node_id)?);
                 }
                 stream
                     .memcpy_dtod(input, slot.as_mut().expect("allocated above"))
                     .map_err(|error| {
                         format!("failed to copy CUDA reshape node {node_id}: {error:?}")
                     })?;
+                release_dead_cuda_values(
+                    plan,
+                    node_id,
+                    values,
+                    free_buffers,
+                    retained_inputs,
+                    &mut remaining_uses,
+                )?;
                 continue;
             }
         };
@@ -691,12 +883,14 @@ fn execute_cuda_device_program(
     DynamicTensor::new(output_shape, data.into_iter().map(f64::from).collect()).map(Some)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_cuda_fused_elementwise_program(
     plan: &TensorExecutionPlan,
     inputs: &BTreeMap<String, DynamicTensor>,
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
     values: &mut Vec<Option<CudaSlice<f32>>>,
+    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
     retained_inputs: &BTreeSet<String>,
     copy_output: bool,
 ) -> Result<Option<DynamicTensor>, String> {
@@ -722,17 +916,7 @@ fn execute_cuda_fused_elementwise_program(
         if retained_inputs.contains(name) && slot.is_some() {
             continue;
         }
-        match slot {
-            Some(buffer) => stream
-                .memcpy_htod(&host, buffer)
-                .map_err(|error| format!("failed to update CUDA input {name:?}: {error:?}"))?,
-            None => {
-                *slot =
-                    Some(stream.clone_htod(&host).map_err(|error| {
-                        format!("failed to copy CUDA input {name:?}: {error:?}")
-                    })?);
-            }
-        }
+        upload_cuda_input(stream, slot, free_buffers, &host, name)?;
     }
 
     let output_node_id = plan.output_node_id;
@@ -740,47 +924,156 @@ fn execute_cuda_fused_elementwise_program(
     let count = element_count(&output_shape)?;
     let launch_count = u32::try_from(count)
         .map_err(|_| "CUDA fused elementwise launch exceeds u32 element count".to_string())?;
-    let (before_output, output_and_after) = values.split_at_mut(output_node_id);
-    let output = output_and_after
-        .first_mut()
-        .ok_or_else(|| "CUDA fused elementwise output slot is missing".to_string())?;
-    if output.is_none() {
-        *output = Some(
-            stream
-                .alloc_zeros::<f32>(count)
-                .map_err(|error| format!("failed to allocate CUDA fused output: {error:?}"))?,
-        );
-    }
-    let output = output
-        .as_mut()
-        .ok_or_else(|| "CUDA fused elementwise output was not allocated".to_string())?;
-    let kernel = module
-        .load_function("nabla_fused_elementwise")
-        .map_err(|error| format!("failed to load CUDA fused elementwise kernel: {error:?}"))?;
-    let mut launch = stream.launch_builder(&kernel);
+    let data = {
+        let (before_output, output_and_after) = values.split_at_mut(output_node_id);
+        let output = output_and_after
+            .first_mut()
+            .ok_or_else(|| "CUDA fused elementwise output slot is missing".to_string())?;
+        if output.is_none() {
+            *output = Some(take_cuda_buffer(
+                stream,
+                free_buffers,
+                count,
+                output_node_id,
+            )?);
+        }
+        let output = output
+            .as_mut()
+            .ok_or_else(|| "CUDA fused elementwise output was not allocated".to_string())?;
+        let kernel = module
+            .load_function("nabla_fused_elementwise")
+            .map_err(|error| format!("failed to load CUDA fused elementwise kernel: {error:?}"))?;
+        let mut launch = stream.launch_builder(&kernel);
+        for (node_id, node) in plan.nodes.iter().enumerate() {
+            if matches!(&node.op, TensorOp::Input { .. }) {
+                launch.arg(cuda_value(before_output, node_id)?);
+            }
+        }
+        let device_count = u64::try_from(count)
+            .map_err(|_| "CUDA fused elementwise count exceeds u64".to_string())?;
+        launch.arg(&mut *output);
+        launch.arg(&device_count);
+        unsafe {
+            launch
+                .launch(LaunchConfig::for_num_elems(launch_count))
+                .map_err(|error| {
+                    format!("failed to launch CUDA fused elementwise kernel: {error:?}")
+                })?;
+        }
+        if copy_output {
+            Some(
+                stream.clone_dtoh(output).map_err(|error| {
+                    format!("failed to copy CUDA fused output to host: {error:?}")
+                })?,
+            )
+        } else {
+            None
+        }
+    };
     for (node_id, node) in plan.nodes.iter().enumerate() {
-        if matches!(&node.op, TensorOp::Input { .. }) {
-            launch.arg(cuda_value(before_output, node_id)?);
+        if matches!(&node.op, TensorOp::Input { name } if !retained_inputs.contains(name)) {
+            release_cuda_value(values, free_buffers, node_id)?;
         }
     }
-    let device_count =
-        u64::try_from(count).map_err(|_| "CUDA fused elementwise count exceeds u64".to_string())?;
-    launch.arg(&mut *output);
-    launch.arg(&device_count);
-    unsafe {
-        launch
-            .launch(LaunchConfig::for_num_elems(launch_count))
-            .map_err(|error| {
-                format!("failed to launch CUDA fused elementwise kernel: {error:?}")
-            })?;
+    data.map(|data| DynamicTensor::new(output_shape, data.into_iter().map(f64::from).collect()))
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_cuda_matmul_bias_tanh_program(
+    plan: &TensorExecutionPlan,
+    inputs: &BTreeMap<String, DynamicTensor>,
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    values: &mut Vec<Option<CudaSlice<f32>>>,
+    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    retained_inputs: &BTreeSet<String>,
+    copy_output: bool,
+    epilogue: CudaMatmulBiasTanhEpilogue,
+) -> Result<Option<DynamicTensor>, String> {
+    validate_cuda_program_inputs(plan, inputs)?;
+    if values.len() != plan.nodes.len() {
+        *values = std::iter::repeat_with(|| None)
+            .take(plan.nodes.len())
+            .collect();
     }
-    if !copy_output {
-        return Ok(None);
+    for (node_id, node) in plan.nodes.iter().enumerate() {
+        let TensorOp::Input { name } = &node.op else {
+            continue;
+        };
+        let slot = &mut values[node_id];
+        if retained_inputs.contains(name) && slot.is_some() {
+            continue;
+        }
+        let host = inputs[name]
+            .data()
+            .iter()
+            .map(|value| *value as f32)
+            .collect::<Vec<_>>();
+        upload_cuda_input(stream, slot, free_buffers, &host, name)?;
     }
-    let data = stream
-        .clone_dtoh(output)
-        .map_err(|error| format!("failed to copy CUDA fused output to host: {error:?}"))?;
-    DynamicTensor::new(output_shape, data.into_iter().map(f64::from).collect()).map(Some)
+    let output_node_id = plan.output_node_id;
+    let count = element_count(&plan.output_shape()?)?;
+    let data = {
+        let (before, current) = values.split_at_mut(output_node_id);
+        let output = current
+            .first_mut()
+            .ok_or_else(|| "CUDA epilogue output slot is missing".to_string())?;
+        if output.is_none() {
+            *output = Some(take_cuda_buffer(
+                stream,
+                free_buffers,
+                count,
+                output_node_id,
+            )?);
+        }
+        let output = output
+            .as_mut()
+            .expect("CUDA epilogue output was allocated above");
+        let kernel = module
+            .load_function("nabla_matmul_bias_tanh")
+            .map_err(|error| format!("failed to load CUDA matmul epilogue kernel: {error:?}"))?;
+        let mut launch = stream.launch_builder(&kernel);
+        launch.arg(cuda_value(before, epilogue.lhs)?);
+        launch.arg(cuda_value(before, epilogue.rhs)?);
+        launch.arg(cuda_value(before, epilogue.bias)?);
+        launch.arg(&mut *output);
+        let rows = epilogue.rows as u64;
+        let inner = epilogue.inner as u64;
+        let cols = epilogue.cols as u64;
+        launch.arg(&rows);
+        launch.arg(&inner);
+        launch.arg(&cols);
+        unsafe {
+            launch
+                .launch(LaunchConfig::for_num_elems(
+                    u32::try_from(count)
+                        .map_err(|_| "CUDA epilogue launch exceeds u32".to_string())?,
+                ))
+                .map_err(|error| format!("failed to launch CUDA matmul epilogue: {error:?}"))?;
+        }
+        if copy_output {
+            Some(
+                stream
+                    .clone_dtoh(output)
+                    .map_err(|error| format!("failed to copy CUDA epilogue output: {error:?}"))?,
+            )
+        } else {
+            None
+        }
+    };
+    for (node_id, node) in plan.nodes.iter().enumerate() {
+        if matches!(&node.op, TensorOp::Input { name } if !retained_inputs.contains(name)) {
+            release_cuda_value(values, free_buffers, node_id)?;
+        }
+    }
+    data.map(|data| {
+        DynamicTensor::new(
+            plan.output_shape()?,
+            data.into_iter().map(f64::from).collect(),
+        )
+    })
+    .transpose()
 }
 
 impl CudaBackend {
@@ -1817,6 +2110,22 @@ extern "C" __global__ void nabla_rank_two_matmul(
     if (row < rows && col + NABLA_BLOCK < cols) output[row * cols + col + NABLA_BLOCK] = value_01;
     if (row + NABLA_BLOCK < rows && col < cols) output[(row + NABLA_BLOCK) * cols + col] = value_10;
     if (row + NABLA_BLOCK < rows && col + NABLA_BLOCK < cols) output[(row + NABLA_BLOCK) * cols + col + NABLA_BLOCK] = value_11;
+}
+"#;
+
+const CUDA_MATMUL_BIAS_TANH_SOURCE: &str = r#"
+extern "C" __global__ void nabla_matmul_bias_tanh(
+    const float* lhs, const float* rhs, const float* bias, float* out,
+    unsigned long long rows, unsigned long long inner, unsigned long long cols
+) {
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long count = rows * cols;
+    if (index >= count) return;
+    unsigned long long row = index / cols;
+    unsigned long long col = index % cols;
+    float value = 0.0f;
+    for (unsigned long long k = 0; k < inner; ++k) value += lhs[row * inner + k] * rhs[k * cols + col];
+    out[index] = tanhf(value + bias[col]);
 }
 "#;
 

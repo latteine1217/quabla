@@ -64,6 +64,20 @@ impl TensorBackend for MlxBackend {
                 TensorOp::Mul { lhs, rhs } => mlx_value(&values, *lhs)?
                     .multiply_device(mlx_value(&values, *rhs)?, &stream)
                     .map_err(|error| error.to_string()),
+                TensorOp::Greater { lhs, rhs } => mlx_value(&values, *lhs)?
+                    .gt_device(mlx_value(&values, *rhs)?, &stream)
+                    .map_err(|error| error.to_string()),
+                TensorOp::Where {
+                    condition,
+                    on_true,
+                    on_false,
+                } => ops::r#where_device(
+                    mlx_value(&values, *condition)?,
+                    mlx_value(&values, *on_true)?,
+                    mlx_value(&values, *on_false)?,
+                    &stream,
+                )
+                .map_err(|error| error.to_string()),
                 TensorOp::Tanh { input } => ops::tanh_device(mlx_value(&values, *input)?, &stream)
                     .map_err(|error| error.to_string()),
                 TensorOp::Exp { input } => mlx_value(&values, *input)?
@@ -92,6 +106,21 @@ impl TensorBackend for MlxBackend {
                     .map_err(|error| error.to_string()),
                 TensorOp::Mean { input } => mlx_value(&values, *input)?
                     .mean_device(None, &stream)
+                    .map_err(|error| error.to_string()),
+                TensorOp::SumAxis { input, axis } => mlx_value(&values, *input)?
+                    .sum_axis_device(
+                        i32::try_from(*axis).map_err(|_| "MLX sum axis exceeds i32".to_string())?,
+                        None,
+                        &stream,
+                    )
+                    .map_err(|error| error.to_string()),
+                TensorOp::MeanAxis { input, axis } => mlx_value(&values, *input)?
+                    .mean_axis_device(
+                        i32::try_from(*axis)
+                            .map_err(|_| "MLX mean axis exceeds i32".to_string())?,
+                        None,
+                        &stream,
+                    )
                     .map_err(|error| error.to_string()),
                 TensorOp::Reshape { input } => mlx_value(&values, *input)?
                     .reshape_device(&mlx_shape(&node.shape)?, &stream)
@@ -124,16 +153,30 @@ impl TensorBackend for MlxBackend {
                     &stream,
                 )
                 .map_err(|error| error.to_string()),
-                TensorOp::Greater { .. }
-                | TensorOp::Where { .. }
-                | TensorOp::SumAxis { .. }
-                | TensorOp::MeanAxis { .. }
-                | TensorOp::Slice { .. }
-                | TensorOp::PadSlice { .. } => {
-                    return Err(format!(
-                        "MLX backend does not yet support {}",
-                        mlx_op_name(&node.op)
-                    ))
+                TensorOp::Slice { .. } => {
+                    return Err("MLX backend does not yet support slice".to_string())
+                }
+                TensorOp::PadSlice { input, axis, start } => {
+                    let rank = node.shape.len();
+                    let mut widths = vec![(0_i32, 0_i32); rank];
+                    let before = i32::try_from(*start)
+                        .map_err(|_| "MLX pad start exceeds i32".to_string())?;
+                    let after = node.shape[*axis]
+                        .checked_sub(start + plan.nodes[*input].shape[*axis])
+                        .ok_or_else(|| "MLX pad extent underflows".to_string())?;
+                    widths[*axis] = (
+                        before,
+                        i32::try_from(after)
+                            .map_err(|_| "MLX pad extent exceeds i32".to_string())?,
+                    );
+                    ops::pad_device(
+                        mlx_value(&values, *input)?,
+                        widths.as_slice(),
+                        None,
+                        None,
+                        &stream,
+                    )
+                    .map_err(|error| error.to_string())
                 }
             }
             .map_err(|error| {

@@ -76,6 +76,17 @@ impl CudaExecutionPlan {
         false
     }
 
+    pub fn uses_fused_matmul_bias_tanh(&self) -> bool {
+        false
+    }
+
+    pub fn device_buffer_count(&self) -> Result<usize, String> {
+        Err(format!(
+            "CUDA backend is unavailable for device {}: build Nabla on Linux with --features cuda",
+            self.device_ordinal
+        ))
+    }
+
     pub fn synchronize(&self) -> Result<(), String> {
         Err(format!(
             "CUDA backend is unavailable for device {}: build Nabla on Linux with --features cuda",
