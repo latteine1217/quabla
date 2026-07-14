@@ -2017,7 +2017,7 @@ impl TensorIr {
         self.slice(input, axis, start, length)
     }
 
-    fn pad_slice(
+    pub fn pad_slice(
         &mut self,
         input: TensorNodeId,
         output_shape: Vec<usize>,

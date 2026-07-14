@@ -381,6 +381,30 @@ def test_tensor_maximum_and_minimum_broadcast_and_choose_rhs_on_ties():
     assert left.minimum(1.0).to_flat_list() == [1.0, 0.0]
 
 
+def test_tensor_gather_and_scatter_add_support_negative_and_repeated_indices():
+    source = nabla.Tensor([2, 3], [0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+    assert source.gather([2, -3], axis=1).to_flat_list() == [2.0, 0.0, 5.0, 3.0]
+
+    base = nabla.Tensor.zeros([2, 3])
+    updates = nabla.Tensor([2, 3], [10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+    assert base.scatter_add([1, 1, 0], updates, axis=1).to_flat_list() == [
+        30.0,
+        30.0,
+        0.0,
+        60.0,
+        90.0,
+        0.0,
+    ]
+
+    for indices in ([], [3]):
+        try:
+            source.gather(indices, axis=1)
+        except (IndexError, ValueError):
+            pass
+        else:
+            raise AssertionError(f"gather accepted invalid indices {indices}")
+
+
 def test_tensor_broadcast_to_materializes_rank_n_contiguous_storage():
     tensor = nabla.Tensor([1, 2, 1], [2.0, -3.0])
     output = tensor.broadcast_to([3, 2, 4])
@@ -1465,6 +1489,50 @@ def test_trace_tensor_reduction_extrema_choose_last_tied_coordinate_for_gradient
             assert_close_rows(
                 [cuda_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
             )
+
+
+def test_trace_tensor_gather_and_scatter_add_preserve_repeated_index_gradients():
+    gather = nabla.trace_tensor(
+        lambda x: x.gather([2, 0, 2], axis=1).sum(), [("x", [2, 3])]
+    )
+    gather_inputs = {"x": nabla.Tensor([2, 3], [0.0] * 6)}
+    _, gather_gradients = gather.graph.evaluate_value_and_vjp(
+        gather.output.node_id, gather_inputs, nabla.Tensor([], [1.0])
+    )
+    assert gather_gradients["x"].to_flat_list() == [1.0, 0.0, 2.0, 1.0, 0.0, 2.0]
+
+    scatter = nabla.trace_tensor(
+        lambda base, updates, weight: (base.scatter_add([1, 1, 0], updates, axis=1) * weight).sum(),
+        [("base", [1, 3]), ("updates", [1, 3]), ("weight", [1, 3])],
+    )
+    scatter_inputs = {
+        "base": nabla.Tensor.zeros([1, 3]),
+        "updates": nabla.Tensor([1, 3], [2.0, 3.0, 5.0]),
+        "weight": nabla.Tensor([1, 3], [1.0, 2.0, 4.0]),
+    }
+    _, scatter_gradients = scatter.graph.evaluate_value_and_vjp(
+        scatter.output.node_id, scatter_inputs, nabla.Tensor([], [1.0])
+    )
+    assert scatter_gradients["base"].to_flat_list() == [1.0, 2.0, 4.0]
+    assert scatter_gradients["updates"].to_flat_list() == [2.0, 2.0, 1.0]
+
+    symbolic = scatter.symbolic_vjp("loss_cotangent")["updates"]
+    symbolic_inputs = {**scatter_inputs, "loss_cotangent": nabla.Tensor([], [1.0])}
+    assert symbolic.graph.evaluate(
+        symbolic.output.node_id, symbolic_inputs
+    ).to_flat_list() == [2.0, 2.0, 1.0]
+
+    cpu_gradient = symbolic.output.compile_cpu().evaluate(symbolic_inputs)
+    if os.environ.get("NABLA_MLX_TEST") is not None:
+        mlx_gradient = symbolic.output.compile_mlx().evaluate(symbolic_inputs)
+        assert_close_rows(
+            [mlx_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
+        )
+    if os.environ.get("NABLA_CUDA_TEST") is not None:
+        cuda_gradient = symbolic.output.compile_cuda().evaluate(symbolic_inputs)
+        assert_close_rows(
+            [cuda_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
+        )
 
 
 def test_trace_tensor_where_routes_gradients_and_masks_condition_derivatives():

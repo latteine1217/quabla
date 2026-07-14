@@ -10,7 +10,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyString, PyTuple};
 
-use crate::tensor::{parse_tensor_indices, PyTensor, TensorIndex};
+use crate::tensor::{parse_axis_indices, parse_tensor_indices, PyTensor, TensorIndex};
 
 fn normalize_reduction_axes(axes: Vec<isize>, rank: usize) -> Result<Vec<usize>, String> {
     let rank = isize::try_from(rank).map_err(|_| "tensor rank exceeds isize".to_string())?;
@@ -743,6 +743,100 @@ impl TraceTensor {
         ))
     }
 
+    fn pad_slice_tensor(
+        &self,
+        shape: Vec<usize>,
+        axis: isize,
+        start: usize,
+    ) -> Result<Self, String> {
+        let mut ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let node_id = ir.pad_slice(
+            self.node_id,
+            self.example_shape(shape),
+            usize::try_from(self.example_axis(axis)?)
+                .map_err(|_| "normalized tensor axis is negative".to_string())?,
+            start,
+        )?;
+        let shape = ir.node_shape(node_id)?;
+        Ok(Self::from_node(
+            self.graph.clone(),
+            node_id,
+            shape,
+            self.batch_axis,
+        ))
+    }
+
+    fn gather_tensor(&self, indices: &[usize], axis: isize) -> Result<Self, String> {
+        let actual_axis = usize::try_from(self.example_axis(axis)?)
+            .map_err(|_| "normalized tensor axis is negative".to_string())?;
+        if indices.is_empty() {
+            return Err("gather indices must not be empty".to_string());
+        }
+        if indices
+            .iter()
+            .any(|index| *index >= self.shape[actual_axis])
+        {
+            return Err(format!(
+                "gather index is out of bounds for axis {axis} with extent {}",
+                self.shape[actual_axis]
+            ));
+        }
+        let gathered = indices
+            .iter()
+            .map(|index| self.slice_tensor(axis, *index, index + 1))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_concat(
+            &gathered,
+            actual_axis - usize::from(self.batch_axis.is_some()),
+        )
+    }
+
+    fn scatter_add_tensor(
+        &self,
+        indices: &[usize],
+        updates: &Self,
+        axis: isize,
+    ) -> Result<Self, String> {
+        self.same_graph(updates)?;
+        let actual_axis = usize::try_from(self.example_axis(axis)?)
+            .map_err(|_| "normalized tensor axis is negative".to_string())?;
+        if indices.is_empty() {
+            return Err("scatter indices must not be empty".to_string());
+        }
+        if indices
+            .iter()
+            .any(|index| *index >= self.shape[actual_axis])
+        {
+            return Err(format!(
+                "scatter index is out of bounds for axis {axis} with extent {}",
+                self.shape[actual_axis]
+            ));
+        }
+        let mut expected_shape = self.shape.clone();
+        expected_shape[actual_axis] = indices.len();
+        if updates.shape != expected_shape || updates.batch_axis != self.batch_axis {
+            return Err(format!(
+                "scatter updates shape {:?} is incompatible with base shape {:?}, axis {axis}, and {} indices",
+                updates.shape,
+                self.shape,
+                indices.len()
+            ));
+        }
+        let batch_offset = usize::from(self.batch_axis.is_some());
+        let mut output = self.clone();
+        for (update_index, destination) in indices.iter().copied().enumerate() {
+            let update = updates.slice_tensor(axis, update_index, update_index + 1)?;
+            let padded =
+                update.pad_slice_tensor(self.shape[batch_offset..].to_vec(), axis, destination)?;
+            output = output.binary(&padded, "add")?;
+        }
+        Ok(output)
+    }
+
     fn index_tensor(&self, indices: &[TensorIndex]) -> Result<Self, String> {
         let mut output = self.clone();
         let mut axis = 0;
@@ -1396,6 +1490,29 @@ impl TraceTensor {
     #[pyo3(signature = (axis = None, keepdims = false))]
     fn min(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
         self.extrema_axes_tensor(extract_reduction_axes(axis)?, keepdims, false)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (indices, axis = 0))]
+    fn gather(&self, indices: &Bound<'_, PyAny>, axis: isize) -> PyResult<Self> {
+        let actual_axis = usize::try_from(self.example_axis(axis).map_err(PyValueError::new_err)?)
+            .map_err(|_| PyValueError::new_err("normalized tensor axis is negative"))?;
+        let indices = parse_axis_indices(indices, self.shape[actual_axis])?;
+        self.gather_tensor(&indices, axis)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (indices, updates, axis = 0))]
+    fn scatter_add(
+        &self,
+        indices: &Bound<'_, PyAny>,
+        updates: &Self,
+        axis: isize,
+    ) -> PyResult<Self> {
+        let actual_axis = usize::try_from(self.example_axis(axis).map_err(PyValueError::new_err)?)
+            .map_err(|_| PyValueError::new_err("normalized tensor axis is negative"))?;
+        let indices = parse_axis_indices(indices, self.shape[actual_axis])?;
+        self.scatter_add_tensor(&indices, updates, axis)
             .map_err(PyValueError::new_err)
     }
 

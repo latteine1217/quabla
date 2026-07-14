@@ -146,6 +146,12 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
   existing slice and selection nodes; when extrema tie, the final coordinate
   in row-major reduction order receives the derivative. A native fused extrema
   reduction remains a compiler-performance follow-up.
+- `Tensor.gather(indices, axis=0)` and `Tensor.scatter_add(indices, updates,
+  axis=0)` support static integer index sequences, including negative and
+  repeated indices. `scatter_add` is functional and accumulates repeated
+  destinations; its traced lowering uses slice/concat/pad-slice so VJPs route
+  repeated gather/scatter coordinates correctly. Dynamic tensor indices,
+  boolean masks, and assignment-style scatter are not yet supported.
 - `Tensor` and `TraceTensor` support `__getitem__` with integer and
   contiguous unit-step slice tuples, including negative indices. Integer
   indices lower to a length-one slice plus reshape, so reverse-mode AD and

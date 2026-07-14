@@ -461,8 +461,11 @@ extrema route the derivative to the final row-major coordinate. Native `sqrt`
 and L2 `norm` are available across CPU, CUDA, and MLX; negative values follow
 IEEE floating-point `NaN` semantics and all
 derivative orders at zero use an explicit zero subgradient. Native fused extrema
-reductions, other norm variants, gather/scatter, linear algebra extensions,
-remaining neural primitives, and
+reductions and other norm variants remain pending. Static integer-index
+`gather` and functional `scatter_add` are available with repeated-index VJP
+accumulation; dynamic tensor indices, masks, and assignment-style scatter
+remain pending the dtype/index IR design. Linear algebra extensions, remaining
+neural primitives, and
 dtype/device APIs remain pending.
 Eager and traced tensors now share a
 differentiable integer/contiguous-slice indexing subset; it lowers through

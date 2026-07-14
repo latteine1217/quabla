@@ -91,6 +91,35 @@ pub fn parse_tensor_indices(
     Ok(result)
 }
 
+pub fn parse_axis_indices(indices: &Bound<'_, PyAny>, axis_extent: usize) -> PyResult<Vec<usize>> {
+    let indices = indices
+        .extract::<Vec<isize>>()
+        .map_err(|_| PyTypeError::new_err("indices must be a sequence of integers"))?;
+    if indices.is_empty() {
+        return Err(PyValueError::new_err(
+            "gather/scatter indices must not be empty",
+        ));
+    }
+    indices
+        .into_iter()
+        .map(|index| {
+            let normalized = if index < 0 {
+                axis_extent as isize + index
+            } else {
+                index
+            };
+            usize::try_from(normalized)
+                .ok()
+                .filter(|index| *index < axis_extent)
+                .ok_or_else(|| {
+                    PyIndexError::new_err(format!(
+                        "index {index} is out of bounds for axis extent {axis_extent}"
+                    ))
+                })
+        })
+        .collect()
+}
+
 fn element_count(shape: &[usize]) -> Result<usize, String> {
     if shape.contains(&0) {
         return Err("tensor extents must be greater than zero".to_string());
@@ -920,6 +949,76 @@ impl PyTensor {
         }
         Ok(output)
     }
+
+    pub fn try_gather(&self, indices: &[usize], axis: isize) -> Result<Self, String> {
+        let axis = normalize_axis(axis, self.shape.len())?;
+        if indices.is_empty() {
+            return Err("gather indices must not be empty".to_string());
+        }
+        if indices.iter().any(|index| *index >= self.shape[axis]) {
+            return Err(format!(
+                "gather index is out of bounds for axis {axis} with extent {}",
+                self.shape[axis]
+            ));
+        }
+        let gathered = indices
+            .iter()
+            .map(|index| self.try_slice(axis, *index, 1, 1)?.materialize())
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_concat(&gathered, axis)
+    }
+
+    pub fn try_scatter_add(
+        &self,
+        indices: &[usize],
+        updates: &Self,
+        axis: isize,
+    ) -> Result<Self, String> {
+        let axis = normalize_axis(axis, self.shape.len())?;
+        if indices.is_empty() {
+            return Err("scatter indices must not be empty".to_string());
+        }
+        if indices.iter().any(|index| *index >= self.shape[axis]) {
+            return Err(format!(
+                "scatter index is out of bounds for axis {axis} with extent {}",
+                self.shape[axis]
+            ));
+        }
+        if updates.shape.len() != self.shape.len()
+            || updates.shape.iter().enumerate().any(|(dimension, extent)| {
+                if dimension == axis {
+                    *extent != indices.len()
+                } else {
+                    *extent != self.shape[dimension]
+                }
+            })
+        {
+            return Err(format!(
+                "scatter updates shape {:?} is incompatible with base shape {:?}, axis {axis}, and {} indices",
+                updates.shape,
+                self.shape,
+                indices.len()
+            ));
+        }
+        let strides = contiguous_strides(&self.shape);
+        let mut data = self.data.as_ref().clone();
+        for (source_index, value) in updates.data.iter().copied().enumerate() {
+            let mut remaining = source_index;
+            let mut destination_index = 0;
+            for dimension in (0..updates.shape.len()).rev() {
+                let coordinate = remaining % updates.shape[dimension];
+                remaining /= updates.shape[dimension];
+                let coordinate = if dimension == axis {
+                    indices[coordinate]
+                } else {
+                    coordinate
+                };
+                destination_index += coordinate * strides[dimension];
+            }
+            data[destination_index] += value;
+        }
+        Self::from_shape_data(self.shape.clone(), data)
+    }
 }
 
 #[pymethods]
@@ -1119,6 +1218,27 @@ impl PyTensor {
     #[pyo3(signature = (axis = None, keepdims = false))]
     fn min(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
         self.try_min_axes(extract_reduction_axes(axis)?, keepdims)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (indices, axis = 0))]
+    fn gather(&self, indices: &Bound<'_, PyAny>, axis: isize) -> PyResult<Self> {
+        let axis = normalize_axis(axis, self.shape.len()).map_err(PyValueError::new_err)?;
+        let indices = parse_axis_indices(indices, self.shape[axis])?;
+        self.try_gather(&indices, axis as isize)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (indices, updates, axis = 0))]
+    fn scatter_add(
+        &self,
+        indices: &Bound<'_, PyAny>,
+        updates: &Self,
+        axis: isize,
+    ) -> PyResult<Self> {
+        let axis = normalize_axis(axis, self.shape.len()).map_err(PyValueError::new_err)?;
+        let indices = parse_axis_indices(indices, self.shape[axis])?;
+        self.try_scatter_add(&indices, updates, axis as isize)
             .map_err(PyValueError::new_err)
     }
 
