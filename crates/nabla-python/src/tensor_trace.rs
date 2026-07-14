@@ -850,6 +850,65 @@ impl TraceTensor {
             .sqrt_tensor()
     }
 
+    fn extrema_axes_tensor(
+        &self,
+        axes: Option<Vec<isize>>,
+        keepdims: bool,
+        maximum: bool,
+    ) -> Result<Self, String> {
+        let example_rank = self.shape.len() - usize::from(self.batch_axis.is_some());
+        let Some(axes) = axes else {
+            let mut reduced = self.clone();
+            for _ in 0..example_rank {
+                reduced = reduced.extrema_axis_tensor(-1, maximum)?;
+            }
+            return if keepdims {
+                reduced.reshape_tensor(vec![1; example_rank])
+            } else {
+                Ok(reduced)
+            };
+        };
+        let mut axes = normalize_reduction_axes(axes, example_rank)?;
+        axes.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+        let mut reduced = self.clone();
+        for axis in axes {
+            reduced = reduced.extrema_axis_tensor(axis as isize, maximum)?;
+            if keepdims {
+                let batch_offset = usize::from(reduced.batch_axis.is_some());
+                let mut shape = reduced.shape[batch_offset..].to_vec();
+                shape.insert(axis, 1);
+                reduced = reduced.reshape_tensor(shape)?;
+            }
+        }
+        Ok(reduced)
+    }
+
+    fn extrema_axis_tensor(&self, axis: isize, maximum: bool) -> Result<Self, String> {
+        let batch_offset = usize::from(self.batch_axis.is_some());
+        let actual_axis = usize::try_from(self.example_axis(axis)?)
+            .map_err(|_| "normalized tensor axis is negative".to_string())?;
+        let axis = actual_axis - batch_offset;
+        let axis_extent = self.shape[actual_axis];
+        if axis_extent == 0 {
+            return Err("max/min reduction requires a non-empty reduced axis".to_string());
+        }
+        let remove_axis = |tensor: Self| {
+            let mut shape = tensor.shape[batch_offset..].to_vec();
+            shape.remove(axis);
+            tensor.reshape_tensor(shape)
+        };
+        let mut reduced = remove_axis(self.slice_tensor(axis as isize, 0, 1)?)?;
+        for index in 1..axis_extent {
+            let candidate = remove_axis(self.slice_tensor(axis as isize, index, index + 1)?)?;
+            reduced = if maximum {
+                reduced.maximum_tensor(&candidate)?
+            } else {
+                reduced.minimum_tensor(&candidate)?
+            };
+        }
+        Ok(reduced)
+    }
+
     fn sin_tensor(&self) -> Result<Self, String> {
         let mut ir = self
             .graph
@@ -1325,6 +1384,18 @@ impl TraceTensor {
     #[pyo3(signature = (axis = None, keepdims = false))]
     fn norm(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
         self.norm_tensor(extract_reduction_axes(axis)?, keepdims)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn max(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.extrema_axes_tensor(extract_reduction_axes(axis)?, keepdims, true)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn min(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.extrema_axes_tensor(extract_reduction_axes(axis)?, keepdims, false)
             .map_err(PyValueError::new_err)
     }
 

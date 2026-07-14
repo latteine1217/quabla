@@ -297,6 +297,11 @@ def test_tensor_reductions_match_trace_tensor_axis_semantics():
         [tensor.norm(axis=[0, -1], keepdims=True).to_flat_list()],
         [[math.sqrt(118.0), math.sqrt(206.0), math.sqrt(326.0)]],
     )
+    assert tensor.max().to_flat_list() == [12.0]
+    assert tensor.min().to_flat_list() == [1.0]
+    assert tensor.max(axis=[0, -1]).to_flat_list() == [8.0, 10.0, 12.0]
+    assert tensor.min(axis=[0, -1], keepdims=True).shape == [1, 3, 1]
+    assert tensor.min(axis=[0, -1], keepdims=True).to_flat_list() == [1.0, 3.0, 5.0]
 
 
 def test_tensor_elementwise_math_matches_python_math():
@@ -1424,6 +1429,42 @@ def test_trace_tensor_sqrt_and_norm_define_zero_subgradient_and_preserve_symboli
     )
     assert value.to_flat_list() == [5.0]
     assert norm_gradients["x"].to_flat_list() == [0.6, 0.8]
+
+
+def test_trace_tensor_reduction_extrema_choose_last_tied_coordinate_for_gradients():
+    inputs = {"x": nabla.Tensor([2, 3], [1.0, 5.0, 5.0, 2.0, 2.0, 0.0])}
+    cotangent = nabla.Tensor([], [1.0])
+
+    for operation, expected_value, expected_gradient in (
+        ("max", [7.0], [0.0, 0.0, 1.0, 0.0, 1.0, 0.0]),
+        ("min", [1.0], [1.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
+    ):
+        traced = nabla.trace_tensor(
+            lambda x: getattr(x, operation)(axis=1).sum(), [("x", [2, 3])]
+        )
+        value, gradients = traced.graph.evaluate_value_and_vjp(
+            traced.output.node_id, inputs, cotangent
+        )
+        symbolic = traced.symbolic_vjp("loss_cotangent")["x"]
+        symbolic_inputs = {**inputs, "loss_cotangent": cotangent}
+
+        assert value.to_flat_list() == expected_value
+        assert gradients["x"].to_flat_list() == expected_gradient
+        assert symbolic.graph.evaluate(
+            symbolic.output.node_id, symbolic_inputs
+        ).to_flat_list() == expected_gradient
+
+        cpu_gradient = symbolic.output.compile_cpu().evaluate(symbolic_inputs)
+        if os.environ.get("NABLA_MLX_TEST") is not None:
+            mlx_gradient = symbolic.output.compile_mlx().evaluate(symbolic_inputs)
+            assert_close_rows(
+                [mlx_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
+            )
+        if os.environ.get("NABLA_CUDA_TEST") is not None:
+            cuda_gradient = symbolic.output.compile_cuda().evaluate(symbolic_inputs)
+            assert_close_rows(
+                [cuda_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
+            )
 
 
 def test_trace_tensor_where_routes_gradients_and_masks_condition_derivatives():

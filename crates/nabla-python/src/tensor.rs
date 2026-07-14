@@ -649,6 +649,14 @@ impl PyTensor {
         self.try_powi(2)?.try_sum_axes(axes, keepdims)?.try_sqrt()
     }
 
+    pub fn try_max_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        self.try_extrema_axes(axes, keepdims, true)
+    }
+
+    pub fn try_min_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        self.try_extrema_axes(axes, keepdims, false)
+    }
+
     fn try_reduce_axes(
         &self,
         axes: Option<Vec<isize>>,
@@ -683,6 +691,91 @@ impl PyTensor {
             }
         }
         Ok(reduced)
+    }
+
+    fn try_extrema_axes(
+        &self,
+        axes: Option<Vec<isize>>,
+        keepdims: bool,
+        maximum: bool,
+    ) -> Result<Self, String> {
+        let Some(axes) = axes else {
+            let reduced = self.try_extrema(None, maximum)?;
+            return if keepdims {
+                reduced.try_reshape(vec![1; self.shape.len()])
+            } else {
+                Ok(reduced)
+            };
+        };
+        let mut axes = normalize_reduction_axes(axes, self.shape.len())?;
+        axes.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+        let mut reduced = self.clone();
+        for axis in axes {
+            reduced = reduced.try_extrema(Some(axis as isize), maximum)?;
+            if keepdims {
+                let mut shape = reduced.shape.clone();
+                shape.insert(axis, 1);
+                reduced = reduced.try_reshape(shape)?;
+            }
+        }
+        Ok(reduced)
+    }
+
+    fn try_extrema(&self, axis: Option<isize>, maximum: bool) -> Result<Self, String> {
+        if self.data.is_empty() {
+            return Err("max/min reduction requires at least one tensor element".to_string());
+        }
+        let Some(axis) = axis else {
+            let value = self
+                .data
+                .iter()
+                .copied()
+                .fold(self.data[0], |current, value| {
+                    if (maximum && value >= current) || (!maximum && value <= current) {
+                        value
+                    } else {
+                        current
+                    }
+                });
+            return Self::from_shape_data(vec![], vec![value]);
+        };
+        let axis = normalize_axis(axis, self.shape.len())?;
+        if self.shape[axis] == 0 {
+            return Err("max/min reduction requires a non-empty reduced axis".to_string());
+        }
+        let mut shape = self.shape.clone();
+        shape.remove(axis);
+        let output_strides = contiguous_strides(&shape);
+        let mut data = vec![None; element_count(&shape)?];
+
+        for (source_index, value) in self.data.iter().copied().enumerate() {
+            let mut remaining = source_index;
+            let mut output_index = 0;
+            for source_axis in (0..self.shape.len()).rev() {
+                let coordinate = remaining % self.shape[source_axis];
+                remaining /= self.shape[source_axis];
+                if source_axis != axis {
+                    let output_axis = if source_axis < axis {
+                        source_axis
+                    } else {
+                        source_axis - 1
+                    };
+                    output_index += coordinate * output_strides[output_axis];
+                }
+            }
+            match data[output_index] {
+                Some(current)
+                    if !((maximum && value >= current) || (!maximum && value <= current)) => {}
+                _ => data[output_index] = Some(value),
+            }
+        }
+
+        Self::from_shape_data(
+            shape,
+            data.into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| "max/min reduction produced an empty output".to_string())?,
+        )
     }
 
     pub fn try_tanh(&self) -> Result<Self, String> {
@@ -1014,6 +1107,18 @@ impl PyTensor {
     #[pyo3(signature = (axis = None, keepdims = false))]
     fn norm(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
         self.try_norm(extract_reduction_axes(axis)?, keepdims)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn max(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.try_max_axes(extract_reduction_axes(axis)?, keepdims)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn min(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.try_min_axes(extract_reduction_axes(axis)?, keepdims)
             .map_err(PyValueError::new_err)
     }
 

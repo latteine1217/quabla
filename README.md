@@ -141,6 +141,11 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
 - `Tensor.norm(axis=None, keepdims=False)` and `TraceTensor.norm(...)` provide
   an L2 norm over the selected axes. It is composed as `sqrt(sum(x.powi(2)))`
   and therefore preserves the same normalized-axis, backend, and AD contract.
+- `Tensor.max(axis=None, keepdims=False)` / `Tensor.min(...)` and traced
+  equivalents reduce one or more axes. Their static-shape trace lowering uses
+  existing slice and selection nodes; when extrema tie, the final coordinate
+  in row-major reduction order receives the derivative. A native fused extrema
+  reduction remains a compiler-performance follow-up.
 - `Tensor` and `TraceTensor` support `__getitem__` with integer and
   contiguous unit-step slice tuples, including negative indices. Integer
   indices lower to a length-one slice plus reshape, so reverse-mode AD and

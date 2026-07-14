@@ -455,10 +455,14 @@ are available for eager and traced tensors. They preserve symbolic AD and
 lower through the existing CPU, CUDA, and MLX reduction/reshape paths.
 Elementwise `maximum`/`minimum` are also available on eager and traced tensors;
 they compose `greater` and `where`, with equality subgradients routed to the
-right operand. Native `sqrt` and L2 `norm` are available across CPU, CUDA, and
-MLX; negative values follow IEEE floating-point `NaN` semantics and all
-derivative orders at zero use an explicit zero subgradient. Reduction extrema, other norm variants,
-gather/scatter, linear algebra extensions, remaining neural primitives, and
+right operand. `max`/`min` reductions now accept the same axis/keepdims
+contract and lower static traces through slice plus selection nodes; repeated
+extrema route the derivative to the final row-major coordinate. Native `sqrt`
+and L2 `norm` are available across CPU, CUDA, and MLX; negative values follow
+IEEE floating-point `NaN` semantics and all
+derivative orders at zero use an explicit zero subgradient. Native fused extrema
+reductions, other norm variants, gather/scatter, linear algebra extensions,
+remaining neural primitives, and
 dtype/device APIs remain pending.
 Eager and traced tensors now share a
 differentiable integer/contiguous-slice indexing subset; it lowers through
