@@ -1,9 +1,9 @@
 """Train a two-layer Poisson PINN with CUDA-resident multi-parameter Adam.
 
 Build on Linux with `maturin develop --features cuda`, then run this file.
-The residual and boundary losses share one symbolic graph. Its VJP outputs are
-compiled into one CUDA plan, so every parameter update uses the same gradient
-snapshot without host-side gradient aggregation.
+The loss-aware optimizer owns one shared CUDA value-and-gradient plan. Static
+collocation tensors, parameters, and Adam state stay device-resident; the loop
+does not construct VJP dictionaries or materialize gradients on the host.
 """
 
 import math
@@ -44,9 +44,7 @@ def main() -> None:
     residual_loss = (second_derivative.output + forcing).powi(2).mean()
     boundary_loss = (boundary - target).powi(2).mean()
     loss = residual_loss + boundary_loss
-    gradients = loss.symbolic_vjp("loss_cotangent")
     parameter_names = ["w1", "b1", "w2", "b2"]
-    loss_plan = loss.compile_cuda()
 
     teacher = {
         "w1": nabla.Tensor([1, 2], [1.2, -0.7]),
@@ -59,7 +57,6 @@ def main() -> None:
         "x_boundary": nabla.Tensor([4, 1], boundary_coordinates),
         "forcing": nabla.Tensor([4, 1], [0.0] * 4),
         "target": nabla.Tensor([4, 1], [0.0] * 4),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
         **teacher,
     }
     second_value = graph.evaluate(second_derivative.output.node_id, teacher_inputs)
@@ -69,28 +66,38 @@ def main() -> None:
         "x_boundary": nabla.Tensor([4, 1], boundary_coordinates),
         "forcing": nabla.Tensor([4, 1], [-value for value in second_value.to_flat_list()]),
         "target": boundary_target,
-        "loss_cotangent": nabla.Tensor([], [1.0]),
-        "w1": nabla.Tensor([1, 2], [0.3, -0.1]),
+        "w1": nabla.Tensor.glorot_normal([1, 2], nabla.Tensor.split_key(2026, 2)[0]),
         "b1": nabla.Tensor([1, 2], [0.0, 0.0]),
-        "w2": nabla.Tensor([2, 1], [0.2, 0.1]),
+        "w2": nabla.Tensor.glorot_normal([2, 1], nabla.Tensor.split_key(2026, 2)[1]),
         "b2": nabla.Tensor([1, 1], [0.0]),
     }
-    retained = ["x", "x_boundary", "forcing", "target", "loss_cotangent"]
-    optimizer = nabla.cuda_adam_vjp_optimizer(
-        {name: gradients[name] for name in parameter_names},
+    optimizer = nabla.cuda_adam_loss_optimizer(
+        loss,
+        parameter_names,
         inputs,
         0.02,
-        retained,
+        ["x", "x_boundary", "forcing", "target"],
     )
 
-    initial_loss = loss_plan.evaluate(inputs).to_flat_list()[0]
+    initial_loss = optimizer.loss().to_flat_list()[0]
     for _ in range(1500):
         optimizer.step()
+    final_loss = optimizer.loss().to_flat_list()[0]
     trained = optimizer.parameters()
-    final_loss = loss_plan.evaluate({**inputs, **trained}).to_flat_list()[0]
-    if not math.isfinite(final_loss) or final_loss >= initial_loss * 1e-4:
+    final_inputs = {**inputs, **trained}
+    final_residual_loss = graph.evaluate(residual_loss.node_id, final_inputs).to_flat_list()[0]
+    final_boundary_loss = graph.evaluate(boundary_loss.node_id, final_inputs).to_flat_list()[0]
+    if (
+        not math.isfinite(final_loss)
+        or final_loss >= initial_loss * 1e-4
+        or final_residual_loss >= 1e-5
+        or final_boundary_loss >= 1e-5
+    ):
         raise RuntimeError(f"CUDA MLP PINN did not converge: {initial_loss} -> {final_loss}")
-    print(f"loss={initial_loss:.8e}->{final_loss:.8e}")
+    print(
+        f"loss={initial_loss:.8e}->{final_loss:.8e}, "
+        f"residual={final_residual_loss:.8e}, boundary={final_boundary_loss:.8e}"
+    )
 
 
 if __name__ == "__main__":

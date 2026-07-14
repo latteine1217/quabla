@@ -22,6 +22,24 @@ def test_matrix_matmul():
     assert c.to_list() == [[58.0, 64.0], [139.0, 154.0]]
 
 
+def test_tensor_stateless_random_keys_and_glorot_initializer_are_reproducible():
+    first_keys = nabla.Tensor.split_key(1234, 2)
+    second_keys = nabla.Tensor.split_key(1234, 2)
+    assert first_keys == second_keys
+    assert first_keys[0] != first_keys[1]
+
+    first = nabla.Tensor.random_normal([2, 3], first_keys[0])
+    second = nabla.Tensor.random_normal([2, 3], first_keys[0])
+    different = nabla.Tensor.random_normal([2, 3], first_keys[1])
+    assert first.shape == [2, 3]
+    assert first.to_flat_list() == second.to_flat_list()
+    assert first.to_flat_list() != different.to_flat_list()
+
+    glorot = nabla.Tensor.glorot_normal([2, 3], first_keys[0])
+    assert glorot.shape == [2, 3]
+    assert all(math.isfinite(value) for value in glorot.to_flat_list())
+
+
 def test_matrix_add():
     a = nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
     b = nabla.Matrix([[0.5, 1.5], [2.5, 3.5]])
@@ -1657,6 +1675,78 @@ def test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan():
         assert abs(actual - expected) <= 1e-5
     for actual, expected in zip(second.to_flat_list(), expected_second):
         assert abs(actual - expected) <= 1e-5
+
+
+def test_tensor_value_and_grad_cuda_fn_uses_one_callable_plan():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    value_and_grad = nabla.tensor_value_and_grad_cuda_fn(
+        lambda x, target, weight, bias: ((x * weight + bias - target).powi(2)).mean(),
+        [("x", [2]), ("target", [2]), ("weight", [1]), ("bias", [1])],
+        ["weight", "bias"],
+    )
+    inputs = {
+        "x": nabla.Tensor([2], [-1.0, 1.0]),
+        "target": nabla.Tensor([2], [-1.0, 3.0]),
+        "weight": nabla.Tensor([1], [0.0]),
+        "bias": nabla.Tensor([1], [0.0]),
+    }
+
+    value, gradients = value_and_grad(inputs)
+    cpu_value_and_grad = nabla.tensor_value_and_grad_fn(
+        lambda x, target, weight, bias: ((x * weight + bias - target).powi(2)).mean(),
+        [("x", [2]), ("target", [2]), ("weight", [1]), ("bias", [1])],
+    )
+    cpu_value, cpu_gradients = cpu_value_and_grad(inputs)
+    assert abs(value.to_flat_list()[0] - 5.0) < 1e-5
+    assert abs(gradients["weight"].to_flat_list()[0] + 4.0) < 1e-5
+    assert abs(gradients["bias"].to_flat_list()[0] + 2.0) < 1e-5
+    assert abs(value.to_flat_list()[0] - cpu_value.to_flat_list()[0]) < 1e-5
+    assert abs(
+        gradients["weight"].to_flat_list()[0]
+        - cpu_gradients["weight"].to_flat_list()[0]
+    ) < 1e-5
+    assert abs(
+        gradients["bias"].to_flat_list()[0]
+        - cpu_gradients["bias"].to_flat_list()[0]
+    ) < 1e-5
+
+
+def test_cuda_adam_loss_optimizer_owns_scalar_loss_and_parameters():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, weight, bias: (x * weight) + bias,
+        [("x", [2]), ("weight", [1]), ("bias", [1])],
+    )
+    target = traced.graph.input("target", [2])
+    loss = (traced.output - target).powi(2).mean()
+    optimizer = nabla.cuda_adam_loss_optimizer(
+        loss,
+        ["weight", "bias"],
+        {
+            "x": nabla.Tensor([2], [-1.0, 1.0]),
+            "target": nabla.Tensor([2], [-1.0, 3.0]),
+            "weight": nabla.Tensor([1], [0.0]),
+            "bias": nabla.Tensor([1], [0.0]),
+        },
+        0.05,
+        ["x", "target"],
+    )
+
+    initial_loss = optimizer.loss().to_flat_list()[0]
+    initial_buffers = optimizer.device_buffer_count
+    for _ in range(250):
+        optimizer.step()
+    final_loss = optimizer.loss().to_flat_list()[0]
+    trained = optimizer.parameters()
+
+    assert final_loss < initial_loss * 1e-4
+    assert abs(trained["weight"].to_flat_list()[0] - 2.0) < 2e-3
+    assert abs(trained["bias"].to_flat_list()[0] - 1.0) < 2e-3
+    assert optimizer.device_buffer_count == initial_buffers
 
 
 def test_tensor_vjp_fn_reuses_a_compiled_plan_with_runtime_cotangent():
@@ -3356,6 +3446,7 @@ def test_grad_fn_evaluates_composed_add_matmul_vjp():
 
 
 if __name__ == "__main__":
+    test_tensor_stateless_random_keys_and_glorot_initializer_are_reproducible()
     test_matrix_matmul()
     test_matrix_add()
     test_matrix_sub()
@@ -3435,6 +3526,8 @@ if __name__ == "__main__":
     test_tensor_vmap_fn_traces_one_batched_plan()
     test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace()
     test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan()
+    test_tensor_value_and_grad_cuda_fn_uses_one_callable_plan()
+    test_cuda_adam_loss_optimizer_owns_scalar_loss_and_parameters()
     test_tensor_vjp_fn_reuses_a_compiled_plan_with_runtime_cotangent()
     test_tensor_jvp_fn_reuses_a_compiled_plan_with_runtime_tangent()
     test_tensor_jacobian_fn_reuses_a_compiled_plan()

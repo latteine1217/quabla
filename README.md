@@ -112,6 +112,14 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
   gradients from one frozen-plan execution.
 - `tensor_jit_cuda_fn(fn, input_specs, device_ordinal=0)` traces and compiles
   a fixed-shape rank-N function to a reusable callable CUDA plan on Linux.
+- `tensor_value_and_grad_cuda_fn(fn, input_specs, parameter_names,
+  device_ordinal=0)` traces a scalar loss and compiles its value plus named
+  VJP gradients into one CUDA union plan. It inserts the scalar loss cotangent
+  internally and returns host values only when its callable is invoked.
+  `cuda_adam_loss_optimizer(loss, parameter_names, inputs, learning_rate, ...)`
+  accepts a scalar `TraceTensor` or `TensorTraceResult`, retains static inputs,
+  parameters, and Adam state on the GPU, and performs device-only `step()`
+  calls. `loss()` is an explicit diagnostic host readback.
 - `tensor_vmap_fn(fn, input_specs, batch_size)` traces one fixed-size axis-0
   batched plan. `input_specs` describe one example; every input is supplied as
   `[batch_size, ...example_shape]` at invocation. `tensor_vmap_cuda_fn(...)`
@@ -187,6 +195,10 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
   symbolic VJP graph into one union plan, computes every gradient from the
   same parameter snapshot, and updates them without any gradient D2H copy.
   Fused GEMM and distributed backends remain future work.
+- `Tensor.split_key(key, count)`, `Tensor.random_normal(shape, key, ...)`, and
+  `Tensor.glorot_normal(shape, key)` provide stateless, deterministic host-side
+  initialization. They do not retain global RNG state; generated parameters are
+  uploaded once when a CUDA optimizer is created.
 - On Apple silicon, the experimental `mlx` feature executes supported frozen
   Tensor IR plans as MLX arrays on `StreamOrDevice::gpu()`. Python exposes this
   through `TensorTraceGraph.compile_mlx()`, `TraceTensor.compile_mlx()`, and

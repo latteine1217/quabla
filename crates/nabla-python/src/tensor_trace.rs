@@ -55,6 +55,7 @@ pub struct TensorMlxExecutionPlan {
 pub struct TensorCudaAdamOptimizer {
     parameter_plans: Vec<(String, TensorCudaExecutionPlan)>,
     shared_plan: Option<SharedCudaAdamPlan>,
+    shared_plan_includes_loss: bool,
     parameter_names: BTreeSet<String>,
     inputs: BTreeMap<String, DynamicTensor>,
     retained_inputs: BTreeSet<String>,
@@ -95,6 +96,14 @@ pub struct TensorHvpScalarFunction {
 #[pyclass(name = "TensorJitFunction", skip_from_py_object)]
 pub struct TensorJitFunction {
     plan: TensorExecutionPlan,
+}
+
+#[pyclass(name = "TensorCudaValueAndGradFunction", skip_from_py_object)]
+pub struct TensorCudaValueAndGradFunction {
+    plan: TensorCudaExecutionPlan,
+    loss_node_id: TensorNodeId,
+    gradient_node_ids: BTreeMap<String, TensorNodeId>,
+    cotangent_name: String,
 }
 
 #[pyclass(name = "TensorVjpFunction", skip_from_py_object)]
@@ -715,6 +724,32 @@ impl TensorTraceResult {
                 ))
             })
             .collect()
+    }
+
+    fn symbolic_vjp_graph(
+        &self,
+        cotangent_name: &str,
+    ) -> Result<
+        (
+            TensorTraceGraph,
+            TensorNodeId,
+            BTreeMap<String, TensorNodeId>,
+        ),
+        String,
+    > {
+        let ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let transformed = ir.symbolic_vjp(self.output.node_id, cotangent_name)?;
+        Ok((
+            TensorTraceGraph {
+                ir: Arc::new(Mutex::new(transformed.graph)),
+            },
+            transformed.value,
+            transformed.gradients,
+        ))
     }
 }
 
@@ -1514,6 +1549,53 @@ impl TensorJitFunction {
 }
 
 #[pymethods]
+impl TensorCudaValueAndGradFunction {
+    fn __call__(
+        &self,
+        values: &Bound<'_, PyDict>,
+    ) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+        let mut inputs = extract_tensor_map(values)?;
+        inputs.insert(
+            self.cotangent_name.clone(),
+            DynamicTensor::new(vec![], vec![1.0]).map_err(PyValueError::new_err)?,
+        );
+        self.plan
+            .plan
+            .execute_retaining_without_output(&inputs, &BTreeSet::new())
+            .map_err(PyValueError::new_err)?;
+        let loss = self
+            .plan
+            .plan
+            .computed_node_to_host(self.loss_node_id)
+            .map_err(PyValueError::new_err)?;
+        let gradients = self
+            .gradient_node_ids
+            .iter()
+            .map(|(name, node_id)| {
+                self.plan
+                    .plan
+                    .computed_node_to_host(*node_id)
+                    .and_then(PyTensor::from_dynamic_tensor)
+                    .map(|tensor| (name.clone(), tensor))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            PyTensor::from_dynamic_tensor(loss).map_err(PyValueError::new_err)?,
+            gradients,
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorCudaValueAndGradFunction(parameter_count={}, node_count={})",
+            self.gradient_node_ids.len(),
+            self.plan.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
 impl TensorVjpFunction {
     fn __call__(
         &self,
@@ -1815,6 +1897,87 @@ pub fn tensor_jit_cuda_fn(
         .map_err(PyValueError::new_err)
 }
 
+const CUDA_LOSS_COTANGENT_NAME: &str = "__nabla_loss_cotangent";
+
+fn compile_cuda_scalar_value_and_grad(
+    loss: &TensorTraceResult,
+    parameter_names: Vec<String>,
+    device_ordinal: usize,
+) -> PyResult<(
+    TensorCudaExecutionPlan,
+    TensorNodeId,
+    BTreeMap<String, TensorNodeId>,
+)> {
+    if parameter_names.is_empty() {
+        return Err(PyValueError::new_err(
+            "CUDA value-and-grad requires at least one parameter name",
+        ));
+    }
+    if !loss.output.shape.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "CUDA value-and-grad requires a scalar output, got shape {:?}",
+            loss.output.shape
+        )));
+    }
+    let (graph, loss_node_id, gradients) = loss
+        .symbolic_vjp_graph(CUDA_LOSS_COTANGENT_NAME)
+        .map_err(PyValueError::new_err)?;
+    let mut output_node_ids = vec![loss_node_id];
+    let mut requested_names = Vec::with_capacity(parameter_names.len());
+    let mut seen = BTreeSet::new();
+    for parameter_name in parameter_names {
+        if !seen.insert(parameter_name.clone()) {
+            return Err(PyValueError::new_err(format!(
+                "duplicate parameter name {parameter_name:?}"
+            )));
+        }
+        let gradient_node_id = gradients.get(&parameter_name).copied().ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "parameter {parameter_name:?} is not declared in the loss trace"
+            ))
+        })?;
+        requested_names.push(parameter_name);
+        output_node_ids.push(gradient_node_id);
+    }
+    let (plan, remapped_outputs) = graph
+        .compile_cuda_multi_plan(&output_node_ids, device_ordinal)
+        .map_err(PyValueError::new_err)?;
+    let loss_node_id = remapped_outputs[0];
+    let gradient_node_ids = requested_names
+        .into_iter()
+        .zip(remapped_outputs.into_iter().skip(1))
+        .collect();
+    Ok((plan, loss_node_id, gradient_node_ids))
+}
+
+#[pyfunction]
+#[pyo3(signature = (function, input_specs, parameter_names, device_ordinal = 0))]
+pub fn tensor_value_and_grad_cuda_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    parameter_names: Vec<String>,
+    device_ordinal: usize,
+) -> PyResult<TensorCudaValueAndGradFunction> {
+    if input_specs
+        .iter()
+        .any(|(name, _)| name == CUDA_LOSS_COTANGENT_NAME)
+    {
+        return Err(PyValueError::new_err(format!(
+            "tensor_value_and_grad_cuda_fn reserves input name {CUDA_LOSS_COTANGENT_NAME:?}"
+        )));
+    }
+    let traced = trace_tensor_python_function(py, function, input_specs)?;
+    let (plan, loss_node_id, gradient_node_ids) =
+        compile_cuda_scalar_value_and_grad(&traced, parameter_names, device_ordinal)?;
+    Ok(TensorCudaValueAndGradFunction {
+        plan,
+        loss_node_id,
+        gradient_node_ids,
+        cotangent_name: CUDA_LOSS_COTANGENT_NAME.to_string(),
+    })
+}
+
 /// Trace a fixed-size axis-0 vectorized function into one reusable CUDA plan.
 #[pyfunction]
 #[pyo3(signature = (function, input_specs, batch_size, device_ordinal = 0))]
@@ -2096,6 +2259,57 @@ impl TensorCudaAdamOptimizer {
             .collect()
     }
 
+    #[getter]
+    fn device_buffer_count(&self) -> PyResult<usize> {
+        if let Some(shared_plan) = &self.shared_plan {
+            return shared_plan
+                .plan
+                .plan
+                .device_buffer_count()
+                .map_err(PyValueError::new_err);
+        }
+        self.parameter_plans
+            .iter()
+            .try_fold(0usize, |count, (_, plan)| {
+                plan.plan.device_buffer_count().and_then(|plan_count| {
+                    count
+                        .checked_add(plan_count)
+                        .ok_or_else(|| "CUDA device buffer count overflow".to_string())
+                })
+            })
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (inputs = None))]
+    fn loss(&mut self, inputs: Option<&Bound<'_, PyDict>>) -> PyResult<PyTensor> {
+        if !self.shared_plan_includes_loss {
+            return Err(PyValueError::new_err(
+                "loss is available only on optimizers created by cuda_adam_loss_optimizer",
+            ));
+        }
+        let shared_plan = self.shared_plan.as_ref().ok_or_else(|| {
+            PyValueError::new_err(
+                "loss is available only on optimizers created by cuda_adam_loss_optimizer",
+            )
+        })?;
+        let mut retained_inputs = self.retained_inputs.clone();
+        if let Some(inputs) = inputs {
+            for (name, tensor) in extract_tensor_map(inputs)? {
+                self.inputs.insert(name.clone(), tensor);
+                if !self.parameter_names.contains(&name) {
+                    retained_inputs.remove(&name);
+                }
+            }
+        }
+        retained_inputs.extend(self.parameter_names.iter().cloned());
+        let loss = shared_plan
+            .plan
+            .plan
+            .execute_retaining(&self.inputs, &retained_inputs)
+            .map_err(PyValueError::new_err)?;
+        PyTensor::from_dynamic_tensor(loss).map_err(PyValueError::new_err)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "TensorCudaAdamOptimizer(parameter_count={}, retained_input_count={})",
@@ -2126,6 +2340,7 @@ pub fn cuda_adam_optimizer(
         retained_inputs: retained_cuda_inputs(&parameter_plans, retained_input_names),
         parameter_plans,
         shared_plan: None,
+        shared_plan_includes_loss: false,
         parameter_names,
         inputs: extract_tensor_map(inputs)?,
         learning_rate,
@@ -2176,8 +2391,67 @@ pub fn cuda_adam_vjp_optimizer(
             plan,
             gradient_node_ids,
         }),
+        shared_plan_includes_loss: false,
         parameter_names,
         inputs: extract_tensor_map(inputs)?,
+        retained_inputs,
+        learning_rate,
+        beta1,
+        beta2,
+        epsilon,
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (loss, parameter_names, inputs, learning_rate, retained_input_names = None, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8, device_ordinal = 0))]
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_adam_loss_optimizer(
+    loss: &Bound<'_, PyAny>,
+    parameter_names: Vec<String>,
+    inputs: &Bound<'_, PyDict>,
+    learning_rate: f32,
+    retained_input_names: Option<Vec<String>>,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+    device_ordinal: usize,
+) -> PyResult<TensorCudaAdamOptimizer> {
+    let loss = if let Ok(loss) = loss.extract::<PyRef<'_, TensorTraceResult>>() {
+        loss.clone()
+    } else if let Ok(loss) = loss.extract::<PyRef<'_, TraceTensor>>() {
+        TensorTraceResult::new(loss.graph.clone(), loss.clone())
+    } else {
+        return Err(PyTypeError::new_err(
+            "cuda_adam_loss_optimizer loss must be a TraceTensor or TensorTraceResult",
+        ));
+    };
+    let (plan, _, gradient_node_ids) =
+        compile_cuda_scalar_value_and_grad(&loss, parameter_names, device_ordinal)?;
+    let parameter_names = gradient_node_ids.keys().cloned().collect::<BTreeSet<_>>();
+    let mut values = extract_tensor_map(inputs)?;
+    if values.contains_key(CUDA_LOSS_COTANGENT_NAME) {
+        return Err(PyValueError::new_err(format!(
+            "cuda_adam_loss_optimizer reserves input name {CUDA_LOSS_COTANGENT_NAME:?}"
+        )));
+    }
+    values.insert(
+        CUDA_LOSS_COTANGENT_NAME.to_string(),
+        DynamicTensor::new(vec![], vec![1.0]).map_err(PyValueError::new_err)?,
+    );
+    let mut retained_inputs = retained_input_names
+        .map(|names| names.into_iter().collect::<BTreeSet<_>>())
+        .unwrap_or_else(|| values.keys().cloned().collect());
+    retained_inputs.insert(CUDA_LOSS_COTANGENT_NAME.to_string());
+    retained_inputs.extend(parameter_names.iter().cloned());
+    Ok(TensorCudaAdamOptimizer {
+        parameter_plans: Vec::new(),
+        shared_plan: Some(SharedCudaAdamPlan {
+            plan,
+            gradient_node_ids,
+        }),
+        shared_plan_includes_loss: true,
+        parameter_names,
+        inputs: values,
         retained_inputs,
         learning_rate,
         beta1,

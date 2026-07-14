@@ -204,6 +204,15 @@ Current state:
   returning a reusable primal callable backed by that same frozen-plan boundary.
 - `tensor_jit_cuda_fn(fn, input_specs, device_ordinal=0)` traces and compiles
   a fixed-shape rank-N function to a reusable callable CUDA plan on Linux.
+- `tensor_value_and_grad_cuda_fn(fn, input_specs, parameter_names,
+  device_ordinal=0)` traces a scalar function once and compiles its primal
+  value plus requested named gradients into one CUDA union plan. It owns its
+  scalar cotangent input rather than requiring it from Python.
+- `cuda_adam_loss_optimizer(loss, parameter_names, inputs, learning_rate, ...)`
+  accepts a scalar `TraceTensor` or `TensorTraceResult`, creates the same union
+  plan, and retains static inputs, parameters, and Adam state on device.
+  `step()` has no parameter or gradient host readback; `loss()` is an explicit
+  diagnostic readback.
 - `tensor_vmap_fn(fn, input_specs, batch_size)` performs a compiler-level,
   fixed-size axis-0 batch transform: it prepends `batch_size` to each
   per-example input shape, traces once, and returns one reusable CPU plan.
@@ -319,6 +328,9 @@ as scalar constants, `powf` exponents, reduction axes, and concat axes.
   Slice and internal zero-padding are rejected explicitly
   when a plan uses them.
 - The Python bridge does not yet provide general compiled JIT lowering.
+- `Tensor.split_key(...)`, `Tensor.random_normal(...)`, and
+  `Tensor.glorot_normal(...)` provide deterministic stateless initialization
+  without a global RNG.
 
 Target direction:
 
@@ -372,6 +384,9 @@ Acceptance checks:
 
 Goal: make a small PINN train through one high-level CUDA API without copying
 parameters or gradients to the host on every step.
+
+Status: completed. The CUDA implementation is verified on the configured
+Linux GPU with a two-layer Poisson PINN integration run.
 
 - Add `tensor_value_and_grad_cuda_fn` for a scalar loss and named parameters.
   It must compile a shared forward/reverse union plan rather than one plan per

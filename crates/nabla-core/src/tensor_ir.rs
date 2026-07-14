@@ -170,6 +170,13 @@ impl CudaExecutionPlan {
         ))
     }
 
+    pub fn computed_node_to_host(&self, _node_id: usize) -> Result<DynamicTensor, String> {
+        Err(format!(
+            "CUDA backend is unavailable for device {}: build Nabla on Linux with --features cuda",
+            self.device_ordinal
+        ))
+    }
+
     pub fn sync_retained_input_to(
         &self,
         _source_name: &str,

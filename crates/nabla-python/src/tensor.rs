@@ -31,6 +31,25 @@ fn element_count(shape: &[usize]) -> Result<usize, String> {
     })
 }
 
+fn next_random_key(key: &mut u64) -> u64 {
+    *key = key.wrapping_add(0x9e3779b97f4a7c15);
+    let mut value = *key;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
+
+fn uniform_open_unit(key: &mut u64) -> f64 {
+    let bits = next_random_key(key) >> 11;
+    (bits as f64 + 0.5) * (1.0 / ((1u64 << 53) as f64))
+}
+
+fn standard_normal(key: &mut u64) -> f64 {
+    let radius = (-2.0 * uniform_open_unit(key).ln()).sqrt();
+    let angle = std::f64::consts::TAU * uniform_open_unit(key);
+    radius * angle.cos()
+}
+
 fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
     let mut strides = vec![1; shape.len()];
 
@@ -652,6 +671,46 @@ impl PyTensor {
             shape,
             data: Arc::new(vec![value; size]),
         })
+    }
+
+    #[staticmethod]
+    fn split_key(key: u64, count: usize) -> PyResult<Vec<u64>> {
+        if count == 0 {
+            return Err(PyValueError::new_err("split_key count must be positive"));
+        }
+        let mut state = key;
+        Ok((0..count).map(|_| next_random_key(&mut state)).collect())
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (shape, key, mean = 0.0, stddev = 1.0))]
+    fn random_normal(shape: Vec<usize>, key: u64, mean: f64, stddev: f64) -> PyResult<Self> {
+        if !(mean.is_finite() && stddev.is_finite() && stddev >= 0.0) {
+            return Err(PyValueError::new_err(
+                "random_normal mean must be finite and stddev must be finite and non-negative",
+            ));
+        }
+        let count = element_count(&shape).map_err(PyValueError::new_err)?;
+        let mut state = key;
+        let data = (0..count)
+            .map(|_| mean + stddev * standard_normal(&mut state))
+            .collect();
+        Self::from_shape_data(shape, data).map_err(PyValueError::new_err)
+    }
+
+    #[staticmethod]
+    fn glorot_normal(shape: Vec<usize>, key: u64) -> PyResult<Self> {
+        if shape.len() != 2 {
+            return Err(PyValueError::new_err(format!(
+                "glorot_normal requires a rank-2 shape, got {:?}",
+                shape
+            )));
+        }
+        let fan_sum = shape[0]
+            .checked_add(shape[1])
+            .ok_or_else(|| PyValueError::new_err("glorot_normal fan sum overflows usize"))?;
+        let stddev = (2.0 / fan_sum as f64).sqrt();
+        Self::random_normal(shape, key, 0.0, stddev)
     }
 
     #[staticmethod]

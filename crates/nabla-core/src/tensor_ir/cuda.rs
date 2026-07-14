@@ -433,6 +433,32 @@ impl CudaExecutionPlan {
         DynamicTensor::new(shape, data.into_iter().map(f64::from).collect())
     }
 
+    /// Materializes an already-evaluated node from a multi-output plan.
+    pub fn computed_node_to_host(&self, node_id: usize) -> Result<DynamicTensor, String> {
+        let node = self
+            .plan
+            .nodes
+            .get(node_id)
+            .ok_or_else(|| format!("CUDA node {node_id} does not exist"))?;
+        let stream = self.context.default_stream();
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "CUDA execution plan state lock is poisoned".to_string())?;
+        let buffer = state
+            .values
+            .get(node_id)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| format!("CUDA node {node_id} has not been evaluated"))?;
+        let data = stream
+            .clone_dtoh(buffer)
+            .map_err(|error| format!("failed to copy CUDA node {node_id} to host: {error:?}"))?;
+        DynamicTensor::new(
+            node.shape.clone(),
+            data.into_iter().map(f64::from).collect(),
+        )
+    }
+
     /// Copies a retained input directly into another CUDA plan's retained input.
     ///
     /// Call this after every participating gradient plan has evaluated and

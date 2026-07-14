@@ -12,10 +12,10 @@ pub use optim::{sum_gradients, PyAdam};
 pub use tensor::{PyTensor, PyTensorView};
 pub use tensor_trace::{
     TensorCpuExecutionPlan, TensorCudaAdamOptimizer, TensorCudaExecutionPlan,
-    TensorGradScalarFunction, TensorHessianScalarFunction, TensorHvpScalarFunction,
-    TensorJacobianFunction, TensorJitFunction, TensorJvpFunction, TensorMlxExecutionPlan,
-    TensorTraceGraph, TensorTraceResult, TensorValueAndGradFunction, TensorVjpFunction,
-    TraceTensor,
+    TensorCudaValueAndGradFunction, TensorGradScalarFunction, TensorHessianScalarFunction,
+    TensorHvpScalarFunction, TensorJacobianFunction, TensorJitFunction, TensorJvpFunction,
+    TensorMlxExecutionPlan, TensorTraceGraph, TensorTraceResult, TensorValueAndGradFunction,
+    TensorVjpFunction, TraceTensor,
 };
 pub use trace::{
     CpuExecutionPlan, GradFunction, GradScalarFunction, GradScalarTransform, IrAttrValue,
@@ -211,6 +211,7 @@ fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TensorHessianScalarFunction>()?;
     m.add_class::<TensorHvpScalarFunction>()?;
     m.add_class::<TensorJitFunction>()?;
+    m.add_class::<TensorCudaValueAndGradFunction>()?;
     m.add_class::<TensorVjpFunction>()?;
     m.add_class::<TensorJvpFunction>()?;
     m.add_class::<TensorJacobianFunction>()?;
@@ -247,6 +248,10 @@ fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_cuda_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        tensor_trace::tensor_value_and_grad_cuda_fn,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_cuda_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_mlx_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_vjp_fn, m)?)?;
@@ -255,6 +260,7 @@ fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tensor_trace::cuda_adam_step, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::cuda_adam_optimizer, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::cuda_adam_vjp_optimizer, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::cuda_adam_loss_optimizer, m)?)?;
     m.add_function(wrap_pyfunction!(py_where, m)?)?;
     m.add_function(wrap_pyfunction!(py_concat, m)?)?;
     m.add_function(wrap_pyfunction!(py_stack, m)?)?;
