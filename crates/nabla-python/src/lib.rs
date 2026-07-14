@@ -193,6 +193,53 @@ fn py_stack(py: Python<'_>, tensors: &Bound<'_, PySequence>, axis: isize) -> PyR
     Ok(output.into_pyobject(py)?.into_any().unbind())
 }
 
+#[pyfunction(name = "einsum")]
+fn py_einsum(
+    py: Python<'_>,
+    equation: &str,
+    operands: &Bound<'_, PySequence>,
+) -> PyResult<Py<PyAny>> {
+    let normalized = equation
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    if !matches!(normalized.as_str(), "ij,jk->ik" | "...ij,...jk->...ik") {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "einsum currently supports only 'ij,jk->ik' and '...ij,...jk->...ik'",
+        ));
+    }
+    if operands.len()? != 2 {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "einsum matrix multiplication requires exactly two operands",
+        ));
+    }
+    let lhs = operands.get_item(0)?;
+    let rhs = operands.get_item(1)?;
+
+    if let (Ok(lhs), Ok(rhs)) = (
+        lhs.extract::<PyRef<'_, PyTensor>>(),
+        rhs.extract::<PyRef<'_, PyTensor>>(),
+    ) {
+        let output = lhs
+            .try_matmul(&rhs)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        return Ok(output.into_pyobject(py)?.into_any().unbind());
+    }
+    if let (Ok(lhs), Ok(rhs)) = (
+        lhs.extract::<PyRef<'_, TraceTensor>>(),
+        rhs.extract::<PyRef<'_, TraceTensor>>(),
+    ) {
+        let output = lhs
+            .try_matmul(&rhs)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        return Ok(output.into_pyobject(py)?.into_any().unbind());
+    }
+
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "einsum expects two Tensor or two TraceTensor operands",
+    ))
+}
+
 #[pymodule]
 fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMatrix>()?;
@@ -274,5 +321,6 @@ fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_where, m)?)?;
     m.add_function(wrap_pyfunction!(py_concat, m)?)?;
     m.add_function(wrap_pyfunction!(py_stack, m)?)?;
+    m.add_function(wrap_pyfunction!(py_einsum, m)?)?;
     Ok(())
 }

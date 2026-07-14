@@ -639,6 +639,10 @@ impl TraceTensor {
         ))
     }
 
+    pub fn try_matmul(&self, rhs: &Self) -> Result<Self, String> {
+        self.matmul_tensor(rhs)
+    }
+
     pub fn where_tensor(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
         self.same_graph(on_true)?;
         self.same_graph(on_false)?;

@@ -464,8 +464,9 @@ derivative orders at zero use an explicit zero subgradient. Native fused extrema
 reductions and other norm variants remain pending. Static integer-index
 `gather` and functional `scatter_add` are available with repeated-index VJP
 accumulation; dynamic tensor indices, masks, and assignment-style scatter
-remain pending the dtype/index IR design. Linear algebra extensions, remaining
-neural primitives, and
+remain pending the dtype/index IR design. A scoped matrix-product `einsum`
+subset lowers directly to rank-N `matmul`; solve, Cholesky, triangular solve,
+and broader contractions remain pending. Remaining neural primitives and
 dtype/device APIs remain pending.
 Eager and traced tensors now share a
 differentiable integer/contiguous-slice indexing subset; it lowers through

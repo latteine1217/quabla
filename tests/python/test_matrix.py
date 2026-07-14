@@ -405,6 +405,23 @@ def test_tensor_gather_and_scatter_add_support_negative_and_repeated_indices():
             raise AssertionError(f"gather accepted invalid indices {indices}")
 
 
+def test_einsum_scoped_matmul_subset_matches_tensor_matmul():
+    left = nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])
+    right = nabla.Tensor([2, 3], [1.0, -1.0, 2.0, 0.0, 3.0, 1.0])
+    expected = (left @ right).to_flat_list()
+
+    assert nabla.einsum("ij,jk->ik", [left, right]).to_flat_list() == expected
+    assert nabla.einsum("...ij,...jk->...ik", [left, right]).to_flat_list() == expected
+
+    for equation in ("ij,ij->ij", "ij,jk->ij"):
+        try:
+            nabla.einsum(equation, [left, right])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"einsum accepted unsupported equation {equation}")
+
+
 def test_tensor_broadcast_to_materializes_rank_n_contiguous_storage():
     tensor = nabla.Tensor([1, 2, 1], [2.0, -3.0])
     output = tensor.broadcast_to([3, 2, 4])
@@ -1523,6 +1540,37 @@ def test_trace_tensor_gather_and_scatter_add_preserve_repeated_index_gradients()
     ).to_flat_list() == [2.0, 2.0, 1.0]
 
     cpu_gradient = symbolic.output.compile_cpu().evaluate(symbolic_inputs)
+    if os.environ.get("NABLA_MLX_TEST") is not None:
+        mlx_gradient = symbolic.output.compile_mlx().evaluate(symbolic_inputs)
+        assert_close_rows(
+            [mlx_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
+        )
+    if os.environ.get("NABLA_CUDA_TEST") is not None:
+        cuda_gradient = symbolic.output.compile_cuda().evaluate(symbolic_inputs)
+        assert_close_rows(
+            [cuda_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
+        )
+
+
+def test_trace_tensor_einsum_scoped_matmul_subset_preserves_backend_ad():
+    traced = nabla.trace_tensor(
+        lambda left, right: nabla.einsum("ij,jk->ik", [left, right]).sum(),
+        [("left", [2, 2]), ("right", [2, 2])],
+    )
+    inputs = {
+        "left": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+        "right": nabla.Tensor([2, 2], [1.0, 0.0, 2.0, 1.0]),
+    }
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    assert gradients["left"].to_flat_list() == [1.0, 3.0, 1.0, 3.0]
+    assert gradients["right"].to_flat_list() == [4.0, 4.0, 6.0, 6.0]
+
+    symbolic = traced.symbolic_vjp("loss_cotangent")["left"]
+    symbolic_inputs = {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])}
+    cpu_gradient = symbolic.output.compile_cpu().evaluate(symbolic_inputs)
+    assert cpu_gradient.to_flat_list() == gradients["left"].to_flat_list()
     if os.environ.get("NABLA_MLX_TEST") is not None:
         mlx_gradient = symbolic.output.compile_mlx().evaluate(symbolic_inputs)
         assert_close_rows(

@@ -152,6 +152,10 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
   destinations; its traced lowering uses slice/concat/pad-slice so VJPs route
   repeated gather/scatter coordinates correctly. Dynamic tensor indices,
   boolean masks, and assignment-style scatter are not yet supported.
+- `nabla.einsum("ij,jk->ik", [lhs, rhs])` and
+  `nabla.einsum("...ij,...jk->...ik", [lhs, rhs])` are scoped matrix-product
+  spellings that lower directly to the existing rank-N `matmul` plan. Other
+  einsum equations are rejected rather than silently interpreted.
 - `Tensor` and `TraceTensor` support `__getitem__` with integer and
   contiguous unit-step slice tuples, including negative indices. Integer
   indices lower to a length-one slice plus reshape, so reverse-mode AD and
