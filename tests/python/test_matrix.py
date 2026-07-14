@@ -1619,6 +1619,48 @@ def test_tensor_vmap_fn_traces_one_batched_plan():
         raise AssertionError("tensor_vmap_fn accepted a zero batch size")
 
 
+def test_tensor_vmap_fn_supports_in_axes_out_axis_and_unmapped_inputs():
+    mapped = nabla.tensor_vmap_fn(
+        lambda x, weight: (x * weight).sum(),
+        [("x", [2]), ("weight", [2])],
+        3,
+        in_axes=[-1, None],
+        out_axis=-1,
+    )
+
+    result = mapped(
+        {
+            "x": nabla.Tensor([2, 3], [1.0, 3.0, 5.0, 2.0, 4.0, 6.0]),
+            "weight": nabla.Tensor([2], [2.0, -1.0]),
+        }
+    )
+
+    assert result.shape == [3]
+    assert_close_rows([result.to_flat_list()], [[0.0, 2.0, 4.0]])
+
+
+def test_tensor_vmap_fn_reductions_and_transpose_preserve_batch_axis():
+    mapped = nabla.tensor_vmap_fn(
+        lambda x: x.transpose().mean(axis=1),
+        [("x", [2, 3])],
+        2,
+        in_axes=[2],
+        out_axis=1,
+    )
+
+    result = mapped(
+        {
+            "x": nabla.Tensor(
+                [2, 3, 2],
+                [1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0, 5.0, 50.0, 6.0, 60.0],
+            )
+        }
+    )
+
+    assert result.shape == [3, 2]
+    assert_close_rows([result.to_flat_list()], [[2.5, 25.0, 3.5, 35.0, 4.5, 45.0]])
+
+
 def test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace():
     input_specs = [("x", [2, 2]), ("weight", [2, 1])]
     values = {
@@ -1629,6 +1671,8 @@ def test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace():
         "weight": nabla.Tensor([3, 2, 1], [1.0, -1.0, 1.0, 0.5, 2.0, 1.0]),
     }
     expected = [[math.tanh(value) for value in [1.0, -1.0, 2.5, 2.0, 6.0, 3.0]]]
+    nonleading_values = {"x": nabla.Tensor([2, 3], [1.0, 3.0, 5.0, 2.0, 4.0, 6.0])}
+    nonleading_expected = [[3.0, 7.0, 11.0]]
 
     if os.environ.get("NABLA_MLX_TEST") is not None:
         mlx_compiled = nabla.tensor_vmap_mlx_fn(
@@ -1636,6 +1680,12 @@ def test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace():
         )
         assert mlx_compiled.backend == "mlx"
         assert_close_rows([mlx_compiled(values).to_flat_list()], expected, tol=1e-5)
+        mlx_nonleading = nabla.tensor_vmap_mlx_fn(
+            lambda x: x.sum(), [("x", [2])], 3, in_axes=[1]
+        )
+        assert_close_rows(
+            [mlx_nonleading(nonleading_values).to_flat_list()], nonleading_expected, tol=1e-5
+        )
 
     if os.environ.get("NABLA_CUDA_TEST") is not None:
         cuda_compiled = nabla.tensor_vmap_cuda_fn(
@@ -1643,6 +1693,12 @@ def test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace():
         )
         assert cuda_compiled.backend in {"cublas", "nvrtc"}
         assert_close_rows([cuda_compiled(values).to_flat_list()], expected, tol=1e-5)
+        cuda_nonleading = nabla.tensor_vmap_cuda_fn(
+            lambda x: x.sum(), [("x", [2])], 3, in_axes=[1]
+        )
+        assert_close_rows(
+            [cuda_nonleading(nonleading_values).to_flat_list()], nonleading_expected, tol=1e-5
+        )
 
 
 def test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan():
@@ -3524,6 +3580,8 @@ if __name__ == "__main__":
     test_tensor_hessian_and_hvp_scalar_fn_reuse_a_compiled_plan()
     test_tensor_jit_fn_reuses_a_compiled_plan()
     test_tensor_vmap_fn_traces_one_batched_plan()
+    test_tensor_vmap_fn_supports_in_axes_out_axis_and_unmapped_inputs()
+    test_tensor_vmap_fn_reductions_and_transpose_preserve_batch_axis()
     test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace()
     test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan()
     test_tensor_value_and_grad_cuda_fn_uses_one_callable_plan()

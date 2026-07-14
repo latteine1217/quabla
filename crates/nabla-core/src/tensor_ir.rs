@@ -863,6 +863,14 @@ impl DynamicTensor {
         Self::new(output_shape, data)
     }
 
+    /// Returns a materialized permutation of the tensor axes.
+    ///
+    /// This is intentionally a small public boundary for transform wrappers;
+    /// compiled execution plans remain responsible for backend lowering.
+    pub fn permute(&self, axes: &[usize]) -> Result<Self, String> {
+        self.transpose(axes)
+    }
+
     fn broadcast_to_shape(&self, target_shape: &[usize]) -> Result<Self, String> {
         if broadcast_shape(&self.shape, target_shape)? != target_shape {
             return Err(format!(

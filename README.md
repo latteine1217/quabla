@@ -120,12 +120,14 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
   accepts a scalar `TraceTensor` or `TensorTraceResult`, retains static inputs,
   parameters, and Adam state on the GPU, and performs device-only `step()`
   calls. `loss()` is an explicit diagnostic host readback.
-- `tensor_vmap_fn(fn, input_specs, batch_size)` traces one fixed-size axis-0
-  batched plan. `input_specs` describe one example; every input is supplied as
-  `[batch_size, ...example_shape]` at invocation. `tensor_vmap_cuda_fn(...)`
-  and `tensor_vmap_mlx_fn(...)` compile the same vectorized trace for CUDA and
-  MLX. This first transform deliberately supports only mapped leading axes and
-  a static batch size.
+- `tensor_vmap_fn(fn, input_specs, batch_size, in_axes=None, out_axis=0)`
+  traces one fixed-size batched plan. `input_specs` describe one example;
+  `in_axes` supports mapped axes (including normalized negative axes) and
+  unmapped `None` inputs, while `out_axis` selects the returned batch layout.
+  The trace tracks batch semantics through elementwise operations, matmul,
+  reductions, transpose, reshape, broadcast, concat, slice, and `where`.
+  `tensor_vmap_cuda_fn(...)` and `tensor_vmap_mlx_fn(...)` lower the same
+  canonical trace for CUDA and MLX. Batch extent remains static.
 - `tensor_hessian_scalar_fn(fn, input_specs, input_name)` and
   `tensor_hvp_scalar_fn(fn, input_specs, input_name)` freeze a scalar rank-N
   trace for dense Hessian or Hessian-vector-product evaluation. They are

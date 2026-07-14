@@ -24,6 +24,9 @@ pub struct TraceTensor {
     graph: TensorTraceGraph,
     node_id: TensorNodeId,
     shape: Vec<usize>,
+    // vmap canonicalizes the mapped dimension to axis zero while tracing.
+    // Normal traces have no mapped axis.
+    batch_axis: Option<usize>,
 }
 
 #[pyclass(name = "TensorTraceResult", skip_from_py_object)]
@@ -98,6 +101,31 @@ pub struct TensorJitFunction {
     plan: TensorExecutionPlan,
 }
 
+#[derive(Clone, Debug)]
+struct VmapSignature {
+    input_names: Vec<String>,
+    in_axes: Vec<Option<usize>>,
+    out_axis: usize,
+}
+
+#[pyclass(name = "TensorVmapFunction", skip_from_py_object)]
+pub struct TensorVmapFunction {
+    plan: TensorExecutionPlan,
+    signature: VmapSignature,
+}
+
+#[pyclass(name = "TensorVmapCudaFunction", skip_from_py_object)]
+pub struct TensorVmapCudaFunction {
+    plan: TensorCudaExecutionPlan,
+    signature: VmapSignature,
+}
+
+#[pyclass(name = "TensorVmapMlxFunction", skip_from_py_object)]
+pub struct TensorVmapMlxFunction {
+    plan: TensorMlxExecutionPlan,
+    signature: VmapSignature,
+}
+
 #[pyclass(name = "TensorCudaValueAndGradFunction", skip_from_py_object)]
 pub struct TensorCudaValueAndGradFunction {
     plan: TensorCudaExecutionPlan,
@@ -138,7 +166,14 @@ impl TensorTraceGraph {
             graph: self.clone(),
             node_id,
             shape,
+            batch_axis: None,
         })
+    }
+
+    fn add_batched_input(&self, name: &str, shape: Vec<usize>) -> Result<TraceTensor, String> {
+        let mut tensor = self.add_input(name, shape)?;
+        tensor.batch_axis = Some(0);
+        Ok(tensor)
     }
 
     fn existing_input(&self, name: &str) -> Result<TraceTensor, String> {
@@ -152,6 +187,7 @@ impl TensorTraceGraph {
             graph: self.clone(),
             node_id,
             shape,
+            batch_axis: None,
         })
     }
 
@@ -299,6 +335,57 @@ impl TensorTraceGraph {
 }
 
 impl TraceTensor {
+    fn from_node(
+        graph: TensorTraceGraph,
+        node_id: TensorNodeId,
+        shape: Vec<usize>,
+        batch_axis: Option<usize>,
+    ) -> Self {
+        Self {
+            graph,
+            node_id,
+            shape,
+            batch_axis,
+        }
+    }
+
+    fn merged_batch_axis(tensors: &[&Self]) -> Result<Option<usize>, String> {
+        let mut batch_axis = None;
+        for tensor in tensors {
+            match (batch_axis, tensor.batch_axis) {
+                (None, axis) => batch_axis = axis,
+                (Some(lhs), Some(rhs)) if lhs == rhs => {}
+                (Some(_), Some(_)) => {
+                    return Err("cannot combine vmap tensors with different batch axes".to_string())
+                }
+                (Some(_), None) => {}
+            }
+        }
+        Ok(batch_axis)
+    }
+
+    fn example_axis(&self, axis: isize) -> Result<isize, String> {
+        let rank = self.shape.len() - usize::from(self.batch_axis.is_some());
+        let normalized = if axis < 0 { axis + rank as isize } else { axis };
+        if !(0..rank as isize).contains(&normalized) {
+            return Err(format!("axis {axis} is out of bounds for rank {rank}"));
+        }
+        Ok(normalized + self.batch_axis.map_or(0, |_| 1) as isize)
+    }
+
+    fn example_shape(&self, shape: Vec<usize>) -> Vec<usize> {
+        match self.batch_axis {
+            Some(axis) => {
+                debug_assert_eq!(axis, 0);
+                let mut batched = Vec::with_capacity(shape.len() + 1);
+                batched.push(self.shape[axis]);
+                batched.extend(shape);
+                batched
+            }
+            None => shape,
+        }
+    }
+
     fn same_graph(&self, rhs: &Self) -> Result<(), String> {
         if Arc::ptr_eq(&self.graph.ir, &rhs.graph.ir) {
             Ok(())
@@ -314,21 +401,36 @@ impl TraceTensor {
         for tensor in &tensors[1..] {
             first.same_graph(tensor)?;
         }
+        let batch_axis = Self::merged_batch_axis(&tensors.iter().collect::<Vec<_>>())?;
+        let batch_extent = tensors
+            .iter()
+            .find_map(|tensor| tensor.batch_axis.map(|axis| tensor.shape[axis]));
         let mut ir = first
             .graph
             .ir
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
-        let node_id = ir.concat(
-            tensors.iter().map(|tensor| tensor.node_id).collect(),
-            axis as isize,
-        )?;
+        let axis = if batch_axis.is_some() { axis + 1 } else { axis };
+        let inputs = tensors
+            .iter()
+            .map(|tensor| match (batch_extent, tensor.batch_axis) {
+                (Some(batch_extent), None) => {
+                    let mut shape = Vec::with_capacity(tensor.shape.len() + 1);
+                    shape.push(batch_extent);
+                    shape.extend(&tensor.shape);
+                    ir.broadcast_to(tensor.node_id, shape)
+                }
+                _ => Ok(tensor.node_id),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let node_id = ir.concat(inputs, axis as isize)?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: first.graph.clone(),
+        Ok(Self::from_node(
+            first.graph.clone(),
             node_id,
             shape,
-        })
+            batch_axis,
+        ))
     }
 
     pub fn try_stack(tensors: &[Self], axis: isize) -> Result<Self, String> {
@@ -338,7 +440,8 @@ impl TraceTensor {
         if tensors.iter().any(|tensor| tensor.shape != first.shape) {
             return Err("stack requires TraceTensor values with identical shapes".to_string());
         }
-        let rank = first.shape.len() + 1;
+        let example_rank = first.shape.len() - usize::from(first.batch_axis.is_some());
+        let rank = example_rank + 1;
         let normalized_axis = if axis < 0 { axis + rank as isize } else { axis };
         let axis = usize::try_from(normalized_axis)
             .ok()
@@ -347,7 +450,7 @@ impl TraceTensor {
         let reshaped = tensors
             .iter()
             .map(|tensor| {
-                let mut shape = tensor.shape.clone();
+                let mut shape = tensor.shape[usize::from(tensor.batch_axis.is_some())..].to_vec();
                 shape.insert(axis, 1);
                 tensor.reshape_tensor(shape)
             })
@@ -371,11 +474,12 @@ impl TraceTensor {
             _ => return Err(format!("unsupported trace tensor binary op {op}")),
         };
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            Self::merged_batch_axis(&[self, rhs])?,
+        ))
     }
 
     fn scalar_binary(&self, value: f64, op: &str) -> Result<Self, String> {
@@ -394,11 +498,12 @@ impl TraceTensor {
             _ => return Err(format!("unsupported trace tensor scalar op {op}")),
         };
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn scalar_left_binary(&self, value: f64, op: &str) -> Result<Self, String> {
@@ -417,11 +522,12 @@ impl TraceTensor {
             _ => return Err(format!("unsupported left scalar trace op {op}")),
         };
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn sum_tensor(&self, axis: Option<isize>) -> Result<Self, String> {
@@ -430,16 +536,24 @@ impl TraceTensor {
             .ir
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
-        let node_id = match axis {
-            Some(axis) => ir.sum_axis(self.node_id, axis)?,
-            None => ir.sum(self.node_id)?,
+        let node_id = match (self.batch_axis, axis) {
+            (Some(_), None) => {
+                let mut node_id = self.node_id;
+                for axis in (1..self.shape.len()).rev() {
+                    node_id = ir.sum_axis(node_id, axis as isize)?;
+                }
+                node_id
+            }
+            (_, Some(axis)) => ir.sum_axis(self.node_id, self.example_axis(axis)?)?,
+            (None, None) => ir.sum(self.node_id)?,
         };
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn matmul_tensor(&self, rhs: &Self) -> Result<Self, String> {
@@ -451,11 +565,12 @@ impl TraceTensor {
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
         let node_id = ir.matmul(self.node_id, rhs.node_id)?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            Self::merged_batch_axis(&[self, rhs])?,
+        ))
     }
 
     pub fn where_tensor(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
@@ -468,11 +583,12 @@ impl TraceTensor {
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
         let node_id = ir.where_select(self.node_id, on_true.node_id, on_false.node_id)?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            Self::merged_batch_axis(&[self, on_true, on_false])?,
+        ))
     }
 
     fn tanh_tensor(&self) -> Result<Self, String> {
@@ -483,11 +599,12 @@ impl TraceTensor {
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
         let node_id = ir.tanh(self.node_id)?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn exp_tensor(&self) -> Result<Self, String> {
@@ -498,11 +615,12 @@ impl TraceTensor {
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
         let node_id = ir.exp(self.node_id)?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn reshape_tensor(&self, shape: Vec<usize>) -> Result<Self, String> {
@@ -511,13 +629,14 @@ impl TraceTensor {
             .ir
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
-        let node_id = ir.reshape(self.node_id, shape)?;
+        let node_id = ir.reshape(self.node_id, self.example_shape(shape))?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn slice_tensor(&self, axis: isize, start: usize, stop: usize) -> Result<Self, String> {
@@ -526,13 +645,14 @@ impl TraceTensor {
             .ir
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
-        let node_id = ir.slice_axis(self.node_id, axis, start, stop)?;
+        let node_id = ir.slice_axis(self.node_id, self.example_axis(axis)?, start, stop)?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn broadcast_to_tensor(&self, shape: Vec<usize>) -> Result<Self, String> {
@@ -541,13 +661,14 @@ impl TraceTensor {
             .ir
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
-        let node_id = ir.broadcast_to(self.node_id, shape)?;
+        let node_id = ir.broadcast_to(self.node_id, self.example_shape(shape))?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn mean_tensor(&self, axis: Option<isize>) -> Result<Self, String> {
@@ -556,16 +677,24 @@ impl TraceTensor {
             .ir
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
-        let node_id = match axis {
-            Some(axis) => ir.mean_axis(self.node_id, axis)?,
-            None => ir.mean(self.node_id)?,
+        let node_id = match (self.batch_axis, axis) {
+            (Some(_), None) => {
+                let mut node_id = self.node_id;
+                for axis in (1..self.shape.len()).rev() {
+                    node_id = ir.mean_axis(node_id, axis as isize)?;
+                }
+                node_id
+            }
+            (_, Some(axis)) => ir.mean_axis(self.node_id, self.example_axis(axis)?)?,
+            (None, None) => ir.mean(self.node_id)?,
         };
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn sin_tensor(&self) -> Result<Self, String> {
@@ -576,11 +705,12 @@ impl TraceTensor {
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
         let node_id = ir.sin(self.node_id)?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn cos_tensor(&self) -> Result<Self, String> {
@@ -591,11 +721,12 @@ impl TraceTensor {
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
         let node_id = ir.cos(self.node_id)?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn powi_tensor(&self, exponent: u32) -> Result<Self, String> {
@@ -606,11 +737,12 @@ impl TraceTensor {
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
         let node_id = ir.powi(self.node_id, exponent)?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn transpose_tensor(&self, axes: Option<Vec<isize>>) -> Result<Self, String> {
@@ -619,13 +751,27 @@ impl TraceTensor {
             .ir
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let axes = match (self.batch_axis, axes) {
+            (Some(_), Some(axes)) => Some(
+                axes.into_iter()
+                    .map(|axis| self.example_axis(axis))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            (Some(_), None) => Some(
+                std::iter::once(0)
+                    .chain((1..self.shape.len()).rev().map(|axis| axis as isize))
+                    .collect(),
+            ),
+            (None, axes) => axes,
+        };
         let node_id = ir.transpose(self.node_id, axes)?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn log_tensor(&self) -> Result<Self, String> {
@@ -636,11 +782,12 @@ impl TraceTensor {
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
         let node_id = ir.log(self.node_id)?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 
     fn sqrt_tensor(&self) -> Result<Self, String> {
@@ -654,11 +801,12 @@ impl TraceTensor {
         let scaled = ir.mul(log, half)?;
         let node_id = ir.exp(scaled)?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self {
-            graph: self.graph.clone(),
+        Ok(Self::from_node(
+            self.graph.clone(),
             node_id,
             shape,
-        })
+            self.batch_axis,
+        ))
     }
 }
 
@@ -688,6 +836,7 @@ impl TensorTraceResult {
                 graph,
                 node_id: transformed.tangent,
                 shape,
+                batch_axis: self.output.batch_axis,
             },
         ))
     }
@@ -719,6 +868,7 @@ impl TensorTraceResult {
                             graph: graph.clone(),
                             node_id,
                             shape,
+                            batch_axis: self.output.batch_axis,
                         },
                     ),
                 ))
@@ -1256,6 +1406,33 @@ impl TensorMlxExecutionPlan {
 }
 
 #[pymethods]
+impl TensorVmapMlxFunction {
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.plan.plan.node_count()
+    }
+
+    #[getter]
+    fn backend(&self) -> &'static str {
+        "mlx"
+    }
+
+    fn __call__(&self, inputs: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
+        let value = MlxBackend
+            .execute(&self.plan.plan, &vmap_inputs(&self.signature, inputs)?)
+            .map_err(PyValueError::new_err)?;
+        vmap_output(&self.signature, value)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorVmapMlxFunction(node_count={})",
+            self.plan.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
 impl TensorCudaExecutionPlan {
     #[getter]
     fn node_count(&self) -> usize {
@@ -1435,6 +1612,39 @@ impl TensorCudaExecutionPlan {
 }
 
 #[pymethods]
+impl TensorVmapCudaFunction {
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.plan.plan.node_count()
+    }
+
+    #[getter]
+    fn backend(&self) -> &'static str {
+        if self.plan.plan.uses_cublas() {
+            "cublas"
+        } else {
+            "nvrtc"
+        }
+    }
+
+    fn __call__(&self, inputs: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
+        let value = self
+            .plan
+            .plan
+            .execute(&vmap_inputs(&self.signature, inputs)?)
+            .map_err(PyValueError::new_err)?;
+        vmap_output(&self.signature, value)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorVmapCudaFunction(node_count={})",
+            self.plan.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
 impl TensorGradScalarFunction {
     fn __call__(&self, values: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, PyTensor>> {
         let inputs = extract_tensor_map(values)?;
@@ -1545,6 +1755,26 @@ impl TensorJitFunction {
 
     fn __repr__(&self) -> String {
         format!("TensorJitFunction(node_count={})", self.plan.node_count())
+    }
+}
+
+#[pymethods]
+impl TensorVmapFunction {
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.plan.node_count()
+    }
+
+    fn __call__(&self, inputs: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
+        let value = self
+            .plan
+            .evaluate(&vmap_inputs(&self.signature, inputs)?)
+            .map_err(PyValueError::new_err)?;
+        vmap_output(&self.signature, value)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("TensorVmapFunction(node_count={})", self.plan.node_count())
     }
 }
 
@@ -1732,6 +1962,112 @@ pub fn trace_tensor_python_function(
     Ok(TensorTraceResult::new(graph, output))
 }
 
+fn normalize_vmap_axis(axis: isize, rank: usize, label: &str) -> PyResult<usize> {
+    let normalized = if axis < 0 { axis + rank as isize } else { axis };
+    usize::try_from(normalized)
+        .ok()
+        .filter(|axis| *axis < rank)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "{label} axis {axis} is out of bounds for rank {rank}"
+            ))
+        })
+}
+
+fn make_vmap_signature(
+    input_specs: &[(String, Vec<usize>)],
+    in_axes: Option<Vec<Option<isize>>>,
+    out_axis: isize,
+    output_rank: usize,
+) -> PyResult<VmapSignature> {
+    let in_axes = in_axes.unwrap_or_else(|| vec![Some(0); input_specs.len()]);
+    if in_axes.len() != input_specs.len() {
+        return Err(PyValueError::new_err(format!(
+            "in_axes has length {}, but function has {} inputs",
+            in_axes.len(),
+            input_specs.len()
+        )));
+    }
+    let in_axes = input_specs
+        .iter()
+        .zip(in_axes)
+        .map(|((name, shape), axis)| match axis {
+            Some(axis) => normalize_vmap_axis(axis, shape.len() + 1, name).map(Some),
+            None => Ok(None),
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(VmapSignature {
+        input_names: input_specs.iter().map(|(name, _)| name.clone()).collect(),
+        in_axes,
+        out_axis: normalize_vmap_axis(out_axis, output_rank, "out_axes")?,
+    })
+}
+
+fn trace_tensor_vmap_python_function(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    batch_size: usize,
+    in_axes: Option<Vec<Option<isize>>>,
+    out_axis: isize,
+) -> PyResult<(TensorTraceResult, VmapSignature)> {
+    if batch_size == 0 {
+        return Err(PyValueError::new_err(
+            "tensor_vmap_fn requires batch_size > 0",
+        ));
+    }
+    let input_axes = in_axes
+        .clone()
+        .unwrap_or_else(|| vec![Some(0); input_specs.len()]);
+    if input_axes.len() != input_specs.len() {
+        return Err(PyValueError::new_err(format!(
+            "in_axes has length {}, but function has {} inputs",
+            input_axes.len(),
+            input_specs.len()
+        )));
+    }
+    let graph = TensorTraceGraph::new();
+    let mut inputs = Vec::with_capacity(input_specs.len());
+    for ((name, shape), axis) in input_specs.iter().zip(&input_axes) {
+        let tensor = if axis.is_some() {
+            let mut batched_shape = Vec::with_capacity(shape.len() + 1);
+            batched_shape.push(batch_size);
+            batched_shape.extend(shape.iter().copied());
+            graph.add_batched_input(name, batched_shape)
+        } else {
+            graph.add_input(name, shape.clone())
+        }
+        .map_err(PyValueError::new_err)?;
+        inputs.push(tensor);
+    }
+    let args = PyTuple::new(py, inputs)?;
+    let output: TraceTensor = function
+        .call1(args)?
+        .extract()
+        .map_err(|_| PyTypeError::new_err("tensor_vmap_fn function must return a TraceTensor"))?;
+    if !Arc::ptr_eq(&graph.ir, &output.graph.ir) {
+        return Err(PyValueError::new_err(
+            "tensor_vmap_fn function returned a tensor from a different graph",
+        ));
+    }
+    let output = if output.batch_axis.is_none() {
+        let mut shape = Vec::with_capacity(output.shape.len() + 1);
+        shape.push(batch_size);
+        shape.extend(&output.shape);
+        let node_id = graph
+            .ir
+            .lock()
+            .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
+            .broadcast_to(output.node_id, shape.clone())
+            .map_err(PyValueError::new_err)?;
+        TraceTensor::from_node(graph.clone(), node_id, shape, Some(0))
+    } else {
+        output
+    };
+    let signature = make_vmap_signature(&input_specs, in_axes, out_axis, output.shape.len())?;
+    Ok((TensorTraceResult::new(graph, output), signature))
+}
+
 #[pyfunction]
 pub fn trace_tensor(
     py: Python<'_>,
@@ -1846,40 +2182,78 @@ pub fn tensor_jit_fn(
     Ok(TensorJitFunction { plan })
 }
 
-fn batched_input_specs(
-    input_specs: Vec<(String, Vec<usize>)>,
-    batch_size: usize,
-) -> PyResult<Vec<(String, Vec<usize>)>> {
-    if batch_size == 0 {
-        return Err(PyValueError::new_err(
-            "tensor_vmap_fn requires batch_size > 0",
+fn move_axis(
+    tensor: DynamicTensor,
+    source: usize,
+    destination: usize,
+) -> Result<DynamicTensor, String> {
+    if source == destination {
+        return Ok(tensor);
+    }
+    let rank = tensor.shape().len();
+    if source >= rank || destination >= rank {
+        return Err(format!(
+            "cannot move axis {source} to {destination} for rank {rank}"
         ));
     }
-
-    Ok(input_specs
-        .into_iter()
-        .map(|(name, shape)| {
-            let mut batched_shape = Vec::with_capacity(shape.len() + 1);
-            batched_shape.push(batch_size);
-            batched_shape.extend(shape);
-            (name, batched_shape)
-        })
-        .collect())
+    let mut axes = (0..rank).collect::<Vec<_>>();
+    let axis = axes.remove(source);
+    axes.insert(destination, axis);
+    tensor.permute(&axes)
 }
 
-/// Trace a fixed-size axis-0 vectorized function into one reusable CPU plan.
+fn vmap_inputs(
+    signature: &VmapSignature,
+    values: &Bound<'_, PyDict>,
+) -> PyResult<BTreeMap<String, DynamicTensor>> {
+    let mut inputs = extract_tensor_map(values)?;
+    for (name, axis) in signature.input_names.iter().zip(&signature.in_axes) {
+        let Some(axis) = axis else { continue };
+        let tensor = inputs
+            .remove(name)
+            .ok_or_else(|| PyValueError::new_err(format!("missing input {name:?}")))?;
+        inputs.insert(
+            name.clone(),
+            move_axis(tensor, *axis, 0).map_err(PyValueError::new_err)?,
+        );
+    }
+    Ok(inputs)
+}
+
+fn vmap_output(signature: &VmapSignature, output: DynamicTensor) -> PyResult<PyTensor> {
+    let output = move_axis(output, 0, signature.out_axis).map_err(PyValueError::new_err)?;
+    PyTensor::from_dynamic_tensor(output).map_err(PyValueError::new_err)
+}
+
+/// Trace a fixed-size vectorized function into one reusable CPU plan.
 ///
-/// Every argument is mapped over its leading dimension. The supplied input
-/// shapes describe one example; the compiled plan expects `[batch_size, ..shape]`
-/// inputs and returns an output with the same leading batch dimension.
+/// `input_specs` describes one example. Mapped inputs are canonicalized to a
+/// leading batch axis during tracing; `in_axes` and `out_axis` only select the
+/// public layout at invocation boundaries.
 #[pyfunction]
+#[pyo3(signature = (function, input_specs, batch_size, in_axes = None, out_axis = 0))]
 pub fn tensor_vmap_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
     input_specs: Vec<(String, Vec<usize>)>,
     batch_size: usize,
-) -> PyResult<TensorJitFunction> {
-    tensor_jit_fn(py, function, batched_input_specs(input_specs, batch_size)?)
+    in_axes: Option<Vec<Option<isize>>>,
+    out_axis: isize,
+) -> PyResult<TensorVmapFunction> {
+    let (traced, signature) = trace_tensor_vmap_python_function(
+        py,
+        function,
+        input_specs,
+        batch_size,
+        in_axes,
+        out_axis,
+    )?;
+    let plan = traced
+        .graph
+        .compile_cpu_plan(traced.output.node_id)
+        .map_err(PyValueError::new_err)?
+        .plan;
+    Ok(TensorVmapFunction { plan, signature })
 }
 
 #[pyfunction]
@@ -1978,38 +2352,57 @@ pub fn tensor_value_and_grad_cuda_fn(
     })
 }
 
-/// Trace a fixed-size axis-0 vectorized function into one reusable CUDA plan.
+/// Trace a fixed-size vectorized function into one reusable CUDA plan.
 #[pyfunction]
-#[pyo3(signature = (function, input_specs, batch_size, device_ordinal = 0))]
+#[pyo3(signature = (function, input_specs, batch_size, in_axes = None, out_axis = 0, device_ordinal = 0))]
 pub fn tensor_vmap_cuda_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
     input_specs: Vec<(String, Vec<usize>)>,
     batch_size: usize,
+    in_axes: Option<Vec<Option<isize>>>,
+    out_axis: isize,
     device_ordinal: usize,
-) -> PyResult<TensorCudaExecutionPlan> {
-    tensor_jit_cuda_fn(
+) -> PyResult<TensorVmapCudaFunction> {
+    let (traced, signature) = trace_tensor_vmap_python_function(
         py,
         function,
-        batched_input_specs(input_specs, batch_size)?,
-        device_ordinal,
-    )
+        input_specs,
+        batch_size,
+        in_axes,
+        out_axis,
+    )?;
+    let plan = traced
+        .graph
+        .compile_cuda_plan(traced.output.node_id, device_ordinal)
+        .map_err(PyValueError::new_err)?;
+    Ok(TensorVmapCudaFunction { plan, signature })
 }
 
-/// Trace a fixed-size axis-0 vectorized function into one reusable MLX plan.
+/// Trace a fixed-size vectorized function into one reusable MLX plan.
 #[pyfunction]
+#[pyo3(signature = (function, input_specs, batch_size, in_axes = None, out_axis = 0))]
 pub fn tensor_vmap_mlx_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
     input_specs: Vec<(String, Vec<usize>)>,
     batch_size: usize,
-) -> PyResult<TensorMlxExecutionPlan> {
-    let traced =
-        trace_tensor_python_function(py, function, batched_input_specs(input_specs, batch_size)?)?;
-    traced
+    in_axes: Option<Vec<Option<isize>>>,
+    out_axis: isize,
+) -> PyResult<TensorVmapMlxFunction> {
+    let (traced, signature) = trace_tensor_vmap_python_function(
+        py,
+        function,
+        input_specs,
+        batch_size,
+        in_axes,
+        out_axis,
+    )?;
+    let plan = traced
         .graph
         .compile_mlx_plan(traced.output.node_id)
-        .map_err(PyValueError::new_err)
+        .map_err(PyValueError::new_err)?;
+    Ok(TensorVmapMlxFunction { plan, signature })
 }
 
 #[pyfunction]
