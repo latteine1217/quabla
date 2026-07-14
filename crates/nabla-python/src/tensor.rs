@@ -434,6 +434,24 @@ impl PyTensor {
         self.try_map(|lhs| if lhs > rhs { 1.0 } else { 0.0 })
     }
 
+    pub fn try_maximum(&self, rhs: &Self) -> Result<Self, String> {
+        let mask = self.try_gt(rhs)?;
+        Self::try_where(&mask, self, rhs)
+    }
+
+    pub fn try_maximum_scalar(&self, rhs: f64) -> Result<Self, String> {
+        self.try_map(|lhs| if lhs > rhs { lhs } else { rhs })
+    }
+
+    pub fn try_minimum(&self, rhs: &Self) -> Result<Self, String> {
+        let mask = rhs.try_gt(self)?;
+        Self::try_where(&mask, self, rhs)
+    }
+
+    pub fn try_minimum_scalar(&self, rhs: f64) -> Result<Self, String> {
+        self.try_map(|lhs| if rhs > lhs { lhs } else { rhs })
+    }
+
     pub fn try_where(mask: &Self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
         let value_shape = broadcast_shape(&on_true.shape, &on_false.shape)?;
         let shape = broadcast_shape(&mask.shape, &value_shape)?;
@@ -1159,6 +1177,30 @@ impl PyTensor {
         }
         if let Ok(rhs) = rhs.extract::<f64>() {
             return self.try_gt_scalar(rhs).map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected Tensor or numeric scalar operand",
+        ))
+    }
+
+    fn maximum(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
+            return self.try_maximum(&rhs).map_err(PyValueError::new_err);
+        }
+        if let Ok(rhs) = rhs.extract::<f64>() {
+            return self.try_maximum_scalar(rhs).map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected Tensor or numeric scalar operand",
+        ))
+    }
+
+    fn minimum(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
+            return self.try_minimum(&rhs).map_err(PyValueError::new_err);
+        }
+        if let Ok(rhs) = rhs.extract::<f64>() {
+            return self.try_minimum_scalar(rhs).map_err(PyValueError::new_err);
         }
         Err(PyTypeError::new_err(
             "expected Tensor or numeric scalar operand",

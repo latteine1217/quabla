@@ -561,6 +561,17 @@ impl TraceTensor {
         ))
     }
 
+    fn scalar_tensor(&self, value: f64) -> Result<Self, String> {
+        let mut ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let node_id = ir.scalar_constant(value);
+        let shape = ir.node_shape(node_id)?;
+        Ok(Self::from_node(self.graph.clone(), node_id, shape, None))
+    }
+
     fn scalar_left_binary(&self, value: f64, op: &str) -> Result<Self, String> {
         let mut ir = self
             .graph
@@ -644,6 +655,28 @@ impl TraceTensor {
             shape,
             Self::merged_batch_axis(&[self, on_true, on_false])?,
         ))
+    }
+
+    fn maximum_tensor(&self, rhs: &Self) -> Result<Self, String> {
+        let mask = self.binary(rhs, "greater")?;
+        mask.where_tensor(self, rhs)
+    }
+
+    fn maximum_scalar(&self, rhs: f64) -> Result<Self, String> {
+        let mask = self.scalar_binary(rhs, "greater")?;
+        let rhs = self.scalar_tensor(rhs)?;
+        mask.where_tensor(self, &rhs)
+    }
+
+    fn minimum_tensor(&self, rhs: &Self) -> Result<Self, String> {
+        let mask = rhs.binary(self, "greater")?;
+        mask.where_tensor(self, rhs)
+    }
+
+    fn minimum_scalar(&self, rhs: f64) -> Result<Self, String> {
+        let mask = self.scalar_left_binary(rhs, "greater")?;
+        let rhs = self.scalar_tensor(rhs)?;
+        mask.where_tensor(self, &rhs)
     }
 
     fn tanh_tensor(&self) -> Result<Self, String> {
@@ -1220,6 +1253,30 @@ impl TraceTensor {
 
     fn gt(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
         trace_tensor_or_scalar_operand(self, rhs, "greater")
+    }
+
+    fn maximum(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(rhs) = rhs.extract::<PyRef<'_, TraceTensor>>() {
+            return self.maximum_tensor(&rhs).map_err(PyValueError::new_err);
+        }
+        if let Ok(rhs) = rhs.extract::<f64>() {
+            return self.maximum_scalar(rhs).map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected TraceTensor or numeric scalar operand",
+        ))
+    }
+
+    fn minimum(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(rhs) = rhs.extract::<PyRef<'_, TraceTensor>>() {
+            return self.minimum_tensor(&rhs).map_err(PyValueError::new_err);
+        }
+        if let Ok(rhs) = rhs.extract::<f64>() {
+            return self.minimum_scalar(rhs).map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected TraceTensor or numeric scalar operand",
+        ))
     }
 
     fn where_select(&self, on_true: &Self, on_false: &Self) -> PyResult<Self> {

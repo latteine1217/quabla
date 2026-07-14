@@ -76,7 +76,7 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
   NumPy-style batched `matmul`, rank-N `nabla.concat([...], axis=...)`,
   permutation-validated `transpose(axes=None)`, global or single-axis `sum`/`mean`,
   common elementwise math (`tanh`, `exp`, `log`, `sqrt`, `sin`, `cos`, `powi`),
-  `gt(...)` masks, broadcasted `nabla.where(...)`, materialized `broadcast_to(shape)`,
+  `gt(...)` masks, `maximum(...)`/`minimum(...)`, broadcasted `nabla.where(...)`, materialized `broadcast_to(shape)`,
   and element-count-preserving reshape.
   `Tensor` is not yet traceable,
   differentiable, or part of the CPU plan. `Tensor.slice(...)` returns a
@@ -87,7 +87,7 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
 - `tensor_jacobian_fn(fn, input_specs, input_name)` freezes one rank-N trace
   and returns an output-flat by input-flat dense Jacobian for the selected input.
   Its `TraceTensor` values currently support broadcasted add/subtract/multiply/divide,
-  batched `matmul`, rank-N `concat`, `stack([...], axis=...)`, `slice(axis, start, stop)`, `broadcast_to(shape)`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `log`, reshape, global or single-axis `sum`/`mean`, and `gt`/`where` masks. `stack` is composed from reshape plus concat, so it inherits the same direct and symbolic CPU/CUDA AD rules. `concat` is linear: direct and symbolic VJP split the upstream cotangent with internal slice nodes, while its JVP and mixed second-direction transform concatenate the corresponding tangents. `slice` supports normalized negative axes and uses a zero-padded internal reverse node, keeping direct and symbolic gradients on the selected original coordinates. `broadcast_to` is a dedicated shape node whose VJP reduces repeated axes back to the input shape. Comparisons are explicitly non-differentiable; `where` routes VJP/JVP contributions only through the selected data branch. `TensorTraceGraph.evaluate_vjp(...)` and
+  batched `matmul`, rank-N `concat`, `stack([...], axis=...)`, `slice(axis, start, stop)`, `broadcast_to(shape)`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `log`, reshape, global or single-axis `sum`/`mean`, `maximum`/`minimum`, and `gt`/`where` masks. `stack` is composed from reshape plus concat, so it inherits the same direct and symbolic CPU/CUDA AD rules. `concat` is linear: direct and symbolic VJP split the upstream cotangent with internal slice nodes, while its JVP and mixed second-direction transform concatenate the corresponding tangents. `slice` supports normalized negative axes and uses a zero-padded internal reverse node, keeping direct and symbolic gradients on the selected original coordinates. `broadcast_to` is a dedicated shape node whose VJP reduces repeated axes back to the input shape. Comparisons are explicitly non-differentiable; `where` routes VJP/JVP contributions only through the selected data branch. `maximum` and `minimum` are composed from those primitives and route equality subgradients to their right operand. `TensorTraceGraph.evaluate_vjp(...)` and
   `TensorTraceGraph.evaluate_jvp(...)` execute the corresponding rank-N CPU
   reverse and forward transforms. `TensorTraceGraph.hessian_scalar(...)`
   computes an exact dense Hessian for one named input and a scalar output using

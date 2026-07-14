@@ -358,6 +358,17 @@ def test_tensor_comparisons_and_where_support_rank_n_broadcasting():
     ]
 
 
+def test_tensor_maximum_and_minimum_broadcast_and_choose_rhs_on_ties():
+    left = nabla.Tensor([2, 1], [2.0, 0.0])
+    right = nabla.Tensor([1, 3], [2.0, 1.0, -1.0])
+
+    assert left.maximum(right).shape == [2, 3]
+    assert left.maximum(right).to_flat_list() == [2.0, 2.0, 2.0, 2.0, 1.0, 0.0]
+    assert left.minimum(right).to_flat_list() == [2.0, 1.0, -1.0, 0.0, 0.0, -1.0]
+    assert left.maximum(1.0).to_flat_list() == [2.0, 1.0]
+    assert left.minimum(1.0).to_flat_list() == [1.0, 0.0]
+
+
 def test_tensor_broadcast_to_materializes_rank_n_contiguous_storage():
     tensor = nabla.Tensor([1, 2, 1], [2.0, -3.0])
     output = tensor.broadcast_to([3, 2, 4])
@@ -1388,6 +1399,45 @@ def test_trace_tensor_where_routes_gradients_and_masks_condition_derivatives():
     assert transformed_value.to_flat_list() == [13.0]
     assert plan_value.to_flat_list() == value.to_flat_list()
     assert plan_gradients["x"].to_flat_list() == gradients["x"].to_flat_list()
+
+
+def test_trace_tensor_maximum_and_minimum_route_tie_gradients_to_rhs():
+    left = nabla.Tensor([3], [2.0, 3.0, 0.0])
+    right = nabla.Tensor([3], [2.0, 1.0, 4.0])
+    cotangent = nabla.Tensor([], [1.0])
+
+    for operation, expected_value, expected_left, expected_right in (
+        ("maximum", [2.0, 3.0, 4.0], [0.0, 1.0, 0.0], [1.0, 0.0, 1.0]),
+        ("minimum", [2.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 0.0]),
+    ):
+        traced = nabla.trace_tensor(
+            lambda x, y: getattr(x, operation)(y).sum(),
+            [("x", [3]), ("y", [3])],
+        )
+        inputs = {"x": left, "y": right}
+        value, gradients = traced.graph.evaluate_value_and_vjp(
+            traced.output.node_id, inputs, cotangent
+        )
+        symbolic = traced.symbolic_vjp("loss_cotangent")
+        symbolic_inputs = {**inputs, "loss_cotangent": cotangent}
+
+        assert value.to_flat_list() == [sum(expected_value)]
+        assert gradients["x"].to_flat_list() == expected_left
+        assert gradients["y"].to_flat_list() == expected_right
+        assert symbolic["x"].graph.evaluate(
+            symbolic["x"].output.node_id, symbolic_inputs
+        ).to_flat_list() == expected_left
+        assert symbolic["y"].graph.evaluate(
+            symbolic["y"].output.node_id, symbolic_inputs
+        ).to_flat_list() == expected_right
+
+        cpu = traced.output.compile_cpu().evaluate(inputs)
+        if os.environ.get("NABLA_MLX_TEST") is not None:
+            mlx = traced.output.compile_mlx().evaluate(inputs)
+            assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
+        if os.environ.get("NABLA_CUDA_TEST") is not None:
+            cuda = traced.output.compile_cuda().evaluate(inputs)
+            assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
 
 def test_trace_tensor_log_supports_jvp_and_vjp():
