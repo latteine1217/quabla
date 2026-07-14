@@ -10,8 +10,8 @@ use cudarc::driver::{
 use cudarc::nvrtc::compile_ptx;
 
 use super::{
-    contiguous_strides, element_count, tensor_op_inputs, DynamicTensor, TensorBackend,
-    TensorExecutionPlan, TensorOp,
+    contiguous_strides, element_count, sqrt_derivative_coefficient, tensor_op_inputs,
+    DynamicTensor, TensorBackend, TensorExecutionPlan, TensorOp,
 };
 
 const CUDA_MATMUL_TILE: usize = 32;
@@ -815,6 +815,8 @@ fn execute_cuda_device_program(
             | TensorOp::Where { .. }
             | TensorOp::Tanh { .. }
             | TensorOp::Exp { .. }
+            | TensorOp::Sqrt { .. }
+            | TensorOp::SqrtDerivative { .. }
             | TensorOp::Sin { .. }
             | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
@@ -1321,6 +1323,8 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
         }
         TensorOp::Tanh { input }
         | TensorOp::Exp { input }
+        | TensorOp::Sqrt { input }
+        | TensorOp::SqrtDerivative { input, .. }
         | TensorOp::Sin { input }
         | TensorOp::Cos { input }
         | TensorOp::Powi { input, .. }
@@ -1737,6 +1741,8 @@ extern \"C\" __global__ void nabla_sgd(float* parameter, const float* gradient, 
             }
             TensorOp::Tanh { input }
             | TensorOp::Exp { input }
+            | TensorOp::Sqrt { input }
+            | TensorOp::SqrtDerivative { input, .. }
             | TensorOp::Sin { input }
             | TensorOp::Cos { input }
             | TensorOp::Powi { input, .. }
@@ -1744,6 +1750,14 @@ extern \"C\" __global__ void nabla_sgd(float* parameter, const float* gradient, 
                 let expression = match &node.op {
                     TensorOp::Tanh { .. } => "tanhf(input[index])".to_string(),
                     TensorOp::Exp { .. } => "expf(input[index])".to_string(),
+                    TensorOp::Sqrt { .. } => "sqrtf(input[index])".to_string(),
+                    TensorOp::SqrtDerivative { order, .. } => {
+                        let coefficient = cuda_float_literal(sqrt_derivative_coefficient(*order));
+                        let exponent = cuda_float_literal(0.5 - *order as f64);
+                        format!(
+                            "input[index] == 0.0f ? 0.0f : {coefficient} * powf(input[index], {exponent})"
+                        )
+                    }
                     TensorOp::Sin { .. } => "sinf(input[index])".to_string(),
                     TensorOp::Cos { .. } => "cosf(input[index])".to_string(),
                     TensorOp::Powi { exponent, .. } => {
@@ -2039,6 +2053,8 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Matmul { .. } => "matmul",
         TensorOp::Tanh { .. } => "tanh",
         TensorOp::Exp { .. } => "exp",
+        TensorOp::Sqrt { .. } => "sqrt",
+        TensorOp::SqrtDerivative { .. } => "sqrt_derivative",
         TensorOp::Reshape { .. } => "reshape",
         TensorOp::Mean { .. } => "mean",
         TensorOp::MeanAxis { .. } => "mean_axis",

@@ -645,6 +645,10 @@ impl PyTensor {
         self.try_reduce_axes(axes, keepdims, true)
     }
 
+    pub fn try_norm(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        self.try_powi(2)?.try_sum_axes(axes, keepdims)?.try_sqrt()
+    }
+
     fn try_reduce_axes(
         &self,
         axes: Option<Vec<isize>>,
@@ -1004,6 +1008,12 @@ impl PyTensor {
     #[pyo3(signature = (axis = None, keepdims = false))]
     fn mean(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
         self.try_mean_axes(extract_reduction_axes(axis)?, keepdims)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn norm(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.try_norm(extract_reduction_axes(axis)?, keepdims)
             .map_err(PyValueError::new_err)
     }
 

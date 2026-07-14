@@ -844,6 +844,12 @@ impl TraceTensor {
         Ok(reduced)
     }
 
+    fn norm_tensor(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        self.powi_tensor(2)?
+            .reduce_axes_tensor(axes, keepdims, false)?
+            .sqrt_tensor()
+    }
+
     fn sin_tensor(&self) -> Result<Self, String> {
         let mut ir = self
             .graph
@@ -943,10 +949,7 @@ impl TraceTensor {
             .ir
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
-        let log = ir.log(self.node_id)?;
-        let half = ir.scalar_constant(0.5);
-        let scaled = ir.mul(log, half)?;
-        let node_id = ir.exp(scaled)?;
+        let node_id = ir.sqrt(self.node_id)?;
         let shape = ir.node_shape(node_id)?;
         Ok(Self::from_node(
             self.graph.clone(),
@@ -1316,6 +1319,12 @@ impl TraceTensor {
     #[pyo3(signature = (axis = None, keepdims = false))]
     fn mean(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
         self.reduce_axes_tensor(extract_reduction_axes(axis)?, keepdims, true)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn norm(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.norm_tensor(extract_reduction_axes(axis)?, keepdims)
             .map_err(PyValueError::new_err)
     }
 

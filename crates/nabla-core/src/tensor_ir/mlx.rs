@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use mlx_rs::{ops, Array, StreamOrDevice};
 
-use super::{DynamicTensor, TensorBackend, TensorExecutionPlan, TensorOp};
+use super::{
+    sqrt_derivative_coefficient, DynamicTensor, TensorBackend, TensorExecutionPlan, TensorOp,
+};
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
 ///
@@ -83,6 +85,26 @@ impl TensorBackend for MlxBackend {
                 TensorOp::Exp { input } => mlx_value(&values, *input)?
                     .exp_device(&stream)
                     .map_err(|error| error.to_string()),
+                TensorOp::Sqrt { input } => mlx_value(&values, *input)?
+                    .sqrt_device(&stream)
+                    .map_err(|error| error.to_string()),
+                TensorOp::SqrtDerivative { input, order } => {
+                    let input = mlx_value(&values, *input)?;
+                    let zero = Array::from_f32(0.0);
+                    let exponent = Array::from_f32(0.5 - *order as f32);
+                    let coefficient = Array::from_f32(sqrt_derivative_coefficient(*order) as f32);
+                    let power = input
+                        .power_device(&exponent, &stream)
+                        .map_err(|error| error.to_string())?;
+                    let scaled = power
+                        .multiply_device(&coefficient, &stream)
+                        .map_err(|error| error.to_string())?;
+                    let positive = input
+                        .gt_device(&zero, &stream)
+                        .map_err(|error| error.to_string())?;
+                    ops::r#where_device(&positive, &scaled, &zero, &stream)
+                        .map_err(|error| error.to_string())
+                }
                 TensorOp::Sin { input } => mlx_value(&values, *input)?
                     .sin_device(&stream)
                     .map_err(|error| error.to_string()),
@@ -256,6 +278,8 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Matmul { .. } => "matmul",
         TensorOp::Tanh { .. } => "tanh",
         TensorOp::Exp { .. } => "exp",
+        TensorOp::Sqrt { .. } => "sqrt",
+        TensorOp::SqrtDerivative { .. } => "sqrt_derivative",
         TensorOp::Reshape { .. } => "reshape",
         TensorOp::Mean { .. } => "mean",
         TensorOp::MeanAxis { .. } => "mean_axis",

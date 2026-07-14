@@ -291,6 +291,13 @@ def test_tensor_reductions_match_trace_tensor_axis_semantics():
         else:
             raise AssertionError(f"sum accepted invalid axis {axis}")
 
+    assert tensor.norm().to_flat_list() == [math.sqrt(650.0)]
+    assert tensor.norm(axis=[0, -1], keepdims=True).shape == [1, 3, 1]
+    assert_close_rows(
+        [tensor.norm(axis=[0, -1], keepdims=True).to_flat_list()],
+        [[math.sqrt(118.0), math.sqrt(206.0), math.sqrt(326.0)]],
+    )
+
 
 def test_tensor_elementwise_math_matches_python_math():
     tensor = nabla.Tensor([2, 2], [0.0, 1.0, -1.0, 4.0])
@@ -1371,6 +1378,52 @@ def test_trace_tensor_sqrt_supports_jvp_and_vjp():
     expected = [0.5, 0.25, 1.0 / 6.0, 0.125]
     assert_close_rows([gradients["x"].to_flat_list()], [expected])
     assert abs(tangent.to_flat_list()[0] - sum(expected)) <= 1e-12
+
+
+def test_trace_tensor_sqrt_and_norm_define_zero_subgradient_and_preserve_symbolic_ad():
+    traced = nabla.trace_tensor(lambda x: x.sqrt().sum(), [("x", [3])])
+    inputs = {"x": nabla.Tensor([3], [0.0, 1.0, 4.0])}
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id, inputs, {"x": nabla.Tensor([3], [1.0, 1.0, 1.0])}
+    )
+    symbolic = traced.symbolic_vjp("loss_cotangent")["x"]
+
+    assert gradients["x"].to_flat_list() == [0.0, 0.5, 0.25]
+    assert tangent.to_flat_list() == [0.75]
+    assert symbolic.graph.evaluate(
+        symbolic.output.node_id,
+        {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])},
+    ).to_flat_list() == [0.0, 0.5, 0.25]
+    hessian = traced.graph.hessian_scalar(traced.output.node_id, "x", inputs)
+    assert hessian.shape == [3, 3]
+    assert_close_rows(
+        [hessian.to_flat_list()],
+        [[0.0, 0.0, 0.0, 0.0, -0.25, 0.0, 0.0, 0.0, -1.0 / 32.0]],
+    )
+
+    symbolic_inputs = {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])}
+    cpu_gradient = symbolic.output.compile_cpu().evaluate(symbolic_inputs)
+    if os.environ.get("NABLA_MLX_TEST") is not None:
+        mlx_gradient = symbolic.output.compile_mlx().evaluate(symbolic_inputs)
+        assert_close_rows(
+            [mlx_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
+        )
+    if os.environ.get("NABLA_CUDA_TEST") is not None:
+        cuda_gradient = symbolic.output.compile_cuda().evaluate(symbolic_inputs)
+        assert_close_rows(
+            [cuda_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
+        )
+
+    norm = nabla.trace_tensor(lambda x: x.norm(), [("x", [2])])
+    norm_inputs = {"x": nabla.Tensor([2], [3.0, 4.0])}
+    value, norm_gradients = norm.graph.evaluate_value_and_vjp(
+        norm.output.node_id, norm_inputs, nabla.Tensor([], [1.0])
+    )
+    assert value.to_flat_list() == [5.0]
+    assert norm_gradients["x"].to_flat_list() == [0.6, 0.8]
 
 
 def test_trace_tensor_where_routes_gradients_and_masks_condition_derivatives():

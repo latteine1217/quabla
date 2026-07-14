@@ -266,6 +266,13 @@ enum TensorOp {
     Exp {
         input: TensorNodeId,
     },
+    Sqrt {
+        input: TensorNodeId,
+    },
+    SqrtDerivative {
+        input: TensorNodeId,
+        order: u32,
+    },
     Reshape {
         input: TensorNodeId,
     },
@@ -617,6 +624,27 @@ impl DynamicTensor {
         Self::new(
             self.shape.clone(),
             self.data.iter().map(|value| value.exp()).collect(),
+        )
+    }
+
+    fn sqrt(&self) -> Result<Self, String> {
+        self.sqrt_derivative(0)
+    }
+
+    fn sqrt_derivative(&self, order: u32) -> Result<Self, String> {
+        let coefficient = sqrt_derivative_coefficient(order);
+        Self::new(
+            self.shape.clone(),
+            self.data
+                .iter()
+                .map(|value| {
+                    if *value == 0.0 {
+                        0.0
+                    } else {
+                        coefficient * value.powf(0.5 - order as f64)
+                    }
+                })
+                .collect(),
         )
     }
 
@@ -1047,6 +1075,21 @@ impl TensorIr {
                     let value = transformed.exp(input_value)?;
                     (value, transformed.mul(input_tangent, value)?)
                 }
+                TensorOp::Sqrt { input } => {
+                    let (input_value, input_tangent) = pairs[*input];
+                    let value = transformed.sqrt(input_value)?;
+                    let derivative = transformed.sqrt_derivative(input_value, 1)?;
+                    (value, transformed.mul(input_tangent, derivative)?)
+                }
+                TensorOp::SqrtDerivative { input, order } => {
+                    let (input_value, input_tangent) = pairs[*input];
+                    let value = transformed.sqrt_derivative(input_value, *order)?;
+                    let next_order = order
+                        .checked_add(1)
+                        .ok_or_else(|| "sqrt derivative order overflows u32".to_string())?;
+                    let derivative = transformed.sqrt_derivative(input_value, next_order)?;
+                    (value, transformed.mul(input_tangent, derivative)?)
+                }
                 TensorOp::Sin { input } => {
                     let (input_value, input_tangent) = pairs[*input];
                     let value = transformed.sin(input_value)?;
@@ -1228,6 +1271,10 @@ impl TensorIr {
                 TensorOp::Matmul { lhs, rhs } => transformed.matmul(values[*lhs], values[*rhs])?,
                 TensorOp::Tanh { input } => transformed.tanh(values[*input])?,
                 TensorOp::Exp { input } => transformed.exp(values[*input])?,
+                TensorOp::Sqrt { input } => transformed.sqrt(values[*input])?,
+                TensorOp::SqrtDerivative { input, order } => {
+                    transformed.sqrt_derivative(values[*input], *order)?
+                }
                 TensorOp::Reshape { input } => {
                     transformed.reshape(values[*input], node.shape.clone())?
                 }
@@ -1457,6 +1504,31 @@ impl TensorIr {
                 }
                 TensorOp::Exp { input } => {
                     let contribution = transformed.mul(upstream, values[node_id])?;
+                    let contribution = symbolic_reduce_to_shape(
+                        &mut transformed,
+                        contribution,
+                        &node.shape,
+                        &self.node(*input)?.shape,
+                    )?;
+                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
+                }
+                TensorOp::Sqrt { input } => {
+                    let derivative = transformed.sqrt_derivative(values[*input], 1)?;
+                    let contribution = transformed.mul(upstream, derivative)?;
+                    let contribution = symbolic_reduce_to_shape(
+                        &mut transformed,
+                        contribution,
+                        &node.shape,
+                        &self.node(*input)?.shape,
+                    )?;
+                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
+                }
+                TensorOp::SqrtDerivative { input, order } => {
+                    let next_order = order
+                        .checked_add(1)
+                        .ok_or_else(|| "sqrt derivative order overflows u32".to_string())?;
+                    let derivative = transformed.sqrt_derivative(values[*input], next_order)?;
+                    let contribution = transformed.mul(upstream, derivative)?;
                     let contribution = symbolic_reduce_to_shape(
                         &mut transformed,
                         contribution,
@@ -1731,6 +1803,26 @@ impl TensorIr {
         let id = self.nodes.len();
         self.nodes.push(TensorNode {
             op: TensorOp::Exp { input },
+            shape,
+        });
+        Ok(id)
+    }
+
+    pub fn sqrt(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        let shape = self.node(input)?.shape.clone();
+        let id = self.nodes.len();
+        self.nodes.push(TensorNode {
+            op: TensorOp::Sqrt { input },
+            shape,
+        });
+        Ok(id)
+    }
+
+    fn sqrt_derivative(&mut self, input: TensorNodeId, order: u32) -> Result<TensorNodeId, String> {
+        let shape = self.node(input)?.shape.clone();
+        let id = self.nodes.len();
+        self.nodes.push(TensorNode {
+            op: TensorOp::SqrtDerivative { input, order },
             shape,
         });
         Ok(id)
@@ -2207,6 +2299,27 @@ impl TensorIr {
                         .reduce_to_shape(&self.node(*input)?.shape)?;
                     accumulate(&mut cotangents[*input], contribution)?;
                 }
+                TensorOp::Sqrt { input } => {
+                    let input_value = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let contribution = cotangent
+                        .mul(&input_value.sqrt_derivative(1)?)?
+                        .reduce_to_shape(&self.node(*input)?.shape)?;
+                    accumulate(&mut cotangents[*input], contribution)?;
+                }
+                TensorOp::SqrtDerivative { input, order } => {
+                    let input_value = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let next_order = order
+                        .checked_add(1)
+                        .ok_or_else(|| "sqrt derivative order overflows u32".to_string())?;
+                    let contribution = cotangent
+                        .mul(&input_value.sqrt_derivative(next_order)?)?
+                        .reduce_to_shape(&self.node(*input)?.shape)?;
+                    accumulate(&mut cotangents[*input], contribution)?;
+                }
                 TensorOp::Reshape { input } => {
                     let contribution = cotangent.reshape(self.node(*input)?.shape.clone())?;
                     accumulate(&mut cotangents[*input], contribution)?;
@@ -2448,6 +2561,27 @@ impl TensorIr {
                         .get(node_id)
                         .ok_or_else(|| format!("node {node_id} has no evaluated value"))?;
                     input_tangent.mul(output_value)?
+                }
+                TensorOp::Sqrt { input } => {
+                    let input_tangent = tangents
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated tangent"))?;
+                    let input_value = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    input_tangent.mul(&input_value.sqrt_derivative(1)?)?
+                }
+                TensorOp::SqrtDerivative { input, order } => {
+                    let input_tangent = tangents
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated tangent"))?;
+                    let input_value = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let next_order = order
+                        .checked_add(1)
+                        .ok_or_else(|| "sqrt derivative order overflows u32".to_string())?;
+                    input_tangent.mul(&input_value.sqrt_derivative(next_order)?)?
                 }
                 TensorOp::Reshape { input } => tangents
                     .get(*input)
@@ -2693,6 +2827,13 @@ impl TensorIr {
                 TensorOp::Exp { input } => {
                     format!("%{id} = exp(%{input}) : {}", format_shape(&node.shape))
                 }
+                TensorOp::Sqrt { input } => {
+                    format!("%{id} = sqrt(%{input}) : {}", format_shape(&node.shape))
+                }
+                TensorOp::SqrtDerivative { input, order } => format!(
+                    "%{id} = sqrt_derivative(%{input}, order={order}) : {}",
+                    format_shape(&node.shape)
+                ),
                 TensorOp::Reshape { input } => {
                     format!("%{id} = reshape(%{input}) : {}", format_shape(&node.shape))
                 }
@@ -2870,6 +3011,14 @@ impl TensorIr {
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .exp()?,
+                TensorOp::Sqrt { input } => values
+                    .get(*input)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .sqrt()?,
+                TensorOp::SqrtDerivative { input, order } => values
+                    .get(*input)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .sqrt_derivative(*order)?,
                 TensorOp::Reshape { input } => values
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
@@ -3098,6 +3247,44 @@ impl TensorIr {
                                 .add(&input.first.mul(&input.second)?)?
                                 .mul(&value)?,
                             value,
+                        }
+                    }
+                    TensorOp::Sqrt { input } => {
+                        let input = values
+                            .get(*input)
+                            .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                        let first_derivative = input.value.sqrt_derivative(1)?;
+                        let second_derivative = input.value.sqrt_derivative(2)?;
+                        MixedTangent {
+                            value: input.value.sqrt()?,
+                            first: input.first.mul(&first_derivative)?,
+                            second: input.second.mul(&first_derivative)?,
+                            mixed: input
+                                .mixed
+                                .mul(&first_derivative)?
+                                .add(&input.first.mul(&input.second)?.mul(&second_derivative)?)?,
+                        }
+                    }
+                    TensorOp::SqrtDerivative { input, order } => {
+                        let input = values
+                            .get(*input)
+                            .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                        let first_order = order
+                            .checked_add(1)
+                            .ok_or_else(|| "sqrt derivative order overflows u32".to_string())?;
+                        let second_order = order
+                            .checked_add(2)
+                            .ok_or_else(|| "sqrt derivative order overflows u32".to_string())?;
+                        let first_derivative = input.value.sqrt_derivative(first_order)?;
+                        let second_derivative = input.value.sqrt_derivative(second_order)?;
+                        MixedTangent {
+                            value: input.value.sqrt_derivative(*order)?,
+                            first: input.first.mul(&first_derivative)?,
+                            second: input.second.mul(&first_derivative)?,
+                            mixed: input
+                                .mixed
+                                .mul(&first_derivative)?
+                                .add(&input.first.mul(&input.second)?.mul(&second_derivative)?)?,
                         }
                     }
                     TensorOp::ScalarConstant { value } => MixedTangent {
@@ -3693,6 +3880,15 @@ fn cuda_expression(nodes: &[TensorNode], node_id: TensorNodeId) -> Result<String
         )),
         TensorOp::Tanh { input } => Ok(format!("tanhf({})", child(*input)?)),
         TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
+        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
+        TensorOp::SqrtDerivative { input, order } => {
+            let input = child(*input)?;
+            let coefficient = cuda_scalar_literal(sqrt_derivative_coefficient(*order));
+            let exponent = cuda_scalar_literal(0.5 - *order as f64);
+            Ok(format!(
+                "(({input} == 0.0f) ? 0.0f : ({coefficient} * powf({input}, {exponent})))"
+            ))
+        }
         TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
         TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
         TensorOp::Powi { input, exponent } => Ok(format!(
@@ -3786,6 +3982,8 @@ fn is_fusable_elementwise_subgraph(nodes: &[TensorNode], node_id: TensorNodeId) 
         }
         TensorOp::Tanh { input }
         | TensorOp::Exp { input }
+        | TensorOp::Sqrt { input }
+        | TensorOp::SqrtDerivative { input, .. }
         | TensorOp::Sin { input }
         | TensorOp::Cos { input }
         | TensorOp::Powi { input, .. } => is_fusable_elementwise_subgraph(nodes, *input),
@@ -3886,6 +4084,18 @@ fn evaluate_fused_element(
         }
         TensorOp::Tanh { input } => Ok(child(*input)?.tanh()),
         TensorOp::Exp { input } => Ok(child(*input)?.exp()),
+        TensorOp::Sqrt { input } => {
+            let value = child(*input)?;
+            Ok(value.sqrt())
+        }
+        TensorOp::SqrtDerivative { input, order } => {
+            let value = child(*input)?;
+            Ok(if value == 0.0 {
+                0.0
+            } else {
+                sqrt_derivative_coefficient(*order) * value.powf(0.5 - *order as f64)
+            })
+        }
         TensorOp::Sin { input } => Ok(child(*input)?.sin()),
         TensorOp::Cos { input } => Ok(child(*input)?.cos()),
         TensorOp::Powi { input, exponent } => {
@@ -3936,6 +4146,8 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         | TensorOp::SumAxis { input, .. }
         | TensorOp::Tanh { input }
         | TensorOp::Exp { input }
+        | TensorOp::Sqrt { input }
+        | TensorOp::SqrtDerivative { input, .. }
         | TensorOp::Reshape { input }
         | TensorOp::Mean { input }
         | TensorOp::MeanAxis { input, .. }
@@ -3968,6 +4180,8 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Matmul { .. } => "matmul",
         TensorOp::Tanh { .. } => "tanh",
         TensorOp::Exp { .. } => "exp",
+        TensorOp::Sqrt { .. } => "sqrt",
+        TensorOp::SqrtDerivative { .. } => "sqrt_derivative",
         TensorOp::Reshape { .. } => "reshape",
         TensorOp::Mean { .. } => "mean",
         TensorOp::MeanAxis { .. } => "mean_axis",
@@ -4002,6 +4216,10 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<String> {
         TensorOp::Matmul { lhs, rhs } => format!("matmul:{lhs}:{rhs}:{shape:?}"),
         TensorOp::Tanh { input } => format!("tanh:{input}:{shape:?}"),
         TensorOp::Exp { input } => format!("exp:{input}:{shape:?}"),
+        TensorOp::Sqrt { input } => format!("sqrt:{input}:{shape:?}"),
+        TensorOp::SqrtDerivative { input, order } => {
+            format!("sqrt_derivative:{input}:{order}:{shape:?}")
+        }
         TensorOp::Reshape { input } => format!("reshape:{input}:{shape:?}"),
         TensorOp::Mean { input } => format!("mean:{input}:{shape:?}"),
         TensorOp::MeanAxis { input, axis } => format!("mean_axis:{input}:{axis}:{shape:?}"),
@@ -4085,6 +4303,13 @@ fn remap_tensor_op(
         }),
         TensorOp::Exp { input } => Ok(TensorOp::Exp {
             input: remap_node(*input)?,
+        }),
+        TensorOp::Sqrt { input } => Ok(TensorOp::Sqrt {
+            input: remap_node(*input)?,
+        }),
+        TensorOp::SqrtDerivative { input, order } => Ok(TensorOp::SqrtDerivative {
+            input: remap_node(*input)?,
+            order: *order,
         }),
         TensorOp::Reshape { input } => Ok(TensorOp::Reshape {
             input: remap_node(*input)?,
@@ -4186,6 +4411,10 @@ fn input_tangent_or_zero(
         }
         None => DynamicTensor::filled(shape.to_vec(), 0.0),
     }
+}
+
+fn sqrt_derivative_coefficient(order: u32) -> f64 {
+    (0..order).fold(1.0, |coefficient, index| coefficient * (0.5 - index as f64))
 }
 
 fn element_count(shape: &[usize]) -> Result<usize, String> {
