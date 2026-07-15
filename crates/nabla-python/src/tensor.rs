@@ -569,6 +569,69 @@ impl PyTensor {
         })
     }
 
+    pub fn try_solve(&self, rhs: &Self) -> Result<Self, String> {
+        if self.shape.len() != 2 || rhs.shape.len() != 2 {
+            return Err(format!(
+                "solve requires rank-2 matrix and right-hand side tensors, got {:?} and {:?}",
+                self.shape, rhs.shape
+            ));
+        }
+        let n = self.shape[0];
+        if n != self.shape[1] || n != rhs.shape[0] {
+            return Err(format!(
+                "solve requires coefficient shape {:?} and right-hand side shape {:?} to have compatible rows",
+                self.shape, rhs.shape
+            ));
+        }
+        let columns = rhs.shape[1];
+        let mut factor = self.data.as_ref().clone();
+        let mut result = rhs.data.as_ref().clone();
+        for pivot in 0..n {
+            let pivot_row = (pivot..n)
+                .max_by(|&left, &right| {
+                    factor[left * n + pivot]
+                        .abs()
+                        .total_cmp(&factor[right * n + pivot].abs())
+                })
+                .expect("pivot range is non-empty");
+            if factor[pivot_row * n + pivot] == 0.0 {
+                return Err("solve requires a non-singular coefficient matrix".to_string());
+            }
+            if pivot_row != pivot {
+                for column in 0..n {
+                    factor.swap(pivot * n + column, pivot_row * n + column);
+                }
+                for column in 0..columns {
+                    result.swap(pivot * columns + column, pivot_row * columns + column);
+                }
+            }
+            let diagonal = factor[pivot * n + pivot];
+            for row in pivot + 1..n {
+                let multiplier = factor[row * n + pivot] / diagonal;
+                factor[row * n + pivot] = multiplier;
+                for column in pivot + 1..n {
+                    factor[row * n + column] -= multiplier * factor[pivot * n + column];
+                }
+                for column in 0..columns {
+                    result[row * columns + column] -= multiplier * result[pivot * columns + column];
+                }
+            }
+        }
+        for row in (0..n).rev() {
+            for column in 0..columns {
+                let mut value = result[row * columns + column];
+                for inner in row + 1..n {
+                    value -= factor[row * n + inner] * result[inner * columns + column];
+                }
+                result[row * columns + column] = value / factor[row * n + row];
+            }
+        }
+        Ok(Self {
+            shape: rhs.shape.clone(),
+            data: Arc::new(result),
+        })
+    }
+
     pub fn try_reshape(&self, shape: Vec<usize>) -> Result<Self, String> {
         let expected = element_count(&shape)?;
         if expected != self.data.len() {
@@ -1448,6 +1511,10 @@ impl PyTensor {
 
     fn matmul(&self, rhs: &Self) -> PyResult<Self> {
         self.__matmul__(rhs)
+    }
+
+    fn solve(&self, rhs: &Self) -> PyResult<Self> {
+        self.try_solve(rhs).map_err(PyValueError::new_err)
     }
 
     fn __repr__(&self) -> String {

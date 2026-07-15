@@ -123,6 +123,12 @@ impl TensorBackend for MlxBackend {
                 TensorOp::Matmul { lhs, rhs } => mlx_value(&values, *lhs)?
                     .matmul_device(mlx_value(&values, *rhs)?, &stream)
                     .map_err(|error| error.to_string()),
+                TensorOp::Solve { .. } => {
+                    return Err(
+                        "MLX GPU backend does not yet support solve: MLX linalg::solve only accepts a CPU stream"
+                            .to_string(),
+                    )
+                }
                 TensorOp::Sum { input } => mlx_value(&values, *input)?
                     .sum_device(None, &stream)
                     .map_err(|error| error.to_string()),
@@ -276,6 +282,7 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::Matmul { .. } => "matmul",
+        TensorOp::Solve { .. } => "solve",
         TensorOp::Tanh { .. } => "tanh",
         TensorOp::Exp { .. } => "exp",
         TensorOp::Sqrt { .. } => "sqrt",

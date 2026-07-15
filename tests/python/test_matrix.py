@@ -22,6 +22,20 @@ def test_matrix_matmul():
     assert c.to_list() == [[58.0, 64.0], [139.0, 154.0]]
 
 
+def test_tensor_solve_and_jit_vjp():
+    matrix = nabla.Tensor([2, 2], [3.0, 1.0, 1.0, 2.0])
+    rhs = nabla.Tensor([2, 1], [9.0, 8.0])
+    assert matrix.solve(rhs).to_flat_list() == [2.0, 3.0]
+
+    value_and_grad = nabla.tensor_value_and_grad_fn(
+        lambda a, b: a.solve(b).sum(), [("a", [2, 2]), ("b", [2, 1])]
+    )
+    value, gradients = value_and_grad({"a": matrix, "b": rhs})
+    assert value.to_flat_list() == [5.0]
+    assert_close_rows([gradients["a"].to_flat_list()], [[-0.4, -0.6, -0.8, -1.2]])
+    assert_close_rows([gradients["b"].to_flat_list()], [[0.2, 0.4]])
+
+
 def test_tensor_stateless_random_keys_and_glorot_initializer_are_reproducible():
     first_keys = nabla.Tensor.split_key(1234, 2)
     second_keys = nabla.Tensor.split_key(1234, 2)

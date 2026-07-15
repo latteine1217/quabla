@@ -643,6 +643,25 @@ impl TraceTensor {
         self.matmul_tensor(rhs)
     }
 
+    fn solve_tensor(&self, rhs: &Self) -> Result<Self, String> {
+        self.same_graph(rhs)?;
+        if self.batch_axis.is_some() || rhs.batch_axis.is_some() {
+            return Err("solve does not yet support vmap-batched tensors".to_string());
+        }
+        let mut ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let node_id = ir.solve(self.node_id, rhs.node_id)?;
+        let shape = ir.node_shape(node_id)?;
+        Ok(Self::from_node(self.graph.clone(), node_id, shape, None))
+    }
+
+    pub fn try_solve(&self, rhs: &Self) -> Result<Self, String> {
+        self.solve_tensor(rhs)
+    }
+
     pub fn where_tensor(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
         self.same_graph(on_true)?;
         self.same_graph(on_false)?;
@@ -1409,6 +1428,10 @@ impl TraceTensor {
 
     fn matmul(&self, rhs: &Self) -> PyResult<Self> {
         self.__matmul__(rhs)
+    }
+
+    fn solve(&self, rhs: &Self) -> PyResult<Self> {
+        self.solve_tensor(rhs).map_err(PyValueError::new_err)
     }
 
     fn gt(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {

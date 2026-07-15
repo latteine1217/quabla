@@ -1080,6 +1080,78 @@ fn symbolic_jvp_supports_log_and_parameter_vjp() {
     assert!((gradients["weight"].data()[0] + 2.0 / 125.0).abs() < 1e-12);
 }
 
+#[test]
+fn solve_evaluates_and_differentiates() {
+    let mut graph = TensorIr::new();
+    let matrix = must!(graph.input("matrix", vec![2, 2]));
+    let rhs = must!(graph.input("rhs", vec![2, 1]));
+    let output = must!(graph.solve(matrix, rhs));
+    let inputs = BTreeMap::from([
+        (
+            "matrix".to_string(),
+            must!(DynamicTensor::new(vec![2, 2], vec![3.0, 1.0, 1.0, 2.0])),
+        ),
+        (
+            "rhs".to_string(),
+            must!(DynamicTensor::new(vec![2, 1], vec![9.0, 8.0])),
+        ),
+    ]);
+    let value = must!(graph.evaluate(output, &inputs));
+    assert_eq!(value.data(), &[2.0, 3.0]);
+
+    let tangents = BTreeMap::from([
+        (
+            "matrix".to_string(),
+            must!(DynamicTensor::new(vec![2, 2], vec![1.0, 0.0, 0.0, 0.0])),
+        ),
+        (
+            "rhs".to_string(),
+            must!(DynamicTensor::new(vec![2, 1], vec![0.0, 1.0])),
+        ),
+    ]);
+    let (_, tangent) = must!(graph.jvp(output, &inputs, &tangents));
+    for (actual, expected) in tangent.data().iter().zip([-1.0, 1.0]) {
+        assert!((actual - expected).abs() < 1e-12);
+    }
+
+    let upstream = must!(DynamicTensor::new(vec![2, 1], vec![1.0, 1.0]));
+    let gradients = must!(graph.vjp(output, &inputs, upstream));
+    for (actual, expected) in gradients["rhs"].data().iter().zip([0.2, 0.4]) {
+        assert!((actual - expected).abs() < 1e-12);
+    }
+    for (actual, expected) in gradients["matrix"]
+        .data()
+        .iter()
+        .zip([-0.4, -0.6, -0.8, -1.2])
+    {
+        assert!((actual - expected).abs() < 1e-12);
+    }
+}
+
+#[test]
+fn solve_rejects_unsupported_shapes_and_singular_matrices() {
+    let mut graph = TensorIr::new();
+    let matrix = must!(graph.input("matrix", vec![2, 3]));
+    let rhs = must!(graph.input("rhs", vec![2, 1]));
+    assert!(graph.solve(matrix, rhs).is_err());
+
+    let mut graph = TensorIr::new();
+    let matrix = must!(graph.input("matrix", vec![2, 2]));
+    let rhs = must!(graph.input("rhs", vec![2, 1]));
+    let output = must!(graph.solve(matrix, rhs));
+    let inputs = BTreeMap::from([
+        (
+            "matrix".to_string(),
+            must!(DynamicTensor::new(vec![2, 2], vec![1.0, 2.0, 2.0, 4.0])),
+        ),
+        (
+            "rhs".to_string(),
+            must!(DynamicTensor::new(vec![2, 1], vec![1.0, 2.0])),
+        ),
+    ]);
+    assert!(graph.evaluate(output, &inputs).is_err());
+}
+
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
 fn mlx_backend_matches_cpu_for_concat_broadcast_and_tanh() {
@@ -1120,4 +1192,28 @@ fn mlx_backend_matches_cpu_for_concat_broadcast_and_tanh() {
             "actual={actual}, expected={expected}"
         );
     }
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_backend_rejects_solve_until_a_gpu_implementation_exists() {
+    let mut graph = TensorIr::new();
+    let matrix = must!(graph.input("matrix", vec![2, 2]));
+    let rhs = must!(graph.input("rhs", vec![2, 1]));
+    let output = must!(graph.solve(matrix, rhs));
+    let inputs = BTreeMap::from([
+        (
+            "matrix".to_string(),
+            must!(DynamicTensor::new(vec![2, 2], vec![3.0, 1.0, 1.0, 2.0])),
+        ),
+        (
+            "rhs".to_string(),
+            must!(DynamicTensor::new(vec![2, 1], vec![9.0, 8.0])),
+        ),
+    ]);
+    let plan = must!(graph.compile_cpu(output));
+    let error = MlxBackend
+        .execute(&plan, &inputs)
+        .expect_err("MLX solve must not fall back to CPU");
+    assert!(error.contains("does not yet support solve"));
 }

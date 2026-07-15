@@ -465,8 +465,13 @@ reductions and other norm variants remain pending. Static integer-index
 `gather` and functional `scatter_add` are available with repeated-index VJP
 accumulation; dynamic tensor indices, masks, and assignment-style scatter
 remain pending the dtype/index IR design. A scoped matrix-product `einsum`
-subset lowers directly to rank-N `matmul`; solve, Cholesky, triangular solve,
-and broader contractions remain pending. Remaining neural primitives and
+subset lowers directly to rank-N `matmul`. Rank-2 `solve(A, B)` now has a
+partial-pivot LU CPU reference implementation, eager and traced Python APIs,
+and direct/symbolic JVP/VJP plus mixed-tangent rules; it rejects non-square,
+rank-mismatched, and singular inputs explicitly. CUDA CUSOLVER lowering,
+Cholesky, triangular solve, and broader contractions remain pending. MLX 0.25.3
+only exposes `linalg::solve` on a CPU stream, so Nabla rejects it on the MLX GPU
+backend rather than silently falling back. Remaining neural primitives and
 dtype/device APIs remain pending.
 Eager and traced tensors now share a
 differentiable integer/contiguous-slice indexing subset; it lowers through
