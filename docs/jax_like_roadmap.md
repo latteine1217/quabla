@@ -474,8 +474,10 @@ buffers on device; it has passed Linux feature compilation but remains pending
 runtime validation on a host with `libcusolver` and a visible NVIDIA device.
 Cholesky, triangular solve, and broader contractions remain pending. MLX 0.25.3
 only exposes `linalg::solve` on a CPU stream, so Nabla rejects it on the MLX GPU
-backend rather than silently falling back. Remaining neural primitives and
-dtype/device APIs remain pending.
+backend rather than silently falling back. `relu`, `abs`, `sigmoid`, and a
+numerically stable `softplus` are available on eager and traced tensors; `relu`
+uses a zero subgradient at zero, while `abs` follows the existing `where`
+tie-rule and has derivative -1 at zero. Dtype/device APIs remain pending.
 Eager and traced tensors now share a
 differentiable integer/contiguous-slice indexing subset; it lowers through
 Slice/PadSlice on CPU, CUDA, and MLX. Strided/empty slices, ellipsis, and

@@ -886,6 +886,24 @@ impl PyTensor {
         self.try_map(f64::sqrt)
     }
 
+    pub fn try_relu(&self) -> Result<Self, String> {
+        self.try_maximum_scalar(0.0)
+    }
+
+    pub fn try_abs(&self) -> Result<Self, String> {
+        let mask = self.try_gt_scalar(0.0)?;
+        let negative = self.try_mul_scalar(-1.0)?;
+        Self::try_where(&mask, self, &negative)
+    }
+
+    pub fn try_sigmoid(&self) -> Result<Self, String> {
+        self.try_map(|value| 1.0 / (1.0 + (-value).exp()))
+    }
+
+    pub fn try_softplus(&self) -> Result<Self, String> {
+        self.try_map(|value| value.max(0.0) + (-value.abs()).exp().ln_1p())
+    }
+
     pub fn try_sin(&self) -> Result<Self, String> {
         self.try_map(f64::sin)
     }
@@ -1319,6 +1337,22 @@ impl PyTensor {
 
     fn sqrt(&self) -> PyResult<Self> {
         self.try_sqrt().map_err(PyValueError::new_err)
+    }
+
+    fn relu(&self) -> PyResult<Self> {
+        self.try_relu().map_err(PyValueError::new_err)
+    }
+
+    fn abs(&self) -> PyResult<Self> {
+        self.try_abs().map_err(PyValueError::new_err)
+    }
+
+    fn sigmoid(&self) -> PyResult<Self> {
+        self.try_sigmoid().map_err(PyValueError::new_err)
+    }
+
+    fn softplus(&self) -> PyResult<Self> {
+        self.try_softplus().map_err(PyValueError::new_err)
     }
 
     fn sin(&self) -> PyResult<Self> {

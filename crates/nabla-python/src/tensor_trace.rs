@@ -718,6 +718,34 @@ impl TraceTensor {
         ))
     }
 
+    fn relu_tensor(&self) -> Result<Self, String> {
+        self.maximum_scalar(0.0)
+    }
+
+    fn abs_tensor(&self) -> Result<Self, String> {
+        let mask = self.scalar_binary(0.0, "greater")?;
+        let negative = self.scalar_left_binary(0.0, "sub")?;
+        mask.where_tensor(self, &negative)
+    }
+
+    fn sigmoid_tensor(&self) -> Result<Self, String> {
+        self.scalar_binary(-1.0, "mul")?
+            .exp_tensor()?
+            .scalar_binary(1.0, "add")?
+            .scalar_left_binary(1.0, "div")
+    }
+
+    fn softplus_tensor(&self) -> Result<Self, String> {
+        let linear = self.maximum_scalar(0.0)?;
+        let correction = self
+            .abs_tensor()?
+            .scalar_binary(-1.0, "mul")?
+            .exp_tensor()?
+            .scalar_binary(1.0, "add")?
+            .log_tensor()?;
+        linear.binary(&correction, "add")
+    }
+
     fn exp_tensor(&self) -> Result<Self, String> {
         let mut ir = self
             .graph
@@ -1469,6 +1497,22 @@ impl TraceTensor {
 
     fn tanh(&self) -> PyResult<Self> {
         self.tanh_tensor().map_err(PyValueError::new_err)
+    }
+
+    fn relu(&self) -> PyResult<Self> {
+        self.relu_tensor().map_err(PyValueError::new_err)
+    }
+
+    fn abs(&self) -> PyResult<Self> {
+        self.abs_tensor().map_err(PyValueError::new_err)
+    }
+
+    fn sigmoid(&self) -> PyResult<Self> {
+        self.sigmoid_tensor().map_err(PyValueError::new_err)
+    }
+
+    fn softplus(&self) -> PyResult<Self> {
+        self.softplus_tensor().map_err(PyValueError::new_err)
     }
 
     fn exp(&self) -> PyResult<Self> {

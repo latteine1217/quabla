@@ -36,6 +36,33 @@ def test_tensor_solve_and_jit_vjp():
     assert_close_rows([gradients["b"].to_flat_list()], [[0.2, 0.4]])
 
 
+def test_tensor_neural_primitives_and_trace_gradients():
+    values = nabla.Tensor([3], [-1.0, 0.0, 1.0])
+    assert values.relu().to_flat_list() == [0.0, 0.0, 1.0]
+    assert values.abs().to_flat_list() == [1.0, -0.0, 1.0]
+
+    sigmoid = values.sigmoid().to_flat_list()
+    softplus = values.softplus().to_flat_list()
+    expected_sigmoid = [1.0 / (1.0 + math.exp(-value)) for value in [-1.0, 0.0, 1.0]]
+    assert_close_rows([sigmoid], [expected_sigmoid])
+    assert_close_rows(
+        [softplus], [[math.log1p(math.exp(value)) for value in [-1.0, 0.0, 1.0]]]
+    )
+    assert nabla.Tensor([2], [-1000.0, 1000.0]).softplus().to_flat_list() == [0.0, 1000.0]
+
+    for name, expected_gradient in [
+        ("relu", [0.0, 0.0, 1.0]),
+        ("abs", [-1.0, -1.0, 1.0]),
+        ("sigmoid", [value * (1.0 - value) for value in expected_sigmoid]),
+        ("softplus", expected_sigmoid),
+    ]:
+        transform = nabla.tensor_value_and_grad_fn(
+            lambda x, name=name: getattr(x, name)().sum(), [("x", [3])]
+        )
+        _, gradients = transform({"x": values})
+        assert_close_rows([gradients["x"].to_flat_list()], [expected_gradient])
+
+
 def test_tensor_stateless_random_keys_and_glorot_initializer_are_reproducible():
     first_keys = nabla.Tensor.split_key(1234, 2)
     second_keys = nabla.Tensor.split_key(1234, 2)
