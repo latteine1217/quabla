@@ -472,7 +472,7 @@ rank-mismatched, and singular inputs explicitly. CUDA now has a CUSOLVER
 `Sgetrf`/`Sgetrs` rank-2 lowering that keeps factorization and right-hand-side
 buffers on device; it has passed Linux feature compilation but remains pending
 runtime validation on a host with `libcusolver` and a visible NVIDIA device.
-Cholesky, triangular solve, and broader contractions remain pending. MLX 0.25.3
+Cholesky and broader contractions remain pending. MLX 0.25.3
 only exposes `linalg::solve` on a CPU stream, so Nabla rejects it on the MLX GPU
 backend rather than silently falling back. `relu`, `abs`, `sigmoid`, and a
 numerically stable `softplus` are available on eager and traced tensors; `relu`
