@@ -515,6 +515,12 @@ pipeline.
 - Evaluate CUDA Graphs for static training steps. Treat MLIR/StableHLO export
   as an optional interoperability path, not a prerequisite for useful JIT.
 
+Implementation status (2026-07-15): `kernel_ir()` now carries logical `f64`
+dtype, scalar/row-major-contiguous layout, backend-neutral `unplaced`
+placement, and input/pure effect metadata. The validator enforces these current
+invariants; physical placement, aliases, effects beyond inputs, and buffer
+planning remain pending.
+
 Acceptance checks:
 
 - Each pass has IR-level golden tests and preserves CPU reference results.

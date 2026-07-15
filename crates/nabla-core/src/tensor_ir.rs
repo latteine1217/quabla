@@ -366,6 +366,10 @@ pub struct TensorKernelNode {
     pub id: TensorNodeId,
     pub op: String,
     pub shape: Vec<usize>,
+    pub dtype: String,
+    pub layout: String,
+    pub placement: String,
+    pub effect: String,
     pub inputs: Vec<TensorNodeId>,
     pub name: Option<String>,
 }
@@ -387,6 +391,36 @@ impl TensorKernelProgram {
             }
             if node.shape.contains(&0) {
                 return Err(format!("kernel node {} has a zero tensor extent", node.id));
+            }
+            if node.dtype != "f64" {
+                return Err(format!(
+                    "kernel node {} has unsupported dtype {:?}",
+                    node.id, node.dtype
+                ));
+            }
+            let expected_layout = if node.shape.is_empty() {
+                "scalar"
+            } else {
+                "row_major_contiguous"
+            };
+            if node.layout != expected_layout {
+                return Err(format!(
+                    "kernel node {} has layout {:?}, expected {expected_layout}",
+                    node.id, node.layout
+                ));
+            }
+            if node.placement != "unplaced" {
+                return Err(format!(
+                    "kernel node {} has non-neutral placement {:?}",
+                    node.id, node.placement
+                ));
+            }
+            let expected_effect = if node.op == "input" { "input" } else { "pure" };
+            if node.effect != expected_effect {
+                return Err(format!(
+                    "kernel node {} has effect {:?}, expected {expected_effect}",
+                    node.id, node.effect
+                ));
             }
             for input in &node.inputs {
                 if *input >= position {
@@ -3974,6 +4008,18 @@ impl TensorExecutionPlan {
                     id,
                     op: tensor_op_name(&node.op).to_string(),
                     shape: node.shape.clone(),
+                    dtype: "f64".to_string(),
+                    layout: if node.shape.is_empty() {
+                        "scalar".to_string()
+                    } else {
+                        "row_major_contiguous".to_string()
+                    },
+                    placement: "unplaced".to_string(),
+                    effect: if matches!(node.op, TensorOp::Input { .. }) {
+                        "input".to_string()
+                    } else {
+                        "pure".to_string()
+                    },
                     inputs: tensor_op_inputs(&node.op),
                     name: match &node.op {
                         TensorOp::Input { name } => Some(name.clone()),

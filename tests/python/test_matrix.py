@@ -2790,8 +2790,27 @@ def test_trace_tensor_compile_cpu_eliminates_unreachable_nodes():
         ]
     )
     assert plan.kernel_ir() == [
-        {"id": 0, "op": "input", "shape": [2, 2], "inputs": [], "name": "x"},
-        {"id": 1, "op": "add", "shape": [2, 2], "inputs": [0, 0]},
+        {
+            "id": 0,
+            "op": "input",
+            "shape": [2, 2],
+            "dtype": "f64",
+            "layout": "row_major_contiguous",
+            "placement": "unplaced",
+            "effect": "input",
+            "inputs": [],
+            "name": "x",
+        },
+        {
+            "id": 1,
+            "op": "add",
+            "shape": [2, 2],
+            "dtype": "f64",
+            "layout": "row_major_contiguous",
+            "placement": "unplaced",
+            "effect": "pure",
+            "inputs": [0, 0],
+        },
     ]
     plan.validate_kernel_ir()
     inputs = {"x": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])}

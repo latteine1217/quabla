@@ -1837,6 +1837,10 @@ impl TensorCpuExecutionPlan {
             item.set_item("id", node.id)?;
             item.set_item("op", node.op)?;
             item.set_item("shape", node.shape)?;
+            item.set_item("dtype", node.dtype)?;
+            item.set_item("layout", node.layout)?;
+            item.set_item("placement", node.placement)?;
+            item.set_item("effect", node.effect)?;
             item.set_item("inputs", node.inputs)?;
             if let Some(name) = node.name {
                 item.set_item("name", name)?;
