@@ -1841,6 +1841,7 @@ impl TensorCpuExecutionPlan {
             item.set_item("layout", node.layout)?;
             item.set_item("placement", node.placement)?;
             item.set_item("effect", node.effect)?;
+            item.set_item("alias_of", node.alias_of)?;
             item.set_item("inputs", node.inputs)?;
             if let Some(name) = node.name {
                 item.set_item("name", name)?;

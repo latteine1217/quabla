@@ -370,6 +370,7 @@ pub struct TensorKernelNode {
     pub layout: String,
     pub placement: String,
     pub effect: String,
+    pub alias_of: Option<TensorNodeId>,
     pub inputs: Vec<TensorNodeId>,
     pub name: Option<String>,
 }
@@ -420,6 +421,17 @@ impl TensorKernelProgram {
                 return Err(format!(
                     "kernel node {} has effect {:?}, expected {expected_effect}",
                     node.id, node.effect
+                ));
+            }
+            let expected_alias = if node.op == "reshape" {
+                node.inputs.first().copied()
+            } else {
+                None
+            };
+            if node.alias_of != expected_alias {
+                return Err(format!(
+                    "kernel node {} has alias {:?}, expected {:?}",
+                    node.id, node.alias_of, expected_alias
                 ));
             }
             for input in &node.inputs {
@@ -4019,6 +4031,10 @@ impl TensorExecutionPlan {
                         "input".to_string()
                     } else {
                         "pure".to_string()
+                    },
+                    alias_of: match node.op {
+                        TensorOp::Reshape { input } => Some(input),
+                        _ => None,
                     },
                     inputs: tensor_op_inputs(&node.op),
                     name: match &node.op {

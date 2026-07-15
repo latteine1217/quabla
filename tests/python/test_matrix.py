@@ -2798,6 +2798,7 @@ def test_trace_tensor_compile_cpu_eliminates_unreachable_nodes():
             "layout": "row_major_contiguous",
             "placement": "unplaced",
             "effect": "input",
+            "alias_of": None,
             "inputs": [],
             "name": "x",
         },
@@ -2809,6 +2810,7 @@ def test_trace_tensor_compile_cpu_eliminates_unreachable_nodes():
             "layout": "row_major_contiguous",
             "placement": "unplaced",
             "effect": "pure",
+            "alias_of": None,
             "inputs": [0, 0],
         },
     ]
@@ -2823,6 +2825,13 @@ def test_trace_tensor_compile_cpu_eliminates_unreachable_nodes():
     assert alias_gradients["x"].to_flat_list() == [2.0] * 4
     _, tangent = plan.evaluate_jvp(inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)})
     assert tangent.to_flat_list() == [2.0] * 4
+
+
+def test_kernel_ir_marks_reshape_as_logical_alias_candidate():
+    traced = nabla.trace_tensor(lambda x: x.reshape([4]), [("x", [2, 2])])
+    plan = traced.output.compile_cpu()
+    assert plan.kernel_ir()[1]["alias_of"] == 0
+    plan.validate_kernel_ir()
 
 
 def test_trace_tensor_compile_cpu_commons_identical_pure_nodes():

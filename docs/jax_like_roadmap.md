@@ -519,7 +519,8 @@ Implementation status (2026-07-15): `kernel_ir()` now carries logical `f64`
 dtype, scalar/row-major-contiguous layout, backend-neutral `unplaced`
 placement, and input/pure effect metadata. The validator enforces these current
 invariants; physical placement, aliases, effects beyond inputs, and buffer
-planning remain pending.
+planning remain pending. `reshape` additionally exposes a logical alias
+candidate in the IR; physical buffer reuse is still deferred to buffer planning.
 
 Acceptance checks:
 
