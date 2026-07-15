@@ -662,6 +662,21 @@ impl TraceTensor {
         self.solve_tensor(rhs)
     }
 
+    fn solve_triangular_tensor(
+        &self,
+        rhs: &Self,
+        lower: bool,
+        transpose: bool,
+    ) -> Result<Self, String> {
+        let matrix = self.triangular_tensor(lower)?;
+        let matrix = if transpose {
+            matrix.transpose_tensor(None)?
+        } else {
+            matrix
+        };
+        matrix.solve_tensor(rhs)
+    }
+
     pub fn where_tensor(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
         self.same_graph(on_true)?;
         self.same_graph(on_false)?;
@@ -1476,6 +1491,12 @@ impl TraceTensor {
 
     fn solve(&self, rhs: &Self) -> PyResult<Self> {
         self.solve_tensor(rhs).map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (rhs, lower = true, transpose = false))]
+    fn solve_triangular(&self, rhs: &Self, lower: bool, transpose: bool) -> PyResult<Self> {
+        self.solve_triangular_tensor(rhs, lower, transpose)
+            .map_err(PyValueError::new_err)
     }
 
     fn gt(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {

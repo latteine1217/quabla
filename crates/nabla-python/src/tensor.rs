@@ -632,6 +632,21 @@ impl PyTensor {
         })
     }
 
+    pub fn try_solve_triangular(
+        &self,
+        rhs: &Self,
+        lower: bool,
+        transpose: bool,
+    ) -> Result<Self, String> {
+        let matrix = self.try_triangular(lower)?;
+        let matrix = if transpose {
+            matrix.try_transpose(None)?
+        } else {
+            matrix
+        };
+        matrix.try_solve(rhs)
+    }
+
     pub fn try_reshape(&self, shape: Vec<usize>) -> Result<Self, String> {
         let expected = element_count(&shape)?;
         if expected != self.data.len() {
@@ -1583,6 +1598,12 @@ impl PyTensor {
 
     fn solve(&self, rhs: &Self) -> PyResult<Self> {
         self.try_solve(rhs).map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (rhs, lower = true, transpose = false))]
+    fn solve_triangular(&self, rhs: &Self, lower: bool, transpose: bool) -> PyResult<Self> {
+        self.try_solve_triangular(rhs, lower, transpose)
+            .map_err(PyValueError::new_err)
     }
 
     fn __repr__(&self) -> String {

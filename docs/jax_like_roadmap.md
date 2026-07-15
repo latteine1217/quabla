@@ -482,6 +482,10 @@ tie-rule and has derivative -1 at zero. Dtype/device APIs remain pending.
 CUDA, and MLX, with direct/symbolic JVP/VJP and mixed-tangent propagation; they
 provide the gradient masking primitive required before triangular solve and
 Cholesky can be added.
+`solve_triangular(rhs, lower=True, transpose=False)` is now available for
+rank-2 eager and traced tensors. Its reference lowering composes triangular
+projection with `solve`, preserving existing AD semantics; unit-diagonal and a
+dedicated CUDA TRSM lowering remain pending performance work.
 Eager and traced tensors now share a
 differentiable integer/contiguous-slice indexing subset; it lowers through
 Slice/PadSlice on CPU, CUDA, and MLX. Strided/empty slices, ellipsis, and

@@ -79,6 +79,22 @@ def test_tensor_triangular_projections_preserve_trace_gradients():
         assert gradients["x"].to_flat_list() == expected_gradient
 
 
+def test_tensor_triangular_solve_preserves_vjp_and_transpose_contract():
+    matrix = nabla.Tensor([2, 2], [2.0, 9.0, 3.0, 4.0])
+    rhs = nabla.Tensor([2, 1], [2.0, 11.0])
+    assert matrix.solve_triangular(rhs).to_flat_list() == [1.0, 2.0]
+    assert matrix.solve_triangular(
+        nabla.Tensor([2, 1], [8.0, 8.0]), transpose=True
+    ).to_flat_list() == [1.0, 2.0]
+
+    transform = nabla.tensor_value_and_grad_fn(
+        lambda a, b: a.solve_triangular(b).sum(), [("a", [2, 2]), ("b", [2, 1])]
+    )
+    _, gradients = transform({"a": matrix, "b": rhs})
+    assert_close_rows([gradients["a"].to_flat_list()], [[-0.125, 0.0, -0.25, -0.5]])
+    assert_close_rows([gradients["b"].to_flat_list()], [[0.125, 0.25]])
+
+
 def test_tensor_stateless_random_keys_and_glorot_initializer_are_reproducible():
     first_keys = nabla.Tensor.split_key(1234, 2)
     second_keys = nabla.Tensor.split_key(1234, 2)
