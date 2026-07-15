@@ -521,6 +521,9 @@ placement, and input/pure effect metadata. The validator enforces these current
 invariants; physical placement, aliases, effects beyond inputs, and buffer
 planning remain pending. `reshape` additionally exposes a logical alias
 candidate in the IR; physical buffer reuse is still deferred to buffer planning.
+Scalar-only constant subgraphs are folded during CPU-plan compilation when the
+fold preserves checked runtime semantics; division by zero and invalid log/powi
+domains intentionally remain runtime operations.
 
 Acceptance checks:
 

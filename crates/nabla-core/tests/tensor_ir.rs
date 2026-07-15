@@ -273,6 +273,24 @@ fn cpu_backend_executes_a_frozen_tensor_plan() {
     must!(kernel.validate());
 }
 
+#[test]
+fn compile_cpu_folds_scalar_constant_subgraphs() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![1]));
+    let two = graph.scalar_constant(2.0);
+    let three = graph.scalar_constant(3.0);
+    let five = must!(graph.add(two, three));
+    let output = must!(graph.mul(x, five));
+    let plan = must!(graph.compile_cpu(output));
+    assert!(plan.lower_text().contains("constant[value=5]"));
+    assert!(!plan.lower_text().contains("add(%"));
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![1], vec![4.0])),
+    )]);
+    assert_eq!(must!(CpuBackend.execute(&plan, &inputs)).data(), &[20.0]);
+}
+
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_fused_elementwise_plan_when_enabled() {

@@ -2326,7 +2326,10 @@ impl TensorIr {
             if !reachable.contains(&old_id) {
                 continue;
             }
-            let op = remap_tensor_op(&node.op, &remap)?;
+            let mut op = remap_tensor_op(&node.op, &remap)?;
+            if let Some(value) = fold_scalar_constant_op(&op, &nodes) {
+                op = TensorOp::ScalarConstant { value };
+            }
             if let Some(key) = pure_tensor_op_cse_key(&op, &node.shape) {
                 if let Some(existing_id) = cse_nodes.get(&key) {
                     remap.insert(old_id, *existing_id);
@@ -4535,6 +4538,45 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Slice { .. } => "slice",
         TensorOp::PadSlice { .. } => "pad_slice",
         TensorOp::Broadcast { .. } => "broadcast",
+    }
+}
+
+fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
+    let scalar = |node_id: TensorNodeId| {
+        nodes.get(node_id).and_then(|node| match node {
+            TensorNode {
+                op: TensorOp::ScalarConstant { value },
+                shape,
+            } if shape.is_empty() => Some(*value),
+            _ => None,
+        })
+    };
+    match op {
+        TensorOp::Add { lhs, rhs } => Some(scalar(*lhs)? + scalar(*rhs)?),
+        TensorOp::Sub { lhs, rhs } => Some(scalar(*lhs)? - scalar(*rhs)?),
+        TensorOp::Mul { lhs, rhs } => Some(scalar(*lhs)? * scalar(*rhs)?),
+        TensorOp::Div { lhs, rhs } => {
+            let denominator = scalar(*rhs)?;
+            if denominator == 0.0 {
+                None
+            } else {
+                Some(scalar(*lhs)? / denominator)
+            }
+        }
+        TensorOp::Greater { lhs, rhs } => Some(f64::from(scalar(*lhs)? > scalar(*rhs)?)),
+        TensorOp::Tanh { input } => Some(scalar(*input)?.tanh()),
+        TensorOp::Exp { input } => Some(scalar(*input)?.exp()),
+        TensorOp::Sin { input } => Some(scalar(*input)?.sin()),
+        TensorOp::Cos { input } => Some(scalar(*input)?.cos()),
+        TensorOp::Powi { input, exponent } => {
+            let exponent = i32::try_from(*exponent).ok()?;
+            Some(scalar(*input)?.powi(exponent))
+        }
+        TensorOp::Log { input } => {
+            let value = scalar(*input)?;
+            (value > 0.0).then(|| value.ln())
+        }
+        _ => None,
     }
 }
 
