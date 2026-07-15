@@ -95,6 +95,19 @@ def test_tensor_triangular_solve_preserves_vjp_and_transpose_contract():
     assert_close_rows([gradients["b"].to_flat_list()], [[0.125, 0.25]])
 
 
+def test_tensor_cholesky_reference_trace_preserves_vjp():
+    matrix = nabla.Tensor([2, 2], [4.0, 2.0, 2.0, 5.0])
+    expected = [2.0, 0.0, 1.0, 2.0]
+    assert matrix.cholesky().to_flat_list() == expected
+
+    transform = nabla.tensor_value_and_grad_fn(
+        lambda a: a.cholesky().sum(), [("a", [2, 2])]
+    )
+    value, gradients = transform({"a": matrix})
+    assert value.to_flat_list() == [5.0]
+    assert_close_rows([gradients["a"].to_flat_list()], [[0.1875, 0.0, 0.25, 0.25]])
+
+
 def test_tensor_stateless_random_keys_and_glorot_initializer_are_reproducible():
     first_keys = nabla.Tensor.split_key(1234, 2)
     second_keys = nabla.Tensor.split_key(1234, 2)

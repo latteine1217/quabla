@@ -647,6 +647,42 @@ impl PyTensor {
         matrix.try_solve(rhs)
     }
 
+    pub fn try_cholesky(&self) -> Result<Self, String> {
+        if self.shape.len() != 2 || self.shape[0] != self.shape[1] {
+            return Err(format!(
+                "cholesky requires a square rank-2 tensor, got {:?}",
+                self.shape
+            ));
+        }
+        let n = self.shape[0];
+        let mut factor = vec![0.0; n * n];
+        for row in 0..n {
+            for column in 0..=row {
+                let symmetric = self.data[column * n + row];
+                let value = self.data[row * n + column];
+                let tolerance = 1e-12 * value.abs().max(symmetric.abs()).max(1.0);
+                if (value - symmetric).abs() > tolerance {
+                    return Err("cholesky requires a symmetric coefficient matrix".to_string());
+                }
+                let mut reduced = value;
+                for inner in 0..column {
+                    reduced -= factor[row * n + inner] * factor[column * n + inner];
+                }
+                if row == column {
+                    if reduced.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+                        return Err(
+                            "cholesky requires a positive-definite coefficient matrix".to_string()
+                        );
+                    }
+                    factor[row * n + column] = reduced.sqrt();
+                } else {
+                    factor[row * n + column] = reduced / factor[column * n + column];
+                }
+            }
+        }
+        Self::from_shape_data(self.shape.clone(), factor)
+    }
+
     pub fn try_reshape(&self, shape: Vec<usize>) -> Result<Self, String> {
         let expected = element_count(&shape)?;
         if expected != self.data.len() {
@@ -1604,6 +1640,10 @@ impl PyTensor {
     fn solve_triangular(&self, rhs: &Self, lower: bool, transpose: bool) -> PyResult<Self> {
         self.try_solve_triangular(rhs, lower, transpose)
             .map_err(PyValueError::new_err)
+    }
+
+    fn cholesky(&self) -> PyResult<Self> {
+        self.try_cholesky().map_err(PyValueError::new_err)
     }
 
     fn __repr__(&self) -> String {

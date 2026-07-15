@@ -677,6 +677,56 @@ impl TraceTensor {
         matrix.solve_tensor(rhs)
     }
 
+    #[allow(clippy::needless_range_loop)]
+    fn cholesky_tensor(&self) -> Result<Self, String> {
+        if self.batch_axis.is_some() || self.shape.len() != 2 || self.shape[0] != self.shape[1] {
+            return Err(format!(
+                "cholesky reference tracing requires a square unbatched rank-2 tensor, got {:?}",
+                self.shape
+            ));
+        }
+        let n = self.shape[0];
+        let mut rows: Vec<Vec<Self>> = Vec::with_capacity(n);
+        for row in 0..n {
+            let mut current = Vec::with_capacity(n);
+            for column in 0..n {
+                if column > row {
+                    current.push(self.scalar_tensor(0.0)?);
+                    continue;
+                }
+                let mut reduced =
+                    self.index_tensor(&[TensorIndex::Integer(row), TensorIndex::Integer(column)])?;
+                for inner in 0..column {
+                    let column_value = if row == column {
+                        &current[inner]
+                    } else {
+                        &rows[column][inner]
+                    };
+                    let product = current[inner].binary(column_value, "mul")?;
+                    reduced = reduced.binary(&product, "sub")?;
+                }
+                let value = if row == column {
+                    reduced.sqrt_tensor()?
+                } else {
+                    reduced.binary(&rows[column][column], "div")?
+                };
+                current.push(value);
+            }
+            rows.push(current);
+        }
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                let entries = row
+                    .into_iter()
+                    .map(|value| value.reshape_tensor(vec![1]))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Self::try_concat(&entries, 0)?.reshape_tensor(vec![1, n])
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_concat(&rows, 0)
+    }
+
     pub fn where_tensor(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
         self.same_graph(on_true)?;
         self.same_graph(on_false)?;
@@ -1497,6 +1547,10 @@ impl TraceTensor {
     fn solve_triangular(&self, rhs: &Self, lower: bool, transpose: bool) -> PyResult<Self> {
         self.solve_triangular_tensor(rhs, lower, transpose)
             .map_err(PyValueError::new_err)
+    }
+
+    fn cholesky(&self) -> PyResult<Self> {
+        self.cholesky_tensor().map_err(PyValueError::new_err)
     }
 
     fn gt(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
