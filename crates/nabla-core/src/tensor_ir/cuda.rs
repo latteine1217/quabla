@@ -4,8 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
+use cudarc::cusolver::{safe::DnHandle, sys as cusolver_sys};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtrMut, LaunchConfig,
+    PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
 
@@ -42,6 +44,7 @@ pub struct CudaExecutionPlan {
     context: Arc<CudaContext>,
     module: Arc<CudaModule>,
     blas: Option<Arc<Mutex<CudaBlas>>>,
+    solver: Option<Arc<Mutex<DnHandle>>>,
     state: Arc<Mutex<CudaExecutionState>>,
 }
 
@@ -103,6 +106,7 @@ impl CudaBackend {
             .load_module(ptx)
             .map_err(|error| format!("failed to load CUDA device program: {error:?}"))?;
         let blas = cuda_blas(context.default_stream())?;
+        let solver = cuda_solver(context.default_stream())?;
         Ok(CudaExecutionPlan {
             plan,
             fused_elementwise,
@@ -111,6 +115,7 @@ impl CudaBackend {
             context,
             module,
             blas,
+            solver,
             state: Arc::new(Mutex::new(CudaExecutionState::default())),
         })
     }
@@ -225,6 +230,7 @@ impl CudaExecutionPlan {
                     stream: &stream,
                     module: &self.module,
                     blas: self.blas.as_ref(),
+                    solver: self.solver.as_ref(),
                 },
                 values,
                 free_buffers,
@@ -629,6 +635,7 @@ struct CudaProgramRuntime<'a> {
     stream: &'a Arc<CudaStream>,
     module: &'a Arc<CudaModule>,
     blas: Option<&'a Arc<Mutex<CudaBlas>>>,
+    solver: Option<&'a Arc<Mutex<DnHandle>>>,
 }
 
 fn cuda_remaining_use_counts(plan: &TensorExecutionPlan) -> Vec<usize> {
@@ -777,6 +784,7 @@ fn execute_cuda_device_program(
         stream,
         module,
         blas,
+        solver,
     } = runtime;
     validate_cuda_program_inputs(plan, inputs)?;
     if values.len() != plan.nodes.len() {
@@ -805,6 +813,31 @@ fn execute_cuda_device_program(
                 }
                 upload_cuda_input(stream, slot, free_buffers, &host, name)?;
                 continue;
+            }
+            TensorOp::Solve { matrix, rhs } => {
+                let (before, current_and_after) = values.split_at_mut(node_id);
+                let slot = current_and_after
+                    .first_mut()
+                    .ok_or_else(|| format!("CUDA node {node_id} is missing its buffer"))?;
+                if slot.is_none() {
+                    *slot = Some(take_cuda_buffer(stream, free_buffers, count, node_id)?);
+                }
+                let output = slot
+                    .as_mut()
+                    .ok_or_else(|| format!("CUDA node {node_id} buffer was not allocated"))?;
+                let solver = solver.ok_or_else(|| {
+                    "CUDA solve requires CUSOLVER, but libcusolver could not be loaded".to_string()
+                })?;
+                launch_cusolver_rank_two_solve(
+                    stream,
+                    module,
+                    solver,
+                    cuda_value(before, *matrix)?,
+                    cuda_value(before, *rhs)?,
+                    output,
+                    plan.nodes[*matrix].shape[0],
+                    plan.nodes[*rhs].shape[1],
+                )?;
             }
             TensorOp::ScalarConstant { .. }
             | TensorOp::Add { .. }
@@ -1475,6 +1508,141 @@ fn cuda_blas(stream: Arc<CudaStream>) -> Result<Option<Arc<Mutex<CudaBlas>>>, St
         .map_err(|error| format!("failed to initialize cuBLAS from {library_name:?}: {error:?}"))
 }
 
+fn cuda_solver(stream: Arc<CudaStream>) -> Result<Option<Arc<Mutex<DnHandle>>>, String> {
+    let library_name = libloading::library_filename("cusolver");
+    let library = unsafe { libloading::Library::new(&library_name) };
+    if library.is_err() {
+        return Ok(None);
+    }
+    drop(library);
+    DnHandle::new(stream)
+        .map(|solver| Some(Arc::new(Mutex::new(solver))))
+        .map_err(|error| format!("failed to initialize CUSOLVER from {library_name:?}: {error:?}"))
+}
+
+fn launch_cuda_transpose_copy(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    input: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    rows: usize,
+    columns: usize,
+) -> Result<(), String> {
+    let count = rows
+        .checked_mul(columns)
+        .ok_or_else(|| "CUDA transpose element count overflows usize".to_string())?;
+    let count =
+        u32::try_from(count).map_err(|_| "CUDA transpose element count exceeds u32".to_string())?;
+    let rows = u64::try_from(rows).map_err(|_| "CUDA transpose rows exceed u64".to_string())?;
+    let columns =
+        u64::try_from(columns).map_err(|_| "CUDA transpose columns exceed u64".to_string())?;
+    let kernel = module
+        .load_function("nabla_transpose_copy")
+        .map_err(|error| format!("failed to load CUDA transpose kernel: {error:?}"))?;
+    let mut launch = stream.launch_builder(&kernel);
+    launch.arg(input);
+    launch.arg(output);
+    launch.arg(&rows);
+    launch.arg(&columns);
+    unsafe {
+        launch
+            .launch(LaunchConfig::for_num_elems(count))
+            .map_err(|error| format!("failed to launch CUDA transpose kernel: {error:?}"))?;
+    }
+    Ok(())
+}
+
+fn launch_cusolver_rank_two_solve(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    solver: &Arc<Mutex<DnHandle>>,
+    matrix: &CudaSlice<f32>,
+    rhs: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    n: usize,
+    rhs_columns: usize,
+) -> Result<(), String> {
+    let n_i32 = i32::try_from(n).map_err(|_| "CUSOLVER solve dimension exceeds i32".to_string())?;
+    let rhs_columns_i32 = i32::try_from(rhs_columns)
+        .map_err(|_| "CUSOLVER solve right-hand-side columns exceed i32".to_string())?;
+    let mut factor = unsafe { stream.alloc::<f32>(n * n) }
+        .map_err(|error| format!("failed to allocate CUSOLVER factor buffer: {error:?}"))?;
+    let mut column_rhs = unsafe { stream.alloc::<f32>(n * rhs_columns) }.map_err(|error| {
+        format!("failed to allocate CUSOLVER right-hand-side buffer: {error:?}")
+    })?;
+    launch_cuda_transpose_copy(stream, module, matrix, &mut factor, n, n)?;
+    launch_cuda_transpose_copy(stream, module, rhs, &mut column_rhs, n, rhs_columns)?;
+    let mut pivots = unsafe { stream.alloc::<i32>(n) }
+        .map_err(|error| format!("failed to allocate CUSOLVER pivot buffer: {error:?}"))?;
+    let mut info = stream
+        .alloc_zeros::<i32>(1)
+        .map_err(|error| format!("failed to allocate CUSOLVER status buffer: {error:?}"))?;
+    let solver = solver
+        .lock()
+        .map_err(|_| "CUSOLVER handle lock is poisoned".to_string())?;
+    {
+        let (factor_ptr, _factor_read) = factor.device_ptr_mut(stream);
+        let (rhs_ptr, _rhs_read) = column_rhs.device_ptr_mut(stream);
+        let (pivot_ptr, _pivot_read) = pivots.device_ptr_mut(stream);
+        let (info_ptr, _info_read) = info.device_ptr_mut(stream);
+        let mut workspace_elements = 0_i32;
+        unsafe {
+            cusolver_sys::cusolverDnSgetrf_bufferSize(
+                solver.cu(),
+                n_i32,
+                n_i32,
+                factor_ptr as *mut f32,
+                n_i32,
+                &mut workspace_elements,
+            )
+            .result()
+            .map_err(|error| format!("CUSOLVER Sgetrf workspace query failed: {error:?}"))?;
+        }
+        let mut workspace = unsafe { stream.alloc::<f32>(workspace_elements as usize) }
+            .map_err(|error| format!("failed to allocate CUSOLVER workspace: {error:?}"))?;
+        let (workspace_ptr, _workspace_read) = workspace.device_ptr_mut(stream);
+        unsafe {
+            cusolver_sys::cusolverDnSgetrf(
+                solver.cu(),
+                n_i32,
+                n_i32,
+                factor_ptr as *mut f32,
+                n_i32,
+                workspace_ptr as *mut f32,
+                pivot_ptr as *mut i32,
+                info_ptr as *mut i32,
+            )
+            .result()
+            .map_err(|error| format!("CUSOLVER Sgetrf failed: {error:?}"))?;
+            cusolver_sys::cusolverDnSgetrs(
+                solver.cu(),
+                cusolver_sys::cublasOperation_t::CUBLAS_OP_N,
+                n_i32,
+                rhs_columns_i32,
+                factor_ptr as *const f32,
+                n_i32,
+                pivot_ptr as *const i32,
+                rhs_ptr as *mut f32,
+                n_i32,
+                info_ptr as *mut i32,
+            )
+            .result()
+            .map_err(|error| format!("CUSOLVER Sgetrs failed: {error:?}"))?;
+        }
+    }
+    let mut host_info = [0_i32; 1];
+    stream
+        .memcpy_dtoh(&info, &mut host_info)
+        .map_err(|error| format!("failed to read CUSOLVER status: {error:?}"))?;
+    if host_info[0] != 0 {
+        return Err(format!(
+            "CUSOLVER solve failed with devInfo={}",
+            host_info[0]
+        ));
+    }
+    launch_cuda_transpose_copy(stream, module, &column_rhs, output, rhs_columns, n)
+}
+
 fn launch_cublas_rank_two_matmul(
     blas: &Arc<Mutex<CudaBlas>>,
     lhs: &CudaSlice<f32>,
@@ -1692,6 +1860,12 @@ extern \"C\" __global__ void nabla_sgd(float* parameter, const float* gradient, 
         parameter[index] -= learning_rate * (first / correction1) / (sqrtf(second / correction2) + epsilon);\n\
     }\n}\n",
     );
+    source.push_str(
+        "extern \"C\" __global__ void nabla_transpose_copy(const float* input, float* output, unsigned long long rows, unsigned long long columns) {\n\\
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
+    unsigned long long count = rows * columns;\n\\
+    if (index < count) { unsigned long long row = index / columns; unsigned long long column = index % columns; output[column * rows + row] = input[index]; }\n}\n",
+    );
     for (node_id, node) in plan.nodes.iter().enumerate() {
         let function = cuda_node_function_name(node_id);
         let count = element_count(&node.shape)?;
@@ -1801,6 +1975,7 @@ extern \"C\" __global__ void nabla_sgd(float* parameter, const float* gradient, 
                 )
                 }
             }
+            TensorOp::Solve { .. } => String::new(),
             TensorOp::Sum { .. } | TensorOp::Mean { .. } => {
                 let scale = if matches!(&node.op, TensorOp::Mean { .. }) {
                     " / (float)count".to_string()
@@ -2051,6 +2226,7 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::Matmul { .. } => "matmul",
+        TensorOp::Solve { .. } => "solve",
         TensorOp::Tanh { .. } => "tanh",
         TensorOp::Exp { .. } => "exp",
         TensorOp::Sqrt { .. } => "sqrt",

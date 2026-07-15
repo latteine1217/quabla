@@ -1152,6 +1152,36 @@ fn solve_rejects_unsupported_shapes_and_singular_matrices() {
     assert!(graph.evaluate(output, &inputs).is_err());
 }
 
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_rank_two_solve_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let matrix = must!(graph.input("matrix", vec![2, 2]));
+    let rhs = must!(graph.input("rhs", vec![2, 1]));
+    let output = must!(graph.solve(matrix, rhs));
+    let inputs = BTreeMap::from([
+        (
+            "matrix".to_string(),
+            must!(DynamicTensor::new(vec![2, 2], vec![3.0, 1.0, 1.0, 2.0])),
+        ),
+        (
+            "rhs".to_string(),
+            must!(DynamicTensor::new(vec![2, 1], vec![9.0, 8.0])),
+        ),
+    ]);
+    let plan = must!(graph.compile_cpu(output));
+    let cpu = must!(CpuBackend.execute(&plan, &inputs));
+    let cuda = must!(CudaBackend::default().execute(&plan, &inputs));
+    assert_eq!(cuda.shape(), cpu.shape());
+    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+        assert!((actual - expected).abs() < 1e-5);
+    }
+}
+
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
 fn mlx_backend_matches_cpu_for_concat_broadcast_and_tanh() {

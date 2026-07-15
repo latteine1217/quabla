@@ -468,7 +468,10 @@ remain pending the dtype/index IR design. A scoped matrix-product `einsum`
 subset lowers directly to rank-N `matmul`. Rank-2 `solve(A, B)` now has a
 partial-pivot LU CPU reference implementation, eager and traced Python APIs,
 and direct/symbolic JVP/VJP plus mixed-tangent rules; it rejects non-square,
-rank-mismatched, and singular inputs explicitly. CUDA CUSOLVER lowering,
+rank-mismatched, and singular inputs explicitly. CUDA now has a CUSOLVER
+`Sgetrf`/`Sgetrs` rank-2 lowering that keeps factorization and right-hand-side
+buffers on device; it has passed Linux feature compilation but remains pending
+runtime validation on a host with `libcusolver` and a visible NVIDIA device.
 Cholesky, triangular solve, and broader contractions remain pending. MLX 0.25.3
 only exposes `linalg::solve` on a CPU stream, so Nabla rejects it on the MLX GPU
 backend rather than silently falling back. Remaining neural primitives and
