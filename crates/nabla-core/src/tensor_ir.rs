@@ -264,6 +264,10 @@ enum TensorOp {
         matrix: TensorNodeId,
         rhs: TensorNodeId,
     },
+    Triangular {
+        input: TensorNodeId,
+        lower: bool,
+    },
     Tanh {
         input: TensorNodeId,
     },
@@ -896,6 +900,36 @@ impl DynamicTensor {
         Self::new(rhs.shape.clone(), result)
     }
 
+    fn triangular(&self, lower: bool) -> Result<Self, String> {
+        if self.shape.len() < 2 {
+            return Err(format!(
+                "triangular projection requires at least rank two, got {:?}",
+                self.shape
+            ));
+        }
+        let rows = self.shape[self.shape.len() - 2];
+        let columns = self.shape[self.shape.len() - 1];
+        let matrix_size = rows
+            .checked_mul(columns)
+            .ok_or_else(|| "triangular matrix size overflows usize".to_string())?;
+        let data = self
+            .data
+            .chunks_exact(matrix_size)
+            .flat_map(|matrix| {
+                matrix.iter().enumerate().map(move |(index, value)| {
+                    let row = index / columns;
+                    let column = index % columns;
+                    if (lower && row >= column) || (!lower && row <= column) {
+                        *value
+                    } else {
+                        0.0
+                    }
+                })
+            })
+            .collect();
+        Self::new(self.shape.clone(), data)
+    }
+
     fn transpose_last_two(&self) -> Result<Self, String> {
         if self.shape.len() < 2 {
             return Err(format!(
@@ -1185,6 +1219,13 @@ impl TensorIr {
                     let tangent = transformed.solve(matrix_value, adjusted_rhs)?;
                     (value, tangent)
                 }
+                TensorOp::Triangular { input, lower } => {
+                    let (value, tangent) = pairs[*input];
+                    (
+                        transformed.triangular(value, *lower)?,
+                        transformed.triangular(tangent, *lower)?,
+                    )
+                }
                 TensorOp::Sum { input } => {
                     let (value, tangent) = pairs[*input];
                     (transformed.sum(value)?, transformed.sum(tangent)?)
@@ -1335,6 +1376,9 @@ impl TensorIr {
                 TensorOp::Matmul { lhs, rhs } => transformed.matmul(values[*lhs], values[*rhs])?,
                 TensorOp::Solve { matrix, rhs } => {
                     transformed.solve(values[*matrix], values[*rhs])?
+                }
+                TensorOp::Triangular { input, lower } => {
+                    transformed.triangular(values[*input], *lower)?
                 }
                 TensorOp::Tanh { input } => transformed.tanh(values[*input])?,
                 TensorOp::Exp { input } => transformed.exp(values[*input])?,
@@ -1580,6 +1624,10 @@ impl TensorIr {
                         matrix_contribution,
                     )?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *rhs, rhs_contribution)?;
+                }
+                TensorOp::Triangular { input, lower } => {
+                    let contribution = transformed.triangular(upstream, *lower)?;
+                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
                 }
                 TensorOp::Tanh { input } => {
                     let one = transformed.scalar_constant(1.0);
@@ -1889,6 +1937,22 @@ impl TensorIr {
         let id = self.nodes.len();
         self.nodes.push(TensorNode {
             op: TensorOp::Solve { matrix, rhs },
+            shape,
+        });
+        Ok(id)
+    }
+
+    pub fn triangular(&mut self, input: TensorNodeId, lower: bool) -> Result<TensorNodeId, String> {
+        let shape = self.node(input)?.shape.clone();
+        if shape.len() < 2 {
+            return Err(format!(
+                "triangular projection requires at least rank two, got {:?}",
+                shape
+            ));
+        }
+        let id = self.nodes.len();
+        self.nodes.push(TensorNode {
+            op: TensorOp::Triangular { input, lower },
             shape,
         });
         Ok(id)
@@ -2406,6 +2470,9 @@ impl TensorIr {
                     let _ = rhs_value;
                     accumulate(&mut cotangents[*rhs], rhs_contribution)?;
                 }
+                TensorOp::Triangular { input, lower } => {
+                    accumulate(&mut cotangents[*input], cotangent.triangular(*lower)?)?;
+                }
                 TensorOp::Tanh { input } => {
                     let output_value = values
                         .get(node_id)
@@ -2684,6 +2751,10 @@ impl TensorIr {
                         .ok_or_else(|| format!("node {node_id} has no evaluated value"))?;
                     matrix_value.solve(&rhs_tangent.sub(&matrix_tangent.matmul(output_value)?)?)?
                 }
+                TensorOp::Triangular { input, lower } => tangents
+                    .get(*input)
+                    .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
+                    .triangular(*lower)?,
                 TensorOp::Tanh { input } => {
                     let input_tangent = tangents
                         .get(*input)
@@ -2965,6 +3036,11 @@ impl TensorIr {
                     "%{id} = solve(%{matrix}, %{rhs}) : {}",
                     format_shape(&node.shape)
                 ),
+                TensorOp::Triangular { input, lower } => format!(
+                    "%{id} = {}(%{input}) : {}",
+                    if *lower { "tril" } else { "triu" },
+                    format_shape(&node.shape)
+                ),
                 TensorOp::Tanh { input } => {
                     format!("%{id} = tanh(%{input}) : {}", format_shape(&node.shape))
                 }
@@ -3155,6 +3231,10 @@ impl TensorIr {
                             .get(*rhs)
                             .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
                     )?,
+                TensorOp::Triangular { input, lower } => values
+                    .get(*input)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .triangular(*lower)?,
                 TensorOp::Tanh { input } => values
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
@@ -3649,6 +3729,17 @@ impl TensorIr {
                             mixed: matrix.value.solve(&mixed_rhs)?,
                         }
                     }
+                    TensorOp::Triangular { input, lower } => {
+                        let input = values
+                            .get(*input)
+                            .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                        MixedTangent {
+                            value: input.value.triangular(*lower)?,
+                            first: input.first.triangular(*lower)?,
+                            second: input.second.triangular(*lower)?,
+                            mixed: input.mixed.triangular(*lower)?,
+                        }
+                    }
                     TensorOp::Tanh { input } => {
                         let input = values
                             .get(*input)
@@ -4082,6 +4173,7 @@ fn cuda_expression(nodes: &[TensorNode], node_id: TensorNodeId) -> Result<String
         | TensorOp::SumAxis { .. }
         | TensorOp::Matmul { .. }
         | TensorOp::Solve { .. }
+        | TensorOp::Triangular { .. }
         | TensorOp::Reshape { .. }
         | TensorOp::Mean { .. }
         | TensorOp::MeanAxis { .. }
@@ -4170,6 +4262,7 @@ fn is_fusable_elementwise_subgraph(nodes: &[TensorNode], node_id: TensorNodeId) 
         | TensorOp::SumAxis { .. }
         | TensorOp::Matmul { .. }
         | TensorOp::Solve { .. }
+        | TensorOp::Triangular { .. }
         | TensorOp::Reshape { .. }
         | TensorOp::Mean { .. }
         | TensorOp::MeanAxis { .. }
@@ -4294,6 +4387,7 @@ fn evaluate_fused_element(
         | TensorOp::SumAxis { .. }
         | TensorOp::Matmul { .. }
         | TensorOp::Solve { .. }
+        | TensorOp::Triangular { .. }
         | TensorOp::Reshape { .. }
         | TensorOp::Mean { .. }
         | TensorOp::MeanAxis { .. }
@@ -4319,6 +4413,7 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
             vec![*lhs, *rhs]
         }
         TensorOp::Solve { matrix, rhs } => vec![*matrix, *rhs],
+        TensorOp::Triangular { input, .. } => vec![*input],
         TensorOp::Where {
             condition,
             on_true,
@@ -4361,6 +4456,7 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::Matmul { .. } => "matmul",
         TensorOp::Solve { .. } => "solve",
+        TensorOp::Triangular { .. } => "triangular",
         TensorOp::Tanh { .. } => "tanh",
         TensorOp::Exp { .. } => "exp",
         TensorOp::Sqrt { .. } => "sqrt",
@@ -4398,6 +4494,7 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<String> {
         TensorOp::SumAxis { input, axis } => format!("sum_axis:{input}:{axis}:{shape:?}"),
         TensorOp::Matmul { lhs, rhs } => format!("matmul:{lhs}:{rhs}:{shape:?}"),
         TensorOp::Solve { matrix, rhs } => format!("solve:{matrix}:{rhs}:{shape:?}"),
+        TensorOp::Triangular { input, lower } => format!("triangular:{input}:{lower}:{shape:?}"),
         TensorOp::Tanh { input } => format!("tanh:{input}:{shape:?}"),
         TensorOp::Exp { input } => format!("exp:{input}:{shape:?}"),
         TensorOp::Sqrt { input } => format!("sqrt:{input}:{shape:?}"),
@@ -4485,6 +4582,10 @@ fn remap_tensor_op(
         TensorOp::Solve { matrix, rhs } => Ok(TensorOp::Solve {
             matrix: remap_node(*matrix)?,
             rhs: remap_node(*rhs)?,
+        }),
+        TensorOp::Triangular { input, lower } => Ok(TensorOp::Triangular {
+            input: remap_node(*input)?,
+            lower: *lower,
         }),
         TensorOp::Tanh { input } => Ok(TensorOp::Tanh {
             input: remap_node(*input)?,

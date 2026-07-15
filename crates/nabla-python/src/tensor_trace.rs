@@ -746,6 +746,22 @@ impl TraceTensor {
         linear.binary(&correction, "add")
     }
 
+    fn triangular_tensor(&self, lower: bool) -> Result<Self, String> {
+        let mut ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let node_id = ir.triangular(self.node_id, lower)?;
+        let shape = ir.node_shape(node_id)?;
+        Ok(Self::from_node(
+            self.graph.clone(),
+            node_id,
+            shape,
+            self.batch_axis,
+        ))
+    }
+
     fn exp_tensor(&self) -> Result<Self, String> {
         let mut ir = self
             .graph
@@ -1513,6 +1529,14 @@ impl TraceTensor {
 
     fn softplus(&self) -> PyResult<Self> {
         self.softplus_tensor().map_err(PyValueError::new_err)
+    }
+
+    fn tril(&self) -> PyResult<Self> {
+        self.triangular_tensor(true).map_err(PyValueError::new_err)
+    }
+
+    fn triu(&self) -> PyResult<Self> {
+        self.triangular_tensor(false).map_err(PyValueError::new_err)
     }
 
     fn exp(&self) -> PyResult<Self> {

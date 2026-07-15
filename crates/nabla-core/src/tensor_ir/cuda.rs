@@ -854,6 +854,7 @@ fn execute_cuda_device_program(
             | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
             | TensorOp::Log { .. }
+            | TensorOp::Triangular { .. }
             | TensorOp::Matmul { .. }
             | TensorOp::Sum { .. }
             | TensorOp::Mean { .. }
@@ -1362,7 +1363,8 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
         | TensorOp::Cos { input }
         | TensorOp::Powi { input, .. }
         | TensorOp::Log { input }
-        | TensorOp::Transpose { input, .. } => {
+        | TensorOp::Transpose { input, .. }
+        | TensorOp::Triangular { input, .. } => {
             launch.arg(cuda_value(values, *input)?);
             launch.arg(output);
             launch.arg(&count);
@@ -1552,6 +1554,7 @@ fn launch_cuda_transpose_copy(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_cusolver_rank_two_solve(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
@@ -1879,6 +1882,17 @@ extern \"C\" __global__ void nabla_sgd(float* parameter, const float* gradient, 
             ),
             TensorOp::ScalarConstant { .. } => {
                 return Err("CUDA device program does not support non-finite constants".to_string())
+            }
+            TensorOp::Triangular { input: _, lower } => {
+                let rows = node.shape[node.shape.len() - 2];
+                let columns = node.shape[node.shape.len() - 1];
+                let matrix_size = rows * columns;
+                let predicate = if *lower { "row >= column" } else { "row <= column" };
+                format!(
+                    "extern \"C\" __global__ void {function}(const float* input, float* out, unsigned long long count) {{\n\\
+                        unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
+                        if (index < count) {{ unsigned long long local = index % {matrix_size}ULL; unsigned long long row = local / {columns}ULL; unsigned long long column = local % {columns}ULL; out[index] = ({predicate}) ? input[index] : 0.0f; }}\n}}\n"
+                )
             }
             TensorOp::Add { lhs, rhs }
             | TensorOp::Sub { lhs, rhs }
@@ -2227,6 +2241,7 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::Matmul { .. } => "matmul",
         TensorOp::Solve { .. } => "solve",
+        TensorOp::Triangular { .. } => "triangular",
         TensorOp::Tanh { .. } => "tanh",
         TensorOp::Exp { .. } => "exp",
         TensorOp::Sqrt { .. } => "sqrt",

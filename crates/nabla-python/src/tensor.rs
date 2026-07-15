@@ -904,6 +904,32 @@ impl PyTensor {
         self.try_map(|value| value.max(0.0) + (-value.abs()).exp().ln_1p())
     }
 
+    pub fn try_triangular(&self, lower: bool) -> Result<Self, String> {
+        if self.shape.len() < 2 {
+            return Err(format!(
+                "triangular projection requires at least rank two, got {:?}",
+                self.shape
+            ));
+        }
+        let columns = self.shape[self.shape.len() - 1];
+        let rows = self.shape[self.shape.len() - 2];
+        let data = self
+            .data
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let row = (index / columns) % rows;
+                let column = index % columns;
+                if (lower && row >= column) || (!lower && row <= column) {
+                    *value
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        Self::from_shape_data(self.shape.clone(), data)
+    }
+
     pub fn try_sin(&self) -> Result<Self, String> {
         self.try_map(f64::sin)
     }
@@ -1353,6 +1379,14 @@ impl PyTensor {
 
     fn softplus(&self) -> PyResult<Self> {
         self.try_softplus().map_err(PyValueError::new_err)
+    }
+
+    fn tril(&self) -> PyResult<Self> {
+        self.try_triangular(true).map_err(PyValueError::new_err)
+    }
+
+    fn triu(&self) -> PyResult<Self> {
+        self.try_triangular(false).map_err(PyValueError::new_err)
     }
 
     fn sin(&self) -> PyResult<Self> {

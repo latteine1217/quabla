@@ -63,6 +63,22 @@ def test_tensor_neural_primitives_and_trace_gradients():
         assert_close_rows([gradients["x"].to_flat_list()], [expected_gradient])
 
 
+def test_tensor_triangular_projections_preserve_trace_gradients():
+    values = nabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    assert values.tril().to_flat_list() == [1.0, 0.0, 0.0, 4.0, 5.0, 0.0]
+    assert values.triu().to_flat_list() == [1.0, 2.0, 3.0, 0.0, 5.0, 6.0]
+
+    for name, expected_gradient in [
+        ("tril", [1.0, 0.0, 0.0, 1.0, 1.0, 0.0]),
+        ("triu", [1.0, 1.0, 1.0, 0.0, 1.0, 1.0]),
+    ]:
+        transform = nabla.tensor_value_and_grad_fn(
+            lambda x, name=name: getattr(x, name)().sum(), [("x", [2, 3])]
+        )
+        _, gradients = transform({"x": values})
+        assert gradients["x"].to_flat_list() == expected_gradient
+
+
 def test_tensor_stateless_random_keys_and_glorot_initializer_are_reproducible():
     first_keys = nabla.Tensor.split_key(1234, 2)
     second_keys = nabla.Tensor.split_key(1234, 2)

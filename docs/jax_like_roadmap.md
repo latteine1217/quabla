@@ -478,6 +478,10 @@ backend rather than silently falling back. `relu`, `abs`, `sigmoid`, and a
 numerically stable `softplus` are available on eager and traced tensors; `relu`
 uses a zero subgradient at zero, while `abs` follows the existing `where`
 tie-rule and has derivative -1 at zero. Dtype/device APIs remain pending.
+`tril` and `triu` now project the last two axes of rank-N tensors across CPU,
+CUDA, and MLX, with direct/symbolic JVP/VJP and mixed-tangent propagation; they
+provide the gradient masking primitive required before triangular solve and
+Cholesky can be added.
 Eager and traced tensors now share a
 differentiable integer/contiguous-slice indexing subset; it lowers through
 Slice/PadSlice on CPU, CUDA, and MLX. Strided/empty slices, ellipsis, and
