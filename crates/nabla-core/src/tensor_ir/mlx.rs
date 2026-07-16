@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use mlx_rs::{ops, Array, StreamOrDevice};
+use mlx_rs::{ops, transforms, Array, StreamOrDevice};
 
 use super::{
     sqrt_derivative_coefficient, DynamicTensor, TensorBackend, TensorExecutionPlan, TensorOp,
@@ -252,13 +252,16 @@ impl MlxBackend {
             values.push(value);
         }
 
+        let outputs = output_node_ids
+            .iter()
+            .map(|node_id| mlx_value(&values, *node_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        transforms::eval(outputs.iter().copied())
+            .map_err(|error| format!("MLX output evaluation failed: {error}"))?;
         output_node_ids
             .iter()
-            .map(|node_id| {
-                let output = mlx_value(&values, *node_id)?;
-                output
-                    .eval()
-                    .map_err(|error| format!("MLX output evaluation failed: {error}"))?;
+            .zip(outputs)
+            .map(|(node_id, output)| {
                 let shape = plan
                     .nodes
                     .get(*node_id)
