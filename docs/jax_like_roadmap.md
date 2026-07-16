@@ -566,7 +566,7 @@ Implementation status (2026-07-16): `tensor_jit_batch_fn(...)` provides the
 first bounded-specialization path for CPU plans. It traces lazily on the first
 observed mapped batch size, caches a fixed number of batch-size plans, and
 rejects changes to non-batch dimensions or unmapped inputs. Symbolic dimensions,
-CUDA/MLX specialization, and explicit control-flow IR remain pending.
+CUDA/MLX batch specialization and explicit control-flow IR remain pending.
 `TraceTensor.__bool__` now rejects data-dependent Python branches explicitly,
 so tracing cannot silently specialize to one host-side branch.
 `tensor_fori_loop(...)` statically unrolls fixed host-integer bounds with a
@@ -583,6 +583,13 @@ Acceptance checks:
 
 Goal: make the Apple backend a usable training backend rather than primal-only
 execution.
+
+Implementation status (2026-07-16): `tensor_value_and_grad_mlx_fn(...)`
+lowers a scalar loss and its requested symbolic VJP gradients into one
+multi-output MLX plan. The backend evaluates the shared graph once before
+materializing each requested result. Device-resident parameters, gradient
+buffers, and Adam state are still pending, so this is value-and-grad parity,
+not yet an efficient training loop.
 
 - Lower rank-N `slice` and internal `pad_slice` correctly on MLX.
 - Add MLX device-resident parameters, gradients, and Adam state.

@@ -2463,6 +2463,37 @@ def test_tensor_value_and_grad_cuda_fn_uses_one_callable_plan():
     ) < 1e-5
 
 
+def test_tensor_value_and_grad_mlx_fn_uses_one_symbolic_plan():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+
+    value_and_grad = nabla.tensor_value_and_grad_mlx_fn(
+        lambda x, target, weight, bias: ((x * weight + bias - target).powi(2)).mean(),
+        [("x", [2]), ("target", [2]), ("weight", [1]), ("bias", [1])],
+        ["weight", "bias"],
+    )
+    inputs = {
+        "x": nabla.Tensor([2], [-1.0, 1.0]),
+        "target": nabla.Tensor([2], [-1.0, 3.0]),
+        "weight": nabla.Tensor([1], [0.0]),
+        "bias": nabla.Tensor([1], [0.0]),
+    }
+    value, gradients = value_and_grad(inputs)
+    cpu_value, cpu_gradients = nabla.tensor_value_and_grad_fn(
+        lambda x, target, weight, bias: ((x * weight + bias - target).powi(2)).mean(),
+        [("x", [2]), ("target", [2]), ("weight", [1]), ("bias", [1])],
+    )(inputs)
+    assert abs(value.to_flat_list()[0] - cpu_value.to_flat_list()[0]) < 1e-5
+    assert abs(
+        gradients["weight"].to_flat_list()[0]
+        - cpu_gradients["weight"].to_flat_list()[0]
+    ) < 1e-5
+    assert abs(
+        gradients["bias"].to_flat_list()[0]
+        - cpu_gradients["bias"].to_flat_list()[0]
+    ) < 1e-5
+
+
 def test_cuda_adam_loss_optimizer_owns_scalar_loss_and_parameters():
     if os.environ.get("NABLA_CUDA_TEST") is None:
         return
@@ -4350,6 +4381,7 @@ if __name__ == "__main__":
     test_tensor_vmap_batched_mlp_gradients_match_loop_on_cpu_and_cuda()
     test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan()
     test_tensor_value_and_grad_cuda_fn_uses_one_callable_plan()
+    test_tensor_value_and_grad_mlx_fn_uses_one_symbolic_plan()
     test_cuda_adam_loss_optimizer_owns_scalar_loss_and_parameters()
     test_tensor_vjp_fn_reuses_a_compiled_plan_with_runtime_cotangent()
     test_tensor_jvp_fn_reuses_a_compiled_plan_with_runtime_tangent()

@@ -200,6 +200,14 @@ pub struct TensorCudaValueAndGradFunction {
     cotangent_name: String,
 }
 
+#[pyclass(name = "TensorMlxValueAndGradFunction", skip_from_py_object)]
+pub struct TensorMlxValueAndGradFunction {
+    plan: TensorMlxExecutionPlan,
+    loss_node_id: TensorNodeId,
+    gradient_node_ids: BTreeMap<String, TensorNodeId>,
+    cotangent_name: String,
+}
+
 #[pyclass(name = "TensorVjpFunction", skip_from_py_object)]
 pub struct TensorVjpFunction {
     plan: TensorExecutionPlan,
@@ -397,6 +405,18 @@ impl TensorTraceGraph {
         CudaBackend::new(device_ordinal)
             .compile(plan)
             .map(|plan| (TensorCudaExecutionPlan { plan }, output_node_ids))
+    }
+
+    fn compile_mlx_multi_plan(
+        &self,
+        output_node_ids: &[TensorNodeId],
+    ) -> Result<(TensorMlxExecutionPlan, Vec<TensorNodeId>), String> {
+        let (plan, output_node_ids) = self
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+            .compile_cpu_many(output_node_ids)?;
+        Ok((TensorMlxExecutionPlan { plan }, output_node_ids))
     }
 }
 
@@ -2661,6 +2681,52 @@ impl TensorCudaValueAndGradFunction {
 }
 
 #[pymethods]
+impl TensorMlxValueAndGradFunction {
+    fn __call__(
+        &self,
+        values: &Bound<'_, PyDict>,
+    ) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+        let mut inputs = extract_tensor_map(values)?;
+        inputs.insert(
+            self.cotangent_name.clone(),
+            DynamicTensor::new(vec![], vec![1.0]).map_err(PyValueError::new_err)?,
+        );
+        let mut output_node_ids = Vec::with_capacity(self.gradient_node_ids.len() + 1);
+        output_node_ids.push(self.loss_node_id);
+        output_node_ids.extend(self.gradient_node_ids.values().copied());
+        let outputs = MlxBackend
+            .execute_many(&self.plan.plan, &output_node_ids, &inputs)
+            .map_err(PyValueError::new_err)?;
+        let mut outputs = outputs.into_iter();
+        let loss = outputs
+            .next()
+            .ok_or_else(|| PyValueError::new_err("MLX value-and-grad produced no loss"))?;
+        let gradients = self
+            .gradient_node_ids
+            .keys()
+            .cloned()
+            .zip(outputs)
+            .map(|(name, gradient)| {
+                PyTensor::from_dynamic_tensor(gradient).map(|tensor| (name, tensor))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            PyTensor::from_dynamic_tensor(loss).map_err(PyValueError::new_err)?,
+            gradients,
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorMlxValueAndGradFunction(parameter_count={}, node_count={})",
+            self.gradient_node_ids.len(),
+            self.plan.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
 impl TensorVjpFunction {
     fn __call__(
         &self,
@@ -3289,6 +3355,7 @@ pub fn tensor_jit_cuda_fn(
 }
 
 const CUDA_LOSS_COTANGENT_NAME: &str = "__nabla_loss_cotangent";
+const MLX_LOSS_COTANGENT_NAME: &str = "__nabla_mlx_loss_cotangent";
 
 fn compile_cuda_scalar_value_and_grad(
     loss: &TensorTraceResult,
@@ -3366,6 +3433,83 @@ pub fn tensor_value_and_grad_cuda_fn(
         loss_node_id,
         gradient_node_ids,
         cotangent_name: CUDA_LOSS_COTANGENT_NAME.to_string(),
+    })
+}
+
+fn compile_mlx_scalar_value_and_grad(
+    loss: &TensorTraceResult,
+    parameter_names: Vec<String>,
+) -> PyResult<(
+    TensorMlxExecutionPlan,
+    TensorNodeId,
+    BTreeMap<String, TensorNodeId>,
+)> {
+    if parameter_names.is_empty() {
+        return Err(PyValueError::new_err(
+            "MLX value-and-grad requires at least one parameter name",
+        ));
+    }
+    if !loss.output.shape.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "MLX value-and-grad requires a scalar output, got shape {:?}",
+            loss.output.shape
+        )));
+    }
+    let (graph, loss_node_id, gradients) = loss
+        .symbolic_vjp_graph(MLX_LOSS_COTANGENT_NAME)
+        .map_err(PyValueError::new_err)?;
+    let mut output_node_ids = vec![loss_node_id];
+    let mut requested_names = Vec::with_capacity(parameter_names.len());
+    let mut seen = BTreeSet::new();
+    for parameter_name in parameter_names {
+        if !seen.insert(parameter_name.clone()) {
+            return Err(PyValueError::new_err(format!(
+                "duplicate parameter name {parameter_name:?}"
+            )));
+        }
+        let gradient_node_id = gradients.get(&parameter_name).copied().ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "parameter {parameter_name:?} is not declared in the loss trace"
+            ))
+        })?;
+        requested_names.push(parameter_name);
+        output_node_ids.push(gradient_node_id);
+    }
+    let (plan, remapped_outputs) = graph
+        .compile_mlx_multi_plan(&output_node_ids)
+        .map_err(PyValueError::new_err)?;
+    let loss_node_id = remapped_outputs[0];
+    let gradient_node_ids = requested_names
+        .into_iter()
+        .zip(remapped_outputs.into_iter().skip(1))
+        .collect();
+    Ok((plan, loss_node_id, gradient_node_ids))
+}
+
+#[pyfunction]
+#[pyo3(signature = (function, input_specs, parameter_names))]
+pub fn tensor_value_and_grad_mlx_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    parameter_names: Vec<String>,
+) -> PyResult<TensorMlxValueAndGradFunction> {
+    if input_specs
+        .iter()
+        .any(|(name, _)| name == MLX_LOSS_COTANGENT_NAME)
+    {
+        return Err(PyValueError::new_err(format!(
+            "tensor_value_and_grad_mlx_fn reserves input name {MLX_LOSS_COTANGENT_NAME:?}"
+        )));
+    }
+    let traced = trace_tensor_python_function(py, function, input_specs)?;
+    let (plan, loss_node_id, gradient_node_ids) =
+        compile_mlx_scalar_value_and_grad(&traced, parameter_names)?;
+    Ok(TensorMlxValueAndGradFunction {
+        plan,
+        loss_node_id,
+        gradient_node_ids,
+        cotangent_name: MLX_LOSS_COTANGENT_NAME.to_string(),
     })
 }
 

@@ -20,6 +20,18 @@ pub use mlx::MlxBackend;
 pub struct MlxBackend;
 
 #[cfg(not(all(feature = "mlx", target_os = "macos")))]
+impl MlxBackend {
+    pub fn execute_many(
+        &self,
+        _plan: &TensorExecutionPlan,
+        _output_node_ids: &[TensorNodeId],
+        _inputs: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<Vec<DynamicTensor>, String> {
+        Err("MLX backend is unavailable: build Nabla on macOS with --features mlx".to_string())
+    }
+}
+
+#[cfg(not(all(feature = "mlx", target_os = "macos")))]
 impl TensorBackend for MlxBackend {
     fn name(&self) -> &'static str {
         "mlx"

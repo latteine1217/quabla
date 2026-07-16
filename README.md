@@ -134,6 +134,10 @@ python examples/benchmark_pinn_cuda.py
   accepts a scalar `TraceTensor` or `TensorTraceResult`, retains static inputs,
   parameters, and Adam state on the GPU, and performs device-only `step()`
   calls. `loss()` is an explicit diagnostic host readback.
+- `tensor_value_and_grad_mlx_fn(fn, input_specs, parameter_names)` builds one
+  symbolic VJP graph and evaluates its scalar loss plus requested gradients
+  from a shared MLX GPU value table. Results are materialized on the host when
+  called; device-resident MLX optimizer state remains pending.
 - `tensor_vmap_fn(fn, input_specs, batch_size, in_axes=None, out_axis=0)`
   traces one fixed-size batched plan. `input_specs` describe one example;
   `in_axes` supports mapped axes (including normalized negative axes) and
@@ -260,9 +264,10 @@ python examples/benchmark_pinn_cuda.py
   through `TensorTraceGraph.compile_mlx()`, `TraceTensor.compile_mlx()`, and
   `TensorTraceResult.compile_mlx()`. The backend has CPU-parity coverage for
   elementwise operations, matmul, global reductions, reshape, transpose,
-  concat, and broadcast. It is a primal execution backend, not a JIT: reverse
-  graphs that contain unsupported operations such as `slice` or internal
-  zero-padding return an explicit error rather
+  concat, and broadcast. `tensor_value_and_grad_mlx_fn(...)` uses the same
+  backend for a scalar loss and named symbolic VJP gradients. It is not a JIT,
+  and reverse graphs that contain unsupported operations such as `slice` or
+  internal zero-padding return an explicit error rather
   than falling back to the host. Building the native MLX dependency requires
   Xcode's Metal Toolchain in addition to CMake:
   `xcodebuild -downloadComponent MetalToolchain`. The Python MLX wheel is not

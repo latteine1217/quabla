@@ -14,16 +14,21 @@ use super::{
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MlxBackend;
 
-impl TensorBackend for MlxBackend {
-    fn name(&self) -> &'static str {
-        "mlx"
-    }
-
-    fn execute(
+impl MlxBackend {
+    /// Executes one compiled graph and materializes each requested output.
+    ///
+    /// All requested outputs share the same MLX value table, so symbolic VJP
+    /// graphs can return their primal loss and several gradients without
+    /// rebuilding the graph or recomputing its common prefix.
+    pub fn execute_many(
         &self,
         plan: &TensorExecutionPlan,
+        output_node_ids: &[usize],
         inputs: &BTreeMap<String, DynamicTensor>,
-    ) -> Result<DynamicTensor, String> {
+    ) -> Result<Vec<DynamicTensor>, String> {
+        if output_node_ids.is_empty() {
+            return Err("MLX execution requires at least one output node".to_string());
+        }
         let stream = StreamOrDevice::gpu();
         let mut values = Vec::with_capacity(plan.nodes.len());
 
@@ -247,19 +252,49 @@ impl TensorBackend for MlxBackend {
             values.push(value);
         }
 
-        let output = mlx_value(&values, plan.output_node_id)?;
-        output
-            .eval()
-            .map_err(|error| format!("MLX output evaluation failed: {error}"))?;
-        DynamicTensor::new(
-            plan.output_shape()?,
-            output
-                .as_slice::<f32>()
-                .iter()
-                .copied()
-                .map(f64::from)
-                .collect(),
-        )
+        output_node_ids
+            .iter()
+            .map(|node_id| {
+                let output = mlx_value(&values, *node_id)?;
+                output
+                    .eval()
+                    .map_err(|error| format!("MLX output evaluation failed: {error}"))?;
+                let shape = plan
+                    .nodes
+                    .get(*node_id)
+                    .ok_or_else(|| format!("MLX output node {node_id} is missing"))?
+                    .shape
+                    .clone();
+                DynamicTensor::new(
+                    shape,
+                    output
+                        .as_slice::<f32>()
+                        .iter()
+                        .copied()
+                        .map(f64::from)
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+}
+
+impl TensorBackend for MlxBackend {
+    fn name(&self) -> &'static str {
+        "mlx"
+    }
+
+    fn execute(
+        &self,
+        plan: &TensorExecutionPlan,
+        inputs: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<DynamicTensor, String> {
+        self.execute_many(plan, &[plan.output_node_id], inputs)
+            .and_then(|mut outputs| {
+                outputs
+                    .pop()
+                    .ok_or_else(|| "MLX execution produced no output".to_string())
+            })
     }
 }
 
