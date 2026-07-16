@@ -199,8 +199,10 @@ python examples/benchmark_pinn_cuda.py
   primitives. Global sum/mean use a block-parallel reduction with atomic scalar
   accumulation. `compile_cuda()` retains its CUDA context and loaded module, so
   repeated `evaluate()` calls do not recompile NVRTC code. Pure elementwise
-  graphs use one fused CUDA kernel; `div` and `log` retain their checked-domain
-  semantics through general per-operation lowering.
+  graphs use one fused CUDA kernel; general plans additionally fuse maximal
+  elementwise tails after materialized leaves such as matmul outputs and bias.
+  `plan.fused_region_count` exposes the selected regions. `div` and `log`
+  retain their checked-domain semantics through general per-operation lowering.
   It requires a CUDA driver plus `libnvrtc.so` at runtime. Host inputs and
   outputs still cross the device boundary on every `evaluate()`. Intermediate
   device buffers are reclaimed after their final consumer and reused by later

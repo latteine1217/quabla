@@ -80,6 +80,10 @@ impl CudaExecutionPlan {
         false
     }
 
+    pub fn fused_region_count(&self) -> usize {
+        0
+    }
+
     pub fn device_buffer_count(&self) -> Result<usize, String> {
         Err(format!(
             "CUDA backend is unavailable for device {}: build Nabla on Linux with --features cuda",
@@ -4156,6 +4160,52 @@ extern \"C\" __global__ void nabla_fused_elementwise({parameters}) {{\n\
         ))
     }
 
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    pub fn cuda_fusion_region_source(&self, region: &TensorFusionRegion) -> Result<String, String> {
+        let output = self
+            .nodes
+            .get(region.output_node_id)
+            .ok_or_else(|| "CUDA fusion region output node does not exist".to_string())?;
+        let leaves = region
+            .input_node_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let expression = cuda_region_expression(&self.nodes, region.output_node_id, &leaves)?;
+        let parameters = region
+            .input_node_ids
+            .iter()
+            .map(|id| format!("const float* input_{id}"))
+            .chain([
+                "float* output".to_string(),
+                "unsigned long long count".to_string(),
+            ])
+            .collect::<Vec<_>>()
+            .join(", ");
+        let offsets = region
+            .input_node_ids
+            .iter()
+            .map(|id| {
+                let input = self.nodes.get(*id).ok_or_else(|| {
+                    format!("CUDA fusion region references missing input node {id}")
+                })?;
+                Ok(cuda_broadcast_offset_function(
+                    *id,
+                    &output.shape,
+                    &input.shape,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .join("\n");
+        let function = cuda_fusion_region_function_name(region.output_node_id);
+        Ok(format!(
+            "{offsets}\nextern \"C\" __global__ void {function}({parameters}) {{\n\
+    const unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
+    if (index < count) output[index] = {expression};\n\
+}}\n"
+        ))
+    }
+
     pub fn evaluate(
         &self,
         inputs: &BTreeMap<String, DynamicTensor>,
@@ -4297,6 +4347,70 @@ fn cuda_expression(nodes: &[TensorNode], node_id: TensorNodeId) -> Result<String
             tensor_op_name(&node.op)
         )),
     }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn cuda_region_expression(
+    nodes: &[TensorNode],
+    node_id: TensorNodeId,
+    leaves: &HashSet<TensorNodeId>,
+) -> Result<String, String> {
+    if leaves.contains(&node_id) {
+        return Ok(format!("input_{node_id}[nabla_offset_{node_id}(index)]"));
+    }
+    let node = nodes
+        .get(node_id)
+        .ok_or_else(|| format!("CUDA fusion region references missing node {node_id}"))?;
+    let child = |child_id| cuda_region_expression(nodes, child_id, leaves);
+    match &node.op {
+        TensorOp::ScalarConstant { value } if value.is_finite() => Ok(cuda_scalar_literal(*value)),
+        TensorOp::ScalarConstant { .. } => {
+            Err("CUDA fusion region does not support non-finite scalar constants".to_string())
+        }
+        TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Greater { lhs, rhs } => Ok(format!(
+            "(({} > {}) ? 1.0f : 0.0f)",
+            child(*lhs)?,
+            child(*rhs)?
+        )),
+        TensorOp::Where {
+            condition,
+            on_true,
+            on_false,
+        } => Ok(format!(
+            "(({} != 0.0f) ? {} : {})",
+            child(*condition)?,
+            child(*on_true)?,
+            child(*on_false)?
+        )),
+        TensorOp::Tanh { input } => Ok(format!("tanhf({})", child(*input)?)),
+        TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
+        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
+        TensorOp::SqrtDerivative { input, order } => {
+            let input = child(*input)?;
+            let coefficient = cuda_scalar_literal(sqrt_derivative_coefficient(*order));
+            let exponent = cuda_scalar_literal(0.5 - *order as f64);
+            Ok(format!(
+                "(({input} == 0.0f) ? 0.0f : ({coefficient} * powf({input}, {exponent})))"
+            ))
+        }
+        TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
+        TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
+        TensorOp::Powi { input, exponent } => {
+            Ok(format!("nabla_powi({}, {}U)", child(*input)?, exponent))
+        }
+        _ => Err(format!(
+            "CUDA fusion region cannot inline {} node {node_id}",
+            tensor_op_name(&node.op)
+        )),
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn cuda_fusion_region_function_name(output_node_id: TensorNodeId) -> String {
+    format!("nabla_fused_region_{output_node_id}")
 }
 
 fn cuda_broadcast_offset_function(

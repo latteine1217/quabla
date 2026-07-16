@@ -249,7 +249,8 @@ Current state:
   broadcast-batched matmul,
   rank-N concat with GPU-resident slice/pad-slice reverse nodes, global and axis reductions, transpose, broadcasting, `where`, `div`, `log`,
   and the supported unary primitives. Pure elementwise graphs use one fused
-  CUDA kernel; general graphs still lower per operation. Intermediate CUDA
+  CUDA kernel; general graphs also lower maximal elementwise tails after
+  materialized leaves through `fusion_regions()`. Intermediate CUDA
   buffers are recycled by last-use liveness, while retained inputs, the output,
   and Adam state stay allocated. `TensorCudaExecutionPlan.device_buffer_count`
   exposes the current allocation count for diagnostics. It is still preview
@@ -541,7 +542,9 @@ has a visible GPU driver and its runtime libraries.
 `fusion_regions()` now exposes maximal elementwise partitions with explicit
 materialized inputs. It prevents unsafe fusion across values consumed by a
 non-elementwise operation, such as a matmul, and is the lowering contract for
-partial CUDA fusion; only whole-plan elementwise fusion currently executes.
+partial CUDA fusion. CUDA source-level tests and feature Clippy cover this
+executor path; runtime parity remains pending a host with a visible NVIDIA
+driver and runtime libraries.
 
 Acceptance checks:
 

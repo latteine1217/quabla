@@ -13,7 +13,7 @@ use cudarc::nvrtc::compile_ptx;
 
 use super::{
     contiguous_strides, element_count, sqrt_derivative_coefficient, tensor_op_inputs,
-    DynamicTensor, TensorBackend, TensorExecutionPlan, TensorOp,
+    DynamicTensor, TensorBackend, TensorExecutionPlan, TensorFusionRegion, TensorOp,
 };
 
 const CUDA_MATMUL_TILE: usize = 32;
@@ -39,6 +39,7 @@ pub struct CudaBackend {
 pub struct CudaExecutionPlan {
     plan: TensorExecutionPlan,
     fused_elementwise: bool,
+    fused_region_count: usize,
     matmul_bias_tanh: Option<CudaMatmulBiasTanhEpilogue>,
     device_ordinal: usize,
     context: Arc<CudaContext>,
@@ -83,6 +84,7 @@ impl CudaBackend {
 
     pub fn compile(&self, plan: TensorExecutionPlan) -> Result<CudaExecutionPlan, String> {
         let matmul_bias_tanh = cuda_matmul_bias_tanh_epilogue(&plan);
+        let fusion_regions = plan.fusion_regions();
         let fused_candidate = plan.uses_fused_elementwise_kernel()
             && !matches!(&plan.nodes[plan.output_node_id].op, TensorOp::Input { .. });
         let (source, fused_elementwise) = if fused_candidate {
@@ -97,6 +99,9 @@ impl CudaBackend {
         if matmul_bias_tanh.is_some() {
             source.push_str(CUDA_MATMUL_BIAS_TANH_SOURCE);
         }
+        for region in &fusion_regions {
+            source.push_str(&plan.cuda_fusion_region_source(region)?);
+        }
         let context = CudaContext::new(self.device_ordinal)
             .map_err(|error| format!("failed to create CUDA context: {error:?}"))?;
         let ptx = compile_ptx(source).map_err(|error| {
@@ -110,6 +115,7 @@ impl CudaBackend {
         Ok(CudaExecutionPlan {
             plan,
             fused_elementwise,
+            fused_region_count: fusion_regions.len(),
             matmul_bias_tanh,
             device_ordinal: self.device_ordinal,
             context,
@@ -136,6 +142,10 @@ impl CudaExecutionPlan {
 
     pub fn uses_fused_matmul_bias_tanh(&self) -> bool {
         self.matmul_bias_tanh.is_some()
+    }
+
+    pub fn fused_region_count(&self) -> usize {
+        self.fused_region_count
     }
 
     /// Number of allocated device buffers currently owned by this plan,
@@ -793,8 +803,35 @@ fn execute_cuda_device_program(
             .collect();
     }
     let mut remaining_uses = cuda_remaining_use_counts(plan);
+    let mut fusion_regions = BTreeMap::new();
+    let mut fusion_interior_nodes = BTreeSet::new();
+    for region in plan.fusion_regions() {
+        for node_id in &region.node_ids {
+            if *node_id != region.output_node_id {
+                fusion_interior_nodes.insert(*node_id);
+            }
+        }
+        fusion_regions.insert(region.output_node_id, region);
+    }
 
     for (node_id, node) in plan.nodes.iter().enumerate() {
+        if fusion_interior_nodes.contains(&node_id) {
+            continue;
+        }
+        if let Some(region) = fusion_regions.get(&node_id) {
+            execute_cuda_fusion_region(plan, region, stream, module, values, free_buffers)?;
+            for fused_node_id in &region.node_ids {
+                release_dead_cuda_values(
+                    plan,
+                    *fused_node_id,
+                    values,
+                    free_buffers,
+                    retained_inputs,
+                    &mut remaining_uses,
+                )?;
+            }
+            continue;
+        }
         let count = element_count(&node.shape)?;
         let launch_count = u32::try_from(count)
             .map_err(|_| format!("CUDA node {node_id} launch exceeds u32 element count"))?;
@@ -943,6 +980,57 @@ fn execute_cuda_device_program(
         .clone_dtoh(output)
         .map_err(|error| format!("failed to copy CUDA program output to host: {error:?}"))?;
     DynamicTensor::new(output_shape, data.into_iter().map(f64::from).collect()).map(Some)
+}
+
+fn execute_cuda_fusion_region(
+    plan: &TensorExecutionPlan,
+    region: &TensorFusionRegion,
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    values: &mut [Option<CudaSlice<f32>>],
+    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+) -> Result<(), String> {
+    let output_node_id = region.output_node_id;
+    let output_node = plan
+        .nodes
+        .get(output_node_id)
+        .ok_or_else(|| format!("CUDA fusion output node {output_node_id} is missing"))?;
+    let count = element_count(&output_node.shape)?;
+    let launch_count = u32::try_from(count).map_err(|_| {
+        format!("CUDA fusion node {output_node_id} launch exceeds u32 element count")
+    })?;
+    let (before_output, output_and_after) = values.split_at_mut(output_node_id);
+    let output = output_and_after
+        .first_mut()
+        .ok_or_else(|| format!("CUDA fusion output node {output_node_id} is missing its buffer"))?;
+    if output.is_none() {
+        *output = Some(take_cuda_buffer(
+            stream,
+            free_buffers,
+            count,
+            output_node_id,
+        )?);
+    }
+    let output = output
+        .as_mut()
+        .ok_or_else(|| format!("CUDA fusion output node {output_node_id} was not allocated"))?;
+    let kernel = module
+        .load_function(&format!("nabla_fused_region_{output_node_id}"))
+        .map_err(|error| format!("failed to load CUDA fusion region kernel: {error:?}"))?;
+    let mut launch = stream.launch_builder(&kernel);
+    for input_node_id in &region.input_node_ids {
+        launch.arg(cuda_value(before_output, *input_node_id)?);
+    }
+    let count = u64::try_from(count)
+        .map_err(|_| format!("CUDA fusion node {output_node_id} count exceeds u64"))?;
+    launch.arg(&mut *output);
+    launch.arg(&count);
+    unsafe {
+        launch
+            .launch(LaunchConfig::for_num_elems(launch_count))
+            .map_err(|error| format!("failed to launch CUDA fusion region: {error:?}"))?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

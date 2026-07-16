@@ -1143,6 +1143,27 @@ def test_cuda_fuses_rank_two_matmul_bias_tanh_epilogue():
         assert abs(value - target) < 1e-5
 
 
+def test_cuda_fuses_elementwise_tail_after_matmul():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, weight, bias: ((x.matmul(weight) + bias).tanh()).sin(),
+        [("x", [2, 2]), ("weight", [2, 3]), ("bias", [1, 3])],
+    )
+    inputs = {
+        "x": nabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
+        "weight": nabla.Tensor([2, 3], [1.0, -1.0, 2.0, 0.5, 1.5, -0.5]),
+        "bias": nabla.Tensor([1, 3], [0.25, -0.5, 1.0]),
+    }
+    cpu = traced.output.compile_cpu().evaluate(inputs).to_flat_list()
+    plan = traced.output.compile_cuda()
+    cuda = plan.evaluate(inputs).to_flat_list()
+
+    assert plan.fused_region_count == 1
+    assert_close_rows([cuda], [cpu], tol=1e-5)
+
+
 def test_cuda_multi_parameter_adam_keeps_gradient_plans_synchronized():
     if os.environ.get("NABLA_CUDA_TEST") is None:
         return

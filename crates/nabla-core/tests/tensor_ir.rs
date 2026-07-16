@@ -387,6 +387,28 @@ fn fusion_regions_do_not_duplicate_a_value_shared_by_two_elementwise_tails() {
     assert!(plan.fusion_regions().is_empty());
 }
 
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_fusion_region_source_materializes_matmul_and_bias_leaves() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 3]));
+    let weight = must!(graph.input("weight", vec![3, 4]));
+    let bias = must!(graph.input("bias", vec![1, 4]));
+    let product = must!(graph.matmul(x, weight));
+    let shifted = must!(graph.add(product, bias));
+    let activated = must!(graph.tanh(shifted));
+    let output = must!(graph.sin(activated));
+    let plan = must!(graph.compile_cpu(output));
+    let region = plan.fusion_regions().pop().expect("expected fusion region");
+    let source = must!(plan.cuda_fusion_region_source(&region));
+
+    assert!(source.contains("nabla_fused_region_6"));
+    assert!(source.contains("const float* input_2"));
+    assert!(source.contains("const float* input_3"));
+    assert!(source.contains("tanhf("));
+    assert!(source.contains("sinf("));
+}
+
 #[test]
 fn buffer_plan_reuses_temporary_slots_after_their_final_use() {
     let mut graph = TensorIr::new();

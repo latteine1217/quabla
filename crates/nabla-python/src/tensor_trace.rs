@@ -2046,6 +2046,11 @@ impl TensorCudaExecutionPlan {
         self.plan.uses_fused_matmul_bias_tanh()
     }
 
+    #[getter]
+    fn fused_region_count(&self) -> usize {
+        self.plan.fused_region_count()
+    }
+
     fn evaluate(&self, inputs: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
         let value = self
             .plan
