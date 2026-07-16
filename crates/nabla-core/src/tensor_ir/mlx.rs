@@ -332,6 +332,17 @@ impl MlxBackend {
             })
             .collect()
     }
+
+    /// Executes a graph using the backend-owned retained input state.
+    pub fn execute_many_with_state(
+        &self,
+        plan: &TensorExecutionPlan,
+        output_node_ids: &[usize],
+        inputs: &BTreeMap<String, DynamicTensor>,
+        state: &MlxRetainedInputs,
+    ) -> Result<Vec<DynamicTensor>, String> {
+        self.execute_many_with_retained(plan, output_node_ids, inputs, state.arrays())
+    }
 }
 
 impl TensorBackend for MlxBackend {
