@@ -532,6 +532,12 @@ not yet been refactored to consume this common schedule. Canonicalization also
 removes identity reshape/broadcast nodes and collapses reshape chains before
 backend lowering, avoiding unnecessary layout copies.
 
+`examples/benchmark_pinn_cuda.py` records reproducible compilation, warm-up,
+and synchronized device-resident Poisson PINN Adam-step timings, including
+shape, transfer, and buffer-stability metadata. It is present for the P4
+acceptance measurement but remains unexecuted until the configured CUDA host
+has a visible GPU driver and its runtime libraries.
+
 Acceptance checks:
 
 - Each pass has IR-level golden tests and preserves CPU reference results.

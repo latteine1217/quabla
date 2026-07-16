@@ -59,6 +59,13 @@ python examples/benchmark_tensor_cuda.py --elementwise --rows 1024 --inner 1024
 python examples/benchmark_tensor_cuda.py --rank-two --device-resident
 ```
 
+Measure device-resident two-layer Poisson PINN Adam steps with separate compile,
+warm-up, and synchronized training timings:
+
+```sh
+python examples/benchmark_pinn_cuda.py
+```
+
 ## Current Capabilities
 
 - Scalar forward-mode automatic differentiation with `Dual`.
