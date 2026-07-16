@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use nabla_core::tensor_ir::{CpuBackend, DynamicTensor, TensorBackend, TensorIr};
+use nabla_core::tensor_ir::{CpuBackend, DynamicTensor, TensorBackend, TensorBufferSlot, TensorIr};
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 use nabla_core::tensor_ir::CudaBackend;
@@ -292,6 +292,63 @@ fn compile_cpu_folds_scalar_constant_subgraphs() {
         must!(DynamicTensor::new(vec![1], vec![4.0])),
     )]);
     assert_eq!(must!(CpuBackend.execute(&plan, &inputs)).data(), &[20.0]);
+}
+
+#[test]
+fn buffer_plan_reuses_temporary_slots_after_their_final_use() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let y = must!(graph.input("y", vec![2]));
+    let z = must!(graph.input("z", vec![2]));
+    let q = must!(graph.input("q", vec![2]));
+    let r = must!(graph.input("r", vec![2]));
+    let first = must!(graph.add(x, y));
+    let second = must!(graph.add(first, z));
+    let third = must!(graph.add(second, q));
+    let output = must!(graph.add(third, r));
+
+    let buffers = must!(must!(graph.compile_cpu(output)).buffer_plan());
+    assert_eq!(buffers.slots.len(), 2);
+    assert_eq!(
+        buffers.slots,
+        vec![
+            TensorBufferSlot {
+                id: 0,
+                element_count: 2,
+            },
+            TensorBufferSlot {
+                id: 1,
+                element_count: 2,
+            },
+        ]
+    );
+    assert_eq!(
+        buffers.node_slots,
+        vec![
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(0),
+            Some(1),
+            Some(0),
+            Some(1)
+        ]
+    );
+}
+
+#[test]
+fn buffer_plan_preserves_reshape_as_an_input_alias() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 2]));
+    let output = must!(graph.reshape(x, vec![4]));
+
+    let buffers = must!(must!(graph.compile_cpu(output)).buffer_plan());
+    assert!(buffers.slots.is_empty());
+    assert_eq!(buffers.node_slots, vec![None, None]);
+    assert_eq!(buffers.node_aliases, vec![None, Some(0)]);
+    assert_eq!(buffers.output_backing_node_id, 0);
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]

@@ -525,7 +525,10 @@ Scalar-only constant subgraphs are folded during CPU-plan compilation when the
 fold preserves checked runtime semantics; division by zero and invalid log/powi
 domains intentionally remain runtime operations. A final DCE pass then removes
 the unreachable source constants and intermediates introduced by folding or CSE
-before any backend sees the plan.
+before any backend sees the plan. `buffer_plan()` now provides a backend-neutral
+exact-size temporary-slot schedule from final-use liveness; inputs remain
+external bindings and reshape aliases preserve their backing storage. CUDA has
+not yet been refactored to consume this common schedule.
 
 Acceptance checks:
 

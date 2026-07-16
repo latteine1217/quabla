@@ -381,6 +381,26 @@ pub struct TensorKernelProgram {
     pub output_node_id: TensorNodeId,
 }
 
+/// One reusable temporary allocation in a backend-neutral execution plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorBufferSlot {
+    pub id: usize,
+    pub element_count: usize,
+}
+
+/// Static liveness-based allocation contract for a frozen tensor plan.
+///
+/// Inputs are externally bound and therefore have no slot. `reshape` nodes
+/// carry an alias instead of allocating storage. All other values use an
+/// exact-size temporary slot that may be reused after its final consumer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorBufferPlan {
+    pub slots: Vec<TensorBufferSlot>,
+    pub node_slots: Vec<Option<usize>>,
+    pub node_aliases: Vec<Option<TensorNodeId>>,
+    pub output_backing_node_id: TensorNodeId,
+}
+
 impl TensorKernelProgram {
     pub fn validate(&self) -> Result<(), String> {
         for (position, node) in self.nodes.iter().enumerate() {
@@ -4054,6 +4074,10 @@ impl TensorExecutionPlan {
         }
     }
 
+    pub fn buffer_plan(&self) -> Result<TensorBufferPlan, String> {
+        build_tensor_buffer_plan(&self.nodes, self.output_node_id)
+    }
+
     /// Lowers a fused rank-N elementwise plan to one CUDA C kernel.
     ///
     /// The generated kernel deliberately excludes operations whose current CPU
@@ -4622,6 +4646,90 @@ fn prune_unreachable_tensor_nodes(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok((compacted, remapped_outputs))
+}
+
+fn build_tensor_buffer_plan(
+    nodes: &[TensorNode],
+    output_node_id: TensorNodeId,
+) -> Result<TensorBufferPlan, String> {
+    let output_backing_node_id = tensor_storage_root(nodes, output_node_id)?;
+    let mut remaining_uses = vec![0usize; nodes.len()];
+    for node in nodes {
+        for input in tensor_op_inputs(&node.op) {
+            let root = tensor_storage_root(nodes, input)?;
+            remaining_uses[root] = remaining_uses[root]
+                .checked_add(1)
+                .ok_or_else(|| "tensor buffer use count overflows usize".to_string())?;
+        }
+    }
+
+    let mut free_slots = BTreeMap::<usize, Vec<usize>>::new();
+    let mut slots = Vec::new();
+    let mut node_slots = vec![None; nodes.len()];
+    let mut node_aliases = vec![None; nodes.len()];
+    for (node_id, node) in nodes.iter().enumerate() {
+        if let TensorOp::Reshape { input } = &node.op {
+            let root = tensor_storage_root(nodes, *input)?;
+            node_slots[node_id] = node_slots[root];
+            node_aliases[node_id] = Some(*input);
+        } else if !matches!(node.op, TensorOp::Input { .. }) {
+            let count = element_count(&node.shape)?;
+            let slot = free_slots
+                .get_mut(&count)
+                .and_then(|available| available.pop())
+                .unwrap_or_else(|| {
+                    let id = slots.len();
+                    slots.push(TensorBufferSlot {
+                        id,
+                        element_count: count,
+                    });
+                    id
+                });
+            node_slots[node_id] = Some(slot);
+        }
+
+        for input in tensor_op_inputs(&node.op) {
+            let root = tensor_storage_root(nodes, input)?;
+            let uses = remaining_uses
+                .get_mut(root)
+                .ok_or_else(|| format!("tensor buffer input node {root} is missing"))?;
+            *uses = uses
+                .checked_sub(1)
+                .ok_or_else(|| format!("tensor buffer input node {root} has invalid use count"))?;
+            if *uses == 0 && root != output_backing_node_id {
+                if let Some(slot) = node_slots[root] {
+                    let count = slots
+                        .get(slot)
+                        .ok_or_else(|| format!("tensor buffer slot {slot} is missing"))?
+                        .element_count;
+                    free_slots.entry(count).or_default().push(slot);
+                }
+            }
+        }
+    }
+    Ok(TensorBufferPlan {
+        slots,
+        node_slots,
+        node_aliases,
+        output_backing_node_id,
+    })
+}
+
+fn tensor_storage_root(
+    nodes: &[TensorNode],
+    node_id: TensorNodeId,
+) -> Result<TensorNodeId, String> {
+    let mut root = node_id;
+    loop {
+        match &nodes
+            .get(root)
+            .ok_or_else(|| format!("tensor buffer node {root} is missing"))?
+            .op
+        {
+            TensorOp::Reshape { input } => root = *input,
+            _ => return Ok(root),
+        }
+    }
 }
 
 fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<String> {

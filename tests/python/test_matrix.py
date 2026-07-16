@@ -2834,6 +2834,27 @@ def test_kernel_ir_marks_reshape_as_logical_alias_candidate():
     plan.validate_kernel_ir()
 
 
+def test_cpu_execution_plan_exposes_liveness_buffer_schedule():
+    def model(x, y, z, q, r):
+        first = x + y
+        second = first + z
+        third = second + q
+        return third + r
+
+    traced = nabla.trace_tensor(
+        model,
+        [("x", [2]), ("y", [2]), ("z", [2]), ("q", [2]), ("r", [2])],
+    )
+    buffers = traced.output.compile_cpu().buffer_plan()
+
+    assert buffers == {
+        "slots": [{"id": 0, "element_count": 2}, {"id": 1, "element_count": 2}],
+        "node_slots": [None, None, None, None, None, 0, 1, 0, 1],
+        "node_aliases": [None] * 9,
+        "output_backing_node_id": 8,
+    }
+
+
 def test_trace_tensor_compile_cpu_commons_identical_pure_nodes():
     def model(x):
         return x.tanh() + x.tanh()

@@ -1858,6 +1858,23 @@ impl TensorCpuExecutionPlan {
             .map_err(PyValueError::new_err)
     }
 
+    fn buffer_plan(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let buffer_plan = self.plan.buffer_plan().map_err(PyValueError::new_err)?;
+        let result = PyDict::new(py);
+        let slots = PyList::empty(py);
+        for slot in buffer_plan.slots {
+            let item = PyDict::new(py);
+            item.set_item("id", slot.id)?;
+            item.set_item("element_count", slot.element_count)?;
+            slots.append(item)?;
+        }
+        result.set_item("slots", slots)?;
+        result.set_item("node_slots", buffer_plan.node_slots)?;
+        result.set_item("node_aliases", buffer_plan.node_aliases)?;
+        result.set_item("output_backing_node_id", buffer_plan.output_backing_node_id)?;
+        Ok(result.into())
+    }
+
     fn evaluate(&self, inputs: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
         let value = self
             .plan
