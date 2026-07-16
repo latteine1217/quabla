@@ -1875,6 +1875,18 @@ impl TensorCpuExecutionPlan {
         Ok(result.into())
     }
 
+    fn fusion_regions(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+        let regions = PyList::empty(py);
+        for region in self.plan.fusion_regions() {
+            let item = PyDict::new(py);
+            item.set_item("output_node_id", region.output_node_id)?;
+            item.set_item("node_ids", region.node_ids)?;
+            item.set_item("input_node_ids", region.input_node_ids)?;
+            regions.append(item)?;
+        }
+        Ok(regions.into())
+    }
+
     fn evaluate(&self, inputs: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
         let value = self
             .plan

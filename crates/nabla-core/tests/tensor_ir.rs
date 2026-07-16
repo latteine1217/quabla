@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use nabla_core::tensor_ir::{CpuBackend, DynamicTensor, TensorBackend, TensorBufferSlot, TensorIr};
+use nabla_core::tensor_ir::{
+    CpuBackend, DynamicTensor, TensorBackend, TensorBufferSlot, TensorFusionRegion, TensorIr,
+};
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 use nabla_core::tensor_ir::CudaBackend;
@@ -326,6 +328,63 @@ fn compile_cpu_composes_non_identity_reshape_chains() {
     assert_eq!(plan.node_count(), 2);
     assert_eq!(plan.lower_text().matches("reshape(").count(), 1);
     assert!(plan.lower_text().contains("reshape(%0)"));
+}
+
+#[test]
+fn fusion_regions_isolate_an_elementwise_tail_after_matmul() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 3]));
+    let weight = must!(graph.input("weight", vec![3, 4]));
+    let bias = must!(graph.input("bias", vec![1, 4]));
+    let product = must!(graph.matmul(x, weight));
+    let shifted = must!(graph.add(product, bias));
+    let activated = must!(graph.tanh(shifted));
+    let output = must!(graph.sin(activated));
+
+    let regions = must!(graph.compile_cpu(output)).fusion_regions();
+    assert_eq!(
+        regions,
+        vec![TensorFusionRegion {
+            output_node_id: 6,
+            node_ids: vec![4, 5, 6],
+            input_node_ids: vec![2, 3],
+        }]
+    );
+}
+
+#[test]
+fn fusion_regions_materialize_values_with_non_elementwise_consumers() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 3]));
+    let weight = must!(graph.input("weight", vec![3, 4]));
+    let activated = must!(graph.tanh(x));
+    let _product = must!(graph.matmul(activated, weight));
+    let cosine = must!(graph.cos(activated));
+    let output = must!(graph.sin(cosine));
+
+    let (plan, _) = must!(graph.compile_cpu_many(&[_product, output]));
+    let regions = plan.fusion_regions();
+    assert_eq!(
+        regions,
+        vec![TensorFusionRegion {
+            output_node_id: 5,
+            node_ids: vec![4, 5],
+            input_node_ids: vec![2],
+        }]
+    );
+}
+
+#[test]
+fn fusion_regions_do_not_duplicate_a_value_shared_by_two_elementwise_tails() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let shared = must!(graph.tanh(x));
+    let left = must!(graph.sin(shared));
+    let right = must!(graph.cos(shared));
+    let left_loss = must!(graph.sum(left));
+
+    let (plan, _) = must!(graph.compile_cpu_many(&[left_loss, right]));
+    assert!(plan.fusion_regions().is_empty());
 }
 
 #[test]

@@ -401,6 +401,14 @@ pub struct TensorBufferPlan {
     pub output_backing_node_id: TensorNodeId,
 }
 
+/// A maximal elementwise region whose leaves must be materialized first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorFusionRegion {
+    pub output_node_id: TensorNodeId,
+    pub node_ids: Vec<TensorNodeId>,
+    pub input_node_ids: Vec<TensorNodeId>,
+}
+
 impl TensorKernelProgram {
     pub fn validate(&self) -> Result<(), String> {
         for (position, node) in self.nodes.iter().enumerate() {
@@ -4082,6 +4090,12 @@ impl TensorExecutionPlan {
         build_tensor_buffer_plan(&self.nodes, self.output_node_id)
     }
 
+    /// Returns maximal elementwise regions that backends may lower as one
+    /// kernel after materializing each listed input node.
+    pub fn fusion_regions(&self) -> Vec<TensorFusionRegion> {
+        build_tensor_fusion_regions(&self.nodes)
+    }
+
     /// Lowers a fused rank-N elementwise plan to one CUDA C kernel.
     ///
     /// The generated kernel deliberately excludes operations whose current CPU
@@ -4373,6 +4387,24 @@ fn is_fusable_elementwise_subgraph(nodes: &[TensorNode], node_id: TensorNodeId) 
     }
 }
 
+fn is_fusable_elementwise_compute_op(op: &TensorOp) -> bool {
+    matches!(
+        op,
+        TensorOp::Add { .. }
+            | TensorOp::Sub { .. }
+            | TensorOp::Mul { .. }
+            | TensorOp::Greater { .. }
+            | TensorOp::Where { .. }
+            | TensorOp::Tanh { .. }
+            | TensorOp::Exp { .. }
+            | TensorOp::Sqrt { .. }
+            | TensorOp::SqrtDerivative { .. }
+            | TensorOp::Sin { .. }
+            | TensorOp::Cos { .. }
+            | TensorOp::Powi { .. }
+    )
+}
+
 fn evaluate_fused_elementwise(
     nodes: &[TensorNode],
     output_node_id: TensorNodeId,
@@ -4637,6 +4669,78 @@ fn canonicalize_tensor_op(
             Ok((source.shape == output_shape).then_some(*input))
         }
         _ => Ok(None),
+    }
+}
+
+fn build_tensor_fusion_regions(nodes: &[TensorNode]) -> Vec<TensorFusionRegion> {
+    let mut users = vec![Vec::new(); nodes.len()];
+    for (node_id, node) in nodes.iter().enumerate() {
+        for input in tensor_op_inputs(&node.op) {
+            if let Some(input_users) = users.get_mut(input) {
+                if !input_users.contains(&node_id) {
+                    input_users.push(node_id);
+                }
+            }
+        }
+    }
+
+    let mut regions = Vec::new();
+    for (root, node) in nodes.iter().enumerate() {
+        if !is_fusable_elementwise_compute_op(&node.op)
+            || users[root]
+                .iter()
+                .any(|user| is_fusable_elementwise_compute_op(&nodes[*user].op))
+        {
+            continue;
+        }
+        let mut region_nodes = HashSet::new();
+        let mut inputs = HashSet::new();
+        collect_fusion_region_nodes(nodes, &users, root, root, &mut region_nodes, &mut inputs);
+        if region_nodes.len() < 2 {
+            continue;
+        }
+        let mut node_ids = region_nodes.into_iter().collect::<Vec<_>>();
+        node_ids.sort_unstable();
+        let mut input_node_ids = inputs.into_iter().collect::<Vec<_>>();
+        input_node_ids.sort_unstable();
+        regions.push(TensorFusionRegion {
+            output_node_id: root,
+            node_ids,
+            input_node_ids,
+        });
+    }
+    regions
+}
+
+fn collect_fusion_region_nodes(
+    nodes: &[TensorNode],
+    users: &[Vec<TensorNodeId>],
+    root: TensorNodeId,
+    node_id: TensorNodeId,
+    region_nodes: &mut HashSet<TensorNodeId>,
+    inputs: &mut HashSet<TensorNodeId>,
+) {
+    let Some(node) = nodes.get(node_id) else {
+        return;
+    };
+    if matches!(node.op, TensorOp::ScalarConstant { .. }) {
+        return;
+    }
+    if !is_fusable_elementwise_compute_op(&node.op)
+        || (node_id != root
+            && (users[node_id].len() != 1
+                || users[node_id]
+                    .iter()
+                    .any(|user| !is_fusable_elementwise_compute_op(&nodes[*user].op))))
+    {
+        inputs.insert(node_id);
+        return;
+    }
+    if !region_nodes.insert(node_id) {
+        return;
+    }
+    for input in tensor_op_inputs(&node.op) {
+        collect_fusion_region_nodes(nodes, users, root, input, region_nodes, inputs);
     }
 }
 

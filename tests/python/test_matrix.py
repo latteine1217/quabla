@@ -2855,6 +2855,17 @@ def test_cpu_execution_plan_exposes_liveness_buffer_schedule():
     }
 
 
+def test_cpu_execution_plan_exposes_elementwise_fusion_regions():
+    traced = nabla.trace_tensor(
+        lambda x, weight, bias: ((x @ weight + bias).tanh()).sin(),
+        [("x", [2, 3]), ("weight", [3, 4]), ("bias", [1, 4])],
+    )
+
+    assert traced.output.compile_cpu().fusion_regions() == [
+        {"output_node_id": 6, "node_ids": [4, 5, 6], "input_node_ids": [2, 3]}
+    ]
+
+
 def test_trace_tensor_compile_cpu_commons_identical_pure_nodes():
     def model(x):
         return x.tanh() + x.tanh()

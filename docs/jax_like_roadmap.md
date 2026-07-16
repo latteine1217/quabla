@@ -538,6 +538,11 @@ shape, transfer, and buffer-stability metadata. It is present for the P4
 acceptance measurement but remains unexecuted until the configured CUDA host
 has a visible GPU driver and its runtime libraries.
 
+`fusion_regions()` now exposes maximal elementwise partitions with explicit
+materialized inputs. It prevents unsafe fusion across values consumed by a
+non-elementwise operation, such as a matmul, and is the lowering contract for
+partial CUDA fusion; only whole-plan elementwise fusion currently executes.
+
 Acceptance checks:
 
 - Each pass has IR-level golden tests and preserves CPU reference results.
