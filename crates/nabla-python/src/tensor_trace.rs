@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -133,6 +134,16 @@ pub struct TensorHvpScalarFunction {
 #[pyclass(name = "TensorJitFunction", skip_from_py_object)]
 pub struct TensorJitFunction {
     plan: TensorExecutionPlan,
+}
+
+#[pyclass(name = "TensorBatchJitFunction", unsendable)]
+pub struct TensorBatchJitFunction {
+    function: Py<PyAny>,
+    input_names: Vec<String>,
+    input_axes: Vec<Option<isize>>,
+    max_specializations: usize,
+    static_shapes: RefCell<Option<Vec<Vec<usize>>>>,
+    plans: RefCell<BTreeMap<usize, TensorExecutionPlan>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2410,6 +2421,103 @@ impl TensorJitFunction {
 }
 
 #[pymethods]
+impl TensorBatchJitFunction {
+    fn __call__(&self, py: Python<'_>, values: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
+        let inputs = extract_tensor_map(values)?;
+        if inputs.len() != self.input_names.len()
+            || self
+                .input_names
+                .iter()
+                .any(|name| !inputs.contains_key(name))
+        {
+            return Err(PyValueError::new_err(format!(
+                "tensor_jit_batch_fn expects exactly inputs {:?}",
+                self.input_names
+            )));
+        }
+        let mut batch_size = None;
+        let mut static_shapes = Vec::with_capacity(self.input_names.len());
+        let mut input_specs = Vec::with_capacity(self.input_names.len());
+        for ((name, axis), tensor) in self
+            .input_names
+            .iter()
+            .zip(&self.input_axes)
+            .zip(self.input_names.iter().map(|name| &inputs[name]))
+        {
+            let shape = tensor.shape().to_vec();
+            let static_shape = if let Some(axis) = axis {
+                let normalized = normalize_batch_axis(*axis, shape.len(), name)?;
+                let extent = shape[normalized];
+                match batch_size {
+                    Some(existing) if existing != extent => {
+                        return Err(PyValueError::new_err(format!(
+                            "mapped input {name:?} has batch size {extent}, expected {existing}"
+                        )));
+                    }
+                    None => batch_size = Some(extent),
+                    _ => {}
+                }
+                shape
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, extent)| (index != normalized).then_some(*extent))
+                    .collect()
+            } else {
+                shape.clone()
+            };
+            static_shapes.push(static_shape);
+            input_specs.push((name.clone(), shape));
+        }
+        let batch_size = batch_size.ok_or_else(|| {
+            PyValueError::new_err("tensor_jit_batch_fn requires at least one mapped input axis")
+        })?;
+        let mut expected_shapes = self.static_shapes.borrow_mut();
+        if let Some(expected) = expected_shapes.as_ref() {
+            if expected != &static_shapes {
+                return Err(PyValueError::new_err(format!(
+                    "tensor_jit_batch_fn only specializes mapped batch axes; expected non-batch shapes {expected:?}, got {static_shapes:?}"
+                )));
+            }
+        } else {
+            *expected_shapes = Some(static_shapes);
+        }
+        drop(expected_shapes);
+
+        let cached_plan = self.plans.borrow().get(&batch_size).cloned();
+        let plan = if let Some(plan) = cached_plan {
+            plan.clone()
+        } else {
+            if self.plans.borrow().len() >= self.max_specializations {
+                return Err(PyValueError::new_err(format!(
+                    "tensor_jit_batch_fn reached max_specializations={} before batch size {batch_size}",
+                    self.max_specializations
+                )));
+            }
+            let traced = trace_tensor_python_function(py, self.function.bind(py), input_specs)?;
+            let plan = traced
+                .graph
+                .compile_cpu_plan(traced.output.node_id)
+                .map_err(PyValueError::new_err)?
+                .plan;
+            self.plans.borrow_mut().insert(batch_size, plan.clone());
+            plan
+        };
+        PyTensor::from_dynamic_tensor(plan.evaluate(&inputs).map_err(PyValueError::new_err)?)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[getter]
+    fn specialization_count(&self) -> usize {
+        self.plans.borrow().len()
+    }
+
+    #[getter]
+    fn max_specializations(&self) -> usize {
+        self.max_specializations
+    }
+}
+
+#[pymethods]
 impl TensorVmapFunction {
     #[getter]
     fn node_count(&self) -> usize {
@@ -2901,6 +3009,60 @@ pub fn tensor_jit_fn(
         .map_err(PyValueError::new_err)?
         .plan;
     Ok(TensorJitFunction { plan })
+}
+
+#[pyfunction]
+#[pyo3(signature = (function, input_names, in_axes = None, batch_axis = 0, max_specializations = 4))]
+pub fn tensor_jit_batch_fn(
+    function: Py<PyAny>,
+    input_names: Vec<String>,
+    in_axes: Option<Vec<Option<isize>>>,
+    batch_axis: isize,
+    max_specializations: usize,
+) -> PyResult<TensorBatchJitFunction> {
+    if input_names.is_empty() {
+        return Err(PyValueError::new_err(
+            "tensor_jit_batch_fn requires at least one input name",
+        ));
+    }
+    if max_specializations == 0 {
+        return Err(PyValueError::new_err(
+            "tensor_jit_batch_fn max_specializations must be positive",
+        ));
+    }
+    let input_axes = in_axes.unwrap_or_else(|| vec![Some(batch_axis); input_names.len()]);
+    if input_axes.len() != input_names.len() {
+        return Err(PyValueError::new_err(format!(
+            "tensor_jit_batch_fn in_axes has length {}, expected {}",
+            input_axes.len(),
+            input_names.len()
+        )));
+    }
+    if !input_axes.iter().any(Option::is_some) {
+        return Err(PyValueError::new_err(
+            "tensor_jit_batch_fn requires at least one mapped input axis",
+        ));
+    }
+    Ok(TensorBatchJitFunction {
+        function,
+        input_names,
+        input_axes,
+        max_specializations,
+        static_shapes: RefCell::new(None),
+        plans: RefCell::new(BTreeMap::new()),
+    })
+}
+
+fn normalize_batch_axis(axis: isize, rank: usize, name: &str) -> PyResult<usize> {
+    let rank = isize::try_from(rank)
+        .map_err(|_| PyValueError::new_err(format!("input {name:?} rank exceeds isize")))?;
+    let normalized = if axis < 0 { rank + axis } else { axis };
+    if !(0..rank).contains(&normalized) {
+        return Err(PyValueError::new_err(format!(
+            "batch axis {axis} is out of bounds for input {name:?} rank {rank}"
+        )));
+    }
+    Ok(normalized as usize)
 }
 
 fn move_axis(

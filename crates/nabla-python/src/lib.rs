@@ -11,12 +11,13 @@ pub use matrix::PyMatrix;
 pub use optim::{sum_gradients, PyAdam};
 pub use tensor::{PyTensor, PyTensorView};
 pub use tensor_trace::{
-    TensorCpuExecutionPlan, TensorCudaAdamOptimizer, TensorCudaExecutionPlan,
-    TensorCudaValueAndGradFunction, TensorGradScalarFunction, TensorHessianScalarFunction,
-    TensorHvpScalarFunction, TensorJacobianFunction, TensorJitFunction, TensorJvpFunction,
-    TensorMlxExecutionPlan, TensorTraceGraph, TensorTraceResult, TensorValueAndGradFunction,
-    TensorVjpFunction, TensorVmapCudaFunction, TensorVmapCudaVjpFunction, TensorVmapFunction,
-    TensorVmapJvpFunction, TensorVmapMlxFunction, TensorVmapVjpFunction, TraceTensor,
+    TensorBatchJitFunction, TensorCpuExecutionPlan, TensorCudaAdamOptimizer,
+    TensorCudaExecutionPlan, TensorCudaValueAndGradFunction, TensorGradScalarFunction,
+    TensorHessianScalarFunction, TensorHvpScalarFunction, TensorJacobianFunction,
+    TensorJitFunction, TensorJvpFunction, TensorMlxExecutionPlan, TensorTraceGraph,
+    TensorTraceResult, TensorValueAndGradFunction, TensorVjpFunction, TensorVmapCudaFunction,
+    TensorVmapCudaVjpFunction, TensorVmapFunction, TensorVmapJvpFunction, TensorVmapMlxFunction,
+    TensorVmapVjpFunction, TraceTensor,
 };
 pub use trace::{
     CpuExecutionPlan, GradFunction, GradScalarFunction, GradScalarTransform, IrAttrValue,
@@ -259,6 +260,7 @@ fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TensorHessianScalarFunction>()?;
     m.add_class::<TensorHvpScalarFunction>()?;
     m.add_class::<TensorJitFunction>()?;
+    m.add_class::<TensorBatchJitFunction>()?;
     m.add_class::<TensorCudaValueAndGradFunction>()?;
     m.add_class::<TensorVjpFunction>()?;
     m.add_class::<TensorJvpFunction>()?;
@@ -294,6 +296,7 @@ fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_hessian_scalar_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_hvp_scalar_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_batch_fn, m)?)?;
     m.add_class::<TensorVmapFunction>()?;
     m.add_class::<TensorVmapCudaFunction>()?;
     m.add_class::<TensorVmapMlxFunction>()?;

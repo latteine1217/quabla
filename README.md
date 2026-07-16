@@ -135,6 +135,10 @@ python examples/benchmark_pinn_cuda.py
   reductions, transpose, reshape, broadcast, concat, slice, and `where`.
   `tensor_vmap_cuda_fn(...)` and `tensor_vmap_mlx_fn(...)` lower the same
   canonical trace for CUDA and MLX. Batch extent remains static.
+- `tensor_jit_batch_fn(fn, input_names, in_axes=None, batch_axis=0,
+  max_specializations=4)` lazily traces CPU plans for observed batch sizes.
+  Non-batch dimensions and unmapped inputs must remain fixed; the bounded cache
+  raises instead of silently retracing after its specialization limit.
 - `tensor_vmap_jvp_fn(...)` and `tensor_vmap_vjp_fn(...)` apply the same
   batch-layout contract to runtime tangents and cotangents. Mapped input
   gradients are restored to their declared `in_axes`; unmapped input gradients

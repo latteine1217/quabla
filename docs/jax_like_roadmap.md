@@ -562,6 +562,12 @@ programs without tracing arbitrary Python control flow.
 - Define JVP/VJP semantics for each control-flow operation and reject
   data-dependent Python branches during tracing.
 
+Implementation status (2026-07-16): `tensor_jit_batch_fn(...)` provides the
+first bounded-specialization path for CPU plans. It traces lazily on the first
+observed mapped batch size, caches a fixed number of batch-size plans, and
+rejects changes to non-batch dimensions or unmapped inputs. Symbolic dimensions,
+CUDA/MLX specialization, and explicit control-flow IR remain pending.
+
 Acceptance checks:
 
 - A time-stepping differentiable model and multiple collocation batch sizes run
