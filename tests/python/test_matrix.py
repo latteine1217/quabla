@@ -2072,6 +2072,25 @@ def test_trace_tensor_rejects_data_dependent_python_branches():
         assert "cannot drive Python control flow" in str(error)
 
 
+def test_tensor_fori_loop_unrolls_differentiable_carry():
+    traced = nabla.trace_tensor(
+        lambda x: nabla.tensor_fori_loop(0, 3, lambda _, carry: carry * x, x),
+        [("x", [1])],
+    )
+    inputs = {"x": nabla.Tensor([1], [2.0])}
+    value, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([1], [1.0])
+    )
+
+    assert value.to_flat_list() == [16.0]
+    assert gradients["x"].to_flat_list() == [32.0]
+    try:
+        nabla.tensor_fori_loop(2, 1, lambda _, carry: carry, traced.output)
+        assert False, "expected invalid loop bounds"
+    except ValueError as error:
+        assert "upper >= lower" in str(error)
+
+
 def test_tensor_jit_batch_fn_bounds_batch_shape_specialization():
     compiled = nabla.tensor_jit_batch_fn(
         lambda x, weight: (x.matmul(weight)).tanh(),
@@ -4305,6 +4324,7 @@ if __name__ == "__main__":
     test_tensor_hessian_and_hvp_scalar_fn_reuse_a_compiled_plan()
     test_tensor_jit_fn_reuses_a_compiled_plan()
     test_trace_tensor_rejects_data_dependent_python_branches()
+    test_tensor_fori_loop_unrolls_differentiable_carry()
     test_tensor_jit_batch_fn_bounds_batch_shape_specialization()
     test_tensor_vmap_fn_traces_one_batched_plan()
     test_tensor_vmap_fn_supports_in_axes_out_axis_and_unmapped_inputs()

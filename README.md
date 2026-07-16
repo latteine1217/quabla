@@ -109,6 +109,8 @@ python examples/benchmark_pinn_cuda.py
   A `TraceTensor` cannot be used as a Python boolean, preventing accidental
   data-dependent host branches during tracing; use `nabla.where` for
   elementwise selection while structured `cond`/loop IR is pending.
+  `tensor_fori_loop(lower, upper, body, init)` statically unrolls a
+  fixed-bounds, shape-preserving TraceTensor carry into that same IR.
   `TensorTraceResult.symbolic_vjp(cotangent_name)` and
   `TraceTensor.symbolic_vjp(cotangent_name)` emit one transformable
   gradient trace per original input, all sharing a graph with the explicit

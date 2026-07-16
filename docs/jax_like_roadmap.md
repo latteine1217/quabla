@@ -569,6 +569,9 @@ rejects changes to non-batch dimensions or unmapped inputs. Symbolic dimensions,
 CUDA/MLX specialization, and explicit control-flow IR remain pending.
 `TraceTensor.__bool__` now rejects data-dependent Python branches explicitly,
 so tracing cannot silently specialize to one host-side branch.
+`tensor_fori_loop(...)` statically unrolls fixed host-integer bounds with a
+same-graph, shape-preserving TraceTensor carry; dynamic loop IR and `scan`/
+`cond` remain pending.
 
 Acceptance checks:
 

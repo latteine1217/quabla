@@ -2912,6 +2912,48 @@ pub fn trace_tensor(
     trace_tensor_python_function(py, function, input_specs)
 }
 
+/// Statically unrolls a differentiable loop into the current Tensor IR.
+///
+/// The bounds are host integers, so this does not model data-dependent loop
+/// control flow. The carry must retain its graph and shape on every iteration.
+#[pyfunction]
+pub fn tensor_fori_loop(
+    py: Python<'_>,
+    lower: usize,
+    upper: usize,
+    body: &Bound<'_, PyAny>,
+    init: TraceTensor,
+) -> PyResult<TraceTensor> {
+    if upper < lower {
+        return Err(PyValueError::new_err(format!(
+            "tensor_fori_loop requires upper >= lower, got {upper} < {lower}"
+        )));
+    }
+    let expected_graph = init.graph.clone();
+    let expected_shape = init.shape.clone();
+    let mut carry = init;
+    for index in lower..upper {
+        let argument = Py::new(py, carry.clone())?;
+        let output = body.call1((index, argument))?;
+        let next = output
+            .extract::<PyRef<'_, TraceTensor>>()
+            .map_err(|_| PyTypeError::new_err("tensor_fori_loop body must return a TraceTensor"))?;
+        if !Arc::ptr_eq(&expected_graph.ir, &next.graph.ir) {
+            return Err(PyValueError::new_err(
+                "tensor_fori_loop body returned a TraceTensor from a different graph",
+            ));
+        }
+        if next.shape != expected_shape {
+            return Err(PyValueError::new_err(format!(
+                "tensor_fori_loop body changed carry shape from {expected_shape:?} to {:?}",
+                next.shape
+            )));
+        }
+        carry = next.clone();
+    }
+    Ok(carry)
+}
+
 #[pyfunction]
 pub fn tensor_grad_scalar_fn(
     py: Python<'_>,

@@ -297,6 +297,7 @@ fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_hvp_scalar_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_fn, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_batch_fn, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_fori_loop, m)?)?;
     m.add_class::<TensorVmapFunction>()?;
     m.add_class::<TensorVmapCudaFunction>()?;
     m.add_class::<TensorVmapMlxFunction>()?;
