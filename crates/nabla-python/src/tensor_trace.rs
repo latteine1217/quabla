@@ -1478,6 +1478,12 @@ impl TensorTraceGraph {
 
 #[pymethods]
 impl TraceTensor {
+    fn __bool__(&self) -> PyResult<bool> {
+        Err(PyTypeError::new_err(
+            "TraceTensor cannot drive Python control flow; use nabla.where for elementwise selection or an explicit control-flow primitive",
+        ))
+    }
+
     #[getter]
     fn node_id(&self) -> TensorNodeId {
         self.node_id

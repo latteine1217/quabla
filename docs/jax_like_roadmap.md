@@ -567,6 +567,8 @@ first bounded-specialization path for CPU plans. It traces lazily on the first
 observed mapped batch size, caches a fixed number of batch-size plans, and
 rejects changes to non-batch dimensions or unmapped inputs. Symbolic dimensions,
 CUDA/MLX specialization, and explicit control-flow IR remain pending.
+`TraceTensor.__bool__` now rejects data-dependent Python branches explicitly,
+so tracing cannot silently specialize to one host-side branch.
 
 Acceptance checks:
 

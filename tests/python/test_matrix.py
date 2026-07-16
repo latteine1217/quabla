@@ -2059,6 +2059,19 @@ def test_tensor_jit_fn_reuses_a_compiled_plan():
     )
 
 
+def test_trace_tensor_rejects_data_dependent_python_branches():
+    def model(x):
+        if x.gt(0.0):
+            return x
+        return x * -1.0
+
+    try:
+        nabla.trace_tensor(model, [("x", [1])])
+        assert False, "expected traced Python branch rejection"
+    except TypeError as error:
+        assert "cannot drive Python control flow" in str(error)
+
+
 def test_tensor_jit_batch_fn_bounds_batch_shape_specialization():
     compiled = nabla.tensor_jit_batch_fn(
         lambda x, weight: (x.matmul(weight)).tanh(),
@@ -4291,6 +4304,7 @@ if __name__ == "__main__":
     test_tensor_value_and_grad_fn_returns_scalar_value_and_gradients()
     test_tensor_hessian_and_hvp_scalar_fn_reuse_a_compiled_plan()
     test_tensor_jit_fn_reuses_a_compiled_plan()
+    test_trace_tensor_rejects_data_dependent_python_branches()
     test_tensor_jit_batch_fn_bounds_batch_shape_specialization()
     test_tensor_vmap_fn_traces_one_batched_plan()
     test_tensor_vmap_fn_supports_in_axes_out_axis_and_unmapped_inputs()

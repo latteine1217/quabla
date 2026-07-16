@@ -106,6 +106,9 @@ python examples/benchmark_pinn_cuda.py
   rank-N trace whose output is the coordinate JVP; it can be applied again for
   second derivatives and then differentiated with VJP with respect to model
   parameters. Its rules cover every current rank-N `TensorIr` primitive.
+  A `TraceTensor` cannot be used as a Python boolean, preventing accidental
+  data-dependent host branches during tracing; use `nabla.where` for
+  elementwise selection while structured `cond`/loop IR is pending.
   `TensorTraceResult.symbolic_vjp(cotangent_name)` and
   `TraceTensor.symbolic_vjp(cotangent_name)` emit one transformable
   gradient trace per original input, all sharing a graph with the explicit
