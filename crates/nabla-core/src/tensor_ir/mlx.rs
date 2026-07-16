@@ -14,6 +14,40 @@ use super::{
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MlxBackend;
 
+/// Named MLX arrays retained across executions of a fixed Tensor IR plan.
+///
+/// This owns long-lived parameters and, later, optimizer state. Dynamic batch
+/// inputs remain ordinary host bindings and are uploaded for each execution.
+#[derive(Clone, Debug, Default)]
+pub struct MlxRetainedInputs {
+    values: BTreeMap<String, Array>,
+}
+
+impl MlxRetainedInputs {
+    pub fn upload(
+        inputs: &BTreeMap<String, DynamicTensor>,
+        names: impl IntoIterator<Item = String>,
+    ) -> Result<Self, String> {
+        let mut values = BTreeMap::new();
+        for name in names {
+            let input = inputs
+                .get(&name)
+                .ok_or_else(|| format!("cannot retain missing input {name:?}"))?;
+            values.insert(name, mlx_array_from_dynamic(input)?);
+        }
+        Ok(Self { values })
+    }
+
+    pub fn replace(&mut self, name: String, value: &DynamicTensor) -> Result<(), String> {
+        self.values.insert(name, mlx_array_from_dynamic(value)?);
+        Ok(())
+    }
+
+    pub fn arrays(&self) -> &BTreeMap<String, Array> {
+        &self.values
+    }
+}
+
 impl MlxBackend {
     /// Executes one compiled graph and materializes each requested output.
     ///
@@ -326,6 +360,16 @@ fn mlx_shape(shape: &[usize]) -> Result<Vec<i32>, String> {
             i32::try_from(*extent).map_err(|_| "MLX shape extent exceeds i32".to_string())
         })
         .collect()
+}
+
+fn mlx_array_from_dynamic(input: &DynamicTensor) -> Result<Array, String> {
+    let shape = mlx_shape(input.shape())?;
+    let data = input
+        .data()
+        .iter()
+        .map(|value| *value as f32)
+        .collect::<Vec<_>>();
+    Ok(Array::from_slice(&data, &shape))
 }
 
 fn mlx_value(values: &[Array], node_id: usize) -> Result<&Array, String> {

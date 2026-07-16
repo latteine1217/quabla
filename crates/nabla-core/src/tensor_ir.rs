@@ -13,11 +13,15 @@ mod mlx;
 pub use cuda::{CudaBackend, CudaExecutionPlan};
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
-pub use mlx::MlxBackend;
+pub use mlx::{MlxBackend, MlxRetainedInputs};
 
 #[cfg(not(all(feature = "mlx", target_os = "macos")))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MlxBackend;
+
+#[cfg(not(all(feature = "mlx", target_os = "macos")))]
+#[derive(Clone, Debug, Default)]
+pub struct MlxRetainedInputs;
 
 #[cfg(not(all(feature = "mlx", target_os = "macos")))]
 impl MlxBackend {
