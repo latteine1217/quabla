@@ -528,7 +528,9 @@ the unreachable source constants and intermediates introduced by folding or CSE
 before any backend sees the plan. `buffer_plan()` now provides a backend-neutral
 exact-size temporary-slot schedule from final-use liveness; inputs remain
 external bindings and reshape aliases preserve their backing storage. CUDA has
-not yet been refactored to consume this common schedule.
+not yet been refactored to consume this common schedule. Canonicalization also
+removes identity reshape/broadcast nodes and collapses reshape chains before
+backend lowering, avoiding unnecessary layout copies.
 
 Acceptance checks:
 

@@ -2347,6 +2347,10 @@ impl TensorIr {
                 continue;
             }
             let mut op = remap_tensor_op(&node.op, &remap)?;
+            if let Some(alias) = canonicalize_tensor_op(&mut op, &node.shape, &nodes)? {
+                remap.insert(old_id, alias);
+                continue;
+            }
             if let Some(value) = fold_scalar_constant_op(&op, &nodes) {
                 op = TensorOp::ScalarConstant { value };
             }
@@ -4605,6 +4609,34 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
             (value > 0.0).then(|| value.ln())
         }
         _ => None,
+    }
+}
+
+fn canonicalize_tensor_op(
+    op: &mut TensorOp,
+    output_shape: &[usize],
+    nodes: &[TensorNode],
+) -> Result<Option<TensorNodeId>, String> {
+    match op {
+        TensorOp::Reshape { input } => loop {
+            let source = nodes
+                .get(*input)
+                .ok_or_else(|| format!("reshape source node {input} is missing"))?;
+            if source.shape == output_shape {
+                return Ok(Some(*input));
+            }
+            match source.op {
+                TensorOp::Reshape { input: parent } => *input = parent,
+                _ => return Ok(None),
+            }
+        },
+        TensorOp::Broadcast { input } => {
+            let source = nodes
+                .get(*input)
+                .ok_or_else(|| format!("broadcast source node {input} is missing"))?;
+            Ok((source.shape == output_shape).then_some(*input))
+        }
+        _ => Ok(None),
     }
 }
 

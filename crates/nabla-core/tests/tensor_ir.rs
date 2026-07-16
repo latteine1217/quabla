@@ -295,6 +295,40 @@ fn compile_cpu_folds_scalar_constant_subgraphs() {
 }
 
 #[test]
+fn compile_cpu_canonicalizes_identity_broadcast_and_reshape_chains() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 2]));
+    let same_shape = must!(graph.broadcast_to(x, vec![2, 2]));
+    let flattened = must!(graph.reshape(same_shape, vec![4]));
+    let output = must!(graph.reshape(flattened, vec![2, 2]));
+    let plan = must!(graph.compile_cpu(output));
+
+    assert_eq!(plan.node_count(), 1);
+    assert_eq!(plan.lower_text(), "%0 = input[name=x] : tensor<2x2xf64>");
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0])),
+    )]);
+    assert_eq!(
+        must!(CpuBackend.execute(&plan, &inputs)).data(),
+        &[1.0, 2.0, 3.0, 4.0]
+    );
+}
+
+#[test]
+fn compile_cpu_composes_non_identity_reshape_chains() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 2]));
+    let flattened = must!(graph.reshape(x, vec![4]));
+    let output = must!(graph.reshape(flattened, vec![1, 4]));
+    let plan = must!(graph.compile_cpu(output));
+
+    assert_eq!(plan.node_count(), 2);
+    assert_eq!(plan.lower_text().matches("reshape(").count(), 1);
+    assert!(plan.lower_text().contains("reshape(%0)"));
+}
+
+#[test]
 fn buffer_plan_reuses_temporary_slots_after_their_final_use() {
     let mut graph = TensorIr::new();
     let x = must!(graph.input("x", vec![2]));
