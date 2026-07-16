@@ -282,7 +282,10 @@ fn compile_cpu_folds_scalar_constant_subgraphs() {
     let five = must!(graph.add(two, three));
     let output = must!(graph.mul(x, five));
     let plan = must!(graph.compile_cpu(output));
+    assert_eq!(plan.node_count(), 3);
     assert!(plan.lower_text().contains("constant[value=5]"));
+    assert!(!plan.lower_text().contains("constant[value=2]"));
+    assert!(!plan.lower_text().contains("constant[value=3]"));
     assert!(!plan.lower_text().contains("add(%"));
     let inputs = BTreeMap::from([(
         "x".to_string(),

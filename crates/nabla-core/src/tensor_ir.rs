@@ -2352,6 +2352,10 @@ impl TensorIr {
                     .ok_or_else(|| format!("output node {output} is not reachable"))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // Folding and CSE can make nodes retained by the source-graph DCE
+        // unreachable. Compact the finalized plan so backends never allocate
+        // buffers or launch work for those obsolete intermediates.
+        let (nodes, output_node_ids) = prune_unreachable_tensor_nodes(nodes, &output_node_ids)?;
         let output_node_id = *output_node_ids
             .first()
             .ok_or_else(|| "execution plan requires at least one output".to_string())?;
@@ -4578,6 +4582,46 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
         }
         _ => None,
     }
+}
+
+fn prune_unreachable_tensor_nodes(
+    nodes: Vec<TensorNode>,
+    outputs: &[TensorNodeId],
+) -> Result<(Vec<TensorNode>, Vec<TensorNodeId>), String> {
+    let mut reachable = HashSet::new();
+    let mut pending = outputs.to_vec();
+    while let Some(node_id) = pending.pop() {
+        if !reachable.insert(node_id) {
+            continue;
+        }
+        let node = nodes
+            .get(node_id)
+            .ok_or_else(|| format!("execution plan output node {node_id} is missing"))?;
+        pending.extend(tensor_op_inputs(&node.op));
+    }
+
+    let mut remap = HashMap::new();
+    let mut compacted = Vec::with_capacity(reachable.len());
+    for (old_id, node) in nodes.iter().enumerate() {
+        if !reachable.contains(&old_id) {
+            continue;
+        }
+        remap.insert(old_id, compacted.len());
+        compacted.push(TensorNode {
+            op: remap_tensor_op(&node.op, &remap)?,
+            shape: node.shape.clone(),
+        });
+    }
+    let remapped_outputs = outputs
+        .iter()
+        .map(|output| {
+            remap
+                .get(output)
+                .copied()
+                .ok_or_else(|| format!("execution plan output node {output} is unreachable"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((compacted, remapped_outputs))
 }
 
 fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<String> {

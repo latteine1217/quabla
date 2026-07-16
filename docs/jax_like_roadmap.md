@@ -523,7 +523,9 @@ planning remain pending. `reshape` additionally exposes a logical alias
 candidate in the IR; physical buffer reuse is still deferred to buffer planning.
 Scalar-only constant subgraphs are folded during CPU-plan compilation when the
 fold preserves checked runtime semantics; division by zero and invalid log/powi
-domains intentionally remain runtime operations.
+domains intentionally remain runtime operations. A final DCE pass then removes
+the unreachable source constants and intermediates introduced by folding or CSE
+before any backend sees the plan.
 
 Acceptance checks:
 
