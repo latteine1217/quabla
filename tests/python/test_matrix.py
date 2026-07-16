@@ -2091,6 +2091,19 @@ def test_tensor_fori_loop_unrolls_differentiable_carry():
         assert "upper >= lower" in str(error)
 
 
+def test_tensor_scan_unrolls_differentiable_outputs():
+    traced = nabla.trace_tensor(
+        lambda x: nabla.tensor_scan(3, lambda _, carry: (carry * x, carry * x), x)[1].sum(),
+        [("x", [1])],
+    )
+    _, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id,
+        {"x": nabla.Tensor([1], [2.0])},
+        nabla.Tensor([], [1.0]),
+    )
+    assert gradients["x"].to_flat_list() == [48.0]
+
+
 def test_tensor_jit_batch_fn_bounds_batch_shape_specialization():
     compiled = nabla.tensor_jit_batch_fn(
         lambda x, weight: (x.matmul(weight)).tanh(),
@@ -4325,6 +4338,7 @@ if __name__ == "__main__":
     test_tensor_jit_fn_reuses_a_compiled_plan()
     test_trace_tensor_rejects_data_dependent_python_branches()
     test_tensor_fori_loop_unrolls_differentiable_carry()
+    test_tensor_scan_unrolls_differentiable_outputs()
     test_tensor_jit_batch_fn_bounds_batch_shape_specialization()
     test_tensor_vmap_fn_traces_one_batched_plan()
     test_tensor_vmap_fn_supports_in_axes_out_axis_and_unmapped_inputs()

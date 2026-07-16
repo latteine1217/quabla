@@ -111,6 +111,8 @@ python examples/benchmark_pinn_cuda.py
   elementwise selection while structured `cond`/loop IR is pending.
   `tensor_fori_loop(lower, upper, body, init)` statically unrolls a
   fixed-bounds, shape-preserving TraceTensor carry into that same IR.
+  `tensor_scan(length, body, init)` similarly returns a final carry and a
+  leading-axis stack of fixed-shape outputs.
   `TensorTraceResult.symbolic_vjp(cotangent_name)` and
   `TraceTensor.symbolic_vjp(cotangent_name)` emit one transformable
   gradient trace per original input, all sharing a graph with the explicit

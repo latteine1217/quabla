@@ -571,7 +571,8 @@ CUDA/MLX specialization, and explicit control-flow IR remain pending.
 so tracing cannot silently specialize to one host-side branch.
 `tensor_fori_loop(...)` statically unrolls fixed host-integer bounds with a
 same-graph, shape-preserving TraceTensor carry; dynamic loop IR and `scan`/
-`cond` remain pending.
+`cond` remain pending. `tensor_scan(...)` statically unrolls a fixed-length
+carry/output loop and stacks its fixed-shape TraceTensor outputs.
 
 Acceptance checks:
 

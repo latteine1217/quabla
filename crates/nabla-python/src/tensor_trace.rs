@@ -2954,6 +2954,69 @@ pub fn tensor_fori_loop(
     Ok(carry)
 }
 
+/// Statically unrolls a carry/output scan into the current Tensor IR.
+#[pyfunction]
+pub fn tensor_scan(
+    py: Python<'_>,
+    length: usize,
+    body: &Bound<'_, PyAny>,
+    init: TraceTensor,
+) -> PyResult<Py<PyTuple>> {
+    if length == 0 {
+        return Err(PyValueError::new_err("tensor_scan length must be positive"));
+    }
+    let graph = init.graph.clone();
+    let carry_shape = init.shape.clone();
+    let mut carry = init;
+    let mut outputs = Vec::with_capacity(length);
+    let mut output_shape = None;
+    for index in 0..length {
+        let argument = Py::new(py, carry.clone())?;
+        let result = body.call1((index, argument))?;
+        let result = result.cast::<PyTuple>().map_err(|_| {
+            PyTypeError::new_err("tensor_scan body must return a (carry, output) tuple")
+        })?;
+        if result.len() != 2 {
+            return Err(PyTypeError::new_err(
+                "tensor_scan body must return exactly two values",
+            ));
+        }
+        let next = result
+            .get_item(0)?
+            .extract::<PyRef<'_, TraceTensor>>()
+            .map_err(|_| PyTypeError::new_err("tensor_scan carry must be a TraceTensor"))?;
+        let output = result
+            .get_item(1)?
+            .extract::<PyRef<'_, TraceTensor>>()
+            .map_err(|_| PyTypeError::new_err("tensor_scan output must be a TraceTensor"))?;
+        if !Arc::ptr_eq(&graph.ir, &next.graph.ir) || !Arc::ptr_eq(&graph.ir, &output.graph.ir) {
+            return Err(PyValueError::new_err(
+                "tensor_scan body returned a TraceTensor from a different graph",
+            ));
+        }
+        if next.shape != carry_shape {
+            return Err(PyValueError::new_err(format!(
+                "tensor_scan body changed carry shape from {carry_shape:?} to {:?}",
+                next.shape
+            )));
+        }
+        if let Some(expected) = &output_shape {
+            if &output.shape != expected {
+                return Err(PyValueError::new_err(format!(
+                    "tensor_scan body changed output shape from {expected:?} to {:?}",
+                    output.shape
+                )));
+            }
+        } else {
+            output_shape = Some(output.shape.clone());
+        }
+        carry = next.clone();
+        outputs.push(output.clone());
+    }
+    let stacked = TraceTensor::try_stack(&outputs, 0).map_err(PyValueError::new_err)?;
+    Ok(PyTuple::new(py, [carry, stacked])?.unbind())
+}
+
 #[pyfunction]
 pub fn tensor_grad_scalar_fn(
     py: Python<'_>,
