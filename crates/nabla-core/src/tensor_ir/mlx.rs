@@ -26,6 +26,20 @@ impl MlxBackend {
         output_node_ids: &[usize],
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<Vec<DynamicTensor>, String> {
+        self.execute_many_with_retained(plan, output_node_ids, inputs, &BTreeMap::new())
+    }
+
+    /// Executes a graph while reusing named MLX input arrays.
+    ///
+    /// Retained arrays take precedence over same-named host inputs. Callers
+    /// must create them from the matching Tensor IR input shapes.
+    pub fn execute_many_with_retained(
+        &self,
+        plan: &TensorExecutionPlan,
+        output_node_ids: &[usize],
+        inputs: &BTreeMap<String, DynamicTensor>,
+        retained_inputs: &BTreeMap<String, Array>,
+    ) -> Result<Vec<DynamicTensor>, String> {
         if output_node_ids.is_empty() {
             return Err("MLX execution requires at least one output node".to_string());
         }
@@ -35,23 +49,27 @@ impl MlxBackend {
         for (node_id, node) in plan.nodes.iter().enumerate() {
             let value = match &node.op {
                 TensorOp::Input { name } => {
-                    let input = inputs
-                        .get(name)
-                        .ok_or_else(|| format!("missing input {name:?}"))?;
-                    if input.shape() != node.shape {
-                        return Err(format!(
-                            "input {name:?} has shape {:?}, expected {:?}",
-                            input.shape(),
-                            node.shape
-                        ));
+                    if let Some(input) = retained_inputs.get(name) {
+                        Ok(input.clone())
+                    } else {
+                        let input = inputs
+                            .get(name)
+                            .ok_or_else(|| format!("missing input {name:?}"))?;
+                        if input.shape() != node.shape {
+                            return Err(format!(
+                                "input {name:?} has shape {:?}, expected {:?}",
+                                input.shape(),
+                                node.shape
+                            ));
+                        }
+                        let shape = mlx_shape(&node.shape)?;
+                        let data = input
+                            .data()
+                            .iter()
+                            .map(|value| *value as f32)
+                            .collect::<Vec<_>>();
+                        Ok(Array::from_slice(&data, &shape))
                     }
-                    let shape = mlx_shape(&node.shape)?;
-                    let data = input
-                        .data()
-                        .iter()
-                        .map(|value| *value as f32)
-                        .collect::<Vec<_>>();
-                    Ok(Array::from_slice(&data, &shape))
                 }
                 TensorOp::ScalarConstant { value } if value.is_finite() => {
                     Ok(Array::from_f32(*value as f32))
