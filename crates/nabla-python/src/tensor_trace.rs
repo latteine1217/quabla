@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use nabla_core::tensor_ir::{
-    CudaBackend, CudaExecutionPlan, DynamicTensor, MlxBackend, TensorBackend, TensorExecutionPlan,
-    TensorIr, TensorNodeId,
+    CudaBackend, CudaExecutionPlan, DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs,
+    TensorBackend, TensorCondExecutionPlan, TensorExecutionPlan, TensorForiExecutionPlan, TensorIr,
+    TensorNodeId, TensorReplicaReduction,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -87,6 +88,7 @@ pub struct TensorCudaExecutionPlan {
 #[derive(Clone, Debug)]
 pub struct TensorMlxExecutionPlan {
     plan: TensorExecutionPlan,
+    retained_inputs: Arc<Mutex<MlxRetainedInputs>>,
 }
 
 #[pyclass(name = "TensorCudaAdamOptimizer", skip_from_py_object)]
@@ -101,6 +103,13 @@ pub struct TensorCudaAdamOptimizer {
     beta1: f32,
     beta2: f32,
     epsilon: f32,
+}
+
+#[pyclass(name = "TensorMlxAdamOptimizer", unsendable, skip_from_py_object)]
+pub struct TensorMlxAdamOptimizer {
+    plan: MlxAdamPlan,
+    parameter_names: BTreeSet<String>,
+    inputs: BTreeMap<String, DynamicTensor>,
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +145,25 @@ pub struct TensorJitFunction {
     plan: TensorExecutionPlan,
 }
 
+/// A pair of frozen CPU branch regions selected by a host boolean predicate.
+///
+/// This is deliberately a function-level control-flow boundary: it preserves
+/// lazy branch execution while the Tensor IR gains nested region nodes.
+#[pyclass(name = "TensorCondFunction", skip_from_py_object)]
+pub struct TensorCondFunction {
+    plan: TensorCondExecutionPlan,
+}
+
+#[pyclass(name = "TensorCondValueAndGradFunction", skip_from_py_object)]
+pub struct TensorCondValueAndGradFunction {
+    plan: TensorCondExecutionPlan,
+}
+
+#[pyclass(name = "TensorCondJvpFunction", skip_from_py_object)]
+pub struct TensorCondJvpFunction {
+    plan: TensorCondExecutionPlan,
+}
+
 #[pyclass(name = "TensorBatchJitFunction", unsendable)]
 pub struct TensorBatchJitFunction {
     function: Py<PyAny>,
@@ -144,6 +172,64 @@ pub struct TensorBatchJitFunction {
     max_specializations: usize,
     static_shapes: RefCell<Option<Vec<Vec<usize>>>>,
     plans: RefCell<BTreeMap<usize, TensorExecutionPlan>>,
+}
+
+#[pyclass(name = "TensorBatchValueAndGradFunction", unsendable)]
+pub struct TensorBatchValueAndGradFunction {
+    function: Py<PyAny>,
+    input_names: Vec<String>,
+    input_axes: Vec<Option<isize>>,
+    max_specializations: usize,
+    static_shapes: RefCell<Option<Vec<Vec<usize>>>>,
+    plans: RefCell<BTreeMap<usize, TensorExecutionPlan>>,
+}
+
+struct MlxBatchValueAndGradPlan {
+    plan: TensorMlxExecutionPlan,
+    loss_node_id: TensorNodeId,
+    gradient_node_ids: BTreeMap<String, TensorNodeId>,
+}
+
+struct CudaBatchValueAndGradPlan {
+    plan: TensorCudaExecutionPlan,
+    loss_node_id: TensorNodeId,
+    gradient_node_ids: BTreeMap<String, TensorNodeId>,
+}
+
+type BatchSpecializationSignature = (usize, Vec<Vec<usize>>, Vec<(String, Vec<usize>)>);
+
+#[pyclass(name = "TensorBatchMlxValueAndGradFunction", unsendable)]
+pub struct TensorBatchMlxValueAndGradFunction {
+    function: Py<PyAny>,
+    input_names: Vec<String>,
+    parameter_names: Vec<String>,
+    input_axes: Vec<Option<isize>>,
+    max_specializations: usize,
+    static_shapes: RefCell<Option<Vec<Vec<usize>>>>,
+    plans: RefCell<BTreeMap<usize, MlxBatchValueAndGradPlan>>,
+}
+
+#[pyclass(name = "TensorBatchCudaJitFunction", unsendable)]
+pub struct TensorBatchCudaJitFunction {
+    function: Py<PyAny>,
+    input_names: Vec<String>,
+    input_axes: Vec<Option<isize>>,
+    max_specializations: usize,
+    device_ordinal: usize,
+    static_shapes: RefCell<Option<Vec<Vec<usize>>>>,
+    plans: RefCell<BTreeMap<usize, TensorCudaExecutionPlan>>,
+}
+
+#[pyclass(name = "TensorBatchCudaValueAndGradFunction", unsendable)]
+pub struct TensorBatchCudaValueAndGradFunction {
+    function: Py<PyAny>,
+    input_names: Vec<String>,
+    parameter_names: Vec<String>,
+    input_axes: Vec<Option<isize>>,
+    max_specializations: usize,
+    device_ordinal: usize,
+    static_shapes: RefCell<Option<Vec<Vec<usize>>>>,
+    plans: RefCell<BTreeMap<usize, CudaBatchValueAndGradPlan>>,
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +257,24 @@ pub struct TensorVmapMlxFunction {
     signature: VmapSignature,
 }
 
+#[pyclass(name = "TensorVmapMlxVjpFunction", skip_from_py_object)]
+pub struct TensorVmapMlxVjpFunction {
+    plan: TensorMlxExecutionPlan,
+    output_node_id: TensorNodeId,
+    gradient_node_ids: BTreeMap<String, TensorNodeId>,
+    signature: VmapSignature,
+    cotangent_name: String,
+}
+
+#[pyclass(name = "TensorVmapMlxJvpFunction", skip_from_py_object)]
+pub struct TensorVmapMlxJvpFunction {
+    plan: TensorMlxExecutionPlan,
+    value_node_id: TensorNodeId,
+    tangent_node_id: TensorNodeId,
+    signature: VmapSignature,
+    tangent_names: BTreeMap<String, String>,
+}
+
 #[pyclass(name = "TensorVmapVjpFunction", skip_from_py_object)]
 pub struct TensorVmapVjpFunction {
     plan: TensorExecutionPlan,
@@ -190,6 +294,15 @@ pub struct TensorVmapCudaVjpFunction {
     gradient_node_ids: BTreeMap<String, TensorNodeId>,
     signature: VmapSignature,
     cotangent_name: String,
+}
+
+#[pyclass(name = "TensorVmapCudaJvpFunction", skip_from_py_object)]
+pub struct TensorVmapCudaJvpFunction {
+    plan: TensorCudaExecutionPlan,
+    value_node_id: TensorNodeId,
+    tangent_node_id: TensorNodeId,
+    signature: VmapSignature,
+    tangent_names: BTreeMap<String, String>,
 }
 
 #[pyclass(name = "TensorCudaValueAndGradFunction", skip_from_py_object)]
@@ -389,7 +502,10 @@ impl TensorTraceGraph {
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
             .compile_cpu(output_node_id)?;
-        Ok(TensorMlxExecutionPlan { plan })
+        Ok(TensorMlxExecutionPlan {
+            plan,
+            retained_inputs: Arc::new(Mutex::new(MlxRetainedInputs::empty())),
+        })
     }
 
     fn compile_cuda_multi_plan(
@@ -416,7 +532,13 @@ impl TensorTraceGraph {
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
             .compile_cpu_many(output_node_ids)?;
-        Ok((TensorMlxExecutionPlan { plan }, output_node_ids))
+        Ok((
+            TensorMlxExecutionPlan {
+                plan,
+                retained_inputs: Arc::new(Mutex::new(MlxRetainedInputs::empty())),
+            },
+            output_node_ids,
+        ))
     }
 }
 
@@ -1876,7 +1998,7 @@ impl TensorCpuExecutionPlan {
             item.set_item("shape", node.shape)?;
             item.set_item("dtype", node.dtype)?;
             item.set_item("layout", node.layout)?;
-            item.set_item("placement", node.placement)?;
+            item.set_item("placement", node.placement.to_string())?;
             item.set_item("effect", node.effect)?;
             item.set_item("alias_of", node.alias_of)?;
             item.set_item("inputs", node.inputs)?;
@@ -1966,6 +2088,46 @@ impl TensorCpuExecutionPlan {
         self.evaluate_vjp(inputs, output_cotangent)
     }
 
+    #[pyo3(signature = (inputs, mapped_input_names, shard_count, reduction = "mean"))]
+    fn value_and_grad_data_parallel(
+        &self,
+        inputs: &Bound<'_, PyDict>,
+        mapped_input_names: Vec<String>,
+        shard_count: usize,
+        reduction: &str,
+    ) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+        let reduction = match reduction {
+            "sum" => TensorReplicaReduction::Sum,
+            "mean" => TensorReplicaReduction::Mean,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "data-parallel reduction must be 'sum' or 'mean'",
+                ))
+            }
+        };
+        let (value, gradients) = self
+            .plan
+            .value_and_vjp_data_parallel(
+                &extract_tensor_map(inputs)?,
+                DynamicTensor::new(vec![], vec![1.0]).map_err(PyValueError::new_err)?,
+                &mapped_input_names.into_iter().collect(),
+                shard_count,
+                reduction,
+            )
+            .map_err(PyValueError::new_err)?;
+        let gradients = gradients
+            .into_iter()
+            .map(|(name, tensor)| {
+                PyTensor::from_dynamic_tensor(tensor).map(|tensor| (name, tensor))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)?,
+            gradients,
+        ))
+    }
+
     fn evaluate_jvp(
         &self,
         inputs: &Bound<'_, PyDict>,
@@ -2005,10 +2167,80 @@ impl TensorMlxExecutionPlan {
     }
 
     fn evaluate(&self, inputs: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
+        let retained_inputs = self
+            .retained_inputs
+            .lock()
+            .map_err(|_| PyValueError::new_err("MLX retained input lock is poisoned"))?;
         let value = MlxBackend
-            .execute(&self.plan, &extract_tensor_map(inputs)?)
+            .execute_many_with_state(
+                &self.plan,
+                &[self.plan.output_node_id()],
+                &extract_tensor_map(inputs)?,
+                &retained_inputs,
+            )
             .map_err(PyValueError::new_err)?;
+        let value = value
+            .into_iter()
+            .next()
+            .ok_or_else(|| PyValueError::new_err("MLX execution produced no output"))?;
         PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)
+    }
+
+    /// Evaluate a fixed MLX plan and synchronize its GPU output without a host readback.
+    fn evaluate_device(&self, inputs: &Bound<'_, PyDict>) -> PyResult<()> {
+        let retained_inputs = self
+            .retained_inputs
+            .lock()
+            .map_err(|_| PyValueError::new_err("MLX retained input lock is poisoned"))?;
+        MlxBackend
+            .execute_without_output_with_state(
+                &self.plan,
+                &extract_tensor_map(inputs)?,
+                &retained_inputs,
+            )
+            .map_err(PyValueError::new_err)
+    }
+
+    /// Upload selected bindings once and reuse their MLX arrays on later calls.
+    fn retain_inputs(&self, inputs: &Bound<'_, PyDict>, input_names: Vec<String>) -> PyResult<()> {
+        let inputs = extract_tensor_map(inputs)?;
+        let mut retained = self
+            .retained_inputs
+            .lock()
+            .map_err(|_| PyValueError::new_err("MLX retained input lock is poisoned"))?;
+        for name in input_names {
+            if self.plan.input_shape(&name).is_err() {
+                return Err(PyValueError::new_err(format!(
+                    "cannot retain {name:?}: it is not a plan input"
+                )));
+            }
+            let input = inputs.get(&name).ok_or_else(|| {
+                PyValueError::new_err(format!("cannot retain missing input {name:?}"))
+            })?;
+            retained
+                .replace(name, input)
+                .map_err(PyValueError::new_err)?;
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn retained_input_names(&self) -> PyResult<Vec<String>> {
+        Ok(self
+            .retained_inputs
+            .lock()
+            .map_err(|_| PyValueError::new_err("MLX retained input lock is poisoned"))?
+            .names()
+            .map(str::to_string)
+            .collect())
+    }
+
+    fn clear_retained_inputs(&self) -> PyResult<()> {
+        self.retained_inputs
+            .lock()
+            .map_err(|_| PyValueError::new_err("MLX retained input lock is poisoned"))?
+            .clear();
+        Ok(())
     }
 
     fn __call__(&self, inputs: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
@@ -2045,6 +2277,119 @@ impl TensorVmapMlxFunction {
     fn __repr__(&self) -> String {
         format!(
             "TensorVmapMlxFunction(node_count={})",
+            self.plan.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
+impl TensorVmapMlxVjpFunction {
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.plan.plan.node_count()
+    }
+
+    #[getter]
+    fn backend(&self) -> &'static str {
+        "mlx"
+    }
+
+    fn __call__(
+        &self,
+        values: &Bound<'_, PyDict>,
+        output_cotangent: &PyTensor,
+    ) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+        let mut inputs = vmap_inputs(&self.signature, values)?;
+        inputs.insert(
+            self.cotangent_name.clone(),
+            move_axis(
+                output_cotangent
+                    .to_dynamic_tensor()
+                    .map_err(PyValueError::new_err)?,
+                self.signature.out_axis,
+                0,
+            )
+            .map_err(PyValueError::new_err)?,
+        );
+        let mut output_node_ids = Vec::with_capacity(self.gradient_node_ids.len() + 1);
+        output_node_ids.push(self.output_node_id);
+        output_node_ids.extend(self.gradient_node_ids.values().copied());
+        let outputs = MlxBackend
+            .execute_many(&self.plan.plan, &output_node_ids, &inputs)
+            .map_err(PyValueError::new_err)?;
+        let mut outputs = outputs.into_iter();
+        let value = outputs
+            .next()
+            .ok_or_else(|| PyValueError::new_err("MLX vmap VJP produced no primal output"))?;
+        let gradients = self
+            .gradient_node_ids
+            .keys()
+            .cloned()
+            .zip(outputs)
+            .collect::<BTreeMap<_, _>>();
+        Ok((
+            vmap_output(&self.signature, value)?,
+            vmap_gradient_outputs(&self.signature, gradients)?,
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorVmapMlxVjpFunction(parameter_count={}, node_count={})",
+            self.gradient_node_ids.len(),
+            self.plan.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
+impl TensorVmapMlxJvpFunction {
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.plan.plan.node_count()
+    }
+
+    #[getter]
+    fn backend(&self) -> &'static str {
+        "mlx"
+    }
+
+    fn __call__(
+        &self,
+        values: &Bound<'_, PyDict>,
+        input_tangents: &Bound<'_, PyDict>,
+    ) -> PyResult<(PyTensor, PyTensor)> {
+        let mut inputs = vmap_inputs(&self.signature, values)?;
+        let mut tangents = vmap_inputs(&self.signature, input_tangents)?;
+        for (input_name, tangent_name) in &self.tangent_names {
+            let tangent = tangents.remove(input_name).ok_or_else(|| {
+                PyValueError::new_err(format!("missing input tangent {input_name:?}"))
+            })?;
+            inputs.insert(tangent_name.clone(), tangent);
+        }
+        let outputs = MlxBackend
+            .execute_many(
+                &self.plan.plan,
+                &[self.value_node_id, self.tangent_node_id],
+                &inputs,
+            )
+            .map_err(PyValueError::new_err)?;
+        let mut outputs = outputs.into_iter();
+        let value = outputs
+            .next()
+            .ok_or_else(|| PyValueError::new_err("MLX vmap JVP produced no primal output"))?;
+        let tangent = outputs
+            .next()
+            .ok_or_else(|| PyValueError::new_err("MLX vmap JVP produced no tangent output"))?;
+        Ok((
+            vmap_output(&self.signature, value)?,
+            vmap_output(&self.signature, tangent)?,
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorVmapMlxJvpFunction(node_count={})",
             self.plan.plan.node_count()
         )
     }
@@ -2333,6 +2678,63 @@ impl TensorVmapCudaVjpFunction {
 }
 
 #[pymethods]
+impl TensorVmapCudaJvpFunction {
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.plan.plan.node_count()
+    }
+
+    #[getter]
+    fn backend(&self) -> &'static str {
+        if self.plan.plan.uses_cublas() {
+            "cublas"
+        } else {
+            "nvrtc"
+        }
+    }
+
+    fn __call__(
+        &self,
+        values: &Bound<'_, PyDict>,
+        input_tangents: &Bound<'_, PyDict>,
+    ) -> PyResult<(PyTensor, PyTensor)> {
+        let mut inputs = vmap_inputs(&self.signature, values)?;
+        let mut tangents = vmap_inputs(&self.signature, input_tangents)?;
+        for (input_name, tangent_name) in &self.tangent_names {
+            let tangent = tangents.remove(input_name).ok_or_else(|| {
+                PyValueError::new_err(format!("missing input tangent {input_name:?}"))
+            })?;
+            inputs.insert(tangent_name.clone(), tangent);
+        }
+        self.plan
+            .plan
+            .execute_retaining_without_output(&inputs, &BTreeSet::new())
+            .map_err(PyValueError::new_err)?;
+        let value = self
+            .plan
+            .plan
+            .computed_node_to_host(self.value_node_id)
+            .map_err(PyValueError::new_err)?;
+        let tangent = self
+            .plan
+            .plan
+            .computed_node_to_host(self.tangent_node_id)
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            vmap_output(&self.signature, value)?,
+            vmap_output(&self.signature, tangent)?,
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorVmapCudaJvpFunction(node_count={})",
+            self.plan.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
 impl TensorGradScalarFunction {
     fn __call__(&self, values: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, PyTensor>> {
         let inputs = extract_tensor_map(values)?;
@@ -2447,6 +2849,94 @@ impl TensorJitFunction {
 }
 
 #[pymethods]
+impl TensorCondFunction {
+    fn __call__(&self, predicate: bool, values: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
+        PyTensor::from_dynamic_tensor(
+            self.plan
+                .evaluate(predicate, &extract_tensor_map(values)?)
+                .map_err(PyValueError::new_err)?,
+        )
+        .map_err(PyValueError::new_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorCondFunction(true_node_count={}, false_node_count={})",
+            self.plan.true_node_count(),
+            self.plan.false_node_count()
+        )
+    }
+}
+
+#[pymethods]
+impl TensorCondValueAndGradFunction {
+    fn __call__(
+        &self,
+        predicate: bool,
+        values: &Bound<'_, PyDict>,
+    ) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+        let (value, gradients) = self
+            .plan
+            .value_and_vjp(
+                predicate,
+                &extract_tensor_map(values)?,
+                DynamicTensor::filled(vec![], 1.0).map_err(PyValueError::new_err)?,
+            )
+            .map_err(PyValueError::new_err)?;
+        let gradients = gradients
+            .into_iter()
+            .map(|(name, tensor)| {
+                PyTensor::from_dynamic_tensor(tensor).map(|tensor| (name, tensor))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)?,
+            gradients,
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorCondValueAndGradFunction(true_node_count={}, false_node_count={})",
+            self.plan.true_node_count(),
+            self.plan.false_node_count()
+        )
+    }
+}
+
+#[pymethods]
+impl TensorCondJvpFunction {
+    fn __call__(
+        &self,
+        predicate: bool,
+        values: &Bound<'_, PyDict>,
+        input_tangents: &Bound<'_, PyDict>,
+    ) -> PyResult<(PyTensor, PyTensor)> {
+        let (value, tangent) = self
+            .plan
+            .jvp(
+                predicate,
+                &extract_tensor_map(values)?,
+                &extract_tensor_map(input_tangents)?,
+            )
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)?,
+            PyTensor::from_dynamic_tensor(tangent).map_err(PyValueError::new_err)?,
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorCondJvpFunction(true_node_count={}, false_node_count={})",
+            self.plan.true_node_count(),
+            self.plan.false_node_count()
+        )
+    }
+}
+
+#[pymethods]
 impl TensorBatchJitFunction {
     fn __call__(&self, py: Python<'_>, values: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
         let inputs = extract_tensor_map(values)?;
@@ -2541,6 +3031,449 @@ impl TensorBatchJitFunction {
     fn max_specializations(&self) -> usize {
         self.max_specializations
     }
+}
+
+#[pymethods]
+impl TensorBatchValueAndGradFunction {
+    fn __call__(
+        &self,
+        py: Python<'_>,
+        values: &Bound<'_, PyDict>,
+    ) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+        let inputs = extract_tensor_map(values)?;
+        if inputs.len() != self.input_names.len()
+            || self
+                .input_names
+                .iter()
+                .any(|name| !inputs.contains_key(name))
+        {
+            return Err(PyValueError::new_err(format!(
+                "tensor_value_and_grad_batch_fn expects exactly inputs {:?}",
+                self.input_names
+            )));
+        }
+        let mut batch_size = None;
+        let mut static_shapes = Vec::with_capacity(self.input_names.len());
+        let mut input_specs = Vec::with_capacity(self.input_names.len());
+        for ((name, axis), tensor) in self
+            .input_names
+            .iter()
+            .zip(&self.input_axes)
+            .zip(self.input_names.iter().map(|name| &inputs[name]))
+        {
+            let shape = tensor.shape().to_vec();
+            let static_shape = if let Some(axis) = axis {
+                let normalized = normalize_batch_axis(*axis, shape.len(), name)?;
+                let extent = shape[normalized];
+                match batch_size {
+                    Some(existing) if existing != extent => {
+                        return Err(PyValueError::new_err(format!(
+                            "mapped input {name:?} has batch size {extent}, expected {existing}"
+                        )));
+                    }
+                    None => batch_size = Some(extent),
+                    _ => {}
+                }
+                shape
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, extent)| (index != normalized).then_some(*extent))
+                    .collect()
+            } else {
+                shape.clone()
+            };
+            static_shapes.push(static_shape);
+            input_specs.push((name.clone(), shape));
+        }
+        let batch_size = batch_size.ok_or_else(|| {
+            PyValueError::new_err(
+                "tensor_value_and_grad_batch_fn requires at least one mapped input axis",
+            )
+        })?;
+        let mut expected_shapes = self.static_shapes.borrow_mut();
+        if let Some(expected) = expected_shapes.as_ref() {
+            if expected != &static_shapes {
+                return Err(PyValueError::new_err(format!(
+                    "tensor_value_and_grad_batch_fn only specializes mapped batch axes; expected non-batch shapes {expected:?}, got {static_shapes:?}"
+                )));
+            }
+        } else {
+            *expected_shapes = Some(static_shapes);
+        }
+        drop(expected_shapes);
+
+        let cached_plan = self.plans.borrow().get(&batch_size).cloned();
+        let plan = if let Some(plan) = cached_plan {
+            plan
+        } else {
+            if self.plans.borrow().len() >= self.max_specializations {
+                return Err(PyValueError::new_err(format!(
+                    "tensor_value_and_grad_batch_fn reached max_specializations={} before batch size {batch_size}",
+                    self.max_specializations
+                )));
+            }
+            let traced = trace_tensor_python_function(py, self.function.bind(py), input_specs)?;
+            if !traced.output.shape.is_empty() {
+                return Err(PyValueError::new_err(format!(
+                    "tensor_value_and_grad_batch_fn requires a scalar output, got shape {:?}",
+                    traced.output.shape
+                )));
+            }
+            let plan = traced
+                .graph
+                .compile_cpu_plan(traced.output.node_id)
+                .map_err(PyValueError::new_err)?
+                .plan;
+            self.plans.borrow_mut().insert(batch_size, plan.clone());
+            plan
+        };
+        let (value, gradients) = plan
+            .value_and_vjp(
+                &inputs,
+                DynamicTensor::filled(vec![], 1.0).map_err(PyValueError::new_err)?,
+            )
+            .map_err(PyValueError::new_err)?;
+        let gradients = gradients
+            .into_iter()
+            .map(|(name, tensor)| {
+                PyTensor::from_dynamic_tensor(tensor).map(|tensor| (name, tensor))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)?,
+            gradients,
+        ))
+    }
+
+    #[getter]
+    fn specialization_count(&self) -> usize {
+        self.plans.borrow().len()
+    }
+
+    #[getter]
+    fn max_specializations(&self) -> usize {
+        self.max_specializations
+    }
+}
+
+#[pymethods]
+impl TensorBatchMlxValueAndGradFunction {
+    fn __call__(
+        &self,
+        py: Python<'_>,
+        values: &Bound<'_, PyDict>,
+    ) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+        let inputs = extract_tensor_map(values)?;
+        if inputs.len() != self.input_names.len()
+            || self
+                .input_names
+                .iter()
+                .any(|name| !inputs.contains_key(name))
+        {
+            return Err(PyValueError::new_err(format!(
+                "tensor_value_and_grad_batch_mlx_fn expects exactly inputs {:?}",
+                self.input_names
+            )));
+        }
+        let mut batch_size = None;
+        let mut static_shapes = Vec::with_capacity(self.input_names.len());
+        let mut input_specs = Vec::with_capacity(self.input_names.len());
+        for ((name, axis), tensor) in self
+            .input_names
+            .iter()
+            .zip(&self.input_axes)
+            .zip(self.input_names.iter().map(|name| &inputs[name]))
+        {
+            let shape = tensor.shape().to_vec();
+            let static_shape = if let Some(axis) = axis {
+                let normalized = normalize_batch_axis(*axis, shape.len(), name)?;
+                let extent = shape[normalized];
+                match batch_size {
+                    Some(existing) if existing != extent => {
+                        return Err(PyValueError::new_err(format!(
+                            "mapped input {name:?} has batch size {extent}, expected {existing}"
+                        )));
+                    }
+                    None => batch_size = Some(extent),
+                    _ => {}
+                }
+                shape
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, extent)| (index != normalized).then_some(*extent))
+                    .collect()
+            } else {
+                shape.clone()
+            };
+            static_shapes.push(static_shape);
+            input_specs.push((name.clone(), shape));
+        }
+        let batch_size = batch_size.ok_or_else(|| {
+            PyValueError::new_err(
+                "tensor_value_and_grad_batch_mlx_fn requires at least one mapped input axis",
+            )
+        })?;
+        let mut expected_shapes = self.static_shapes.borrow_mut();
+        if let Some(expected) = expected_shapes.as_ref() {
+            if expected != &static_shapes {
+                return Err(PyValueError::new_err(format!(
+                    "tensor_value_and_grad_batch_mlx_fn only specializes mapped batch axes; expected non-batch shapes {expected:?}, got {static_shapes:?}"
+                )));
+            }
+        } else {
+            *expected_shapes = Some(static_shapes);
+        }
+        drop(expected_shapes);
+
+        if !self.plans.borrow().contains_key(&batch_size) {
+            if self.plans.borrow().len() >= self.max_specializations {
+                return Err(PyValueError::new_err(format!(
+                    "tensor_value_and_grad_batch_mlx_fn reached max_specializations={} before batch size {batch_size}",
+                    self.max_specializations
+                )));
+            }
+            let traced = trace_tensor_python_function(py, self.function.bind(py), input_specs)?;
+            let (plan, loss_node_id, gradient_node_ids) =
+                compile_mlx_scalar_value_and_grad(&traced, self.parameter_names.clone())?;
+            self.plans.borrow_mut().insert(
+                batch_size,
+                MlxBatchValueAndGradPlan {
+                    plan,
+                    loss_node_id,
+                    gradient_node_ids,
+                },
+            );
+        }
+        let plan = self.plans.borrow();
+        let plan = plan.get(&batch_size).ok_or_else(|| {
+            PyValueError::new_err("MLX batch value-and-grad specialization was not cached")
+        })?;
+        execute_mlx_value_and_grad_plan(plan, inputs)
+    }
+
+    #[getter]
+    fn specialization_count(&self) -> usize {
+        self.plans.borrow().len()
+    }
+
+    #[getter]
+    fn max_specializations(&self) -> usize {
+        self.max_specializations
+    }
+}
+
+#[pymethods]
+impl TensorBatchCudaJitFunction {
+    fn __call__(&self, py: Python<'_>, values: &Bound<'_, PyDict>) -> PyResult<PyTensor> {
+        let inputs = extract_tensor_map(values)?;
+        let (batch_size, static_shapes, input_specs) = batch_specialization_signature(
+            &inputs,
+            &self.input_names,
+            &self.input_axes,
+            "tensor_jit_batch_cuda_fn",
+        )?;
+        validate_batch_static_shapes(
+            &self.static_shapes,
+            static_shapes,
+            "tensor_jit_batch_cuda_fn",
+        )?;
+        if !self.plans.borrow().contains_key(&batch_size) {
+            if self.plans.borrow().len() >= self.max_specializations {
+                return Err(PyValueError::new_err(format!(
+                    "tensor_jit_batch_cuda_fn reached max_specializations={} before batch size {batch_size}",
+                    self.max_specializations
+                )));
+            }
+            let traced = trace_tensor_python_function(py, self.function.bind(py), input_specs)?;
+            let plan = traced
+                .graph
+                .compile_cuda_plan(traced.output.node_id, self.device_ordinal)
+                .map_err(PyValueError::new_err)?;
+            self.plans.borrow_mut().insert(batch_size, plan);
+        }
+        let plans = self.plans.borrow();
+        let plan = plans
+            .get(&batch_size)
+            .ok_or_else(|| PyValueError::new_err("CUDA batch JIT specialization was not cached"))?;
+        let value = plan.plan.execute(&inputs).map_err(PyValueError::new_err)?;
+        PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)
+    }
+
+    #[getter]
+    fn specialization_count(&self) -> usize {
+        self.plans.borrow().len()
+    }
+
+    #[getter]
+    fn max_specializations(&self) -> usize {
+        self.max_specializations
+    }
+}
+
+#[pymethods]
+impl TensorBatchCudaValueAndGradFunction {
+    fn __call__(
+        &self,
+        py: Python<'_>,
+        values: &Bound<'_, PyDict>,
+    ) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+        let inputs = extract_tensor_map(values)?;
+        let (batch_size, static_shapes, input_specs) = batch_specialization_signature(
+            &inputs,
+            &self.input_names,
+            &self.input_axes,
+            "tensor_value_and_grad_batch_cuda_fn",
+        )?;
+        validate_batch_static_shapes(
+            &self.static_shapes,
+            static_shapes,
+            "tensor_value_and_grad_batch_cuda_fn",
+        )?;
+        if !self.plans.borrow().contains_key(&batch_size) {
+            if self.plans.borrow().len() >= self.max_specializations {
+                return Err(PyValueError::new_err(format!(
+                    "tensor_value_and_grad_batch_cuda_fn reached max_specializations={} before batch size {batch_size}",
+                    self.max_specializations
+                )));
+            }
+            let traced = trace_tensor_python_function(py, self.function.bind(py), input_specs)?;
+            let (plan, loss_node_id, gradient_node_ids) = compile_cuda_scalar_value_and_grad(
+                &traced,
+                self.parameter_names.clone(),
+                self.device_ordinal,
+            )?;
+            self.plans.borrow_mut().insert(
+                batch_size,
+                CudaBatchValueAndGradPlan {
+                    plan,
+                    loss_node_id,
+                    gradient_node_ids,
+                },
+            );
+        }
+        let plans = self.plans.borrow();
+        let plan = plans.get(&batch_size).ok_or_else(|| {
+            PyValueError::new_err("CUDA batch value-and-grad specialization was not cached")
+        })?;
+        execute_cuda_value_and_grad_plan(plan, inputs)
+    }
+
+    #[getter]
+    fn specialization_count(&self) -> usize {
+        self.plans.borrow().len()
+    }
+
+    #[getter]
+    fn max_specializations(&self) -> usize {
+        self.max_specializations
+    }
+}
+
+fn batch_specialization_signature(
+    inputs: &BTreeMap<String, DynamicTensor>,
+    input_names: &[String],
+    input_axes: &[Option<isize>],
+    function_name: &str,
+) -> PyResult<BatchSpecializationSignature> {
+    if inputs.len() != input_names.len()
+        || input_names.iter().any(|name| !inputs.contains_key(name))
+    {
+        return Err(PyValueError::new_err(format!(
+            "{function_name} expects exactly inputs {input_names:?}"
+        )));
+    }
+    let mut batch_size = None;
+    let mut static_shapes = Vec::with_capacity(input_names.len());
+    let mut input_specs = Vec::with_capacity(input_names.len());
+    for ((name, axis), tensor) in input_names
+        .iter()
+        .zip(input_axes)
+        .zip(input_names.iter().map(|name| &inputs[name]))
+    {
+        let shape = tensor.shape().to_vec();
+        let static_shape = if let Some(axis) = axis {
+            let normalized = normalize_batch_axis(*axis, shape.len(), name)?;
+            let extent = shape[normalized];
+            match batch_size {
+                Some(existing) if existing != extent => {
+                    return Err(PyValueError::new_err(format!(
+                        "mapped input {name:?} has batch size {extent}, expected {existing}"
+                    )));
+                }
+                None => batch_size = Some(extent),
+                _ => {}
+            }
+            shape
+                .iter()
+                .enumerate()
+                .filter_map(|(index, extent)| (index != normalized).then_some(*extent))
+                .collect()
+        } else {
+            shape.clone()
+        };
+        static_shapes.push(static_shape);
+        input_specs.push((name.clone(), shape));
+    }
+    let batch_size = batch_size.ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "{function_name} requires at least one mapped input axis"
+        ))
+    })?;
+    Ok((batch_size, static_shapes, input_specs))
+}
+
+fn validate_batch_static_shapes(
+    expected_shapes: &RefCell<Option<Vec<Vec<usize>>>>,
+    static_shapes: Vec<Vec<usize>>,
+    function_name: &str,
+) -> PyResult<()> {
+    let mut expected = expected_shapes.borrow_mut();
+    if let Some(expected) = expected.as_ref() {
+        if expected != &static_shapes {
+            return Err(PyValueError::new_err(format!(
+                "{function_name} only specializes mapped batch axes; expected non-batch shapes {expected:?}, got {static_shapes:?}"
+            )));
+        }
+    } else {
+        *expected = Some(static_shapes);
+    }
+    Ok(())
+}
+
+fn execute_cuda_value_and_grad_plan(
+    plan: &CudaBatchValueAndGradPlan,
+    mut inputs: BTreeMap<String, DynamicTensor>,
+) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+    inputs.insert(
+        CUDA_LOSS_COTANGENT_NAME.to_string(),
+        DynamicTensor::new(vec![], vec![1.0]).map_err(PyValueError::new_err)?,
+    );
+    plan.plan
+        .plan
+        .execute_retaining_without_output(&inputs, &BTreeSet::new())
+        .map_err(PyValueError::new_err)?;
+    let loss = plan
+        .plan
+        .plan
+        .computed_node_to_host(plan.loss_node_id)
+        .map_err(PyValueError::new_err)?;
+    let gradients = plan
+        .gradient_node_ids
+        .iter()
+        .map(|(name, node_id)| {
+            plan.plan
+                .plan
+                .computed_node_to_host(*node_id)
+                .and_then(PyTensor::from_dynamic_tensor)
+                .map(|tensor| (name.clone(), tensor))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .map_err(PyValueError::new_err)?;
+    Ok((
+        PyTensor::from_dynamic_tensor(loss).map_err(PyValueError::new_err)?,
+        gradients,
+    ))
 }
 
 #[pymethods]
@@ -2726,6 +3659,86 @@ impl TensorMlxValueAndGradFunction {
     }
 }
 
+fn execute_mlx_value_and_grad_plan(
+    plan: &MlxBatchValueAndGradPlan,
+    mut inputs: BTreeMap<String, DynamicTensor>,
+) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+    inputs.insert(
+        MLX_LOSS_COTANGENT_NAME.to_string(),
+        DynamicTensor::new(vec![], vec![1.0]).map_err(PyValueError::new_err)?,
+    );
+    let mut output_node_ids = Vec::with_capacity(plan.gradient_node_ids.len() + 1);
+    output_node_ids.push(plan.loss_node_id);
+    output_node_ids.extend(plan.gradient_node_ids.values().copied());
+    let outputs = MlxBackend
+        .execute_many(&plan.plan.plan, &output_node_ids, &inputs)
+        .map_err(PyValueError::new_err)?;
+    let mut outputs = outputs.into_iter();
+    let loss = outputs
+        .next()
+        .ok_or_else(|| PyValueError::new_err("MLX value-and-grad produced no loss"))?;
+    let gradients = plan
+        .gradient_node_ids
+        .keys()
+        .cloned()
+        .zip(outputs)
+        .map(|(name, gradient)| {
+            PyTensor::from_dynamic_tensor(gradient).map(|tensor| (name, tensor))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .map_err(PyValueError::new_err)?;
+    Ok((
+        PyTensor::from_dynamic_tensor(loss).map_err(PyValueError::new_err)?,
+        gradients,
+    ))
+}
+
+#[pymethods]
+impl TensorMlxAdamOptimizer {
+    #[pyo3(signature = (inputs = None))]
+    fn step(&mut self, inputs: Option<&Bound<'_, PyDict>>) -> PyResult<()> {
+        if let Some(inputs) = inputs {
+            self.inputs.extend(extract_tensor_map(inputs)?);
+        }
+        self.plan.step(&self.inputs).map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (inputs = None))]
+    fn loss(&mut self, inputs: Option<&Bound<'_, PyDict>>) -> PyResult<PyTensor> {
+        if let Some(inputs) = inputs {
+            self.inputs.extend(extract_tensor_map(inputs)?);
+        }
+        self.plan
+            .loss(&self.inputs)
+            .and_then(|value| {
+                PyTensor::from_dynamic_tensor(value).map_err(|error| error.to_string())
+            })
+            .map_err(PyValueError::new_err)
+    }
+
+    fn parameters(&self) -> PyResult<BTreeMap<String, PyTensor>> {
+        self.parameter_names
+            .iter()
+            .map(|name| {
+                self.plan
+                    .parameter(name)
+                    .and_then(|value| {
+                        PyTensor::from_dynamic_tensor(value).map_err(|error| error.to_string())
+                    })
+                    .map(|value| (name.clone(), value))
+                    .map_err(PyValueError::new_err)
+            })
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorMlxAdamOptimizer(parameter_count={})",
+            self.parameter_names.len()
+        )
+    }
+}
+
 #[pymethods]
 impl TensorVjpFunction {
     fn __call__(
@@ -2861,6 +3874,93 @@ pub fn trace_tensor_python_function(
         ));
     }
     Ok(TensorTraceResult::new(graph, output))
+}
+
+/// Traces a lazy scalar conditional into the parent Tensor IR.
+///
+/// Branches are separate region traces. They can only depend on the explicit
+/// `operands`, which become ordered capture bindings in the parent graph.
+#[pyfunction]
+pub fn tensor_cond(
+    py: Python<'_>,
+    predicate: TraceTensor,
+    on_true: &Bound<'_, PyAny>,
+    on_false: &Bound<'_, PyAny>,
+    operands: Vec<TraceTensor>,
+) -> PyResult<TraceTensor> {
+    if !predicate.shape.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "tensor_cond predicate must be scalar, got shape {:?}",
+            predicate.shape
+        )));
+    }
+    if predicate.batch_axis.is_some() || operands.iter().any(|operand| operand.batch_axis.is_some())
+    {
+        return Err(PyValueError::new_err(
+            "tensor_cond does not yet support vmapped predicates or operands",
+        ));
+    }
+    for operand in &operands {
+        predicate
+            .same_graph(operand)
+            .map_err(PyValueError::new_err)?;
+    }
+
+    let input_specs = operands
+        .iter()
+        .enumerate()
+        .map(|(index, operand)| {
+            (
+                format!("__nabla_cond_capture_{index}"),
+                operand.shape.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let on_true = trace_tensor_python_function(py, on_true, input_specs.clone())?;
+    let on_false = trace_tensor_python_function(py, on_false, input_specs)?;
+    let branches = TensorCondExecutionPlan::new(
+        on_true
+            .graph
+            .compile_cpu_plan(on_true.output.node_id)
+            .map_err(PyValueError::new_err)?
+            .plan,
+        on_false
+            .graph
+            .compile_cpu_plan(on_false.output.node_id)
+            .map_err(PyValueError::new_err)?
+            .plan,
+    )
+    .map_err(PyValueError::new_err)?;
+    let captures = branches
+        .captures()
+        .keys()
+        .map(|name| {
+            let index = name
+                .strip_prefix("__nabla_cond_capture_")
+                .ok_or_else(|| {
+                    PyValueError::new_err("conditional branch capture is not an operand")
+                })?
+                .parse::<usize>()
+                .map_err(|_| {
+                    PyValueError::new_err("conditional branch capture index is invalid")
+                })?;
+            let operand = operands.get(index).ok_or_else(|| {
+                PyValueError::new_err("conditional branch capture index is out of range")
+            })?;
+            Ok((name.clone(), operand.node_id))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let graph = predicate.graph.clone();
+    let mut ir = graph
+        .ir
+        .lock()
+        .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?;
+    let node_id = ir
+        .cond_with_captures(predicate.node_id, branches, captures)
+        .map_err(PyValueError::new_err)?;
+    let shape = ir.node_shape(node_id).map_err(PyValueError::new_err)?;
+    drop(ir);
+    Ok(TraceTensor::from_node(graph, node_id, shape, None))
 }
 
 fn normalize_vmap_axis(axis: isize, rank: usize, label: &str) -> PyResult<usize> {
@@ -3018,6 +4118,105 @@ pub fn tensor_fori_loop(
         carry = next.clone();
     }
     Ok(carry)
+}
+
+/// Traces a fixed-bounds loop body once into a runtime Tensor IR region.
+///
+/// `body` receives `(index, carry, *operands)`, where `index` is a scalar
+/// TraceTensor. All external values must be provided as explicit operands.
+#[pyfunction]
+pub fn tensor_fori_loop_region(
+    py: Python<'_>,
+    lower: usize,
+    upper: usize,
+    body: &Bound<'_, PyAny>,
+    init: TraceTensor,
+    operands: Vec<TraceTensor>,
+) -> PyResult<TraceTensor> {
+    if upper < lower {
+        return Err(PyValueError::new_err(format!(
+            "tensor_fori_loop_region requires upper >= lower, got {upper} < {lower}"
+        )));
+    }
+    if init.batch_axis.is_some() || operands.iter().any(|operand| operand.batch_axis.is_some()) {
+        return Err(PyValueError::new_err(
+            "tensor_fori_loop_region does not yet support vmapped carries or operands",
+        ));
+    }
+    for operand in &operands {
+        init.same_graph(operand).map_err(PyValueError::new_err)?;
+    }
+
+    let body_graph = TensorTraceGraph::new();
+    let carry = body_graph
+        .add_input("__nabla_fori_carry", init.shape.clone())
+        .map_err(PyValueError::new_err)?;
+    let index = body_graph
+        .add_input("__nabla_fori_index", vec![])
+        .map_err(PyValueError::new_err)?;
+    let captures = operands
+        .iter()
+        .enumerate()
+        .map(|(index, operand)| {
+            body_graph
+                .add_input(
+                    &format!("__nabla_fori_capture_{index}"),
+                    operand.shape.clone(),
+                )
+                .map_err(PyValueError::new_err)
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let mut arguments = vec![index, carry];
+    arguments.extend(captures);
+    let output: TraceTensor = body
+        .call1(PyTuple::new(py, arguments)?)?
+        .extract()
+        .map_err(|_| {
+            PyTypeError::new_err("tensor_fori_loop_region body must return a TraceTensor")
+        })?;
+    if !Arc::ptr_eq(&body_graph.ir, &output.graph.ir) {
+        return Err(PyValueError::new_err(
+            "tensor_fori_loop_region body returned a TraceTensor from a different graph",
+        ));
+    }
+    if output.batch_axis.is_some() {
+        return Err(PyValueError::new_err(
+            "tensor_fori_loop_region body output cannot be vmapped",
+        ));
+    }
+    if output.shape != init.shape {
+        return Err(PyValueError::new_err(format!(
+            "tensor_fori_loop_region body changed carry shape from {:?} to {:?}",
+            init.shape, output.shape
+        )));
+    }
+    let loop_plan = TensorForiExecutionPlan::new(
+        lower,
+        upper,
+        body_graph
+            .compile_cpu_plan(output.node_id)
+            .map_err(PyValueError::new_err)?
+            .plan,
+        "__nabla_fori_carry",
+        "__nabla_fori_index",
+    )
+    .map_err(PyValueError::new_err)?;
+    let parent_graph = init.graph.clone();
+    let captures = operands
+        .iter()
+        .enumerate()
+        .map(|(index, operand)| (format!("__nabla_fori_capture_{index}"), operand.node_id))
+        .collect();
+    let mut ir = parent_graph
+        .ir
+        .lock()
+        .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?;
+    let node_id = ir
+        .fori(init.node_id, loop_plan, captures)
+        .map_err(PyValueError::new_err)?;
+    let shape = ir.node_shape(node_id).map_err(PyValueError::new_err)?;
+    drop(ir);
+    Ok(TraceTensor::from_node(parent_graph, node_id, shape, None))
 }
 
 /// Statically unrolls a carry/output scan into the current Tensor IR.
@@ -3188,6 +4387,110 @@ pub fn tensor_jit_fn(
     Ok(TensorJitFunction { plan })
 }
 
+/// Freezes two CPU branch regions and dispatches only the selected branch.
+///
+/// `predicate` is supplied as a host boolean when invoking the returned
+/// callable. This avoids evaluating an inactive branch, unlike elementwise
+/// `where`; nested Tensor IR regions and device-resident predicates remain a
+/// later control-flow lowering step.
+#[pyfunction]
+pub fn tensor_cond_fn(
+    py: Python<'_>,
+    on_true: &Bound<'_, PyAny>,
+    on_false: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+) -> PyResult<TensorCondFunction> {
+    let on_true = trace_tensor_python_function(py, on_true, input_specs.clone())?;
+    let on_false = trace_tensor_python_function(py, on_false, input_specs)?;
+    if on_true.output.shape != on_false.output.shape {
+        return Err(PyValueError::new_err(format!(
+            "tensor_cond_fn branch output shapes differ: {:?} versus {:?}",
+            on_true.output.shape, on_false.output.shape
+        )));
+    }
+    Ok(TensorCondFunction {
+        plan: TensorCondExecutionPlan::new(
+            on_true
+                .graph
+                .compile_cpu_plan(on_true.output.node_id)
+                .map_err(PyValueError::new_err)?
+                .plan,
+            on_false
+                .graph
+                .compile_cpu_plan(on_false.output.node_id)
+                .map_err(PyValueError::new_err)?
+                .plan,
+        )
+        .map_err(PyValueError::new_err)?,
+    })
+}
+
+/// Freezes two scalar-loss CPU branch regions with branch-selected VJP.
+#[pyfunction]
+pub fn tensor_cond_value_and_grad_fn(
+    py: Python<'_>,
+    on_true: &Bound<'_, PyAny>,
+    on_false: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+) -> PyResult<TensorCondValueAndGradFunction> {
+    let on_true = trace_tensor_python_function(py, on_true, input_specs.clone())?;
+    let on_false = trace_tensor_python_function(py, on_false, input_specs)?;
+    if !on_true.output.shape.is_empty() || !on_false.output.shape.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "tensor_cond_value_and_grad_fn requires scalar branch outputs, got {:?} and {:?}",
+            on_true.output.shape, on_false.output.shape
+        )));
+    }
+    Ok(TensorCondValueAndGradFunction {
+        plan: TensorCondExecutionPlan::new(
+            on_true
+                .graph
+                .compile_cpu_plan(on_true.output.node_id)
+                .map_err(PyValueError::new_err)?
+                .plan,
+            on_false
+                .graph
+                .compile_cpu_plan(on_false.output.node_id)
+                .map_err(PyValueError::new_err)?
+                .plan,
+        )
+        .map_err(PyValueError::new_err)?,
+    })
+}
+
+/// Freezes two CPU branch regions with branch-selected JVP execution.
+#[pyfunction]
+pub fn tensor_cond_jvp_fn(
+    py: Python<'_>,
+    on_true: &Bound<'_, PyAny>,
+    on_false: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+) -> PyResult<TensorCondJvpFunction> {
+    let on_true = trace_tensor_python_function(py, on_true, input_specs.clone())?;
+    let on_false = trace_tensor_python_function(py, on_false, input_specs)?;
+    if on_true.output.shape != on_false.output.shape {
+        return Err(PyValueError::new_err(format!(
+            "tensor_cond_jvp_fn branch output shapes differ: {:?} versus {:?}",
+            on_true.output.shape, on_false.output.shape
+        )));
+    }
+    Ok(TensorCondJvpFunction {
+        plan: TensorCondExecutionPlan::new(
+            on_true
+                .graph
+                .compile_cpu_plan(on_true.output.node_id)
+                .map_err(PyValueError::new_err)?
+                .plan,
+            on_false
+                .graph
+                .compile_cpu_plan(on_false.output.node_id)
+                .map_err(PyValueError::new_err)?
+                .plan,
+        )
+        .map_err(PyValueError::new_err)?,
+    })
+}
+
 #[pyfunction]
 #[pyo3(signature = (function, input_names, in_axes = None, batch_axis = 0, max_specializations = 4))]
 pub fn tensor_jit_batch_fn(
@@ -3225,6 +4528,221 @@ pub fn tensor_jit_batch_fn(
         input_names,
         input_axes,
         max_specializations,
+        static_shapes: RefCell::new(None),
+        plans: RefCell::new(BTreeMap::new()),
+    })
+}
+
+/// Creates a bounded-specialization scalar value-and-gradient callable.
+///
+/// Each observed mapped batch size receives one frozen CPU plan. Non-batch
+/// dimensions and unmapped inputs must remain fixed across calls.
+#[pyfunction]
+#[pyo3(signature = (function, input_names, in_axes = None, batch_axis = 0, max_specializations = 4))]
+pub fn tensor_value_and_grad_batch_fn(
+    function: Py<PyAny>,
+    input_names: Vec<String>,
+    in_axes: Option<Vec<Option<isize>>>,
+    batch_axis: isize,
+    max_specializations: usize,
+) -> PyResult<TensorBatchValueAndGradFunction> {
+    if input_names.is_empty() {
+        return Err(PyValueError::new_err(
+            "tensor_value_and_grad_batch_fn requires at least one input name",
+        ));
+    }
+    if max_specializations == 0 {
+        return Err(PyValueError::new_err(
+            "tensor_value_and_grad_batch_fn max_specializations must be positive",
+        ));
+    }
+    let input_axes = in_axes.unwrap_or_else(|| vec![Some(batch_axis); input_names.len()]);
+    if input_axes.len() != input_names.len() {
+        return Err(PyValueError::new_err(format!(
+            "tensor_value_and_grad_batch_fn in_axes has length {}, expected {}",
+            input_axes.len(),
+            input_names.len()
+        )));
+    }
+    if !input_axes.iter().any(Option::is_some) {
+        return Err(PyValueError::new_err(
+            "tensor_value_and_grad_batch_fn requires at least one mapped input axis",
+        ));
+    }
+    Ok(TensorBatchValueAndGradFunction {
+        function,
+        input_names,
+        input_axes,
+        max_specializations,
+        static_shapes: RefCell::new(None),
+        plans: RefCell::new(BTreeMap::new()),
+    })
+}
+
+/// Creates a bounded-specialization MLX scalar value-and-gradient callable.
+///
+/// Every allowed batch size owns one MLX multi-output plan. Results are copied
+/// to host only because this diagnostic callable returns the loss and gradients.
+#[pyfunction]
+#[pyo3(signature = (function, input_names, parameter_names, in_axes = None, batch_axis = 0, max_specializations = 4))]
+pub fn tensor_value_and_grad_batch_mlx_fn(
+    function: Py<PyAny>,
+    input_names: Vec<String>,
+    parameter_names: Vec<String>,
+    in_axes: Option<Vec<Option<isize>>>,
+    batch_axis: isize,
+    max_specializations: usize,
+) -> PyResult<TensorBatchMlxValueAndGradFunction> {
+    if input_names.is_empty() {
+        return Err(PyValueError::new_err(
+            "tensor_value_and_grad_batch_mlx_fn requires at least one input name",
+        ));
+    }
+    if parameter_names.is_empty() {
+        return Err(PyValueError::new_err(
+            "tensor_value_and_grad_batch_mlx_fn requires at least one parameter name",
+        ));
+    }
+    if parameter_names
+        .iter()
+        .any(|name| name == MLX_LOSS_COTANGENT_NAME)
+    {
+        return Err(PyValueError::new_err(format!(
+            "tensor_value_and_grad_batch_mlx_fn reserves parameter name {MLX_LOSS_COTANGENT_NAME:?}"
+        )));
+    }
+    if max_specializations == 0 {
+        return Err(PyValueError::new_err(
+            "tensor_value_and_grad_batch_mlx_fn max_specializations must be positive",
+        ));
+    }
+    let input_axes = in_axes.unwrap_or_else(|| vec![Some(batch_axis); input_names.len()]);
+    if input_axes.len() != input_names.len() {
+        return Err(PyValueError::new_err(format!(
+            "tensor_value_and_grad_batch_mlx_fn in_axes has length {}, expected {}",
+            input_axes.len(),
+            input_names.len()
+        )));
+    }
+    if !input_axes.iter().any(Option::is_some) {
+        return Err(PyValueError::new_err(
+            "tensor_value_and_grad_batch_mlx_fn requires at least one mapped input axis",
+        ));
+    }
+    Ok(TensorBatchMlxValueAndGradFunction {
+        function,
+        input_names,
+        parameter_names,
+        input_axes,
+        max_specializations,
+        static_shapes: RefCell::new(None),
+        plans: RefCell::new(BTreeMap::new()),
+    })
+}
+
+/// Creates a bounded-specialization CUDA JIT callable.
+///
+/// Each observed mapped batch size owns one CUDA plan. Runtime execution still
+/// requires the CUDA driver and NVRTC library on Linux.
+#[pyfunction]
+#[pyo3(signature = (function, input_names, in_axes = None, batch_axis = 0, max_specializations = 4, device_ordinal = 0))]
+pub fn tensor_jit_batch_cuda_fn(
+    function: Py<PyAny>,
+    input_names: Vec<String>,
+    in_axes: Option<Vec<Option<isize>>>,
+    batch_axis: isize,
+    max_specializations: usize,
+    device_ordinal: usize,
+) -> PyResult<TensorBatchCudaJitFunction> {
+    if input_names.is_empty() {
+        return Err(PyValueError::new_err(
+            "tensor_jit_batch_cuda_fn requires at least one input name",
+        ));
+    }
+    if max_specializations == 0 {
+        return Err(PyValueError::new_err(
+            "tensor_jit_batch_cuda_fn max_specializations must be positive",
+        ));
+    }
+    let input_axes = in_axes.unwrap_or_else(|| vec![Some(batch_axis); input_names.len()]);
+    if input_axes.len() != input_names.len() {
+        return Err(PyValueError::new_err(format!(
+            "tensor_jit_batch_cuda_fn in_axes has length {}, expected {}",
+            input_axes.len(),
+            input_names.len()
+        )));
+    }
+    if !input_axes.iter().any(Option::is_some) {
+        return Err(PyValueError::new_err(
+            "tensor_jit_batch_cuda_fn requires at least one mapped input axis",
+        ));
+    }
+    Ok(TensorBatchCudaJitFunction {
+        function,
+        input_names,
+        input_axes,
+        max_specializations,
+        device_ordinal,
+        static_shapes: RefCell::new(None),
+        plans: RefCell::new(BTreeMap::new()),
+    })
+}
+
+/// Creates a bounded-specialization CUDA scalar value-and-gradient callable.
+#[pyfunction]
+#[pyo3(signature = (function, input_names, parameter_names, in_axes = None, batch_axis = 0, max_specializations = 4, device_ordinal = 0))]
+pub fn tensor_value_and_grad_batch_cuda_fn(
+    function: Py<PyAny>,
+    input_names: Vec<String>,
+    parameter_names: Vec<String>,
+    in_axes: Option<Vec<Option<isize>>>,
+    batch_axis: isize,
+    max_specializations: usize,
+    device_ordinal: usize,
+) -> PyResult<TensorBatchCudaValueAndGradFunction> {
+    if input_names.is_empty() {
+        return Err(PyValueError::new_err(
+            "tensor_value_and_grad_batch_cuda_fn requires at least one input name",
+        ));
+    }
+    if input_names
+        .iter()
+        .any(|name| name == CUDA_LOSS_COTANGENT_NAME)
+    {
+        return Err(PyValueError::new_err(format!(
+            "tensor_value_and_grad_batch_cuda_fn reserves input name {CUDA_LOSS_COTANGENT_NAME:?}"
+        )));
+    }
+    if parameter_names.is_empty() {
+        return Err(PyValueError::new_err(
+            "tensor_value_and_grad_batch_cuda_fn requires at least one parameter name",
+        ));
+    }
+    if max_specializations == 0 {
+        return Err(PyValueError::new_err(
+            "tensor_value_and_grad_batch_cuda_fn max_specializations must be positive",
+        ));
+    }
+    let input_axes = in_axes.unwrap_or_else(|| vec![Some(batch_axis); input_names.len()]);
+    if input_axes.len() != input_names.len() {
+        return Err(PyValueError::new_err(format!(
+            "tensor_value_and_grad_batch_cuda_fn in_axes has length {}, expected {}",
+            input_axes.len(),
+            input_names.len()
+        )));
+    }
+    if !input_axes.iter().any(Option::is_some) {
+        return Err(PyValueError::new_err(
+            "tensor_value_and_grad_batch_cuda_fn requires at least one mapped input axis",
+        ));
+    }
+    Ok(TensorBatchCudaValueAndGradFunction {
+        function,
+        input_names,
+        parameter_names,
+        input_axes,
+        max_specializations,
+        device_ordinal,
         static_shapes: RefCell::new(None),
         plans: RefCell::new(BTreeMap::new()),
     })
@@ -3513,6 +5031,66 @@ pub fn tensor_value_and_grad_mlx_fn(
     })
 }
 
+#[pyfunction]
+#[pyo3(signature = (loss, parameter_names, inputs, learning_rate, retained_input_names = None, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8))]
+#[allow(clippy::too_many_arguments)]
+pub fn mlx_adam_loss_optimizer(
+    loss: &Bound<'_, PyAny>,
+    parameter_names: Vec<String>,
+    inputs: &Bound<'_, PyDict>,
+    learning_rate: f32,
+    retained_input_names: Option<Vec<String>>,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+) -> PyResult<TensorMlxAdamOptimizer> {
+    let loss = if let Ok(loss) = loss.extract::<PyRef<'_, TensorTraceResult>>() {
+        loss.clone()
+    } else if let Ok(loss) = loss.extract::<PyRef<'_, TraceTensor>>() {
+        TensorTraceResult::new(loss.graph.clone(), loss.clone())
+    } else {
+        return Err(PyTypeError::new_err(
+            "mlx_adam_loss_optimizer loss must be a TraceTensor or TensorTraceResult",
+        ));
+    };
+    let (plan, loss_node_id, gradient_node_ids) =
+        compile_mlx_scalar_value_and_grad(&loss, parameter_names)?;
+    let parameter_names = gradient_node_ids.keys().cloned().collect::<BTreeSet<_>>();
+    let mut values = extract_tensor_map(inputs)?;
+    if values.contains_key(MLX_LOSS_COTANGENT_NAME) {
+        return Err(PyValueError::new_err(format!(
+            "mlx_adam_loss_optimizer reserves input name {MLX_LOSS_COTANGENT_NAME:?}"
+        )));
+    }
+    values.insert(
+        MLX_LOSS_COTANGENT_NAME.to_string(),
+        DynamicTensor::new(vec![], vec![1.0]).map_err(PyValueError::new_err)?,
+    );
+    let mut retained_inputs = retained_input_names
+        .unwrap_or_else(|| values.keys().cloned().collect())
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    retained_inputs.insert(MLX_LOSS_COTANGENT_NAME.to_string());
+    retained_inputs.extend(parameter_names.iter().cloned());
+    let plan = MlxAdamPlan::new(
+        plan.plan,
+        loss_node_id,
+        gradient_node_ids,
+        &values,
+        retained_inputs,
+        learning_rate,
+        beta1,
+        beta2,
+        epsilon,
+    )
+    .map_err(PyValueError::new_err)?;
+    Ok(TensorMlxAdamOptimizer {
+        plan,
+        parameter_names,
+        inputs: values,
+    })
+}
+
 /// Trace a fixed-size vectorized function into one reusable CUDA plan.
 #[pyfunction]
 #[pyo3(signature = (function, input_specs, batch_size, in_axes = None, out_axis = 0, device_ordinal = 0))]
@@ -3564,6 +5142,180 @@ pub fn tensor_vmap_mlx_fn(
         .compile_mlx_plan(traced.output.node_id)
         .map_err(PyValueError::new_err)?;
     Ok(TensorVmapMlxFunction { plan, signature })
+}
+
+/// Trace a fixed-size vectorized VJP into one reusable MLX multi-output plan.
+#[pyfunction]
+#[pyo3(signature = (function, input_specs, batch_size, in_axes = None, out_axis = 0))]
+pub fn tensor_vmap_vjp_mlx_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    batch_size: usize,
+    in_axes: Option<Vec<Option<isize>>>,
+    out_axis: isize,
+) -> PyResult<TensorVmapMlxVjpFunction> {
+    if input_specs
+        .iter()
+        .any(|(name, _)| name == MLX_LOSS_COTANGENT_NAME)
+    {
+        return Err(PyValueError::new_err(format!(
+            "tensor_vmap_vjp_mlx_fn reserves input name {MLX_LOSS_COTANGENT_NAME:?}"
+        )));
+    }
+    let (traced, signature) = trace_tensor_vmap_python_function(
+        py,
+        function,
+        input_specs,
+        batch_size,
+        in_axes,
+        out_axis,
+    )?;
+    let (graph, output_node_id, gradients) = traced
+        .symbolic_vjp_graph(MLX_LOSS_COTANGENT_NAME)
+        .map_err(PyValueError::new_err)?;
+    let mut output_node_ids = vec![output_node_id];
+    let mut gradient_names = Vec::with_capacity(signature.input_names.len());
+    for name in &signature.input_names {
+        let node_id = gradients.get(name).copied().ok_or_else(|| {
+            PyValueError::new_err(format!("vmap VJP input {name:?} is absent from the trace"))
+        })?;
+        gradient_names.push(name.clone());
+        output_node_ids.push(node_id);
+    }
+    let (plan, output_node_ids) = graph
+        .compile_mlx_multi_plan(&output_node_ids)
+        .map_err(PyValueError::new_err)?;
+    let output_node_id = output_node_ids[0];
+    let gradient_node_ids = gradient_names
+        .into_iter()
+        .zip(output_node_ids.into_iter().skip(1))
+        .collect();
+    Ok(TensorVmapMlxVjpFunction {
+        plan,
+        output_node_id,
+        gradient_node_ids,
+        signature,
+        cotangent_name: MLX_LOSS_COTANGENT_NAME.to_string(),
+    })
+}
+
+const MLX_VMAP_TANGENT_PREFIX: &str = "__nabla_mlx_vmap_tangent_";
+const CUDA_VMAP_TANGENT_PREFIX: &str = "__nabla_cuda_vmap_tangent_";
+
+/// Trace a fixed-size vectorized JVP into one reusable MLX multi-output plan.
+#[pyfunction]
+#[pyo3(signature = (function, input_specs, batch_size, in_axes = None, out_axis = 0))]
+pub fn tensor_vmap_jvp_mlx_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    batch_size: usize,
+    in_axes: Option<Vec<Option<isize>>>,
+    out_axis: isize,
+) -> PyResult<TensorVmapMlxJvpFunction> {
+    let input_names = input_specs
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    let tangent_names = input_names
+        .iter()
+        .map(|name| (name.clone(), format!("{MLX_VMAP_TANGENT_PREFIX}{name}")))
+        .collect::<BTreeMap<_, _>>();
+    if tangent_names
+        .values()
+        .any(|tangent_name| input_names.contains(tangent_name))
+    {
+        return Err(PyValueError::new_err(format!(
+            "tensor_vmap_jvp_mlx_fn reserves input names beginning with {MLX_VMAP_TANGENT_PREFIX:?}"
+        )));
+    }
+    let (traced, signature) = trace_tensor_vmap_python_function(
+        py,
+        function,
+        input_specs,
+        batch_size,
+        in_axes,
+        out_axis,
+    )?;
+    let transformed = traced
+        .graph
+        .ir
+        .lock()
+        .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
+        .symbolic_jvp_with_tangent_inputs(traced.output.node_id, &tangent_names)
+        .map_err(PyValueError::new_err)?;
+    let graph = TensorTraceGraph {
+        ir: Arc::new(Mutex::new(transformed.graph)),
+    };
+    let (plan, output_node_ids) = graph
+        .compile_mlx_multi_plan(&[transformed.value, transformed.tangent])
+        .map_err(PyValueError::new_err)?;
+    Ok(TensorVmapMlxJvpFunction {
+        plan,
+        value_node_id: output_node_ids[0],
+        tangent_node_id: output_node_ids[1],
+        signature,
+        tangent_names,
+    })
+}
+
+/// Trace a fixed-size vectorized JVP into one reusable CUDA union plan.
+#[pyfunction]
+#[pyo3(signature = (function, input_specs, batch_size, in_axes = None, out_axis = 0, device_ordinal = 0))]
+pub fn tensor_vmap_jvp_cuda_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    batch_size: usize,
+    in_axes: Option<Vec<Option<isize>>>,
+    out_axis: isize,
+    device_ordinal: usize,
+) -> PyResult<TensorVmapCudaJvpFunction> {
+    let input_names = input_specs
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<BTreeSet<_>>();
+    let tangent_names = input_names
+        .iter()
+        .map(|name| (name.clone(), format!("{CUDA_VMAP_TANGENT_PREFIX}{name}")))
+        .collect::<BTreeMap<_, _>>();
+    if tangent_names
+        .values()
+        .any(|tangent_name| input_names.contains(tangent_name))
+    {
+        return Err(PyValueError::new_err(format!(
+            "tensor_vmap_jvp_cuda_fn reserves input names beginning with {CUDA_VMAP_TANGENT_PREFIX:?}"
+        )));
+    }
+    let (traced, signature) = trace_tensor_vmap_python_function(
+        py,
+        function,
+        input_specs,
+        batch_size,
+        in_axes,
+        out_axis,
+    )?;
+    let transformed = traced
+        .graph
+        .ir
+        .lock()
+        .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
+        .symbolic_jvp_with_tangent_inputs(traced.output.node_id, &tangent_names)
+        .map_err(PyValueError::new_err)?;
+    let graph = TensorTraceGraph {
+        ir: Arc::new(Mutex::new(transformed.graph)),
+    };
+    let (plan, output_node_ids) = graph
+        .compile_cuda_multi_plan(&[transformed.value, transformed.tangent], device_ordinal)
+        .map_err(PyValueError::new_err)?;
+    Ok(TensorVmapCudaJvpFunction {
+        plan,
+        value_node_id: output_node_ids[0],
+        tangent_node_id: output_node_ids[1],
+        signature,
+        tangent_names,
+    })
 }
 
 #[pyfunction]

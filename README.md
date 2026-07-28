@@ -17,14 +17,33 @@ reverse-mode graph VJP path for the current primitive set through `grad(...)` /
 Reusable `grad_*`, `value_and_grad_fn(...)`, `vjp_fn(...)`,
 `jacobian_fn(...)`, `jacobians_fn(...)`, `jvp_fn(...)`, and `jit(...)`
 transforms trace once when the callable/decorator is created, then evaluate the
-cached graph on later calls. It does not yet have source-to-source AD, a
-general compiled JIT, or distributed sharding.
+cached graph on later calls. It has an experimental restricted source-level
+forward-mode macro, but not general source-to-source AD, a general compiled
+JIT, or distributed sharding.
 
 Run the verified one-dimensional Poisson PINN example after `maturin develop`:
 
 ```sh
 .venv/bin/python examples/pinn_poisson.py
 ```
+
+On Apple silicon, build with the MLX feature to run one-graph Poisson PINNs.
+They keep parameters and Adam moments on the MLX GPU stream; the two-layer MLP
+example checks PDE and boundary residuals plus trained parameters against CPU:
+
+```sh
+.venv/bin/maturin develop --release --features mlx
+.venv/bin/python examples/pinn_poisson_mlx.py
+.venv/bin/python examples/pinn_mlp_mlx.py
+.venv/bin/python examples/benchmark_pinn_mlx.py
+.venv/bin/python examples/benchmark_mlp_value_and_grad_mlx.py
+.venv/bin/python examples/benchmark_forward_mlx.py
+```
+
+Use `examples/benchmark_forward_mlx.py --device-only` to exclude only output
+readback; dynamic host input upload remains part of that timing. Add
+`--retain-static-inputs` to upload model weights once and time only dynamic
+input upload on later calls.
 
 On Linux with the `cuda` feature, run the verified two-point batched Poisson
 PINN, whose Adam optimizer state and collocation tensors stay on the GPU:
@@ -66,9 +85,25 @@ warm-up, and synchronized training timings:
 python examples/benchmark_pinn_cuda.py
 ```
 
+The MLX benchmarks report reproducibility metadata for both the one-parameter
+Poisson optimizer path and an end-to-end batched MLP value-and-gradient path.
+The former excludes diagnostic readbacks; the latter includes input uploads and
+loss/gradient readbacks, so neither is a CUDA/JAX comparison.
+
 ## Current Capabilities
 
 - Scalar forward-mode automatic differentiation with `Dual`.
+- Experimental `forward_diff!(|x| expression)` procedural macro for a
+  one-input pure scalar expression subset. It parses the closure AST at compile
+  time and rewrites its input as a `Dual` seed, yielding a closure that returns
+  primal and derivative values without a runtime tape. Mutation, arbitrary
+  control flow, multi-input Jacobians, and captured methods without `Dual`
+  arithmetic remain intentionally unsupported.
+- `forward_gradient!(|x, y, ...| scalar_expression)` extends the same source
+  subset to multiple active scalar inputs. It emits one forward-mode seeded
+  expression per parameter and returns `ForwardGradient { value, gradient }`;
+  its O(input dimension) cost is deliberate and suitable only as a small-model
+  compiler reference, not as a reverse-mode replacement.
 - Compile-time shaped `Tensor2<ROWS, COLS>` with shape-checked matmul.
 - Pure-Rust `TensorIr` compiler core for dynamic rank-N input tensors with
   broadcasted add/multiply, scalar `sum`, CPU evaluation, direct JVP and
@@ -111,6 +146,9 @@ python examples/benchmark_pinn_cuda.py
   elementwise selection while structured `cond`/loop IR is pending.
   `tensor_fori_loop(lower, upper, body, init)` statically unrolls a
   fixed-bounds, shape-preserving TraceTensor carry into that same IR.
+  `tensor_fori_loop_region(lower, upper, body, init, operands)` instead
+  traces `body(index, carry, *operands)` once into a runtime CPU loop region;
+  captures must be explicit and the scalar `index` is a TraceTensor.
   `tensor_scan(length, body, init)` similarly returns a final carry and a
   leading-axis stack of fixed-shape outputs.
   `TensorTraceResult.symbolic_vjp(cotangent_name)` and
@@ -137,7 +175,13 @@ python examples/benchmark_pinn_cuda.py
 - `tensor_value_and_grad_mlx_fn(fn, input_specs, parameter_names)` builds one
   symbolic VJP graph and evaluates its scalar loss plus requested gradients
   from a shared MLX GPU value table. Results are materialized on the host when
-  called; device-resident MLX optimizer state remains pending.
+  called. `mlx_adam_loss_optimizer(loss, parameter_names, inputs,
+  learning_rate, ...)` retains parameters, selected static inputs, gradients,
+  and bias-corrected Adam moments on the MLX GPU stream; `step()` performs no
+  parameter or gradient host readback, while `loss()` and `parameters()` are
+  explicit diagnostics. Inputs omitted from `retained_input_names` can be
+  replaced through `step({"batch_input": tensor, ...})` without resetting the
+  retained parameter or moment state.
 - `tensor_vmap_fn(fn, input_specs, batch_size, in_axes=None, out_axis=0)`
   traces one fixed-size batched plan. `input_specs` describe one example;
   `in_axes` supports mapped axes (including normalized negative axes) and
@@ -150,12 +194,32 @@ python examples/benchmark_pinn_cuda.py
   max_specializations=4)` lazily traces CPU plans for observed batch sizes.
   Non-batch dimensions and unmapped inputs must remain fixed; the bounded cache
   raises instead of silently retracing after its specialization limit.
+- `tensor_value_and_grad_batch_fn(...)` applies the same bounded CPU batch
+  specialization contract to scalar losses and returns frozen-plan VJP
+  gradients, including aggregated gradients for unmapped parameters.
+- `tensor_value_and_grad_batch_mlx_fn(...)` caches one MLX multi-output
+  value-and-gradient plan per bounded batch specialization. Its returned loss
+  and requested gradients are diagnostic host readbacks; use the MLX Adam API
+  for device-resident parameter updates.
+- `tensor_jit_batch_cuda_fn(...)` and `tensor_value_and_grad_batch_cuda_fn(...)`
+  apply the same bounded-specialization contract to CUDA. Each observed batch
+  size owns one CUDA plan; runtime execution requires a Linux CUDA driver and
+  `libnvrtc.so`.
+- `tensor_cond(predicate, on_true, on_false, operands)` traces a scalar
+  Tensor predicate into CPU Tensor IR. Branches receive only explicit operands,
+  which become parent-region capture bindings; the CPU evaluator materializes
+  only the selected branch and supports direct first-order JVP/VJP. CUDA and
+  MLX reject these regions until device-predicate lowering exists.
+  `tensor_cond_fn(on_true, on_false, input_specs)` remains the host-boolean
+  function-level boundary; `tensor_cond_value_and_grad_fn(...)` and
+  `tensor_cond_jvp_fn(...)` apply the matching branch VJP or JVP.
 - `tensor_vmap_jvp_fn(...)` and `tensor_vmap_vjp_fn(...)` apply the same
   batch-layout contract to runtime tangents and cotangents. Mapped input
   gradients are restored to their declared `in_axes`; unmapped input gradients
   aggregate over the mapped batch as required by reverse-mode AD.
-  `tensor_vmap_vjp_cuda_fn(...)` lowers the primal plus all requested VJP
-  outputs into one CUDA union plan.
+  `tensor_vmap_vjp_cuda_fn(...)`, `tensor_vmap_vjp_mlx_fn(...)`,
+  `tensor_vmap_jvp_cuda_fn(...)`, and `tensor_vmap_jvp_mlx_fn(...)` lower
+  their primal plus AD outputs into one CUDA or MLX multi-output plan.
 - `Tensor.sum(axis=None, keepdims=False)` and `Tensor.mean(...)` accept a
   single integer axis or a sequence of normalized axes. Trace tensors expose
   the same contract; multi-axis reductions lower to existing axis-reduction
@@ -206,6 +270,11 @@ python examples/benchmark_pinn_cuda.py
   `plan.evaluate_jvp(...)` execute cached-plan AD transforms without returning
   to the mutable tracer. `plan.kernel_ir()` exposes the same plan as structured
   op, operand, shape, and input-name records for later backend lowering.
+  For a scalar replica-local loss,
+  `plan.value_and_grad_data_parallel(inputs, mapped_input_names, shard_count,
+  reduction="mean")` is the deterministic CPU reference for equal axis-zero
+  sharding; it validates the shard contract and returns the aggregated value
+  and gradients without claiming CPU parallel execution.
 - `TensorBackend` defines the rank-N plan execution contract. `CpuBackend` is
   the default implementation. On Linux, the optional `cuda` feature adds an
   NVRTC-compiled FP32 `CudaBackend` and immutable `TensorCudaExecutionPlan`.
@@ -265,10 +334,17 @@ python examples/benchmark_pinn_cuda.py
   `TensorTraceResult.compile_mlx()`. The backend has CPU-parity coverage for
   elementwise operations, matmul, global reductions, reshape, transpose,
   concat, and broadcast. `tensor_value_and_grad_mlx_fn(...)` uses the same
-  backend for a scalar loss and named symbolic VJP gradients. It is not a JIT,
-  and reverse graphs that contain unsupported operations such as `slice` or
-  internal zero-padding return an explicit error rather
-  than falling back to the host. Building the native MLX dependency requires
+  backend for a scalar loss and named symbolic VJP gradients. Contiguous
+  `slice` and internal reverse `pad_slice` nodes execute on MLX through
+  device-side take/pad lowering. `TensorMlxExecutionPlan.retain_inputs(...)`
+  retains selected fixed bindings on the MLX GPU stream; later `evaluate(...)`
+  and `evaluate_device(...)` calls may omit those bindings. Call
+  `clear_retained_inputs()` to release that plan-owned state.
+  `mlx_adam_loss_optimizer(...)` keeps fixed parameters and Adam moments on
+  that GPU stream across `step()` calls; `loss()` and `parameters()` are the
+  only host diagnostics. It is not a JIT,
+  and unsupported reverse graphs return an explicit error rather than falling
+  back to the host. Building the native MLX dependency requires
   Xcode's Metal Toolchain in addition to CMake:
   `xcodebuild -downloadComponent MetalToolchain`. The Python MLX wheel is not
   used by this Rust backend.

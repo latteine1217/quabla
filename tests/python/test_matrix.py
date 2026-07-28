@@ -1,5 +1,6 @@
 import math
 import os
+import runpy
 
 import nabla
 
@@ -825,6 +826,12 @@ def test_trace_tensor_getitem_preserves_slice_ad_and_backend_parity():
     if os.environ.get("NABLA_MLX_TEST") is not None:
         mlx = traced.output.compile_mlx().evaluate(inputs)
         assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
+        mlx_gradient = symbolic.output.compile_mlx().evaluate(
+            {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])}
+        )
+        assert_close_rows(
+            [mlx_gradient.to_flat_list()], [gradients["x"].to_flat_list()], tol=1e-5
+        )
     if os.environ.get("NABLA_CUDA_TEST") is not None:
         cuda = traced.output.compile_cuda().evaluate(inputs)
         assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
@@ -924,6 +931,40 @@ def test_mlx_trace_tensor_compiles_and_matches_cpu():
     plan = traced.output.compile_mlx()
     assert plan.backend == "mlx"
     assert_close_rows([plan.evaluate(inputs).to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
+    assert plan.evaluate_device(inputs) is None
+
+
+def test_mlx_execution_plan_retains_static_inputs_across_calls():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, weight, bias: (x.matmul(weight) + bias).tanh(),
+        [("x", [2, 2]), ("weight", [2, 2]), ("bias", [1, 2])],
+    )
+    inputs = {
+        "x": nabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
+        "weight": nabla.Tensor([2, 2], [1.0, -1.0, 0.5, 1.5]),
+        "bias": nabla.Tensor([1, 2], [0.25, -0.5]),
+    }
+    cpu = traced.output.compile_cpu().evaluate(inputs)
+    plan = traced.output.compile_mlx()
+    plan.retain_inputs(inputs, ["weight", "bias"])
+    assert plan.retained_input_names == ["bias", "weight"]
+    dynamic_inputs = {"x": inputs["x"]}
+    assert_close_rows(
+        [plan.evaluate(dynamic_inputs).to_flat_list()], [cpu.to_flat_list()], tol=1e-5
+    )
+    assert plan.evaluate_device(dynamic_inputs) is None
+
+    plan.clear_retained_inputs()
+    assert plan.retained_input_names == []
+    try:
+        plan.evaluate(dynamic_inputs)
+    except ValueError as error:
+        assert 'missing input "weight"' in str(error)
+    else:
+        raise AssertionError("cleared retained MLX input unexpectedly remained available")
 
 
 def test_mlx_symbolic_vjp_executes_mlp_bias_gradient():
@@ -1718,6 +1759,30 @@ def test_trace_tensor_where_routes_gradients_and_masks_condition_derivatives():
     assert plan_gradients["x"].to_flat_list() == gradients["x"].to_flat_list()
 
 
+def test_tensor_cpu_plan_data_parallel_value_and_grad_matches_single_plan():
+    traced = nabla.trace_tensor(
+        lambda x, target, weight: ((x * weight - target).powi(2)).mean(),
+        [("x", [4, 1]), ("target", [4, 1]), ("weight", [1, 1])],
+    )
+    plan = traced.output.compile_cpu()
+    inputs = {
+        "x": nabla.Tensor([4, 1], [-2.0, -1.0, 1.0, 2.0]),
+        "target": nabla.Tensor([4, 1], [-3.0, -1.0, 3.0, 5.0]),
+        "weight": nabla.Tensor([1, 1], [0.5]),
+    }
+    single_value, single_gradients = plan.evaluate_value_and_vjp(
+        inputs, nabla.Tensor([], [1.0])
+    )
+    parallel_value, parallel_gradients = plan.value_and_grad_data_parallel(
+        inputs, ["x", "target"], 2, "mean"
+    )
+
+    assert parallel_value.to_flat_list() == single_value.to_flat_list()
+    assert parallel_gradients["x"].to_flat_list() == single_gradients["x"].to_flat_list()
+    assert parallel_gradients["target"].to_flat_list() == single_gradients["target"].to_flat_list()
+    assert parallel_gradients["weight"].to_flat_list() == single_gradients["weight"].to_flat_list()
+
+
 def test_trace_tensor_maximum_and_minimum_route_tie_gradients_to_rhs():
     left = nabla.Tensor([3], [2.0, 3.0, 0.0])
     right = nabla.Tensor([3], [2.0, 1.0, 4.0])
@@ -2030,6 +2095,31 @@ def test_tensor_hessian_and_hvp_scalar_fn_reuse_a_compiled_plan():
     )
 
 
+def test_tensor_hessian_and_hvp_scalar_fn_support_fixed_fori_regions():
+    def loop_loss(initial, scale):
+        return nabla.tensor_fori_loop_region(
+            0,
+            3,
+            lambda index, carry, captured_scale: carry * captured_scale + index,
+            initial,
+            [scale],
+        )
+
+    hessian = nabla.tensor_hessian_scalar_fn(
+        loop_loss, [("initial", []), ("scale", [])], "scale"
+    )
+    hvp = nabla.tensor_hvp_scalar_fn(
+        loop_loss, [("initial", []), ("scale", [])], "scale"
+    )
+    inputs = {
+        "initial": nabla.Tensor([], [1.0]),
+        "scale": nabla.Tensor([], [2.0]),
+    }
+
+    assert hessian(inputs) == [[12.0]]
+    assert hvp(inputs, nabla.Tensor([], [3.0])).to_flat_list() == [36.0]
+
+
 def test_tensor_jit_fn_reuses_a_compiled_plan():
     compiled = nabla.tensor_jit_fn(
         lambda x, y: (x.matmul(y)).tanh(),
@@ -2091,6 +2181,88 @@ def test_tensor_fori_loop_unrolls_differentiable_carry():
         assert "upper >= lower" in str(error)
 
 
+def test_tensor_fori_loop_region_traces_once_and_differentiates_parent_inputs():
+    traced = nabla.trace_tensor(
+        lambda initial, scale: nabla.tensor_fori_loop_region(
+            0,
+            3,
+            lambda index, carry, captured_scale: carry * captured_scale + index,
+            initial,
+            [scale],
+        ).sum(),
+        [("initial", [1]), ("scale", [1])],
+    )
+    inputs = {
+        "initial": nabla.Tensor([1], [1.0]),
+        "scale": nabla.Tensor([1], [2.0]),
+    }
+    value, gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+    )
+    _, tangent = traced.graph.evaluate_jvp(
+        traced.output.node_id,
+        inputs,
+        {
+            "initial": nabla.Tensor([1], [1.0]),
+            "scale": nabla.Tensor([1], [0.0]),
+        },
+    )
+
+    assert value.to_flat_list() == [12.0]
+    assert tangent.to_flat_list() == [8.0]
+    assert gradients["initial"].to_flat_list() == [8.0]
+    assert gradients["scale"].to_flat_list() == [13.0]
+
+
+def test_tensor_fori_loop_region_supports_symbolic_jvp():
+    traced = nabla.trace_tensor(
+        lambda initial, scale: nabla.tensor_fori_loop_region(
+            0,
+            3,
+            lambda index, carry, captured_scale: carry * captured_scale + index,
+            initial,
+            [scale],
+        ),
+        [("initial", []), ("scale", [])],
+    )
+    tangent = traced.symbolic_jvp("initial")
+    value = tangent.graph.evaluate(
+        tangent.output.node_id,
+        {
+            "initial": nabla.Tensor([], [1.0]),
+            "scale": nabla.Tensor([], [2.0]),
+        },
+    )
+    assert value.to_flat_list() == [8.0]
+
+
+def test_tensor_fori_loop_region_supports_symbolic_vjp():
+    traced = nabla.trace_tensor(
+        lambda initial, scale: nabla.tensor_fori_loop_region(
+            0,
+            3,
+            lambda index, carry, captured_scale: carry * captured_scale + index,
+            initial,
+            [scale],
+        ),
+        [("initial", []), ("scale", [])],
+    )
+    gradients = traced.symbolic_vjp("seed")
+    inputs = {
+        "initial": nabla.Tensor([], [1.0]),
+        "scale": nabla.Tensor([], [2.0]),
+        "seed": nabla.Tensor([], [1.0]),
+    }
+    assert (
+        gradients["initial"].graph.evaluate(gradients["initial"].output.node_id, inputs).to_flat_list()
+        == [8.0]
+    )
+    assert (
+        gradients["scale"].graph.evaluate(gradients["scale"].output.node_id, inputs).to_flat_list()
+        == [13.0]
+    )
+
+
 def test_tensor_scan_unrolls_differentiable_outputs():
     traced = nabla.trace_tensor(
         lambda x: nabla.tensor_scan(3, lambda _, carry: (carry * x, carry * x), x)[1].sum(),
@@ -2102,6 +2274,181 @@ def test_tensor_scan_unrolls_differentiable_outputs():
         nabla.Tensor([], [1.0]),
     )
     assert gradients["x"].to_flat_list() == [48.0]
+
+
+def test_tensor_cond_fn_only_executes_selected_branch():
+    condition = nabla.tensor_cond_fn(
+        lambda x: x.log(),
+        lambda x: x * 2.0,
+        [("x", [1])],
+    )
+    negative = {"x": nabla.Tensor([1], [-2.0])}
+    assert condition(False, negative).to_flat_list() == [-4.0]
+    try:
+        condition(True, negative)
+        assert False, "expected selected log branch to reject a negative input"
+    except ValueError as error:
+        assert "log" in str(error)
+
+    try:
+        nabla.tensor_cond_fn(lambda x: x, lambda x: x.sum(), [("x", [1])])
+        assert False, "expected mismatched branch output shapes"
+    except ValueError as error:
+        assert "branch output shapes differ" in str(error)
+
+
+def test_tensor_cond_value_and_grad_selects_matching_branch_vjp():
+    condition = nabla.tensor_cond_value_and_grad_fn(
+        lambda x: (x * x).sum(),
+        lambda x: x.powi(3).sum(),
+        [("x", [1])],
+    )
+    values = {"x": nabla.Tensor([1], [3.0])}
+    true_value, true_gradients = condition(True, values)
+    false_value, false_gradients = condition(False, values)
+    assert true_value.to_flat_list() == [9.0]
+    assert true_gradients["x"].to_flat_list() == [6.0]
+    assert false_value.to_flat_list() == [27.0]
+    assert false_gradients["x"].to_flat_list() == [27.0]
+
+
+def test_tensor_cond_jvp_selects_matching_branch_direction():
+    condition = nabla.tensor_cond_jvp_fn(
+        lambda x: x * x,
+        lambda x: x.powi(3),
+        [("x", [1])],
+    )
+    values = {"x": nabla.Tensor([1], [3.0])}
+    tangents = {"x": nabla.Tensor([1], [2.0])}
+    true_value, true_tangent = condition(True, values, tangents)
+    false_value, false_tangent = condition(False, values, tangents)
+    assert true_value.to_flat_list() == [9.0]
+    assert true_tangent.to_flat_list() == [12.0]
+    assert false_value.to_flat_list() == [27.0]
+    assert false_tangent.to_flat_list() == [54.0]
+
+
+def test_tensor_cond_traces_a_lazy_tensor_predicate_with_explicit_captures():
+    traced = nabla.trace_tensor(
+        lambda predicate, x: nabla.tensor_cond(
+            predicate,
+            lambda captured: captured * captured,
+            lambda captured: captured * 3.0,
+            [x + x],
+        ),
+        [("predicate", []), ("x", [])],
+    )
+    true_inputs = {
+        "predicate": nabla.Tensor([], [1.0]),
+        "x": nabla.Tensor([], [2.0]),
+    }
+    true_value, true_gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, true_inputs, nabla.Tensor([], [1.0])
+    )
+    assert true_value.to_flat_list() == [16.0]
+    assert true_gradients["x"].to_flat_list() == [16.0]
+    assert true_gradients["predicate"].to_flat_list() == [0.0]
+
+    false_inputs = {
+        "predicate": nabla.Tensor([], [0.0]),
+        "x": nabla.Tensor([], [2.0]),
+    }
+    false_value, false_gradients = traced.graph.evaluate_value_and_vjp(
+        traced.output.node_id, false_inputs, nabla.Tensor([], [1.0])
+    )
+    assert false_value.to_flat_list() == [12.0]
+    assert false_gradients["x"].to_flat_list() == [6.0]
+
+
+def test_tensor_cond_supports_nested_tensor_predicates():
+    traced = nabla.trace_tensor(
+        lambda outer, inner, x: nabla.tensor_cond(
+            outer,
+            lambda inner_predicate, captured: nabla.tensor_cond(
+                inner_predicate,
+                lambda nested: nested * nested,
+                lambda nested: nested * 3.0,
+                [captured],
+            ),
+            lambda inner_predicate, captured: captured + inner_predicate * 0.0,
+            [inner, x],
+        ),
+        [("outer", []), ("inner", []), ("x", [])],
+    )
+    for outer, inner, expected_value, expected_gradient in [
+        (1.0, 1.0, 4.0, 4.0),
+        (1.0, 0.0, 6.0, 3.0),
+        (0.0, 1.0, 2.0, 1.0),
+    ]:
+        value, gradients = traced.graph.evaluate_value_and_vjp(
+            traced.output.node_id,
+            {
+                "outer": nabla.Tensor([], [outer]),
+                "inner": nabla.Tensor([], [inner]),
+                "x": nabla.Tensor([], [2.0]),
+            },
+            nabla.Tensor([], [1.0]),
+        )
+        assert value.to_flat_list() == [expected_value]
+        assert gradients["x"].to_flat_list() == [expected_gradient]
+
+
+def test_tensor_cond_symbolic_ad_supports_nested_regions():
+    traced = nabla.trace_tensor(
+        lambda outer, inner, x: nabla.tensor_cond(
+            outer,
+            lambda inner_predicate, captured: nabla.tensor_cond(
+                inner_predicate,
+                lambda nested: nested * nested,
+                lambda nested: nested * 3.0,
+                [captured],
+            ),
+            lambda inner_predicate, captured: captured + inner_predicate * 0.0,
+            [inner, x],
+        ),
+        [("outer", []), ("inner", []), ("x", [])],
+    )
+    symbolic_jvp = traced.symbolic_jvp("x")
+    symbolic_vjp = traced.symbolic_vjp("seed")["x"]
+    for outer, inner, expected_gradient in [
+        (1.0, 1.0, 4.0),
+        (1.0, 0.0, 3.0),
+        (0.0, 1.0, 1.0),
+    ]:
+        inputs = {
+            "outer": nabla.Tensor([], [outer]),
+            "inner": nabla.Tensor([], [inner]),
+            "x": nabla.Tensor([], [2.0]),
+        }
+        jvp_value = symbolic_jvp.graph.evaluate(symbolic_jvp.output.node_id, inputs)
+        assert jvp_value.to_flat_list() == [expected_gradient]
+        vjp_value = symbolic_vjp.graph.evaluate(
+            symbolic_vjp.output.node_id,
+            {**inputs, "seed": nabla.Tensor([], [1.0])},
+        )
+        assert vjp_value.to_flat_list() == [expected_gradient]
+
+
+def test_tensor_cond_supports_second_order_ad_through_symbolic_regions():
+    traced = nabla.trace_tensor(
+        lambda predicate, x: nabla.tensor_cond(
+            predicate,
+            lambda captured: captured * captured,
+            lambda captured: captured * 3.0,
+            [x + x],
+        ),
+        [("predicate", []), ("x", [])],
+    )
+    for predicate, expected in [(1.0, 8.0), (0.0, 0.0)]:
+        inputs = {
+            "predicate": nabla.Tensor([], [predicate]),
+            "x": nabla.Tensor([], [2.0]),
+        }
+        assert traced.graph.hessian_scalar(traced.output.node_id, "x", inputs) == [[expected]]
+        hvp = traced.graph.hvp_scalar(
+            traced.output.node_id, "x", inputs, nabla.Tensor([], [1.0])
+        )
+        assert hvp.to_flat_list() == [expected]
 
 
 def test_tensor_jit_batch_fn_bounds_batch_shape_specialization():
@@ -2134,6 +2481,98 @@ def test_tensor_jit_batch_fn_bounds_batch_shape_specialization():
         assert False, "expected non-batch shape error"
     except ValueError as error:
         assert "non-batch shapes" in str(error)
+
+
+def test_tensor_value_and_grad_batch_fn_specializes_collocation_batches():
+    compiled = nabla.tensor_value_and_grad_batch_fn(
+        lambda x, weight: (x * weight).powi(2).mean(),
+        ["x", "weight"],
+        in_axes=[0, None],
+        max_specializations=2,
+    )
+    weight = nabla.Tensor([1], [2.0])
+
+    first_value, first_gradients = compiled(
+        {"x": nabla.Tensor([2, 1], [1.0, 2.0]), "weight": weight}
+    )
+    second_value, second_gradients = compiled(
+        {"x": nabla.Tensor([3, 1], [1.0, 2.0, 3.0]), "weight": weight}
+    )
+
+    assert_close_rows([first_value.to_flat_list()], [[10.0]])
+    assert_close_rows([first_gradients["x"].to_flat_list()], [[4.0, 8.0]])
+    assert_close_rows([first_gradients["weight"].to_flat_list()], [[10.0]])
+    assert_close_rows([second_value.to_flat_list()], [[56.0 / 3.0]])
+    assert_close_rows(
+        [second_gradients["x"].to_flat_list()], [[8.0 / 3.0, 16.0 / 3.0, 8.0]]
+    )
+    assert_close_rows([second_gradients["weight"].to_flat_list()], [[56.0 / 3.0]])
+    assert compiled.specialization_count == 2
+    try:
+        compiled({"x": nabla.Tensor([4, 1], [1.0] * 4), "weight": weight})
+        assert False, "expected bounded specialization error"
+    except ValueError as error:
+        assert "max_specializations" in str(error)
+
+
+def test_tensor_jit_batch_cuda_fn_specializes_bounded_batches():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    compiled = nabla.tensor_jit_batch_cuda_fn(
+        lambda x, weight: (x.matmul(weight)).tanh(),
+        ["x", "weight"],
+        in_axes=[0, None],
+        max_specializations=2,
+    )
+    weight = nabla.Tensor([1, 1], [2.0])
+    first = compiled({"x": nabla.Tensor([2, 1], [0.5, -1.0]), "weight": weight})
+    second = compiled(
+        {"x": nabla.Tensor([3, 1], [0.0, 1.0, -0.5]), "weight": weight}
+    )
+
+    assert_close_rows(
+        [first.to_flat_list()], [[math.tanh(1.0), math.tanh(-2.0)]], tol=1e-5
+    )
+    assert_close_rows(
+        [second.to_flat_list()], [[0.0, math.tanh(2.0), math.tanh(-1.0)]], tol=1e-5
+    )
+    assert compiled.specialization_count == 2
+    try:
+        compiled({"x": nabla.Tensor([4, 1], [0.0] * 4), "weight": weight})
+        assert False, "expected bounded CUDA specialization error"
+    except ValueError as error:
+        assert "max_specializations" in str(error)
+
+
+def test_tensor_value_and_grad_batch_cuda_fn_specializes_collocation_batches():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    compiled = nabla.tensor_value_and_grad_batch_cuda_fn(
+        lambda x, weight: (x * weight).powi(2).mean(),
+        ["x", "weight"],
+        ["x", "weight"],
+        in_axes=[0, None],
+        max_specializations=2,
+    )
+    weight = nabla.Tensor([1], [2.0])
+    first_value, first_gradients = compiled(
+        {"x": nabla.Tensor([2, 1], [1.0, 2.0]), "weight": weight}
+    )
+    second_value, second_gradients = compiled(
+        {"x": nabla.Tensor([3, 1], [1.0, 2.0, 3.0]), "weight": weight}
+    )
+
+    assert_close_rows([first_value.to_flat_list()], [[10.0]], tol=1e-5)
+    assert_close_rows([first_gradients["x"].to_flat_list()], [[4.0, 8.0]], tol=1e-5)
+    assert_close_rows([first_gradients["weight"].to_flat_list()], [[10.0]], tol=1e-5)
+    assert_close_rows([second_value.to_flat_list()], [[56.0 / 3.0]], tol=1e-5)
+    assert_close_rows(
+        [second_gradients["x"].to_flat_list()], [[8.0 / 3.0, 16.0 / 3.0, 8.0]], tol=1e-5
+    )
+    assert_close_rows([second_gradients["weight"].to_flat_list()], [[56.0 / 3.0]], tol=1e-5)
+    assert compiled.specialization_count == 2
 
 
 def test_tensor_vmap_fn_traces_one_batched_plan():
@@ -2296,6 +2735,27 @@ def test_tensor_vmap_vjp_matches_per_example_loop_and_aggregates_unmapped_gradie
     assert_close_rows([gradients["x"].to_flat_list()], [expected_x])
     assert_close_rows([gradients["weight"].to_flat_list()], [expected_weight])
 
+    if os.environ.get("NABLA_MLX_TEST") is not None:
+        mlx_vjp = nabla.tensor_vmap_vjp_mlx_fn(
+            lambda x, weight: (x * weight).tanh().sum(),
+            [("x", [2]), ("weight", [2])],
+            3,
+            in_axes=[1, None],
+        )
+        assert mlx_vjp.backend == "mlx"
+        mlx_output, mlx_gradients = mlx_vjp(
+            {
+                "x": nabla.Tensor([2, 3], x_values),
+                "weight": nabla.Tensor([2], weight_values),
+            },
+            nabla.Tensor([3], cotangent_values),
+        )
+        assert_close_rows([mlx_output.to_flat_list()], [expected_output], tol=1e-5)
+        assert_close_rows([mlx_gradients["x"].to_flat_list()], [expected_x], tol=1e-5)
+        assert_close_rows(
+            [mlx_gradients["weight"].to_flat_list()], [expected_weight], tol=1e-5
+        )
+
 
 def test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes():
     jvp = nabla.tensor_vmap_jvp_fn(
@@ -2318,6 +2778,54 @@ def test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes():
         [output_tangent.to_flat_list()],
         [[direction * (1.0 - math.tanh(value) ** 2) for value, direction in zip(values, tangents)]],
     )
+
+    if os.environ.get("NABLA_MLX_TEST") is not None:
+        mlx_jvp = nabla.tensor_vmap_jvp_mlx_fn(
+            lambda x: x.tanh(),
+            [("x", [2])],
+            3,
+            in_axes=[1],
+            out_axis=1,
+        )
+        assert mlx_jvp.backend == "mlx"
+        mlx_output, mlx_tangent = mlx_jvp(
+            {"x": nabla.Tensor([2, 3], values)},
+            {"x": nabla.Tensor([2, 3], tangents)},
+        )
+        assert_close_rows(
+            [mlx_output.to_flat_list()],
+            [[math.tanh(value) for value in values]],
+            tol=1e-5,
+        )
+        assert_close_rows(
+            [mlx_tangent.to_flat_list()],
+            [[direction * (1.0 - math.tanh(value) ** 2) for value, direction in zip(values, tangents)]],
+            tol=1e-5,
+        )
+
+    if os.environ.get("NABLA_CUDA_TEST") is not None:
+        cuda_jvp = nabla.tensor_vmap_jvp_cuda_fn(
+            lambda x: x.tanh(),
+            [("x", [2])],
+            3,
+            in_axes=[1],
+            out_axis=1,
+        )
+        assert cuda_jvp.backend in {"cublas", "nvrtc"}
+        cuda_output, cuda_tangent = cuda_jvp(
+            {"x": nabla.Tensor([2, 3], values)},
+            {"x": nabla.Tensor([2, 3], tangents)},
+        )
+        assert_close_rows(
+            [cuda_output.to_flat_list()],
+            [[math.tanh(value) for value in values]],
+            tol=2e-5,
+        )
+        assert_close_rows(
+            [cuda_tangent.to_flat_list()],
+            [[direction * (1.0 - math.tanh(value) ** 2) for value, direction in zip(values, tangents)]],
+            tol=2e-5,
+        )
 
 
 def test_tensor_vmap_cuda_vjp_matches_cpu_single_batched_plan():
@@ -2494,6 +3002,60 @@ def test_tensor_value_and_grad_mlx_fn_uses_one_symbolic_plan():
     ) < 1e-5
 
 
+def test_tensor_value_and_grad_batch_mlx_fn_specializes_collocation_batches():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+
+    function = lambda x, target, weight: ((x * weight - target).powi(2)).mean()
+    mlx = nabla.tensor_value_and_grad_batch_mlx_fn(
+        function,
+        ["x", "target", "weight"],
+        ["weight"],
+        in_axes=[0, 0, None],
+        max_specializations=2,
+    )
+    cpu = nabla.tensor_value_and_grad_batch_fn(
+        function,
+        ["x", "target", "weight"],
+        in_axes=[0, 0, None],
+        max_specializations=2,
+    )
+    weight = nabla.Tensor([1], [0.5])
+    first_inputs = {
+        "x": nabla.Tensor([2, 1], [-1.0, 2.0]),
+        "target": nabla.Tensor([2, 1], [-2.0, 3.0]),
+        "weight": weight,
+    }
+    second_inputs = {
+        "x": nabla.Tensor([3, 1], [-2.0, 1.0, 3.0]),
+        "target": nabla.Tensor([3, 1], [-1.0, 2.0, 4.0]),
+        "weight": weight,
+    }
+    for inputs in (first_inputs, second_inputs):
+        mlx_value, mlx_gradients = mlx(inputs)
+        cpu_value, cpu_gradients = cpu(inputs)
+        assert_close_rows(
+            [mlx_value.to_flat_list()], [cpu_value.to_flat_list()], tol=1e-5
+        )
+        assert_close_rows(
+            [mlx_gradients["weight"].to_flat_list()],
+            [cpu_gradients["weight"].to_flat_list()],
+            tol=1e-5,
+        )
+    assert mlx.specialization_count == 2
+    try:
+        mlx(
+            {
+                "x": nabla.Tensor([4, 1], [0.0] * 4),
+                "target": nabla.Tensor([4, 1], [0.0] * 4),
+                "weight": weight,
+            }
+        )
+        assert False, "expected bounded MLX specialization error"
+    except ValueError as error:
+        assert "max_specializations" in str(error)
+
+
 def test_cuda_adam_loss_optimizer_owns_scalar_loss_and_parameters():
     if os.environ.get("NABLA_CUDA_TEST") is None:
         return
@@ -2528,6 +3090,156 @@ def test_cuda_adam_loss_optimizer_owns_scalar_loss_and_parameters():
     assert abs(trained["weight"].to_flat_list()[0] - 2.0) < 2e-3
     assert abs(trained["bias"].to_flat_list()[0] - 1.0) < 2e-3
     assert optimizer.device_buffer_count == initial_buffers
+
+
+def test_mlx_adam_loss_optimizer_keeps_parameters_and_moments_on_device():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, weight, bias: (x * weight) + bias,
+        [("x", [2]), ("weight", [1]), ("bias", [1])],
+    )
+    target = traced.graph.input("target", [2])
+    loss = (traced.output - target).powi(2).mean()
+    optimizer = nabla.mlx_adam_loss_optimizer(
+        loss,
+        ["weight", "bias"],
+        {
+            "x": nabla.Tensor([2], [-1.0, 1.0]),
+            "target": nabla.Tensor([2], [-1.0, 3.0]),
+            "weight": nabla.Tensor([1], [0.0]),
+            "bias": nabla.Tensor([1], [0.0]),
+        },
+        0.05,
+        ["x", "target"],
+    )
+
+    initial_loss = optimizer.loss().to_flat_list()[0]
+    for _ in range(250):
+        optimizer.step()
+    final_loss = optimizer.loss().to_flat_list()[0]
+    trained = optimizer.parameters()
+
+    assert final_loss < initial_loss * 1e-4
+    assert abs(trained["weight"].to_flat_list()[0] - 2.0) < 2e-3
+    assert abs(trained["bias"].to_flat_list()[0] - 1.0) < 2e-3
+
+
+def test_mlx_adam_loss_optimizer_refreshes_dynamic_minibatches():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+
+    traced = nabla.trace_tensor(
+        lambda x, target, weight, bias: (x * weight) + bias,
+        [("x", [2]), ("target", [2]), ("weight", [1]), ("bias", [1])],
+    )
+    loss = ((traced.output - traced.graph.input("target")).powi(2)).mean()
+    initial_batch = {
+        "x": nabla.Tensor([2], [-1.0, 1.0]),
+        "target": nabla.Tensor([2], [-1.0, 3.0]),
+        "weight": nabla.Tensor([1], [0.0]),
+        "bias": nabla.Tensor([1], [0.0]),
+    }
+    refreshed_batch = {
+        "x": nabla.Tensor([2], [-2.0, 2.0]),
+        "target": nabla.Tensor([2], [-3.0, 5.0]),
+    }
+    optimizer = nabla.mlx_adam_loss_optimizer(
+        loss, ["weight", "bias"], initial_batch, 0.05, []
+    )
+
+    optimizer.step(initial_batch)
+    initial_refreshed_loss = optimizer.loss(refreshed_batch).to_flat_list()[0]
+    for _ in range(250):
+        optimizer.step(refreshed_batch)
+    final_refreshed_loss = optimizer.loss().to_flat_list()[0]
+    trained = optimizer.parameters()
+
+    assert final_refreshed_loss < initial_refreshed_loss * 1e-4
+    assert abs(trained["weight"].to_flat_list()[0] - 2.0) < 2e-3
+    assert abs(trained["bias"].to_flat_list()[0] - 1.0) < 2e-3
+
+
+def test_mlx_poisson_pinn_matches_cpu_reference():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+
+    collocation = [0.15, 0.35, 0.55, 0.75, 0.9]
+    coordinates = collocation + [0.0, 1.0]
+    forcing = [math.pi**2 * math.sin(math.pi * x) for x in collocation] + [0.0, 0.0]
+    traced = nabla.trace_tensor(
+        lambda x, weight, forcing, boundary_target, boundary_mask: (x * weight).sin(),
+        [
+            ("x", [7, 1]),
+            ("weight", [1, 1]),
+            ("forcing", [7, 1]),
+            ("boundary_target", [7, 1]),
+            ("boundary_mask", [7, 1]),
+        ],
+    )
+    second_derivative = traced.symbolic_jvp("x").symbolic_jvp("x")
+    graph = second_derivative.graph
+    x = graph.input("x")
+    weight = graph.input("weight")
+    residual = second_derivative.output + graph.input("forcing")
+    boundary_error = (x * weight).sin() - graph.input("boundary_target")
+    error = nabla.where(graph.input("boundary_mask").gt(0.0), boundary_error, residual)
+    loss = (error * error).mean()
+    inputs = {
+        "x": nabla.Tensor([7, 1], coordinates),
+        "forcing": nabla.Tensor([7, 1], forcing),
+        "boundary_target": nabla.Tensor([7, 1], [0.0] * 7),
+        "boundary_mask": nabla.Tensor([7, 1], [0.0] * 5 + [1.0] * 2),
+        "weight": nabla.Tensor([1, 1], [2.5]),
+    }
+
+    cpu_optimizer = nabla.Adam(learning_rate=0.01)
+    cpu_parameters = {"weight": inputs["weight"]}
+    for _ in range(2000):
+        _, gradients = graph.evaluate_value_and_vjp(
+            loss.node_id,
+            {**inputs, **cpu_parameters},
+            nabla.Tensor([], [1.0]),
+        )
+        cpu_parameters = cpu_optimizer.step(cpu_parameters, {"weight": gradients["weight"]})
+    cpu_loss, _ = graph.evaluate_value_and_vjp(
+        loss.node_id,
+        {**inputs, **cpu_parameters},
+        nabla.Tensor([], [1.0]),
+    )
+
+    mlx_optimizer = nabla.mlx_adam_loss_optimizer(
+        loss,
+        ["weight"],
+        inputs,
+        0.01,
+        ["x", "forcing", "boundary_target", "boundary_mask"],
+    )
+    mlx_initial = mlx_optimizer.loss().to_flat_list()[0]
+    for _ in range(2000):
+        mlx_optimizer.step()
+    mlx_loss = mlx_optimizer.loss().to_flat_list()[0]
+    mlx_weight = mlx_optimizer.parameters()["weight"].to_flat_list()[0]
+    cpu_weight = cpu_parameters["weight"].to_flat_list()[0]
+
+    assert mlx_loss < mlx_initial * 1e-8
+    assert cpu_loss.to_flat_list()[0] < 1e-20
+    assert abs(mlx_weight - cpu_weight) < 2e-3
+
+
+def test_mlx_two_layer_poisson_pinn_matches_cpu_reference():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+
+    example = runpy.run_path(
+        os.path.join(os.path.dirname(__file__), "..", "..", "examples", "pinn_mlp_mlx.py")
+    )
+    metrics = example["run"]()
+    assert metrics["mlx_final"] < metrics["mlx_initial"] * 1e-4
+    assert metrics["mlx_residual"] < 1e-5
+    assert metrics["mlx_boundary"] < 1e-5
+    assert metrics["max_parameter_difference"] < 2e-3
 
 
 def test_tensor_vjp_fn_reuses_a_compiled_plan_with_runtime_cotangent():
@@ -4330,6 +5042,7 @@ if __name__ == "__main__":
     test_trace_tensor_stack_supports_symbolic_vjp()
     test_cuda_trace_tensor_concat_keeps_primal_and_symbolic_vjp_on_device()
     test_mlx_trace_tensor_compiles_and_matches_cpu()
+    test_mlx_execution_plan_retains_static_inputs_across_calls()
     test_mlx_symbolic_vjp_executes_mlp_bias_gradient()
     test_mlx_trace_tensor_executes_masked_loss()
     test_mlx_symbolic_vjp_executes_masked_loss_gradient()
@@ -4357,6 +5070,7 @@ if __name__ == "__main__":
     test_trace_tensor_sin_supports_jvp_and_vjp()
     test_trace_tensor_sqrt_supports_jvp_and_vjp()
     test_trace_tensor_where_routes_gradients_and_masks_condition_derivatives()
+    test_tensor_cpu_plan_data_parallel_value_and_grad_matches_single_plan()
     test_trace_tensor_log_supports_jvp_and_vjp()
     test_trace_tensor_cos_supports_jvp_and_vjp()
     test_trace_tensor_powi_supports_second_order_ad()
@@ -4366,11 +5080,25 @@ if __name__ == "__main__":
     test_tensor_grad_scalar_fn_reuses_a_compiled_plan()
     test_tensor_value_and_grad_fn_returns_scalar_value_and_gradients()
     test_tensor_hessian_and_hvp_scalar_fn_reuse_a_compiled_plan()
+    test_tensor_hessian_and_hvp_scalar_fn_support_fixed_fori_regions()
     test_tensor_jit_fn_reuses_a_compiled_plan()
     test_trace_tensor_rejects_data_dependent_python_branches()
     test_tensor_fori_loop_unrolls_differentiable_carry()
+    test_tensor_fori_loop_region_traces_once_and_differentiates_parent_inputs()
+    test_tensor_fori_loop_region_supports_symbolic_jvp()
+    test_tensor_fori_loop_region_supports_symbolic_vjp()
     test_tensor_scan_unrolls_differentiable_outputs()
+    test_tensor_cond_fn_only_executes_selected_branch()
+    test_tensor_cond_value_and_grad_selects_matching_branch_vjp()
+    test_tensor_cond_jvp_selects_matching_branch_direction()
+    test_tensor_cond_traces_a_lazy_tensor_predicate_with_explicit_captures()
+    test_tensor_cond_supports_nested_tensor_predicates()
+    test_tensor_cond_symbolic_ad_supports_nested_regions()
+    test_tensor_cond_supports_second_order_ad_through_symbolic_regions()
     test_tensor_jit_batch_fn_bounds_batch_shape_specialization()
+    test_tensor_value_and_grad_batch_fn_specializes_collocation_batches()
+    test_tensor_jit_batch_cuda_fn_specializes_bounded_batches()
+    test_tensor_value_and_grad_batch_cuda_fn_specializes_collocation_batches()
     test_tensor_vmap_fn_traces_one_batched_plan()
     test_tensor_vmap_fn_supports_in_axes_out_axis_and_unmapped_inputs()
     test_tensor_vmap_fn_reductions_and_transpose_preserve_batch_axis()
@@ -4382,7 +5110,12 @@ if __name__ == "__main__":
     test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan()
     test_tensor_value_and_grad_cuda_fn_uses_one_callable_plan()
     test_tensor_value_and_grad_mlx_fn_uses_one_symbolic_plan()
+    test_tensor_value_and_grad_batch_mlx_fn_specializes_collocation_batches()
     test_cuda_adam_loss_optimizer_owns_scalar_loss_and_parameters()
+    test_mlx_adam_loss_optimizer_keeps_parameters_and_moments_on_device()
+    test_mlx_adam_loss_optimizer_refreshes_dynamic_minibatches()
+    test_mlx_poisson_pinn_matches_cpu_reference()
+    test_mlx_two_layer_poisson_pinn_matches_cpu_reference()
     test_tensor_vjp_fn_reuses_a_compiled_plan_with_runtime_cotangent()
     test_tensor_jvp_fn_reuses_a_compiled_plan_with_runtime_tangent()
     test_tensor_jacobian_fn_reuses_a_compiled_plan()

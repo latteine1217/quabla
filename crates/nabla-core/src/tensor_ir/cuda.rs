@@ -83,6 +83,36 @@ impl CudaBackend {
     }
 
     pub fn compile(&self, plan: TensorExecutionPlan) -> Result<CudaExecutionPlan, String> {
+        if plan
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, TensorOp::Cond { .. }))
+        {
+            return Err(
+                "CUDA backend does not yet support Cond regions with device predicates".to_string(),
+            );
+        }
+        if plan
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, TensorOp::Fori { .. }))
+        {
+            return Err(
+                "CUDA backend does not yet support Fori regions with device loop lowering"
+                    .to_string(),
+            );
+        }
+        if plan
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, TensorOp::ForiVjp { .. }))
+        {
+            return Err(
+                "CUDA backend does not yet support Fori VJP regions with device loop lowering"
+                    .to_string(),
+            );
+        }
+        ensure_nvrtc_runtime_available()?;
         let matmul_bias_tanh = cuda_matmul_bias_tanh_epilogue(&plan);
         let fusion_regions = plan.fusion_regions();
         let fused_candidate = plan.uses_fused_elementwise_kernel()
@@ -96,6 +126,9 @@ impl CudaBackend {
             (cuda_program_source(&plan)?, false)
         };
         let mut source = source;
+        if fused_elementwise {
+            source.push_str(CUDA_OPTIMIZER_SOURCE);
+        }
         if matmul_bias_tanh.is_some() {
             source.push_str(CUDA_MATMUL_BIAS_TANH_SOURCE);
         }
@@ -125,6 +158,33 @@ impl CudaBackend {
             state: Arc::new(Mutex::new(CudaExecutionState::default())),
         })
     }
+}
+
+fn ensure_nvrtc_runtime_available() -> Result<(), String> {
+    const LIBRARY_NAMES: [&str; 6] = [
+        "libnvrtc.so",
+        "libnvrtc.so.13",
+        "libnvrtc.so.12",
+        "libnvrtc.so.11",
+        "libnvrtc.so.10",
+        "libnvrtc.so.9",
+    ];
+
+    let mut errors = Vec::with_capacity(LIBRARY_NAMES.len());
+    for name in LIBRARY_NAMES {
+        match unsafe { libloading::Library::new(name) } {
+            Ok(library) => {
+                drop(library);
+                return Ok(());
+            }
+            Err(error) => errors.push(format!("{name}: {error}")),
+        }
+    }
+
+    Err(format!(
+        "CUDA NVRTC runtime is unavailable. Install the Linux CUDA toolkit that provides libnvrtc.so and add its library directory to LD_LIBRARY_PATH. Attempted: {}",
+        errors.join("; ")
+    ))
 }
 
 impl CudaExecutionPlan {
@@ -542,6 +602,7 @@ impl TensorBackend for CudaBackend {
         plan: &TensorExecutionPlan,
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<DynamicTensor, String> {
+        ensure_nvrtc_runtime_available()?;
         if let Some((lhs, rhs)) = direct_rank_two_matmul_inputs(plan)? {
             return self.execute_rank_two_matmul(plan, inputs, lhs, rhs);
         }
@@ -767,7 +828,7 @@ fn release_dead_cuda_values(
         *remaining = remaining
             .checked_sub(1)
             .ok_or_else(|| format!("CUDA input node {input_id} has an invalid use count"))?;
-        if *remaining != 0 || input_id == plan.output_node_id {
+        if *remaining != 0 || plan.output_node_ids().contains(&input_id) {
             continue;
         }
         if matches!(
@@ -875,6 +936,24 @@ fn execute_cuda_device_program(
                     plan.nodes[*matrix].shape[0],
                     plan.nodes[*rhs].shape[1],
                 )?;
+            }
+            TensorOp::Cond { .. } => {
+                return Err(
+                    "CUDA backend does not yet support Cond regions with device predicates"
+                        .to_string(),
+                )
+            }
+            TensorOp::Fori { .. } => {
+                return Err(
+                    "CUDA backend does not yet support Fori regions with device loop lowering"
+                        .to_string(),
+                )
+            }
+            TensorOp::ForiVjp { .. } => {
+                return Err(
+                    "CUDA backend does not yet support Fori VJP regions with device loop lowering"
+                        .to_string(),
+                )
             }
             TensorOp::ScalarConstant { .. }
             | TensorOp::Add { .. }
@@ -1587,27 +1666,32 @@ fn use_cublas_rank_two_matmul(
 }
 
 fn cuda_blas(stream: Arc<CudaStream>) -> Result<Option<Arc<Mutex<CudaBlas>>>, String> {
-    let library_name = libloading::library_filename("cublas");
-    let library = unsafe { libloading::Library::new(&library_name) };
-    if library.is_err() {
+    if !cuda_library_available("cublas") {
         return Ok(None);
     }
-    drop(library);
     CudaBlas::new(stream)
         .map(|blas| Some(Arc::new(Mutex::new(blas))))
-        .map_err(|error| format!("failed to initialize cuBLAS from {library_name:?}: {error:?}"))
+        .map_err(|error| format!("failed to initialize cuBLAS: {error:?}"))
 }
 
 fn cuda_solver(stream: Arc<CudaStream>) -> Result<Option<Arc<Mutex<DnHandle>>>, String> {
-    let library_name = libloading::library_filename("cusolver");
-    let library = unsafe { libloading::Library::new(&library_name) };
-    if library.is_err() {
+    if !cuda_library_available("cusolver") {
         return Ok(None);
     }
-    drop(library);
     DnHandle::new(stream)
         .map(|solver| Some(Arc::new(Mutex::new(solver))))
-        .map_err(|error| format!("failed to initialize CUSOLVER from {library_name:?}: {error:?}"))
+        .map_err(|error| format!("failed to initialize CUSOLVER: {error:?}"))
+}
+
+fn cuda_library_available(name: &str) -> bool {
+    [
+        format!("lib{name}.so"),
+        format!("lib{name}.so.13"),
+        format!("lib{name}.so.12"),
+        format!("lib{name}.so.11"),
+    ]
+    .iter()
+    .any(|candidate| unsafe { libloading::Library::new(candidate).is_ok() })
 }
 
 fn launch_cuda_transpose_copy(
@@ -1934,23 +2018,9 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
         "__device__ __forceinline__ float nabla_powi(float base, unsigned int exponent) {\n\
     float result = 1.0f;\n\
     while (exponent != 0U) { if ((exponent & 1U) != 0U) result *= base; base *= base; exponent >>= 1U; }\n\
-    return result;\n}\n\
-extern \"C\" __global__ void nabla_sgd(float* parameter, const float* gradient, float learning_rate, unsigned long long count) {\n\
-    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
-    if (index < count) parameter[index] -= learning_rate * gradient[index];\n}\n",
+    return result;\n}\n",
     );
-    source.push_str(
-        "extern \"C\" __global__ void nabla_adam(float* parameter, const float* gradient, float* first_moment, float* second_moment, float learning_rate, float beta1, float beta2, float epsilon, float correction1, float correction2, unsigned long long count) {\n\
-    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
-    if (index < count) {\n\
-        float gradient_value = gradient[index];\n\
-        float first = beta1 * first_moment[index] + (1.0f - beta1) * gradient_value;\n\
-        float second = beta2 * second_moment[index] + (1.0f - beta2) * gradient_value * gradient_value;\n\
-        first_moment[index] = first;\n\
-        second_moment[index] = second;\n\
-        parameter[index] -= learning_rate * (first / correction1) / (sqrtf(second / correction2) + epsilon);\n\
-    }\n}\n",
-    );
+    source.push_str(CUDA_OPTIMIZER_SOURCE);
     source.push_str(
         "extern \"C\" __global__ void nabla_transpose_copy(const float* input, float* output, unsigned long long rows, unsigned long long columns) {\n\\
     unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
@@ -2078,6 +2148,24 @@ extern \"C\" __global__ void nabla_sgd(float* parameter, const float* gradient, 
                 }
             }
             TensorOp::Solve { .. } => String::new(),
+            TensorOp::Cond { .. } => {
+                return Err(
+                    "CUDA backend does not yet support Cond regions with device predicates"
+                        .to_string(),
+                )
+            }
+            TensorOp::Fori { .. } => {
+                return Err(
+                    "CUDA backend does not yet support Fori regions with device loop lowering"
+                        .to_string(),
+                )
+            }
+            TensorOp::ForiVjp { .. } => {
+                return Err(
+                    "CUDA backend does not yet support Fori VJP regions with device loop lowering"
+                        .to_string(),
+                )
+            }
             TensorOp::Sum { .. } | TensorOp::Mean { .. } => {
                 let scale = if matches!(&node.op, TensorOp::Mean { .. }) {
                     " / (float)count".to_string()
@@ -2325,6 +2413,9 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Mul { .. } => "mul",
         TensorOp::Greater { .. } => "greater",
         TensorOp::Where { .. } => "where",
+        TensorOp::Cond { .. } => "cond",
+        TensorOp::Fori { .. } => "fori",
+        TensorOp::ForiVjp { .. } => "fori_vjp",
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::Matmul { .. } => "matmul",
@@ -2431,6 +2522,31 @@ extern "C" __global__ void nabla_rank_two_matmul(
     if (row < rows && col + NABLA_BLOCK < cols) output[row * cols + col + NABLA_BLOCK] = value_01;
     if (row + NABLA_BLOCK < rows && col < cols) output[(row + NABLA_BLOCK) * cols + col] = value_10;
     if (row + NABLA_BLOCK < rows && col + NABLA_BLOCK < cols) output[(row + NABLA_BLOCK) * cols + col + NABLA_BLOCK] = value_11;
+}
+"#;
+
+const CUDA_OPTIMIZER_SOURCE: &str = r#"
+extern "C" __global__ void nabla_sgd(
+    float* parameter, const float* gradient, float learning_rate, unsigned long long count
+) {
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) parameter[index] -= learning_rate * gradient[index];
+}
+
+extern "C" __global__ void nabla_adam(
+    float* parameter, const float* gradient, float* first_moment, float* second_moment,
+    float learning_rate, float beta1, float beta2, float epsilon,
+    float correction1, float correction2, unsigned long long count
+) {
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) {
+        float gradient_value = gradient[index];
+        float first = beta1 * first_moment[index] + (1.0f - beta1) * gradient_value;
+        float second = beta2 * second_moment[index] + (1.0f - beta2) * gradient_value * gradient_value;
+        first_moment[index] = first;
+        second_moment[index] = second;
+        parameter[index] -= learning_rate * (first / correction1) / (sqrtf(second / correction2) + epsilon);
+    }
 }
 "#;
 

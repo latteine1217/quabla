@@ -23,7 +23,35 @@ pub struct MlxRetainedInputs {
     values: BTreeMap<String, Array>,
 }
 
+#[derive(Debug)]
+struct MlxAdamState {
+    first_moment: Array,
+    second_moment: Array,
+    step: u64,
+}
+
+/// A scalar-loss MLX training plan with retained parameters and Adam state.
+///
+/// `step` only evaluates gradients, updated parameters, and moment buffers on
+/// MLX's GPU stream. Host materialization is limited to explicit diagnostics.
+#[derive(Debug)]
+pub struct MlxAdamPlan {
+    plan: TensorExecutionPlan,
+    loss_node_id: usize,
+    gradient_node_ids: BTreeMap<String, usize>,
+    retained_inputs: MlxRetainedInputs,
+    adam: BTreeMap<String, MlxAdamState>,
+    learning_rate: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+}
+
 impl MlxRetainedInputs {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
     pub fn upload(
         inputs: &BTreeMap<String, DynamicTensor>,
         names: impl IntoIterator<Item = String>,
@@ -46,6 +74,238 @@ impl MlxRetainedInputs {
     pub fn arrays(&self) -> &BTreeMap<String, Array> {
         &self.values
     }
+
+    pub fn get(&self, name: &str) -> Option<&Array> {
+        self.values.get(name)
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.values.keys().map(String::as_str)
+    }
+
+    pub fn clear(&mut self) {
+        self.values.clear();
+    }
+}
+
+impl MlxAdamPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        plan: TensorExecutionPlan,
+        loss_node_id: usize,
+        gradient_node_ids: BTreeMap<String, usize>,
+        inputs: &BTreeMap<String, DynamicTensor>,
+        retained_input_names: impl IntoIterator<Item = String>,
+        learning_rate: f32,
+        beta1: f32,
+        beta2: f32,
+        epsilon: f32,
+    ) -> Result<Self, String> {
+        if gradient_node_ids.is_empty() {
+            return Err("MLX Adam requires at least one parameter gradient".to_string());
+        }
+        if !(learning_rate.is_finite()
+            && learning_rate > 0.0
+            && epsilon.is_finite()
+            && epsilon > 0.0
+            && beta1.is_finite()
+            && (0.0..1.0).contains(&beta1)
+            && beta2.is_finite()
+            && (0.0..1.0).contains(&beta2))
+        {
+            return Err(
+                "MLX Adam requires positive finite learning_rate and epsilon, plus beta1/beta2 in [0, 1)"
+                    .to_string(),
+            );
+        }
+        let mut names = retained_input_names.into_iter().collect::<Vec<_>>();
+        names.extend(gradient_node_ids.keys().cloned());
+        names.sort();
+        names.dedup();
+        let retained_inputs = MlxRetainedInputs::upload(inputs, names)?;
+        for parameter_name in gradient_node_ids.keys() {
+            let node = plan
+                .nodes
+                .iter()
+                .find(|node| matches!(&node.op, TensorOp::Input { name } if name == parameter_name))
+                .ok_or_else(|| {
+                    format!("MLX Adam parameter {parameter_name:?} is not a plan input")
+                })?;
+            let parameter = retained_inputs
+                .values
+                .get(parameter_name)
+                .ok_or_else(|| format!("MLX Adam did not retain parameter {parameter_name:?}"))?;
+            if parameter.shape() != mlx_shape(&node.shape)?.as_slice() {
+                return Err(format!(
+                    "MLX Adam parameter {parameter_name:?} has an unexpected retained shape"
+                ));
+            }
+        }
+        Ok(Self {
+            plan,
+            loss_node_id,
+            gradient_node_ids,
+            retained_inputs,
+            adam: BTreeMap::new(),
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+        })
+    }
+
+    pub fn step(&mut self, inputs: &BTreeMap<String, DynamicTensor>) -> Result<(), String> {
+        let parameter_names = self.gradient_node_ids.keys().cloned().collect::<Vec<_>>();
+        let gradient_node_ids = parameter_names
+            .iter()
+            .map(|name| {
+                self.gradient_node_ids
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| format!("MLX Adam gradient for {name:?} is missing"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let gradients = MlxBackend.execute_arrays_with_retained(
+            &self.plan,
+            &gradient_node_ids,
+            inputs,
+            self.retained_inputs.arrays(),
+        )?;
+        let stream = StreamOrDevice::gpu();
+        for (parameter_name, gradient) in parameter_names.iter().zip(gradients) {
+            let parameter = self
+                .retained_inputs
+                .values
+                .get(parameter_name)
+                .ok_or_else(|| {
+                    format!("MLX Adam retained parameter {parameter_name:?} is missing")
+                })?
+                .clone();
+            if parameter.shape() != gradient.shape() {
+                return Err(format!(
+                    "MLX Adam parameter {parameter_name:?} and gradient shapes differ"
+                ));
+            }
+            if !self.adam.contains_key(parameter_name) {
+                let shape = parameter.shape();
+                let first_moment = Array::zeros_device::<f32>(shape, &stream)
+                    .map_err(|error| format!("MLX Adam first moment allocation failed: {error}"))?;
+                let second_moment =
+                    Array::zeros_device::<f32>(shape, &stream).map_err(|error| {
+                        format!("MLX Adam second moment allocation failed: {error}")
+                    })?;
+                self.adam.insert(
+                    parameter_name.clone(),
+                    MlxAdamState {
+                        first_moment,
+                        second_moment,
+                        step: 0,
+                    },
+                );
+            }
+            let state = self
+                .adam
+                .get_mut(parameter_name)
+                .ok_or_else(|| format!("MLX Adam state for {parameter_name:?} is missing"))?;
+            state.step = state
+                .step
+                .checked_add(1)
+                .ok_or_else(|| "MLX Adam step counter overflow".to_string())?;
+            let one_minus_beta1 = Array::from_f32(1.0 - self.beta1);
+            let one_minus_beta2 = Array::from_f32(1.0 - self.beta2);
+            let first_moment = state
+                .first_moment
+                .multiply_device(Array::from_f32(self.beta1), &stream)
+                .and_then(|value| {
+                    gradient
+                        .multiply_device(&one_minus_beta1, &stream)
+                        .and_then(|scaled_gradient| value.add_device(&scaled_gradient, &stream))
+                })
+                .map_err(|error| format!("MLX Adam first moment update failed: {error}"))?;
+            let second_moment = state
+                .second_moment
+                .multiply_device(Array::from_f32(self.beta2), &stream)
+                .and_then(|value| {
+                    gradient
+                        .multiply_device(&gradient, &stream)
+                        .and_then(|squared_gradient| {
+                            squared_gradient.multiply_device(&one_minus_beta2, &stream)
+                        })
+                        .and_then(|scaled_gradient| value.add_device(&scaled_gradient, &stream))
+                })
+                .map_err(|error| format!("MLX Adam second moment update failed: {error}"))?;
+            let correction1 = Array::from_f32(1.0 - self.beta1.powf(state.step as f32));
+            let correction2 = Array::from_f32(1.0 - self.beta2.powf(state.step as f32));
+            let update = first_moment
+                .divide_device(&correction1, &stream)
+                .and_then(|first| {
+                    second_moment
+                        .divide_device(&correction2, &stream)
+                        .and_then(|second| second.sqrt_device(&stream))
+                        .and_then(|denominator| {
+                            denominator.add_device(Array::from_f32(self.epsilon), &stream)
+                        })
+                        .and_then(|denominator| first.divide_device(&denominator, &stream))
+                })
+                .and_then(|normalized| {
+                    normalized.multiply_device(Array::from_f32(self.learning_rate), &stream)
+                })
+                .map_err(|error| format!("MLX Adam update failed: {error}"))?;
+            let updated_parameter = parameter
+                .subtract_device(&update, &stream)
+                .map_err(|error| format!("MLX Adam parameter update failed: {error}"))?;
+            state.first_moment = first_moment;
+            state.second_moment = second_moment;
+            self.retained_inputs
+                .values
+                .insert(parameter_name.clone(), updated_parameter);
+        }
+        let mut values = self.retained_inputs.values.values().collect::<Vec<_>>();
+        for state in self.adam.values() {
+            values.push(&state.first_moment);
+            values.push(&state.second_moment);
+        }
+        transforms::eval(values)
+            .map_err(|error| format!("MLX Adam state evaluation failed: {error}"))
+    }
+
+    pub fn loss(&self, inputs: &BTreeMap<String, DynamicTensor>) -> Result<DynamicTensor, String> {
+        MlxBackend
+            .execute_many_with_retained(
+                &self.plan,
+                &[self.loss_node_id],
+                inputs,
+                self.retained_inputs.arrays(),
+            )
+            .and_then(|mut values| {
+                values
+                    .pop()
+                    .ok_or_else(|| "MLX Adam loss evaluation produced no output".to_string())
+            })
+    }
+
+    pub fn parameter(&self, name: &str) -> Result<DynamicTensor, String> {
+        let node = self
+            .plan
+            .nodes
+            .iter()
+            .find(|node| matches!(&node.op, TensorOp::Input { name: input_name } if input_name == name))
+            .ok_or_else(|| format!("MLX Adam parameter {name:?} is not a plan input"))?;
+        let parameter = self
+            .retained_inputs
+            .values
+            .get(name)
+            .ok_or_else(|| format!("MLX Adam parameter {name:?} is not retained"))?;
+        DynamicTensor::new(
+            node.shape.clone(),
+            parameter
+                .as_slice::<f32>()
+                .iter()
+                .copied()
+                .map(f64::from)
+                .collect(),
+        )
+    }
 }
 
 impl MlxBackend {
@@ -63,6 +323,31 @@ impl MlxBackend {
         self.execute_many_with_retained(plan, output_node_ids, inputs, &BTreeMap::new())
     }
 
+    /// Executes a graph to completion without materializing its output on the host.
+    ///
+    /// Dynamic host inputs are still uploaded for this call. The requested output
+    /// is evaluated on the MLX GPU stream and then discarded, which makes this a
+    /// useful boundary for forward-execution timing without diagnostic readback.
+    pub fn execute_without_output(
+        &self,
+        plan: &TensorExecutionPlan,
+        inputs: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<(), String> {
+        self.execute_arrays_with_retained(plan, &[plan.output_node_id], inputs, &BTreeMap::new())
+            .map(|_| ())
+    }
+
+    /// Executes a graph to completion using retained input arrays without host readback.
+    pub fn execute_without_output_with_state(
+        &self,
+        plan: &TensorExecutionPlan,
+        inputs: &BTreeMap<String, DynamicTensor>,
+        state: &MlxRetainedInputs,
+    ) -> Result<(), String> {
+        self.execute_arrays_with_retained(plan, &[plan.output_node_id], inputs, state.arrays())
+            .map(|_| ())
+    }
+
     /// Executes a graph while reusing named MLX input arrays.
     ///
     /// Retained arrays take precedence over same-named host inputs. Callers
@@ -74,6 +359,39 @@ impl MlxBackend {
         inputs: &BTreeMap<String, DynamicTensor>,
         retained_inputs: &BTreeMap<String, Array>,
     ) -> Result<Vec<DynamicTensor>, String> {
+        let outputs =
+            self.execute_arrays_with_retained(plan, output_node_ids, inputs, retained_inputs)?;
+        output_node_ids
+            .iter()
+            .zip(outputs)
+            .map(|(node_id, output)| {
+                let shape = plan
+                    .nodes
+                    .get(*node_id)
+                    .ok_or_else(|| format!("MLX output node {node_id} is missing"))?
+                    .shape
+                    .clone();
+                DynamicTensor::new(
+                    shape,
+                    output
+                        .as_slice::<f32>()
+                        .iter()
+                        .copied()
+                        .map(f64::from)
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Executes a graph and returns evaluated MLX arrays without host readback.
+    fn execute_arrays_with_retained(
+        &self,
+        plan: &TensorExecutionPlan,
+        output_node_ids: &[usize],
+        inputs: &BTreeMap<String, DynamicTensor>,
+        retained_inputs: &BTreeMap<String, Array>,
+    ) -> Result<Vec<Array>, String> {
         if output_node_ids.is_empty() {
             return Err("MLX execution requires at least one output node".to_string());
         }
@@ -137,6 +455,24 @@ impl MlxBackend {
                     &stream,
                 )
                 .map_err(|error| error.to_string()),
+                TensorOp::Cond { .. } => {
+                    return Err(
+                        "MLX backend does not yet support Cond regions with device predicates"
+                            .to_string(),
+                    )
+                }
+                TensorOp::Fori { .. } => {
+                    return Err(
+                        "MLX backend does not yet support Fori regions with device loop lowering"
+                            .to_string(),
+                    )
+                }
+                TensorOp::ForiVjp { .. } => {
+                    return Err(
+                        "MLX backend does not yet support Fori VJP regions with device loop lowering"
+                            .to_string(),
+                    )
+                }
                 TensorOp::Tanh { input } => ops::tanh_device(mlx_value(&values, *input)?, &stream)
                     .map_err(|error| error.to_string()),
                 TensorOp::Exp { input } => mlx_value(&values, *input)?
@@ -310,27 +646,7 @@ impl MlxBackend {
             .collect::<Result<Vec<_>, _>>()?;
         transforms::eval(outputs.iter().copied())
             .map_err(|error| format!("MLX output evaluation failed: {error}"))?;
-        output_node_ids
-            .iter()
-            .zip(outputs)
-            .map(|(node_id, output)| {
-                let shape = plan
-                    .nodes
-                    .get(*node_id)
-                    .ok_or_else(|| format!("MLX output node {node_id} is missing"))?
-                    .shape
-                    .clone();
-                DynamicTensor::new(
-                    shape,
-                    output
-                        .as_slice::<f32>()
-                        .iter()
-                        .copied()
-                        .map(f64::from)
-                        .collect(),
-                )
-            })
-            .collect()
+        Ok(outputs.into_iter().cloned().collect())
     }
 
     /// Executes a graph using the backend-owned retained input state.
@@ -380,7 +696,12 @@ fn mlx_array_from_dynamic(input: &DynamicTensor) -> Result<Array, String> {
         .iter()
         .map(|value| *value as f32)
         .collect::<Vec<_>>();
-    Ok(Array::from_slice(&data, &shape))
+    let stream = StreamOrDevice::gpu();
+    let host_value = Array::from_slice(&data, &shape);
+    let zeros = Array::zeros_device::<f32>(&shape, &stream).map_err(|error| error.to_string())?;
+    host_value
+        .add_device(&zeros, &stream)
+        .map_err(|error| error.to_string())
 }
 
 fn mlx_value(values: &[Array], node_id: usize) -> Result<&Array, String> {
@@ -399,6 +720,9 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Mul { .. } => "mul",
         TensorOp::Greater { .. } => "greater",
         TensorOp::Where { .. } => "where",
+        TensorOp::Cond { .. } => "cond",
+        TensorOp::Fori { .. } => "fori",
+        TensorOp::ForiVjp { .. } => "fori_vjp",
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::Matmul { .. } => "matmul",

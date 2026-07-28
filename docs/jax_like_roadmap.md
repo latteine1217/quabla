@@ -376,8 +376,9 @@ Acceptance checks:
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
   and the Python test suite pass on the default build.
 - The MLX feature passes its Rust and Python suites on Apple silicon.
-- The CUDA feature passes its Rust and Python suites on the configured Linux
-  GPU, including a retained-device execution check.
+- The CUDA Rust and Python suites pass on the configured GTX 1660 SUPER,
+  including retained device execution, cuBLAS matmul, CUSOLVER solve,
+  symbolic VJP/JVP, multi-output materialization, and device optimizer checks.
 - `git diff --check` passes and benchmark artifacts report enough metadata to
   reproduce a result.
 
@@ -386,8 +387,11 @@ Acceptance checks:
 Goal: make a small PINN train through one high-level CUDA API without copying
 parameters or gradients to the host on every step.
 
-Status: completed. The CUDA implementation is verified on the configured
-Linux GPU with a two-layer Poisson PINN integration run.
+Status: implementation and Rust runtime validation complete on the configured
+GTX 1660 SUPER. The 2026-07-28 driver-backed suite passed all 47 CUDA core
+tests and the release Python suite, including retained device buffers,
+symbolic VJP/JVP, multi-output materialization, cuBLAS, CUSOLVER, SGD, and
+Adam. Benchmark execution remains separate from correctness validation.
 
 - Add `tensor_value_and_grad_cuda_fn` for a scalar loss and named parameters.
   It must compile a shared forward/reverse union plan rather than one plan per
@@ -436,6 +440,14 @@ existing primitive surface. CPU coverage validates non-leading axes, unmapped
 arguments, reductions, transpose, batched JVP, and batched VJP. CUDA now
 lowers batched VJP primal and gradient outputs into one union plan; CPU and
 CUDA tests compare per-example gradients of a batched MLP with a loop reference.
+MLX now lowers the same batched VJP primal and gradient outputs into one
+multi-output GPU plan; its CPU-parity coverage includes a non-leading mapped
+axis and an unmapped parameter. MLX also lowers batched primal/JVP pairs from
+explicit runtime tangent IR inputs in one multi-output GPU plan, with
+non-leading input and output axes covered against the CPU reference.
+CUDA now lowers the same explicit-tangent batched JVP union plan; its runtime
+parity test is gated on `NABLA_CUDA_TEST` until the configured CUDA host exposes
+its NVIDIA driver and runtime libraries.
 
 ### P3. SciML Array And Linear-Algebra Surface
 
@@ -471,8 +483,8 @@ partial-pivot LU CPU reference implementation, eager and traced Python APIs,
 and direct/symbolic JVP/VJP plus mixed-tangent rules; it rejects non-square,
 rank-mismatched, and singular inputs explicitly. CUDA now has a CUSOLVER
 `Sgetrf`/`Sgetrs` rank-2 lowering that keeps factorization and right-hand-side
-buffers on device; it has passed Linux feature compilation but remains pending
-runtime validation on a host with `libcusolver` and a visible NVIDIA device.
+buffers on device; it passed driver-backed CUSOLVER validation on the configured
+GTX 1660 SUPER on 2026-07-28.
 `cholesky()` is available as a rank-2 eager factorization with symmetry/SPD
 validation and as a static trace-time recurrence, so existing JVP/VJP machinery
 provides verified derivatives. Native CUDA/MLX factorization lowering and
@@ -532,6 +544,11 @@ external bindings and reshape aliases preserve their backing storage. CUDA has
 not yet been refactored to consume this common schedule. Canonicalization also
 removes identity reshape/broadcast nodes and collapses reshape chains before
 backend lowering, avoiding unnecessary layout copies.
+The base plan remains `Unplaced`, while `kernel_ir_with_placements(...)` can
+apply validated typed compiler metadata without changing execution: a
+`TensorDeviceId`, shaped `TensorDeviceMesh`, and
+`TensorPartitionSpec::{Replicated, Sharded}`. This is an IR contract only; no
+backend lowers it to multi-device work yet.
 
 `examples/benchmark_pinn_cuda.py` records reproducible compilation, warm-up,
 and synchronized device-resident Poisson PINN Adam-step timings, including
@@ -539,12 +556,41 @@ shape, transfer, and buffer-stability metadata. It is present for the P4
 acceptance measurement but remains unexecuted until the configured CUDA host
 has a visible GPU driver and its runtime libraries.
 
+`examples/benchmark_pinn_mlx.py` records the corresponding MLX compile,
+warm-up, fixed-shape training-step, dtype, device, synchronization, and
+transfer metadata. On the local Apple silicon host (2026-07-28), its
+1,000-step baseline was 1,906.15 steps/s (0.525 ms/step) for the one-parameter,
+seven-point Poisson PINN; loss decreased from `5.51` to `1.28e-12`. This is a
+local small-graph baseline, not a cross-backend or large-model performance
+claim.
+`examples/benchmark_mlp_value_and_grad_mlx.py` additionally records the
+compile, warm-up, and steady-state timing of a batched two-layer MLP scalar
+value-and-gradient specialization. It explicitly includes dynamic input upload
+and loss/gradient diagnostic readback in each timed call, separating that
+end-to-end measurement from the device-resident optimizer benchmark. On the
+same local Apple silicon host (2026-07-28), its batch-256, width-64 baseline
+was 2,699.41 calls/s (0.370 ms/call); this is likewise not a cross-backend
+comparison.
+`examples/benchmark_forward_mlx.py` records corresponding end-to-end batched
+matmul and two-layer MLP forward baselines. Its explicit host transfer and
+materialization metadata prevents those diagnostics from being interpreted as
+device-only kernel throughput. `TensorMlxExecutionPlan.evaluate_device(...)`
+also evaluates and synchronizes a primal output without materializing it on
+the host, so the same script can exclude output readback while still reporting
+the dynamic host-input upload that remains in each invocation.
+`TensorMlxExecutionPlan.retain_inputs(...)` now retains selected static
+bindings across primal calls, and `benchmark_forward_mlx.py
+--retain-static-inputs` records that mode separately from the all-dynamic
+baseline. On the same host (2026-07-28), retaining static weights improved a
+batch-256, feature-64, output-64 matmul from 0.182 to 0.172 ms/call and a
+two-layer width-128 MLP from 0.231 to 0.221 ms/call. These device-only
+measurements exclude output readback but still include dynamic-input upload.
+
 `fusion_regions()` now exposes maximal elementwise partitions with explicit
 materialized inputs. It prevents unsafe fusion across values consumed by a
 non-elementwise operation, such as a matmul, and is the lowering contract for
-partial CUDA fusion. CUDA source-level tests and feature Clippy cover this
-executor path; runtime parity remains pending a host with a visible NVIDIA
-driver and runtime libraries.
+partial CUDA fusion. The configured GTX 1660 SUPER passed driver-backed fusion,
+buffer reuse, symbolic VJP, and device optimizer coverage on 2026-07-28.
 
 Acceptance checks:
 
@@ -562,17 +608,123 @@ programs without tracing arbitrary Python control flow.
 - Define JVP/VJP semantics for each control-flow operation and reject
   data-dependent Python branches during tracing.
 
-Implementation status (2026-07-16): `tensor_jit_batch_fn(...)` provides the
+Implementation status (2026-07-27): `tensor_jit_batch_fn(...)` provides the
 first bounded-specialization path for CPU plans. It traces lazily on the first
 observed mapped batch size, caches a fixed number of batch-size plans, and
-rejects changes to non-batch dimensions or unmapped inputs. Symbolic dimensions,
-CUDA/MLX batch specialization and explicit control-flow IR remain pending.
+rejects changes to non-batch dimensions or unmapped inputs.
+`tensor_value_and_grad_batch_fn(...)` uses the same cache contract for scalar
+losses and performs their VJP from the frozen plan, so variable collocation
+batch sizes now have a CPU reference for both values and gradients.
+`tensor_value_and_grad_batch_mlx_fn(...)` mirrors that bounded specialization
+contract on MLX for requested scalar-loss gradients, with one multi-output GPU
+plan per batch size and explicit result readback.
+`tensor_jit_batch_cuda_fn(...)` and
+`tensor_value_and_grad_batch_cuda_fn(...)` now provide the same bounded cache
+contract for CUDA primal and scalar value-and-gradient plans. Their Rust
+runtime coverage now passes on the configured Linux host with `libnvrtc.so`.
+Symbolic
+dimensions and explicit control-flow IR remain pending.
 `TraceTensor.__bool__` now rejects data-dependent Python branches explicitly,
 so tracing cannot silently specialize to one host-side branch.
-`tensor_fori_loop(...)` statically unrolls fixed host-integer bounds with a
-same-graph, shape-preserving TraceTensor carry; dynamic loop IR and `scan`/
-`cond` remain pending. `tensor_scan(...)` statically unrolls a fixed-length
-carry/output loop and stacks its fixed-shape TraceTensor outputs.
+`tensor_cond_fn(...)` now freezes true/false CPU branch regions and evaluates
+only the host-boolean-selected branch; its scalar value-and-gradient variant
+selects the matching branch VJP, while `tensor_cond_jvp_fn(...)` selects its
+matching JVP. This establishes lazy branch semantics without misrepresenting
+`where` as control flow. `TensorRegion` and `TensorCondExecutionPlan` now own
+the identical-capture validation and selected-branch primal/JVP/VJP execution
+in `nabla-core`, rather than leaving this contract in the Python bridge.
+`TensorOp::Cond` now owns two frozen `TensorRegion` plans plus ordered,
+explicit named capture bindings to parent node IDs. CPU execution evaluates the
+scalar predicate first and materializes only the selected branch; DCE, remap,
+buffer planning, direct JVP, and direct VJP preserve those bindings. The
+current regression covers a capture from a parent intermediate, lazy inactive
+branch failure avoidance, and branch-selected first-order derivatives.
+`tensor_cond(predicate, on_true, on_false, operands)` exposes the same
+contract to Python tracing, including nested CPU regions. Its operands are the
+only legal branch captures. Symbolic JVP and VJP now rewrite `Cond` regions:
+they preserve the predicate and use branch-selected primal/tangent or gradient
+regions. Region transform outputs retain a stable capture ABI even if DCE
+would otherwise remove an unused capture in one branch. Public scalar
+Hessian/HVP calls through `Cond` compose symbolic VJP with symbolic JVP, so
+second coordinate derivatives needed by PINNs work on CPU. General mixed and
+higher-order region transforms remain pending. CUDA and MLX explicitly reject
+`Cond` before device lowering; neither backend eagerly materializes both
+branches. Vmappable conditional predicates remain pending.
+`tensor_fori_loop(...)` remains the compatibility API that statically unrolls
+fixed host-integer bounds with a same-graph, shape-preserving TraceTensor
+carry. `TensorForiExecutionPlan` now owns a frozen fixed-bounds body region:
+CPU primal execution iterates its carry at runtime, JVP propagates carry and
+explicit-capture tangents, and VJP records a carry tape then replays body VJPs
+in reverse. `TensorOp::Fori` embeds that plan in parent Tensor IR with explicit
+capture bindings; DCE/remap, CPU execution, direct JVP/VJP, text lowering, and
+CPU compilation preserve the region boundary. `tensor_fori_loop_region(lower,
+upper, body, init, operands)` exposes one-time Python tracing of
+`body(index, carry, *operands)`, where the scalar index is a TraceTensor and
+all external captures are explicit. CUDA and MLX reject `Fori` before device
+lowering, and batch specialization rejects it rather than silently unrolling
+or changing layout. Symbolic JVP through `Fori` packs primal/tangent carries
+into one fixed-shape region carry, so transformed graphs preserve a runtime
+loop rather than statically expanding it. Symbolic VJP through `Fori` uses a
+fixed-bound carry tape and grouped `ForiVjp` result nodes, so gradients of the
+initial carry and explicit captures reuse one reverse loop. JVP through a
+`ForiVjp` result is still unsupported; consequently, Hessian/HVP through
+`Fori` do not yet use a compiled forward-over-reverse transform. The CPU mixed
+direction evaluator now propagates value, both tangent directions, and their
+mixed carry through fixed `Fori` recurrences, so public exact
+`hessian_scalar`/`hvp_scalar` calls work for loops today. `tensor_scan(...)`
+still statically unrolls a fixed-length carry/output loop and stacks its
+fixed-shape TraceTensor outputs. The core now also has
+`TensorScanExecutionPlan`: it executes one frozen two-result body region and
+returns final carry plus a leading-time-axis output stack. Its direct JVP
+returns carry/output primals and tangents without unrolling the body plan.
+Direct VJP replays a forward carry tape and jointly differentiates carry/output
+cotangents at each reverse body step. The parent multi-result IR node and
+Python region API remain pending.
+
+Control-flow implementation order:
+
+1. Add a private `TensorRegion` representation containing a region-local node
+   list, ordered explicit capture bindings, and one output. Captures must be
+   shape-checked at construction; a region cannot implicitly read a parent
+   value by node ID.
+2. Add a scalar-predicate `Cond` node whose true and false regions have the
+   same output shape. The CPU evaluator must evaluate the predicate first and
+   invoke only the selected region, preserving errors and side-effect-free
+   numerical semantics of the unselected branch.
+3. Define transforms structurally. JVP emits a conditional over transformed
+   branches with the original predicate. VJP emits branch-local reverse
+   regions and routes cotangents only through the selected region; predicates
+   are non-differentiable. Mixed directional transforms must use the same
+   selected branch contract.
+4. Update lowering, canonicalization, DCE, buffer planning, and kernel-IR
+   validation to either preserve region boundaries or reject unsupported
+   region lowering explicitly. CUDA and MLX must reject `Cond` until they have
+   device-predicate lowering; neither may eagerly materialize both branches.
+5. Expose a traced Tensor-predicate API only after the core contract passes:
+   lazy inactive-branch tests, primal/JVP/VJP finite-difference checks,
+   nested-condition coverage, and backend rejection tests. `fori_loop` and
+   `scan` reuse this region representation in a later increment rather than
+   introducing unrelated loop encodings.
+
+Next control-flow implementation order:
+
+1. Add a structural JVP rule for grouped `ForiVjp` results, preserving their
+shared reverse-loop cache and replacing the CPU mixed-direction fallback with
+a compiled forward-over-reverse Hessian/HVP path for fixed loops.
+2. Add a region-backed `scan` node with fixed-shape carry/output invariants,
+   direct and symbolic AD, and a Python tracing API that does not unroll its
+   body graph.
+3. Lower structured loops to MLX and CUDA device control flow, then add
+   vmappable loop semantics and distributed placement rules.
+
+Implementation note (2026-07-29): `TensorForiTape` retains the fixed-bound
+forward carry sequence and is reused by direct and symbolic reverse paths.
+`TensorMultiRegion` and `TensorForiMultiExecutionPlan` retain shared
+multi-output body plans, execute independently shaped carries in one loop, and
+reverse all body outputs jointly in each iteration. Parent `ForiVjp` nodes
+select the initial-carry or explicit-capture gradient and share one cached
+reverse pass per source loop. These nodes are intentionally CPU-only and do
+not yet support a further JVP or MLX/CUDA lowering.
 
 Acceptance checks:
 
@@ -584,27 +736,91 @@ Acceptance checks:
 Goal: make the Apple backend a usable training backend rather than primal-only
 execution.
 
-Implementation status (2026-07-16): `tensor_value_and_grad_mlx_fn(...)`
+Implementation status (2026-07-24): `tensor_value_and_grad_mlx_fn(...)`
 lowers a scalar loss and its requested symbolic VJP gradients into one
-multi-output MLX plan. The backend evaluates the shared graph once before
-materializing each requested result. Device-resident parameters, gradient
-buffers, and Adam state are still pending, so this is value-and-grad parity,
-not yet an efficient training loop.
+multi-output MLX plan. `mlx_adam_loss_optimizer(...)` retains selected static
+inputs, parameters, gradient outputs, and bias-corrected Adam moments across
+steps; the MLX executor evaluates updates on `StreamOrDevice::gpu()` and does
+not materialize parameters or gradients on the host during `step()`. `loss()`
+and `parameters()` are explicit diagnostic readbacks. The training API has
+scalar-loss parity for its supported Tensor IR operations. The fixed-shape
+one-parameter Poisson PINN in `examples/pinn_poisson_mlx.py` combines PDE and
+boundary terms into one graph, converges on MLX, and checks its final parameter
+against the CPU reference within `2e-3`. The two-layer Poisson MLP integration
+in `examples/pinn_mlp_mlx.py` covers second coordinate derivatives, four
+device-resident Adam parameters, residual and boundary losses, and CPU parity.
+Its MLX-gated integration test reaches residual below `1e-5`, boundary loss
+below `1e-5`, and maximum CPU/MLX parameter difference below `2e-3` after
+1,500 fixed-shape steps. Broader MLX performance validation remains pending.
+Unretained mini-batch inputs can be supplied to `step(inputs)` and replace only
+their host binding; retained parameters and Adam moments stay on the device.
+Contiguous rank-N `Slice` and reverse-mode `PadSlice` now lower to MLX
+device-side take/pad operations; primal and symbolic-VJP parity are covered
+against the CPU reference.
 
-- Lower rank-N `slice` and internal `pad_slice` correctly on MLX.
-- Add MLX device-resident parameters, gradients, and Adam state.
-- Expose MLX `value_and_grad` and training APIs with the same semantic contract
-  as CUDA for supported operations.
+Remaining work is performance validation on representative larger MLP/PINN
+workloads; no MLX result is presented as a CUDA/JAX comparison.
 
 Acceptance checks:
 
-- The P1 PINN example runs on MLX and agrees with CPU within its `f32`
-  tolerance.
+- The P1-style one-parameter Poisson PINN runs on MLX and agrees with CPU
+  within its `f32` tolerance. Completed by
+  `test_mlx_poisson_pinn_matches_cpu_reference`.
 
 ### P7. Distributed Sharding
 
 Goal: add multi-device execution only after single-device plans, layout, and
 memory contracts are stable.
+
+Implementation status (2026-07-27): typed `TensorPlacement` metadata now
+models unplaced, single-device, and mesh placement. Mesh validation rejects
+duplicate devices, invalid topology, unknown mesh axes, out-of-range tensor
+axes, and static extents that cannot be evenly sharded. Existing Python
+`kernel_ir()` output continues to project the default placement as
+`"unplaced"`; there is no distributed execution, implicit copy, or collective.
+`kernel_ir_with_placement_propagation(...)` is an opt-in compiler check that
+propagates supported local placements through elementwise operations,
+transpose, and broadcast. It rejects mixing a placed tensor with an unplaced
+non-scalar, reductions over a sharded axis, sharded matmul/solve/triangular
+operations, and reshape or slice cases that require redistribution. It does
+not insert copies or collectives.
+`TensorExecutionPlan::sharding_plan(...)` extends that contract for legal
+sharded reductions: it emits an ordered backend-neutral `TensorAllReduce`
+schedule after each replica-local reduction and changes that result's
+placement to replicated on the same mesh. The schedule distinguishes `Sum`
+from `Mean`; a CUDA/NCCL backend must still lower and execute it. Sharded
+matmul, solve, triangular, reshape, and slice redistribution remain rejected.
+`TensorCpuExecutionPlan.value_and_grad_data_parallel(...)` exposes the same
+reference from Python. `TensorExecutionPlan::value_and_vjp_data_parallel(...)`
+is the deterministic CPU scalar-loss reference: it rebuilds a shape-specialized
+IR for equal axis-zero shards, aggregates replica-local `Sum` or `Mean` losses
+explicitly, concatenates mapped-input gradients, and adds replicated gradients
+in increasing shard order. It has single-device VJP parity coverage but does
+not yet spawn CPU workers or lower any collective.
+
+Entry contract before implementation:
+
+- Replace the current string-only neutral placement with typed core metadata:
+  `DeviceId { backend, ordinal }`, `DeviceMesh { devices, axis_names }`, and
+  `PartitionSpec::{Replicated, Sharded { tensor_axis, mesh_axis }}`. Keep the
+  existing Python `kernel_ir()` placement string as a compatibility projection
+  until a versioned structured representation is available.
+- A sharded value must name both its mesh axis and tensor axis. Validation must
+  reject duplicate devices, unknown mesh axes, out-of-range tensor axes, and
+  a non-divisible static tensor extent before execution begins.
+- Placement propagation is explicit: elementwise inputs must share a compatible
+  partition, reductions over a sharded axis require an all-reduce, and matmul
+  must reject unsupported partition pairs rather than inserting a host copy.
+  `reshape` may preserve placement only when it does not split or merge the
+  sharded axis.
+- The first executable reference is deterministic CPU data parallelism for a
+  scalar loss: shard mapped axis-zero inputs, evaluate each replica, then add
+  named gradients in increasing mesh-device order. It is the oracle for CUDA
+  collective tests, not a claim of CPU scaling. Implemented without worker
+  parallelism; the next step is its CUDA collective equivalent.
+- CUDA NCCL lowering begins only after that reference proves single-device and
+  two-shard loss/gradient equivalence. Collective timing is reported separately
+  from compute and host/device transfer timing.
 
 - Model mesh, placement, and partition specifications in IR metadata.
 - Implement data parallelism first, including deterministic gradient
@@ -624,3 +840,16 @@ macro over a pure, restricted Rust expression subset and compare it against
 Tensor IR AD and Enzyme. Do not claim support for arbitrary borrowing,
 mutation, dynamic dispatch, async code, or Python callbacks until their
 semantics are explicitly modeled and tested.
+
+Implementation status (2026-07-27): the `nabla-macros` procedural-macro crate
+exports `forward_diff!(|x| expression)`. It parses a one-argument closure and
+rewrites the parameter to a `Dual::variable` seed at expansion time, so Rust's
+operator and method resolution produces forward-mode value/derivative pairs
+without a runtime tape. Analytic tests cover captured scalar constants, block
+expressions, elementary methods, and `powi`. This is a source-level prototype,
+not general source-to-source AD: mutation, arbitrary control flow, multiple
+outputs, and type-generic captures remain unsupported.
+`forward_gradient!(|x, y, ...| scalar_expression)` now adds an ordered
+multi-input scalar gradient by expanding one Dual seed per input and returning
+`ForwardGradient`. It is intentionally O(input dimension); dense Jacobian,
+HVP, and reverse-mode source transforms remain future work.

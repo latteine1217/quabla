@@ -366,6 +366,16 @@ dependencies = [
  "cudarc",
  "libloading 0.8.9",
  "mlx-rs",
+ "nabla-macros",
+]
+
+[[package]]
+name = "nabla-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

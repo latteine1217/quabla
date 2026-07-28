@@ -6,6 +6,29 @@ pub struct Dual {
     derivative: f64,
 }
 
+/// Primal scalar value and an ordered forward-mode gradient.
+///
+/// `forward_gradient!` preserves the closure parameter order in `gradient`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForwardGradient {
+    value: f64,
+    gradient: Vec<f64>,
+}
+
+impl ForwardGradient {
+    pub fn new(value: f64, gradient: Vec<f64>) -> Self {
+        Self { value, gradient }
+    }
+
+    pub fn value(&self) -> f64 {
+        self.value
+    }
+
+    pub fn gradient(&self) -> &[f64] {
+        &self.gradient
+    }
+}
+
 impl Dual {
     pub fn new(value: f64, derivative: f64) -> Self {
         Self { value, derivative }
