@@ -924,6 +924,27 @@ recorded in P6.
 1. Keep arbitrary indexed or non-elementwise unequal-lane Scan bodies as
    explicit CUDA rejections until their reduction structure is represented in
    device reverse IR; add a rejection test for every unsupported form.
+
+   Status (2026-09-27): the rejection matrix is covered at CUDA compile
+   time. `test_compiler_facade_cuda_rejects_every_unsupported_scan_lane_form`
+   covers primal Scan (reduced output, output-shaped capture on unequal
+   lanes, capture incompatible with an equal-count output reshape, matmul,
+   in-body reduction, transpose, indexed gather, layout-changing reshape),
+   `ScanVjp` (non-direct-broadcast unequal output, layout-changing reshape,
+   in-body capture reduction, VJP of a packed-pair Scan JVP), and
+   `ScanVjpJvp` (layout-changing reshape, in-body capture reduction); the
+   existing indexed unequal-lane HVP test remains.
+   `test_compiler_facade_rejects_scan_derivatives_beyond_forward_over_reverse`
+   covers VJP of `ScanVjp` and JVP of `ScanVjpJvp`. The audit found two
+   forms that CUDA had accepted with wrong numbers. A reshape that moves a
+   broadcast axis, such as a `[2, 1]` capture reshaped to `[1, 2]` or a
+   reshape before an unequal-lane broadcast, is now rejected unless it only
+   adds or drops leading unit axes, or has equal lanes with scalar or
+   carry-sized captures. Packed-pair bodies (symbolic Scan JVP) read the
+   partner half through slice/concat. The primal kernel now holds both
+   halves in registers per thread instead of rejecting them, because
+   accepted CUDA HVP programs keep a packed JVP Scan live. GTX 1660 SUPER
+   parity covers nonlinear Scan JVP and a row-swap body.
 2. P7 needs a host exposing at least two CUDA devices and NCCL. When that
    prerequisite is available, connect the typed sharding schedule to the
    Python training interface, add two-GPU loss/gradient parity, then measure

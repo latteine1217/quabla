@@ -973,6 +973,175 @@ def test_compiler_facade_cuda_executes_packed_pair_scan_bodies():
     assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
 
+def _scan_rejection_program(body, carry_shape, capture_shape, result="outputs"):
+    def function(initial, capture):
+        carry, outputs = nabla.tensor_scan_region(0, 2, body, initial, [capture])
+        if result == "loss":
+            return carry.sum() + outputs.sum()
+        return outputs
+
+    return nabla.Compiler().trace(
+        function, [("initial", carry_shape), ("capture", capture_shape)]
+    )
+
+
+def test_compiler_facade_cuda_rejects_every_unsupported_scan_lane_form():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    def primal(body, carry_shape, capture_shape):
+        return _scan_rejection_program(body, carry_shape, capture_shape)
+
+    def gradient(body, carry_shape, capture_shape, name):
+        program = _scan_rejection_program(body, carry_shape, capture_shape, "loss")
+        return program.vjp("loss_cotangent")[name]
+
+    def hvp(body, carry_shape, capture_shape):
+        return gradient(body, carry_shape, capture_shape, "capture").jvp("capture")
+
+    reshaped_capture = lambda index, current, capture: (
+        (current * capture.reshape([1, 2])).tanh(),
+        (current * capture.reshape([1, 2])).tanh(),
+    )
+    scalar_capture = lambda index, current, capture: (
+        current * capture.tanh(),
+        current * capture.tanh(),
+    )
+    linear = lambda index, current, capture: (
+        current * capture + index,
+        current * capture + index,
+    )
+    cases = [
+        # Primal Scan: lane shapes and capture shapes.
+        (
+            "reduced per-step output",
+            primal(lambda i, c, s: (c * s, (c * s).sum()), [3], [3]),
+            "must broadcast the carry shape",
+        ),
+        (
+            "output-shaped capture on unequal lanes",
+            primal(lambda i, c, s: (c + i, c.broadcast_to([2, 3]) * s), [2, 1], [2, 3]),
+            "cannot broadcast to carry shape",
+        ),
+        (
+            "capture that cannot follow an equal-count output reshape",
+            primal(lambda i, c, s: (c * s, (c * s).reshape([6])), [2, 3], [3]),
+            "cannot broadcast to output shape",
+        ),
+        # Primal Scan: non-elementwise and indexed bodies.
+        (
+            "matmul body",
+            primal(lambda i, c, w: (c.matmul(w), c.matmul(w)), [2, 2], [2, 2]),
+            "unsupported matmul operation",
+        ),
+        (
+            "reduction inside the body",
+            primal(lambda i, c, s: (c - c.sum() * s, c * s), [3], []),
+            "unsupported sum operation",
+        ),
+        (
+            "transpose body",
+            primal(lambda i, c, s: (c.transpose() * s, c * s), [2, 2], []),
+            "unsupported transpose operation",
+        ),
+        (
+            "indexed gather on an unpacked carry",
+            primal(lambda i, c, s: (c.gather([2, 0, 1], 0) * s, c * s), [3], [3]),
+            "unsupported slice operation",
+        ),
+        (
+            "reshape that moves a capture axis",
+            primal(reshaped_capture, [2, 2], [2, 1]),
+            "changes the per-lane broadcast layout",
+        ),
+        (
+            "reshape before an unequal-lane broadcast",
+            primal(
+                lambda i, c, s: (c * s, (c * s).reshape([1, 2]).broadcast_to([2, 2])),
+                [2, 1],
+                [1],
+            ),
+            "changes the per-lane broadcast layout",
+        ),
+        # First-order ScanVjp.
+        (
+            "VJP of an indexed unequal-lane output",
+            gradient(
+                lambda i, c, s: (c * s + i, (c * s + i).broadcast_to([2, 3]) + i),
+                [2, 1],
+                [2, 1],
+                "initial",
+            ),
+            "requires a direct broadcast from the carry shape",
+        ),
+        (
+            "VJP through a capture reshape",
+            gradient(reshaped_capture, [2, 2], [2, 1], "capture"),
+            "changes the per-lane broadcast layout",
+        ),
+        (
+            "VJP needing an in-body capture reduction",
+            gradient(scalar_capture, [3], [], "capture"),
+            "did not expose an elementwise contribution",
+        ),
+        (
+            "VJP of a packed-pair Scan JVP",
+            _scan_rejection_program(linear, [3], [3], "loss")
+            .jvp("initial")
+            .vjp("jvp_cotangent")["initial"],
+            "unsupported pad_slice operation",
+        ),
+        # Forward-over-reverse ScanVjpJvp.
+        (
+            "HVP through a capture reshape",
+            hvp(reshaped_capture, [2, 2], [2, 1]),
+            "changes the per-lane broadcast layout",
+        ),
+        (
+            "HVP needing an in-body capture reduction",
+            hvp(scalar_capture, [3], []),
+            "did not expose an elementwise contribution",
+        ),
+    ]
+    for label, program, expected in cases:
+        try:
+            program.compile("cuda")
+        except ValueError as error:
+            assert expected in str(error), f"{label}: {error}"
+        else:
+            raise AssertionError(f"CUDA accepted unsupported Scan form: {label}")
+
+
+def test_compiler_facade_rejects_scan_derivatives_beyond_forward_over_reverse():
+    gradient = _scan_rejection_program(
+        lambda index, current, capture: (
+            (current * capture).tanh(),
+            (current * capture).tanh(),
+        ),
+        [2],
+        [2],
+        "loss",
+    ).vjp("loss_cotangent")["capture"]
+    cases = [
+        (
+            "VJP of a Scan VJP",
+            lambda: gradient.vjp("second_cotangent"),
+            "symbolic VJP through a Scan VJP result is not implemented",
+        ),
+        (
+            "JVP of a Scan VJP JVP",
+            lambda: gradient.jvp("capture").jvp("initial"),
+            "symbolic JVP through a Scan VJP JVP result is not implemented",
+        ),
+    ]
+    for label, transform, expected in cases:
+        try:
+            transform()
+        except ValueError as error:
+            assert expected in str(error), f"{label}: {error}"
+        else:
+            raise AssertionError(f"accepted unsupported Scan derivative: {label}")
+
 
 
 def test_trace_tensor_batched_matmul_scalar_loss_vjp():
