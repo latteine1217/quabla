@@ -526,9 +526,10 @@ Current migration status:
 - The facade owns the new rank-N `TensorTraceGraph` lifecycle.
 - Single-output CPU helpers (`tensor_jit_fn`, `tensor_*grad*_fn`, `tensor_vjp_fn`,
   `tensor_jvp_fn`, `tensor_jacobian_fn`, CPU vmap, batch, and cond helpers)
-  compile through `NablaCompiler`; their public signatures and results are
-  unchanged. MLX, CUDA, and multi-output helpers still construct their own
-  plans; `docs/jax_like_roadmap.md` lists the migration plan.
+  and `tensor_vmap_mlx_fn` compile through `NablaCompiler`; their public
+  signatures and results are unchanged. CUDA and multi-output helpers still
+  construct their own plans; `docs/jax_like_roadmap.md` lists the migration
+  plan.
 - `Program.jvp(...)` is the one-named-input symbolic coordinate derivative;
   `Program.vjp(...)` returns one `Program` per original input. Runtime tangent
   maps and multi-output compiler programs remain lower-level Rust APIs.

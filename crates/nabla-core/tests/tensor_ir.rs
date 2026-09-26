@@ -83,6 +83,35 @@ fn compiler_facade_owns_program_transform_and_cpu_execution_lifecycle() {
 }
 
 #[test]
+fn compiler_facade_leaves_unbuilt_backend_errors_to_the_backend() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let doubled = must!(graph.add(x, x));
+    let compiler = NablaCompiler;
+    let program = must!(compiler.program(graph, doubled));
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![2], vec![1.0, 2.0])),
+    )]);
+
+    let cuda = NablaTarget::Cuda { device_ordinal: 0 };
+    if !cuda.is_built() {
+        let error = compiler
+            .compile(&program, cuda)
+            .expect_err("an unbuilt CUDA backend must reject compilation");
+        assert!(error.contains("build Nabla on Linux with --features cuda"));
+    }
+    if !NablaTarget::Mlx.is_built() {
+        // Python MLX helpers construct lazily and fail on first execution.
+        let executable = must!(compiler.compile(&program, NablaTarget::Mlx));
+        let error = executable
+            .execute(&inputs)
+            .expect_err("an unbuilt MLX backend must reject execution");
+        assert!(error.contains("--features mlx"));
+    }
+}
+
+#[test]
 fn stablehlo_export_preserves_a_pure_elementwise_static_graph() {
     let mut graph = TensorIr::new();
     let x = must!(graph.input("x", vec![2]));

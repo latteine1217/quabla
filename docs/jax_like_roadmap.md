@@ -192,10 +192,13 @@ than silently treating one output lane as one carry lane.
 Helper migration plan (2026-09-27): every rank-N Python helper is classified
 against the current single-output facade contract. Category (a) helpers
 compile one traced output; migrated targets delegate through
-`TensorTraceGraph::compile_cpu_plan`, which builds a `NablaProgram` from a
-snapshot of the traced IR and calls `NablaCompiler::compile`.
-`Program.compile("cpu")` and the legacy `compile_cpu` methods share the same
-path. The snapshot is one extra IR clone per compilation: constructing a
+`TensorTraceGraph::compile_{cpu,mlx}_plan`, which build a `NablaProgram` from
+a snapshot of the traced IR and call `NablaCompiler::compile`.
+`Program.compile(...)` and the legacy `compile_cpu`/`compile_mlx` methods
+share the same path. `NablaCompiler::compile` no longer rejects unbuilt
+targets up front: `capability()` reports build availability, and an unbuilt
+backend rejects the program itself (CUDA at compile time, MLX on first
+execution), which is the error contract the Python helpers already expose. The snapshot is one extra IR clone per compilation: constructing a
 `tensor_jit_fn` over a 2,000-step `tanh` chain moved from 2.38 ms to 2.55 ms
 median on the local Apple-silicon host; execution is unchanged. CPU
 derivative helpers keep evaluating their derivative with the frozen plan's
@@ -206,7 +209,7 @@ numerics and operation coverage, so it is not part of this migration.
 | Category | Helpers | Status |
 | --- | --- | --- |
 | (a) CPU | `tensor_jit_fn`, `tensor_grad_scalar_fn`, `tensor_value_and_grad_fn`, `tensor_hessian_scalar_fn`, `tensor_hvp_scalar_fn`, `tensor_vjp_fn`, `tensor_jvp_fn`, `tensor_jacobian_fn`, `tensor_vmap_fn`, `tensor_vmap_vjp_fn`, `tensor_vmap_jvp_fn`, `tensor_vmap_hvp_scalar_fn`, `tensor_jit_batch_fn`, `tensor_value_and_grad_batch_fn` (per specialization), `tensor_cond_fn`, `tensor_cond_value_and_grad_fn`, `tensor_cond_jvp_fn` (one program per branch) | Delegates through the facade |
-| (a) MLX | `tensor_vmap_mlx_fn` | Planned |
+| (a) MLX | `tensor_vmap_mlx_fn` | Delegates through the facade |
 | (a) CUDA | `tensor_jit_cuda_fn`, `tensor_vmap_cuda_fn`, `tensor_vmap_hvp_scalar_cuda_fn`, `tensor_jit_batch_cuda_fn` (per specialization) | Planned |
 | (b) Multi-output program | `tensor_value_and_grad_{mlx,cuda}_fn`, `tensor_value_and_grad_batch_{mlx,cuda}_fn`, `tensor_vmap_{vjp,jvp}_{mlx,cuda}_fn`, `mlx_adam_loss_optimizer`, `cuda_adam_vjp_optimizer`, `cuda_adam_loss_optimizer` | Next step |
 | (c) Separate | `tensor_value_and_grad_data_parallel_cuda_fn`, `cuda_adam_optimizer`, `cuda_adam_step`, trace-time region builders (`tensor_cond`, `tensor_fori_loop*`, `tensor_scan*`), eager graph evaluation methods, legacy 2D `TraceGraph` | Stays outside the facade |
