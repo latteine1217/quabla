@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use nabla_core::tensor_ir::{
-    CudaBackend, CudaExecutionPlan, DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs,
-    TensorBackend, TensorCondExecutionPlan, TensorExecutionPlan, TensorForiExecutionPlan, TensorIr,
-    TensorNodeId, TensorReplicaReduction,
+    CudaBackend, CudaDataParallelExecutionPlan, CudaDataParallelTiming, CudaExecutionPlan,
+    DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs, TensorBackend,
+    TensorCondExecutionPlan, TensorExecutionPlan, TensorForiExecutionPlan, TensorIr, TensorNodeId,
+    TensorReplicaReduction, TensorScanExecutionPlan,
 };
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
@@ -51,14 +52,14 @@ fn extract_reduction_axes(axis: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Ve
 #[pyclass(name = "TensorTraceGraph", skip_from_py_object)]
 #[derive(Clone, Debug, Default)]
 pub struct TensorTraceGraph {
-    ir: Arc<Mutex<TensorIr>>,
+    pub(crate) ir: Arc<Mutex<TensorIr>>,
 }
 
 #[pyclass(name = "TraceTensor", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct TraceTensor {
     graph: TensorTraceGraph,
-    node_id: TensorNodeId,
+    pub(crate) node_id: TensorNodeId,
     shape: Vec<usize>,
     // vmap canonicalizes the mapped dimension to axis zero while tracing.
     // Normal traces have no mapped axis.
@@ -68,27 +69,27 @@ pub struct TraceTensor {
 #[pyclass(name = "TensorTraceResult", skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct TensorTraceResult {
-    graph: TensorTraceGraph,
-    output: TraceTensor,
+    pub(crate) graph: TensorTraceGraph,
+    pub(crate) output: TraceTensor,
 }
 
 #[pyclass(name = "TensorCpuExecutionPlan", skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct TensorCpuExecutionPlan {
-    plan: TensorExecutionPlan,
+    pub(crate) plan: TensorExecutionPlan,
 }
 
 #[pyclass(name = "TensorCudaExecutionPlan", skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct TensorCudaExecutionPlan {
-    plan: CudaExecutionPlan,
+    pub(crate) plan: CudaExecutionPlan,
 }
 
 #[pyclass(name = "TensorMlxExecutionPlan", skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct TensorMlxExecutionPlan {
-    plan: TensorExecutionPlan,
-    retained_inputs: Arc<Mutex<MlxRetainedInputs>>,
+    pub(crate) plan: TensorExecutionPlan,
+    pub(crate) retained_inputs: Arc<Mutex<MlxRetainedInputs>>,
 }
 
 #[pyclass(name = "TensorCudaAdamOptimizer", skip_from_py_object)]
@@ -305,12 +306,50 @@ pub struct TensorVmapCudaJvpFunction {
     tangent_names: BTreeMap<String, String>,
 }
 
+/// A per-example Hessian-vector product. The traced function must produce one
+/// scalar for every mapped example; internally Nabla differentiates their sum.
+#[pyclass(name = "TensorVmapHvpScalarFunction", skip_from_py_object)]
+pub struct TensorVmapHvpScalarFunction {
+    plan: TensorExecutionPlan,
+    signature: VmapSignature,
+    input_name: String,
+    input_axis: usize,
+    cotangent_name: String,
+    tangent_name: String,
+}
+
+/// CUDA counterpart of [`TensorVmapHvpScalarFunction`].
+#[pyclass(name = "TensorVmapCudaHvpScalarFunction", skip_from_py_object)]
+pub struct TensorVmapCudaHvpScalarFunction {
+    plan: TensorCudaExecutionPlan,
+    signature: VmapSignature,
+    input_name: String,
+    input_axis: usize,
+    cotangent_name: String,
+    tangent_name: String,
+}
+
 #[pyclass(name = "TensorCudaValueAndGradFunction", skip_from_py_object)]
 pub struct TensorCudaValueAndGradFunction {
     plan: TensorCudaExecutionPlan,
     loss_node_id: TensorNodeId,
     gradient_node_ids: BTreeMap<String, TensorNodeId>,
     cotangent_name: String,
+}
+
+#[pyclass(
+    name = "TensorCudaDataParallelValueAndGradFunction",
+    skip_from_py_object
+)]
+pub struct TensorCudaDataParallelValueAndGradFunction {
+    plan: CudaDataParallelExecutionPlan,
+    input_shapes: BTreeMap<String, Vec<usize>>,
+    mapped_input_names: BTreeSet<String>,
+    loss_node_id: TensorNodeId,
+    gradient_node_ids: BTreeMap<String, TensorNodeId>,
+    cotangent_name: String,
+    reduction: TensorReplicaReduction,
+    last_timing: Arc<Mutex<Option<CudaDataParallelTiming>>>,
 }
 
 #[pyclass(name = "TensorMlxValueAndGradFunction", skip_from_py_object)]
@@ -465,7 +504,15 @@ impl TensorTraceGraph {
         Ok(ir.lower_text())
     }
 
-    fn compile_cpu_plan(
+    fn stablehlo_text_ir(&self, output_node_id: TensorNodeId) -> Result<String, String> {
+        let ir = self
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        ir.stablehlo_text(output_node_id)
+    }
+
+    pub(crate) fn compile_cpu_plan(
         &self,
         output_node_id: TensorNodeId,
     ) -> Result<TensorCpuExecutionPlan, String> {
@@ -478,7 +525,7 @@ impl TensorTraceGraph {
         })
     }
 
-    fn compile_cuda_plan(
+    pub(crate) fn compile_cuda_plan(
         &self,
         output_node_id: TensorNodeId,
         device_ordinal: usize,
@@ -493,7 +540,7 @@ impl TensorTraceGraph {
             .map(|plan| TensorCudaExecutionPlan { plan })
     }
 
-    fn compile_mlx_plan(
+    pub(crate) fn compile_mlx_plan(
         &self,
         output_node_id: TensorNodeId,
     ) -> Result<TensorMlxExecutionPlan, String> {
@@ -513,14 +560,22 @@ impl TensorTraceGraph {
         output_node_ids: &[TensorNodeId],
         device_ordinal: usize,
     ) -> Result<(TensorCudaExecutionPlan, Vec<TensorNodeId>), String> {
+        let (plan, output_node_ids) = self.compile_cpu_multi_plan(output_node_ids)?;
+        CudaBackend::new(device_ordinal)
+            .compile(plan)
+            .map(|plan| (TensorCudaExecutionPlan { plan }, output_node_ids))
+    }
+
+    fn compile_cpu_multi_plan(
+        &self,
+        output_node_ids: &[TensorNodeId],
+    ) -> Result<(TensorExecutionPlan, Vec<TensorNodeId>), String> {
         let (plan, output_node_ids) = self
             .ir
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
             .compile_cpu_many(output_node_ids)?;
-        CudaBackend::new(device_ordinal)
-            .compile(plan)
-            .map(|plan| (TensorCudaExecutionPlan { plan }, output_node_ids))
+        Ok((plan, output_node_ids))
     }
 
     fn compile_mlx_multi_plan(
@@ -1403,7 +1458,7 @@ impl TensorTraceResult {
         Self { graph, output }
     }
 
-    fn symbolic_jvp_result(&self, input_name: &str) -> Result<Self, String> {
+    pub(crate) fn symbolic_jvp_result(&self, input_name: &str) -> Result<Self, String> {
         let ir = self
             .graph
             .ir
@@ -1429,7 +1484,10 @@ impl TensorTraceResult {
         ))
     }
 
-    fn symbolic_vjp_results(&self, cotangent_name: &str) -> Result<BTreeMap<String, Self>, String> {
+    pub(crate) fn symbolic_vjp_results(
+        &self,
+        cotangent_name: &str,
+    ) -> Result<BTreeMap<String, Self>, String> {
         let ir = self
             .graph
             .ir
@@ -1509,6 +1567,11 @@ impl TensorTraceGraph {
 
     fn lower_text(&self) -> PyResult<String> {
         self.lower_text_ir().map_err(PyValueError::new_err)
+    }
+
+    fn stablehlo_text(&self, output_node_id: TensorNodeId) -> PyResult<String> {
+        self.stablehlo_text_ir(output_node_id)
+            .map_err(PyValueError::new_err)
     }
 
     fn evaluate(
@@ -1996,7 +2059,7 @@ impl TensorCpuExecutionPlan {
             item.set_item("id", node.id)?;
             item.set_item("op", node.op)?;
             item.set_item("shape", node.shape)?;
-            item.set_item("dtype", node.dtype)?;
+            item.set_item("dtype", node.dtype.to_string())?;
             item.set_item("layout", node.layout)?;
             item.set_item("placement", node.placement.to_string())?;
             item.set_item("effect", node.effect)?;
@@ -2729,6 +2792,48 @@ impl TensorVmapCudaJvpFunction {
     fn __repr__(&self) -> String {
         format!(
             "TensorVmapCudaJvpFunction(node_count={})",
+            self.plan.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
+impl TensorVmapCudaHvpScalarFunction {
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.plan.plan.node_count()
+    }
+
+    #[getter]
+    fn backend(&self) -> &'static str {
+        if self.plan.plan.uses_cublas() {
+            "cublas"
+        } else {
+            "nvrtc"
+        }
+    }
+
+    fn __call__(&self, values: &Bound<'_, PyDict>, input_tangent: &PyTensor) -> PyResult<PyTensor> {
+        let inputs = vmap_hvp_inputs(
+            &self.signature,
+            values,
+            &self.cotangent_name,
+            &self.tangent_name,
+            self.input_axis,
+            input_tangent,
+        )?;
+        let value = self
+            .plan
+            .plan
+            .execute(&inputs)
+            .map_err(PyValueError::new_err)?;
+        vmap_hvp_output(value, self.input_axis)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorVmapCudaHvpScalarFunction(input_name={:?}, node_count={})",
+            self.input_name,
             self.plan.plan.node_count()
         )
     }
@@ -3567,6 +3672,35 @@ impl TensorVmapJvpFunction {
 }
 
 #[pymethods]
+impl TensorVmapHvpScalarFunction {
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.plan.node_count()
+    }
+
+    fn __call__(&self, values: &Bound<'_, PyDict>, input_tangent: &PyTensor) -> PyResult<PyTensor> {
+        let inputs = vmap_hvp_inputs(
+            &self.signature,
+            values,
+            &self.cotangent_name,
+            &self.tangent_name,
+            self.input_axis,
+            input_tangent,
+        )?;
+        let value = self.plan.evaluate(&inputs).map_err(PyValueError::new_err)?;
+        vmap_hvp_output(value, self.input_axis)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "TensorVmapHvpScalarFunction(input_name={:?}, node_count={})",
+            self.input_name,
+            self.plan.node_count()
+        )
+    }
+}
+
+#[pymethods]
 impl TensorCudaValueAndGradFunction {
     fn __call__(
         &self,
@@ -4138,19 +4272,40 @@ pub fn tensor_fori_loop_region(
             "tensor_fori_loop_region requires upper >= lower, got {upper} < {lower}"
         )));
     }
-    if init.batch_axis.is_some() || operands.iter().any(|operand| operand.batch_axis.is_some()) {
+    if init.batch_axis.is_none() && operands.iter().any(|operand| operand.batch_axis.is_some()) {
         return Err(PyValueError::new_err(
-            "tensor_fori_loop_region does not yet support vmapped carries or operands",
+            "tensor_fori_loop_region requires a vmapped carry when an operand is vmapped",
         ));
+    }
+    if init.batch_axis.is_some_and(|axis| axis != 0)
+        || operands
+            .iter()
+            .any(|operand| operand.batch_axis.is_some_and(|axis| axis != 0))
+    {
+        return Err(PyValueError::new_err(
+            "tensor_fori_loop_region only supports canonical batch axis zero",
+        ));
+    }
+    if let Some(batch_size) = init.batch_axis.map(|_| init.shape[0]) {
+        for operand in &operands {
+            if operand.batch_axis.is_some() && operand.shape.first() != Some(&batch_size) {
+                return Err(PyValueError::new_err(
+                    "tensor_fori_loop_region vmapped operands must share the carry batch size",
+                ));
+            }
+        }
     }
     for operand in &operands {
         init.same_graph(operand).map_err(PyValueError::new_err)?;
     }
 
     let body_graph = TensorTraceGraph::new();
-    let carry = body_graph
-        .add_input("__nabla_fori_carry", init.shape.clone())
-        .map_err(PyValueError::new_err)?;
+    let carry = if init.batch_axis.is_some() {
+        body_graph.add_batched_input("__nabla_fori_carry", init.shape.clone())
+    } else {
+        body_graph.add_input("__nabla_fori_carry", init.shape.clone())
+    }
+    .map_err(PyValueError::new_err)?;
     let index = body_graph
         .add_input("__nabla_fori_index", vec![])
         .map_err(PyValueError::new_err)?;
@@ -4158,12 +4313,18 @@ pub fn tensor_fori_loop_region(
         .iter()
         .enumerate()
         .map(|(index, operand)| {
-            body_graph
-                .add_input(
+            if operand.batch_axis.is_some() {
+                body_graph.add_batched_input(
                     &format!("__nabla_fori_capture_{index}"),
                     operand.shape.clone(),
                 )
-                .map_err(PyValueError::new_err)
+            } else {
+                body_graph.add_input(
+                    &format!("__nabla_fori_capture_{index}"),
+                    operand.shape.clone(),
+                )
+            }
+            .map_err(PyValueError::new_err)
         })
         .collect::<PyResult<Vec<_>>>()?;
     let mut arguments = vec![index, carry];
@@ -4179,9 +4340,9 @@ pub fn tensor_fori_loop_region(
             "tensor_fori_loop_region body returned a TraceTensor from a different graph",
         ));
     }
-    if output.batch_axis.is_some() {
+    if output.batch_axis != init.batch_axis {
         return Err(PyValueError::new_err(
-            "tensor_fori_loop_region body output cannot be vmapped",
+            "tensor_fori_loop_region body output must preserve the carry batch axis",
         ));
     }
     if output.shape != init.shape {
@@ -4216,7 +4377,185 @@ pub fn tensor_fori_loop_region(
         .map_err(PyValueError::new_err)?;
     let shape = ir.node_shape(node_id).map_err(PyValueError::new_err)?;
     drop(ir);
-    Ok(TraceTensor::from_node(parent_graph, node_id, shape, None))
+    Ok(TraceTensor::from_node(
+        parent_graph,
+        node_id,
+        shape,
+        init.batch_axis,
+    ))
+}
+
+/// Traces a fixed-bounds carry/output scan body once into a runtime Tensor IR
+/// region. `body` receives `(index, carry, *operands)` and returns
+/// `(next_carry, output)`.
+#[pyfunction]
+pub fn tensor_scan_region(
+    py: Python<'_>,
+    lower: usize,
+    upper: usize,
+    body: &Bound<'_, PyAny>,
+    init: TraceTensor,
+    operands: Vec<TraceTensor>,
+) -> PyResult<Py<PyTuple>> {
+    if upper <= lower {
+        return Err(PyValueError::new_err(format!(
+            "tensor_scan_region requires upper > lower, got {upper} <= {lower}"
+        )));
+    }
+    if init.batch_axis.is_none() && operands.iter().any(|operand| operand.batch_axis.is_some()) {
+        return Err(PyValueError::new_err(
+            "tensor_scan_region requires a vmapped carry when an operand is vmapped",
+        ));
+    }
+    if init.batch_axis.is_some_and(|axis| axis != 0)
+        || operands
+            .iter()
+            .any(|operand| operand.batch_axis.is_some_and(|axis| axis != 0))
+    {
+        return Err(PyValueError::new_err(
+            "tensor_scan_region only supports canonical batch axis zero",
+        ));
+    }
+    if let Some(batch_size) = init.batch_axis.map(|_| init.shape[0]) {
+        for operand in &operands {
+            if operand.batch_axis.is_some() && operand.shape.first() != Some(&batch_size) {
+                return Err(PyValueError::new_err(
+                    "tensor_scan_region vmapped operands must share the carry batch size",
+                ));
+            }
+        }
+    }
+    for operand in &operands {
+        init.same_graph(operand).map_err(PyValueError::new_err)?;
+    }
+
+    let body_graph = TensorTraceGraph::new();
+    let carry = if init.batch_axis.is_some() {
+        body_graph.add_batched_input("__nabla_scan_carry", init.shape.clone())
+    } else {
+        body_graph.add_input("__nabla_scan_carry", init.shape.clone())
+    }
+    .map_err(PyValueError::new_err)?;
+    let index = body_graph
+        .add_input("__nabla_scan_index", vec![])
+        .map_err(PyValueError::new_err)?;
+    let body_captures = operands
+        .iter()
+        .enumerate()
+        .map(|(index, operand)| {
+            if operand.batch_axis.is_some() {
+                body_graph.add_batched_input(
+                    &format!("__nabla_scan_capture_{index}"),
+                    operand.shape.clone(),
+                )
+            } else {
+                body_graph.add_input(
+                    &format!("__nabla_scan_capture_{index}"),
+                    operand.shape.clone(),
+                )
+            }
+            .map_err(PyValueError::new_err)
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let mut arguments = vec![index, carry];
+    arguments.extend(body_captures);
+    let result = body.call1(PyTuple::new(py, arguments)?)?;
+    let result = result.cast::<PyTuple>().map_err(|_| {
+        PyTypeError::new_err("tensor_scan_region body must return a (carry, output) tuple")
+    })?;
+    if result.len() != 2 {
+        return Err(PyTypeError::new_err(
+            "tensor_scan_region body must return exactly two values",
+        ));
+    }
+    let next = result
+        .get_item(0)?
+        .extract::<PyRef<'_, TraceTensor>>()
+        .map_err(|_| PyTypeError::new_err("tensor_scan_region carry must be a TraceTensor"))?;
+    let output = result
+        .get_item(1)?
+        .extract::<PyRef<'_, TraceTensor>>()
+        .map_err(|_| PyTypeError::new_err("tensor_scan_region output must be a TraceTensor"))?;
+    if !Arc::ptr_eq(&body_graph.ir, &next.graph.ir)
+        || !Arc::ptr_eq(&body_graph.ir, &output.graph.ir)
+    {
+        return Err(PyValueError::new_err(
+            "tensor_scan_region body returned a TraceTensor from a different graph",
+        ));
+    }
+    if next.batch_axis != init.batch_axis || output.batch_axis != init.batch_axis {
+        return Err(PyValueError::new_err(
+            "tensor_scan_region body results must preserve the carry batch axis",
+        ));
+    }
+    if next.shape != init.shape {
+        return Err(PyValueError::new_err(format!(
+            "tensor_scan_region body changed carry shape from {:?} to {:?}",
+            init.shape, next.shape
+        )));
+    }
+    let body_plan = body_graph
+        .ir
+        .lock()
+        .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
+        .compile_cpu_many(&[next.node_id, output.node_id])
+        .map_err(PyValueError::new_err)?
+        .0;
+    let scan_plan = TensorScanExecutionPlan::new(
+        lower,
+        upper,
+        body_plan,
+        "__nabla_scan_carry",
+        "__nabla_scan_index",
+    )
+    .map_err(PyValueError::new_err)?;
+    let parent_graph = init.graph.clone();
+    let captures = operands
+        .iter()
+        .enumerate()
+        .map(|(index, operand)| (format!("__nabla_scan_capture_{index}"), operand.node_id))
+        .collect();
+    let mut ir = parent_graph
+        .ir
+        .lock()
+        .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?;
+    let (carry_node_id, scan_output_node_id) = ir
+        .scan(init.node_id, scan_plan, captures)
+        .map_err(PyValueError::new_err)?;
+    let carry_shape = ir
+        .node_shape(carry_node_id)
+        .map_err(PyValueError::new_err)?;
+    let output_node_id = if init.batch_axis.is_some() {
+        let scan_shape = ir
+            .node_shape(scan_output_node_id)
+            .map_err(PyValueError::new_err)?;
+        let axes = std::iter::once(1)
+            .chain(std::iter::once(0))
+            .chain(2..scan_shape.len())
+            .map(|axis| axis as isize)
+            .collect();
+        ir.transpose(scan_output_node_id, Some(axes))
+            .map_err(PyValueError::new_err)?
+    } else {
+        scan_output_node_id
+    };
+    let output_shape = ir
+        .node_shape(output_node_id)
+        .map_err(PyValueError::new_err)?;
+    drop(ir);
+    Ok(PyTuple::new(
+        py,
+        [
+            TraceTensor::from_node(
+                parent_graph.clone(),
+                carry_node_id,
+                carry_shape,
+                init.batch_axis,
+            ),
+            TraceTensor::from_node(parent_graph, output_node_id, output_shape, init.batch_axis),
+        ],
+    )?
+    .unbind())
 }
 
 /// Statically unrolls a carry/output scan into the current Tensor IR.
@@ -4826,6 +5165,36 @@ fn vmap_gradient_outputs(
         .collect()
 }
 
+fn vmap_hvp_inputs(
+    signature: &VmapSignature,
+    values: &Bound<'_, PyDict>,
+    cotangent_name: &str,
+    tangent_name: &str,
+    input_axis: usize,
+    input_tangent: &PyTensor,
+) -> PyResult<BTreeMap<String, DynamicTensor>> {
+    let mut inputs = vmap_inputs(signature, values)?;
+    let tangent = move_axis(
+        input_tangent
+            .to_dynamic_tensor()
+            .map_err(PyValueError::new_err)?,
+        input_axis,
+        0,
+    )
+    .map_err(PyValueError::new_err)?;
+    inputs.insert(
+        cotangent_name.to_string(),
+        DynamicTensor::filled(vec![], 1.0).map_err(PyValueError::new_err)?,
+    );
+    inputs.insert(tangent_name.to_string(), tangent);
+    Ok(inputs)
+}
+
+fn vmap_hvp_output(output: DynamicTensor, input_axis: usize) -> PyResult<PyTensor> {
+    let output = move_axis(output, 0, input_axis).map_err(PyValueError::new_err)?;
+    PyTensor::from_dynamic_tensor(output).map_err(PyValueError::new_err)
+}
+
 /// Trace a fixed-size vectorized function into one reusable CPU plan.
 ///
 /// `input_specs` describes one example. Mapped inputs are canonicalized to a
@@ -4884,6 +5253,26 @@ fn compile_cuda_scalar_value_and_grad(
     TensorNodeId,
     BTreeMap<String, TensorNodeId>,
 )> {
+    let (plan, loss_node_id, gradient_node_ids) =
+        build_cuda_scalar_value_and_grad_plan(loss, parameter_names)?;
+    let plan = CudaBackend::new(device_ordinal)
+        .compile(plan)
+        .map_err(PyValueError::new_err)?;
+    Ok((
+        TensorCudaExecutionPlan { plan },
+        loss_node_id,
+        gradient_node_ids,
+    ))
+}
+
+fn build_cuda_scalar_value_and_grad_plan(
+    loss: &TensorTraceResult,
+    parameter_names: Vec<String>,
+) -> PyResult<(
+    TensorExecutionPlan,
+    TensorNodeId,
+    BTreeMap<String, TensorNodeId>,
+)> {
     if parameter_names.is_empty() {
         return Err(PyValueError::new_err(
             "CUDA value-and-grad requires at least one parameter name",
@@ -4916,7 +5305,7 @@ fn compile_cuda_scalar_value_and_grad(
         output_node_ids.push(gradient_node_id);
     }
     let (plan, remapped_outputs) = graph
-        .compile_cuda_multi_plan(&output_node_ids, device_ordinal)
+        .compile_cpu_multi_plan(&output_node_ids)
         .map_err(PyValueError::new_err)?;
     let loss_node_id = remapped_outputs[0];
     let gradient_node_ids = requested_names
@@ -4952,6 +5341,236 @@ pub fn tensor_value_and_grad_cuda_fn(
         gradient_node_ids,
         cotangent_name: CUDA_LOSS_COTANGENT_NAME.to_string(),
     })
+}
+
+/// Creates a fixed-shape, single-node CUDA data-parallel value-and-gradient
+/// callable. Mapped inputs are split along axis zero; requested parameters must
+/// be replicated and are therefore the only gradients all-reduced by NCCL.
+#[pyfunction]
+#[pyo3(signature = (function, input_specs, parameter_names, mapped_input_names, device_ordinals, reduction = "mean"))]
+pub fn tensor_value_and_grad_data_parallel_cuda_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    parameter_names: Vec<String>,
+    mapped_input_names: Vec<String>,
+    device_ordinals: Vec<usize>,
+    reduction: &str,
+) -> PyResult<TensorCudaDataParallelValueAndGradFunction> {
+    if input_specs
+        .iter()
+        .any(|(name, _)| name == CUDA_LOSS_COTANGENT_NAME)
+    {
+        return Err(PyValueError::new_err(format!(
+            "tensor_value_and_grad_data_parallel_cuda_fn reserves input name {CUDA_LOSS_COTANGENT_NAME:?}"
+        )));
+    }
+    if device_ordinals.len() < 2 {
+        return Err(PyValueError::new_err(
+            "CUDA data-parallel value-and-grad requires at least two device ordinals",
+        ));
+    }
+    let reduction = match reduction {
+        "sum" => TensorReplicaReduction::Sum,
+        "mean" => TensorReplicaReduction::Mean,
+        _ => {
+            return Err(PyValueError::new_err(
+                "CUDA data-parallel reduction must be 'sum' or 'mean'",
+            ))
+        }
+    };
+    let mapped_input_names = mapped_input_names.into_iter().collect::<BTreeSet<_>>();
+    if mapped_input_names.is_empty() {
+        return Err(PyValueError::new_err(
+            "CUDA data-parallel value-and-grad requires at least one mapped input",
+        ));
+    }
+    if parameter_names
+        .iter()
+        .any(|name| mapped_input_names.contains(name))
+    {
+        return Err(PyValueError::new_err(
+            "CUDA data-parallel value-and-grad only supports replicated parameter gradients; mapped inputs cannot be requested parameters",
+        ));
+    }
+
+    let mut input_shapes = BTreeMap::new();
+    for (name, shape) in &input_specs {
+        if input_shapes.insert(name.clone(), shape.clone()).is_some() {
+            return Err(PyValueError::new_err(format!(
+                "duplicate CUDA data-parallel input name {name:?}"
+            )));
+        }
+    }
+    if input_shapes.len() != input_specs.len()
+        || mapped_input_names
+            .iter()
+            .any(|name| !input_shapes.contains_key(name))
+    {
+        return Err(PyValueError::new_err(format!(
+            "CUDA data-parallel mapped inputs must be declared in input_specs: {mapped_input_names:?}"
+        )));
+    }
+
+    let mut shard_input_specs = input_specs;
+    for (name, shape) in &mut shard_input_specs {
+        if !mapped_input_names.contains(name) {
+            continue;
+        }
+        let batch_extent = shape.first_mut().ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "CUDA data-parallel mapped input {name:?} must have rank at least one"
+            ))
+        })?;
+        if *batch_extent % device_ordinals.len() != 0 {
+            return Err(PyValueError::new_err(format!(
+                "CUDA data-parallel mapped input {name:?} batch extent {batch_extent} is not divisible by {} replicas",
+                device_ordinals.len()
+            )));
+        }
+        *batch_extent /= device_ordinals.len();
+    }
+
+    let traced = trace_tensor_python_function(py, function, shard_input_specs)?;
+    let (plan, loss_node_id, gradient_node_ids) =
+        build_cuda_scalar_value_and_grad_plan(&traced, parameter_names)?;
+    let plan = CudaBackend::new(device_ordinals[0])
+        .compile_data_parallel(plan, device_ordinals)
+        .map_err(PyValueError::new_err)?;
+    Ok(TensorCudaDataParallelValueAndGradFunction {
+        plan,
+        input_shapes,
+        mapped_input_names,
+        loss_node_id,
+        gradient_node_ids,
+        cotangent_name: CUDA_LOSS_COTANGENT_NAME.to_string(),
+        reduction,
+        last_timing: Arc::new(Mutex::new(None)),
+    })
+}
+
+#[pymethods]
+impl TensorCudaDataParallelValueAndGradFunction {
+    fn __call__(
+        &self,
+        values: &Bound<'_, PyDict>,
+    ) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
+        let inputs = extract_tensor_map(values)?;
+        if inputs.len() != self.input_shapes.len()
+            || self.input_shapes.iter().any(|(name, shape)| {
+                inputs
+                    .get(name)
+                    .is_none_or(|input| input.shape() != shape.as_slice())
+            })
+        {
+            return Err(PyValueError::new_err(format!(
+                "CUDA data-parallel value-and-grad expects exactly input shapes {:?}",
+                self.input_shapes
+            )));
+        }
+        let replica_count = self.plan.replica_count();
+        if replica_count == 0 {
+            return Err(PyValueError::new_err(
+                "CUDA data-parallel plan has no compiled replicas",
+            ));
+        }
+        let mut replica_inputs = Vec::with_capacity(replica_count);
+        for replica in 0..replica_count {
+            let mut shard_inputs = inputs.clone();
+            for name in &self.mapped_input_names {
+                let input = &inputs[name];
+                let shard_extent = input.shape()[0] / replica_count;
+                shard_inputs.insert(
+                    name.clone(),
+                    input
+                        .slice_axis(0, replica * shard_extent, shard_extent)
+                        .map_err(PyValueError::new_err)?,
+                );
+            }
+            shard_inputs.insert(
+                self.cotangent_name.clone(),
+                DynamicTensor::new(vec![], vec![1.0]).map_err(PyValueError::new_err)?,
+            );
+            replica_inputs.push(shard_inputs);
+        }
+        let result = self
+            .plan
+            .execute_replicas(&replica_inputs, self.reduction)
+            .map_err(PyValueError::new_err)?;
+        let positions = self
+            .plan
+            .output_node_ids()
+            .iter()
+            .enumerate()
+            .map(|(position, node_id)| (*node_id, position))
+            .collect::<BTreeMap<_, _>>();
+        let loss_position = positions.get(&self.loss_node_id).copied().ok_or_else(|| {
+            PyValueError::new_err("CUDA data-parallel loss output was not retained")
+        })?;
+        let loss =
+            result.outputs.get(loss_position).cloned().ok_or_else(|| {
+                PyValueError::new_err("CUDA data-parallel loss output is missing")
+            })?;
+        let gradients = self
+            .gradient_node_ids
+            .iter()
+            .map(|(name, node_id)| -> PyResult<(String, PyTensor)> {
+                let position = positions.get(node_id).copied().ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "CUDA data-parallel gradient output for {name:?} was not retained"
+                    ))
+                })?;
+                let gradient = result.outputs.get(position).cloned().ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "CUDA data-parallel gradient output for {name:?} is missing"
+                    ))
+                })?;
+                PyTensor::from_dynamic_tensor(gradient)
+                    .map(|tensor| (name.clone(), tensor))
+                    .map_err(PyValueError::new_err)
+            })
+            .collect::<PyResult<BTreeMap<_, _>>>()?;
+        *self
+            .last_timing
+            .lock()
+            .map_err(|_| PyValueError::new_err("CUDA data-parallel timing lock is poisoned"))? =
+            Some(result.timing);
+        Ok((
+            PyTensor::from_dynamic_tensor(loss).map_err(PyValueError::new_err)?,
+            gradients,
+        ))
+    }
+
+    #[getter]
+    fn replica_count(&self) -> usize {
+        self.plan.replica_count()
+    }
+
+    #[getter]
+    fn device_ordinals(&self) -> Vec<usize> {
+        self.plan.device_ordinals()
+    }
+
+    #[getter]
+    fn last_timing(&self) -> PyResult<Option<BTreeMap<String, f64>>> {
+        Ok(self
+            .last_timing
+            .lock()
+            .map_err(|_| PyValueError::new_err("CUDA data-parallel timing lock is poisoned"))?
+            .map(|timing| {
+                BTreeMap::from([
+                    (
+                        "replica_enqueue".to_string(),
+                        timing.replica_enqueue.as_secs_f64(),
+                    ),
+                    ("collective".to_string(), timing.collective.as_secs_f64()),
+                    (
+                        "output_readback".to_string(),
+                        timing.output_readback.as_secs_f64(),
+                    ),
+                ])
+            }))
+    }
 }
 
 fn compile_mlx_scalar_value_and_grad(
@@ -5315,6 +5934,156 @@ pub fn tensor_vmap_jvp_cuda_fn(
         tangent_node_id: output_node_ids[1],
         signature,
         tangent_names,
+    })
+}
+
+const VMAP_HVP_COTANGENT_PREFIX: &str = "__nabla_vmap_hvp_cotangent";
+const VMAP_HVP_TANGENT_PREFIX: &str = "__nabla_vmap_hvp_tangent_";
+
+fn build_vmap_hvp_scalar_graph(
+    traced: TensorTraceResult,
+    signature: &VmapSignature,
+    batch_size: usize,
+    input_name: &str,
+) -> PyResult<(TensorTraceGraph, TensorNodeId, usize, String, String)> {
+    if traced.output.shape != vec![batch_size] || traced.output.batch_axis != Some(0) {
+        return Err(PyValueError::new_err(format!(
+            "tensor_vmap_hvp_scalar_fn requires one scalar output per mapped example, got shape {:?}",
+            traced.output.shape
+        )));
+    }
+    let input_index = signature
+        .input_names
+        .iter()
+        .position(|name| name == input_name)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!("input {input_name:?} is absent from the trace"))
+        })?;
+    let input_axis = signature.in_axes[input_index].ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "tensor_vmap_hvp_scalar_fn requires input {input_name:?} to be mapped"
+        ))
+    })?;
+    let cotangent_name = VMAP_HVP_COTANGENT_PREFIX.to_string();
+    let tangent_name = format!("{VMAP_HVP_TANGENT_PREFIX}{input_name}");
+    if signature
+        .input_names
+        .iter()
+        .any(|name| name == &cotangent_name || name == &tangent_name)
+    {
+        return Err(PyValueError::new_err(format!(
+            "tensor_vmap_hvp_scalar_fn reserves input names {cotangent_name:?} and {tangent_name:?}"
+        )));
+    }
+
+    let mut ir = traced
+        .graph
+        .ir
+        .lock()
+        .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?;
+    let scalar_loss = ir
+        .sum(traced.output.node_id)
+        .map_err(PyValueError::new_err)?;
+    let vjp = ir
+        .symbolic_vjp(scalar_loss, &cotangent_name)
+        .map_err(PyValueError::new_err)?;
+    drop(ir);
+    let gradient = vjp.gradients.get(input_name).copied().ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "vmap HVP input {input_name:?} is absent from the VJP"
+        ))
+    })?;
+    let directional = vjp
+        .graph
+        .symbolic_jvp_with_tangent_inputs(
+            gradient,
+            &BTreeMap::from([(input_name.to_string(), tangent_name.clone())]),
+        )
+        .map_err(PyValueError::new_err)?;
+    Ok((
+        TensorTraceGraph {
+            ir: Arc::new(Mutex::new(directional.graph)),
+        },
+        directional.tangent,
+        input_axis,
+        cotangent_name,
+        tangent_name,
+    ))
+}
+
+/// Trace a vectorized per-example scalar loss and compile its HVP with respect
+/// to one mapped input. The returned callable accepts the public-layout values
+/// and a same-shaped tangent for `input_name`.
+#[pyfunction]
+#[pyo3(signature = (function, input_specs, batch_size, input_name, in_axes = None, out_axis = 0))]
+pub fn tensor_vmap_hvp_scalar_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    batch_size: usize,
+    input_name: String,
+    in_axes: Option<Vec<Option<isize>>>,
+    out_axis: isize,
+) -> PyResult<TensorVmapHvpScalarFunction> {
+    let (traced, signature) = trace_tensor_vmap_python_function(
+        py,
+        function,
+        input_specs,
+        batch_size,
+        in_axes,
+        out_axis,
+    )?;
+    let (graph, output_node_id, input_axis, cotangent_name, tangent_name) =
+        build_vmap_hvp_scalar_graph(traced, &signature, batch_size, &input_name)?;
+    let plan = graph
+        .compile_cpu_plan(output_node_id)
+        .map_err(PyValueError::new_err)?
+        .plan;
+    Ok(TensorVmapHvpScalarFunction {
+        plan,
+        signature,
+        input_name,
+        input_axis,
+        cotangent_name,
+        tangent_name,
+    })
+}
+
+/// CUDA variant of [`tensor_vmap_hvp_scalar_fn`]. It emits the existing
+/// structural VJP-JVP IR, so Scan and Fori regions remain in the CUDA plan.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (function, input_specs, batch_size, input_name, in_axes = None, out_axis = 0, device_ordinal = 0))]
+pub fn tensor_vmap_hvp_scalar_cuda_fn(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    input_specs: Vec<(String, Vec<usize>)>,
+    batch_size: usize,
+    input_name: String,
+    in_axes: Option<Vec<Option<isize>>>,
+    out_axis: isize,
+    device_ordinal: usize,
+) -> PyResult<TensorVmapCudaHvpScalarFunction> {
+    let (traced, signature) = trace_tensor_vmap_python_function(
+        py,
+        function,
+        input_specs,
+        batch_size,
+        in_axes,
+        out_axis,
+    )?;
+    let (graph, output_node_id, input_axis, cotangent_name, tangent_name) =
+        build_vmap_hvp_scalar_graph(traced, &signature, batch_size, &input_name)?;
+    let plan = graph
+        .compile_cuda_plan(output_node_id, device_ordinal)
+        .map_err(PyValueError::new_err)?;
+    Ok(TensorVmapCudaHvpScalarFunction {
+        plan,
+        signature,
+        input_name,
+        input_axis,
+        cotangent_name,
+        tangent_name,
     })
 }
 
@@ -5903,7 +6672,9 @@ pub fn cuda_adam_step(
     .map_err(PyValueError::new_err)
 }
 
-fn extract_tensor_map(inputs: &Bound<'_, PyDict>) -> PyResult<BTreeMap<String, DynamicTensor>> {
+pub(crate) fn extract_tensor_map(
+    inputs: &Bound<'_, PyDict>,
+) -> PyResult<BTreeMap<String, DynamicTensor>> {
     let mut tensors = BTreeMap::new();
     for (key, value) in inputs.iter() {
         let key = key.cast::<PyString>()?.to_str()?.to_string();

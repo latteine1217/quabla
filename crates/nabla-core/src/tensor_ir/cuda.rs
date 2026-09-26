@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+#[cfg(feature = "cuda-nccl")]
+use std::time::Instant;
 
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
@@ -11,9 +15,15 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::compile_ptx;
 
+#[cfg(feature = "cuda-nccl")]
+use cudarc::nccl::{Comm as NcclComm, ReduceOp as NcclReduceOp};
+
 use super::{
     contiguous_strides, element_count, sqrt_derivative_coefficient, tensor_op_inputs,
-    DynamicTensor, TensorBackend, TensorExecutionPlan, TensorFusionRegion, TensorOp,
+    DynamicTensor, TensorBackend, TensorExecutionPlan, TensorForiExecutionPlan,
+    TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget, TensorFusionRegion, TensorNodeId, TensorOp,
+    TensorReplicaReduction, TensorScanExecutionPlan, TensorScanTarget, TensorScanVjpJvpExecutionPlan,
+    TensorScanVjpTarget,
 };
 
 const CUDA_MATMUL_TILE: usize = 32;
@@ -49,6 +59,36 @@ pub struct CudaExecutionPlan {
     state: Arc<Mutex<CudaExecutionState>>,
 }
 
+/// A single-node NCCL data-parallel executable.
+///
+/// Each replica owns a complete CUDA compilation on one explicit device. The
+/// caller supplies already-sharded inputs, then this plan all-reduces every
+/// retained output in place. This keeps input partitioning and the collective
+/// boundary explicit: it never copies a shard through the host to another GPU.
+#[derive(Clone, Debug)]
+pub struct CudaDataParallelExecutionPlan {
+    replicas: Vec<CudaExecutionPlan>,
+    output_node_ids: Vec<TensorNodeId>,
+}
+
+/// Host-observed boundaries for one data-parallel invocation.
+///
+/// `replica_enqueue` measures submission of replica work, not GPU kernel
+/// runtime. `collective` includes NCCL submission and device synchronization;
+/// `output_readback` measures the final rank-zero diagnostics transfer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CudaDataParallelTiming {
+    pub replica_enqueue: Duration,
+    pub collective: Duration,
+    pub output_readback: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct CudaDataParallelResult {
+    pub outputs: Vec<DynamicTensor>,
+    pub timing: CudaDataParallelTiming,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct CudaMatmulBiasTanhEpilogue {
     lhs: usize,
@@ -67,6 +107,32 @@ struct CudaExecutionState {
 }
 
 #[derive(Debug)]
+struct CudaScanCache {
+    carry: Option<CudaSlice<f32>>,
+    outputs: Option<CudaSlice<f32>>,
+}
+
+/// Device buffers produced together by one structural Fori reverse group.
+/// Keeping the sibling results here lets the first group node launch the
+/// shared reverse kernel while later nodes simply claim their result buffer.
+#[derive(Debug, Default)]
+struct CudaForiVjpCache {
+    results: BTreeMap<TensorNodeId, CudaSlice<f32>>,
+}
+
+/// Device buffers produced together by one structural Scan reverse group.
+#[derive(Debug, Default)]
+struct CudaScanVjpCache {
+    results: BTreeMap<TensorNodeId, CudaSlice<f32>>,
+}
+
+/// Device buffers produced together by one structural Scan forward-over-reverse group.
+#[derive(Debug, Default)]
+struct CudaScanVjpJvpCache {
+    results: BTreeMap<TensorNodeId, CudaSlice<f32>>,
+}
+
+#[derive(Debug)]
 struct CudaAdamState {
     first_moment: CudaSlice<f32>,
     second_moment: CudaSlice<f32>,
@@ -82,6 +148,56 @@ impl CudaBackend {
         self.device_ordinal
     }
 
+    /// Compiles one identical retained-output plan per explicitly selected GPU.
+    ///
+    /// This API is available in all CUDA builds so callers get a deterministic
+    /// feature error instead of an implicit single-device fallback. Actual
+    /// collective execution requires the optional `cuda-nccl` feature.
+    #[cfg(feature = "cuda-nccl")]
+    pub fn compile_data_parallel(
+        &self,
+        plan: TensorExecutionPlan,
+        device_ordinals: Vec<usize>,
+    ) -> Result<CudaDataParallelExecutionPlan, String> {
+        validate_cuda_data_parallel_devices(&device_ordinals)?;
+        let output_node_ids = plan.output_node_ids().to_vec();
+        let replicas = device_ordinals
+            .into_iter()
+            .map(|ordinal| CudaBackend::new(ordinal).compile(plan.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CudaDataParallelExecutionPlan {
+            replicas,
+            output_node_ids,
+        })
+    }
+
+    #[cfg(not(feature = "cuda-nccl"))]
+    pub fn compile_data_parallel(
+        &self,
+        _plan: TensorExecutionPlan,
+        _device_ordinals: Vec<usize>,
+    ) -> Result<CudaDataParallelExecutionPlan, String> {
+        Err("CUDA data-parallel execution requires the optional cuda-nccl feature".to_string())
+    }
+
+    /// Evaluates every retained output of one multi-output Tensor IR plan.
+    /// CUDA lowering must keep all requested outputs alive in the shared value
+    /// table, which is required by structured multi-result regions such as Scan.
+    pub fn execute_many(
+        &self,
+        plan: &TensorExecutionPlan,
+        output_node_ids: &[TensorNodeId],
+        inputs: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<Vec<DynamicTensor>, String> {
+        if output_node_ids != plan.output_node_ids() {
+            return Err(
+                "CUDA multi-output execution requires the plan's complete retained output list"
+                    .to_string(),
+            );
+        }
+        self.compile(plan.clone())?.execute_many(inputs)
+    }
+
     pub fn compile(&self, plan: TensorExecutionPlan) -> Result<CudaExecutionPlan, String> {
         if plan
             .nodes
@@ -92,25 +208,64 @@ impl CudaBackend {
                 "CUDA backend does not yet support Cond regions with device predicates".to_string(),
             );
         }
-        if plan
-            .nodes
-            .iter()
-            .any(|node| matches!(node.op, TensorOp::Fori { .. }))
-        {
-            return Err(
-                "CUDA backend does not yet support Fori regions with device loop lowering"
-                    .to_string(),
-            );
-        }
-        if plan
-            .nodes
-            .iter()
-            .any(|node| matches!(node.op, TensorOp::ForiVjp { .. }))
-        {
-            return Err(
-                "CUDA backend does not yet support Fori VJP regions with device loop lowering"
-                    .to_string(),
-            );
+        for (node_id, node) in plan.nodes.iter().enumerate() {
+            match &node.op {
+                TensorOp::Fori { loop_plan, .. } => {
+                    cuda_fori_body_is_lowerable(loop_plan).map_err(|error| {
+                        format!("CUDA Fori node {node_id} cannot lower to a device loop: {error}")
+                    })?;
+                }
+                TensorOp::ForiJvp { loop_plan, .. } => {
+                    cuda_fori_jvp_is_lowerable(loop_plan).map_err(|error| {
+                        format!(
+                            "CUDA Fori JVP node {node_id} cannot lower to a device loop: {error}"
+                        )
+                    })?;
+                }
+                TensorOp::ForiVjp {
+                    loop_plan, target, ..
+                } => {
+                    cuda_fori_vjp_plan(loop_plan, target).map_err(|error| {
+                        format!(
+                            "CUDA Fori VJP node {node_id} cannot lower to a device loop: {error}"
+                        )
+                    })?;
+                }
+                TensorOp::ForiVjpJvp { plan, .. } => {
+                    cuda_fori_vjp_jvp_is_lowerable(plan).map_err(|error| {
+                        format!(
+                            "CUDA Fori VJP JVP node {node_id} cannot lower to a device loop: {error}"
+                        )
+                    })?;
+                }
+                TensorOp::Scan { scan_plan, .. } => {
+                    cuda_scan_body_is_lowerable(scan_plan).map_err(|error| {
+                        format!("CUDA Scan node {node_id} cannot lower to a device loop: {error}")
+                    })?;
+                }
+                TensorOp::ScanVjp {
+                    scan_plan, target, ..
+                } => {
+                    cuda_scan_vjp_plans(scan_plan, target).map_err(|error| {
+                        format!(
+                            "CUDA Scan VJP node {node_id} cannot lower to a device loop: {error}"
+                        )
+                    })?;
+                }
+                TensorOp::ScanVjpJvp {
+                    plan: scan_hvp,
+                    group,
+                    ..
+                } => {
+                    cuda_scan_vjp_jvp_is_lowerable(scan_hvp).map_err(|error| {
+                        format!("CUDA Scan VJP JVP node {node_id} cannot lower to a device loop: {error}")
+                    })?;
+                    cuda_scan_vjp_jvp_group(&plan, *group).map_err(|error| {
+                        format!("CUDA Scan VJP JVP node {node_id} has invalid group bindings: {error}")
+                    })?;
+                }
+                _ => {}
+            }
         }
         ensure_nvrtc_runtime_available()?;
         let matmul_bias_tanh = cuda_matmul_bias_tanh_epilogue(&plan);
@@ -160,6 +315,159 @@ impl CudaBackend {
     }
 }
 
+impl CudaDataParallelExecutionPlan {
+    pub fn replica_count(&self) -> usize {
+        self.replicas.len()
+    }
+
+    pub fn device_ordinals(&self) -> Vec<usize> {
+        self.replicas
+            .iter()
+            .map(CudaExecutionPlan::device_ordinal)
+            .collect()
+    }
+
+    pub fn output_node_ids(&self) -> &[TensorNodeId] {
+        &self.output_node_ids
+    }
+
+    #[cfg(feature = "cuda-nccl")]
+    pub fn execute_replicas(
+        &self,
+        replica_inputs: &[BTreeMap<String, DynamicTensor>],
+        reduction: TensorReplicaReduction,
+    ) -> Result<CudaDataParallelResult, String> {
+        if replica_inputs.len() != self.replicas.len() {
+            return Err(format!(
+                "CUDA data-parallel plan has {} replicas but received {} input maps",
+                self.replicas.len(),
+                replica_inputs.len()
+            ));
+        }
+
+        let enqueue_start = Instant::now();
+        for (replica, inputs) in self.replicas.iter().zip(replica_inputs) {
+            replica.execute_retaining_without_output(inputs, &BTreeSet::new())?;
+        }
+        let replica_enqueue = enqueue_start.elapsed();
+
+        let collective_start = Instant::now();
+        self.all_reduce_retained_outputs(reduction)?;
+        for replica in &self.replicas {
+            replica.synchronize()?;
+        }
+        let collective = collective_start.elapsed();
+
+        let readback_start = Instant::now();
+        let rank_zero = self
+            .replicas
+            .first()
+            .ok_or_else(|| "CUDA data-parallel plan has no replicas".to_string())?;
+        let outputs = self
+            .output_node_ids
+            .iter()
+            .map(|node_id| rank_zero.computed_node_to_host(*node_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_readback = readback_start.elapsed();
+
+        Ok(CudaDataParallelResult {
+            outputs,
+            timing: CudaDataParallelTiming {
+                replica_enqueue,
+                collective,
+                output_readback,
+            },
+        })
+    }
+
+    #[cfg(not(feature = "cuda-nccl"))]
+    pub fn execute_replicas(
+        &self,
+        _replica_inputs: &[BTreeMap<String, DynamicTensor>],
+        _reduction: TensorReplicaReduction,
+    ) -> Result<CudaDataParallelResult, String> {
+        Err("CUDA data-parallel execution requires the optional cuda-nccl feature".to_string())
+    }
+
+    #[cfg(feature = "cuda-nccl")]
+    fn all_reduce_retained_outputs(&self, reduction: TensorReplicaReduction) -> Result<(), String> {
+        let communicators = NcclComm::from_devices(
+            self.replicas
+                .iter()
+                .map(|replica| replica.context.default_stream())
+                .collect(),
+        )
+        .map_err(|error| format!("failed to initialize NCCL communicators: {error:?}"))?;
+        let operation = match reduction {
+            TensorReplicaReduction::Sum => NcclReduceOp::Sum,
+            TensorReplicaReduction::Mean => NcclReduceOp::Avg,
+        };
+
+        for node_id in &self.output_node_ids {
+            let expected_len = self.replicas[0]
+                .plan
+                .nodes
+                .get(*node_id)
+                .ok_or_else(|| format!("CUDA data-parallel output node {node_id} does not exist"))?
+                .shape
+                .iter()
+                .try_fold(1usize, |count, extent| count.checked_mul(*extent))
+                .ok_or_else(|| format!("CUDA data-parallel output node {node_id} size overflows usize"))?;
+            for (rank, (communicator, replica)) in
+                communicators.iter().zip(&self.replicas).enumerate()
+            {
+                let mut state = replica.state.lock().map_err(|_| {
+                    format!("CUDA data-parallel replica {rank} state lock is poisoned")
+                })?;
+                let buffer = state
+                    .values
+                    .get_mut(*node_id)
+                    .and_then(Option::as_mut)
+                    .ok_or_else(|| {
+                        format!(
+                            "CUDA data-parallel replica {rank} output node {node_id} was not retained"
+                        )
+                    })?;
+                if buffer.len() != expected_len {
+                    return Err(format!(
+                        "CUDA data-parallel replica {rank} output node {node_id} has {} elements, expected {expected_len}",
+                        buffer.len()
+                    ));
+                }
+                communicator
+                    .all_reduce_in_place(buffer, &operation)
+                    .map_err(|error| {
+                        format!(
+                            "NCCL all-reduce failed for output node {node_id} on replica {rank}: {error:?}"
+                        )
+                    })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda-nccl")]
+fn validate_cuda_data_parallel_devices(device_ordinals: &[usize]) -> Result<(), String> {
+    if device_ordinals.len() < 2 {
+        return Err("CUDA data-parallel execution requires at least two device ordinals".to_string());
+    }
+    let mut unique = BTreeSet::new();
+    if device_ordinals.iter().any(|ordinal| !unique.insert(*ordinal)) {
+        return Err("CUDA data-parallel device ordinals must be unique".to_string());
+    }
+    let available = CudaContext::device_count()
+        .map_err(|error| format!("failed to query CUDA device count: {error:?}"))?;
+    let available = usize::try_from(available)
+        .map_err(|_| "CUDA driver reported a negative device count".to_string())?;
+    if let Some(ordinal) = device_ordinals.iter().copied().find(|ordinal| *ordinal >= available) {
+        return Err(format!(
+            "CUDA data-parallel device ordinal {ordinal} is unavailable; CUDA reports {available} device(s)"
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_nvrtc_runtime_available() -> Result<(), String> {
     const LIBRARY_NAMES: [&str; 6] = [
         "libnvrtc.so",
@@ -188,6 +496,10 @@ fn ensure_nvrtc_runtime_available() -> Result<(), String> {
 }
 
 impl CudaExecutionPlan {
+    pub fn plan(&self) -> &TensorExecutionPlan {
+        &self.plan
+    }
+
     pub fn node_count(&self) -> usize {
         self.plan.node_count()
     }
@@ -231,6 +543,42 @@ impl CudaExecutionPlan {
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<DynamicTensor, String> {
         self.execute_retaining(inputs, &BTreeSet::new())
+    }
+
+    /// Materializes every output preserved by a shared Tensor IR compilation.
+    pub fn execute_many(
+        &self,
+        inputs: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<Vec<DynamicTensor>, String> {
+        if self.plan.output_node_ids().len() == 1 {
+            return self.execute(inputs).map(|value| vec![value]);
+        }
+        self.execute_retaining_inner(inputs, &BTreeSet::new(), false)?;
+        let stream = self.context.default_stream();
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "CUDA execution plan state lock is poisoned".to_string())?;
+        self.plan
+            .output_node_ids()
+            .iter()
+            .map(|output_node_id| {
+                let buffer = state
+                    .values
+                    .get(*output_node_id)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        format!("CUDA multi-output node {output_node_id} was not evaluated")
+                    })?;
+                let data = stream.clone_dtoh(buffer).map_err(|error| {
+                    format!("failed to copy CUDA multi-output node {output_node_id}: {error:?}")
+                })?;
+                DynamicTensor::new(
+                    self.plan.nodes[*output_node_id].shape.clone(),
+                    data.into_iter().map(f64::from).collect(),
+                )
+            })
+            .collect()
     }
 
     pub fn execute_retaining(
@@ -866,6 +1214,10 @@ fn execute_cuda_device_program(
     let mut remaining_uses = cuda_remaining_use_counts(plan);
     let mut fusion_regions = BTreeMap::new();
     let mut fusion_interior_nodes = BTreeSet::new();
+    let mut fori_vjp_cache = BTreeMap::<usize, CudaForiVjpCache>::new();
+    let mut scan_cache = BTreeMap::<usize, CudaScanCache>::new();
+    let mut scan_vjp_cache = BTreeMap::<usize, CudaScanVjpCache>::new();
+    let mut scan_vjp_jvp_cache = BTreeMap::<usize, CudaScanVjpJvpCache>::new();
     for region in plan.fusion_regions() {
         for node_id in &region.node_ids {
             if *node_id != region.output_node_id {
@@ -943,17 +1295,614 @@ fn execute_cuda_device_program(
                         .to_string(),
                 )
             }
-            TensorOp::Fori { .. } => {
-                return Err(
-                    "CUDA backend does not yet support Fori regions with device loop lowering"
-                        .to_string(),
-                )
+            TensorOp::Fori {
+                carry, captures, ..
+            } => {
+                let (before, current_and_after) = values.split_at_mut(node_id);
+                let slot = current_and_after.first_mut().ok_or_else(|| {
+                    format!("CUDA Fori node {node_id} is missing its buffer slot")
+                })?;
+                if slot.is_none() {
+                    *slot = Some(take_cuda_buffer(stream, free_buffers, count, node_id)?);
+                }
+                let output = slot
+                    .as_mut()
+                    .ok_or_else(|| format!("CUDA Fori node {node_id} buffer was not allocated"))?;
+                let kernel = module
+                    .load_function(&cuda_node_function_name(node_id))
+                    .map_err(|error| {
+                        format!("failed to load CUDA Fori node {node_id} kernel: {error:?}")
+                    })?;
+                launch_cuda_fori_node(
+                    stream,
+                    &kernel,
+                    output,
+                    before,
+                    *carry,
+                    captures,
+                    launch_count,
+                )?;
+                release_dead_cuda_values(
+                    plan,
+                    node_id,
+                    values,
+                    free_buffers,
+                    retained_inputs,
+                    &mut remaining_uses,
+                )?;
+                continue;
             }
-            TensorOp::ForiVjp { .. } => {
-                return Err(
-                    "CUDA backend does not yet support Fori VJP regions with device loop lowering"
-                        .to_string(),
-                )
+            TensorOp::ForiJvp {
+                carry,
+                carry_tangent,
+                captures,
+                tangent_captures,
+                ..
+            } => {
+                let (before, current_and_after) = values.split_at_mut(node_id);
+                let slot = current_and_after.first_mut().ok_or_else(|| {
+                    format!("CUDA Fori JVP node {node_id} is missing its buffer slot")
+                })?;
+                if slot.is_none() {
+                    *slot = Some(take_cuda_buffer(stream, free_buffers, count, node_id)?);
+                }
+                let output = slot.as_mut().ok_or_else(|| {
+                    format!("CUDA Fori JVP node {node_id} buffer was not allocated")
+                })?;
+                let kernel = module
+                    .load_function(&cuda_node_function_name(node_id))
+                    .map_err(|error| {
+                        format!("failed to load CUDA Fori JVP node {node_id} kernel: {error:?}")
+                    })?;
+                launch_cuda_fori_jvp_node(
+                    stream,
+                    &kernel,
+                    output,
+                    before,
+                    *carry,
+                    *carry_tangent,
+                    captures,
+                    tangent_captures,
+                    launch_count,
+                )?;
+                release_dead_cuda_values(
+                    plan,
+                    node_id,
+                    values,
+                    free_buffers,
+                    retained_inputs,
+                    &mut remaining_uses,
+                )?;
+                continue;
+            }
+            TensorOp::ForiVjp {
+                carry,
+                output_cotangent,
+                loop_plan,
+                captures,
+                target: _,
+                group,
+            } => {
+                let (before, current_and_after) = values.split_at_mut(node_id);
+                let slot = current_and_after.first_mut().ok_or_else(|| {
+                    format!("CUDA Fori VJP node {node_id} is missing its buffer slot")
+                })?;
+                let carry_count = element_count(&loop_plan.carry_shape()?)?;
+                if let Some(cached) = fori_vjp_cache.get_mut(group) {
+                    let output = cached.results.remove(&node_id).ok_or_else(|| {
+                        format!(
+                            "CUDA Fori VJP group {group} has no cached result for node {node_id}"
+                        )
+                    })?;
+                    if slot.is_some() {
+                        return Err(format!(
+                            "CUDA Fori VJP node {node_id} unexpectedly owns a result buffer before cache reuse"
+                        ));
+                    }
+                    *slot = Some(output);
+                    if cached.results.is_empty() {
+                        fori_vjp_cache.remove(group);
+                    }
+                } else {
+                    let members = cuda_fori_vjp_group(plan, *group)?;
+                    if members.first().map(|(member_id, _)| *member_id) != Some(node_id) {
+                        return Err(format!(
+                            "CUDA Fori VJP group {group} reached node {node_id} before its producer"
+                        ));
+                    }
+                    let tape_count = loop_plan
+                        .upper
+                        .checked_sub(loop_plan.lower)
+                        .and_then(|steps| steps.checked_add(1))
+                        .and_then(|states| states.checked_mul(carry_count))
+                        .ok_or_else(|| {
+                            "CUDA Fori VJP carry tape size overflowed usize".to_string()
+                        })?;
+                    let mut tape = take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
+                    let carry_launch_count = u32::try_from(carry_count).map_err(|_| {
+                        format!("CUDA Fori VJP node {node_id} launch exceeds u32 element count")
+                    })?;
+                    let mut outputs = Vec::with_capacity(members.len());
+                    for (member_id, member_target) in &members {
+                        let member_count = element_count(&plan.nodes[*member_id].shape)?;
+                        let mut output =
+                            take_cuda_buffer(stream, free_buffers, member_count, *member_id)?;
+                        if matches!(member_target, TensorForiVjpTarget::External(_))
+                            && output.len() != carry_count
+                        {
+                            stream
+                                .memcpy_htod(&[0.0f32], &mut output)
+                                .map_err(|error| {
+                                    format!(
+                                        "failed to clear CUDA reduced Fori VJP output: {error:?}"
+                                    )
+                                })?;
+                        }
+                        outputs.push(output);
+                    }
+                    let kernel = module
+                        .load_function(&cuda_node_function_name(node_id))
+                        .map_err(|error| {
+                            format!("failed to load CUDA Fori VJP node {node_id} kernel: {error:?}")
+                        })?;
+                    if outputs.len() == 1 {
+                        launch_cuda_fori_vjp_node(
+                            stream,
+                            &kernel,
+                            outputs
+                                .first_mut()
+                                .ok_or_else(|| "CUDA Fori VJP group has no output".to_string())?,
+                            &mut tape,
+                            before,
+                            *carry,
+                            *output_cotangent,
+                            captures,
+                            carry_launch_count,
+                        )?;
+                    } else {
+                        launch_cuda_fori_vjp_group(
+                            stream,
+                            &kernel,
+                            &mut outputs,
+                            &mut tape,
+                            before,
+                            *carry,
+                            *output_cotangent,
+                            captures,
+                            carry_launch_count,
+                        )?;
+                    }
+                    free_buffers.entry(tape.len()).or_default().push(tape);
+                    let mut cached = CudaForiVjpCache::default();
+                    for ((member_id, _), output) in members.into_iter().zip(outputs) {
+                        if member_id == node_id {
+                            *slot = Some(output);
+                        } else {
+                            cached.results.insert(member_id, output);
+                        }
+                    }
+                    if !cached.results.is_empty() {
+                        fori_vjp_cache.insert(*group, cached);
+                    }
+                }
+                release_dead_cuda_values(
+                    plan,
+                    node_id,
+                    values,
+                    free_buffers,
+                    retained_inputs,
+                    &mut remaining_uses,
+                )?;
+                continue;
+            }
+            TensorOp::ForiVjpJvp {
+                carry,
+                carry_tangent,
+                output_cotangent,
+                output_cotangent_tangent,
+                plan: fori_plan,
+                captures,
+                tangent_captures,
+                ..
+            } => {
+                let (before, current_and_after) = values.split_at_mut(node_id);
+                let slot = current_and_after.first_mut().ok_or_else(|| {
+                    format!("CUDA Fori VJP JVP node {node_id} is missing its buffer slot")
+                })?;
+                if slot.is_none() {
+                    *slot = Some(take_cuda_buffer(stream, free_buffers, count, node_id)?);
+                }
+                let output = slot.as_mut().ok_or_else(|| {
+                    format!("CUDA Fori VJP JVP node {node_id} buffer was not allocated")
+                })?;
+                let carry_count = element_count(&fori_plan.loop_plan.carry_shape()?)?;
+                let tape_count = fori_plan
+                    .loop_plan
+                    .upper
+                    .checked_sub(fori_plan.loop_plan.lower)
+                    .and_then(|steps| steps.checked_add(1))
+                    .and_then(|states| states.checked_mul(carry_count))
+                    .ok_or_else(|| {
+                        "CUDA Fori VJP JVP carry tape size overflowed usize".to_string()
+                    })?;
+                let mut carry_tape = take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
+                let mut carry_tangent_tape =
+                    take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
+                let launch_count = u32::try_from(carry_count).map_err(|_| {
+                    format!("CUDA Fori VJP JVP node {node_id} launch exceeds u32 element count")
+                })?;
+                let kernel = module
+                    .load_function(&cuda_node_function_name(node_id))
+                    .map_err(|error| {
+                        format!("failed to load CUDA Fori VJP JVP node {node_id} kernel: {error:?}")
+                    })?;
+                launch_cuda_fori_vjp_jvp_node(
+                    stream,
+                    &kernel,
+                    output,
+                    &mut carry_tape,
+                    &mut carry_tangent_tape,
+                    before,
+                    *carry,
+                    *carry_tangent,
+                    *output_cotangent,
+                    *output_cotangent_tangent,
+                    captures,
+                    tangent_captures,
+                    launch_count,
+                )?;
+                free_buffers
+                    .entry(carry_tape.len())
+                    .or_default()
+                    .push(carry_tape);
+                free_buffers
+                    .entry(carry_tangent_tape.len())
+                    .or_default()
+                    .push(carry_tangent_tape);
+                release_dead_cuda_values(
+                    plan,
+                    node_id,
+                    values,
+                    free_buffers,
+                    retained_inputs,
+                    &mut remaining_uses,
+                )?;
+                continue;
+            }
+            TensorOp::Scan {
+                carry,
+                scan_plan,
+                captures,
+                target,
+                group,
+            } => {
+                let (before, current_and_after) = values.split_at_mut(node_id);
+                let slot = current_and_after.first_mut().ok_or_else(|| {
+                    format!("CUDA Scan node {node_id} is missing its buffer slot")
+                })?;
+                if let Some(cached) = scan_cache.get_mut(group) {
+                    let cached_value = match target {
+                        TensorScanTarget::Carry => cached.carry.take(),
+                        TensorScanTarget::Outputs => cached.outputs.take(),
+                    }
+                    .ok_or_else(|| {
+                        format!("CUDA Scan group {group} has no cached {target:?} result")
+                    })?;
+                    if slot.is_some() {
+                        return Err(format!(
+                            "CUDA Scan node {node_id} unexpectedly owns a result buffer before cache reuse"
+                        ));
+                    }
+                    *slot = Some(cached_value);
+                    if cached.carry.is_none() && cached.outputs.is_none() {
+                        scan_cache.remove(group);
+                    }
+                } else {
+                    let carry_count = element_count(&scan_plan.carry_shape()?)?;
+                    let output_shape = scan_plan.output_shape()?;
+                    let output_count = element_count(&output_shape)?;
+                    let output_step_count =
+                        element_count(&scan_plan.body.output_shapes()[1])?;
+                    let launch_count =
+                        u32::try_from(carry_count.max(output_step_count)).map_err(|_| {
+                        format!("CUDA Scan node {node_id} launch exceeds u32 element count")
+                    })?;
+                    if slot.is_none() {
+                        *slot = Some(take_cuda_buffer(stream, free_buffers, count, node_id)?);
+                    }
+                    let auxiliary_count = match target {
+                        TensorScanTarget::Carry => output_count,
+                        TensorScanTarget::Outputs => carry_count,
+                    };
+                    let mut auxiliary =
+                        take_cuda_buffer(stream, free_buffers, auxiliary_count, node_id)?;
+                    let kernel = module
+                        .load_function(&cuda_node_function_name(node_id))
+                        .map_err(|error| {
+                            format!("failed to load CUDA Scan node {node_id} kernel: {error:?}")
+                        })?;
+                    match target {
+                        TensorScanTarget::Carry => {
+                            let output = slot.as_mut().ok_or_else(|| {
+                                format!("CUDA Scan node {node_id} buffer was not allocated")
+                            })?;
+                            launch_cuda_scan_node(
+                                stream,
+                                &kernel,
+                                output,
+                                &mut auxiliary,
+                                before,
+                                *carry,
+                                captures,
+                                output_step_count,
+                                launch_count,
+                            )?;
+                            scan_cache.insert(
+                                *group,
+                                CudaScanCache {
+                                    carry: None,
+                                    outputs: Some(auxiliary),
+                                },
+                            );
+                        }
+                        TensorScanTarget::Outputs => {
+                            let output = slot.as_mut().ok_or_else(|| {
+                                format!("CUDA Scan node {node_id} buffer was not allocated")
+                            })?;
+                            launch_cuda_scan_node(
+                                stream,
+                                &kernel,
+                                &mut auxiliary,
+                                output,
+                                before,
+                                *carry,
+                                captures,
+                                output_step_count,
+                                launch_count,
+                            )?;
+                            scan_cache.insert(
+                                *group,
+                                CudaScanCache {
+                                    carry: Some(auxiliary),
+                                    outputs: None,
+                                },
+                            );
+                        }
+                    }
+                }
+                release_dead_cuda_values(
+                    plan,
+                    node_id,
+                    values,
+                    free_buffers,
+                    retained_inputs,
+                    &mut remaining_uses,
+                )?;
+                continue;
+            }
+            TensorOp::ScanVjp {
+                carry,
+                final_carry_cotangent,
+                output_cotangent,
+                scan_plan,
+                captures,
+                target: _,
+                group,
+            } => {
+                let (before, current_and_after) = values.split_at_mut(node_id);
+                let slot = current_and_after.first_mut().ok_or_else(|| {
+                    format!("CUDA Scan VJP node {node_id} is missing its buffer slot")
+                })?;
+                let carry_count = element_count(&scan_plan.carry_shape()?)?;
+                let output_count = element_count(
+                    &scan_plan.body.plan.nodes[scan_plan.body.plan.output_node_ids[1]].shape,
+                )?;
+                if let Some(cached) = scan_vjp_cache.get_mut(group) {
+                    let output = cached.results.remove(&node_id).ok_or_else(|| {
+                        format!(
+                            "CUDA Scan VJP group {group} has no cached result for node {node_id}"
+                        )
+                    })?;
+                    if slot.is_some() {
+                        return Err(format!(
+                            "CUDA Scan VJP node {node_id} unexpectedly owns a result buffer before cache reuse"
+                        ));
+                    }
+                    *slot = Some(output);
+                    if cached.results.is_empty() {
+                        scan_vjp_cache.remove(group);
+                    }
+                } else {
+                    let members = cuda_scan_vjp_group(plan, *group)?;
+                    if members.first().map(|(member_id, _)| *member_id) != Some(node_id) {
+                        return Err(format!(
+                            "CUDA Scan VJP group {group} reached node {node_id} before its producer"
+                        ));
+                    }
+                    let tape_count = scan_plan
+                        .upper
+                        .checked_sub(scan_plan.lower)
+                        .and_then(|steps| steps.checked_add(1))
+                        .and_then(|states| states.checked_mul(carry_count))
+                        .ok_or_else(|| {
+                            "CUDA Scan VJP carry tape size overflowed usize".to_string()
+                        })?;
+                    let mut tape = take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
+                    let launch_count = u32::try_from(carry_count).map_err(|_| {
+                        format!("CUDA Scan VJP node {node_id} launch exceeds u32 element count")
+                    })?;
+                    let mut outputs = Vec::with_capacity(members.len());
+                    for (member_id, member_target) in &members {
+                        let member_count = element_count(&plan.nodes[*member_id].shape)?;
+                        let mut output =
+                            take_cuda_buffer(stream, free_buffers, member_count, *member_id)?;
+                        if matches!(member_target, TensorScanVjpTarget::External(_))
+                            && output.len() != carry_count
+                        {
+                            stream
+                                .memcpy_htod(&[0.0f32], &mut output)
+                                .map_err(|error| {
+                                    format!(
+                                        "failed to clear CUDA reduced Scan VJP output: {error:?}"
+                                    )
+                                })?;
+                        }
+                        outputs.push(output);
+                    }
+                    let kernel = module
+                        .load_function(&cuda_node_function_name(node_id))
+                        .map_err(|error| {
+                            format!("failed to load CUDA Scan VJP node {node_id} kernel: {error:?}")
+                        })?;
+                    if outputs.len() == 1 {
+                        launch_cuda_scan_vjp_node(
+                            stream,
+                            &kernel,
+                            outputs
+                                .first_mut()
+                                .ok_or_else(|| "CUDA Scan VJP group has no output".to_string())?,
+                            &mut tape,
+                            before,
+                            *carry,
+                            *final_carry_cotangent,
+                            *output_cotangent,
+                            captures,
+                            launch_count,
+                            output_count as u64,
+                        )?;
+                    } else {
+                        launch_cuda_scan_vjp_group(
+                            stream,
+                            &kernel,
+                            &mut outputs,
+                            &mut tape,
+                            before,
+                            *carry,
+                            *final_carry_cotangent,
+                            *output_cotangent,
+                            captures,
+                            launch_count,
+                            output_count as u64,
+                        )?;
+                    }
+                    free_buffers.entry(tape.len()).or_default().push(tape);
+                    let mut cached = CudaScanVjpCache::default();
+                    for ((member_id, _), output) in members.into_iter().zip(outputs) {
+                        if member_id == node_id {
+                            *slot = Some(output);
+                        } else {
+                            cached.results.insert(member_id, output);
+                        }
+                    }
+                    if !cached.results.is_empty() {
+                        scan_vjp_cache.insert(*group, cached);
+                    }
+                }
+                release_dead_cuda_values(
+                    plan,
+                    node_id,
+                    values,
+                    free_buffers,
+                    retained_inputs,
+                    &mut remaining_uses,
+                )?;
+                continue;
+            }
+            TensorOp::ScanVjpJvp {
+                carry,
+                carry_tangent,
+                final_carry_cotangent,
+                final_carry_cotangent_tangent,
+                output_cotangent,
+                output_cotangent_tangent,
+                plan: scan_hvp,
+                captures,
+                tangent_captures,
+                group,
+                ..
+            } => {
+                let (before, current_and_after) = values.split_at_mut(node_id);
+                let slot = current_and_after.first_mut().ok_or_else(|| {
+                    format!("CUDA Scan VJP JVP node {node_id} is missing its buffer slot")
+                })?;
+                let carry_count = element_count(&scan_hvp.scan_plan.carry_shape()?)?;
+                if let Some(cached) = scan_vjp_jvp_cache.get_mut(group) {
+                    let output = cached.results.remove(&node_id).ok_or_else(|| {
+                        format!("CUDA Scan VJP JVP group {group} has no cached result for node {node_id}")
+                    })?;
+                    if slot.is_some() {
+                        return Err(format!("CUDA Scan VJP JVP node {node_id} unexpectedly owns a result buffer before cache reuse"));
+                    }
+                    *slot = Some(output);
+                    if cached.results.is_empty() {
+                        scan_vjp_jvp_cache.remove(group);
+                    }
+                } else {
+                    let members = cuda_scan_vjp_jvp_group(plan, *group)?;
+                    if members.first().map(|(member_id, _)| *member_id) != Some(node_id) {
+                        return Err(format!("CUDA Scan VJP JVP group {group} reached node {node_id} before its producer"));
+                    }
+                    let output_count = element_count(
+                        &scan_hvp.scan_plan.body.plan.nodes
+                            [scan_hvp.scan_plan.body.plan.output_node_ids[1]]
+                            .shape,
+                    )?;
+                    let tape_count = scan_hvp.scan_plan.upper
+                        .checked_sub(scan_hvp.scan_plan.lower)
+                        .and_then(|steps| steps.checked_add(1))
+                        .and_then(|states| states.checked_mul(carry_count))
+                        .ok_or_else(|| "CUDA Scan VJP JVP carry tape size overflowed usize".to_string())?;
+                    let mut carry_tape = take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
+                    let mut tangent_tape = take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
+                    let launch_count = u32::try_from(carry_count).map_err(|_| {
+                        format!("CUDA Scan VJP JVP node {node_id} launch exceeds u32 element count")
+                    })?;
+                    let mut outputs = Vec::with_capacity(members.len());
+                    for (member_id, member_target) in &members {
+                        let member_count = element_count(&plan.nodes[*member_id].shape)?;
+                        let mut output = take_cuda_buffer(stream, free_buffers, member_count, *member_id)?;
+                        if matches!(member_target, TensorScanVjpTarget::External(_))
+                            && output.len() != carry_count
+                        {
+                            stream.memcpy_htod(&[0.0f32], &mut output).map_err(|error| {
+                                format!("failed to clear CUDA reduced Scan VJP JVP output: {error:?}")
+                            })?;
+                        }
+                        outputs.push(output);
+                    }
+                    let kernel = module.load_function(&cuda_node_function_name(node_id)).map_err(|error| {
+                        format!("failed to load CUDA Scan VJP JVP node {node_id} kernel: {error:?}")
+                    })?;
+                    launch_cuda_scan_vjp_jvp_group(
+                        stream, &kernel, &mut outputs, &mut carry_tape, &mut tangent_tape,
+                        before, *carry, *carry_tangent, *final_carry_cotangent,
+                        *final_carry_cotangent_tangent, *output_cotangent,
+                        *output_cotangent_tangent, captures, tangent_captures, launch_count,
+                        output_count as u64,
+                    )?;
+                    free_buffers.entry(carry_tape.len()).or_default().push(carry_tape);
+                    free_buffers.entry(tangent_tape.len()).or_default().push(tangent_tape);
+                    let mut cached = CudaScanVjpJvpCache::default();
+                    for ((member_id, _), output) in members.into_iter().zip(outputs) {
+                        if member_id == node_id {
+                            *slot = Some(output);
+                        } else {
+                            cached.results.insert(member_id, output);
+                        }
+                    }
+                    if !cached.results.is_empty() {
+                        scan_vjp_jvp_cache.insert(*group, cached);
+                    }
+                }
+                release_dead_cuda_values(
+                    plan,
+                    node_id,
+                    values,
+                    free_buffers,
+                    retained_inputs,
+                    &mut remaining_uses,
+                )?;
+                continue;
             }
             TensorOp::ScalarConstant { .. }
             | TensorOp::Add { .. }
@@ -1628,6 +2577,306 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
     Ok(())
 }
 
+fn launch_cuda_fori_node(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    output: &mut CudaSlice<f32>,
+    values: &[Option<CudaSlice<f32>>],
+    carry: TensorNodeId,
+    captures: &[(String, TensorNodeId)],
+    launch_count: u32,
+) -> Result<(), String> {
+    let count = cuda_value(values, carry)?.len() as u64;
+    let mut launch = stream.launch_builder(kernel);
+    for (_, capture) in captures {
+        launch.arg(cuda_value(values, *capture)?);
+    }
+    launch.arg(cuda_value(values, carry)?);
+    launch.arg(output);
+    launch.arg(&count);
+    unsafe {
+        launch
+            .launch(LaunchConfig::for_num_elems(launch_count))
+            .map_err(|error| format!("failed to launch CUDA Fori device loop: {error:?}"))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_fori_jvp_node(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    output: &mut CudaSlice<f32>,
+    values: &[Option<CudaSlice<f32>>],
+    carry: TensorNodeId,
+    carry_tangent: TensorNodeId,
+    captures: &[(String, TensorNodeId)],
+    tangent_captures: &[(String, TensorNodeId)],
+    launch_count: u32,
+) -> Result<(), String> {
+    let count = cuda_value(values, carry)?.len() as u64;
+    let mut launch = stream.launch_builder(kernel);
+    for (_, capture) in captures {
+        launch.arg(cuda_value(values, *capture)?);
+    }
+    for (_, capture) in tangent_captures {
+        launch.arg(cuda_value(values, *capture)?);
+    }
+    launch.arg(cuda_value(values, carry)?);
+    launch.arg(cuda_value(values, carry_tangent)?);
+    launch.arg(output);
+    launch.arg(&count);
+    unsafe {
+        launch
+            .launch(LaunchConfig::for_num_elems(launch_count))
+            .map_err(|error| format!("failed to launch CUDA Fori JVP device loop: {error:?}"))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_fori_vjp_node(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    output: &mut CudaSlice<f32>,
+    tape: &mut CudaSlice<f32>,
+    values: &[Option<CudaSlice<f32>>],
+    carry: TensorNodeId,
+    output_cotangent: TensorNodeId,
+    captures: &[(String, TensorNodeId)],
+    launch_count: u32,
+) -> Result<(), String> {
+    let count = cuda_value(values, carry)?.len() as u64;
+    let mut launch = stream.launch_builder(kernel);
+    for (_, capture) in captures {
+        launch.arg(cuda_value(values, *capture)?);
+    }
+    launch.arg(cuda_value(values, carry)?);
+    launch.arg(cuda_value(values, output_cotangent)?);
+    launch.arg(tape);
+    launch.arg(output);
+    launch.arg(&count);
+    unsafe {
+        launch
+            .launch(LaunchConfig::for_num_elems(launch_count))
+            .map_err(|error| format!("failed to launch CUDA Fori VJP device loop: {error:?}"))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_fori_vjp_group(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    outputs: &mut [CudaSlice<f32>],
+    tape: &mut CudaSlice<f32>,
+    values: &[Option<CudaSlice<f32>>],
+    carry: TensorNodeId,
+    output_cotangent: TensorNodeId,
+    captures: &[(String, TensorNodeId)],
+    launch_count: u32,
+) -> Result<(), String> {
+    let count = cuda_value(values, carry)?.len() as u64;
+    let mut launch = stream.launch_builder(kernel);
+    for (_, capture) in captures {
+        launch.arg(cuda_value(values, *capture)?);
+    }
+    launch.arg(cuda_value(values, carry)?);
+    launch.arg(cuda_value(values, output_cotangent)?);
+    launch.arg(tape);
+    for output in outputs {
+        launch.arg(output);
+    }
+    launch.arg(&count);
+    unsafe {
+        launch
+            .launch(LaunchConfig::for_num_elems(launch_count))
+            .map_err(|error| {
+                format!("failed to launch grouped CUDA Fori VJP device loop: {error:?}")
+            })?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_fori_vjp_jvp_node(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    output: &mut CudaSlice<f32>,
+    carry_tape: &mut CudaSlice<f32>,
+    carry_tangent_tape: &mut CudaSlice<f32>,
+    values: &[Option<CudaSlice<f32>>],
+    carry: TensorNodeId,
+    carry_tangent: TensorNodeId,
+    output_cotangent: TensorNodeId,
+    output_cotangent_tangent: TensorNodeId,
+    captures: &[(String, TensorNodeId)],
+    tangent_captures: &[(String, TensorNodeId)],
+    launch_count: u32,
+) -> Result<(), String> {
+    let count = cuda_value(values, carry)?.len() as u64;
+    let mut launch = stream.launch_builder(kernel);
+    for (_, capture) in captures {
+        launch.arg(cuda_value(values, *capture)?);
+    }
+    for (_, capture) in tangent_captures {
+        launch.arg(cuda_value(values, *capture)?);
+    }
+    launch.arg(cuda_value(values, carry)?);
+    launch.arg(cuda_value(values, carry_tangent)?);
+    launch.arg(cuda_value(values, output_cotangent)?);
+    launch.arg(cuda_value(values, output_cotangent_tangent)?);
+    launch.arg(carry_tape);
+    launch.arg(carry_tangent_tape);
+    launch.arg(output);
+    launch.arg(&count);
+    unsafe {
+        launch
+            .launch(LaunchConfig::for_num_elems(launch_count))
+            .map_err(|error| {
+                format!("failed to launch CUDA Fori VJP JVP device loop: {error:?}")
+            })?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_scan_node(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    final_carry: &mut CudaSlice<f32>,
+    outputs: &mut CudaSlice<f32>,
+    values: &[Option<CudaSlice<f32>>],
+    carry: TensorNodeId,
+    captures: &[(String, TensorNodeId)],
+    output_count: usize,
+    launch_count: u32,
+) -> Result<(), String> {
+    let carry_count = final_carry.len() as u64;
+    let output_count = u64::try_from(output_count)
+        .map_err(|_| "CUDA Scan output count exceeds u64".to_string())?;
+    let mut launch = stream.launch_builder(kernel);
+    for (_, capture) in captures {
+        launch.arg(cuda_value(values, *capture)?);
+    }
+    launch.arg(cuda_value(values, carry)?);
+    launch.arg(final_carry);
+    launch.arg(outputs);
+    launch.arg(&carry_count);
+    launch.arg(&output_count);
+    unsafe {
+        launch
+            .launch(LaunchConfig::for_num_elems(launch_count))
+            .map_err(|error| format!("failed to launch CUDA Scan device loop: {error:?}"))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_scan_vjp_node(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    output: &mut CudaSlice<f32>,
+    tape: &mut CudaSlice<f32>,
+    values: &[Option<CudaSlice<f32>>],
+    carry: TensorNodeId,
+    final_carry_cotangent: TensorNodeId,
+    output_cotangent: TensorNodeId,
+    captures: &[(String, TensorNodeId)],
+    launch_count: u32,
+    output_count: u64,
+) -> Result<(), String> {
+    let carry_count = cuda_value(values, carry)?.len() as u64;
+    let mut launch = stream.launch_builder(kernel);
+    for (_, capture) in captures {
+        launch.arg(cuda_value(values, *capture)?);
+    }
+    launch.arg(cuda_value(values, carry)?);
+    launch.arg(cuda_value(values, final_carry_cotangent)?);
+    launch.arg(cuda_value(values, output_cotangent)?);
+    launch.arg(tape);
+    launch.arg(output);
+    launch.arg(&carry_count);
+    launch.arg(&output_count);
+    unsafe {
+        launch
+            .launch(LaunchConfig::for_num_elems(launch_count))
+            .map_err(|error| format!("failed to launch CUDA Scan VJP device loop: {error:?}"))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_scan_vjp_group(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    outputs: &mut [CudaSlice<f32>],
+    tape: &mut CudaSlice<f32>,
+    values: &[Option<CudaSlice<f32>>],
+    carry: TensorNodeId,
+    final_carry_cotangent: TensorNodeId,
+    output_cotangent: TensorNodeId,
+    captures: &[(String, TensorNodeId)],
+    launch_count: u32,
+    output_count: u64,
+) -> Result<(), String> {
+    let carry_count = cuda_value(values, carry)?.len() as u64;
+    let mut launch = stream.launch_builder(kernel);
+    for (_, capture) in captures {
+        launch.arg(cuda_value(values, *capture)?);
+    }
+    launch.arg(cuda_value(values, carry)?);
+    launch.arg(cuda_value(values, final_carry_cotangent)?);
+    launch.arg(cuda_value(values, output_cotangent)?);
+    launch.arg(tape);
+    for output in outputs {
+        launch.arg(output);
+    }
+    launch.arg(&carry_count);
+    launch.arg(&output_count);
+    unsafe {
+        launch
+            .launch(LaunchConfig::for_num_elems(launch_count))
+            .map_err(|error| {
+                format!("failed to launch grouped CUDA Scan VJP device loop: {error:?}")
+            })?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_cuda_scan_vjp_jvp_group(
+    stream: &Arc<CudaStream>, kernel: &CudaFunction, outputs: &mut [CudaSlice<f32>],
+    carry_tape: &mut CudaSlice<f32>, carry_tangent_tape: &mut CudaSlice<f32>,
+    values: &[Option<CudaSlice<f32>>], carry: TensorNodeId, carry_tangent: TensorNodeId,
+    final_carry_cotangent: TensorNodeId, final_carry_cotangent_tangent: TensorNodeId,
+    output_cotangent: TensorNodeId, output_cotangent_tangent: TensorNodeId,
+    captures: &[(String, TensorNodeId)], tangent_captures: &[(String, TensorNodeId)],
+    launch_count: u32, output_count: u64,
+) -> Result<(), String> {
+    let carry_count = cuda_value(values, carry)?.len() as u64;
+    let mut launch = stream.launch_builder(kernel);
+    for (_, value) in captures { launch.arg(cuda_value(values, *value)?); }
+    for (_, value) in tangent_captures { launch.arg(cuda_value(values, *value)?); }
+    launch.arg(cuda_value(values, carry)?);
+    launch.arg(cuda_value(values, carry_tangent)?);
+    launch.arg(cuda_value(values, final_carry_cotangent)?);
+    launch.arg(cuda_value(values, final_carry_cotangent_tangent)?);
+    launch.arg(cuda_value(values, output_cotangent)?);
+    launch.arg(cuda_value(values, output_cotangent_tangent)?);
+    launch.arg(carry_tape);
+    launch.arg(carry_tangent_tape);
+    for output in outputs { launch.arg(output); }
+    launch.arg(&carry_count);
+    launch.arg(&output_count);
+    unsafe {
+        launch.launch(LaunchConfig::for_num_elems(launch_count)).map_err(|error| {
+            format!("failed to launch grouped CUDA Scan VJP JVP device loop: {error:?}")
+        })?;
+    }
+    Ok(())
+}
+
 fn cuda_value(
     values: &[Option<CudaSlice<f32>>],
     node_id: usize,
@@ -2013,6 +3262,2374 @@ fn cuda_matmul_batch_offset_source(
     Ok(source)
 }
 
+fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<(), String> {
+    let body = &loop_plan.body.plan;
+    let carry_shape = loop_plan.carry_shape()?;
+    if body.output_shape()? != carry_shape {
+        return Err("body output shape does not match carry shape".to_string());
+    }
+    for (node_id, node) in body.nodes.iter().enumerate() {
+        match &node.op {
+            TensorOp::Input { name } => {
+                if !loop_plan.body.captures().contains_key(name) {
+                    return Err(format!("body input {name:?} is not a declared capture"));
+                }
+            }
+            TensorOp::ScalarConstant { value } if value.is_finite() => {}
+            TensorOp::Add { .. }
+            | TensorOp::Sub { .. }
+            | TensorOp::Div { .. }
+            | TensorOp::Mul { .. }
+            | TensorOp::Greater { .. }
+            | TensorOp::Where { .. }
+            | TensorOp::Tanh { .. }
+            | TensorOp::Exp { .. }
+            | TensorOp::Sqrt { .. }
+            | TensorOp::SqrtDerivative { .. }
+            | TensorOp::Sin { .. }
+            | TensorOp::Cos { .. }
+            | TensorOp::Powi { .. }
+            | TensorOp::Log { .. }
+            | TensorOp::Broadcast { .. } => {}
+            TensorOp::Reshape { input } if body.nodes[*input].shape == node.shape => {}
+            _ => {
+                return Err(format!(
+                    "body node {node_id} uses unsupported {} operation",
+                    cuda_op_name(&node.op)
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<(), String> {
+    let carry_shape = scan_plan.carry_shape()?;
+    let output_shape = scan_plan
+        .body
+        .output_shapes()
+        .get(1)
+        .ok_or_else(|| "Scan body output is missing".to_string())?;
+    let output_matches_carry_lanes =
+        element_count(output_shape)? == element_count(&carry_shape)?;
+    if !output_matches_carry_lanes && !cuda_shapes_broadcastable(output_shape, &carry_shape) {
+        return Err(format!(
+            "Scan body output shape {output_shape:?} must broadcast the carry shape {carry_shape:?}"
+        ));
+    }
+    let packed_pair = cuda_scan_is_packed_pair_layout(scan_plan)?;
+    for (name, shape) in scan_plan.external_captures() {
+        if !cuda_shapes_broadcastable(&carry_shape, shape) {
+            return Err(format!(
+                "Scan capture {name:?} shape {shape:?} cannot broadcast to carry shape {carry_shape:?}"
+            ));
+        }
+        if element_count(output_shape)? != element_count(shape)?
+            && !cuda_shapes_broadcastable(output_shape, shape)
+        {
+            return Err(format!(
+                "Scan capture {name:?} shape {shape:?} cannot broadcast to output shape {output_shape:?}"
+            ));
+        }
+    }
+    for (node_id, node) in scan_plan.body.plan.nodes.iter().enumerate() {
+        let node_element_count = element_count(&node.shape)?;
+        match &node.op {
+            TensorOp::Input { name } => {
+                if !scan_plan.body.captures().contains_key(name) {
+                    return Err(format!(
+                        "Scan body input {name:?} is not a declared capture"
+                    ));
+                }
+            }
+            TensorOp::ScalarConstant { value } if value.is_finite() => {}
+            TensorOp::Add { .. }
+            | TensorOp::Sub { .. }
+            | TensorOp::Div { .. }
+            | TensorOp::Mul { .. }
+            | TensorOp::Greater { .. }
+            | TensorOp::Where { .. }
+            | TensorOp::Tanh { .. }
+            | TensorOp::Exp { .. }
+            | TensorOp::Sqrt { .. }
+            | TensorOp::SqrtDerivative { .. }
+            | TensorOp::Sin { .. }
+            | TensorOp::Cos { .. }
+            | TensorOp::Powi { .. }
+            | TensorOp::Log { .. }
+            | TensorOp::Broadcast { .. } => {}
+            TensorOp::Reshape { input }
+                if element_count(&scan_plan.body.plan.nodes[*input].shape)?
+                    == element_count(&node.shape)? => {}
+            TensorOp::Slice {
+                input,
+                axis,
+                start: _,
+                length,
+            } if packed_pair
+                && *axis == 0
+                && scan_plan.body.plan.nodes[*input].shape == carry_shape
+                && *length == 1
+                && node.shape.len() == carry_shape.len()
+                && node.shape[0] == 1
+                && node.shape[1..] == carry_shape[1..] => {}
+            TensorOp::Concat { inputs, axis }
+                if packed_pair
+                    && *axis == 0
+                    && node.shape.first() == Some(&2)
+                    && node_element_count
+                        == element_count(&node.shape[1..])?
+                            .checked_mul(2)
+                            .ok_or_else(|| {
+                                "CUDA Scan packed concat element count overflows usize".to_string()
+                            })?
+                    && inputs.iter().all(|input| {
+                        let shape = &scan_plan.body.plan.nodes[*input].shape;
+                        shape.first() == Some(&1)
+                            && element_count(&shape[1..])
+                                .and_then(|count| count.checked_mul(2).ok_or_else(|| {
+                                    "CUDA Scan packed concat element count overflows usize"
+                                        .to_string()
+                                }))
+                                .is_ok_and(|count| count == node_element_count)
+                    }) => {}
+            _ => {
+                return Err(format!(
+                    "Scan body node {node_id} uses unsupported {} operation with shape {:?}: {:?}",
+                    cuda_op_name(&node.op), node.shape, node.op
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Symbolic JVP represents one Scan carry as `[primal, tangent, ...]` with a
+/// leading extent of two. The CUDA loop may preserve that layout because each
+/// lane maps back to its own packed carry element. This is deliberately not a
+/// general strided/indexed Scan lowering.
+fn cuda_scan_is_packed_pair_layout(scan_plan: &TensorScanExecutionPlan) -> Result<bool, String> {
+    let carry_shape = scan_plan.carry_shape()?;
+    Ok(carry_shape.first() == Some(&2))
+}
+
+fn cuda_fori_body_expression(
+    loop_plan: &TensorForiExecutionPlan,
+    node_id: TensorNodeId,
+    capture_parameters: &BTreeMap<String, usize>,
+    carry_shape: &[usize],
+) -> Result<String, String> {
+    let body = &loop_plan.body.plan;
+    let node = body
+        .nodes
+        .get(node_id)
+        .ok_or_else(|| format!("CUDA Fori body node {node_id} is missing"))?;
+    let child =
+        |child_id| cuda_fori_body_expression(loop_plan, child_id, capture_parameters, carry_shape);
+    match &node.op {
+        TensorOp::Input { name } if name == &loop_plan.carry_name => Ok("carry".to_string()),
+        TensorOp::Input { name } if name == &loop_plan.index_name => Ok("loop_index".to_string()),
+        TensorOp::Input { name } => {
+            let parameter = capture_parameters.get(name).ok_or_else(|| {
+                format!("CUDA Fori body input {name:?} has no parent capture binding")
+            })?;
+            let offset = cuda_offset_expression(carry_shape, &node.shape);
+            Ok(format!("capture_{parameter}[{offset}]"))
+        }
+        TensorOp::ScalarConstant { value } => Ok(cuda_float_literal(*value)),
+        TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Div { lhs, rhs } => Ok(format!("({} / {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Greater { lhs, rhs } => Ok(format!(
+            "(({} > {}) ? 1.0f : 0.0f)",
+            child(*lhs)?,
+            child(*rhs)?
+        )),
+        TensorOp::Where {
+            condition,
+            on_true,
+            on_false,
+        } => Ok(format!(
+            "(({} != 0.0f) ? {} : {})",
+            child(*condition)?,
+            child(*on_true)?,
+            child(*on_false)?
+        )),
+        TensorOp::Tanh { input } => Ok(format!("tanhf({})", child(*input)?)),
+        TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
+        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
+        TensorOp::SqrtDerivative { input, order } => {
+            let input = child(*input)?;
+            let coefficient = cuda_float_literal(sqrt_derivative_coefficient(*order));
+            let exponent = cuda_float_literal(0.5 - *order as f64);
+            Ok(format!(
+                "(({input} == 0.0f) ? 0.0f : ({coefficient} * powf({input}, {exponent})))"
+            ))
+        }
+        TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
+        TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
+        TensorOp::Powi { input, exponent } => {
+            Ok(format!("nabla_powi({}, {exponent}U)", child(*input)?))
+        }
+        TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
+        TensorOp::Broadcast { input } | TensorOp::Reshape { input } => child(*input),
+        _ => Err(format!(
+            "CUDA Fori body {} is not elementwise-lowerable",
+            cuda_op_name(&node.op)
+        )),
+    }
+}
+
+fn cuda_scan_body_expression(
+    scan_plan: &TensorScanExecutionPlan,
+    node_id: TensorNodeId,
+    capture_parameters: &BTreeMap<String, usize>,
+    carry_shape: &[usize],
+) -> Result<String, String> {
+    cuda_scan_body_expression_with_reference(
+        scan_plan,
+        node_id,
+        capture_parameters,
+        carry_shape,
+        "carry",
+    )
+}
+
+fn cuda_scan_body_expression_with_reference(
+    scan_plan: &TensorScanExecutionPlan,
+    node_id: TensorNodeId,
+    capture_parameters: &BTreeMap<String, usize>,
+    reference_shape: &[usize],
+    carry_expression: &str,
+) -> Result<String, String> {
+    let body = &scan_plan.body.plan;
+    let node = body
+        .nodes
+        .get(node_id)
+        .ok_or_else(|| format!("CUDA Scan body node {node_id} is missing"))?;
+    let child = |child_id| {
+        cuda_scan_body_expression_with_reference(
+            scan_plan,
+            child_id,
+            capture_parameters,
+            reference_shape,
+            carry_expression,
+        )
+    };
+    match &node.op {
+        TensorOp::Input { name } if name == &scan_plan.carry_name => {
+            Ok(carry_expression.to_string())
+        }
+        TensorOp::Input { name } if name == &scan_plan.index_name => Ok("loop_index".to_string()),
+        TensorOp::Input { name } => {
+            let parameter = capture_parameters.get(name).ok_or_else(|| {
+                format!("CUDA Scan body input {name:?} has no parent capture binding")
+            })?;
+            let offset = cuda_offset_expression(reference_shape, &node.shape);
+            Ok(format!("capture_{parameter}[{offset}]"))
+        }
+        TensorOp::ScalarConstant { value } => Ok(cuda_float_literal(*value)),
+        TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Div { lhs, rhs } => Ok(format!("({} / {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Greater { lhs, rhs } => Ok(format!(
+            "(({} > {}) ? 1.0f : 0.0f)",
+            child(*lhs)?,
+            child(*rhs)?
+        )),
+        TensorOp::Where {
+            condition,
+            on_true,
+            on_false,
+        } => Ok(format!(
+            "(({} != 0.0f) ? {} : {})",
+            child(*condition)?,
+            child(*on_true)?,
+            child(*on_false)?
+        )),
+        TensorOp::Tanh { input } => Ok(format!("tanhf({})", child(*input)?)),
+        TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
+        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
+        TensorOp::SqrtDerivative { input, order } => {
+            let input = child(*input)?;
+            let coefficient = cuda_float_literal(sqrt_derivative_coefficient(*order));
+            let exponent = cuda_float_literal(0.5 - *order as f64);
+            Ok(format!(
+                "(({input} == 0.0f) ? 0.0f : ({coefficient} * powf({input}, {exponent})))"
+            ))
+        }
+        TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
+        TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
+        TensorOp::Powi { input, exponent } => {
+            Ok(format!("nabla_powi({}, {exponent}U)", child(*input)?))
+        }
+        TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
+        TensorOp::Broadcast { input } | TensorOp::Reshape { input } => child(*input),
+        TensorOp::Slice { input, .. } => child(*input),
+        TensorOp::Concat { inputs, axis } => {
+            if *axis != 0
+                || (element_count(reference_shape)? != element_count(&node.shape)?
+                    && !cuda_shapes_broadcastable(reference_shape, &node.shape))
+            {
+                return Err("CUDA Scan supports only leading-axis packed-pair concat".to_string());
+            }
+            let inner = element_count(&node.shape[1..])?;
+            let node_offset = cuda_offset_expression(reference_shape, &node.shape);
+            let mut start = 0usize;
+            let mut branches = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                let width = body.nodes[*input].shape[0];
+                start += width;
+                branches.push((start, child(*input)?));
+            }
+            if start != node.shape[0] {
+                return Err("CUDA Scan packed concat has an invalid leading extent".to_string());
+            }
+            let (_, mut expression) = branches
+                .pop()
+                .ok_or_else(|| "CUDA Scan packed concat has no inputs".to_string())?;
+            for (limit, branch) in branches.into_iter().rev() {
+                expression = format!(
+                    "(({node_offset} / {inner}ULL) < {limit}ULL ? {branch} : {expression})"
+                );
+            }
+            Ok(expression)
+        }
+        _ => Err(format!(
+            "CUDA Scan body {} is not elementwise-lowerable",
+            cuda_op_name(&node.op)
+        )),
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CudaElementwiseInput {
+    Scalar(String),
+    Buffer(usize),
+}
+
+fn cuda_elementwise_plan_expression(
+    plan: &TensorExecutionPlan,
+    node_id: TensorNodeId,
+    inputs: &BTreeMap<String, CudaElementwiseInput>,
+    reference_shape: &[usize],
+) -> Result<String, String> {
+    cuda_elementwise_plan_expression_with_index(plan, node_id, inputs, reference_shape, "index")
+}
+
+fn cuda_elementwise_plan_expression_with_index(
+    plan: &TensorExecutionPlan,
+    node_id: TensorNodeId,
+    inputs: &BTreeMap<String, CudaElementwiseInput>,
+    reference_shape: &[usize],
+    index_expression: &str,
+) -> Result<String, String> {
+    let node = plan
+        .nodes
+        .get(node_id)
+        .ok_or_else(|| format!("CUDA elementwise plan node {node_id} is missing"))?;
+    let child = |child_id| {
+        cuda_elementwise_plan_expression_with_index(
+            plan,
+            child_id,
+            inputs,
+            reference_shape,
+            index_expression,
+        )
+    };
+    match &node.op {
+        TensorOp::Input { name } => match inputs.get(name) {
+            Some(CudaElementwiseInput::Scalar(expression)) => Ok(expression.clone()),
+            Some(CudaElementwiseInput::Buffer(parameter)) => Ok(format!(
+                "capture_{parameter}[{}]",
+                cuda_offset_expression_with_index(reference_shape, &node.shape, index_expression)
+            )),
+            None => Err(format!(
+                "CUDA elementwise plan input {name:?} has no binding"
+            )),
+        },
+        TensorOp::ScalarConstant { value } if value.is_finite() => Ok(cuda_float_literal(*value)),
+        TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Div { lhs, rhs } => Ok(format!("({} / {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
+        TensorOp::Greater { lhs, rhs } => Ok(format!(
+            "(({} > {}) ? 1.0f : 0.0f)",
+            child(*lhs)?,
+            child(*rhs)?
+        )),
+        TensorOp::Where {
+            condition,
+            on_true,
+            on_false,
+        } => Ok(format!(
+            "(({} != 0.0f) ? {} : {})",
+            child(*condition)?,
+            child(*on_true)?,
+            child(*on_false)?
+        )),
+        TensorOp::Tanh { input } => Ok(format!("tanhf({})", child(*input)?)),
+        TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
+        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
+        TensorOp::SqrtDerivative { input, order } => {
+            let input = child(*input)?;
+            let coefficient = cuda_float_literal(sqrt_derivative_coefficient(*order));
+            let exponent = cuda_float_literal(0.5 - *order as f64);
+            Ok(format!(
+                "(({input} == 0.0f) ? 0.0f : ({coefficient} * powf({input}, {exponent})))"
+            ))
+        }
+        TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
+        TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
+        TensorOp::Powi { input, exponent } => {
+            Ok(format!("nabla_powi({}, {exponent}U)", child(*input)?))
+        }
+        TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
+        TensorOp::Broadcast { input } | TensorOp::Reshape { input } => child(*input),
+        _ => Err(format!(
+            "CUDA Fori VJP body uses unsupported {} operation",
+            cuda_op_name(&node.op)
+        )),
+    }
+}
+
+fn cuda_fori_vjp_plan(
+    loop_plan: &TensorForiExecutionPlan,
+    target: &TensorForiVjpTarget,
+) -> Result<TensorExecutionPlan, String> {
+    cuda_fori_body_is_lowerable(loop_plan)?;
+    let carry_shape = loop_plan.carry_shape()?;
+    for (name, shape) in loop_plan.external_captures() {
+        if !cuda_shapes_broadcastable(&carry_shape, shape) {
+            return Err(format!(
+                "capture {name:?} shape {shape:?} cannot broadcast to carry shape {carry_shape:?}"
+            ));
+        }
+    }
+    let cotangent_name = "__nabla_cuda_fori_vjp_cotangent";
+    if loop_plan.body.captures().contains_key(cotangent_name) {
+        return Err(
+            "CUDA Fori VJP internal cotangent name collides with a body capture".to_string(),
+        );
+    }
+    let body = loop_plan.body.plan.as_ir();
+    let transformed = body.symbolic_vjp(loop_plan.body.plan.output_node_id, cotangent_name)?;
+    let gradient_name = match target {
+        TensorForiVjpTarget::Carry => &loop_plan.carry_name,
+        TensorForiVjpTarget::External(name) => name,
+    };
+    let gradient = transformed
+        .gradients
+        .get(gradient_name)
+        .ok_or_else(|| format!("CUDA Fori VJP body has no gradient for {gradient_name:?}"))?;
+    let plan = transformed.graph.compile_cpu(*gradient)?;
+    let mut inputs = BTreeMap::new();
+    inputs.insert(
+        loop_plan.carry_name.clone(),
+        CudaElementwiseInput::Scalar("carry".to_string()),
+    );
+    inputs.insert(
+        loop_plan.index_name.clone(),
+        CudaElementwiseInput::Scalar("loop_index".to_string()),
+    );
+    inputs.insert(
+        cotangent_name.to_string(),
+        CudaElementwiseInput::Scalar("cotangent".to_string()),
+    );
+    for (index, name) in loop_plan.external_captures().keys().enumerate() {
+        inputs.insert(name.clone(), CudaElementwiseInput::Buffer(index));
+    }
+    let target_shape = match target {
+        TensorForiVjpTarget::Carry => carry_shape.clone(),
+        TensorForiVjpTarget::External(name) => loop_plan
+            .external_captures()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("CUDA Fori VJP has no capture {name:?}"))?,
+    };
+    let expression_node = cuda_vjp_elementwise_output_node(&plan, &target_shape, &carry_shape)?;
+    cuda_elementwise_plan_expression(&plan, expression_node, &inputs, &carry_shape)?;
+    Ok(plan)
+}
+
+fn cuda_fori_jvp_tangent_names(loop_plan: &TensorForiExecutionPlan) -> BTreeMap<String, String> {
+    let mut tangent_names = BTreeMap::new();
+    for (index, name) in loop_plan.body.captures.keys().enumerate() {
+        if name == &loop_plan.index_name {
+            continue;
+        }
+        let mut tangent_name = format!("__nabla_cuda_fori_jvp_tangent_{index}");
+        while loop_plan.body.captures.contains_key(&tangent_name)
+            || tangent_names.values().any(|candidate| candidate == &tangent_name)
+        {
+            tangent_name.push('_');
+        }
+        tangent_names.insert(name.clone(), tangent_name);
+    }
+    tangent_names
+}
+
+fn cuda_fori_jvp_expressions(
+    loop_plan: &TensorForiExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+) -> Result<(String, String), String> {
+    cuda_fori_body_is_lowerable(loop_plan)?;
+    let carry_shape = loop_plan.carry_shape()?;
+    let tangent_names = cuda_fori_jvp_tangent_names(loop_plan);
+    let body = loop_plan.body.plan.as_ir();
+    let forward = body.symbolic_jvp_with_tangent_inputs(
+        loop_plan.body.plan.output_node_id,
+        &tangent_names,
+    )?;
+    let (forward_plan, outputs) = forward
+        .graph
+        .compile_cpu_many(&[forward.value, forward.tangent])?;
+    let mut inputs = BTreeMap::new();
+    inputs.insert(
+        loop_plan.carry_name.clone(),
+        CudaElementwiseInput::Scalar("carry".to_string()),
+    );
+    inputs.insert(
+        loop_plan.index_name.clone(),
+        CudaElementwiseInput::Scalar("loop_index".to_string()),
+    );
+    for (index, (name, _)) in captures.iter().enumerate() {
+        inputs.insert(name.clone(), CudaElementwiseInput::Buffer(index));
+    }
+    for (name, tangent_name) in &tangent_names {
+        let input = if name == &loop_plan.carry_name {
+            CudaElementwiseInput::Scalar("carry_tangent".to_string())
+        } else {
+            let capture_index = captures
+                .iter()
+                .position(|(candidate, _)| candidate == name)
+                .ok_or_else(|| format!("CUDA Fori JVP has no capture {name:?}"))?;
+            CudaElementwiseInput::Buffer(captures.len() + capture_index)
+        };
+        inputs.insert(tangent_name.clone(), input);
+    }
+    Ok((
+        cuda_elementwise_plan_expression(&forward_plan, outputs[0], &inputs, &carry_shape)?,
+        cuda_elementwise_plan_expression(&forward_plan, outputs[1], &inputs, &carry_shape)?,
+    ))
+}
+
+fn cuda_fori_jvp_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<(), String> {
+    let captures = loop_plan
+        .external_captures()
+        .keys()
+        .cloned()
+        .map(|name| (name, 0))
+        .collect::<Vec<_>>();
+    cuda_fori_jvp_expressions(loop_plan, &captures).map(|_| ())
+}
+
+fn cuda_fori_vjp_jvp_is_lowerable(plan: &TensorForiVjpJvpExecutionPlan) -> Result<(), String> {
+    let loop_plan = &plan.loop_plan;
+    cuda_fori_body_is_lowerable(loop_plan)?;
+    let carry_shape = loop_plan.carry_shape()?;
+    for (name, shape) in loop_plan.external_captures() {
+        if shape != &carry_shape {
+            return Err(format!(
+                "CUDA Fori VJP JVP capture {name:?} shape {shape:?} must match carry shape {carry_shape:?}"
+            ));
+        }
+    }
+    let mut forward_tangent_names = plan.tangent_names.clone();
+    forward_tangent_names.remove(&plan.cotangent_name);
+    let body = loop_plan.body.plan.as_ir();
+    let forward = body.symbolic_jvp_with_tangent_inputs(
+        loop_plan.body.plan.output_node_id,
+        &forward_tangent_names,
+    )?;
+    let (forward_plan, outputs) = forward
+        .graph
+        .compile_cpu_many(&[forward.value, forward.tangent])?;
+    let mut forward_inputs = BTreeMap::new();
+    forward_inputs.insert(
+        loop_plan.carry_name.clone(),
+        CudaElementwiseInput::Scalar("carry".to_string()),
+    );
+    forward_inputs.insert(
+        loop_plan.index_name.clone(),
+        CudaElementwiseInput::Scalar("loop_index".to_string()),
+    );
+    for (index, name) in loop_plan.external_captures().keys().enumerate() {
+        forward_inputs.insert(name.clone(), CudaElementwiseInput::Buffer(index));
+    }
+    for (name, tangent_name) in &forward_tangent_names {
+        let input = if name == &loop_plan.carry_name {
+            CudaElementwiseInput::Scalar("carry_tangent".to_string())
+        } else {
+            let capture_index = loop_plan
+                .external_captures()
+                .keys()
+                .position(|candidate| candidate == name)
+                .ok_or_else(|| format!("CUDA Fori VJP JVP has no capture {name:?}"))?;
+            CudaElementwiseInput::Buffer(loop_plan.external_captures().len() + capture_index)
+        };
+        forward_inputs.insert(tangent_name.clone(), input);
+    }
+    for output in outputs {
+        cuda_elementwise_plan_expression(&forward_plan, output, &forward_inputs, &carry_shape)?;
+    }
+    let mut reverse_inputs = forward_inputs;
+    reverse_inputs.insert(
+        plan.cotangent_name.clone(),
+        CudaElementwiseInput::Scalar("cotangent".to_string()),
+    );
+    reverse_inputs.insert(
+        "__nabla_cuda_fori_vjp_cotangent".to_string(),
+        CudaElementwiseInput::Scalar("cotangent".to_string()),
+    );
+    let cotangent_tangent = plan
+        .tangent_names
+        .get(&plan.cotangent_name)
+        .ok_or_else(|| "CUDA Fori VJP JVP has no cotangent tangent name".to_string())?;
+    reverse_inputs.insert(
+        cotangent_tangent.clone(),
+        CudaElementwiseInput::Scalar("cotangent_tangent".to_string()),
+    );
+    for gradient in plan.gradient_tangent_plans.values() {
+        cuda_elementwise_plan_expression(
+            gradient,
+            gradient.output_node_id,
+            &reverse_inputs,
+            &carry_shape,
+        )?;
+    }
+    Ok(())
+}
+
+fn cuda_fori_vjp_group(
+    plan: &TensorExecutionPlan,
+    group: usize,
+) -> Result<Vec<(TensorNodeId, &TensorForiVjpTarget)>, String> {
+    let mut members = Vec::new();
+    let mut signature = None;
+    for (node_id, node) in plan.nodes.iter().enumerate() {
+        let TensorOp::ForiVjp {
+            carry,
+            output_cotangent,
+            loop_plan: _,
+            captures,
+            target,
+            group: node_group,
+        } = &node.op
+        else {
+            continue;
+        };
+        if *node_group != group {
+            continue;
+        }
+        let current_signature = (*carry, *output_cotangent, captures);
+        if let Some((expected_carry, expected_cotangent, expected_captures)) = signature.as_ref() {
+            if *expected_carry != *carry
+                || *expected_cotangent != *output_cotangent
+                || *expected_captures != captures
+            {
+                return Err(format!(
+                    "CUDA Fori VJP group {group} mixes incompatible loop bindings"
+                ));
+            }
+        } else {
+            signature = Some(current_signature);
+        }
+        members.push((node_id, target));
+    }
+    if members.is_empty() {
+        return Err(format!("CUDA Fori VJP group {group} has no result nodes"));
+    }
+    Ok(members)
+}
+
+fn cuda_vjp_elementwise_output_node(
+    plan: &TensorExecutionPlan,
+    target_shape: &[usize],
+    element_shape: &[usize],
+) -> Result<TensorNodeId, String> {
+    if target_shape == element_shape {
+        return Ok(plan.output_node_id);
+    }
+    if !cuda_shapes_broadcastable(element_shape, target_shape) {
+        return Err(format!(
+            "CUDA VJP target shape {target_shape:?} cannot broadcast to element shape {element_shape:?}"
+        ));
+    }
+    let mut node_id = plan.output_node_id;
+    loop {
+        let node = plan
+            .nodes
+            .get(node_id)
+            .ok_or_else(|| format!("CUDA VJP output node {node_id} is missing"))?;
+        match &node.op {
+            TensorOp::Reshape { input }
+            | TensorOp::SumAxis { input, .. }
+            | TensorOp::Sum { input } => {
+                node_id = *input;
+            }
+            _ => break,
+        }
+    }
+    if element_count(&plan.nodes[node_id].shape)? == element_count(element_shape)? {
+        return Ok(node_id);
+    }
+    if plan.nodes[node_id].shape != element_shape {
+        return Err(format!(
+            "CUDA broadcast VJP reduction did not expose an elementwise contribution of shape {element_shape:?}; stopped at {:?} with shape {:?}",
+            plan.nodes[node_id].op,
+            plan.nodes[node_id].shape,
+        ));
+    }
+    Ok(node_id)
+}
+
+fn cuda_scan_vjp_plan(
+    scan_plan: &TensorScanExecutionPlan,
+    target: &TensorScanVjpTarget,
+    body_output_index: usize,
+    cotangent_name: &str,
+) -> Result<TensorExecutionPlan, String> {
+    cuda_scan_body_is_lowerable(scan_plan)?;
+    let carry_shape = scan_plan.carry_shape()?;
+    for (name, shape) in scan_plan.external_captures() {
+        if !cuda_shapes_broadcastable(&carry_shape, shape) {
+            return Err(format!(
+                "capture {name:?} shape {shape:?} cannot broadcast to carry shape {carry_shape:?}"
+            ));
+        }
+    }
+    if scan_plan.body.captures().contains_key(cotangent_name) {
+        return Err(
+            "CUDA Scan VJP internal cotangent name collides with a body capture".to_string(),
+        );
+    }
+    let output_node_id = *scan_plan
+        .body
+        .plan
+        .output_node_ids
+        .get(body_output_index)
+        .ok_or_else(|| format!("CUDA Scan VJP body output {body_output_index} is missing"))?;
+    let (vjp_output_node_id, element_shape) = if body_output_index == 1 {
+        if let Some(input) = cuda_scan_direct_broadcast_output_input(scan_plan)? {
+            (input, carry_shape.clone())
+        } else {
+            (
+                output_node_id,
+                scan_plan.body.plan.nodes[output_node_id].shape.clone(),
+            )
+        }
+    } else {
+        (
+            output_node_id,
+            scan_plan.body.plan.nodes[output_node_id].shape.clone(),
+        )
+    };
+    let body = scan_plan.body.plan.as_ir();
+    let transformed = body.symbolic_vjp(vjp_output_node_id, cotangent_name)?;
+    let gradient_name = match target {
+        TensorScanVjpTarget::Carry => &scan_plan.carry_name,
+        TensorScanVjpTarget::External(name) => name,
+    };
+    let gradient = transformed
+        .gradients
+        .get(gradient_name)
+        .ok_or_else(|| format!("CUDA Scan VJP body has no gradient for {gradient_name:?}"))?;
+    let plan = transformed.graph.compile_cpu(*gradient)?;
+    let mut inputs = BTreeMap::new();
+    inputs.insert(
+        scan_plan.carry_name.clone(),
+        CudaElementwiseInput::Scalar("carry".to_string()),
+    );
+    inputs.insert(
+        scan_plan.index_name.clone(),
+        CudaElementwiseInput::Scalar("loop_index".to_string()),
+    );
+    inputs.insert(
+        cotangent_name.to_string(),
+        CudaElementwiseInput::Scalar("cotangent".to_string()),
+    );
+    for (index, name) in scan_plan.external_captures().keys().enumerate() {
+        inputs.insert(name.clone(), CudaElementwiseInput::Buffer(index));
+    }
+    let target_shape = match target {
+        TensorScanVjpTarget::Carry => carry_shape.clone(),
+        TensorScanVjpTarget::External(name) => scan_plan
+            .external_captures()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("CUDA Scan VJP has no capture {name:?}"))?,
+    };
+    let expression_node = cuda_vjp_elementwise_output_node(&plan, &target_shape, &element_shape)?;
+    cuda_elementwise_plan_expression(&plan, expression_node, &inputs, &element_shape)?;
+    Ok(plan)
+}
+
+/// Returns the carry-shaped source node when an unequal-lane Scan output is a
+/// direct broadcast. Its cotangent can be reduced per carry lane before VJP.
+fn cuda_scan_direct_broadcast_output_input(
+    scan_plan: &TensorScanExecutionPlan,
+) -> Result<Option<TensorNodeId>, String> {
+    let carry_shape = scan_plan.carry_shape()?;
+    let output_node_id = scan_plan.body.plan.output_node_ids[1];
+    let output_shape = &scan_plan.body.plan.nodes[output_node_id].shape;
+    if element_count(output_shape)? == element_count(&carry_shape)? {
+        return Ok(None);
+    }
+    match &scan_plan.body.plan.nodes[output_node_id].op {
+        TensorOp::Broadcast { input } if scan_plan.body.plan.nodes[*input].shape == carry_shape => {
+            Ok(Some(*input))
+        }
+        _ => Err(
+            "CUDA Scan VJP with unequal output and carry lanes requires a direct broadcast from the carry shape"
+                .to_string(),
+        ),
+    }
+}
+
+fn cuda_scan_vjp_plans(
+    scan_plan: &TensorScanExecutionPlan,
+    target: &TensorScanVjpTarget,
+) -> Result<(TensorExecutionPlan, TensorExecutionPlan), String> {
+    Ok((
+        cuda_scan_vjp_plan(
+            scan_plan,
+            target,
+            0,
+            "__nabla_cuda_scan_vjp_carry_cotangent",
+        )?,
+        cuda_scan_vjp_plan(
+            scan_plan,
+            target,
+            1,
+            "__nabla_cuda_scan_vjp_output_cotangent",
+        )?,
+    ))
+}
+
+fn cuda_scan_vjp_jvp_is_lowerable(plan: &TensorScanVjpJvpExecutionPlan) -> Result<(), String> {
+    let scan_plan = &plan.scan_plan;
+    cuda_scan_body_is_lowerable(scan_plan)?;
+    let carry_shape = scan_plan.carry_shape()?;
+    let output_shape = &scan_plan.body.plan.nodes[scan_plan.body.plan.output_node_ids[1]].shape;
+    let direct_broadcast_output = cuda_scan_direct_broadcast_output_input(scan_plan)?.is_some();
+    if element_count(output_shape)? != element_count(&carry_shape)? && !direct_broadcast_output {
+        return Err("CUDA Scan VJP JVP unequal output and carry lanes require a direct broadcast from the carry shape".to_string());
+    }
+    for (name, shape) in scan_plan.external_captures() {
+        if !cuda_shapes_broadcastable(&carry_shape, shape) {
+            return Err(format!(
+                "CUDA Scan VJP JVP capture {name:?} shape {shape:?} cannot broadcast to carry shape {carry_shape:?}"
+            ));
+        }
+    }
+    let forward_tangent_names = plan
+        .tangent_names
+        .iter()
+        .filter(|(name, _)| scan_plan.body.captures.contains_key(*name))
+        .map(|(name, tangent)| (name.clone(), tangent.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let body = scan_plan.body.plan.as_ir();
+    let forward = body.symbolic_jvp_with_tangent_inputs(
+        scan_plan.body.plan.output_node_ids[0],
+        &forward_tangent_names,
+    )?;
+    let (forward_plan, outputs) = forward
+        .graph
+        .compile_cpu_many(&[forward.value, forward.tangent])?;
+    let mut inputs = BTreeMap::new();
+    inputs.insert(
+        scan_plan.carry_name.clone(),
+        CudaElementwiseInput::Scalar("carry".to_string()),
+    );
+    inputs.insert(
+        scan_plan.index_name.clone(),
+        CudaElementwiseInput::Scalar("loop_index".to_string()),
+    );
+    for (index, name) in scan_plan.external_captures().keys().enumerate() {
+        inputs.insert(name.clone(), CudaElementwiseInput::Buffer(index));
+    }
+    for (name, tangent_name) in &forward_tangent_names {
+        let input = if name == &scan_plan.carry_name {
+            CudaElementwiseInput::Scalar("carry_tangent".to_string())
+        } else {
+            let capture_index = scan_plan
+                .external_captures()
+                .keys()
+                .position(|candidate| candidate == name)
+                .ok_or_else(|| format!("CUDA Scan VJP JVP has no capture {name:?}"))?;
+            CudaElementwiseInput::Buffer(scan_plan.external_captures().len() + capture_index)
+        };
+        inputs.insert(tangent_name.clone(), input);
+    }
+    for output in outputs {
+        cuda_elementwise_plan_expression(&forward_plan, output, &inputs, &carry_shape)?;
+    }
+    let mut reverse_inputs = inputs;
+    reverse_inputs.insert(
+        plan.carry_cotangent_name.clone(),
+        CudaElementwiseInput::Scalar("carry_cotangent".to_string()),
+    );
+    reverse_inputs.insert(
+        plan.output_cotangent_name.clone(),
+        CudaElementwiseInput::Scalar("output_cotangent_step".to_string()),
+    );
+    reverse_inputs.insert(
+        "__nabla_cuda_scan_vjp_carry_cotangent".to_string(),
+        CudaElementwiseInput::Scalar("carry_cotangent".to_string()),
+    );
+    reverse_inputs.insert(
+        "__nabla_cuda_scan_vjp_output_cotangent".to_string(),
+        CudaElementwiseInput::Scalar("output_cotangent_step".to_string()),
+    );
+    for (name, tangent_name) in &plan.tangent_names {
+        if name == &plan.carry_cotangent_name {
+            reverse_inputs.insert(
+                tangent_name.clone(),
+                CudaElementwiseInput::Scalar("carry_cotangent_tangent".to_string()),
+            );
+        } else if name == &plan.output_cotangent_name {
+            reverse_inputs.insert(
+                tangent_name.clone(),
+                CudaElementwiseInput::Scalar("output_cotangent_tangent_step".to_string()),
+            );
+        }
+    }
+    for (name, gradient) in &plan.carry_gradient_tangent_plans {
+        let target_shape = if name == &scan_plan.carry_name {
+            carry_shape.clone()
+        } else {
+            scan_plan
+                .external_captures()
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("CUDA Scan VJP JVP has no capture {name:?}"))?
+        };
+        cuda_elementwise_plan_expression(
+            gradient,
+            cuda_vjp_elementwise_output_node(gradient, &target_shape, &carry_shape)?,
+            &reverse_inputs,
+            &carry_shape,
+        )?;
+    }
+    if direct_broadcast_output {
+        for target in std::iter::once(TensorScanVjpTarget::Carry).chain(
+            scan_plan
+                .external_captures()
+                .keys()
+                .cloned()
+                .map(TensorScanVjpTarget::External),
+        ) {
+            let directional =
+                cuda_scan_vjp_jvp_direct_broadcast_output_directional_plan(plan, &target)?;
+            let target_shape = match &target {
+                TensorScanVjpTarget::Carry => carry_shape.clone(),
+                TensorScanVjpTarget::External(name) => scan_plan
+                    .external_captures()
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("CUDA Scan VJP JVP has no capture {name:?}"))?,
+            };
+            cuda_elementwise_plan_expression(
+                &directional,
+                cuda_vjp_elementwise_output_node(&directional, &target_shape, &carry_shape)?,
+                &reverse_inputs,
+                &carry_shape,
+            )?;
+        }
+    } else {
+        for (name, gradient) in &plan.output_gradient_tangent_plans {
+            let target_shape = if name == &scan_plan.carry_name {
+                carry_shape.clone()
+            } else {
+                scan_plan
+                    .external_captures()
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("CUDA Scan VJP JVP has no capture {name:?}"))?
+            };
+            cuda_elementwise_plan_expression(
+                gradient,
+                cuda_vjp_elementwise_output_node(gradient, &target_shape, &carry_shape)?,
+                &reverse_inputs,
+                &carry_shape,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn cuda_scan_vjp_jvp_direct_broadcast_output_directional_plan(
+    plan: &TensorScanVjpJvpExecutionPlan,
+    target: &TensorScanVjpTarget,
+) -> Result<TensorExecutionPlan, String> {
+    let scan_plan = &plan.scan_plan;
+    let output_node = cuda_scan_direct_broadcast_output_input(scan_plan)?.ok_or_else(|| {
+        "CUDA Scan VJP JVP direct-broadcast directional plan requires unequal output lanes"
+            .to_string()
+    })?;
+    let gradient_name = match target {
+        TensorScanVjpTarget::Carry => &scan_plan.carry_name,
+        TensorScanVjpTarget::External(name) => name,
+    };
+    let output_vjp = scan_plan
+        .body
+        .plan
+        .as_ir()
+        .symbolic_vjp(output_node, &plan.output_cotangent_name)?;
+    let gradient = *output_vjp.gradients.get(gradient_name).ok_or_else(|| {
+        format!("CUDA Scan VJP JVP body has no output gradient for {gradient_name:?}")
+    })?;
+    let tangent_names = plan
+        .tangent_names
+        .iter()
+        .filter(|(name, _)| {
+            scan_plan.body.captures.contains_key(*name) || *name == &plan.output_cotangent_name
+        })
+        .map(|(name, tangent)| (name.clone(), tangent.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let directional = output_vjp
+        .graph
+        .symbolic_jvp_with_tangent_inputs(gradient, &tangent_names)?;
+    directional.graph.compile_cpu(directional.tangent)
+}
+
+fn cuda_scan_vjp_group(
+    plan: &TensorExecutionPlan,
+    group: usize,
+) -> Result<Vec<(TensorNodeId, &TensorScanVjpTarget)>, String> {
+    let mut members = Vec::new();
+    let mut signature = None;
+    for (node_id, node) in plan.nodes.iter().enumerate() {
+        let TensorOp::ScanVjp {
+            carry,
+            final_carry_cotangent,
+            output_cotangent,
+            scan_plan: _,
+            captures,
+            target,
+            group: node_group,
+        } = &node.op
+        else {
+            continue;
+        };
+        if *node_group != group {
+            continue;
+        }
+        let current_signature = (*carry, *final_carry_cotangent, *output_cotangent, captures);
+        if let Some((expected_carry, expected_final, expected_output, expected_captures)) =
+            signature.as_ref()
+        {
+            if *expected_carry != *carry
+                || *expected_final != *final_carry_cotangent
+                || *expected_output != *output_cotangent
+                || *expected_captures != captures
+            {
+                return Err(format!(
+                    "CUDA Scan VJP group {group} mixes incompatible scan bindings"
+                ));
+            }
+        } else {
+            signature = Some(current_signature);
+        }
+        members.push((node_id, target));
+    }
+    if members.is_empty() {
+        return Err(format!("CUDA Scan VJP group {group} has no result nodes"));
+    }
+    Ok(members)
+}
+
+fn cuda_scan_vjp_jvp_group(
+    plan: &TensorExecutionPlan,
+    group: usize,
+) -> Result<Vec<(TensorNodeId, &TensorScanVjpTarget)>, String> {
+    let mut members = Vec::new();
+    let mut signature = None;
+    for (node_id, node) in plan.nodes.iter().enumerate() {
+        let TensorOp::ScanVjpJvp {
+            carry,
+            carry_tangent,
+            final_carry_cotangent,
+            final_carry_cotangent_tangent,
+            output_cotangent,
+            output_cotangent_tangent,
+            captures,
+            tangent_captures,
+            target,
+            group: node_group,
+            ..
+        } = &node.op
+        else {
+            continue;
+        };
+        if *node_group != group {
+            continue;
+        }
+        let current_signature = (
+            *carry,
+            *carry_tangent,
+            *final_carry_cotangent,
+            *final_carry_cotangent_tangent,
+            *output_cotangent,
+            *output_cotangent_tangent,
+            captures,
+            tangent_captures,
+        );
+        if let Some(expected) = signature.as_ref() {
+            if *expected != current_signature {
+                return Err(format!("CUDA Scan VJP JVP group {group} mixes incompatible bindings"));
+            }
+        } else {
+            signature = Some(current_signature);
+        }
+        members.push((node_id, target));
+    }
+    if members.is_empty() {
+        return Err(format!("CUDA Scan VJP JVP group {group} has no result nodes"));
+    }
+    Ok(members)
+}
+
+fn cuda_fori_vjp_node_kernel_source(
+    node_id: TensorNodeId,
+    loop_plan: &TensorForiExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+    target: &TensorForiVjpTarget,
+) -> Result<String, String> {
+    let gradient_plan = cuda_fori_vjp_plan(loop_plan, target)?;
+    let carry_gradient_plan = match target {
+        TensorForiVjpTarget::Carry => None,
+        TensorForiVjpTarget::External(_) => {
+            Some(cuda_fori_vjp_plan(loop_plan, &TensorForiVjpTarget::Carry)?)
+        }
+    };
+    let carry_shape = loop_plan.carry_shape()?;
+    let mut inputs = BTreeMap::new();
+    inputs.insert(
+        loop_plan.carry_name.clone(),
+        CudaElementwiseInput::Scalar("carry".to_string()),
+    );
+    inputs.insert(
+        loop_plan.index_name.clone(),
+        CudaElementwiseInput::Scalar("loop_index".to_string()),
+    );
+    inputs.insert(
+        "__nabla_cuda_fori_vjp_cotangent".to_string(),
+        CudaElementwiseInput::Scalar("cotangent".to_string()),
+    );
+    for (index, (name, _)) in captures.iter().enumerate() {
+        inputs.insert(name.clone(), CudaElementwiseInput::Buffer(index));
+    }
+    let forward_parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| (name.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let forward_expression = cuda_fori_body_expression(
+        loop_plan,
+        loop_plan.body.plan.output_node_id,
+        &forward_parameters,
+        &carry_shape,
+    )?;
+    let gradient_expression = cuda_elementwise_plan_expression(
+        &gradient_plan,
+        cuda_vjp_elementwise_output_node(
+            &gradient_plan,
+            &match target {
+                TensorForiVjpTarget::Carry => carry_shape.clone(),
+                TensorForiVjpTarget::External(name) => loop_plan
+                    .external_captures()
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("CUDA Fori VJP has no capture {name:?}"))?,
+            },
+            &carry_shape,
+        )?,
+        &inputs,
+        &carry_shape,
+    )?;
+    let carry_gradient_expression = carry_gradient_plan
+        .as_ref()
+        .map(|plan| {
+            cuda_elementwise_plan_expression(plan, plan.output_node_id, &inputs, &carry_shape)
+        })
+        .transpose()?;
+    let reverse_update = match (target, carry_gradient_expression) {
+        (TensorForiVjpTarget::Carry, None) => "cotangent = contribution;".to_string(),
+        (TensorForiVjpTarget::External(_), Some(carry_gradient)) => format!(
+            "gradient += contribution;\n\\
+                cotangent = {carry_gradient};"
+        ),
+        _ => return Err("CUDA Fori VJP failed to construct its carry reverse update".to_string()),
+    };
+    let target_write = match target {
+        TensorForiVjpTarget::Carry => "out[index] = cotangent;".to_string(),
+        TensorForiVjpTarget::External(name) => {
+            let target_shape = loop_plan
+                .external_captures()
+                .get(name)
+                .ok_or_else(|| format!("CUDA Fori VJP has no capture {name:?}"))?;
+            if target_shape == &carry_shape {
+                "out[index] = gradient;".to_string()
+            } else {
+                format!(
+                    "atomicAdd(out + {}, gradient);",
+                    cuda_offset_expression(&carry_shape, target_shape)
+                )
+            }
+        }
+    };
+    let parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("const float* capture_{index}"))
+        .chain([
+            "const float* initial_carry".to_string(),
+            "const float* output_cotangent".to_string(),
+            "float* carry_tape".to_string(),
+            "float* out".to_string(),
+            "unsigned long long count".to_string(),
+        ])
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+            unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
+            if (index >= count) return;\n\\
+            float carry = initial_carry[index];\n\\
+            carry_tape[index] = carry;\n\\
+            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
+                float loop_index = (float)step;\n\\
+                carry = {forward_expression};\n\\
+                carry_tape[(step - {}ULL + 1ULL) * count + index] = carry;\n\\
+            }}\n\\
+            float cotangent = output_cotangent[index];\n\\
+            float gradient = 0.0f;\n\\
+            for (unsigned long long reverse = {}ULL; reverse > {}ULL; --reverse) {{\n\\
+                unsigned long long step = reverse - 1ULL;\n\\
+                float loop_index = (float)step;\n\\
+                carry = carry_tape[(step - {}ULL) * count + index];\n\\
+                float contribution = {gradient_expression};\n\\
+                {reverse_update}\n\\
+            }}\n\\
+            {}\n}}\n",
+        cuda_node_function_name(node_id),
+        loop_plan.lower,
+        loop_plan.upper,
+        loop_plan.lower,
+        loop_plan.upper,
+        loop_plan.lower,
+        loop_plan.lower,
+        target_write,
+    ))
+}
+
+fn cuda_fori_vjp_group_kernel_source(
+    node_id: TensorNodeId,
+    loop_plan: &TensorForiExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+    targets: &[&TensorForiVjpTarget],
+) -> Result<String, String> {
+    let carry_shape = loop_plan.carry_shape()?;
+    let carry_gradient_plan = cuda_fori_vjp_plan(loop_plan, &TensorForiVjpTarget::Carry)?;
+    let mut inputs = BTreeMap::new();
+    inputs.insert(
+        loop_plan.carry_name.clone(),
+        CudaElementwiseInput::Scalar("carry".to_string()),
+    );
+    inputs.insert(
+        loop_plan.index_name.clone(),
+        CudaElementwiseInput::Scalar("loop_index".to_string()),
+    );
+    inputs.insert(
+        "__nabla_cuda_fori_vjp_cotangent".to_string(),
+        CudaElementwiseInput::Scalar("cotangent".to_string()),
+    );
+    for (index, (name, _)) in captures.iter().enumerate() {
+        inputs.insert(name.clone(), CudaElementwiseInput::Buffer(index));
+    }
+    let forward_parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| (name.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let forward_expression = cuda_fori_body_expression(
+        loop_plan,
+        loop_plan.body.plan.output_node_id,
+        &forward_parameters,
+        &carry_shape,
+    )?;
+    let carry_gradient_expression = cuda_elementwise_plan_expression(
+        &carry_gradient_plan,
+        carry_gradient_plan.output_node_id,
+        &inputs,
+        &carry_shape,
+    )?;
+
+    let mut gradient_declarations = String::new();
+    let mut contribution_updates = String::new();
+    let mut target_writes = String::new();
+    for (target_index, target) in targets.iter().enumerate() {
+        match target {
+            TensorForiVjpTarget::Carry => {
+                target_writes.push_str(&format!("out_{target_index}[index] = cotangent;\n"));
+            }
+            TensorForiVjpTarget::External(name) => {
+                let target_shape = loop_plan
+                    .external_captures()
+                    .get(name)
+                    .ok_or_else(|| format!("CUDA Fori VJP has no capture {name:?}"))?;
+                let gradient_plan = cuda_fori_vjp_plan(loop_plan, target)?;
+                let expression_node =
+                    cuda_vjp_elementwise_output_node(&gradient_plan, target_shape, &carry_shape)?;
+                let gradient_expression = cuda_elementwise_plan_expression(
+                    &gradient_plan,
+                    expression_node,
+                    &inputs,
+                    &carry_shape,
+                )?;
+                gradient_declarations.push_str(&format!("float gradient_{target_index} = 0.0f;\n"));
+                contribution_updates.push_str(&format!(
+                    "gradient_{target_index} += {gradient_expression};\n"
+                ));
+                if target_shape == &carry_shape {
+                    target_writes.push_str(&format!(
+                        "out_{target_index}[index] = gradient_{target_index};\n"
+                    ));
+                } else {
+                    target_writes.push_str(&format!(
+                        "atomicAdd(out_{target_index} + {}, gradient_{target_index});\n",
+                        cuda_offset_expression(&carry_shape, target_shape)
+                    ));
+                }
+            }
+        }
+    }
+    let parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("const float* capture_{index}"))
+        .chain([
+            "const float* initial_carry".to_string(),
+            "const float* output_cotangent".to_string(),
+            "float* carry_tape".to_string(),
+        ])
+        .chain(
+            targets
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("float* out_{index}")),
+        )
+        .chain(["unsigned long long count".to_string()])
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+            unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
+            if (index >= count) return;\n\\
+            float carry = initial_carry[index];\n\\
+            carry_tape[index] = carry;\n\\
+            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
+                float loop_index = (float)step;\n\\
+                carry = {forward_expression};\n\\
+                carry_tape[(step - {}ULL + 1ULL) * count + index] = carry;\n\\
+            }}\n\\
+            float cotangent = output_cotangent[index];\n\\
+            {gradient_declarations}\
+            for (unsigned long long reverse = {}ULL; reverse > {}ULL; --reverse) {{\n\\
+                unsigned long long step = reverse - 1ULL;\n\\
+                float loop_index = (float)step;\n\\
+                carry = carry_tape[(step - {}ULL) * count + index];\n\\
+                {contribution_updates}\
+                cotangent = {carry_gradient_expression};\n\\
+            }}\n\\
+            {target_writes}\
+        }}\n",
+        cuda_node_function_name(node_id),
+        loop_plan.lower,
+        loop_plan.upper,
+        loop_plan.lower,
+        loop_plan.upper,
+        loop_plan.lower,
+        loop_plan.lower,
+    ))
+}
+
+fn cuda_fori_vjp_jvp_node_kernel_source(
+    node_id: TensorNodeId,
+    plan: &TensorForiVjpJvpExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+    target: &TensorForiVjpTarget,
+) -> Result<String, String> {
+    cuda_fori_vjp_jvp_is_lowerable(plan)?;
+    let loop_plan = &plan.loop_plan;
+    let carry_shape = loop_plan.carry_shape()?;
+    let body = loop_plan.body.plan.as_ir();
+    let mut forward_tangent_names = plan.tangent_names.clone();
+    forward_tangent_names.remove(&plan.cotangent_name);
+    let forward = body.symbolic_jvp_with_tangent_inputs(
+        loop_plan.body.plan.output_node_id,
+        &forward_tangent_names,
+    )?;
+    let (forward_plan, forward_outputs) = forward
+        .graph
+        .compile_cpu_many(&[forward.value, forward.tangent])?;
+    let mut forward_inputs = BTreeMap::new();
+    forward_inputs.insert(
+        loop_plan.carry_name.clone(),
+        CudaElementwiseInput::Scalar("carry".to_string()),
+    );
+    forward_inputs.insert(
+        loop_plan.index_name.clone(),
+        CudaElementwiseInput::Scalar("loop_index".to_string()),
+    );
+    for (index, (name, _)) in captures.iter().enumerate() {
+        forward_inputs.insert(name.clone(), CudaElementwiseInput::Buffer(index));
+    }
+    for (name, tangent_name) in &forward_tangent_names {
+        let input = if name == &loop_plan.carry_name {
+            CudaElementwiseInput::Scalar("carry_tangent".to_string())
+        } else {
+            let capture_index = captures
+                .iter()
+                .position(|(candidate, _)| candidate == name)
+                .ok_or_else(|| format!("CUDA Fori VJP JVP has no capture {name:?}"))?;
+            CudaElementwiseInput::Buffer(captures.len() + capture_index)
+        };
+        forward_inputs.insert(tangent_name.clone(), input);
+    }
+    let forward_expression = cuda_elementwise_plan_expression(
+        &forward_plan,
+        forward_outputs[0],
+        &forward_inputs,
+        &carry_shape,
+    )?;
+    let forward_tangent_expression = cuda_elementwise_plan_expression(
+        &forward_plan,
+        forward_outputs[1],
+        &forward_inputs,
+        &carry_shape,
+    )?;
+
+    let mut reverse_inputs = forward_inputs;
+    reverse_inputs.insert(
+        plan.cotangent_name.clone(),
+        CudaElementwiseInput::Scalar("cotangent".to_string()),
+    );
+    reverse_inputs.insert(
+        "__nabla_cuda_fori_vjp_cotangent".to_string(),
+        CudaElementwiseInput::Scalar("cotangent".to_string()),
+    );
+    let cotangent_tangent_name = plan
+        .tangent_names
+        .get(&plan.cotangent_name)
+        .ok_or_else(|| "CUDA Fori VJP JVP has no cotangent tangent input".to_string())?;
+    reverse_inputs.insert(
+        cotangent_tangent_name.clone(),
+        CudaElementwiseInput::Scalar("cotangent_tangent".to_string()),
+    );
+    let carry_vjp = cuda_fori_vjp_plan(loop_plan, &TensorForiVjpTarget::Carry)?;
+    let carry_cotangent_expression = cuda_elementwise_plan_expression(
+        &carry_vjp,
+        carry_vjp.output_node_id,
+        &reverse_inputs,
+        &carry_shape,
+    )?;
+    let target_name = match target {
+        TensorForiVjpTarget::Carry => &loop_plan.carry_name,
+        TensorForiVjpTarget::External(name) => name,
+    };
+    let target_plan = plan
+        .gradient_tangent_plans
+        .get(target_name)
+        .ok_or_else(|| {
+            format!("CUDA Fori VJP JVP has no directional gradient plan for {target_name:?}")
+        })?;
+    let target_expression = cuda_elementwise_plan_expression(
+        target_plan,
+        target_plan.output_node_id,
+        &reverse_inputs,
+        &carry_shape,
+    )?;
+    let carry_tangent_plan = plan
+        .gradient_tangent_plans
+        .get(&loop_plan.carry_name)
+        .ok_or_else(|| "CUDA Fori VJP JVP has no carry directional gradient plan".to_string())?;
+    let carry_tangent_expression = cuda_elementwise_plan_expression(
+        carry_tangent_plan,
+        carry_tangent_plan.output_node_id,
+        &reverse_inputs,
+        &carry_shape,
+    )?;
+    let target_write = match target {
+        TensorForiVjpTarget::Carry => "out[index] = cotangent_tangent;".to_string(),
+        TensorForiVjpTarget::External(_) => "out[index] = gradient;".to_string(),
+    };
+    let parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("const float* capture_{index}"))
+        .chain(
+            captures
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("const float* capture_{}", captures.len() + index)),
+        )
+        .chain([
+            "const float* initial_carry".to_string(),
+            "const float* initial_carry_tangent".to_string(),
+            "const float* output_cotangent".to_string(),
+            "const float* output_cotangent_tangent".to_string(),
+            "float* carry_tape".to_string(),
+            "float* carry_tangent_tape".to_string(),
+            "float* out".to_string(),
+            "unsigned long long count".to_string(),
+        ])
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+            unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
+            if (index >= count) return;\n\\
+            float carry = initial_carry[index];\n\\
+            float carry_tangent = initial_carry_tangent[index];\n\\
+            carry_tape[index] = carry;\n\\
+            carry_tangent_tape[index] = carry_tangent;\n\\
+            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
+                float loop_index = (float)step;\n\\
+                float next_carry = {forward_expression};\n\\
+                float next_carry_tangent = {forward_tangent_expression};\n\\
+                carry = next_carry;\n\\
+                carry_tangent = next_carry_tangent;\n\\
+                carry_tape[(step - {}ULL + 1ULL) * count + index] = carry;\n\\
+                carry_tangent_tape[(step - {}ULL + 1ULL) * count + index] = carry_tangent;\n\\
+            }}\n\\
+            float cotangent = output_cotangent[index];\n\\
+            float cotangent_tangent = output_cotangent_tangent[index];\n\\
+            float gradient = 0.0f;\n\\
+            for (unsigned long long reverse = {}ULL; reverse > {}ULL; --reverse) {{\n\\
+                unsigned long long step = reverse - 1ULL;\n\\
+                float loop_index = (float)step;\n\\
+                carry = carry_tape[(step - {}ULL) * count + index];\n\\
+                carry_tangent = carry_tangent_tape[(step - {}ULL) * count + index];\n\\
+                gradient += {target_expression};\n\\
+                float next_cotangent = {carry_cotangent_expression};\n\\
+                float next_cotangent_tangent = {carry_tangent_expression};\n\\
+                cotangent = next_cotangent;\n\\
+                cotangent_tangent = next_cotangent_tangent;\n\\
+            }}\n\\
+            {target_write}\n\\
+        }}\n",
+        cuda_node_function_name(node_id),
+        loop_plan.lower,
+        loop_plan.upper,
+        loop_plan.lower,
+        loop_plan.lower,
+        loop_plan.upper,
+        loop_plan.lower,
+        loop_plan.lower,
+        loop_plan.lower,
+    ))
+}
+
+fn cuda_fori_jvp_node_kernel_source(
+    node_id: TensorNodeId,
+    loop_plan: &TensorForiExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+) -> Result<String, String> {
+    let (primal_expression, tangent_expression) = cuda_fori_jvp_expressions(loop_plan, captures)?;
+    let parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("const float* capture_{index}"))
+        .chain(
+            captures
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("const float* capture_{}", captures.len() + index)),
+        )
+        .chain([
+            "const float* initial_carry".to_string(),
+            "const float* initial_carry_tangent".to_string(),
+            "float* out".to_string(),
+            "unsigned long long count".to_string(),
+        ])
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+            unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
+            if (index >= count) return;\n\\
+            float carry = initial_carry[index];\n\\
+            float carry_tangent = initial_carry_tangent[index];\n\\
+            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
+                float loop_index = (float)step;\n\\
+                float next_carry = {primal_expression};\n\\
+                float next_carry_tangent = {tangent_expression};\n\\
+                carry = next_carry;\n\\
+                carry_tangent = next_carry_tangent;\n\\
+            }}\n\\
+            out[index] = carry_tangent;\n}}\n",
+        cuda_node_function_name(node_id), loop_plan.lower, loop_plan.upper
+    ))
+}
+
+fn cuda_fori_node_kernel_source(
+    node_id: TensorNodeId,
+    loop_plan: &TensorForiExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+) -> Result<String, String> {
+    cuda_fori_body_is_lowerable(loop_plan)?;
+    let carry_shape = loop_plan.carry_shape()?;
+    let capture_parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| (name.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let expression = cuda_fori_body_expression(
+        loop_plan,
+        loop_plan.body.plan.output_node_id,
+        &capture_parameters,
+        &carry_shape,
+    )?;
+    let parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("const float* capture_{index}"))
+        .chain([
+            "const float* initial_carry".to_string(),
+            "float* out".to_string(),
+            "unsigned long long count".to_string(),
+        ])
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+            unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
+            if (index >= count) return;\n\\
+            float carry = initial_carry[index];\n\\
+            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
+                float loop_index = (float)step;\n\\
+                carry = {expression};\n\\
+            }}\n\\
+            out[index] = carry;\n}}\n",
+        cuda_node_function_name(node_id), loop_plan.lower, loop_plan.upper
+    ))
+}
+
+fn cuda_scan_node_kernel_source(
+    node_id: TensorNodeId,
+    scan_plan: &TensorScanExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+) -> Result<String, String> {
+    cuda_scan_body_is_lowerable(scan_plan)?;
+    let carry_shape = scan_plan.carry_shape()?;
+    let output_step_shape = scan_plan.body.output_shapes()[1].clone();
+    let capture_parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| (name.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let next_expression = cuda_scan_body_expression(
+        scan_plan,
+        scan_plan.body.plan.output_node_ids[0],
+        &capture_parameters,
+        &carry_shape,
+    )?;
+    let output_next_expression = cuda_scan_body_expression_with_reference(
+        scan_plan,
+        scan_plan.body.plan.output_node_ids[0],
+        &capture_parameters,
+        &output_step_shape,
+        "output_carry",
+    )?;
+    let output_expression = cuda_scan_body_expression_with_reference(
+        scan_plan,
+        scan_plan.body.plan.output_node_ids[1],
+        &capture_parameters,
+        &output_step_shape,
+        "output_carry",
+    )?;
+    let output_initial_offset = cuda_offset_expression(&output_step_shape, &carry_shape);
+    let parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("const float* capture_{index}"))
+        .chain([
+            "const float* initial_carry".to_string(),
+            "float* final_carry".to_string(),
+            "float* outputs".to_string(),
+            "unsigned long long carry_count".to_string(),
+            "unsigned long long output_count".to_string(),
+        ])
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+            unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
+            if (index >= carry_count && index >= output_count) return;\n\\
+            float carry = index < carry_count ? initial_carry[index] : 0.0f;\n\\
+            float output_carry = index < output_count ? initial_carry[{output_initial_offset}] : 0.0f;\n\\
+            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
+                float loop_index = (float)step;\n\\
+                if (index < carry_count) {{ float next_carry = {next_expression}; carry = next_carry; }}\n\\
+                if (index < output_count) {{ float scan_output = {output_expression}; outputs[(step - {}ULL) * output_count + index] = scan_output; output_carry = {output_next_expression}; }}\n\\
+            }}\n\\
+            if (index < carry_count) final_carry[index] = carry;\n}}\n",
+        cuda_node_function_name(node_id),
+        scan_plan.lower,
+        scan_plan.upper,
+        scan_plan.lower,
+    ))
+}
+
+fn cuda_scan_vjp_node_kernel_source(
+    node_id: TensorNodeId,
+    scan_plan: &TensorScanExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+    target: &TensorScanVjpTarget,
+) -> Result<String, String> {
+    let (carry_target_plan, output_target_plan) = cuda_scan_vjp_plans(scan_plan, target)?;
+    let carry_reverse_plans = match target {
+        TensorScanVjpTarget::Carry => None,
+        TensorScanVjpTarget::External(_) => {
+            Some(cuda_scan_vjp_plans(scan_plan, &TensorScanVjpTarget::Carry)?)
+        }
+    };
+    let carry_shape = scan_plan.carry_shape()?;
+    let output_step_shape = scan_plan.body.plan.nodes[scan_plan.body.plan.output_node_ids[1]]
+        .shape
+        .clone();
+    let unequal_output_lanes = element_count(&output_step_shape)? != element_count(&carry_shape)?;
+    let target_shape = match target {
+        TensorScanVjpTarget::Carry => carry_shape.clone(),
+        TensorScanVjpTarget::External(name) => scan_plan
+            .external_captures()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("CUDA Scan VJP has no capture {name:?}"))?,
+    };
+    let capture_parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| (name.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let forward_next_expression = cuda_scan_body_expression(
+        scan_plan,
+        scan_plan.body.plan.output_node_ids[0],
+        &capture_parameters,
+        &carry_shape,
+    )?;
+    let mut carry_inputs = BTreeMap::new();
+    carry_inputs.insert(
+        scan_plan.carry_name.clone(),
+        CudaElementwiseInput::Scalar("carry".to_string()),
+    );
+    carry_inputs.insert(
+        scan_plan.index_name.clone(),
+        CudaElementwiseInput::Scalar("loop_index".to_string()),
+    );
+    carry_inputs.insert(
+        "__nabla_cuda_scan_vjp_carry_cotangent".to_string(),
+        CudaElementwiseInput::Scalar("carry_cotangent".to_string()),
+    );
+    for (index, (name, _)) in captures.iter().enumerate() {
+        carry_inputs.insert(name.clone(), CudaElementwiseInput::Buffer(index));
+    }
+    let mut output_inputs = carry_inputs.clone();
+    let output_carry_offset =
+        cuda_offset_expression_with_index(&output_step_shape, &carry_shape, "output_index");
+    if !unequal_output_lanes {
+        output_inputs.insert(
+            scan_plan.carry_name.clone(),
+            CudaElementwiseInput::Scalar(format!(
+                "carry_tape[(step - {}ULL) * carry_count + {output_carry_offset}]",
+                scan_plan.lower
+            )),
+        );
+    }
+    output_inputs.remove("__nabla_cuda_scan_vjp_carry_cotangent");
+    output_inputs.insert(
+        "__nabla_cuda_scan_vjp_output_cotangent".to_string(),
+        CudaElementwiseInput::Scalar(if unequal_output_lanes {
+            "output_cotangent_aggregate".to_string()
+        } else {
+            "output_cotangent_step".to_string()
+        }),
+    );
+    let output_reference_shape = if unequal_output_lanes {
+        &carry_shape
+    } else {
+        &output_step_shape
+    };
+    let output_index_expression = if unequal_output_lanes {
+        "index"
+    } else {
+        "output_index"
+    };
+    let carry_target_expression = cuda_elementwise_plan_expression(
+        &carry_target_plan,
+        cuda_vjp_elementwise_output_node(&carry_target_plan, &target_shape, &carry_shape)?,
+        &carry_inputs,
+        &carry_shape,
+    )?;
+    let output_target_expression = cuda_elementwise_plan_expression_with_index(
+        &output_target_plan,
+        cuda_vjp_elementwise_output_node(
+            &output_target_plan,
+            &target_shape,
+            output_reference_shape,
+        )?,
+        &output_inputs,
+        output_reference_shape,
+        output_index_expression,
+    )?;
+    let (carry_reverse_expression, output_reverse_expression) =
+        if let Some((carry_plan, output_plan)) = carry_reverse_plans.as_ref() {
+            (
+                cuda_elementwise_plan_expression(
+                    carry_plan,
+                    carry_plan.output_node_id,
+                    &carry_inputs,
+                    &carry_shape,
+                )?,
+                cuda_elementwise_plan_expression_with_index(
+                    output_plan,
+                    cuda_vjp_elementwise_output_node(
+                        output_plan,
+                        &carry_shape,
+                        output_reference_shape,
+                    )?,
+                    &output_inputs,
+                    output_reference_shape,
+                    output_index_expression,
+                )?,
+            )
+        } else {
+            (String::new(), String::new())
+        };
+    let reverse_update = match target {
+        TensorScanVjpTarget::Carry => "carry_cotangent = contribution;".to_string(),
+        TensorScanVjpTarget::External(_) => format!(
+            "gradient += contribution;\n\\
+                carry_cotangent = {carry_reverse_expression} + output_reverse_contribution;"
+        ),
+    };
+    let target_write = match target {
+        TensorScanVjpTarget::Carry => "out[index] = carry_cotangent;".to_string(),
+        TensorScanVjpTarget::External(name) => {
+            let target_shape = scan_plan
+                .external_captures()
+                .get(name)
+                .ok_or_else(|| format!("CUDA Scan VJP has no capture {name:?}"))?;
+            if target_shape == &carry_shape {
+                "out[index] = gradient;".to_string()
+            } else {
+                format!(
+                    "atomicAdd(out + {}, gradient);",
+                    cuda_offset_expression(&carry_shape, target_shape)
+                )
+            }
+        }
+    };
+    let output_reverse_update = if output_reverse_expression.is_empty() {
+        String::new()
+    } else {
+        format!("output_reverse_contribution += {output_reverse_expression};")
+    };
+    let (output_loop_update, output_post_loop_update) = if unequal_output_lanes {
+        (
+            String::new(),
+            format!(
+                "output_contribution = {output_target_expression};\n\\
+                {}",
+                if output_reverse_expression.is_empty() {
+                    String::new()
+                } else {
+                    format!("output_reverse_contribution = {output_reverse_expression};")
+                }
+            ),
+        )
+    } else {
+        (
+            format!(
+                "output_contribution += {output_target_expression};\n\\
+                {output_reverse_update}"
+            ),
+            String::new(),
+        )
+    };
+    let parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("const float* capture_{index}"))
+        .chain([
+            "const float* initial_carry".to_string(),
+            "const float* final_carry_cotangent".to_string(),
+            "const float* output_cotangent".to_string(),
+            "float* carry_tape".to_string(),
+            "float* out".to_string(),
+            "unsigned long long carry_count".to_string(),
+            "unsigned long long output_count".to_string(),
+        ])
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+            unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
+            if (index >= carry_count) return;\n\\
+            float carry = initial_carry[index];\n\\
+            carry_tape[index] = carry;\n\\
+            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
+                float loop_index = (float)step;\n\\
+                carry = {forward_next_expression};\n\\
+                carry_tape[(step - {}ULL + 1ULL) * carry_count + index] = carry;\n\\
+            }}\n\\
+            float carry_cotangent = final_carry_cotangent[index];\n\\
+            float gradient = 0.0f;\n\\
+            for (unsigned long long reverse = {}ULL; reverse > {}ULL; --reverse) {{\n\\
+                unsigned long long step = reverse - 1ULL;\n\\
+                float loop_index = (float)step;\n\\
+                carry = carry_tape[(step - {}ULL) * carry_count + index];\n\\
+                float output_contribution = 0.0f;\n\\
+                float output_reverse_contribution = 0.0f;\n\\
+                float output_cotangent_aggregate = 0.0f;\n\\
+                for (unsigned long long output_index = 0ULL; output_index < output_count; ++output_index) {{\n\\
+                    if ({output_carry_offset} == index) {{\n\\
+                        float output_cotangent_step = output_cotangent[(step - {}ULL) * output_count + output_index];\n\\
+                        output_cotangent_aggregate += output_cotangent_step;\n\\
+                        {output_loop_update}\n\\
+                    }}\n\\
+                }}\n\\
+                {output_post_loop_update}\n\\
+                float contribution = ({carry_target_expression} + output_contribution);\n\\
+                {reverse_update}\n\\
+            }}\n\\
+            {}\n}}\n",
+        cuda_node_function_name(node_id),
+        scan_plan.lower,
+        scan_plan.upper,
+        scan_plan.lower,
+        scan_plan.upper,
+        scan_plan.lower,
+        scan_plan.lower,
+        scan_plan.lower,
+        target_write,
+    ))
+}
+
+fn cuda_scan_vjp_group_kernel_source(
+    node_id: TensorNodeId,
+    scan_plan: &TensorScanExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+    targets: &[&TensorScanVjpTarget],
+) -> Result<String, String> {
+    let carry_shape = scan_plan.carry_shape()?;
+    let (carry_reverse_plan, output_reverse_plan) =
+        cuda_scan_vjp_plans(scan_plan, &TensorScanVjpTarget::Carry)?;
+    let capture_parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| (name.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let forward_next_expression = cuda_scan_body_expression(
+        scan_plan,
+        scan_plan.body.plan.output_node_ids[0],
+        &capture_parameters,
+        &carry_shape,
+    )?;
+    let mut carry_inputs = BTreeMap::new();
+    carry_inputs.insert(
+        scan_plan.carry_name.clone(),
+        CudaElementwiseInput::Scalar("carry".to_string()),
+    );
+    carry_inputs.insert(
+        scan_plan.index_name.clone(),
+        CudaElementwiseInput::Scalar("loop_index".to_string()),
+    );
+    carry_inputs.insert(
+        "__nabla_cuda_scan_vjp_carry_cotangent".to_string(),
+        CudaElementwiseInput::Scalar("carry_cotangent".to_string()),
+    );
+    for (index, (name, _)) in captures.iter().enumerate() {
+        carry_inputs.insert(name.clone(), CudaElementwiseInput::Buffer(index));
+    }
+    let mut output_inputs = carry_inputs.clone();
+    output_inputs.remove("__nabla_cuda_scan_vjp_carry_cotangent");
+    output_inputs.insert(
+        "__nabla_cuda_scan_vjp_output_cotangent".to_string(),
+        CudaElementwiseInput::Scalar("output_cotangent_step".to_string()),
+    );
+    let carry_reverse_expression = cuda_elementwise_plan_expression(
+        &carry_reverse_plan,
+        carry_reverse_plan.output_node_id,
+        &carry_inputs,
+        &carry_shape,
+    )?;
+    let output_reverse_expression = cuda_elementwise_plan_expression(
+        &output_reverse_plan,
+        output_reverse_plan.output_node_id,
+        &output_inputs,
+        &carry_shape,
+    )?;
+
+    let mut gradient_declarations = String::new();
+    let mut contribution_updates = String::new();
+    let mut target_writes = String::new();
+    for (target_index, target) in targets.iter().enumerate() {
+        match target {
+            TensorScanVjpTarget::Carry => {
+                target_writes.push_str(&format!("out_{target_index}[index] = carry_cotangent;\n"));
+            }
+            TensorScanVjpTarget::External(name) => {
+                let target_shape = scan_plan
+                    .external_captures()
+                    .get(name)
+                    .ok_or_else(|| format!("CUDA Scan VJP has no capture {name:?}"))?;
+                let (carry_target_plan, output_target_plan) =
+                    cuda_scan_vjp_plans(scan_plan, target)?;
+                let carry_expression = cuda_elementwise_plan_expression(
+                    &carry_target_plan,
+                    cuda_vjp_elementwise_output_node(
+                        &carry_target_plan,
+                        target_shape,
+                        &carry_shape,
+                    )?,
+                    &carry_inputs,
+                    &carry_shape,
+                )?;
+                let output_expression = cuda_elementwise_plan_expression(
+                    &output_target_plan,
+                    cuda_vjp_elementwise_output_node(
+                        &output_target_plan,
+                        target_shape,
+                        &carry_shape,
+                    )?,
+                    &output_inputs,
+                    &carry_shape,
+                )?;
+                gradient_declarations.push_str(&format!("float gradient_{target_index} = 0.0f;\n"));
+                contribution_updates.push_str(&format!(
+                    "gradient_{target_index} += ({carry_expression} + {output_expression});\n"
+                ));
+                if target_shape == &carry_shape {
+                    target_writes.push_str(&format!(
+                        "out_{target_index}[index] = gradient_{target_index};\n"
+                    ));
+                } else {
+                    target_writes.push_str(&format!(
+                        "atomicAdd(out_{target_index} + {}, gradient_{target_index});\n",
+                        cuda_offset_expression(&carry_shape, target_shape)
+                    ));
+                }
+            }
+        }
+    }
+    let parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("const float* capture_{index}"))
+        .chain([
+            "const float* initial_carry".to_string(),
+            "const float* final_carry_cotangent".to_string(),
+            "const float* output_cotangent".to_string(),
+            "float* carry_tape".to_string(),
+        ])
+        .chain(
+            targets
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("float* out_{index}")),
+        )
+        .chain(["unsigned long long carry_count".to_string()])
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+            unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
+            if (index >= carry_count) return;\n\\
+            float carry = initial_carry[index];\n\\
+            carry_tape[index] = carry;\n\\
+            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
+                float loop_index = (float)step;\n\\
+                carry = {forward_next_expression};\n\\
+                carry_tape[(step - {}ULL + 1ULL) * carry_count + index] = carry;\n\\
+            }}\n\\
+            float carry_cotangent = final_carry_cotangent[index];\n\\
+            {gradient_declarations}\
+            for (unsigned long long reverse = {}ULL; reverse > {}ULL; --reverse) {{\n\\
+                unsigned long long step = reverse - 1ULL;\n\\
+                float loop_index = (float)step;\n\\
+                carry = carry_tape[(step - {}ULL) * carry_count + index];\n\\
+                float output_cotangent_step = output_cotangent[(step - {}ULL) * carry_count + index];\n\\
+                {contribution_updates}\
+                carry_cotangent = ({carry_reverse_expression} + {output_reverse_expression});\n\\
+            }}\n\\
+            {target_writes}\
+        }}\n",
+        cuda_node_function_name(node_id),
+        scan_plan.lower,
+        scan_plan.upper,
+        scan_plan.lower,
+        scan_plan.upper,
+        scan_plan.lower,
+        scan_plan.lower,
+        scan_plan.lower,
+    ))
+}
+
+fn cuda_scan_vjp_jvp_group_kernel_source(
+    node_id: TensorNodeId,
+    plan: &TensorScanVjpJvpExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+    targets: &[&TensorScanVjpTarget],
+) -> Result<String, String> {
+    if targets.is_empty() {
+        return Err("CUDA Scan VJP JVP group has no targets".to_string());
+    }
+    cuda_scan_vjp_jvp_is_lowerable(plan)?;
+    let scan = &plan.scan_plan;
+    let shape = scan.carry_shape()?;
+    let output_shape = scan.body.plan.nodes[scan.body.plan.output_node_ids[1]]
+        .shape
+        .clone();
+    let direct_broadcast_output = cuda_scan_direct_broadcast_output_input(scan)?.is_some();
+    let forward_tangents = plan
+        .tangent_names
+        .iter()
+        .filter(|(name, _)| scan.body.captures.contains_key(*name))
+        .map(|(name, tangent)| (name.clone(), tangent.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let forward = scan
+        .body
+        .plan
+        .as_ir()
+        .symbolic_jvp_with_tangent_inputs(scan.body.plan.output_node_ids[0], &forward_tangents)?;
+    let (forward_plan, forward_outputs) = forward
+        .graph
+        .compile_cpu_many(&[forward.value, forward.tangent])?;
+    let mut inputs = BTreeMap::new();
+    inputs.insert(
+        scan.carry_name.clone(),
+        CudaElementwiseInput::Scalar("carry".to_string()),
+    );
+    inputs.insert(
+        scan.index_name.clone(),
+        CudaElementwiseInput::Scalar("loop_index".to_string()),
+    );
+    for (index, (name, _)) in captures.iter().enumerate() {
+        inputs.insert(name.clone(), CudaElementwiseInput::Buffer(index));
+    }
+    for (name, tangent_name) in &forward_tangents {
+        let binding = if name == &scan.carry_name {
+            CudaElementwiseInput::Scalar("carry_tangent".to_string())
+        } else {
+            let index = captures
+                .iter()
+                .position(|(candidate, _)| candidate == name)
+                .ok_or_else(|| format!("CUDA Scan VJP JVP has no capture {name:?}"))?;
+            CudaElementwiseInput::Buffer(captures.len() + index)
+        };
+        inputs.insert(tangent_name.clone(), binding);
+    }
+    let next =
+        cuda_elementwise_plan_expression(&forward_plan, forward_outputs[0], &inputs, &shape)?;
+    let next_tangent =
+        cuda_elementwise_plan_expression(&forward_plan, forward_outputs[1], &inputs, &shape)?;
+    let mut reverse = inputs;
+    reverse.insert(
+        plan.carry_cotangent_name.clone(),
+        CudaElementwiseInput::Scalar("carry_cotangent".to_string()),
+    );
+    reverse.insert(
+        plan.output_cotangent_name.clone(),
+        CudaElementwiseInput::Scalar(if direct_broadcast_output {
+            "output_cotangent_aggregate".to_string()
+        } else {
+            "output_cotangent_step".to_string()
+        }),
+    );
+    reverse.insert(
+        "__nabla_cuda_scan_vjp_carry_cotangent".to_string(),
+        CudaElementwiseInput::Scalar("carry_cotangent".to_string()),
+    );
+    reverse.insert(
+        "__nabla_cuda_scan_vjp_output_cotangent".to_string(),
+        CudaElementwiseInput::Scalar(if direct_broadcast_output {
+            "output_cotangent_aggregate".to_string()
+        } else {
+            "output_cotangent_step".to_string()
+        }),
+    );
+    for (name, tangent_name) in &plan.tangent_names {
+        if name == &plan.carry_cotangent_name {
+            reverse.insert(
+                tangent_name.clone(),
+                CudaElementwiseInput::Scalar("carry_cotangent_tangent".to_string()),
+            );
+        }
+        if name == &plan.output_cotangent_name {
+            reverse.insert(
+                tangent_name.clone(),
+                CudaElementwiseInput::Scalar(if direct_broadcast_output {
+                    "output_cotangent_tangent_aggregate".to_string()
+                } else {
+                    "output_cotangent_tangent_step".to_string()
+                }),
+            );
+        }
+    }
+    let (carry_vjp, output_vjp) = cuda_scan_vjp_plans(scan, &TensorScanVjpTarget::Carry)?;
+    let primal_carry =
+        cuda_elementwise_plan_expression(&carry_vjp, carry_vjp.output_node_id, &reverse, &shape)?;
+    let primal_output =
+        cuda_elementwise_plan_expression(&output_vjp, output_vjp.output_node_id, &reverse, &shape)?;
+    let mut gradient_declarations = String::new();
+    let mut gradient_updates = String::new();
+    let mut target_writes = String::new();
+    for (target_index, target) in targets.iter().enumerate() {
+        let name = match *target {
+            TensorScanVjpTarget::Carry => &scan.carry_name,
+            TensorScanVjpTarget::External(name) => name,
+        };
+        let target_shape = match *target {
+            TensorScanVjpTarget::Carry => shape.clone(),
+            TensorScanVjpTarget::External(name) => scan
+                .external_captures()
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("CUDA Scan VJP JVP has no capture {name:?}"))?,
+        };
+        let carry_directional = plan
+            .carry_gradient_tangent_plans
+            .get(name)
+            .ok_or_else(|| format!("CUDA Scan VJP JVP has no carry directional plan for {name:?}"))?;
+        let output_directional = if direct_broadcast_output {
+            cuda_scan_vjp_jvp_direct_broadcast_output_directional_plan(plan, target)?
+        } else {
+            plan.output_gradient_tangent_plans
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("CUDA Scan VJP JVP has no output directional plan for {name:?}"))?
+        };
+        let directional = format!(
+            "({} + {})",
+            cuda_elementwise_plan_expression(
+                carry_directional,
+                cuda_vjp_elementwise_output_node(carry_directional, &target_shape, &shape)?,
+                &reverse,
+                &shape
+            )?,
+            cuda_elementwise_plan_expression(
+                &output_directional,
+                cuda_vjp_elementwise_output_node(&output_directional, &target_shape, &shape)?,
+                &reverse,
+                &shape
+            )?
+        );
+        gradient_declarations.push_str(&format!("float gradient_{target_index} = 0.0f; "));
+        gradient_updates.push_str(&format!("gradient_{target_index} += {directional}; "));
+        match *target {
+            TensorScanVjpTarget::Carry => target_writes.push_str(&format!(
+                "out_{target_index}[index] = carry_cotangent_tangent; "
+            )),
+            TensorScanVjpTarget::External(_) if target_shape == shape => {
+                target_writes.push_str(&format!(
+                    "out_{target_index}[index] = gradient_{target_index}; "
+                ));
+            }
+            TensorScanVjpTarget::External(_) => target_writes.push_str(&format!(
+                "atomicAdd(out_{target_index} + {}, gradient_{target_index}); ",
+                cuda_offset_expression(&shape, &target_shape)
+            )),
+        }
+    }
+    let carry_directional = plan
+        .carry_gradient_tangent_plans
+        .get(&scan.carry_name)
+        .ok_or_else(|| "CUDA Scan VJP JVP has no carry directional carry plan".to_string())?;
+    let output_directional = if direct_broadcast_output {
+        cuda_scan_vjp_jvp_direct_broadcast_output_directional_plan(
+            plan,
+            &TensorScanVjpTarget::Carry,
+        )?
+    } else {
+        plan.output_gradient_tangent_plans
+            .get(&scan.carry_name)
+            .cloned()
+            .ok_or_else(|| "CUDA Scan VJP JVP has no output directional carry plan".to_string())?
+    };
+    let next_cotangent_tangent = format!(
+        "({} + {})",
+        cuda_elementwise_plan_expression(
+            carry_directional,
+            carry_directional.output_node_id,
+            &reverse,
+            &shape
+        )?,
+        cuda_elementwise_plan_expression(
+            &output_directional,
+            output_directional.output_node_id,
+            &reverse,
+            &shape
+        )?
+    );
+    let reverse_output_setup = if direct_broadcast_output {
+        let carry_offset = cuda_offset_expression_with_index(&output_shape, &shape, "output_index");
+        format!(
+            "float output_cotangent_aggregate = 0.0f; float output_cotangent_tangent_aggregate = 0.0f; for (unsigned long long output_index = 0ULL; output_index < output_count; ++output_index) {{ if ({carry_offset} == index) {{ output_cotangent_aggregate += output_cotangent[(step - {}ULL) * output_count + output_index]; output_cotangent_tangent_aggregate += output_cotangent_tangent[(step - {}ULL) * output_count + output_index]; }} }}",
+            scan.lower, scan.lower
+        )
+    } else {
+        format!(
+            "float output_cotangent_step = output_cotangent[(step - {}ULL) * carry_count + index]; float output_cotangent_tangent_step = output_cotangent_tangent[(step - {}ULL) * carry_count + index];",
+            scan.lower, scan.lower
+        )
+    };
+    let parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("const float* capture_{i}"))
+        .chain(
+            captures
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("const float* capture_{}", captures.len() + i)),
+        )
+        .chain([
+            "const float* initial_carry".to_string(),
+            "const float* initial_carry_tangent".to_string(),
+            "const float* final_carry_cotangent".to_string(),
+            "const float* final_carry_cotangent_tangent".to_string(),
+            "const float* output_cotangent".to_string(),
+            "const float* output_cotangent_tangent".to_string(),
+            "float* carry_tape".to_string(),
+            "float* carry_tangent_tape".to_string(),
+        ])
+        .chain(
+            targets
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("float* out_{index}")),
+        )
+        .chain([
+            "unsigned long long carry_count".to_string(),
+            "unsigned long long output_count".to_string(),
+        ])
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!("extern \"C\" __global__ void {}({parameters}) {{\n\
+        unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; if (index >= carry_count) return;\n\
+        float carry = initial_carry[index]; float carry_tangent = initial_carry_tangent[index]; carry_tape[index] = carry; carry_tangent_tape[index] = carry_tangent;\n\
+        for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{ float loop_index = (float)step; float n = {next}; float nt = {next_tangent}; carry = n; carry_tangent = nt; carry_tape[(step - {}ULL + 1ULL) * carry_count + index] = carry; carry_tangent_tape[(step - {}ULL + 1ULL) * carry_count + index] = carry_tangent; }}\n\
+        float carry_cotangent = final_carry_cotangent[index]; float carry_cotangent_tangent = final_carry_cotangent_tangent[index]; {gradient_declarations}\n\
+        for (unsigned long long reverse_step = {}ULL; reverse_step > {}ULL; --reverse_step) {{ unsigned long long step = reverse_step - 1ULL; float loop_index = (float)step; carry = carry_tape[(step - {}ULL) * carry_count + index]; carry_tangent = carry_tangent_tape[(step - {}ULL) * carry_count + index]; {reverse_output_setup} {gradient_updates} float nc = ({primal_carry} + {primal_output}); float nct = {next_cotangent_tangent}; carry_cotangent = nc; carry_cotangent_tangent = nct; }}\n\
+        {target_writes}\n}}\n", cuda_node_function_name(node_id), scan.lower, scan.upper, scan.lower, scan.lower, scan.upper, scan.lower, scan.lower, scan.lower))
+}
+
 fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
     let mut source = String::from(
         "__device__ __forceinline__ float nabla_powi(float base, unsigned int exponent) {\n\
@@ -2154,17 +5771,80 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                         .to_string(),
                 )
             }
-            TensorOp::Fori { .. } => {
-                return Err(
-                    "CUDA backend does not yet support Fori regions with device loop lowering"
-                        .to_string(),
-                )
+            TensorOp::Fori {
+                loop_plan,
+                captures,
+                ..
+            } => cuda_fori_node_kernel_source(node_id, loop_plan, captures)?,
+            TensorOp::ForiJvp {
+                loop_plan,
+                captures,
+                ..
+            } => cuda_fori_jvp_node_kernel_source(node_id, loop_plan, captures)?,
+            TensorOp::ForiVjp {
+                loop_plan,
+                captures,
+                group,
+                ..
+            } => {
+                let members = cuda_fori_vjp_group(plan, *group)?;
+                if members.first().map(|(member_id, _)| *member_id) != Some(node_id) {
+                    continue;
+                }
+                let targets = members
+                    .iter()
+                    .map(|(_, target)| *target)
+                    .collect::<Vec<_>>();
+                if targets.len() == 1 {
+                    cuda_fori_vjp_node_kernel_source(node_id, loop_plan, captures, targets[0])?
+                } else {
+                    cuda_fori_vjp_group_kernel_source(node_id, loop_plan, captures, &targets)?
+                }
             }
-            TensorOp::ForiVjp { .. } => {
-                return Err(
-                    "CUDA backend does not yet support Fori VJP regions with device loop lowering"
-                        .to_string(),
-                )
+            TensorOp::ForiVjpJvp {
+                plan,
+                captures,
+                target,
+                ..
+            } => cuda_fori_vjp_jvp_node_kernel_source(node_id, plan, captures, target)?,
+            TensorOp::Scan {
+                scan_plan, captures, ..
+            } => cuda_scan_node_kernel_source(node_id, scan_plan, captures)?,
+            TensorOp::ScanVjp {
+                scan_plan,
+                captures,
+                group,
+                ..
+            } => {
+                let members = cuda_scan_vjp_group(plan, *group)?;
+                if members.first().map(|(member_id, _)| *member_id) != Some(node_id) {
+                    continue;
+                }
+                let targets = members
+                    .iter()
+                    .map(|(_, target)| *target)
+                    .collect::<Vec<_>>();
+                if targets.len() == 1 {
+                    cuda_scan_vjp_node_kernel_source(node_id, scan_plan, captures, targets[0])?
+                } else {
+                    cuda_scan_vjp_group_kernel_source(node_id, scan_plan, captures, &targets)?
+                }
+            }
+            TensorOp::ScanVjpJvp {
+                plan: scan_hvp,
+                captures,
+                group,
+                ..
+            } => {
+                let members = cuda_scan_vjp_jvp_group(plan, *group)?;
+                if members.first().map(|(member_id, _)| *member_id) != Some(node_id) {
+                    continue;
+                }
+                let targets = members
+                    .iter()
+                    .map(|(_, target)| *target)
+                    .collect::<Vec<_>>();
+                cuda_scan_vjp_jvp_group_kernel_source(node_id, scan_hvp, captures, &targets)?
             }
             TensorOp::Sum { .. } | TensorOp::Mean { .. } => {
                 let scale = if matches!(&node.op, TensorOp::Mean { .. }) {
@@ -2374,14 +6054,26 @@ fn cuda_node_function_name(node_id: usize) -> String {
 }
 
 fn cuda_offset_expression(output_shape: &[usize], input_shape: &[usize]) -> String {
+    cuda_offset_expression_with_index(output_shape, input_shape, "index")
+}
+
+fn cuda_offset_expression_with_index(
+    output_shape: &[usize],
+    input_shape: &[usize],
+    index_expression: &str,
+) -> String {
     let input_strides = contiguous_strides(input_shape);
+    // A contiguous reshape preserves the flat element order.
+    if output_shape.iter().product::<usize>() == input_shape.iter().product::<usize>() {
+        return index_expression.to_string();
+    }
     let rank_offset = output_shape.len() - input_shape.len();
     let terms = (0..output_shape.len())
         .filter(|axis| *axis >= rank_offset && input_shape[*axis - rank_offset] != 1)
         .map(|axis| {
             let output_stride = output_shape[axis + 1..].iter().product::<usize>();
             format!(
-                "((index / {output_stride}ULL) % {}ULL) * {}ULL",
+                "(({index_expression} / {output_stride}ULL) % {}ULL) * {}ULL",
                 output_shape[axis],
                 input_strides[axis - rank_offset]
             )
@@ -2392,6 +6084,17 @@ fn cuda_offset_expression(output_shape: &[usize], input_shape: &[usize]) -> Stri
     } else {
         terms.join(" + ")
     }
+}
+
+fn cuda_shapes_broadcastable(output_shape: &[usize], input_shape: &[usize]) -> bool {
+    if input_shape.len() > output_shape.len() {
+        return false;
+    }
+    let rank_offset = output_shape.len() - input_shape.len();
+    output_shape[rank_offset..]
+        .iter()
+        .zip(input_shape)
+        .all(|(output_extent, input_extent)| *input_extent == 1 || input_extent == output_extent)
 }
 
 fn cuda_float_literal(value: f64) -> String {
@@ -2415,7 +6118,12 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Where { .. } => "where",
         TensorOp::Cond { .. } => "cond",
         TensorOp::Fori { .. } => "fori",
+        TensorOp::ForiJvp { .. } => "fori_jvp",
         TensorOp::ForiVjp { .. } => "fori_vjp",
+        TensorOp::ForiVjpJvp { .. } => "fori_vjp_jvp",
+        TensorOp::Scan { .. } => "scan",
+        TensorOp::ScanVjp { .. } => "scan_vjp",
+        TensorOp::ScanVjpJvp { .. } => "scan_vjp_jvp",
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::Matmul { .. } => "matmul",

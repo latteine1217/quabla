@@ -19,7 +19,7 @@ Reusable `grad_*`, `value_and_grad_fn(...)`, `vjp_fn(...)`,
 transforms trace once when the callable/decorator is created, then evaluate the
 cached graph on later calls. It has an experimental restricted source-level
 forward-mode macro, but not general source-to-source AD, a general compiled
-JIT, or distributed sharding.
+JIT, or verified multi-GPU distributed sharding.
 
 Run the verified one-dimensional Poisson PINN example after `maturin develop`:
 
@@ -38,6 +38,7 @@ example checks PDE and boundary residuals plus trained parameters against CPU:
 .venv/bin/python examples/benchmark_pinn_mlx.py
 .venv/bin/python examples/benchmark_mlp_value_and_grad_mlx.py
 .venv/bin/python examples/benchmark_forward_mlx.py
+.venv/bin/python examples/benchmark_loop_value_and_grad_mlx.py
 ```
 
 Use `examples/benchmark_forward_mlx.py --device-only` to exclude only output
@@ -126,6 +127,10 @@ loss/gradient readbacks, so neither is a CUDA/JAX comparison.
   source tensors and views share immutable storage, while every arithmetic
   operation returns a new contiguous allocation.
 - Python `trace_tensor(fn, input_specs)` bridge for the rank-N `TensorIr` core.
+  `TensorTraceGraph.stablehlo_text(output_node_id)` exports the verified static
+  `f64` input/add/multiply/tanh subset as deterministic textual StableHLO for
+  compiler-tool inspection. It rejects unsupported operations and is not an
+  execution backend or a complete StableHLO lowering.
 - `tensor_jacobian_fn(fn, input_specs, input_name)` freezes one rank-N trace
   and returns an output-flat by input-flat dense Jacobian for the selected input.
   Its `TraceTensor` values currently support broadcasted add/subtract/multiply/divide,
@@ -149,8 +154,25 @@ loss/gradient readbacks, so neither is a CUDA/JAX comparison.
   `tensor_fori_loop_region(lower, upper, body, init, operands)` instead
   traces `body(index, carry, *operands)` once into a runtime CPU loop region;
   captures must be explicit and the scalar `index` is a TraceTensor.
+  On Linux CUDA, its first-order VJP also lowers to a device kernel when the
+  body is pure elementwise and every explicit capture broadcasts to the carry
+  shape. The kernel keeps a per-element carry tape on device; grouped `ForiVjp`
+  results share that tape and reverse traversal. `tensor_scan_region` also
+  lowers primal and first-order VJP Scan when its output matches the carry
+  shape. Scalar and trailing-axis broadcast captures use device-side atomic
+  gradient reduction. CUDA also lowers `ForiVjpJvp` for pure-elementwise,
+  fixed-bound regions whose explicit captures match the carry shape, keeping
+  primal and tangent carry tapes on device. CUDA `ScanVjpJvp` supports the
+  same pure-elementwise fixed-bound subset with broadcast-compatible explicit
+  captures and matching carry/output shapes,
+  plus a per-step output that directly broadcasts a carry-shaped value; the
+  latter aggregates primal and tangent output cotangents per carry lane.
+  `tensor_scan_region(lower, upper, body, init, operands)` applies the same
+  one-time region tracing contract to a `(next_carry, output)` body and returns
+  the final carry plus a leading-axis stack of fixed-shape outputs.
   `tensor_scan(length, body, init)` similarly returns a final carry and a
-  leading-axis stack of fixed-shape outputs.
+  leading-axis stack of fixed-shape outputs, but remains the compatibility API
+  that statically unrolls the body.
   `TensorTraceResult.symbolic_vjp(cotangent_name)` and
   `TraceTensor.symbolic_vjp(cotangent_name)` emit one transformable
   gradient trace per original input, all sharing a graph with the explicit
@@ -220,6 +242,12 @@ loss/gradient readbacks, so neither is a CUDA/JAX comparison.
   `tensor_vmap_vjp_cuda_fn(...)`, `tensor_vmap_vjp_mlx_fn(...)`,
   `tensor_vmap_jvp_cuda_fn(...)`, and `tensor_vmap_jvp_mlx_fn(...)` lower
   their primal plus AD outputs into one CUDA or MLX multi-output plan.
+- `tensor_vmap_hvp_scalar_fn(fn, input_specs, batch_size, input_name, ...)`
+  differentiates the sum of one scalar loss per mapped example through symbolic
+  VJP then runtime-tangent JVP. `tensor_vmap_hvp_scalar_cuda_fn(...)` lowers
+  that structural HVP plan to CUDA for the supported loop subset. The selected
+  HVP input must be mapped; unmapped parameter HVPs and MLX lowering remain
+  explicit future work.
 - `Tensor.sum(axis=None, keepdims=False)` and `Tensor.mean(...)` accept a
   single integer axis or a sequence of normalized axes. Trace tensors expose
   the same contract; multi-axis reductions lower to existing axis-reduction
@@ -275,6 +303,13 @@ loss/gradient readbacks, so neither is a CUDA/JAX comparison.
   reduction="mean")` is the deterministic CPU reference for equal axis-zero
   sharding; it validates the shard contract and returns the aggregated value
   and gradients without claiming CPU parallel execution.
+- The optional Linux `cuda-nccl` feature adds an experimental single-node
+  data-parallel path. `tensor_value_and_grad_data_parallel_cuda_fn(...)`
+  shards named axis-zero batch inputs across explicit CUDA ordinals and
+  all-reduces only requested replicated parameter gradients. It reports
+  enqueue, collective, and output-readback timing after a call. This interface
+  has feature and single-device rejection coverage, but not yet a verified
+  two-GPU numerical result.
 - `TensorBackend` defines the rank-N plan execution contract. `CpuBackend` is
   the default implementation. On Linux, the optional `cuda` feature adds an
   NVRTC-compiled FP32 `CudaBackend` and immutable `TensorCudaExecutionPlan`.
@@ -434,6 +469,84 @@ loss/gradient readbacks, so neither is a CUDA/JAX comparison.
 - Full four-parameter Lotka-Volterra gradient.
 - Generic fixed-size gradient descent fitting loop.
 - Central finite-difference gradient checks.
+
+## Compiler Facade
+
+The rank-N compiler path has one explicit lifecycle. New Python integrations
+should use this facade instead of coupling to a backend-specific execution
+plan class. It is the canonical entrypoint for new rank-N compiler features;
+the legacy 2D `Matrix` tracer is intentionally outside this migration boundary.
+
+```python
+import nabla
+
+compiler = nabla.Compiler()
+program = compiler.trace(
+    lambda x, weight: (x * weight).sum(),
+    [("x", [2]), ("weight", [2])],
+)
+executable = program.compile("cpu")
+loss = executable({
+    "x": nabla.Tensor([2], [2.0, 3.0]),
+    "weight": nabla.Tensor([2], [4.0, 5.0]),
+})
+```
+
+`Program.jvp(input_name)` and `Program.vjp(cotangent_name)` produce new
+programs that can be compiled through the same interface. `compile("cuda")`
+and `compile("mlx")` use the existing verified backend lowerings; build
+availability is reported by `compiler.capabilities()`, while unsupported IR
+operations still fail explicitly during backend compilation or execution.
+The established `trace_tensor(...)`, `tensor_jit_*`, and `tensor_*_grad_*`
+APIs remain supported compatibility entrypoints.
+
+| Layer | Stable responsibility | Public boundary |
+| --- | --- | --- |
+| Frontend | Trace a Python function with fixed input shapes | `Compiler.trace(...) -> Program` |
+| Transform | Build symbolic first-order coordinate JVP or named VJP programs | `Program.jvp(...)`, `Program.vjp(...)` |
+| Compilation | Freeze reachability-pruned IR and select one target | `Program.compile(target, device_ordinal=0)` |
+| Runtime | Bind eager `Tensor` inputs and execute the frozen plan | `Executable(inputs)` / `Executable.evaluate(inputs)` |
+| Inspection | Report build-time target availability and frozen graph text | `Compiler.capabilities()`, `Program.lower_text()` |
+
+`Compiler.capabilities()` answers only whether this extension was built with a
+target backend. It is not a hardware probe and it does not guarantee that a
+specific graph lowers: CUDA and MLX retain their operation-specific validation
+rules. CUDA structured Scan HVP is a restricted facade capability: the
+verified subset requires a fixed-bound, pure-elementwise Scan with same-shaped
+explicit captures and either equal carry/output shapes, an equal-count output
+reshape, or a per-step output that directly broadcasts a carry-shaped value.
+Its symbolic JVP paired carry uses a leading extent of two. In the direct
+broadcast case, `ScanVjp` and `ScanVjpJvp` aggregate output cotangents, and
+  their tangents for HVP, back to each carry lane before reverse replay;
+  broadcast capture gradients use device-side atomic reduction. General
+unequal-count output graphs and indexed bodies remain explicit CUDA rejections.
+
+Current migration status:
+
+- The facade owns the new rank-N `TensorTraceGraph` lifecycle.
+- Existing function-specific helpers still construct their own wrappers; they
+  have not yet been internally rewritten to delegate through `Program`.
+- `Program.jvp(...)` is the one-named-input symbolic coordinate derivative;
+  `Program.vjp(...)` returns one `Program` per original input. Runtime tangent
+  maps and multi-output compiler programs remain lower-level Rust APIs.
+- CPU facade execution is covered by Rust and installed-extension Python tests.
+  CUDA facade parity is verified on the Linux GTX 1660 SUPER host for a
+  nonlinear scalar loss, its symbolic coordinate JVP, and VJP programs for
+  every input. The same host also verifies a nonlinear fixed-bound Scan HVP
+  through the paired-carry CUDA path against CPU, including a carry/output
+  reshape with equal element count, plus primal, first-order VJP, and HVP
+  parity for a direct `[2, 1] -> [2, 3]` broadcast Scan. MLX facade calls reuse their
+  existing plans but still require
+  target-host validation for each supported operation set.
+
+The corresponding Rust lifecycle is
+`NablaCompiler -> NablaProgram -> NablaExecutable` in
+`nabla_core::compiler`. The ownership boundaries are:
+
+```text
+Python frontend / PyO3 -> TensorTraceGraph -> TensorIr / AD transforms
+                       -> frozen TensorExecutionPlan -> CPU | CUDA | MLX
+```
 
 ## Run
 

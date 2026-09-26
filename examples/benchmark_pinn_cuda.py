@@ -19,18 +19,20 @@ import time
 import nabla
 
 
-def build_optimizer(width: int, device_ordinal: int):
-    coordinates = [0.2, 0.4, 0.6, 0.8]
-    boundary_coordinates = [0.0, 0.0, 1.0, 1.0]
+def build_optimizer(width: int, collocation: int, device_ordinal: int):
+    coordinates = [(index + 1) / (collocation + 1) for index in range(collocation)]
+    boundary_coordinates = [0.0] * (collocation // 2) + [1.0] * (
+        collocation - collocation // 2
+    )
     specs = [
-        ("x", [4, 1]),
-        ("x_boundary", [4, 1]),
+        ("x", [collocation, 1]),
+        ("x_boundary", [collocation, 1]),
         ("w1", [1, width]),
         ("b1", [1, width]),
         ("w2", [width, 1]),
         ("b2", [1, 1]),
-        ("forcing", [4, 1]),
-        ("target", [4, 1]),
+        ("forcing", [collocation, 1]),
+        ("target", [collocation, 1]),
     ]
     traced = nabla.trace_tensor(
         lambda x, x_boundary, w1, b1, w2, b2, forcing, target: (
@@ -60,19 +62,21 @@ def build_optimizer(width: int, device_ordinal: int):
         "b2": nabla.Tensor([1, 1], [0.05]),
     }
     teacher_inputs = {
-        "x": nabla.Tensor([4, 1], coordinates),
-        "x_boundary": nabla.Tensor([4, 1], boundary_coordinates),
-        "forcing": nabla.Tensor([4, 1], [0.0] * 4),
-        "target": nabla.Tensor([4, 1], [0.0] * 4),
+        "x": nabla.Tensor([collocation, 1], coordinates),
+        "x_boundary": nabla.Tensor([collocation, 1], boundary_coordinates),
+        "forcing": nabla.Tensor([collocation, 1], [0.0] * collocation),
+        "target": nabla.Tensor([collocation, 1], [0.0] * collocation),
         **teacher,
     }
     second_value = graph.evaluate(second_derivative.output.node_id, teacher_inputs)
     boundary_target = graph.evaluate(boundary.node_id, teacher_inputs)
     split = nabla.Tensor.split_key(2026, 2)
     inputs = {
-        "x": nabla.Tensor([4, 1], coordinates),
-        "x_boundary": nabla.Tensor([4, 1], boundary_coordinates),
-        "forcing": nabla.Tensor([4, 1], [-value for value in second_value.to_flat_list()]),
+        "x": nabla.Tensor([collocation, 1], coordinates),
+        "x_boundary": nabla.Tensor([collocation, 1], boundary_coordinates),
+        "forcing": nabla.Tensor(
+            [collocation, 1], [-value for value in second_value.to_flat_list()]
+        ),
         "target": boundary_target,
         "w1": nabla.Tensor.glorot_normal([1, width], split[0]),
         "b1": nabla.Tensor([1, width], [0.0] * width),
@@ -90,9 +94,11 @@ def build_optimizer(width: int, device_ordinal: int):
     return optimizer
 
 
-def benchmark(steps: int, warmup_steps: int, width: int, device_ordinal: int) -> None:
+def benchmark(
+    steps: int, warmup_steps: int, width: int, collocation: int, device_ordinal: int
+) -> None:
     compile_start = time.perf_counter()
-    optimizer = build_optimizer(width, device_ordinal)
+    optimizer = build_optimizer(width, collocation, device_ordinal)
     compile_seconds = time.perf_counter() - compile_start
     initial_loss = optimizer.loss().to_flat_list()[0]
     for _ in range(warmup_steps):
@@ -124,7 +130,7 @@ def benchmark(steps: int, warmup_steps: int, width: int, device_ordinal: int) ->
                 "dtype": "f32",
                 "host": platform.platform(),
                 "iterations": steps,
-                "shape": {"collocation": [4, 1], "hidden_width": width},
+                "shape": {"collocation": [collocation, 1], "hidden_width": width},
                 "synchronization_policy": "loss readback after warm-up and timed region",
                 "transfer_policy": "static collocation, parameters, gradients, and Adam state retained on device",
                 "warmup_iterations": warmup_steps,
@@ -147,11 +153,12 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=1_000)
     parser.add_argument("--warmup-steps", type=int, default=100)
     parser.add_argument("--width", type=int, default=16)
+    parser.add_argument("--collocation", type=int, default=4)
     parser.add_argument("--device-ordinal", type=int, default=0)
     args = parser.parse_args()
-    if min(args.steps, args.warmup_steps, args.width) <= 0 or args.device_ordinal < 0:
-        parser.error("steps, warmup-steps, and width must be positive; device-ordinal must be non-negative")
-    benchmark(args.steps, args.warmup_steps, args.width, args.device_ordinal)
+    if min(args.steps, args.warmup_steps, args.width, args.collocation) <= 0 or args.device_ordinal < 0:
+        parser.error("steps, warmup-steps, width, and collocation must be positive; device-ordinal must be non-negative")
+    benchmark(args.steps, args.warmup_steps, args.width, args.collocation, args.device_ordinal)
 
 
 if __name__ == "__main__":

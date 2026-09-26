@@ -10,6 +10,9 @@ path = "src/lib.rs"
 
 [features]
 cuda = ["dep:cudarc", "dep:libloading"]
+# Keep NCCL opt-in: ordinary single-device CUDA builds must neither require nor
+# accidentally link a collective runtime.
+cuda-nccl = ["cuda", "cudarc/nccl"]
 mlx = ["dep:mlx-rs"]
 mlx-metal = ["mlx", "mlx-rs/metal", "mlx-rs/accelerate"]
 

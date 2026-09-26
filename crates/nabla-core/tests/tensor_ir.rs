@@ -2,13 +2,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use nabla_core::tensor_ir::{
     CpuBackend, DynamicTensor, TensorBackend, TensorBufferSlot, TensorCondExecutionPlan,
-    TensorDeviceBackend, TensorDeviceId, TensorDeviceMesh, TensorForiExecutionPlan,
-    TensorForiMultiExecutionPlan, TensorFusionRegion, TensorIr, TensorPartitionSpec,
-    TensorPlacement, TensorReplicaReduction, TensorScanExecutionPlan,
+    TensorDType, TensorDeviceBackend, TensorDeviceId, TensorDeviceMesh, TensorForiExecutionPlan,
+    TensorForiMultiExecutionPlan, TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr,
+    TensorPartitionSpec, TensorPlacement, TensorReplicaReduction, TensorScanExecutionPlan,
 };
+use nabla_core::{NablaCompiler, NablaTarget};
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 use nabla_core::tensor_ir::CudaBackend;
+
+#[cfg(all(feature = "cuda-nccl", target_os = "linux"))]
+use nabla_core::tensor_ir::CudaDataParallelExecutionPlan;
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 use nabla_core::tensor_ir::MlxBackend;
@@ -23,6 +27,84 @@ macro_rules! must {
             }
         }
     };
+}
+
+#[test]
+fn backend_precision_contract_keeps_cpu_reference_and_gpu_execution_explicit() {
+    assert_eq!(
+        TensorDeviceBackend::Cpu.precision(),
+        nabla_core::tensor_ir::TensorBackendPrecision {
+            logical: TensorDType::F64,
+            execution: TensorDType::F64,
+        }
+    );
+    for backend in [TensorDeviceBackend::Cuda, TensorDeviceBackend::Mlx] {
+        assert_eq!(backend.precision().logical, TensorDType::F64);
+        assert_eq!(backend.precision().execution, TensorDType::F32);
+    }
+}
+
+#[test]
+fn compiler_facade_owns_program_transform_and_cpu_execution_lifecycle() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let squared = must!(graph.mul(x, x));
+    let compiler = NablaCompiler;
+    let program = must!(compiler.program(graph, squared));
+
+    assert_eq!(program.output_shape(), Ok(vec![2]));
+    assert!(program.lower_text().contains("mul"));
+    assert!(compiler.capability(NablaTarget::Cpu).built);
+
+    let executable = must!(compiler.compile(&program, NablaTarget::Cpu));
+    assert_eq!(executable.target(), NablaTarget::Cpu);
+    assert_eq!(
+        must!(executable.execute(&BTreeMap::from([(
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![2.0, 3.0])),
+        )]))),
+        must!(DynamicTensor::new(vec![2], vec![4.0, 9.0]))
+    );
+
+    let jvp = must!(program.jvp(&BTreeMap::from([(
+        "x".to_string(),
+        "x_tangent".to_string(),
+    )])));
+    let (jvp_plan, tangent) = must!(jvp.freeze());
+    assert_eq!(jvp_plan.output_node_ids().len(), 2);
+    assert_ne!(jvp_plan.output_node_id(), tangent);
+
+    let vjp = must!(program.vjp("cotangent"));
+    assert_eq!(
+        vjp.cotangent_node_id(),
+        vjp.program().ir().input_node_id("cotangent").unwrap()
+    );
+    assert!(vjp.gradient_node_ids().contains_key("x"));
+}
+
+#[test]
+fn stablehlo_export_preserves_a_pure_elementwise_static_graph() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let y = must!(graph.input("y", vec![2]));
+    let sum = must!(graph.add(x, y));
+    let output = must!(graph.tanh(sum));
+    let text = must!(graph.stablehlo_text(output));
+    assert!(text.contains("func.func @main(%arg0: tensor<2xf64> // x, %arg1: tensor<2xf64> // y)"));
+    assert!(text.contains("stablehlo.add %arg0, %arg1 : tensor<2xf64>"));
+    assert!(text.contains("stablehlo.tanh %v2 : tensor<2xf64>"));
+}
+
+#[test]
+fn stablehlo_export_rejects_operations_without_a_verified_lowering() {
+    let mut graph = TensorIr::new();
+    let input = must!(graph.input("x", vec![2]));
+    let output = must!(graph.exp(input));
+
+    let error = graph
+        .stablehlo_text(output)
+        .expect_err("unimplemented StableHLO operations must fail explicitly");
+    assert!(error.contains("does not yet support exp"));
 }
 
 #[test]
@@ -466,6 +548,33 @@ fn fori_region_executes_and_differentiates_without_static_unrolling() {
 }
 
 #[test]
+fn fori_region_allows_an_unused_index_input() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let output = must!(body.add(carry, scale));
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu(output)),
+        "carry",
+        "index",
+    ));
+
+    assert_eq!(
+        must!(loop_plan.evaluate(
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+            &BTreeMap::from([(
+                "scale".to_string(),
+                must!(DynamicTensor::new(vec![], vec![2.0])),
+            )]),
+        ))
+        .data(),
+        &[7.0]
+    );
+}
+
+#[test]
 fn multi_carry_fori_region_preserves_ordered_outputs_and_external_captures() {
     let mut body = TensorIr::new();
     let position = must!(body.input("position", vec![]));
@@ -574,6 +683,489 @@ fn scan_region_stacks_fixed_shape_outputs_without_unrolling_the_body_plan() {
 }
 
 #[test]
+fn scan_region_integrates_with_parent_ir_execution_jvp_and_vjp() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let next = must!(body.add(scaled, index));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu_many(&[next, next])).0,
+        "carry",
+        "index",
+    ));
+
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let (final_carry, outputs) =
+        must!(graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)],));
+    let output_sum = must!(graph.sum(outputs));
+    let total = must!(graph.add(final_carry, output_sum));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+    ]);
+
+    assert_eq!(must!(graph.evaluate(final_carry, &inputs)).data(), &[12.0]);
+    assert_eq!(
+        must!(graph.evaluate(outputs, &inputs)).data(),
+        &[2.0, 5.0, 12.0]
+    );
+    assert_eq!(must!(graph.evaluate(total, &inputs)).data(), &[31.0]);
+    assert!(graph.lower_text().contains("scan(group="));
+    let (_, tangent) = must!(graph.jvp(
+        total,
+        &inputs,
+        &BTreeMap::from([
+            (
+                "initial".to_string(),
+                must!(DynamicTensor::new(vec![], vec![0.0])),
+            ),
+            (
+                "scale".to_string(),
+                must!(DynamicTensor::new(vec![], vec![1.0])),
+            ),
+        ]),
+    ));
+    assert_eq!(tangent.data(), &[31.0]);
+    let (_, gradients) =
+        must!(graph.value_and_vjp(total, &inputs, must!(DynamicTensor::new(vec![], vec![1.0])),));
+    assert_eq!(gradients["initial"].data(), &[22.0]);
+    assert_eq!(gradients["scale"].data(), &[31.0]);
+
+    let (_, final_carry_gradients) = must!(must!(graph.compile_cpu(final_carry))
+        .value_and_vjp(&inputs, must!(DynamicTensor::new(vec![], vec![1.0])),));
+    assert_eq!(final_carry_gradients["initial"].data(), &[8.0]);
+    assert_eq!(final_carry_gradients["scale"].data(), &[13.0]);
+    let (_, output_gradients) = must!(must!(graph.compile_cpu(outputs)).value_and_vjp(
+        &inputs,
+        must!(DynamicTensor::new(vec![3], vec![1.0, 1.0, 1.0])),
+    ));
+    assert_eq!(output_gradients["initial"].data(), &[14.0]);
+    assert_eq!(output_gradients["scale"].data(), &[18.0]);
+}
+
+#[test]
+fn symbolic_jvp_transforms_scan_region_without_unrolling_parent_loop() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let next = must!(body.add(scaled, index));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu_many(&[next, next])).0,
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let (final_carry, outputs) =
+        must!(graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)],));
+    let output_sum = must!(graph.sum(outputs));
+    let total = must!(graph.add(final_carry, output_sum));
+    let base_inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+    ]);
+
+    let initial_jvp = must!(graph.symbolic_jvp(total, "initial"));
+    assert!(initial_jvp.graph.lower_text().contains("scan(group="));
+    assert_eq!(
+        must!(initial_jvp
+            .graph
+            .compile_cpu(initial_jvp.tangent)
+            .and_then(|plan| plan.evaluate(&base_inputs)))
+        .data(),
+        &[22.0]
+    );
+    let scale_jvp = must!(graph.symbolic_jvp_with_tangent_inputs(
+        total,
+        &BTreeMap::from([("scale".to_string(), "scale_tangent".to_string())]),
+    ));
+    let mut inputs = base_inputs;
+    inputs.insert(
+        "scale_tangent".to_string(),
+        must!(DynamicTensor::new(vec![], vec![1.0])),
+    );
+    assert_eq!(
+        must!(scale_jvp
+            .graph
+            .compile_cpu(scale_jvp.tangent)
+            .and_then(|plan| plan.evaluate(&inputs)))
+        .data(),
+        &[31.0]
+    );
+}
+
+#[test]
+fn symbolic_vjp_transforms_scan_region_with_joint_carry_and_output_cotangents() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let next = must!(body.add(scaled, index));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu_many(&[next, next])).0,
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let (final_carry, outputs) =
+        must!(graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)],));
+    let output_sum = must!(graph.sum(outputs));
+    let total = must!(graph.add(final_carry, output_sum));
+    let symbolic = must!(graph.symbolic_vjp(total, "seed"));
+    assert!(symbolic.graph.lower_text().contains("scan_vjp(group="));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+        (
+            "seed".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    assert_eq!(
+        must!(symbolic
+            .graph
+            .compile_cpu(symbolic.gradients["initial"])
+            .and_then(|plan| plan.evaluate(&inputs)))
+        .data(),
+        &[22.0]
+    );
+    assert_eq!(
+        must!(symbolic
+            .graph
+            .compile_cpu(symbolic.gradients["scale"])
+            .and_then(|plan| plan.evaluate(&inputs)))
+        .data(),
+        &[31.0]
+    );
+}
+
+#[test]
+fn symbolic_jvp_many_retains_scan_vjp_jvp_sibling_targets() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let next = must!(body.add(scaled, index));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu_many(&[next, next])).0,
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let (final_carry, outputs) =
+        must!(graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)]));
+    let output_sum = must!(graph.sum(outputs));
+    let total = must!(graph.add(final_carry, output_sum));
+    let vjp = must!(graph.symbolic_vjp(total, "seed"));
+    let directional = must!(vjp.graph.symbolic_jvp_many_with_tangent_inputs(
+        &[vjp.gradients["initial"], vjp.gradients["scale"]],
+        &BTreeMap::from([("scale".to_string(), "scale_tangent".to_string())]),
+    ));
+    assert_eq!(
+        directional
+            .graph
+            .lower_text()
+            .matches("scan_vjp_jvp(group=")
+            .count(),
+        2
+    );
+    let (plan, output_ids) = must!(directional.graph.compile_cpu_many(&directional.tangents));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+        (
+            "seed".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale_tangent".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let outputs = must!(plan.evaluate_many(&inputs));
+    assert_eq!(output_ids.len(), 2);
+    assert_eq!(outputs[0].data(), &[29.0]);
+    assert_eq!(outputs[1].data(), &[26.0]);
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    if std::env::var_os("NABLA_CUDA_TEST").is_some() {
+        let cuda = must!(CudaBackend::default().execute_many(&plan, &output_ids, &inputs));
+        for (actual, expected) in cuda.iter().zip(&outputs) {
+            assert_eq!(actual.shape(), expected.shape());
+            for (actual, expected) in actual.data().iter().zip(expected.data()) {
+                assert!((actual - expected).abs() < 3e-5);
+            }
+        }
+    }
+}
+
+#[test]
+fn hessian_scalar_propagates_through_nonlinear_scan_vjp_jvp() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let squared = must!(body.mul(carry, carry));
+    let scaled = must!(body.mul(squared, scale));
+    let next = must!(body.add(scaled, index));
+    let output = must!(body.mul(next, scale));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu_many(&[next, output])).0,
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let (final_carry, outputs) =
+        must!(graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)],));
+    let output_sum = must!(graph.sum(outputs));
+    let loss = must!(graph.add(final_carry, output_sum));
+    let evaluate_loss = |scale: f64| {
+        graph
+            .evaluate(
+                loss,
+                &BTreeMap::from([
+                    (
+                        "initial".to_string(),
+                        DynamicTensor::new(vec![], vec![0.4])
+                            .expect("scalar initial tensor is valid"),
+                    ),
+                    (
+                        "scale".to_string(),
+                        DynamicTensor::new(vec![], vec![scale])
+                            .expect("scalar scale tensor is valid"),
+                    ),
+                ]),
+            )
+            .expect("nonlinear Scan loss evaluates")
+            .data()[0]
+    };
+    let scale = 0.8;
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![0.4])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![scale])),
+        ),
+    ]);
+    let hvp = must!(graph.hvp_scalar(
+        loss,
+        "scale",
+        &inputs,
+        must!(DynamicTensor::new(vec![], vec![1.0])),
+    ));
+    let step = 1e-4;
+    let finite_difference = (evaluate_loss(scale + step) - 2.0 * evaluate_loss(scale)
+        + evaluate_loss(scale - step))
+        / (step * step);
+    assert!((hvp.data()[0] - finite_difference).abs() < 2e-5);
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_backend_executes_nonlinear_scan_forward_over_reverse_hvp() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let squared = must!(body.mul(carry, carry));
+    let scaled = must!(body.mul(squared, scale));
+    let next = must!(body.add(scaled, index));
+    let output = must!(body.mul(next, scale));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu_many(&[next, output])).0,
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let (final_carry, outputs) =
+        must!(graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)],));
+    let output_sum = must!(graph.sum(outputs));
+    let loss = must!(graph.add(final_carry, output_sum));
+    let vjp = must!(graph.symbolic_vjp(loss, "cotangent"));
+    let directional = must!(vjp.graph.symbolic_jvp_with_tangent_inputs(
+        vjp.gradients["scale"],
+        &BTreeMap::from([("scale".to_string(), "scale_tangent".to_string())]),
+    ));
+    assert!(directional
+        .graph
+        .lower_text()
+        .contains("scan_vjp_jvp(group="));
+    let plan = must!(directional.graph.compile_cpu(directional.tangent));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![0.4])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![0.8])),
+        ),
+        (
+            "cotangent".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale_tangent".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let cpu = must!(plan.evaluate(&inputs));
+    let mlx = must!(MlxBackend.execute(&plan, &inputs));
+    assert_eq!(mlx.shape(), cpu.shape());
+    assert!((mlx.data()[0] - cpu.data()[0]).abs() < 2e-5);
+}
+
+#[test]
+fn symbolic_jvp_of_scalar_vjp_gradient_propagates_cotangent_direction() {
+    let mut graph = TensorIr::new();
+    let carry = must!(graph.input("carry", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let output = must!(graph.mul(carry, scale));
+    let vjp = must!(graph.symbolic_vjp(output, "cotangent"));
+    let jvp = must!(vjp.graph.symbolic_jvp_with_tangent_inputs(
+        vjp.gradients["carry"],
+        &BTreeMap::from([
+            ("scale".to_string(), "scale_tangent".to_string()),
+            ("cotangent".to_string(), "cotangent_tangent".to_string()),
+        ]),
+    ));
+    let inputs = BTreeMap::from([
+        (
+            "carry".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+        (
+            "cotangent".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+        (
+            "scale_tangent".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "cotangent_tangent".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let value = must!(must!(jvp.graph.compile_cpu(jvp.tangent)).evaluate(&inputs));
+    assert_eq!(value.data(), &[4.0]);
+}
+
+#[test]
+fn scan_region_allows_an_unused_index_input() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let next = must!(body.add(carry, scale));
+    let (plan, _) = must!(body.compile_cpu_many(&[next, next]));
+    let scan = must!(TensorScanExecutionPlan::new(0, 3, plan, "carry", "index"));
+
+    let (carry, outputs) = must!(scan.evaluate(
+        must!(DynamicTensor::new(vec![], vec![1.0])),
+        &BTreeMap::from([(
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        )]),
+    ));
+    assert_eq!(carry.data(), &[7.0]);
+    assert_eq!(outputs.data(), &[3.0, 5.0, 7.0]);
+}
+
+#[test]
+fn fori_vjp_jvp_plan_matches_exact_loop_gradient_direction() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let output = must!(body.add(scaled, index));
+    let plan = must!(TensorForiExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu(output)),
+        "carry",
+        "index"
+    ));
+    let plan = must!(TensorForiVjpJvpExecutionPlan::new(plan, "__debug"));
+    let tangents = must!(plan.jvp(
+        must!(DynamicTensor::new(vec![], vec![1.0])),
+        must!(DynamicTensor::new(vec![], vec![0.0])),
+        &BTreeMap::from([(
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        )]),
+        &BTreeMap::from([(
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        )]),
+        must!(DynamicTensor::new(vec![], vec![1.0])),
+        must!(DynamicTensor::new(vec![], vec![0.0])),
+    ));
+    assert_eq!(tangents["carry"].data(), &[12.0]);
+    assert_eq!(tangents["scale"].data(), &[12.0]);
+}
+
+#[test]
 fn fori_region_integrates_with_parent_ir_execution_and_ad() {
     let mut body = TensorIr::new();
     let carry = must!(body.input("carry", vec![]));
@@ -665,6 +1257,8 @@ fn symbolic_jvp_transforms_fori_region_without_unrolling_parent_loop() {
     ]);
     let symbolic = must!(graph.symbolic_jvp(output, "initial"));
     assert!(symbolic.graph.lower_text().contains("fori(carry="));
+    assert!(symbolic.graph.lower_text().contains("fori_jvp(carry="));
+    assert!(!symbolic.graph.lower_text().contains("slice("));
     let tangent = must!(symbolic
         .graph
         .compile_cpu(symbolic.tangent)
@@ -694,6 +1288,49 @@ fn symbolic_jvp_transforms_fori_region_without_unrolling_parent_loop() {
         .compile_cpu(symbolic.tangent)
         .and_then(|plan| plan.evaluate(&tangent_inputs)));
     assert_eq!(tangent.data(), &[13.0]);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_structural_fori_jvp_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let output = must!(body.add(scaled, index));
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu(output)),
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let output = must!(graph.fori(initial, loop_plan, vec![("scale".to_string(), scale)]));
+    let symbolic = must!(graph.symbolic_jvp_with_tangent_inputs(
+        output,
+        &BTreeMap::from([("scale".to_string(), "scale_tangent".to_string())]),
+    ));
+    let inputs = BTreeMap::from([
+        ("initial".to_string(), must!(DynamicTensor::new(vec![], vec![1.0]))),
+        ("scale".to_string(), must!(DynamicTensor::new(vec![], vec![2.0]))),
+        (
+            "scale_tangent".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let plan = must!(symbolic.graph.compile_cpu(symbolic.tangent));
+    let cpu = must!(plan.evaluate(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_eq!(cuda.shape(), cpu.shape());
+    assert!((cuda.data()[0] - cpu.data()[0]).abs() < 3e-5);
+    assert!((cuda.data()[0] - 13.0).abs() < 3e-5);
 }
 
 #[test]
@@ -801,6 +1438,115 @@ fn hessian_and_hvp_propagate_exactly_through_fori_regions() {
     );
 }
 
+#[test]
+fn symbolic_hvp_through_fori_lowers_to_structural_fori_vjp_jvp() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let output = must!(body.add(scaled, index));
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu(output)),
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let output = must!(graph.fori(initial, loop_plan, vec![("scale".to_string(), scale)]));
+    let vjp = must!(graph.symbolic_vjp(output, "cotangent"));
+    let directional = must!(vjp.graph.symbolic_jvp_with_tangent_inputs(
+        vjp.gradients["scale"],
+        &BTreeMap::from([(String::from("scale"), String::from("scale_tangent"))]),
+    ));
+    assert!(directional.graph.lower_text().contains("fori_vjp_jvp"));
+    let value = must!(directional.graph.evaluate(
+        directional.tangent,
+        &BTreeMap::from([
+            (
+                "initial".to_string(),
+                must!(DynamicTensor::new(vec![], vec![1.0])),
+            ),
+            (
+                "scale".to_string(),
+                must!(DynamicTensor::new(vec![], vec![2.0])),
+            ),
+            (
+                "cotangent".to_string(),
+                must!(DynamicTensor::new(vec![], vec![1.0])),
+            ),
+            (
+                "scale_tangent".to_string(),
+                must!(DynamicTensor::new(vec![], vec![1.0])),
+            ),
+        ]),
+    ));
+    assert_eq!(value.data(), &[12.0]);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_structural_fori_hvp_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let output = must!(body.add(scaled, index));
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu(output)),
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let output = must!(graph.fori(initial, loop_plan, vec![("scale".to_string(), scale)]));
+    let vjp = must!(graph.symbolic_vjp(output, "cotangent"));
+    let directional = must!(vjp.graph.symbolic_jvp_with_tangent_inputs(
+        vjp.gradients["scale"],
+        &BTreeMap::from([(String::from("scale"), String::from("scale_tangent"))]),
+    ));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+        (
+            "cotangent".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale_tangent".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let plan = must!(directional.graph.compile_cpu(directional.tangent));
+    let cpu = must!(plan.evaluate(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_eq!(cuda.shape(), cpu.shape());
+    assert!(
+        (cuda.data()[0] - cpu.data()[0]).abs() < 3e-5,
+        "CUDA Fori HVP mismatch: {} vs {}",
+        cuda.data()[0],
+        cpu.data()[0]
+    );
+    assert!((cuda.data()[0] - 12.0).abs() < 3e-5);
+}
+
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_rejects_cond_regions_before_device_lowering() {
@@ -823,25 +1569,540 @@ fn cuda_backend_rejects_cond_regions_before_device_lowering() {
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
-fn cuda_backend_rejects_fori_regions_before_device_lowering() {
+fn cuda_backend_executes_elementwise_fixed_fori_regions_on_device() {
     let mut body = TensorIr::new();
     let carry = must!(body.input("carry", vec![]));
     let index = must!(body.input("index", vec![]));
-    let output = must!(body.add(carry, index));
+    let scale = must!(body.input("scale", vec![]));
+    let increment = must!(body.mul(index, scale));
+    let output = must!(body.add(carry, increment));
     let loop_plan = must!(TensorForiExecutionPlan::new(
         0,
-        1,
+        3,
         must!(body.compile_cpu(output)),
         "carry",
         "index",
     ));
     let mut graph = TensorIr::new();
     let initial = must!(graph.input("initial", vec![]));
-    let output = must!(graph.fori(initial, loop_plan, vec![]));
-    let error = CudaBackend::new(0)
-        .compile(must!(graph.compile_cpu(output)))
-        .unwrap_err();
-    assert!(error.contains("does not yet support Fori regions"));
+    let scale = must!(graph.input("scale", vec![]));
+    let output = must!(graph.fori(initial, loop_plan, vec![("scale".to_string(), scale)]));
+    let plan = must!(graph.compile_cpu(output));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+    ]);
+    let cpu = must!(plan.evaluate(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_eq!(cuda.shape(), cpu.shape());
+    assert!((cuda.data()[0] - cpu.data()[0]).abs() < 1e-5);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_fixed_fori_vjp_with_device_resident_carry_tape_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![3]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![3]));
+    let scaled = must!(body.mul(carry, scale));
+    let shifted = must!(body.add(scaled, index));
+    let output = must!(body.tanh(shifted));
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu(output)),
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![3]));
+    let scale = must!(graph.input("scale", vec![3]));
+    let output = must!(graph.fori(initial, loop_plan, vec![("scale".to_string(), scale)]));
+    let transformed = must!(graph.symbolic_vjp(output, "seed"));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.2, -0.1, 0.3])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.8, 1.1, 0.6])),
+        ),
+        (
+            "seed".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![1.0, -0.5, 0.25])),
+        ),
+    ]);
+    for name in ["initial", "scale"] {
+        let plan = must!(transformed.graph.compile_cpu(transformed.gradients[name]));
+        let cpu = must!(plan.evaluate(&inputs));
+        let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+        assert_eq!(cuda.shape(), cpu.shape());
+        for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+            assert!(
+                (actual - expected).abs() < 2e-5,
+                "CUDA Fori VJP mismatch for {name}: {actual} vs {expected}"
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_fuses_grouped_fori_vjp_targets_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![3]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![3]));
+    let bias = must!(body.input("bias", vec![3]));
+    let scaled = must!(body.mul(carry, scale));
+    let biased = must!(body.add(scaled, bias));
+    let shifted = must!(body.add(biased, index));
+    let output = must!(body.tanh(shifted));
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu(output)),
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![3]));
+    let scale = must!(graph.input("scale", vec![3]));
+    let bias = must!(graph.input("bias", vec![3]));
+    let output = must!(graph.fori(
+        initial,
+        loop_plan,
+        vec![("scale".to_string(), scale), ("bias".to_string(), bias)],
+    ));
+    let transformed = must!(graph.symbolic_vjp(output, "seed"));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.2, -0.1, 0.3])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.8, 1.1, 0.6])),
+        ),
+        (
+            "bias".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.1, -0.2, 0.05])),
+        ),
+        (
+            "seed".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![1.0, -0.5, 0.25])),
+        ),
+    ]);
+    let (plan, output_ids) = must!(transformed.graph.compile_cpu_many(&[
+        transformed.gradients["initial"],
+        transformed.gradients["scale"],
+        transformed.gradients["bias"],
+    ]));
+    let cpu = must!(plan.evaluate_many(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute_many(&plan, &output_ids, &inputs));
+    for (actual, expected) in cuda.iter().zip(cpu.iter()) {
+        assert_eq!(actual.shape(), expected.shape());
+        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+            assert!(
+                (actual - expected).abs() < 3e-5,
+                "grouped CUDA Fori VJP mismatch: {actual} vs {expected}"
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_reduces_scalar_fori_capture_vjp_on_device_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![3]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let shifted = must!(body.add(scaled, index));
+    let output = must!(body.tanh(shifted));
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu(output)),
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![3]));
+    let scale = must!(graph.input("scale", vec![]));
+    let output = must!(graph.fori(initial, loop_plan, vec![("scale".to_string(), scale)]));
+    let loss = must!(graph.sum(output));
+    let transformed = must!(graph.symbolic_vjp(loss, "seed"));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.2, -0.1, 0.3])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![0.8])),
+        ),
+        (
+            "seed".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let plan = must!(transformed
+        .graph
+        .compile_cpu(transformed.gradients["scale"]));
+    let cpu = must!(plan.evaluate(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_eq!(cuda.shape(), cpu.shape());
+    assert!((cuda.data()[0] - cpu.data()[0]).abs() < 3e-5);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_reduces_broadcast_fori_capture_vjp_on_device_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![2, 3]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![1, 3]));
+    let scaled = must!(body.mul(carry, scale));
+    let shifted = must!(body.add(scaled, index));
+    let output = must!(body.tanh(shifted));
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu(output)),
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![2, 3]));
+    let scale = must!(graph.input("scale", vec![1, 3]));
+    let output = must!(graph.fori(initial, loop_plan, vec![("scale".to_string(), scale)]));
+    let loss = must!(graph.sum(output));
+    let transformed = must!(graph.symbolic_vjp(loss, "seed"));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(
+                vec![2, 3],
+                vec![0.2, -0.1, 0.3, -0.4, 0.5, 0.1],
+            )),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![1, 3], vec![0.8, 1.1, 0.6])),
+        ),
+        (
+            "seed".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let plan = must!(transformed
+        .graph
+        .compile_cpu(transformed.gradients["scale"]));
+    let cpu = must!(plan.evaluate(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_eq!(cuda.shape(), cpu.shape());
+    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+        assert!((actual - expected).abs() < 5e-5);
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_fixed_scan_regions_with_shared_device_results_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![3]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![3]));
+    let scaled = must!(body.mul(carry, scale));
+    let shifted = must!(body.add(scaled, index));
+    let next = must!(body.tanh(shifted));
+    let (body_plan, _) = must!(body.compile_cpu_many(&[next, next]));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0, 3, body_plan, "carry", "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![3]));
+    let scale = must!(graph.input("scale", vec![3]));
+    let (final_carry, outputs) =
+        must!(graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)],));
+    let (plan, output_ids) = must!(graph.compile_cpu_many(&[final_carry, outputs]));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.2, -0.1, 0.3])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.8, 1.1, 0.6])),
+        ),
+    ]);
+    let cpu = must!(plan.evaluate_many(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute_many(&plan, &output_ids, &inputs));
+    for (actual, expected) in cuda.iter().zip(cpu) {
+        assert_eq!(actual.shape(), expected.shape());
+        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+            assert!((actual - expected).abs() < 2e-5);
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_fixed_scan_vjp_with_device_resident_carry_tape_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![3]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![3]));
+    let scaled = must!(body.mul(carry, scale));
+    let shifted = must!(body.add(scaled, index));
+    let next = must!(body.tanh(shifted));
+    let (body_plan, _) = must!(body.compile_cpu_many(&[next, next]));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0, 3, body_plan, "carry", "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![3]));
+    let scale = must!(graph.input("scale", vec![3]));
+    let (final_carry, outputs) =
+        must!(graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)],));
+    let final_sum = must!(graph.sum(final_carry));
+    let output_sum = must!(graph.sum(outputs));
+    let loss = must!(graph.add(final_sum, output_sum));
+    let transformed = must!(graph.symbolic_vjp(loss, "seed"));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.2, -0.1, 0.3])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.8, 1.1, 0.6])),
+        ),
+        (
+            "seed".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    for name in ["initial", "scale"] {
+        let plan = must!(transformed.graph.compile_cpu(transformed.gradients[name]));
+        let cpu = must!(plan.evaluate(&inputs));
+        let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+        assert_eq!(cuda.shape(), cpu.shape());
+        for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+            assert!(
+                (actual - expected).abs() < 3e-5,
+                "CUDA Scan VJP mismatch for {name}: {actual} vs {expected}"
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_fuses_grouped_scan_vjp_targets_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![3]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![3]));
+    let bias = must!(body.input("bias", vec![3]));
+    let scaled = must!(body.mul(carry, scale));
+    let biased = must!(body.add(scaled, bias));
+    let shifted = must!(body.add(biased, index));
+    let next = must!(body.tanh(shifted));
+    let (body_plan, _) = must!(body.compile_cpu_many(&[next, next]));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0, 3, body_plan, "carry", "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![3]));
+    let scale = must!(graph.input("scale", vec![3]));
+    let bias = must!(graph.input("bias", vec![3]));
+    let (final_carry, outputs) = must!(graph.scan(
+        initial,
+        scan_plan,
+        vec![("scale".to_string(), scale), ("bias".to_string(), bias)],
+    ));
+    let final_sum = must!(graph.sum(final_carry));
+    let output_sum = must!(graph.sum(outputs));
+    let loss = must!(graph.add(final_sum, output_sum));
+    let transformed = must!(graph.symbolic_vjp(loss, "seed"));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.2, -0.1, 0.3])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.8, 1.1, 0.6])),
+        ),
+        (
+            "bias".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.1, -0.2, 0.05])),
+        ),
+        (
+            "seed".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let (plan, output_ids) = must!(transformed.graph.compile_cpu_many(&[
+        transformed.gradients["initial"],
+        transformed.gradients["scale"],
+        transformed.gradients["bias"],
+    ]));
+    let cpu = must!(plan.evaluate_many(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute_many(&plan, &output_ids, &inputs));
+    for (actual, expected) in cuda.iter().zip(cpu.iter()) {
+        assert_eq!(actual.shape(), expected.shape());
+        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+            assert!(
+                (actual - expected).abs() < 4e-5,
+                "grouped CUDA Scan VJP mismatch: {actual} vs {expected}"
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_reduces_scalar_scan_capture_vjp_on_device_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![3]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let shifted = must!(body.add(scaled, index));
+    let next = must!(body.tanh(shifted));
+    let (body_plan, _) = must!(body.compile_cpu_many(&[next, next]));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0, 3, body_plan, "carry", "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![3]));
+    let scale = must!(graph.input("scale", vec![]));
+    let (final_carry, outputs) =
+        must!(graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)],));
+    let final_sum = must!(graph.sum(final_carry));
+    let output_sum = must!(graph.sum(outputs));
+    let loss = must!(graph.add(final_sum, output_sum));
+    let transformed = must!(graph.symbolic_vjp(loss, "seed"));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.2, -0.1, 0.3])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![0.8])),
+        ),
+        (
+            "seed".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let plan = must!(transformed
+        .graph
+        .compile_cpu(transformed.gradients["scale"]));
+    let cpu = must!(plan.evaluate(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_eq!(cuda.shape(), cpu.shape());
+    assert!((cuda.data()[0] - cpu.data()[0]).abs() < 4e-5);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_reduces_broadcast_scan_capture_vjp_on_device_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![2, 3]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![1, 3]));
+    let scaled = must!(body.mul(carry, scale));
+    let shifted = must!(body.add(scaled, index));
+    let next = must!(body.tanh(shifted));
+    let (body_plan, _) = must!(body.compile_cpu_many(&[next, next]));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0, 3, body_plan, "carry", "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![2, 3]));
+    let scale = must!(graph.input("scale", vec![1, 3]));
+    let (final_carry, outputs) =
+        must!(graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)],));
+    let final_sum = must!(graph.sum(final_carry));
+    let output_sum = must!(graph.sum(outputs));
+    let loss = must!(graph.add(final_sum, output_sum));
+    let transformed = must!(graph.symbolic_vjp(loss, "seed"));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(
+                vec![2, 3],
+                vec![0.2, -0.1, 0.3, -0.4, 0.5, 0.1],
+            )),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![1, 3], vec![0.8, 1.1, 0.6])),
+        ),
+        (
+            "seed".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let plan = must!(transformed
+        .graph
+        .compile_cpu(transformed.gradients["scale"]));
+    let cpu = must!(plan.evaluate(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_eq!(cuda.shape(), cpu.shape());
+    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+        assert!((actual - expected).abs() < 6e-5);
+    }
 }
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
@@ -870,29 +2131,228 @@ fn mlx_backend_rejects_cond_regions_before_device_lowering() {
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
-fn mlx_backend_rejects_fori_regions_before_device_lowering() {
+fn mlx_backend_executes_fixed_fori_regions_with_device_resident_carry() {
     let mut body = TensorIr::new();
     let carry = must!(body.input("carry", vec![]));
     let index = must!(body.input("index", vec![]));
-    let output = must!(body.add(carry, index));
+    let scale = must!(body.input("scale", vec![]));
+    let increment = must!(body.mul(index, scale));
+    let output = must!(body.add(carry, increment));
     let loop_plan = must!(TensorForiExecutionPlan::new(
         0,
-        1,
+        3,
         must!(body.compile_cpu(output)),
         "carry",
         "index",
     ));
     let mut graph = TensorIr::new();
     let initial = must!(graph.input("initial", vec![]));
-    let output = must!(graph.fori(initial, loop_plan, vec![]));
-    let inputs = BTreeMap::from([(
-        "initial".to_string(),
-        must!(DynamicTensor::new(vec![], vec![1.0])),
-    )]);
-    let error = MlxBackend
-        .execute(&must!(graph.compile_cpu(output)), &inputs)
-        .unwrap_err();
-    assert!(error.contains("does not yet support Fori regions"));
+    let scale = must!(graph.input("scale", vec![]));
+    let output = must!(graph.fori(initial, loop_plan, vec![("scale".to_string(), scale)]));
+    let plan = must!(graph.compile_cpu(output));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+    ]);
+    let cpu = must!(plan.evaluate(&inputs));
+    let mlx = must!(MlxBackend.execute(&plan, &inputs));
+    assert_eq!(mlx.shape(), cpu.shape());
+    assert!((mlx.data()[0] - cpu.data()[0]).abs() < 1e-6);
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_backend_executes_fixed_fori_symbolic_vjp_with_device_resident_tape() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let output = must!(body.add(scaled, index));
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu(output)),
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let output = must!(graph.fori(initial, loop_plan, vec![("scale".to_string(), scale)]));
+    let transformed = must!(graph.symbolic_vjp(output, "seed"));
+    let (plan, output_ids) = must!(transformed.graph.compile_cpu_many(&[
+        transformed.value,
+        transformed.gradients["initial"],
+        transformed.gradients["scale"],
+    ]));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+        (
+            "seed".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let cpu = must!(plan.evaluate_many(&inputs));
+    let mlx = must!(MlxBackend.execute_many(&plan, &output_ids, &inputs));
+    for (actual, expected) in mlx.iter().zip(cpu) {
+        assert_eq!(actual.shape(), expected.shape());
+        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_backend_executes_fixed_fori_forward_over_reverse_hvp() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let output = must!(body.add(scaled, index));
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu(output)),
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let output = must!(graph.fori(initial, loop_plan, vec![("scale".to_string(), scale)]));
+    let vjp = must!(graph.symbolic_vjp(output, "cotangent"));
+    let directional = must!(vjp.graph.symbolic_jvp_with_tangent_inputs(
+        vjp.gradients["scale"],
+        &BTreeMap::from([("scale".to_string(), "scale_tangent".to_string())]),
+    ));
+    let plan = must!(directional.graph.compile_cpu(directional.tangent));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+        (
+            "cotangent".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale_tangent".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let cpu = must!(plan.evaluate(&inputs));
+    let mlx = must!(MlxBackend.execute(&plan, &inputs));
+    assert_eq!(mlx.shape(), cpu.shape());
+    assert!((mlx.data()[0] - cpu.data()[0]).abs() < 1e-5);
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_backend_executes_fixed_scan_regions_with_device_resident_carry() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let next = must!(body.add(scaled, index));
+    let (body_plan, _) = must!(body.compile_cpu_many(&[next, next]));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0, 3, body_plan, "carry", "index"
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let (final_carry, outputs) =
+        must!(graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)],));
+    let (plan, output_ids) = must!(graph.compile_cpu_many(&[final_carry, outputs]));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+    ]);
+    let cpu = must!(plan.evaluate_many(&inputs));
+    let mlx = must!(MlxBackend.execute_many(&plan, &output_ids, &inputs));
+    for (actual, expected) in mlx.iter().zip(cpu) {
+        assert_eq!(actual.shape(), expected.shape());
+        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_backend_executes_fixed_scan_symbolic_vjp_with_device_resident_tape() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let scaled = must!(body.mul(carry, scale));
+    let next = must!(body.add(scaled, index));
+    let (body_plan, _) = must!(body.compile_cpu_many(&[next, next]));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0, 3, body_plan, "carry", "index"
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let (final_carry, outputs) =
+        must!(graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)]));
+    let output_sum = must!(graph.sum(outputs));
+    let total = must!(graph.add(final_carry, output_sum));
+    let transformed = must!(graph.symbolic_vjp(total, "seed"));
+    let (plan, output_ids) = must!(transformed.graph.compile_cpu_many(&[
+        transformed.value,
+        transformed.gradients["initial"],
+        transformed.gradients["scale"],
+    ]));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+        (
+            "seed".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let cpu = must!(plan.evaluate_many(&inputs));
+    let mlx = must!(MlxBackend.execute_many(&plan, &output_ids, &inputs));
+    for (actual, expected) in mlx.iter().zip(cpu) {
+        assert_eq!(actual.shape(), expected.shape());
+        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
 }
 
 #[test]
@@ -1231,6 +2691,33 @@ fn sharding_plan_records_all_reduce_and_replication_for_sharded_mean_axis() {
         TensorReplicaReduction::Mean
     );
     must!(sharding.validate());
+}
+
+#[cfg(all(feature = "cuda-nccl", target_os = "linux"))]
+#[test]
+fn cuda_data_parallel_validates_replica_device_contract_before_lowering() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let plan = must!(graph.compile_cpu(x));
+    let backend = CudaBackend::new(0);
+
+    let error = backend
+        .compile_data_parallel(plan.clone(), vec![0])
+        .expect_err("one CUDA device cannot form a data-parallel plan");
+    assert!(error.contains("at least two"));
+
+    let error = backend
+        .compile_data_parallel(plan.clone(), vec![0, 0])
+        .expect_err("duplicate CUDA device must be rejected");
+    assert!(error.contains("must be unique"));
+
+    let error = backend
+        .compile_data_parallel(plan, vec![0, 1])
+        .expect_err("the single-GPU test host must reject an unavailable second ordinal");
+    assert!(error.contains("CUDA reports"));
+
+    let _: fn(&CudaDataParallelExecutionPlan) -> usize =
+        CudaDataParallelExecutionPlan::replica_count;
 }
 
 #[test]
