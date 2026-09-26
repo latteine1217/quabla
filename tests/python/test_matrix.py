@@ -919,6 +919,61 @@ def test_compiler_facade_cuda_rejects_indexed_unequal_lane_scan_hvp():
         raise AssertionError("CUDA Scan HVP accepted an indexed unequal-lane output")
 
 
+def test_compiler_facade_cuda_executes_packed_pair_scan_bodies():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    # 非線性 JVP 的 tangent 半邊讀取 primal 半邊；row swap 讀取另一半邊。
+    def scan_loss(initial, scale):
+        carry, outputs = nabla.tensor_scan_region(
+            0,
+            3,
+            lambda index, current, captured_scale: (
+                (current * captured_scale).tanh(),
+                (current * captured_scale).tanh(),
+            ),
+            initial,
+            [scale],
+        )
+        return carry.sum() + outputs.sum()
+
+    program = nabla.Compiler().trace(scan_loss, [("initial", [3]), ("scale", [3])])
+    inputs = {
+        "initial": nabla.Tensor([3], [0.2, -0.3, 0.5]),
+        "scale": nabla.Tensor([3], [0.8, 1.1, 0.6]),
+    }
+    for name in ("initial", "scale"):
+        jvp = program.jvp(name)
+        cpu = jvp.compile("cpu")(inputs)
+        cuda = jvp.compile("cuda")(inputs)
+        assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=2e-5)
+
+    def swap_rows(initial, scale):
+        _, outputs = nabla.tensor_scan_region(
+            0,
+            2,
+            lambda index, current, captured_scale: (
+                nabla.concat([current.slice(0, 1, 2), current.slice(0, 0, 1)], 0)
+                * captured_scale,
+                nabla.concat([current.slice(0, 1, 2), current.slice(0, 0, 1)], 0)
+                * captured_scale,
+            ),
+            initial,
+            [scale],
+        )
+        return outputs
+
+    program = nabla.Compiler().trace(swap_rows, [("initial", [2, 3]), ("scale", [3])])
+    inputs = {
+        "initial": nabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        "scale": nabla.Tensor([3], [0.5, 1.0, 2.0]),
+    }
+    cpu = program.compile("cpu")(inputs)
+    cuda = program.compile("cuda")(inputs)
+    assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
+
+
+
 
 def test_trace_tensor_batched_matmul_scalar_loss_vjp():
     def loss(x, y):

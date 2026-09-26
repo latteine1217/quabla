@@ -3318,6 +3318,16 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
         ));
     }
     let packed_pair = cuda_scan_is_packed_pair_layout(scan_plan)?;
+    // 等長 lane 且每個 capture 只有 1 或 lane_count 個元素時，所有葉節點都以
+    // flat lane index 讀取，等元素數 reshape 才是恆等 lane 映射。
+    let lane_count = element_count(&carry_shape)?;
+    let mut identity_reshape_lanes = output_matches_carry_lanes.then_some(lane_count);
+    for shape in scan_plan.external_captures().values() {
+        let capture_count = element_count(shape)?;
+        if capture_count != 1 && capture_count != lane_count {
+            identity_reshape_lanes = None;
+        }
+    }
     for (name, shape) in scan_plan.external_captures() {
         if !cuda_shapes_broadcastable(&carry_shape, shape) {
             return Err(format!(
@@ -3359,8 +3369,16 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
             | TensorOp::Log { .. }
             | TensorOp::Broadcast { .. } => {}
             TensorOp::Reshape { input }
-                if element_count(&scan_plan.body.plan.nodes[*input].shape)?
-                    == element_count(&node.shape)? => {}
+                if cuda_shapes_match_without_leading_units(
+                    &scan_plan.body.plan.nodes[*input].shape,
+                    &node.shape,
+                ) || identity_reshape_lanes == Some(node_element_count) => {}
+            TensorOp::Reshape { input } => {
+                return Err(format!(
+                    "Scan body node {node_id} reshape {:?} -> {:?} changes the per-lane broadcast layout; CUDA Scan lowers only reshapes that add or drop leading unit axes, or equal-lane reshapes whose captures are scalar or carry-sized",
+                    scan_plan.body.plan.nodes[*input].shape, node.shape
+                ))
+            }
             TensorOp::Slice {
                 input,
                 axis,
@@ -3405,12 +3423,50 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
 }
 
 /// Symbolic JVP represents one Scan carry as `[primal, tangent, ...]` with a
-/// leading extent of two. The CUDA loop may preserve that layout because each
-/// lane maps back to its own packed carry element. This is deliberately not a
-/// general strided/indexed Scan lowering.
+/// leading extent of two. A tangent lane reads its primal partner, so a body
+/// that slices or concatenates this layout is lowered with both halves held
+/// in registers by every thread (see `cuda_scan_packed_node_kernel_source`).
+/// This is deliberately not a general strided/indexed Scan lowering.
 fn cuda_scan_is_packed_pair_layout(scan_plan: &TensorScanExecutionPlan) -> Result<bool, String> {
     let carry_shape = scan_plan.carry_shape()?;
     Ok(carry_shape.first() == Some(&2))
+}
+
+/// Returns true when the body addresses packed-pair halves through slice or
+/// concat nodes, which the lane-local loop cannot evaluate.
+fn cuda_scan_uses_packed_halves(scan_plan: &TensorScanExecutionPlan) -> bool {
+    scan_plan
+        .body
+        .plan
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, TensorOp::Slice { .. } | TensorOp::Concat { .. }))
+}
+
+/// Flat stride of the packed carry axis inside `reference_shape`. Equal-count
+/// references map lanes to carry lanes by identity; broadcast references keep
+/// the carry axes trailing-aligned.
+fn cuda_scan_packed_stride(
+    reference_shape: &[usize],
+    carry_shape: &[usize],
+) -> Result<usize, String> {
+    let reference_count = element_count(reference_shape)?;
+    if reference_count == element_count(carry_shape)? {
+        return Ok(reference_count / 2);
+    }
+    let axis = reference_shape
+        .len()
+        .checked_sub(carry_shape.len())
+        .ok_or_else(|| "CUDA Scan packed reference has lower rank than the carry".to_string())?;
+    element_count(&reference_shape[axis + 1..])
+}
+
+/// Reference lane at the same position as `index` but inside packed `half`.
+fn cuda_scan_packed_half_lane(half: usize, stride: usize) -> String {
+    format!(
+        "(index - ((index / {stride}ULL) % 2ULL) * {stride}ULL + {}ULL)",
+        half * stride
+    )
 }
 
 fn cuda_fori_body_expression(
@@ -3503,30 +3559,63 @@ fn cuda_scan_body_expression_with_reference(
     reference_shape: &[usize],
     carry_expression: &str,
 ) -> Result<String, String> {
+    cuda_scan_body_expression_in_half(
+        scan_plan,
+        node_id,
+        capture_parameters,
+        reference_shape,
+        carry_expression,
+        None,
+    )
+}
+
+/// `packed_half = Some((half, stride))` evaluates the node inside one half of
+/// a packed-pair layout: the carry reads register `{carry_expression}_{half}`,
+/// captures read the reference lane at the same position in that half, and
+/// slice/concat select their half statically. Without it, slice and concat are
+/// rejected because a lane-local register cannot read its partner half.
+fn cuda_scan_body_expression_in_half(
+    scan_plan: &TensorScanExecutionPlan,
+    node_id: TensorNodeId,
+    capture_parameters: &BTreeMap<String, usize>,
+    reference_shape: &[usize],
+    carry_expression: &str,
+    packed_half: Option<(usize, usize)>,
+) -> Result<String, String> {
     let body = &scan_plan.body.plan;
     let node = body
         .nodes
         .get(node_id)
         .ok_or_else(|| format!("CUDA Scan body node {node_id} is missing"))?;
-    let child = |child_id| {
-        cuda_scan_body_expression_with_reference(
+    let in_half = |child_id, packed_half| {
+        cuda_scan_body_expression_in_half(
             scan_plan,
             child_id,
             capture_parameters,
             reference_shape,
             carry_expression,
+            packed_half,
         )
     };
+    let child = |child_id| in_half(child_id, packed_half);
     match &node.op {
-        TensorOp::Input { name } if name == &scan_plan.carry_name => {
-            Ok(carry_expression.to_string())
-        }
+        TensorOp::Input { name } if name == &scan_plan.carry_name => Ok(match packed_half {
+            Some((half, _)) => format!("{carry_expression}_{half}"),
+            None => carry_expression.to_string(),
+        }),
         TensorOp::Input { name } if name == &scan_plan.index_name => Ok("loop_index".to_string()),
         TensorOp::Input { name } => {
             let parameter = capture_parameters.get(name).ok_or_else(|| {
                 format!("CUDA Scan body input {name:?} has no parent capture binding")
             })?;
-            let offset = cuda_offset_expression(reference_shape, &node.shape);
+            let offset = match packed_half {
+                Some((half, stride)) => cuda_offset_expression_with_index(
+                    reference_shape,
+                    &node.shape,
+                    &cuda_scan_packed_half_lane(half, stride),
+                ),
+                None => cuda_offset_expression(reference_shape, &node.shape),
+            };
             Ok(format!("capture_{parameter}[{offset}]"))
         }
         TensorOp::ScalarConstant { value } => Ok(cuda_float_literal(*value)),
@@ -3567,35 +3656,32 @@ fn cuda_scan_body_expression_with_reference(
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
         TensorOp::Broadcast { input } | TensorOp::Reshape { input } => child(*input),
-        TensorOp::Slice { input, .. } => child(*input),
+        // The lowerability check restricts slices to one packed half of a
+        // carry-shaped value, so the slice reads that half at the same lane.
+        TensorOp::Slice { input, start, .. } => {
+            let (_, stride) = packed_half.ok_or_else(|| {
+                "CUDA Scan packed-pair slice requires half-aware lowering".to_string()
+            })?;
+            in_half(*input, Some((*start, stride)))
+        }
         TensorOp::Concat { inputs, axis } => {
+            let (half, stride) = packed_half.ok_or_else(|| {
+                "CUDA Scan packed-pair concat requires half-aware lowering".to_string()
+            })?;
+            let aligned = element_count(reference_shape)? == element_count(&node.shape)?
+                || (cuda_shapes_broadcastable(reference_shape, &node.shape)
+                    && reference_shape[reference_shape.len() - node.shape.len()] == 2);
             if *axis != 0
-                || (element_count(reference_shape)? != element_count(&node.shape)?
-                    && !cuda_shapes_broadcastable(reference_shape, &node.shape))
+                || inputs.len() != 2
+                || !aligned
+                || cuda_scan_packed_stride(reference_shape, &node.shape)? != stride
             {
-                return Err("CUDA Scan supports only leading-axis packed-pair concat".to_string());
+                return Err(format!(
+                    "CUDA Scan concat {:?} is not aligned with the packed carry axis of reference {reference_shape:?}",
+                    node.shape
+                ));
             }
-            let inner = element_count(&node.shape[1..])?;
-            let node_offset = cuda_offset_expression(reference_shape, &node.shape);
-            let mut start = 0usize;
-            let mut branches = Vec::with_capacity(inputs.len());
-            for input in inputs {
-                let width = body.nodes[*input].shape[0];
-                start += width;
-                branches.push((start, child(*input)?));
-            }
-            if start != node.shape[0] {
-                return Err("CUDA Scan packed concat has an invalid leading extent".to_string());
-            }
-            let (_, mut expression) = branches
-                .pop()
-                .ok_or_else(|| "CUDA Scan packed concat has no inputs".to_string())?;
-            for (limit, branch) in branches.into_iter().rev() {
-                expression = format!(
-                    "(({node_offset} / {inner}ULL) < {limit}ULL ? {branch} : {expression})"
-                );
-            }
-            Ok(expression)
+            in_half(inputs[half], packed_half)
         }
         _ => Err(format!(
             "CUDA Scan body {} is not elementwise-lowerable",
@@ -4926,6 +5012,9 @@ fn cuda_scan_node_kernel_source(
     captures: &[(String, TensorNodeId)],
 ) -> Result<String, String> {
     cuda_scan_body_is_lowerable(scan_plan)?;
+    if cuda_scan_uses_packed_halves(scan_plan) {
+        return cuda_scan_packed_node_kernel_source(node_id, scan_plan, captures);
+    }
     let carry_shape = scan_plan.carry_shape()?;
     let output_step_shape = scan_plan.body.output_shapes()[1].clone();
     let capture_parameters = captures
@@ -4979,6 +5068,110 @@ fn cuda_scan_node_kernel_source(
                 if (index < output_count) {{ float scan_output = {output_expression}; outputs[(step - {}ULL) * output_count + index] = scan_output; output_carry = {output_next_expression}; }}\n\\
             }}\n\\
             if (index < carry_count) final_carry[index] = carry;\n}}\n",
+        cuda_node_function_name(node_id),
+        scan_plan.lower,
+        scan_plan.upper,
+        scan_plan.lower,
+    ))
+}
+
+/// Packed-pair Scan kernel: every thread keeps both halves of its carry lane
+/// (and of its mapped output lane) in registers and advances them together,
+/// so a half may read its partner, e.g. a nonlinear JVP tangent reading the
+/// primal. Each thread still writes only its own final-carry and output lane.
+fn cuda_scan_packed_node_kernel_source(
+    node_id: TensorNodeId,
+    scan_plan: &TensorScanExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+) -> Result<String, String> {
+    let carry_shape = scan_plan.carry_shape()?;
+    let output_step_shape = scan_plan.body.output_shapes()[1].clone();
+    let carry_stride = cuda_scan_packed_stride(&carry_shape, &carry_shape)?;
+    let output_stride = cuda_scan_packed_stride(&output_step_shape, &carry_shape)?;
+    let capture_parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _))| (name.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let [carry_node, output_node] = [0, 1].map(|index| scan_plan.body.plan.output_node_ids[index]);
+    let expression = |node, reference: &[usize], carry: &str, half, stride| {
+        cuda_scan_body_expression_in_half(
+            scan_plan,
+            node,
+            &capture_parameters,
+            reference,
+            carry,
+            Some((half, stride)),
+        )
+    };
+    let mut initial = String::new();
+    let mut carry_step = String::new();
+    let mut output_step = String::new();
+    for half in 0..2 {
+        let carry_lane = cuda_scan_packed_half_lane(half, carry_stride);
+        let output_lane = cuda_scan_packed_half_lane(half, output_stride);
+        let output_initial_offset =
+            cuda_offset_expression_with_index(&output_step_shape, &carry_shape, &output_lane);
+        initial.push_str(&format!(
+            "float carry_{half} = index < carry_count ? initial_carry[{carry_lane}] : 0.0f;\n\\
+            float output_carry_{half} = index < output_count ? initial_carry[{output_initial_offset}] : 0.0f;\n"
+        ));
+        carry_step.push_str(&format!(
+            "float next_carry_{half} = {};\n",
+            expression(carry_node, &carry_shape, "carry", half, carry_stride)?
+        ));
+        output_step.push_str(&format!(
+            "float next_output_carry_{half} = {};\n",
+            expression(
+                carry_node,
+                &output_step_shape,
+                "output_carry",
+                half,
+                output_stride
+            )?
+        ));
+    }
+    let output_expression = format!(
+        "(((index / {output_stride}ULL) % 2ULL) == 0ULL ? {} : {})",
+        expression(
+            output_node,
+            &output_step_shape,
+            "output_carry",
+            0,
+            output_stride
+        )?,
+        expression(
+            output_node,
+            &output_step_shape,
+            "output_carry",
+            1,
+            output_stride
+        )?,
+    );
+    let parameters = captures
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("const float* capture_{index}"))
+        .chain([
+            "const float* initial_carry".to_string(),
+            "float* final_carry".to_string(),
+            "float* outputs".to_string(),
+            "unsigned long long carry_count".to_string(),
+            "unsigned long long output_count".to_string(),
+        ])
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+            unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
+            if (index >= carry_count && index >= output_count) return;\n\\
+            {initial}\
+            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
+                float loop_index = (float)step;\n\\
+                if (index < carry_count) {{\n{carry_step}carry_0 = next_carry_0; carry_1 = next_carry_1; }}\n\\
+                if (index < output_count) {{ float scan_output = {output_expression}; outputs[(step - {}ULL) * output_count + index] = scan_output;\n{output_step}output_carry_0 = next_output_carry_0; output_carry_1 = next_output_carry_1; }}\n\\
+            }}\n\\
+            if (index < carry_count) final_carry[index] = ((index / {carry_stride}ULL) % 2ULL) == 0ULL ? carry_0 : carry_1;\n}}\n",
         cuda_node_function_name(node_id),
         scan_plan.lower,
         scan_plan.upper,
@@ -6084,6 +6277,18 @@ fn cuda_offset_expression_with_index(
     } else {
         terms.join(" + ")
     }
+}
+
+/// 只差前導 1 軸的兩個 shape 在 trailing-aligned 廣播下有相同的 offset 映射。
+fn cuda_shapes_match_without_leading_units(lhs: &[usize], rhs: &[usize]) -> bool {
+    let strip = |shape: &[usize]| -> Vec<usize> {
+        shape
+            .iter()
+            .copied()
+            .skip_while(|extent| *extent == 1)
+            .collect()
+    };
+    strip(lhs) == strip(rhs)
 }
 
 fn cuda_shapes_broadcastable(output_shape: &[usize], input_shape: &[usize]) -> bool {
