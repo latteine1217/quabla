@@ -1183,6 +1183,12 @@ fn cuda_matmul_bias_tanh_epilogue(
     let TensorOp::Matmul { lhs, rhs } = plan.nodes.get(matmul)?.op else {
         return None;
     };
+    // epilogue 只上傳計畫輸入並只寫入主輸出：計算出的運算元沒有 device
+    // buffer，其他輸出也不會被求值，這兩種情況都必須走逐節點程式。
+    let is_input = |node_id: usize| matches!(plan.nodes[node_id].op, TensorOp::Input { .. });
+    if plan.output_node_ids().len() != 1 || !is_input(lhs) || !is_input(rhs) || !is_input(bias) {
+        return None;
+    }
     let shape = &plan.nodes[plan.output_node_id].shape;
     let lhs_shape = &plan.nodes[lhs].shape;
     let rhs_shape = &plan.nodes[rhs].shape;

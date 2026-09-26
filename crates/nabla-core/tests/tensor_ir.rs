@@ -3687,6 +3687,125 @@ fn cuda_backend_executes_tiled_rank_two_matmul_inside_generic_plan_when_enabled(
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
+fn cuda_epilogue_test_inputs(
+    specs: &[(&str, Vec<usize>)],
+) -> Result<BTreeMap<String, DynamicTensor>, String> {
+    specs
+        .iter()
+        .enumerate()
+        .map(|(seed, (name, shape))| {
+            let count = shape.iter().product::<usize>();
+            let data = (0..count)
+                .map(|index| ((index * 7 + seed) % 11) as f64 * 0.1 - 0.5)
+                .collect();
+            Ok((name.to_string(), DynamicTensor::new(shape.clone(), data)?))
+        })
+        .collect()
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_matmul_bias_tanh_epilogue_only_fuses_plan_inputs_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let inputs = must!(cuda_epilogue_test_inputs(&[
+        ("x", vec![4, 3]),
+        ("w", vec![3, 2]),
+        ("b", vec![1, 2]),
+    ]));
+    // 依序為 raw 輸入、計算出的 lhs、rhs、bias；只有 raw 輸入可走融合 epilogue。
+    for computed in [None, Some("x"), Some("w"), Some("b")] {
+        let mut graph = TensorIr::new();
+        let operand = |graph: &mut TensorIr, name: &str, shape| {
+            let input = graph.input(name, shape)?;
+            if computed == Some(name) {
+                graph.tanh(input)
+            } else {
+                Ok(input)
+            }
+        };
+        let x = must!(operand(&mut graph, "x", vec![4, 3]));
+        let w = must!(operand(&mut graph, "w", vec![3, 2]));
+        let b = must!(operand(&mut graph, "b", vec![1, 2]));
+        let product = must!(graph.matmul(x, w));
+        let shifted = must!(graph.add(product, b));
+        let output = must!(graph.tanh(shifted));
+        let plan = must!(graph.compile_cpu(output));
+
+        let cpu = must!(plan.evaluate(&inputs));
+        let cuda_plan = must!(CudaBackend::new(0).compile(plan));
+        assert_eq!(cuda_plan.uses_fused_matmul_bias_tanh(), computed.is_none());
+        let cuda = must!(cuda_plan.execute(&inputs));
+        assert_eq!(cuda.shape(), cpu.shape());
+        for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "CUDA matmul-bias-tanh with computed {computed:?} mismatch: {actual} vs {expected}"
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_two_layer_mlp_matches_cpu_across_single_and_multi_output_plans_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![4, 3]));
+    let w1 = must!(graph.input("w1", vec![3, 5]));
+    let b1 = must!(graph.input("b1", vec![1, 5]));
+    let w2 = must!(graph.input("w2", vec![5, 2]));
+    let b2 = must!(graph.input("b2", vec![1, 2]));
+    let product = must!(graph.matmul(x, w1));
+    let shifted = must!(graph.add(product, b1));
+    let hidden = must!(graph.tanh(shifted));
+    let product = must!(graph.matmul(hidden, w2));
+    let shifted = must!(graph.add(product, b2));
+    let output = must!(graph.tanh(shifted));
+    let transformed = must!(graph.symbolic_vjp(output, "seed"));
+    let inputs = must!(cuda_epilogue_test_inputs(&[
+        ("x", vec![4, 3]),
+        ("w1", vec![3, 5]),
+        ("b1", vec![1, 5]),
+        ("w2", vec![5, 2]),
+        ("b2", vec![1, 2]),
+        ("seed", vec![4, 2]),
+    ]));
+
+    // 第一個輸出是 raw 輸入的 matmul-bias-tanh 時，其餘輸出仍須逐節點求值。
+    let plans = [
+        must!(graph.compile_cpu_many(&[output])),
+        must!(graph.compile_cpu_many(&[hidden, output])),
+        must!(transformed.graph.compile_cpu_many(&[
+            transformed.value,
+            transformed.gradients["w1"],
+            transformed.gradients["b1"],
+            transformed.gradients["w2"],
+            transformed.gradients["b2"],
+        ])),
+    ];
+    for (plan, output_ids) in plans {
+        let cpu = must!(plan.evaluate_many(&inputs));
+        let cuda = must!(CudaBackend::new(0).execute_many(&plan, &output_ids, &inputs));
+        assert_eq!(cuda.len(), cpu.len());
+        for (actual, expected) in cuda.iter().zip(cpu.iter()) {
+            assert_eq!(actual.shape(), expected.shape());
+            for (actual, expected) in actual.data().iter().zip(expected.data()) {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "CUDA two-layer MLP mismatch: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_broadcast_batched_matmul_when_enabled() {
     if std::env::var_os("NABLA_CUDA_TEST").is_none() {

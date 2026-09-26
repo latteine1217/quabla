@@ -1691,6 +1691,68 @@ def test_cuda_fuses_rank_two_matmul_bias_tanh_epilogue():
         assert abs(value - target) < 1e-5
 
 
+def _cuda_mlp_tensor(shape, seed):
+    count = math.prod(shape)
+    return nabla.Tensor(shape, [((index * 7 + seed) % 11) * 0.1 - 0.5 for index in range(count)])
+
+
+def test_cuda_matmul_bias_tanh_with_computed_operands_matches_cpu():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    specs = [("x", [4, 3]), ("w", [3, 2]), ("b", [1, 2])]
+    inputs = {name: _cuda_mlp_tensor(shape, seed) for seed, (name, shape) in enumerate(specs)}
+    # 融合 epilogue 只綁定計畫輸入；計算出的運算元必須走逐節點程式。
+    functions = {
+        "lhs": lambda x, w, b: (x.tanh().matmul(w) + b).tanh(),
+        "rhs": lambda x, w, b: (x.matmul(w.tanh()) + b).tanh(),
+        "bias": lambda x, w, b: (x.matmul(w) + b.tanh()).tanh(),
+    }
+    for name, function in functions.items():
+        traced = nabla.trace_tensor(function, specs)
+        plan = traced.output.compile_cuda()
+        cpu = traced.output.compile_cpu().evaluate(inputs).to_flat_list()
+        assert not plan.fused_matmul_bias_tanh, name
+        assert_close_rows([plan.evaluate(inputs).to_flat_list()], [cpu], tol=1e-5)
+
+
+def test_cuda_two_layer_mlp_forward_and_value_and_grad_match_cpu():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+
+    specs = [
+        ("x", [4, 3]),
+        ("target", [4, 2]),
+        ("w1", [3, 5]),
+        ("b1", [1, 5]),
+        ("w2", [5, 2]),
+        ("b2", [1, 2]),
+    ]
+    inputs = {name: _cuda_mlp_tensor(shape, seed) for seed, (name, shape) in enumerate(specs)}
+
+    def forward(x, target, w1, b1, w2, b2):
+        return ((x.matmul(w1) + b1).tanh().matmul(w2) + b2).tanh()
+
+    traced = nabla.trace_tensor(forward, specs)
+    cpu = traced.output.compile_cpu().evaluate(inputs).to_flat_list()
+    cuda = traced.output.compile_cuda().evaluate(inputs).to_flat_list()
+    assert_close_rows([cuda], [cpu], tol=1e-5)
+
+    def loss(x, target, w1, b1, w2, b2):
+        return (forward(x, target, w1, b1, w2, b2) - target).powi(2).mean()
+
+    parameters = ["w1", "b1", "w2", "b2"]
+    value, gradients = nabla.tensor_value_and_grad_cuda_fn(loss, specs, parameters)(inputs)
+    cpu_value, cpu_gradients = nabla.tensor_value_and_grad_fn(loss, specs)(inputs)
+    assert_close_rows([value.to_flat_list()], [cpu_value.to_flat_list()], tol=1e-5)
+    for name in parameters:
+        assert_close_rows(
+            [gradients[name].to_flat_list()],
+            [cpu_gradients[name].to_flat_list()],
+            tol=1e-5,
+        )
+
+
 def test_cuda_fuses_elementwise_tail_after_matmul():
     if os.environ.get("NABLA_CUDA_TEST") is None:
         return
