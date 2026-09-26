@@ -7,7 +7,9 @@ Run after building the Python extension with the ``mlx`` feature:
 
 The timed interval contains only ``optimizer.step()``. It excludes diagnostic
 loss and parameter readbacks, but each step evaluates the updated MLX arrays so
-the GPU stream is synchronized before the next measured iteration.
+the GPU stream is synchronized before the next measured iteration. Optimizer
+construction (trace, symbolic VJP, and MLX plan build) and repeated diagnostic
+loss readbacks are timed separately.
 """
 
 import argparse
@@ -38,7 +40,9 @@ def build_optimizer(width: int, length: int):
 
 
 def benchmark(steps: int, warmup_steps: int, width: int, length: int) -> None:
+    compile_started = time.perf_counter()
     optimizer = build_optimizer(width, length)
+    compile_seconds = time.perf_counter() - compile_started
     for _ in range(warmup_steps):
         optimizer.step()
 
@@ -46,7 +50,10 @@ def benchmark(steps: int, warmup_steps: int, width: int, length: int) -> None:
     for _ in range(steps):
         optimizer.step()
     elapsed = time.perf_counter() - started
-    final_loss = optimizer.loss().to_flat_list()[0]
+    diagnostic_reads = 20
+    readback_started = time.perf_counter()
+    final_loss = [optimizer.loss().to_flat_list()[0] for _ in range(diagnostic_reads)][-1]
+    diagnostic_seconds = time.perf_counter() - readback_started
     if not (final_loss >= 0.0 and final_loss < float("inf")):
         raise RuntimeError("MLX loop benchmark produced a non-finite loss")
 
@@ -55,6 +62,9 @@ def benchmark(steps: int, warmup_steps: int, width: int, length: int) -> None:
             {
                 "benchmark": "fixed_bound_fori_value_and_grad_adam_step",
                 "backend": "mlx",
+                "compile_seconds": compile_seconds,
+                "diagnostic_readback_calls": diagnostic_reads,
+                "diagnostic_readback_milliseconds_per_call": diagnostic_seconds * 1e3 / diagnostic_reads,
                 "platform": platform.platform(),
                 "width": width,
                 "loop_length": length,

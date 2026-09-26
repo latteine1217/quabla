@@ -868,13 +868,14 @@ Completed: symbolic JVP now has a multi-output result contract while preserving
 the single-output API. Retained sibling `ScanVjpJvp` targets lower as one CUDA
 source group; the first node launches the shared kernel, caches sibling device
 buffers, and GTX 1660 SUPER parity covers carry plus explicit-capture targets.
+P6's larger MLP/PINN and fixed-bound loop MLX validation (2026-09-27) reports
+compile, device-step, and diagnostic-readback timing separately; results are
+recorded in P6.
 
-1. Run P6's representative larger MLP/PINN MLX performance validation and
-   report compile, device-step, and diagnostic-readback timing separately.
-2. Keep arbitrary indexed or non-elementwise unequal-lane Scan bodies as
+1. Keep arbitrary indexed or non-elementwise unequal-lane Scan bodies as
    explicit CUDA rejections until their reduction structure is represented in
    device reverse IR; add a rejection test for every unsupported form.
-3. P7 needs a host exposing at least two CUDA devices and NCCL. When that
+2. P7 needs a host exposing at least two CUDA devices and NCCL. When that
    prerequisite is available, connect the typed sharding schedule to the
    Python training interface, add two-GPU loss/gradient parity, then measure
    collective and readback boundaries separately.
@@ -933,14 +934,69 @@ Contiguous rank-N `Slice` and reverse-mode `PadSlice` now lower to MLX
 device-side take/pad operations; primal and symbolic-VJP parity are covered
 against the CPU reference.
 
-Remaining work is performance validation on representative larger MLP/PINN
-workloads; no MLX result is presented as a CUDA/JAX comparison.
+Status: complete. Larger-workload performance validation (2026-09-27) ran on
+an Apple M3 (16 GB, macOS 27.0 build 26A428) with the release
+`--features mlx` extension, `f32`, and `mlx.gpu`. Each configuration ran in
+five separate processes, interleaved round-robin across configurations; the
+1-minute load average before each run was 3.0-5.0, with the resident
+`dasd` system daemon near one core. Values are median (min-max) in
+milliseconds. Compile is the wall time to build the optimizer from Python
+(trace, symbolic derivatives, and `mlx_adam_loss_optimizer`); the first loss
+evaluation and warm-up steps are excluded. Step is the mean over the timed
+`optimizer.step()` calls; each evaluates the updated parameters and Adam
+moments on the GPU stream and performs no host readback. Readback is the mean
+of 20 `loss()` calls; each re-evaluates the loss on the device from retained
+state and copies one scalar to the host. `examples/benchmark_pinn_mlx.py
+--hidden-layers N --hidden-width W` replaces the one-parameter model with an
+N-hidden-layer tanh MLP on the same Poisson residual and boundary loss (Adam
+learning rate `0.01`, Glorot-normal weights from key `2026`, zero biases);
+the default command is unchanged. `examples/benchmark_loop_value_and_grad_mlx.py`
+now reports compile and 20-call readback timing beside its step timing.
+
+| Workload | Shape | Warm-up / timed steps | Compile | Step | Readback |
+| --- | --- | --- | --- | --- | --- |
+| One-parameter Poisson PINN | 65,536 collocation + 2 boundary | 100 / 1,000 | 31.40 (30.79-32.20) | 1.317 (1.180-1.490) | 0.956 (0.722-1.068) |
+| MLP PINN, 3 x 128 tanh (33,409 parameters) | 4,096 + 2 | 20 / 200 | 21.93 (21.59-23.20) | 15.466 (14.927-17.173) | 6.365 (4.330-6.415) |
+| MLP PINN, 3 x 128 tanh (33,409 parameters) | 65,536 + 2 | 5 / 30 | 33.10 (31.43-33.66) | 245.669 (241.050-246.310) | 68.353 (66.353-68.669) |
+| MLP PINN, 4 x 256 tanh (198,145 parameters) | 16,384 + 2 | 10 / 50 | 28.75 (28.20-32.83) | 186.647 (181.991-188.397) | 53.500 (51.002-53.615) |
+| MLP PINN, 4 x 512 tanh (789,505 parameters) | 4,096 + 2 | 10 / 50 | 39.36 (38.16-40.51) | 121.024 (119.548-123.108) | 34.772 (33.147-35.120) |
+| Fixed-bound `fori` loop Adam | width 256, length 16 | 20 / 100 | 22.59 (20.65-22.85) | 7.162 (6.489-7.222) | 6.736 (6.241-6.977) |
+| Fixed-bound `fori` loop Adam | width 65,536, length 16 | 20 / 100 | 21.62 (20.85-21.78) | 7.995 (7.784-8.611) | 7.714 (7.163-8.258) |
+| Fixed-bound `fori` loop Adam | width 65,536, length 64 | 10 / 50 | 21.49 (21.09-22.53) | 30.721 (29.229-31.444) | 30.409 (28.001-31.576) |
+
+Loop step time grows with loop length (16 to 64: 8.0 to 30.7 ms) and changes
+little with width (256 to 65,536 at length 16: 7.2 to 8.0 ms). A 4 x 512 MLP
+PINN at 65,536 collocation points did not fit: system-wide free memory fell to
+0% and the process was killed with exit status 137. Final losses were
+identical to the printed precision across the five runs of every
+configuration. Loss fell from
+`48.83` to `4.62e-3` (3 x 128, 4,096 points, 220 steps), from `48.61` to
+`0.113` (4 x 256, 16,384 points, 60 steps), and from `48.85` to `3.23` (3 x 128,
+65,536 points, 35 steps). At learning rate `0.01` the 4 x 512 MLP settles on
+the `u'' = 0` plateau (`48.68`, the mean squared forcing over the `N + 2`
+samples) within 60 steps and stays there through 510 steps. At 256 points the
+CPU and MLX losses after 30 steps agree (`48.3435`) and MLX reaches that
+size's plateau (`48.3270`) by step 300, so this is an optimizer setting rather
+than a backend difference.
+CPU parity used the same graph and initialization with CPU Adam: for 3 x 128 at
+4,096 points after 220 steps, the maximum parameter difference was `3.57e-4`
+and the losses were `4.6176e-3` (CPU) and `4.6187e-3` (MLX); for 4 x 512 at
+256 points after 30 steps, the maximum parameter difference was `5.43e-4`.
+Both are within the documented `2e-3` `f32` tolerance. Continuing the
+3 x 128, 4,096-point run to 3,000 MLX steps gave loss `1.60e-2`, so Adam at
+this learning rate is not monotone after step 220. These are single-device
+Apple silicon measurements; no MLX result is presented as a CUDA or JAX
+comparison.
 
 Acceptance checks:
 
 - The P1-style one-parameter Poisson PINN runs on MLX and agrees with CPU
   within its `f32` tolerance. Completed by
   `test_mlx_poisson_pinn_matches_cpu_reference`.
+- Representative larger MLP/PINN and fixed-bound loop workloads report
+  compile, device-step, and diagnostic-readback time separately over at least
+  three processes, and a larger MLP PINN matches CPU within `2e-3`. Completed
+  by the 2026-09-27 validation above.
 
 ### P7. Distributed Sharding
 
