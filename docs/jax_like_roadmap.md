@@ -189,6 +189,43 @@ parity covers nonlinear HVPs for both same-shaped and broadcast captures.
 General unequal-count output graphs remain explicit rejections, rather
 than silently treating one output lane as one carry lane.
 
+Helper migration plan (2026-09-27): every rank-N Python helper is classified
+against the current single-output facade contract. Category (a) helpers
+compile one traced output; migrated targets delegate through
+`TensorTraceGraph::compile_cpu_plan`, which builds a `NablaProgram` from a
+snapshot of the traced IR and calls `NablaCompiler::compile`.
+`Program.compile("cpu")` and the legacy `compile_cpu` methods share the same
+path. The snapshot is one extra IR clone per compilation: constructing a
+`tensor_jit_fn` over a 2,000-step `tanh` chain moved from 2.38 ms to 2.55 ms
+median on the local Apple-silicon host; execution is unchanged. CPU
+derivative helpers keep evaluating their derivative with the frozen plan's
+runtime AD (`TensorExecutionPlan::vjp`, `jvp`, `hessian_scalar`,
+`hvp_scalar`); replacing that with symbolic `Program.vjp`/`jvp` would change
+numerics and operation coverage, so it is not part of this migration.
+
+| Category | Helpers | Status |
+| --- | --- | --- |
+| (a) CPU | `tensor_jit_fn`, `tensor_grad_scalar_fn`, `tensor_value_and_grad_fn`, `tensor_hessian_scalar_fn`, `tensor_hvp_scalar_fn`, `tensor_vjp_fn`, `tensor_jvp_fn`, `tensor_jacobian_fn`, `tensor_vmap_fn`, `tensor_vmap_vjp_fn`, `tensor_vmap_jvp_fn`, `tensor_vmap_hvp_scalar_fn`, `tensor_jit_batch_fn`, `tensor_value_and_grad_batch_fn` (per specialization), `tensor_cond_fn`, `tensor_cond_value_and_grad_fn`, `tensor_cond_jvp_fn` (one program per branch) | Delegates through the facade |
+| (a) MLX | `tensor_vmap_mlx_fn` | Planned |
+| (a) CUDA | `tensor_jit_cuda_fn`, `tensor_vmap_cuda_fn`, `tensor_vmap_hvp_scalar_cuda_fn`, `tensor_jit_batch_cuda_fn` (per specialization) | Planned |
+| (b) Multi-output program | `tensor_value_and_grad_{mlx,cuda}_fn`, `tensor_value_and_grad_batch_{mlx,cuda}_fn`, `tensor_vmap_{vjp,jvp}_{mlx,cuda}_fn`, `mlx_adam_loss_optimizer`, `cuda_adam_vjp_optimizer`, `cuda_adam_loss_optimizer` | Next step |
+| (c) Separate | `tensor_value_and_grad_data_parallel_cuda_fn`, `cuda_adam_optimizer`, `cuda_adam_step`, trace-time region builders (`tensor_cond`, `tensor_fori_loop*`, `tensor_scan*`), eager graph evaluation methods, legacy 2D `TraceGraph` | Stays outside the facade |
+
+Category (b) helpers freeze a value together with selected gradients or a
+primal/tangent pair into one plan and consume remapped output node ids. They
+need a facade extension for ordered multi-output programs, which would replace
+the three `compile_*_multi_plan` bridge functions. MLX retained-input state
+currently lives in the Python `TensorMlxExecutionPlan`, not in
+`NablaExecutable`, so executing these helpers through the facade also needs
+a retained-state contract. Both change the documented single-output
+`NablaProgram` contract and are left as the next design step. Category (c)
+helpers either target a replica set rather than one `NablaTarget`
+(data-parallel CUDA), only consume already-compiled plans (CUDA Adam), build
+IR regions during tracing rather than executables (single-output `tensor_cond`
+and `tensor_fori_loop_region` bodies still freeze through the facade CPU
+path), interpret the mutable trace graph without freezing it, or belong to the
+separate 2D tracer.
+
 ## Python Bridge
 
 Current state:

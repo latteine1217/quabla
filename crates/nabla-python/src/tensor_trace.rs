@@ -9,6 +9,7 @@ use nabla_core::tensor_ir::{
     TensorCondExecutionPlan, TensorExecutionPlan, TensorForiExecutionPlan, TensorIr, TensorNodeId,
     TensorReplicaReduction, TensorScanExecutionPlan,
 };
+use nabla_core::{NablaCompiler, NablaExecutable, NablaTarget};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyString, PyTuple};
@@ -512,17 +513,35 @@ impl TensorTraceGraph {
         ir.stablehlo_text(output_node_id)
     }
 
+    /// Compiles one traced output through the core compiler facade.
+    ///
+    /// Single-output CPU compilation for function-specific helpers and
+    /// `Program.compile` funnels through here, so `NablaCompiler` owns program
+    /// construction, freezing, and target selection. The
+    /// facade owns an immutable program, while tracing keeps a shared mutable
+    /// graph, so each compilation snapshots the traced IR once.
+    fn compile_executable(
+        &self,
+        output_node_id: TensorNodeId,
+        target: NablaTarget,
+    ) -> Result<NablaExecutable, String> {
+        let ir = self
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+            .clone();
+        let compiler = NablaCompiler;
+        compiler.compile(&compiler.program(ir, output_node_id)?, target)
+    }
+
     pub(crate) fn compile_cpu_plan(
         &self,
         output_node_id: TensorNodeId,
     ) -> Result<TensorCpuExecutionPlan, String> {
-        let ir = self
-            .ir
-            .lock()
-            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
-        Ok(TensorCpuExecutionPlan {
-            plan: ir.compile_cpu(output_node_id)?,
-        })
+        match self.compile_executable(output_node_id, NablaTarget::Cpu)? {
+            NablaExecutable::Cpu(plan) => Ok(TensorCpuExecutionPlan { plan }),
+            executable => Err(unexpected_executable(NablaTarget::Cpu, &executable)),
+        }
     }
 
     pub(crate) fn compile_cuda_plan(
@@ -595,6 +614,16 @@ impl TensorTraceGraph {
             output_node_ids,
         ))
     }
+}
+
+/// Reports a facade executable whose backend differs from the requested
+/// target; this is an invariant violation, never a fallback.
+fn unexpected_executable(requested: NablaTarget, executable: &NablaExecutable) -> String {
+    format!(
+        "compiler facade returned a {} executable for a {} target",
+        executable.target().name(),
+        requested.name()
+    )
 }
 
 impl TraceTensor {
