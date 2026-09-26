@@ -57,6 +57,18 @@ pub struct CudaExecutionPlan {
     blas: Option<Arc<Mutex<CudaBlas>>>,
     solver: Option<Arc<Mutex<DnHandle>>>,
     state: Arc<Mutex<CudaExecutionState>>,
+    cond_branches: BTreeMap<TensorNodeId, CudaCondBranches>,
+}
+
+/// Device plans for the two regions of one `Cond` node.
+///
+/// Both regions are compiled ahead of time in the parent's CUDA context so
+/// captures and the selected result stay device buffers; only the scalar
+/// predicate crosses to the host at execution time.
+#[derive(Clone, Debug)]
+struct CudaCondBranches {
+    on_true: CudaExecutionPlan,
+    on_false: CudaExecutionPlan,
 }
 
 /// A single-node NCCL data-parallel executable.
@@ -199,15 +211,16 @@ impl CudaBackend {
     }
 
     pub fn compile(&self, plan: TensorExecutionPlan) -> Result<CudaExecutionPlan, String> {
-        if plan
-            .nodes
-            .iter()
-            .any(|node| matches!(node.op, TensorOp::Cond { .. }))
-        {
-            return Err(
-                "CUDA backend does not yet support Cond regions with device predicates".to_string(),
-            );
-        }
+        self.compile_in_context(plan, None)
+    }
+
+    /// `region_context` 為 `Some` 時編譯 `Cond` 分支區域：共用父計畫的 CUDA
+    /// context，並固定走逐節點 device program，使捕獲值能以 device buffer 綁定。
+    fn compile_in_context(
+        &self,
+        plan: TensorExecutionPlan,
+        region_context: Option<&Arc<CudaContext>>,
+    ) -> Result<CudaExecutionPlan, String> {
         for (node_id, node) in plan.nodes.iter().enumerate() {
             match &node.op {
                 TensorOp::Fori { loop_plan, .. } => {
@@ -268,9 +281,19 @@ impl CudaBackend {
             }
         }
         ensure_nvrtc_runtime_available()?;
-        let matmul_bias_tanh = cuda_matmul_bias_tanh_epilogue(&plan);
+        // 融合 epilogue 只綁定上傳的輸入，不會先執行 `Cond`；區域計畫則需要逐節點程式。
+        let has_cond = plan
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, TensorOp::Cond { .. }));
+        let matmul_bias_tanh = if region_context.is_none() && !has_cond {
+            cuda_matmul_bias_tanh_epilogue(&plan)
+        } else {
+            None
+        };
         let fusion_regions = plan.fusion_regions();
-        let fused_candidate = plan.uses_fused_elementwise_kernel()
+        let fused_candidate = region_context.is_none()
+            && plan.uses_fused_elementwise_kernel()
             && !matches!(&plan.nodes[plan.output_node_id].op, TensorOp::Input { .. });
         let (source, fused_elementwise) = if fused_candidate {
             match plan.cuda_source() {
@@ -290,8 +313,11 @@ impl CudaBackend {
         for region in &fusion_regions {
             source.push_str(&plan.cuda_fusion_region_source(region)?);
         }
-        let context = CudaContext::new(self.device_ordinal)
-            .map_err(|error| format!("failed to create CUDA context: {error:?}"))?;
+        let context = match region_context {
+            Some(context) => context.clone(),
+            None => CudaContext::new(self.device_ordinal)
+                .map_err(|error| format!("failed to create CUDA context: {error:?}"))?,
+        };
         let ptx = compile_ptx(source).map_err(|error| {
             format!("failed to compile CUDA device program with NVRTC: {error:?}")
         })?;
@@ -300,6 +326,25 @@ impl CudaBackend {
             .map_err(|error| format!("failed to load CUDA device program: {error:?}"))?;
         let blas = cuda_blas(context.default_stream())?;
         let solver = cuda_solver(context.default_stream())?;
+        let mut cond_branches = BTreeMap::new();
+        for (node_id, node) in plan.nodes.iter().enumerate() {
+            let TensorOp::Cond { branches, .. } = &node.op else {
+                continue;
+            };
+            let compile_region = |region: &TensorExecutionPlan| {
+                self.compile_in_context(region.clone(), Some(&context))
+                    .map_err(|error| {
+                        format!("CUDA Cond node {node_id} region cannot lower: {error}")
+                    })
+            };
+            cond_branches.insert(
+                node_id,
+                CudaCondBranches {
+                    on_true: compile_region(&branches.on_true.plan)?,
+                    on_false: compile_region(&branches.on_false.plan)?,
+                },
+            );
+        }
         Ok(CudaExecutionPlan {
             plan,
             fused_elementwise,
@@ -311,6 +356,7 @@ impl CudaBackend {
             blas,
             solver,
             state: Arc::new(Mutex::new(CudaExecutionState::default())),
+            cond_branches,
         })
     }
 }
@@ -601,6 +647,54 @@ impl CudaExecutionPlan {
             .map(|_| ())
     }
 
+    /// Executes this `Cond` region with parent device buffers as captures and
+    /// hands its output buffer to the caller without a host copy.
+    ///
+    /// `output` comes from the parent's buffer pool and is written in place, so
+    /// repeated executions recycle one buffer instead of growing either pool.
+    fn execute_region(
+        &self,
+        captures: &BTreeMap<String, &CudaSlice<f32>>,
+        output: CudaSlice<f32>,
+    ) -> Result<CudaSlice<f32>, String> {
+        let stream = self.context.default_stream();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "CUDA Cond region state lock is poisoned".to_string())?;
+        let CudaExecutionState {
+            values,
+            free_buffers,
+            ..
+        } = &mut *state;
+        if values.len() != self.plan.nodes.len() {
+            *values = std::iter::repeat_with(|| None)
+                .take(self.plan.nodes.len())
+                .collect();
+        }
+        values[self.plan.output_node_id] = Some(output);
+        execute_cuda_device_program(
+            &self.plan,
+            &BTreeMap::new(),
+            CudaProgramRuntime {
+                stream: &stream,
+                module: &self.module,
+                blas: self.blas.as_ref(),
+                solver: self.solver.as_ref(),
+                cond_branches: &self.cond_branches,
+                region_captures: captures,
+            },
+            values,
+            free_buffers,
+            &BTreeSet::new(),
+            false,
+        )?;
+        values
+            .get_mut(self.plan.output_node_id)
+            .and_then(Option::take)
+            .ok_or_else(|| "CUDA Cond region did not produce its output".to_string())
+    }
+
     fn execute_retaining_inner(
         &self,
         inputs: &BTreeMap<String, DynamicTensor>,
@@ -649,6 +743,8 @@ impl CudaExecutionPlan {
                     module: &self.module,
                     blas: self.blas.as_ref(),
                     solver: self.solver.as_ref(),
+                    cond_branches: &self.cond_branches,
+                    region_captures: &BTreeMap::new(),
                 },
                 values,
                 free_buffers,
@@ -1055,6 +1151,9 @@ struct CudaProgramRuntime<'a> {
     module: &'a Arc<CudaModule>,
     blas: Option<&'a Arc<Mutex<CudaBlas>>>,
     solver: Option<&'a Arc<Mutex<DnHandle>>>,
+    cond_branches: &'a BTreeMap<TensorNodeId, CudaCondBranches>,
+    /// 非空時本程式是 `Cond` 區域：每個輸入都由父計畫的 device buffer 綁定。
+    region_captures: &'a BTreeMap<String, &'a CudaSlice<f32>>,
 }
 
 fn cuda_remaining_use_counts(plan: &TensorExecutionPlan) -> Vec<usize> {
@@ -1204,8 +1303,14 @@ fn execute_cuda_device_program(
         module,
         blas,
         solver,
+        cond_branches,
+        region_captures,
     } = runtime;
-    validate_cuda_program_inputs(plan, inputs)?;
+    if region_captures.is_empty() {
+        validate_cuda_program_inputs(plan, inputs)?;
+    } else {
+        validate_cuda_region_captures(plan, region_captures)?;
+    }
     if values.len() != plan.nodes.len() {
         *values = std::iter::repeat_with(|| None)
             .take(plan.nodes.len())
@@ -1250,6 +1355,21 @@ fn execute_cuda_device_program(
             .map_err(|_| format!("CUDA node {node_id} launch exceeds u32 element count"))?;
         match &node.op {
             TensorOp::Input { name } => {
+                if let Some(capture) = region_captures.get(name) {
+                    // 區域捕獲在 device 端複製；父計畫保有原 buffer 的所有權。
+                    let slot = values.get_mut(node_id).ok_or_else(|| {
+                        format!("CUDA region input node {node_id} is missing its buffer")
+                    })?;
+                    if slot.is_none() {
+                        *slot = Some(take_cuda_buffer(stream, free_buffers, count, node_id)?);
+                    }
+                    stream
+                        .memcpy_dtod(*capture, slot.as_mut().expect("allocated above"))
+                        .map_err(|error| {
+                            format!("failed to bind CUDA region capture {name:?}: {error:?}")
+                        })?;
+                    continue;
+                }
                 let host = inputs[name]
                     .data()
                     .iter()
@@ -1289,11 +1409,50 @@ fn execute_cuda_device_program(
                     plan.nodes[*rhs].shape[1],
                 )?;
             }
-            TensorOp::Cond { .. } => {
-                return Err(
-                    "CUDA backend does not yet support Cond regions with device predicates"
-                        .to_string(),
-                )
+            TensorOp::Cond {
+                predicate,
+                captures,
+                ..
+            } => {
+                let branches = cond_branches
+                    .get(&node_id)
+                    .ok_or_else(|| format!("CUDA Cond node {node_id} has no compiled regions"))?;
+                let (before, current_and_after) = values.split_at_mut(node_id);
+                // 主機同步邊界：clone_dtoh 會等 stream 完成並讀回一個 f32 謂詞；
+                // 之後只啟動被選分支的 kernels，未選分支不在 device 上求值。
+                let predicate = stream
+                    .clone_dtoh(cuda_value(before, *predicate)?)
+                    .map_err(|error| {
+                        format!("failed to read CUDA Cond node {node_id} predicate: {error:?}")
+                    })?;
+                let region = if cuda_scalar_predicate(&predicate)? {
+                    &branches.on_true
+                } else {
+                    &branches.on_false
+                };
+                let captures = captures
+                    .iter()
+                    .map(|(name, capture)| {
+                        cuda_value(before, *capture).map(|value| (name.clone(), value))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()?;
+                let slot = current_and_after
+                    .first_mut()
+                    .ok_or_else(|| format!("CUDA Cond node {node_id} is missing its buffer"))?;
+                let output = match slot.take() {
+                    Some(buffer) => buffer,
+                    None => take_cuda_buffer(stream, free_buffers, count, node_id)?,
+                };
+                *slot = Some(region.execute_region(&captures, output)?);
+                release_dead_cuda_values(
+                    plan,
+                    node_id,
+                    values,
+                    free_buffers,
+                    retained_inputs,
+                    &mut remaining_uses,
+                )?;
+                continue;
             }
             TensorOp::Fori {
                 carry, captures, ..
@@ -2375,6 +2534,42 @@ fn validate_cuda_program_inputs(
         }
     }
     Ok(())
+}
+
+/// 區域程式的每個輸入都必須有元素數相符的父計畫 device buffer。
+fn validate_cuda_region_captures(
+    plan: &TensorExecutionPlan,
+    captures: &BTreeMap<String, &CudaSlice<f32>>,
+) -> Result<(), String> {
+    for node in &plan.nodes {
+        if let TensorOp::Input { name } = &node.op {
+            let capture = captures
+                .get(name)
+                .ok_or_else(|| format!("CUDA Cond region capture {name:?} is not bound"))?;
+            if capture.len() != element_count(&node.shape)? {
+                return Err(format!(
+                    "CUDA Cond region capture {name:?} has {} elements, expected shape {:?}",
+                    capture.len(),
+                    node.shape
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 與 CPU `tensor_scalar_predicate` 相同：非有限值拒絕，非零為真。
+fn cuda_scalar_predicate(value: &[f32]) -> Result<bool, String> {
+    let [value] = value else {
+        return Err(format!(
+            "conditional predicate must be scalar, got {} elements",
+            value.len()
+        ));
+    };
+    if !value.is_finite() {
+        return Err("conditional predicate must be finite".to_string());
+    }
+    Ok(*value != 0.0)
 }
 
 struct CudaNodeLaunch<'a> {
@@ -5957,13 +6152,7 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                 )
                 }
             }
-            TensorOp::Solve { .. } => String::new(),
-            TensorOp::Cond { .. } => {
-                return Err(
-                    "CUDA backend does not yet support Cond regions with device predicates"
-                        .to_string(),
-                )
-            }
+            TensorOp::Solve { .. } | TensorOp::Cond { .. } => String::new(),
             TensorOp::Fori {
                 loop_plan,
                 captures,

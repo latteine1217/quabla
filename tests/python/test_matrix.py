@@ -3110,6 +3110,8 @@ def device_cond_compilers():
     compilers = []
     if os.environ.get("NABLA_MLX_TEST") is not None:
         compilers.append(("mlx", lambda output: output.compile_mlx()))
+    if os.environ.get("NABLA_CUDA_TEST") is not None:
+        compilers.append(("cuda", lambda output: output.compile_cuda()))
     return compilers
 
 
@@ -3201,6 +3203,8 @@ def test_tensor_cond_rejects_vmapped_predicates_before_device_lowering():
     vmap_functions = [nabla.tensor_vmap_fn]
     if os.environ.get("NABLA_MLX_TEST") is not None:
         vmap_functions.append(nabla.tensor_vmap_mlx_fn)
+    if os.environ.get("NABLA_CUDA_TEST") is not None:
+        vmap_functions.append(nabla.tensor_vmap_cuda_fn)
     for vmap_function in vmap_functions:
         try:
             vmap_function(

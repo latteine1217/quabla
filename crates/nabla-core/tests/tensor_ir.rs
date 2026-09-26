@@ -1578,22 +1578,147 @@ fn cuda_backend_executes_structural_fori_hvp_when_enabled() {
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
-fn cuda_backend_rejects_cond_regions_before_device_lowering() {
+fn cuda_backend_executes_only_the_selected_cond_region_with_ad_parity_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    must!(assert_log_guard_cond_matches_cpu("CUDA", |plan, inputs| {
+        CudaBackend::new(0).compile(plan.clone())?.execute(inputs)
+    }));
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_reuses_cond_regions_and_rejects_non_finite_predicates_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    let (graph, loss) = must!(log_guard_cond_graph());
+    let compiled = must!(CudaBackend::new(0).compile(must!(graph.compile_cpu(loss))));
+    // 同一個已編譯計畫交替兩個分支，確認區域 buffer 回收後仍正確且不累積。
+    let mut buffer_counts = Vec::new();
+    for (x, expected) in [
+        (2.0, 6.0 * 2.0_f64.ln()),
+        (-1.0, 14.0),
+        (3.0, 6.0 * 3.0_f64.ln()),
+        (-2.0, 14.0),
+    ] {
+        let inputs = BTreeMap::from([
+            ("x".to_string(), must!(DynamicTensor::new(vec![], vec![x]))),
+            (
+                "y".to_string(),
+                must!(DynamicTensor::new(vec![3], vec![1.0, 2.0, 3.0])),
+            ),
+        ]);
+        let value = must!(compiled.execute(&inputs));
+        assert!(
+            (value.data()[0] - expected).abs() < 1e-4,
+            "CUDA Cond at x={x}: {} versus {expected}",
+            value.data()[0]
+        );
+        buffer_counts.push(must!(compiled.device_buffer_count()));
+    }
+    assert_eq!(buffer_counts[1], buffer_counts[3], "{buffer_counts:?}");
+
     let mut on_true = TensorIr::new();
-    let true_output = on_true.scalar_constant(1.0);
+    let true_x = must!(on_true.input("x", vec![]));
     let mut on_false = TensorIr::new();
-    let false_output = on_false.scalar_constant(2.0);
+    let false_x = must!(on_false.input("x", vec![]));
+    let two = on_false.scalar_constant(2.0);
+    let false_output = must!(on_false.mul(false_x, two));
     let branches = must!(TensorCondExecutionPlan::new(
-        must!(on_true.compile_cpu(true_output)),
+        must!(on_true.compile_cpu(true_x)),
         must!(on_false.compile_cpu(false_output)),
     ));
     let mut graph = TensorIr::new();
     let predicate = must!(graph.input("predicate", vec![]));
+    must!(graph.input("x", vec![]));
     let output = must!(graph.cond(predicate, branches));
+    let compiled = must!(CudaBackend::new(0).compile(must!(graph.compile_cpu(output))));
+    for (predicate, expected) in [(1.0, 3.0), (0.0, 6.0)] {
+        let inputs = BTreeMap::from([
+            (
+                "predicate".to_string(),
+                must!(DynamicTensor::new(vec![], vec![predicate])),
+            ),
+            (
+                "x".to_string(),
+                must!(DynamicTensor::new(vec![], vec![3.0])),
+            ),
+        ]);
+        assert_eq!(must!(compiled.execute(&inputs)).data(), &[expected]);
+    }
+    let inputs = BTreeMap::from([
+        (
+            "predicate".to_string(),
+            must!(DynamicTensor::new(vec![], vec![f64::NAN])),
+        ),
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![], vec![3.0])),
+        ),
+    ]);
+    let error = compiled
+        .execute(&inputs)
+        .expect_err("CUDA must reject a non-finite Cond predicate like CPU");
+    assert!(error.contains("conditional predicate must be finite"));
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_rejects_cond_inside_fused_fori_and_scan_bodies() {
+    let mut on_true = TensorIr::new();
+    let true_carry = must!(on_true.input("carry", vec![]));
+    let mut on_false = TensorIr::new();
+    let false_carry = must!(on_false.input("carry", vec![]));
+    let two = on_false.scalar_constant(2.0);
+    let false_output = must!(on_false.mul(false_carry, two));
+    let branches = must!(TensorCondExecutionPlan::new(
+        must!(on_true.compile_cpu(true_carry)),
+        must!(on_false.compile_cpu(false_output)),
+    ));
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    must!(body.input("index", vec![]));
+    let body_output = must!(body.cond(carry, branches));
+
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu(body_output)),
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let output = must!(graph.fori(initial, loop_plan, Vec::new()));
     let error = CudaBackend::new(0)
         .compile(must!(graph.compile_cpu(output)))
-        .expect_err("CUDA must reject Cond until device-predicate lowering exists");
-    assert!(error.contains("does not yet support Cond regions"));
+        .expect_err("CUDA must reject Cond inside a fused Fori body");
+    assert!(
+        error.contains("Fori node") && error.contains("cannot lower to a device loop"),
+        "unexpected error: {error}"
+    );
+    assert!(error.contains("cond"), "unexpected error: {error}");
+
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu_many(&[body_output, body_output])).0,
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let (carry, _) = must!(graph.scan(initial, scan_plan, Vec::new()));
+    let error = CudaBackend::new(0)
+        .compile(must!(graph.compile_cpu(carry)))
+        .expect_err("CUDA must reject Cond inside a fused Scan body");
+    assert!(
+        error.contains("Scan node") && error.contains("cannot lower to a device loop"),
+        "unexpected error: {error}"
+    );
+    assert!(error.contains("cond"), "unexpected error: {error}");
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
@@ -2138,7 +2263,10 @@ fn cuda_backend_reduces_broadcast_scan_capture_vjp_on_device_when_enabled() {
 ///
 /// The inactive log branch would inject NaN into the value and gradients for
 /// `x <= 0` if a backend evaluated both regions and selected afterwards.
-#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
 fn log_guard_cond_graph() -> Result<(TensorIr, nabla_core::tensor_ir::TensorNodeId), String> {
     let mut on_true = TensorIr::new();
     let true_a = on_true.input("a", vec![])?;
@@ -2175,7 +2303,10 @@ fn log_guard_cond_graph() -> Result<(TensorIr, nabla_core::tensor_ir::TensorNode
 /// Compares a device executor with CPU for the log-guard `Cond` primal, its
 /// symbolic VJP/JVP, and the second derivative through a VJP-produced `Cond`,
 /// for both predicate outcomes. Every device value must stay finite.
-#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
 fn assert_log_guard_cond_matches_cpu(
     backend: &str,
     execute: impl Fn(

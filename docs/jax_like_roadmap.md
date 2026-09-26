@@ -803,9 +803,17 @@ device-resident captures; nested regions and the `Cond` nodes produced by
 symbolic JVP/VJP (and their composition for second derivatives) use the same
 path. Evaluating both branches with `where` was rejected because an inactive
 branch such as `log(x)` for `x <= 0` would still inject NaN into gradients
-(`0 * NaN`). Non-finite predicates fail like CPU. CUDA still explicitly rejects `Cond` before device
-lowering; no backend eagerly materializes both branches. Vmappable conditional
-predicates remain pending and are rejected at trace time.
+(`0 * NaN`). Non-finite predicates fail like CPU. CUDA lowers `Cond` with the same host-sync
+boundary: `CudaBackend::compile` compiles both regions as per-node device
+programs in the parent CUDA context (one extra NVRTC module per region), and
+execution copies one `f32` predicate to the host, then launches only the
+selected region's kernels with parent buffers bound through device-to-device
+copies; the region writes into a buffer from the parent pool, so repeated
+executions neither copy the result to the host nor grow device memory. `Cond` inside a fused CUDA
+`Fori`/`Scan` body stays an explicit compile-time rejection, because those
+bodies are single device kernels without a host boundary. No backend eagerly
+materializes both branches. Vmappable conditional predicates remain pending
+and are rejected at trace time.
 `tensor_fori_loop(...)` remains the compatibility API that statically unrolls
 fixed host-integer bounds with a same-graph, shape-preserving TraceTensor
 carry. `TensorForiExecutionPlan` now owns a frozen fixed-bounds body region:
@@ -916,9 +924,9 @@ VJP, Hessian, and HVP paths preserve that laziness. Kernel IR, canonicalization,
 and buffer planning retain the region boundary. Python exposes
 `tensor_cond(...)` after lazy inactive-branch, nested-condition, and AD
 coverage. This closes the original CPU control-flow increment. Status
-(2026-09-27): MLX lowers device-predicate `Cond` through a single host
-predicate readback and selected-region execution; CUDA still rejects
-device-predicate `Cond` explicitly.
+(2026-09-27): MLX and CUDA lower device-predicate `Cond` through a single host
+predicate readback and selected-region execution; CUDA rejects `Cond` inside
+fused device-loop bodies explicitly.
 
 Next implementation order:
 
