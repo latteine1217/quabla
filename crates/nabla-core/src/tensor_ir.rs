@@ -9184,14 +9184,6 @@ impl TensorExecutionPlan {
             let TensorPartitionSpec::Sharded { tensor_axis, .. } = partition else {
                 continue;
             };
-            // Local concatenation of shards interleaves operands instead of
-            // producing the global shard, and propagation does not reject it.
-            if matches!(&node.op, TensorOp::Concat { axis, .. } if axis == tensor_axis) {
-                return Err(format!(
-                    "kernel node {} concatenates along sharded axis {tensor_axis}; explicit redistribution is required",
-                    placed.id
-                ));
-            }
             let TensorOp::Input { name } = &node.op else {
                 continue;
             };
@@ -10514,7 +10506,17 @@ fn infer_tensor_placement(
             let placement = unary(*input)?;
             remap_transpose_placement(node_id, placement, axes)
         }
-        TensorOp::Concat { inputs, .. } => merge(inputs),
+        TensorOp::Concat { inputs, axis } => {
+            let placement = merge(inputs)?;
+            // Local shard concatenation interleaves operands instead of
+            // producing a contiguous shard of the global result.
+            if sharded_tensor_axis(&placement) == Some(*axis) {
+                return Err(format!(
+                    "kernel node {node_id} concatenates along a sharded axis; explicit redistribution is required"
+                ));
+            }
+            Ok(placement)
+        }
         TensorOp::Slice { input, axis, .. } | TensorOp::PadSlice { input, axis, .. } => {
             let placement = unary(*input)?;
             if sharded_tensor_axis(&placement) == Some(*axis) {

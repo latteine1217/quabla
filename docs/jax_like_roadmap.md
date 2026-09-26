@@ -1100,14 +1100,16 @@ axes, and static extents that cannot be evenly sharded. Existing Python
 propagates supported local placements through elementwise operations,
 transpose, and broadcast. It rejects mixing a placed tensor with an unplaced
 non-scalar, reductions over a sharded axis, sharded matmul/solve/triangular
-operations, and reshape or slice cases that require redistribution. It does
-not insert copies or collectives.
+operations, and reshape, slice, or concat cases that require redistribution,
+such as concatenation along a sharded axis. It does not insert copies or
+collectives.
 `TensorExecutionPlan::sharding_plan(...)` extends that contract for legal
 sharded reductions: it emits an ordered backend-neutral `TensorAllReduce`
 schedule after each replica-local reduction and changes that result's
 placement to replicated on the same mesh. The schedule distinguishes `Sum`
 from `Mean`; a CUDA/NCCL backend must still lower and execute it. Sharded
-matmul, solve, triangular, reshape, and slice redistribution remain rejected.
+matmul, solve, triangular, reshape, slice, and concat redistribution remain
+rejected.
 `TensorCpuExecutionPlan.value_and_grad_data_parallel(...)` exposes the same
 reference from Python. `TensorExecutionPlan::value_and_vjp_data_parallel(...)`
 is the deterministic CPU scalar-loss reference: it rebuilds a shape-specialized
@@ -1145,9 +1147,10 @@ It rejects schedules without a collective; meshes that are not 1-D, contain
 non-CUDA devices, or whose ordinals differ from `device_ordinals` in rank
 order or count; inputs sharded on a non-zero axis or with different batch
 extents; all-reduces on non-output or consumed nodes, which would need a
-mid-graph collective; retained outputs without an all-reduce; concatenation
-along the sharded axis; and replica shapes that disagree with placement, such
-as a replicated full-batch operand combined with a shard.
+mid-graph collective; retained outputs without an all-reduce; and replica
+shapes that disagree with placement, such as a replicated full-batch operand
+combined with a shard. Concatenation along the sharded axis is already
+rejected by the re-derived propagation.
 `CudaBackend::compile_data_parallel_sharded(plan, &sharding, device_ordinals)`
 binds that list, and `CudaDataParallelExecutionPlan::execute_sharded(...)`
 issues one NCCL all-reduce per entry in schedule order, so mixed `Sum`/`Mean`

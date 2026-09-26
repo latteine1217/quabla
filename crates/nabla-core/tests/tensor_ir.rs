@@ -2986,6 +2986,46 @@ fn kernel_ir_placement_propagation_rejects_collectives_and_implicit_redistributi
 }
 
 #[test]
+fn kernel_ir_placement_propagation_rejects_concat_along_sharded_axis_only() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![4, 2]));
+    let y = must!(graph.input("y", vec![4, 2]));
+    let along_rows = must!(graph.concat(vec![x, y], 0));
+    let along_columns = must!(graph.concat(vec![x, y], 1));
+    let mean_rows = must!(graph.mean(along_rows));
+    let sharded = TensorPlacement::Mesh {
+        mesh: two_cuda_mesh(),
+        partition: TensorPartitionSpec::Sharded {
+            tensor_axis: 0,
+            mesh_axis: "data".to_string(),
+        },
+    };
+    let placements = BTreeMap::from([(x, sharded.clone()), (y, sharded.clone())]);
+
+    // Local shard concatenation interleaves operands instead of producing a
+    // contiguous shard of the global result.
+    let error = must!(graph.compile_cpu(along_rows))
+        .kernel_ir_with_placement_propagation(&placements)
+        .expect_err("concat along a sharded axis needs redistribution");
+    assert!(
+        error.contains("concatenates along a sharded axis; explicit redistribution is required"),
+        "{error}"
+    );
+    let error = must!(graph.compile_cpu(mean_rows))
+        .sharding_plan(&placements)
+        .expect_err("sharding plans must reject the same redistribution");
+    assert!(
+        error.contains("concatenates along a sharded axis"),
+        "{error}"
+    );
+
+    let program =
+        must!(must!(graph.compile_cpu(along_columns))
+            .kernel_ir_with_placement_propagation(&placements));
+    assert_eq!(program.nodes[program.output_node_id].placement, sharded);
+}
+
+#[test]
 fn sharding_plan_records_all_reduce_and_replication_for_sharded_mean_axis() {
     let mut graph = TensorIr::new();
     let x = must!(graph.input("x", vec![4, 2]));
@@ -3289,7 +3329,7 @@ fn cuda_data_parallel_program_rejects_redistribution_and_foreign_schedules() {
         &[0, 1],
     );
     assert!(
-        error.contains("concatenates along sharded axis 0"),
+        error.contains("concatenates along a sharded axis"),
         "{error}"
     );
 
