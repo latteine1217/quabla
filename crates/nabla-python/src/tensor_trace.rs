@@ -515,9 +515,9 @@ impl TensorTraceGraph {
 
     /// Compiles one traced output through the core compiler facade.
     ///
-    /// Single-output CPU and MLX compilation for function-specific helpers
-    /// and `Program.compile` funnels through here, so `NablaCompiler` owns
-    /// program construction, freezing, and target selection. The
+    /// Single-output compilation for function-specific helpers and
+    /// `Program.compile` funnels through here, so `NablaCompiler` owns program
+    /// construction, freezing, and target selection for every target. The
     /// facade owns an immutable program, while tracing keeps a shared mutable
     /// graph, so each compilation snapshots the traced IR once.
     fn compile_executable(
@@ -549,14 +549,11 @@ impl TensorTraceGraph {
         output_node_id: TensorNodeId,
         device_ordinal: usize,
     ) -> Result<TensorCudaExecutionPlan, String> {
-        let plan = self
-            .ir
-            .lock()
-            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
-            .compile_cpu(output_node_id)?;
-        CudaBackend::new(device_ordinal)
-            .compile(plan)
-            .map(|plan| TensorCudaExecutionPlan { plan })
+        let target = NablaTarget::Cuda { device_ordinal };
+        match self.compile_executable(output_node_id, target)? {
+            NablaExecutable::Cuda(plan) => Ok(TensorCudaExecutionPlan { plan }),
+            executable => Err(unexpected_executable(target, &executable)),
+        }
     }
 
     pub(crate) fn compile_mlx_plan(
