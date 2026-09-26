@@ -3962,6 +3962,65 @@ fn mlx_backend_matches_cpu_for_concat_broadcast_and_tanh() {
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
+fn mlx_backend_serializes_concurrent_execution_across_threads() {
+    // MLX 的預設 GPU stream 為全行程共用；若後端未序列化，多執行緒同時 eval
+    // 會觸發 Metal "uncommitted encoder" assertion 或卡死。Fori 每步都會 eval，
+    // 可放大交錯機率。
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let increment = must!(body.mul(index, scale));
+    let output = must!(body.add(carry, increment));
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        16,
+        must!(body.compile_cpu(output)),
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let output = must!(graph.fori(initial, loop_plan, vec![("scale".to_string(), scale)]));
+    let plan = must!(graph.compile_cpu(output));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+    ]);
+    let expected = must!(plan.evaluate(&inputs)).data()[0];
+    let results = std::thread::scope(|scope| {
+        let workers = (0..4)
+            .map(|_| {
+                scope.spawn(|| -> Result<(), String> {
+                    for _ in 0..16 {
+                        let actual = MlxBackend.execute(&plan, &inputs)?.data()[0];
+                        if (actual - expected).abs() >= 1e-5 {
+                            return Err(format!("actual={actual}, expected={expected}"));
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("MLX worker thread panicked"))
+            .collect::<Vec<_>>()
+    });
+    for result in results {
+        must!(result);
+    }
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
 fn mlx_backend_rejects_solve_until_a_gpu_implementation_exists() {
     let mut graph = TensorIr::new();
     let matrix = must!(graph.input("matrix", vec![2, 2]));

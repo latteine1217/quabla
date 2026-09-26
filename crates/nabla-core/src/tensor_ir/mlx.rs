@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use mlx_rs::{ops, transforms, Array, StreamOrDevice};
 
@@ -12,8 +13,30 @@ use super::{
 /// MLX uses unified memory on Apple silicon. This backend keeps intermediate
 /// arrays on MLX's GPU stream and only materializes the final value for Nabla's
 /// host-facing `DynamicTensor` result.
+///
+/// 執行緒安全：所有 MLX 圖建構、求值與回讀都經由行程層級的鎖序列化，
+/// 因此可從多條執行緒同時呼叫；GPU 工作本來就排在同一條預設 stream 上。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MlxBackend;
+
+/// 序列化本模組對 MLX 的所有存取。
+///
+/// 所依賴的 MLX 0.25 在呼叫端執行緒上把 GPU 工作編碼進預設 GPU stream，
+/// 而該 stream 的 Metal command buffer / encoder 為全行程共用且無鎖保護；
+/// 兩條執行緒同時 eval 會交錯編碼同一個 command buffer，觸發 Metal
+/// assertion 中止或卡死。
+static MLX_EXECUTION_LOCK: Mutex<()> = Mutex::new(());
+
+/// 取得 MLX 行程鎖。
+///
+/// std `Mutex` 不可重入：只在公開進入點取得一次，內部 helper 一律假設已持有，
+/// 公開函式之間也只能委派給恰好一個會取鎖的公開函式。
+fn mlx_execution_guard() -> MutexGuard<'static, ()> {
+    // 鎖不保護任何 Rust 資料，poison 只表示先前持鎖者 panic；照常序列化即可。
+    MLX_EXECUTION_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Named MLX arrays retained across executions of a fixed Tensor IR plan.
 ///
@@ -79,6 +102,7 @@ impl MlxRetainedInputs {
         inputs: &BTreeMap<String, DynamicTensor>,
         names: impl IntoIterator<Item = String>,
     ) -> Result<Self, String> {
+        let _guard = mlx_execution_guard();
         let mut values = BTreeMap::new();
         for name in names {
             let input = inputs
@@ -90,6 +114,7 @@ impl MlxRetainedInputs {
     }
 
     pub fn replace(&mut self, name: String, value: &DynamicTensor) -> Result<(), String> {
+        let _guard = mlx_execution_guard();
         self.values.insert(name, mlx_array_from_dynamic(value)?);
         Ok(())
     }
@@ -178,6 +203,7 @@ impl MlxAdamPlan {
     }
 
     pub fn step(&mut self, inputs: &BTreeMap<String, DynamicTensor>) -> Result<(), String> {
+        let _guard = mlx_execution_guard();
         let parameter_names = self.gradient_node_ids.keys().cloned().collect::<Vec<_>>();
         let gradient_node_ids = parameter_names
             .iter()
@@ -308,6 +334,7 @@ impl MlxAdamPlan {
     }
 
     pub fn parameter(&self, name: &str) -> Result<DynamicTensor, String> {
+        let _guard = mlx_execution_guard();
         let node = self
             .plan
             .nodes
@@ -356,6 +383,7 @@ impl MlxBackend {
         plan: &TensorExecutionPlan,
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<(), String> {
+        let _guard = mlx_execution_guard();
         self.execute_arrays_with_retained(plan, &[plan.output_node_id], inputs, &BTreeMap::new())
             .map(|_| ())
     }
@@ -367,6 +395,7 @@ impl MlxBackend {
         inputs: &BTreeMap<String, DynamicTensor>,
         state: &MlxRetainedInputs,
     ) -> Result<(), String> {
+        let _guard = mlx_execution_guard();
         self.execute_arrays_with_retained(plan, &[plan.output_node_id], inputs, state.arrays())
             .map(|_| ())
     }
@@ -382,6 +411,7 @@ impl MlxBackend {
         inputs: &BTreeMap<String, DynamicTensor>,
         retained_inputs: &BTreeMap<String, Array>,
     ) -> Result<Vec<DynamicTensor>, String> {
+        let _guard = mlx_execution_guard();
         let outputs =
             self.execute_arrays_with_retained(plan, output_node_ids, inputs, retained_inputs)?;
         output_node_ids
