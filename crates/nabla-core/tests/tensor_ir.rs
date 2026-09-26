@@ -3401,10 +3401,11 @@ fn cuda_data_parallel_validates_replica_device_contract_before_lowering() {
         .expect_err("duplicate CUDA device must be rejected");
     assert!(error.contains("must be unique"));
 
+    // `usize::MAX` exceeds any CUDA device count, so this holds on every host.
     let error = backend
-        .compile_data_parallel(plan, vec![0, 1])
-        .expect_err("the single-GPU test host must reject an unavailable second ordinal");
-    assert!(error.contains("CUDA reports"));
+        .compile_data_parallel(plan, vec![0, usize::MAX])
+        .expect_err("an ordinal beyond the CUDA device count must be rejected");
+    assert!(error.contains("CUDA reports"), "{error}");
 
     let _: fn(&CudaDataParallelExecutionPlan) -> usize =
         CudaDataParallelExecutionPlan::replica_count;
