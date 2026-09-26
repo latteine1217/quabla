@@ -513,11 +513,21 @@ impl MlxBackend {
                     &stream,
                 )
                 .map_err(|error| error.to_string()),
-                TensorOp::Cond { .. } => {
-                    return Err(
-                        "MLX backend does not yet support Cond regions with device predicates"
-                            .to_string(),
-                    )
+                TensorOp::Cond {
+                    predicate,
+                    branches,
+                    captures,
+                } => {
+                    // 主機同步邊界：純量謂詞讀回一次，只在 GPU stream 上執行被選分支。
+                    // 不以 where 同時計算兩分支，避免未選分支的 NaN/Inf 滲入值與梯度。
+                    let predicate = mlx_scalar_predicate(mlx_value(&values, *predicate)?)?;
+                    let branch_inputs = captures
+                        .iter()
+                        .map(|(name, node_id)| {
+                            mlx_value(&values, *node_id).map(|value| (name.clone(), value.clone()))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, _>>()?;
+                    mlx_execute_plan_output(self, branches.selected(predicate), &branch_inputs)
                 }
                 TensorOp::Fori { .. } => {
                     let TensorOp::Fori {
@@ -1680,6 +1690,19 @@ fn mlx_array_from_dynamic(input: &DynamicTensor) -> Result<Array, String> {
     host_value
         .add_device(&zeros, &stream)
         .map_err(|error| error.to_string())
+}
+
+/// 讀回 `Cond` 的純量謂詞（評估並同步 GPU stream）。
+///
+/// 語意與 CPU `tensor_scalar_predicate` 一致：非有限值拒絕，非零為真。
+fn mlx_scalar_predicate(predicate: &Array) -> Result<bool, String> {
+    let value = predicate
+        .try_item::<f32>()
+        .map_err(|error| format!("MLX Cond predicate readback failed: {error}"))?;
+    if !value.is_finite() {
+        return Err("conditional predicate must be finite".to_string());
+    }
+    Ok(value != 0.0)
 }
 
 fn mlx_value(values: &[Array], node_id: usize) -> Result<&Array, String> {

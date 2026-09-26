@@ -795,9 +795,17 @@ regions. Region transform outputs retain a stable capture ABI even if DCE
 would otherwise remove an unused capture in one branch. Public scalar
 Hessian/HVP calls through `Cond` compose symbolic VJP with symbolic JVP, so
 second coordinate derivatives needed by PINNs work on CPU. General mixed and
-higher-order region transforms remain pending. CUDA and MLX explicitly reject
-`Cond` before device lowering; neither backend eagerly materializes both
-branches. Vmappable conditional predicates remain pending.
+higher-order region transforms remain pending. Status (2026-09-27): MLX now
+lowers device-predicate `Cond`. The executor evaluates the scalar predicate,
+reads it back to the host once (one GPU stream synchronization per `Cond`
+evaluation), and executes only the selected region plan on the GPU stream with
+device-resident captures; nested regions and the `Cond` nodes produced by
+symbolic JVP/VJP (and their composition for second derivatives) use the same
+path. Evaluating both branches with `where` was rejected because an inactive
+branch such as `log(x)` for `x <= 0` would still inject NaN into gradients
+(`0 * NaN`). Non-finite predicates fail like CPU. CUDA still explicitly rejects `Cond` before device
+lowering; no backend eagerly materializes both branches. Vmappable conditional
+predicates remain pending and are rejected at trace time.
 `tensor_fori_loop(...)` remains the compatibility API that statically unrolls
 fixed host-integer bounds with a same-graph, shape-preserving TraceTensor
 carry. `TensorForiExecutionPlan` now owns a frozen fixed-bounds body region:
@@ -905,11 +913,12 @@ Control-flow completion status:
 `TensorRegion` now provides explicit capture bindings for `Cond`, `Fori`, and
 `Scan`. CPU evaluates only the selected conditional region; structural JVP,
 VJP, Hessian, and HVP paths preserve that laziness. Kernel IR, canonicalization,
-and buffer planning retain the region boundary, while CUDA and MLX reject
-device-predicate `Cond` explicitly. Python exposes `tensor_cond(...)` after
-lazy inactive-branch, nested-condition, and AD coverage. This closes the
-original CPU control-flow increment; device-predicate lowering remains a
-separate backend project.
+and buffer planning retain the region boundary. Python exposes
+`tensor_cond(...)` after lazy inactive-branch, nested-condition, and AD
+coverage. This closes the original CPU control-flow increment. Status
+(2026-09-27): MLX lowers device-predicate `Cond` through a single host
+predicate readback and selected-region execution; CUDA still rejects
+device-predicate `Cond` explicitly.
 
 Next implementation order:
 

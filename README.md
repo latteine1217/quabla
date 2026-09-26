@@ -230,8 +230,14 @@ loss/gradient readbacks, so neither is a CUDA/JAX comparison.
 - `tensor_cond(predicate, on_true, on_false, operands)` traces a scalar
   Tensor predicate into CPU Tensor IR. Branches receive only explicit operands,
   which become parent-region capture bindings; the CPU evaluator materializes
-  only the selected branch and supports direct first-order JVP/VJP. CUDA and
-  MLX reject these regions until device-predicate lowering exists.
+  only the selected branch and supports direct first-order JVP/VJP. MLX
+  lowers the same regions, including symbolic JVP/VJP and nested `Cond`: it
+  reads the scalar predicate back to the host once per `Cond` evaluation (one
+  GPU stream synchronization) and runs only the selected branch on the GPU, so
+  an inactive branch such as `log(x)` for `x <= 0` cannot inject NaN into
+  values or gradients. CUDA rejects these regions until device-predicate
+  lowering exists, and vmapped predicates or operands are rejected at trace
+  time.
   `tensor_cond_fn(on_true, on_false, input_specs)` remains the host-boolean
   function-level boundary; `tensor_cond_value_and_grad_fn(...)` and
   `tensor_cond_jvp_fn(...)` apply the matching branch VJP or JVP.

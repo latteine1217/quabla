@@ -709,8 +709,10 @@ pub struct TensorMultiRegion {
 
 /// Two shape-compatible CPU branch regions selected by a host boolean.
 ///
-/// The predicate is deliberately not a tensor yet. CUDA and MLX must not
-/// lower this boundary until device-predicate regions have explicit semantics.
+/// `TensorOp::Cond` materializes its scalar predicate before selecting a
+/// region. MLX reads a device predicate back once and executes only the
+/// selected region on its GPU stream; CUDA still rejects this boundary until
+/// its device-predicate lowering exists.
 #[derive(Clone, Debug)]
 pub struct TensorCondExecutionPlan {
     on_true: TensorRegion,

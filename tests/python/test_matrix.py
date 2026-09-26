@@ -3106,6 +3106,116 @@ def test_tensor_cond_supports_second_order_ad_through_symbolic_regions():
         assert hvp.to_flat_list() == [expected]
 
 
+def device_cond_compilers():
+    compilers = []
+    if os.environ.get("NABLA_MLX_TEST") is not None:
+        compilers.append(("mlx", lambda output: output.compile_mlx()))
+    return compilers
+
+
+def test_device_tensor_cond_matches_cpu_without_inactive_branch_nan():
+    traced = nabla.trace_tensor(
+        lambda x, y: nabla.tensor_cond(
+            x.gt(0.0),
+            lambda a, b: b * a.log(),
+            lambda a, b: b * b + a * 0.0,
+            [x, y],
+        ).sum(),
+        [("x", []), ("y", [3])],
+    )
+    gradients = traced.symbolic_vjp("seed")
+    tangent = traced.symbolic_jvp("x")
+    outputs = [
+        ("value", traced.output),
+        ("vjp_x", gradients["x"].output),
+        ("vjp_y", gradients["y"].output),
+        ("jvp_x", tangent.output),
+    ]
+    for x in (2.0, -1.0):
+        inputs = {
+            "x": nabla.Tensor([], [x]),
+            "y": nabla.Tensor([3], [1.0, 2.0, 3.0]),
+            "seed": nabla.Tensor([], [1.0]),
+        }
+        for label, output in outputs:
+            cpu = output.compile_cpu().evaluate(inputs).to_flat_list()
+            assert all(math.isfinite(value) for value in cpu), label
+            for backend, compile_device in device_cond_compilers():
+                device = compile_device(output).evaluate(inputs).to_flat_list()
+                assert all(math.isfinite(value) for value in device), (backend, label, x)
+                assert_close_rows([device], [cpu], tol=1e-4)
+    negative = {
+        "x": nabla.Tensor([], [-1.0]),
+        "y": nabla.Tensor([3], [1.0, 2.0, 3.0]),
+        "seed": nabla.Tensor([], [1.0]),
+    }
+    assert gradients["x"].output.compile_cpu().evaluate(negative).to_flat_list() == [0.0]
+    assert gradients["y"].output.compile_cpu().evaluate(negative).to_flat_list() == [
+        2.0,
+        4.0,
+        6.0,
+    ]
+
+
+def test_device_tensor_cond_matches_cpu_for_nested_regions():
+    traced = nabla.trace_tensor(
+        lambda outer, inner, x: nabla.tensor_cond(
+            outer,
+            lambda inner_predicate, captured: nabla.tensor_cond(
+                inner_predicate,
+                lambda nested: nested * nested,
+                lambda nested: nested * 3.0,
+                [captured],
+            ),
+            lambda inner_predicate, captured: captured + inner_predicate * 0.0,
+            [inner, x],
+        ),
+        [("outer", []), ("inner", []), ("x", [])],
+    )
+    gradient = traced.symbolic_vjp("seed")["x"].output
+    for outer, inner, expected_value, expected_gradient in [
+        (1.0, 1.0, 4.0, 4.0),
+        (1.0, 0.0, 6.0, 3.0),
+        (0.0, 1.0, 2.0, 1.0),
+    ]:
+        inputs = {
+            "outer": nabla.Tensor([], [outer]),
+            "inner": nabla.Tensor([], [inner]),
+            "x": nabla.Tensor([], [2.0]),
+            "seed": nabla.Tensor([], [1.0]),
+        }
+        for _, compile_device in device_cond_compilers():
+            assert_close_rows(
+                [compile_device(traced.output).evaluate(inputs).to_flat_list()],
+                [[expected_value]],
+                tol=1e-5,
+            )
+            assert_close_rows(
+                [compile_device(gradient).evaluate(inputs).to_flat_list()],
+                [[expected_gradient]],
+                tol=1e-5,
+            )
+
+
+def test_tensor_cond_rejects_vmapped_predicates_before_device_lowering():
+    vmap_functions = [nabla.tensor_vmap_fn]
+    if os.environ.get("NABLA_MLX_TEST") is not None:
+        vmap_functions.append(nabla.tensor_vmap_mlx_fn)
+    for vmap_function in vmap_functions:
+        try:
+            vmap_function(
+                lambda x, flag: nabla.tensor_cond(
+                    flag, lambda a: a, lambda a: a * 2.0, [x]
+                ),
+                [("x", [2]), ("flag", [])],
+                3,
+                in_axes=[0, None],
+            )
+            assert False, "expected vmapped tensor_cond to reject"
+        except ValueError as error:
+            assert "vmapped predicates" in str(error)
+
+
 def test_tensor_jit_batch_fn_bounds_batch_shape_specialization():
     compiled = nabla.tensor_jit_batch_fn(
         lambda x, weight: (x.matmul(weight)).tanh(),

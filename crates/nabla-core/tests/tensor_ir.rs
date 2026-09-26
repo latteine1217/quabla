@@ -2134,28 +2134,195 @@ fn cuda_backend_reduces_broadcast_scan_capture_vjp_on_device_when_enabled() {
     }
 }
 
+/// Builds `sum(cond(x > 0, y * log(x), y * y + x * 0))`.
+///
+/// The inactive log branch would inject NaN into the value and gradients for
+/// `x <= 0` if a backend evaluated both regions and selected afterwards.
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+fn log_guard_cond_graph() -> Result<(TensorIr, nabla_core::tensor_ir::TensorNodeId), String> {
+    let mut on_true = TensorIr::new();
+    let true_a = on_true.input("a", vec![])?;
+    let true_b = on_true.input("b", vec![3])?;
+    let log_a = on_true.log(true_a)?;
+    let true_output = on_true.mul(true_b, log_a)?;
+
+    let mut on_false = TensorIr::new();
+    let false_a = on_false.input("a", vec![])?;
+    let false_b = on_false.input("b", vec![3])?;
+    let zero = on_false.scalar_constant(0.0);
+    let masked = on_false.mul(false_a, zero)?;
+    let square = on_false.mul(false_b, false_b)?;
+    let false_output = on_false.add(square, masked)?;
+
+    let branches = TensorCondExecutionPlan::new(
+        on_true.compile_cpu(true_output)?,
+        on_false.compile_cpu(false_output)?,
+    )?;
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![])?;
+    let y = graph.input("y", vec![3])?;
+    let zero = graph.scalar_constant(0.0);
+    let predicate = graph.greater(x, zero)?;
+    let selected = graph.cond_with_captures(
+        predicate,
+        branches,
+        vec![("a".to_string(), x), ("b".to_string(), y)],
+    )?;
+    let loss = graph.sum(selected)?;
+    Ok((graph, loss))
+}
+
+/// Compares a device executor with CPU for the log-guard `Cond` primal, its
+/// symbolic VJP/JVP, and the second derivative through a VJP-produced `Cond`,
+/// for both predicate outcomes. Every device value must stay finite.
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+fn assert_log_guard_cond_matches_cpu(
+    backend: &str,
+    execute: impl Fn(
+        &nabla_core::tensor_ir::TensorExecutionPlan,
+        &BTreeMap<String, DynamicTensor>,
+    ) -> Result<DynamicTensor, String>,
+) -> Result<(), String> {
+    let (graph, loss) = log_guard_cond_graph()?;
+    let vjp = graph.symbolic_vjp(loss, "seed")?;
+    let jvp = graph.symbolic_jvp(loss, "x")?;
+    let second = vjp.graph.symbolic_jvp(vjp.gradients["x"], "x")?;
+    let cases = [
+        ("value", &graph, loss),
+        ("vjp_x", &vjp.graph, vjp.gradients["x"]),
+        ("vjp_y", &vjp.graph, vjp.gradients["y"]),
+        ("jvp_x", &jvp.graph, jvp.tangent),
+        ("second_x", &second.graph, second.tangent),
+    ];
+    for x in [2.0, -1.0] {
+        let inputs = BTreeMap::from([
+            ("x".to_string(), DynamicTensor::new(vec![], vec![x])?),
+            (
+                "y".to_string(),
+                DynamicTensor::new(vec![3], vec![1.0, 2.0, 3.0])?,
+            ),
+            ("seed".to_string(), DynamicTensor::new(vec![], vec![1.0])?),
+        ]);
+        for (label, case_graph, node) in cases {
+            let cpu = case_graph.evaluate(node, &inputs)?;
+            let device = execute(&case_graph.compile_cpu(node)?, &inputs)?;
+            if device.shape() != cpu.shape() {
+                return Err(format!("{backend} {label} at x={x} changed shape"));
+            }
+            for (actual, expected) in device.data().iter().zip(cpu.data()) {
+                if !actual.is_finite() || (actual - expected).abs() > 1e-4 * expected.abs().max(1.0)
+                {
+                    return Err(format!(
+                        "{backend} {label} at x={x}: {actual} versus CPU {expected}"
+                    ));
+                }
+            }
+        }
+    }
+    // 未選分支不得影響梯度：x <= 0 時 log 分支完全不參與。
+    let negative = BTreeMap::from([
+        ("x".to_string(), DynamicTensor::new(vec![], vec![-1.0])?),
+        (
+            "y".to_string(),
+            DynamicTensor::new(vec![3], vec![1.0, 2.0, 3.0])?,
+        ),
+        ("seed".to_string(), DynamicTensor::new(vec![], vec![1.0])?),
+    ]);
+    let gradient_x = execute(&vjp.graph.compile_cpu(vjp.gradients["x"])?, &negative)?;
+    let gradient_y = execute(&vjp.graph.compile_cpu(vjp.gradients["y"])?, &negative)?;
+    if gradient_x.data() != [0.0] || gradient_y.data() != [2.0, 4.0, 6.0] {
+        return Err(format!(
+            "{backend} inactive-branch gradients leaked: {:?} {:?}",
+            gradient_x.data(),
+            gradient_y.data()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
-fn mlx_backend_rejects_cond_regions_before_device_lowering() {
-    let mut on_true = TensorIr::new();
-    let true_output = on_true.scalar_constant(1.0);
-    let mut on_false = TensorIr::new();
-    let false_output = on_false.scalar_constant(2.0);
-    let branches = must!(TensorCondExecutionPlan::new(
-        must!(on_true.compile_cpu(true_output)),
-        must!(on_false.compile_cpu(false_output)),
+fn mlx_backend_executes_only_the_selected_cond_region_with_ad_parity() {
+    must!(assert_log_guard_cond_matches_cpu("MLX", |plan, inputs| {
+        MlxBackend.execute(plan, inputs)
+    }));
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_backend_executes_nested_cond_regions_and_rejects_non_finite_predicates() {
+    let mut inner_true = TensorIr::new();
+    let inner_true_x = must!(inner_true.input("x", vec![]));
+    let inner_true_output = must!(inner_true.mul(inner_true_x, inner_true_x));
+    let mut inner_false = TensorIr::new();
+    let inner_false_x = must!(inner_false.input("x", vec![]));
+    let three = inner_false.scalar_constant(3.0);
+    let inner_false_output = must!(inner_false.mul(inner_false_x, three));
+    let inner_branches = must!(TensorCondExecutionPlan::new(
+        must!(inner_true.compile_cpu(inner_true_output)),
+        must!(inner_false.compile_cpu(inner_false_output)),
     ));
+
+    let mut outer_true = TensorIr::new();
+    let inner_predicate = must!(outer_true.input("inner", vec![]));
+    must!(outer_true.input("x", vec![]));
+    let outer_true_output = must!(outer_true.cond(inner_predicate, inner_branches));
+    let mut outer_false = TensorIr::new();
+    let outer_false_inner = must!(outer_false.input("inner", vec![]));
+    let outer_false_x = must!(outer_false.input("x", vec![]));
+    let zero = outer_false.scalar_constant(0.0);
+    let ignored = must!(outer_false.mul(outer_false_inner, zero));
+    let outer_false_output = must!(outer_false.add(outer_false_x, ignored));
+    let outer_branches = must!(TensorCondExecutionPlan::new(
+        must!(outer_true.compile_cpu(outer_true_output)),
+        must!(outer_false.compile_cpu(outer_false_output)),
+    ));
+
     let mut graph = TensorIr::new();
-    let predicate = must!(graph.input("predicate", vec![]));
-    let output = must!(graph.cond(predicate, branches));
-    let inputs = BTreeMap::from([(
-        "predicate".to_string(),
-        must!(DynamicTensor::new(vec![], vec![1.0])),
-    )]);
+    let outer = must!(graph.input("outer", vec![]));
+    must!(graph.input("inner", vec![]));
+    must!(graph.input("x", vec![]));
+    let output = must!(graph.cond(outer, outer_branches));
+    let plan = must!(graph.compile_cpu(output));
+    for (outer, inner, expected) in [(1.0, 1.0, 4.0), (1.0, 0.0, 6.0), (0.0, 1.0, 2.0)] {
+        let inputs = BTreeMap::from([
+            (
+                "outer".to_string(),
+                must!(DynamicTensor::new(vec![], vec![outer])),
+            ),
+            (
+                "inner".to_string(),
+                must!(DynamicTensor::new(vec![], vec![inner])),
+            ),
+            (
+                "x".to_string(),
+                must!(DynamicTensor::new(vec![], vec![2.0])),
+            ),
+        ]);
+        assert_eq!(
+            must!(MlxBackend.execute(&plan, &inputs)).data(),
+            &[expected]
+        );
+    }
+
+    let inputs = BTreeMap::from([
+        (
+            "outer".to_string(),
+            must!(DynamicTensor::new(vec![], vec![f64::NAN])),
+        ),
+        (
+            "inner".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
+    ]);
     let error = MlxBackend
-        .execute(&must!(graph.compile_cpu(output)), &inputs)
-        .expect_err("MLX must reject Cond until device-predicate lowering exists");
-    assert!(error.contains("does not yet support Cond regions"));
+        .execute(&plan, &inputs)
+        .expect_err("MLX must reject a non-finite Cond predicate like CPU");
+    assert!(error.contains("conditional predicate must be finite"));
 }
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
