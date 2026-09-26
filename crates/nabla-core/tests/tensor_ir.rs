@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use nabla_core::tensor_ir::{
     CpuBackend, DynamicTensor, TensorBackend, TensorBufferSlot, TensorCondExecutionPlan,
-    TensorDType, TensorDeviceBackend, TensorDeviceId, TensorDeviceMesh, TensorForiExecutionPlan,
-    TensorForiMultiExecutionPlan, TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr,
-    TensorPartitionSpec, TensorPlacement, TensorReplicaReduction, TensorScanExecutionPlan,
+    TensorDType, TensorDeviceBackend, TensorDeviceId, TensorDeviceMesh, TensorExecutionPlan,
+    TensorForiExecutionPlan, TensorForiMultiExecutionPlan, TensorForiVjpJvpExecutionPlan,
+    TensorFusionRegion, TensorIr, TensorNodeId, TensorPartitionSpec, TensorPlacement,
+    TensorReplicaReduction, TensorScanExecutionPlan, TensorShardingPlan,
 };
 use nabla_core::{NablaCompiler, NablaTarget};
 
@@ -3020,6 +3021,328 @@ fn sharding_plan_records_all_reduce_and_replication_for_sharded_mean_axis() {
     must!(sharding.validate());
 }
 
+fn data_axis_sharded(mesh: &TensorDeviceMesh) -> TensorPlacement {
+    TensorPlacement::Mesh {
+        mesh: mesh.clone(),
+        partition: TensorPartitionSpec::Sharded {
+            tensor_axis: 0,
+            mesh_axis: "data".to_string(),
+        },
+    }
+}
+
+/// `y = tanh(x * w)` with `x` sharded on axis zero and `w` replicated. The
+/// retained outputs are `[sum_axis(y, 0), mean(y)]`, while the sharding
+/// schedule lists the `Mean` collective first because it has the lower node id.
+fn mixed_reduction_data_parallel_plan() -> Result<
+    (
+        TensorExecutionPlan,
+        TensorShardingPlan,
+        TensorNodeId,
+        TensorNodeId,
+    ),
+    String,
+> {
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![8, 2])?;
+    let w = graph.input("w", vec![1, 2])?;
+    let scaled = graph.mul(x, w)?;
+    let activated = graph.tanh(scaled)?;
+    let mean = graph.mean(activated)?;
+    let column_sum = graph.sum_axis(activated, 0)?;
+    let (plan, outputs) = graph.compile_cpu_many(&[column_sum, mean])?;
+    let mesh = two_cuda_mesh();
+    let sharding = plan.sharding_plan(&BTreeMap::from([
+        (x, data_axis_sharded(&mesh)),
+        (
+            w,
+            TensorPlacement::Mesh {
+                mesh,
+                partition: TensorPartitionSpec::Replicated,
+            },
+        ),
+    ]))?;
+    Ok((plan, sharding, outputs[0], outputs[1]))
+}
+
+fn mixed_reduction_data_parallel_inputs() -> Result<BTreeMap<String, DynamicTensor>, String> {
+    Ok(BTreeMap::from([
+        (
+            "x".to_string(),
+            DynamicTensor::new(
+                vec![8, 2],
+                vec![
+                    -2.0, 1.5, -1.0, 0.5, -0.5, 0.25, 0.0, -0.75, 0.5, 1.0, 1.0, -1.25, 1.5, 2.0,
+                    2.0, -0.5,
+                ],
+            )?,
+        ),
+        (
+            "w".to_string(),
+            DynamicTensor::new(vec![1, 2], vec![0.75, -0.4])?,
+        ),
+    ]))
+}
+
+/// Error from lowering the sharding schedule of `graph` compiled at `outputs`,
+/// with `placements` keyed by graph node id.
+fn cuda_data_parallel_program_error(
+    graph: &TensorIr,
+    outputs: &[TensorNodeId],
+    placements: BTreeMap<TensorNodeId, TensorPlacement>,
+    device_ordinals: &[usize],
+) -> String {
+    let result = graph.compile_cpu_many(outputs).and_then(|(plan, _)| {
+        let sharding = plan.sharding_plan(&placements)?;
+        plan.cuda_data_parallel_program(&sharding, device_ordinals)
+    });
+    match result {
+        Ok(_) => "unexpectedly accepted".to_string(),
+        Err(error) => error,
+    }
+}
+
+#[test]
+fn cuda_data_parallel_program_preserves_schedule_order_and_matches_cpu_oracle() {
+    let (plan, sharding, column_sum, mean) = must!(mixed_reduction_data_parallel_plan());
+    let program = must!(plan.cuda_data_parallel_program(&sharding, &[0, 1]));
+
+    assert_eq!(
+        program.collectives,
+        vec![
+            (mean, TensorReplicaReduction::Mean),
+            (column_sum, TensorReplicaReduction::Sum),
+        ]
+    );
+    assert_eq!(program.replica_plan.output_node_ids(), &[column_sum, mean]);
+    assert_eq!(program.replica_plan.input_shape("x"), Ok(vec![4, 2]));
+    assert_eq!(program.replica_plan.input_shape("w"), Ok(vec![1, 2]));
+
+    // Simulate the NCCL schedule on CPU: run each replica on its axis-zero
+    // shard, then apply every scheduled collective to the retained outputs.
+    let inputs = must!(mixed_reduction_data_parallel_inputs());
+    let expected = must!(plan.evaluate_many(&inputs));
+    let mut replica_outputs = Vec::new();
+    for replica in 0..2 {
+        let mut shard_inputs = inputs.clone();
+        let shard = must!(inputs["x"].slice_axis(0, replica * 4, 4));
+        shard_inputs.insert("x".to_string(), shard);
+        replica_outputs.push(must!(program.replica_plan.evaluate_many(&shard_inputs)));
+    }
+    for (node_id, reduction) in &program.collectives {
+        let position = must!(plan
+            .output_node_ids()
+            .iter()
+            .position(|output| output == node_id)
+            .ok_or("scheduled node is not a retained output"));
+        let scale = match reduction {
+            TensorReplicaReduction::Sum => 1.0,
+            TensorReplicaReduction::Mean => 0.5,
+        };
+        let reduced = (0..expected[position].data().len())
+            .map(|index| {
+                scale
+                    * replica_outputs
+                        .iter()
+                        .map(|outputs| outputs[position].data()[index])
+                        .sum::<f64>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replica_outputs[0][position].shape(),
+            expected[position].shape()
+        );
+        for (actual, reference) in reduced.iter().zip(expected[position].data()) {
+            assert!(
+                (actual - reference).abs() <= 1e-12,
+                "node {node_id}: {actual} != {reference}"
+            );
+        }
+    }
+}
+
+#[test]
+fn cuda_data_parallel_program_rejects_mesh_outside_first_subset() {
+    let (plan, sharding, _, _) = must!(mixed_reduction_data_parallel_plan());
+    for (ordinals, reason) in [
+        (vec![1, 0], "rank order"),
+        (vec![0, 1, 2], "mesh size differs from device count"),
+    ] {
+        let error = plan
+            .cuda_data_parallel_program(&sharding, &ordinals)
+            .expect_err(reason);
+        assert!(error.contains("do not match"), "{reason}: {error}");
+    }
+
+    let cuda = |ordinal| TensorDeviceId {
+        backend: TensorDeviceBackend::Cuda,
+        ordinal,
+    };
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![4, 2]));
+    let output = must!(graph.mean_axis(x, 0));
+    let two_dimensional = TensorDeviceMesh {
+        devices: vec![cuda(0), cuda(1)],
+        axis_names: vec!["data".to_string(), "model".to_string()],
+        shape: vec![2, 1],
+    };
+    let error = cuda_data_parallel_program_error(
+        &graph,
+        &[output],
+        BTreeMap::from([(x, data_axis_sharded(&two_dimensional))]),
+        &[0, 1],
+    );
+    assert!(error.contains("only a 1-D mesh"), "{error}");
+
+    let cpu_mesh = TensorDeviceMesh {
+        devices: (0..2)
+            .map(|ordinal| TensorDeviceId {
+                backend: TensorDeviceBackend::Cpu,
+                ordinal,
+            })
+            .collect(),
+        axis_names: vec!["data".to_string()],
+        shape: vec![2],
+    };
+    let error = cuda_data_parallel_program_error(
+        &graph,
+        &[output],
+        BTreeMap::from([(x, data_axis_sharded(&cpu_mesh))]),
+        &[0, 1],
+    );
+    assert!(error.contains("only CUDA devices"), "{error}");
+
+    let mut transposed = TensorIr::new();
+    let x = must!(transposed.input("x", vec![2, 4]));
+    let output = must!(transposed.sum_axis(x, 1));
+    let error = cuda_data_parallel_program_error(
+        &transposed,
+        &[output],
+        BTreeMap::from([(
+            x,
+            TensorPlacement::Mesh {
+                mesh: two_cuda_mesh(),
+                partition: TensorPartitionSpec::Sharded {
+                    tensor_axis: 1,
+                    mesh_axis: "data".to_string(),
+                },
+            },
+        )]),
+        &[0, 1],
+    );
+    assert!(error.contains("only axis-zero batch sharding"), "{error}");
+}
+
+#[test]
+fn cuda_data_parallel_program_rejects_schedules_needing_mid_graph_collectives() {
+    let mesh = two_cuda_mesh();
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![4, 2]));
+    let reduced = must!(graph.mean_axis(x, 0));
+    let consumer = must!(graph.tanh(reduced));
+    let sharded_x = BTreeMap::from([(x, data_axis_sharded(&mesh))]);
+
+    for outputs in [vec![consumer], vec![reduced, consumer]] {
+        let error = cuda_data_parallel_program_error(&graph, &outputs, sharded_x.clone(), &[0, 1]);
+        assert!(
+            error.contains("mid-graph collective"),
+            "{outputs:?}: {error}"
+        );
+    }
+
+    let local = must!(graph.tanh(x));
+    let error = cuda_data_parallel_program_error(&graph, &[reduced, local], sharded_x, &[0, 1]);
+    assert!(error.contains("has no all-reduce"), "{error}");
+
+    let error = cuda_data_parallel_program_error(
+        &graph,
+        &[consumer],
+        BTreeMap::from([(
+            x,
+            TensorPlacement::Mesh {
+                mesh,
+                partition: TensorPartitionSpec::Replicated,
+            },
+        )]),
+        &[0, 1],
+    );
+    assert!(error.contains("no all-reduce"), "{error}");
+}
+
+#[test]
+fn cuda_data_parallel_program_rejects_redistribution_and_foreign_schedules() {
+    let mesh = two_cuda_mesh();
+    let replicated = TensorPlacement::Mesh {
+        mesh: mesh.clone(),
+        partition: TensorPartitionSpec::Replicated,
+    };
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![4, 2]));
+    let z = must!(graph.input("z", vec![4, 2]));
+    let joined = must!(graph.concat(vec![x, z], 0));
+    let output = must!(graph.mean(joined));
+    let error = cuda_data_parallel_program_error(
+        &graph,
+        &[output],
+        BTreeMap::from([(x, data_axis_sharded(&mesh)), (z, data_axis_sharded(&mesh))]),
+        &[0, 1],
+    );
+    assert!(
+        error.contains("concatenates along sharded axis 0"),
+        "{error}"
+    );
+
+    // A replicated operand keeps its full batch extent on every replica, so it
+    // either fails replica shape inference or silently broadcasts a shard.
+    let full = must!(graph.add(x, z));
+    let output = must!(graph.mean(full));
+    let error = cuda_data_parallel_program_error(
+        &graph,
+        &[output],
+        BTreeMap::from([(x, data_axis_sharded(&mesh)), (z, replicated.clone())]),
+        &[0, 1],
+    );
+    assert!(error.contains("specialization failed"), "{error}");
+
+    let mut broadcast = TensorIr::new();
+    let x = must!(broadcast.input("x", vec![2, 2]));
+    let z = must!(broadcast.input("z", vec![2, 2]));
+    let full = must!(broadcast.add(x, z));
+    let output = must!(broadcast.mean(full));
+    let error = cuda_data_parallel_program_error(
+        &broadcast,
+        &[output],
+        BTreeMap::from([(x, data_axis_sharded(&mesh)), (z, replicated)]),
+        &[0, 1],
+    );
+    assert!(error.contains("replica-local shape [2, 2]"), "{error}");
+
+    let mut uneven = TensorIr::new();
+    let x = must!(uneven.input("x", vec![8, 1]));
+    let z = must!(uneven.input("z", vec![4, 1]));
+    let x_sum = must!(uneven.sum(x));
+    let z_sum = must!(uneven.sum(z));
+    let error = cuda_data_parallel_program_error(
+        &uneven,
+        &[x_sum, z_sum],
+        BTreeMap::from([(x, data_axis_sharded(&mesh)), (z, data_axis_sharded(&mesh))]),
+        &[0, 1],
+    );
+    assert!(error.contains("share one axis-zero extent"), "{error}");
+
+    let (plan, _, _, _) = must!(mixed_reduction_data_parallel_plan());
+    let mut other = TensorIr::new();
+    let x = must!(other.input("x", vec![8, 2]));
+    let output = must!(other.sum_axis(x, 0));
+    let foreign = must!(must!(other.compile_cpu(output))
+        .sharding_plan(&BTreeMap::from([(x, data_axis_sharded(&mesh))])));
+    let error = plan
+        .cuda_data_parallel_program(&foreign, &[0, 1])
+        .expect_err("a schedule derived from another plan must be rejected");
+    assert!(error.contains("sharding plan"), "{error}");
+}
+
 #[cfg(all(feature = "cuda-nccl", target_os = "linux"))]
 #[test]
 fn cuda_data_parallel_validates_replica_device_contract_before_lowering() {
@@ -3045,6 +3368,55 @@ fn cuda_data_parallel_validates_replica_device_contract_before_lowering() {
 
     let _: fn(&CudaDataParallelExecutionPlan) -> usize =
         CudaDataParallelExecutionPlan::replica_count;
+}
+
+/// Two-GPU NCCL parity for a mixed `Sum`/`Mean` sharding schedule. Requires
+/// `NABLA_CUDA_NCCL_TEST=1`, a loadable NCCL library, and CUDA ordinals 0 and 1.
+#[cfg(all(feature = "cuda-nccl", target_os = "linux"))]
+#[test]
+fn cuda_data_parallel_sharded_schedule_matches_cpu_oracle_on_two_gpus() {
+    if std::env::var_os("NABLA_CUDA_NCCL_TEST").is_none() {
+        return;
+    }
+    let (plan, sharding, column_sum, mean) = must!(mixed_reduction_data_parallel_plan());
+    let inputs = must!(mixed_reduction_data_parallel_inputs());
+    let expected = must!(plan.evaluate_many(&inputs));
+    let parallel =
+        must!(CudaBackend::new(0).compile_data_parallel_sharded(plan, &sharding, vec![0, 1]));
+    let mut replica_inputs = Vec::new();
+    for replica in 0..2 {
+        let mut shard_inputs = inputs.clone();
+        let shard = must!(inputs["x"].slice_axis(0, replica * 4, 4));
+        shard_inputs.insert("x".to_string(), shard);
+        replica_inputs.push(shard_inputs);
+    }
+
+    let result = must!(parallel.execute_sharded(&replica_inputs));
+
+    assert_eq!(parallel.output_node_ids(), &[column_sum, mean]);
+    for (position, (actual, reference)) in result.outputs.iter().zip(&expected).enumerate() {
+        assert_eq!(actual.shape(), reference.shape());
+        let max_error = actual
+            .data()
+            .iter()
+            .zip(reference.data())
+            .map(|(actual, reference)| (actual - reference).abs())
+            .fold(0.0_f64, f64::max);
+        println!(
+            "sharded-schedule output={position} cuda={:?} cpu={:?} max_abs_error={max_error:e}",
+            actual.data(),
+            reference.data()
+        );
+        assert!(max_error <= 1e-5, "output {position}: {max_error}");
+    }
+    println!("sharded-schedule timing={:?}", result.timing);
+
+    for reduction in [TensorReplicaReduction::Sum, TensorReplicaReduction::Mean] {
+        let error = parallel
+            .execute_replicas(&replica_inputs, reduction)
+            .expect_err("a mixed schedule cannot run under one caller reduction");
+        assert!(error.contains("use execute_sharded"), "{error}");
+    }
 }
 
 #[test]

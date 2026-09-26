@@ -184,6 +184,18 @@ impl CudaBackend {
             self.device_ordinal
         ))
     }
+
+    pub fn compile_data_parallel_sharded(
+        &self,
+        _plan: TensorExecutionPlan,
+        _sharding: &TensorShardingPlan,
+        _device_ordinals: Vec<usize>,
+    ) -> Result<CudaDataParallelExecutionPlan, String> {
+        Err(format!(
+            "CUDA data-parallel backend is unavailable for device {}: build Nabla on Linux with --features cuda-nccl",
+            self.device_ordinal
+        ))
+    }
 }
 
 #[cfg(not(all(feature = "cuda", target_os = "linux")))]
@@ -204,6 +216,13 @@ impl CudaDataParallelExecutionPlan {
         &self,
         _replica_inputs: &[BTreeMap<String, DynamicTensor>],
         _reduction: TensorReplicaReduction,
+    ) -> Result<CudaDataParallelResult, String> {
+        Err("CUDA data-parallel backend is unavailable: build Nabla on Linux with --features cuda-nccl".to_string())
+    }
+
+    pub fn execute_sharded(
+        &self,
+        _replica_inputs: &[BTreeMap<String, DynamicTensor>],
     ) -> Result<CudaDataParallelResult, String> {
         Err("CUDA data-parallel backend is unavailable: build Nabla on Linux with --features cuda-nccl".to_string())
     }
@@ -1115,6 +1134,20 @@ pub struct TensorAllReduce {
 pub struct TensorShardingPlan {
     pub program: TensorKernelProgram,
     pub all_reduces: Vec<TensorAllReduce>,
+}
+
+/// Replica-local lowering of a [`TensorShardingPlan`] for single-node 1-D data
+/// parallelism.
+///
+/// `replica_plan` is the source plan specialized to axis-zero shard shapes with
+/// unchanged node ids. `collectives` keeps the order of
+/// [`TensorShardingPlan::all_reduces`]; a backend applies them after the whole
+/// replica program, which is only equivalent to the schedule because every
+/// entry reduces a retained output that no other node consumes.
+#[derive(Clone, Debug)]
+pub struct TensorDataParallelProgram {
+    pub replica_plan: TensorExecutionPlan,
+    pub collectives: Vec<(TensorNodeId, TensorReplicaReduction)>,
 }
 
 /// One reusable temporary allocation in a backend-neutral execution plan.
@@ -9060,6 +9093,196 @@ impl TensorExecutionPlan {
         };
         plan.validate()?;
         Ok(plan)
+    }
+
+    /// Lowers a sharding schedule derived from this plan to the first CUDA
+    /// data-parallel subset: one 1-D CUDA mesh whose devices are
+    /// `device_ordinals` in rank order, inputs sharded only on axis zero with
+    /// one shared batch extent, and all-reduces only on unconsumed retained
+    /// outputs. Schedules outside that subset would need a mid-graph
+    /// collective, a gather, or a redistribution, so they are rejected.
+    pub fn cuda_data_parallel_program(
+        &self,
+        sharding: &TensorShardingPlan,
+        device_ordinals: &[usize],
+    ) -> Result<TensorDataParallelProgram, String> {
+        // Re-deriving the schedule proves the node ids, placements, and
+        // collectives all belong to this plan and obey propagation rules.
+        let explicit = sharding
+            .program
+            .nodes
+            .iter()
+            .filter(|node| node.placement != TensorPlacement::Unplaced)
+            .map(|node| (node.id, node.placement.clone()))
+            .collect::<BTreeMap<_, _>>();
+        match self.sharding_plan(&explicit) {
+            Ok(derived) if derived == *sharding => {}
+            Ok(_) => {
+                return Err(
+                    "sharding plan was not derived from this execution plan; recompute it with sharding_plan"
+                        .to_string(),
+                )
+            }
+            Err(error) => {
+                return Err(format!(
+                    "sharding plan does not match this execution plan: {error}"
+                ))
+            }
+        }
+
+        let mesh = &sharding
+            .all_reduces
+            .first()
+            .ok_or_else(|| {
+                "sharding plan has no all-reduce; CUDA data-parallel execution requires at least one collective"
+                    .to_string()
+            })?
+            .mesh;
+        if mesh.shape.len() != 1 {
+            return Err(format!(
+                "CUDA data-parallel execution supports only a 1-D mesh, got axes {:?} with shape {:?}",
+                mesh.axis_names, mesh.shape
+            ));
+        }
+        let mesh_ordinals = mesh
+            .devices
+            .iter()
+            .map(|device| (device.backend == TensorDeviceBackend::Cuda).then_some(device.ordinal))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                format!(
+                    "CUDA data-parallel mesh must contain only CUDA devices, got {}",
+                    TensorPlacement::Mesh {
+                        mesh: mesh.clone(),
+                        partition: TensorPartitionSpec::Replicated,
+                    }
+                )
+            })?;
+        if mesh_ordinals != device_ordinals {
+            return Err(format!(
+                "sharding mesh CUDA ordinals {mesh_ordinals:?} do not match data-parallel device ordinals {device_ordinals:?} in rank order"
+            ));
+        }
+        let mesh_extent = mesh.shape[0];
+
+        let mut sharded_inputs = BTreeSet::new();
+        let mut batch_extent = None;
+        for (placed, node) in sharding.program.nodes.iter().zip(&self.nodes) {
+            let partition = match &placed.placement {
+                TensorPlacement::Unplaced => continue,
+                TensorPlacement::Mesh {
+                    mesh: node_mesh,
+                    partition,
+                } if node_mesh == mesh => partition,
+                other => {
+                    return Err(format!(
+                        "kernel node {} has placement {other} outside the data-parallel mesh; explicit redistribution is required",
+                        placed.id
+                    ))
+                }
+            };
+            let TensorPartitionSpec::Sharded { tensor_axis, .. } = partition else {
+                continue;
+            };
+            // Local concatenation of shards interleaves operands instead of
+            // producing the global shard, and propagation does not reject it.
+            if matches!(&node.op, TensorOp::Concat { axis, .. } if axis == tensor_axis) {
+                return Err(format!(
+                    "kernel node {} concatenates along sharded axis {tensor_axis}; explicit redistribution is required",
+                    placed.id
+                ));
+            }
+            let TensorOp::Input { name } = &node.op else {
+                continue;
+            };
+            if *tensor_axis != 0 {
+                return Err(format!(
+                    "CUDA data-parallel input {name:?} is sharded on axis {tensor_axis}; only axis-zero batch sharding is supported"
+                ));
+            }
+            let extent = node.shape[0];
+            if let Some(expected) = batch_extent.filter(|expected| *expected != extent) {
+                return Err(format!(
+                    "CUDA data-parallel input {name:?} has batch extent {extent}, expected {expected}; sharded inputs must share one axis-zero extent"
+                ));
+            }
+            batch_extent = Some(extent);
+            sharded_inputs.insert(name.clone());
+        }
+        let batch_extent = batch_extent.ok_or_else(|| {
+            "sharding plan has no axis-zero sharded input for CUDA data-parallel execution"
+                .to_string()
+        })?;
+
+        let consumed = self
+            .nodes
+            .iter()
+            .flat_map(|node| tensor_op_inputs(&node.op))
+            .collect::<HashSet<_>>();
+        let mut collectives = Vec::with_capacity(sharding.all_reduces.len());
+        for collective in &sharding.all_reduces {
+            let node_id = collective.node_id;
+            if !self.output_node_ids.contains(&node_id) || consumed.contains(&node_id) {
+                return Err(format!(
+                    "sharding plan all-reduces node {node_id} before a consumer; CUDA data-parallel execution only all-reduces unconsumed retained outputs, so this mid-graph collective is unsupported"
+                ));
+            }
+            collectives.push((node_id, collective.reduction));
+        }
+        if let Some(output) = self
+            .output_node_ids
+            .iter()
+            .find(|output| !collectives.iter().any(|(node_id, _)| node_id == *output))
+        {
+            return Err(format!(
+                "retained output {output} has no all-reduce; CUDA data-parallel execution returns rank-zero values only after a collective"
+            ));
+        }
+
+        let replica = self
+            .specialize_mapped_axis_zero(&sharded_inputs, batch_extent / mesh_extent)
+            .map_err(|error| {
+                format!("CUDA data-parallel replica specialization failed: {error}")
+            })?;
+        if replica.nodes.len() != self.nodes.len() {
+            return Err(format!(
+                "CUDA data-parallel replica specialization produced {} nodes, expected {}",
+                replica.nodes.len(),
+                self.nodes.len()
+            ));
+        }
+        for ((local, node), placed) in replica
+            .nodes
+            .iter()
+            .zip(&self.nodes)
+            .zip(&sharding.program.nodes)
+        {
+            if tensor_op_inputs(&local.op) != tensor_op_inputs(&node.op) {
+                return Err(format!(
+                    "CUDA data-parallel replica specialization changed the inputs of node {}",
+                    placed.id
+                ));
+            }
+            let mut expected = node.shape.clone();
+            if let Some(axis) = sharded_tensor_axis(&placed.placement) {
+                expected[axis] /= mesh_extent;
+            }
+            if local.shape != expected {
+                return Err(format!(
+                    "kernel node {} has replica-local shape {:?}, but placement {} requires {expected:?}; explicit redistribution is required",
+                    placed.id, local.shape, placed.placement
+                ));
+            }
+        }
+        Ok(TensorDataParallelProgram {
+            replica_plan: TensorExecutionPlan {
+                nodes: replica.nodes,
+                output_node_id: self.output_node_id,
+                output_node_ids: self.output_node_ids.clone(),
+                fused_elementwise_output: self.fused_elementwise_output,
+            },
+            collectives,
+        })
     }
 
     fn kernel_ir_with_placement_mode(

@@ -16,14 +16,14 @@ use cudarc::driver::{
 use cudarc::nvrtc::compile_ptx;
 
 #[cfg(feature = "cuda-nccl")]
-use cudarc::nccl::{Comm as NcclComm, ReduceOp as NcclReduceOp};
+use cudarc::nccl::{group_end, group_start, Comm as NcclComm, ReduceOp as NcclReduceOp};
 
 use super::{
     contiguous_strides, element_count, sqrt_derivative_coefficient, tensor_op_inputs,
     DynamicTensor, TensorBackend, TensorExecutionPlan, TensorForiExecutionPlan,
     TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget, TensorFusionRegion, TensorNodeId, TensorOp,
     TensorReplicaReduction, TensorScanExecutionPlan, TensorScanTarget, TensorScanVjpJvpExecutionPlan,
-    TensorScanVjpTarget,
+    TensorScanVjpTarget, TensorShardingPlan,
 };
 
 const CUDA_MATMUL_TILE: usize = 32;
@@ -74,13 +74,17 @@ struct CudaCondBranches {
 /// A single-node NCCL data-parallel executable.
 ///
 /// Each replica owns a complete CUDA compilation on one explicit device. The
-/// caller supplies already-sharded inputs, then this plan all-reduces every
-/// retained output in place. This keeps input partitioning and the collective
+/// caller supplies already-sharded inputs, then this plan all-reduces retained
+/// outputs in place. This keeps input partitioning and the collective
 /// boundary explicit: it never copies a shard through the host to another GPU.
 #[derive(Clone, Debug)]
 pub struct CudaDataParallelExecutionPlan {
     replicas: Vec<CudaExecutionPlan>,
     output_node_ids: Vec<TensorNodeId>,
+    /// Ordered collectives bound from a `TensorShardingPlan`; `None` keeps the
+    /// original contract where the caller selects one reduction per call.
+    #[cfg(feature = "cuda-nccl")]
+    collectives: Option<Vec<(TensorNodeId, TensorReplicaReduction)>>,
 }
 
 /// Host-observed boundaries for one data-parallel invocation.
@@ -180,6 +184,7 @@ impl CudaBackend {
         Ok(CudaDataParallelExecutionPlan {
             replicas,
             output_node_ids,
+            collectives: None,
         })
     }
 
@@ -187,6 +192,35 @@ impl CudaBackend {
     pub fn compile_data_parallel(
         &self,
         _plan: TensorExecutionPlan,
+        _device_ordinals: Vec<usize>,
+    ) -> Result<CudaDataParallelExecutionPlan, String> {
+        Err("CUDA data-parallel execution requires the optional cuda-nccl feature".to_string())
+    }
+
+    /// Compiles the replica-local program of a sharding schedule derived from
+    /// `plan` and binds its all-reduces, in schedule order, to NCCL.
+    ///
+    /// `plan` keeps global shapes; replicas run its axis-zero shard
+    /// specialization. Schedules outside the first data-parallel subset are
+    /// rejected by [`TensorExecutionPlan::cuda_data_parallel_program`].
+    #[cfg(feature = "cuda-nccl")]
+    pub fn compile_data_parallel_sharded(
+        &self,
+        plan: TensorExecutionPlan,
+        sharding: &TensorShardingPlan,
+        device_ordinals: Vec<usize>,
+    ) -> Result<CudaDataParallelExecutionPlan, String> {
+        let program = plan.cuda_data_parallel_program(sharding, &device_ordinals)?;
+        let mut compiled = self.compile_data_parallel(program.replica_plan, device_ordinals)?;
+        compiled.collectives = Some(program.collectives);
+        Ok(compiled)
+    }
+
+    #[cfg(not(feature = "cuda-nccl"))]
+    pub fn compile_data_parallel_sharded(
+        &self,
+        _plan: TensorExecutionPlan,
+        _sharding: &TensorShardingPlan,
         _device_ordinals: Vec<usize>,
     ) -> Result<CudaDataParallelExecutionPlan, String> {
         Err("CUDA data-parallel execution requires the optional cuda-nccl feature".to_string())
@@ -377,11 +411,54 @@ impl CudaDataParallelExecutionPlan {
         &self.output_node_ids
     }
 
+    /// Runs every replica, then all-reduces with the caller's `reduction`.
+    ///
+    /// A plan bound to a sharding schedule accepts this call only when every
+    /// scheduled collective uses `reduction`; the schedule is still executed.
     #[cfg(feature = "cuda-nccl")]
     pub fn execute_replicas(
         &self,
         replica_inputs: &[BTreeMap<String, DynamicTensor>],
         reduction: TensorReplicaReduction,
+    ) -> Result<CudaDataParallelResult, String> {
+        let collectives = match &self.collectives {
+            None => self
+                .output_node_ids
+                .iter()
+                .map(|node_id| (*node_id, reduction))
+                .collect(),
+            Some(scheduled) => {
+                if let Some((node_id, planned)) =
+                    scheduled.iter().find(|(_, planned)| *planned != reduction)
+                {
+                    return Err(format!(
+                        "CUDA data-parallel sharding schedule reduces node {node_id} with {planned:?}, but execute_replicas requested {reduction:?}; use execute_sharded"
+                    ));
+                }
+                scheduled.clone()
+            }
+        };
+        self.execute_collectives(replica_inputs, &collectives)
+    }
+
+    /// Runs every replica, then applies the bound sharding schedule in order.
+    #[cfg(feature = "cuda-nccl")]
+    pub fn execute_sharded(
+        &self,
+        replica_inputs: &[BTreeMap<String, DynamicTensor>],
+    ) -> Result<CudaDataParallelResult, String> {
+        let collectives = self.collectives.as_ref().ok_or_else(|| {
+            "CUDA data-parallel plan was compiled without a TensorShardingPlan; use execute_replicas with an explicit reduction"
+                .to_string()
+        })?;
+        self.execute_collectives(replica_inputs, collectives)
+    }
+
+    #[cfg(feature = "cuda-nccl")]
+    fn execute_collectives(
+        &self,
+        replica_inputs: &[BTreeMap<String, DynamicTensor>],
+        collectives: &[(TensorNodeId, TensorReplicaReduction)],
     ) -> Result<CudaDataParallelResult, String> {
         if replica_inputs.len() != self.replicas.len() {
             return Err(format!(
@@ -398,7 +475,7 @@ impl CudaDataParallelExecutionPlan {
         let replica_enqueue = enqueue_start.elapsed();
 
         let collective_start = Instant::now();
-        self.all_reduce_retained_outputs(reduction)?;
+        self.all_reduce_retained_outputs(collectives)?;
         for replica in &self.replicas {
             replica.synchronize()?;
         }
@@ -435,8 +512,19 @@ impl CudaDataParallelExecutionPlan {
         Err("CUDA data-parallel execution requires the optional cuda-nccl feature".to_string())
     }
 
+    #[cfg(not(feature = "cuda-nccl"))]
+    pub fn execute_sharded(
+        &self,
+        _replica_inputs: &[BTreeMap<String, DynamicTensor>],
+    ) -> Result<CudaDataParallelResult, String> {
+        Err("CUDA data-parallel execution requires the optional cuda-nccl feature".to_string())
+    }
+
     #[cfg(feature = "cuda-nccl")]
-    fn all_reduce_retained_outputs(&self, reduction: TensorReplicaReduction) -> Result<(), String> {
+    fn all_reduce_retained_outputs(
+        &self,
+        collectives: &[(TensorNodeId, TensorReplicaReduction)],
+    ) -> Result<(), String> {
         let communicators = NcclComm::from_devices(
             self.replicas
                 .iter()
@@ -444,12 +532,11 @@ impl CudaDataParallelExecutionPlan {
                 .collect(),
         )
         .map_err(|error| format!("failed to initialize NCCL communicators: {error:?}"))?;
-        let operation = match reduction {
-            TensorReplicaReduction::Sum => NcclReduceOp::Sum,
-            TensorReplicaReduction::Mean => NcclReduceOp::Avg,
-        };
-
-        for node_id in &self.output_node_ids {
+        for (node_id, reduction) in collectives {
+            let operation = match reduction {
+                TensorReplicaReduction::Sum => NcclReduceOp::Sum,
+                TensorReplicaReduction::Mean => NcclReduceOp::Avg,
+            };
             let expected_len = self.replicas[0]
                 .plan
                 .nodes
@@ -459,35 +546,57 @@ impl CudaDataParallelExecutionPlan {
                 .iter()
                 .try_fold(1usize, |count, extent| count.checked_mul(*extent))
                 .ok_or_else(|| format!("CUDA data-parallel output node {node_id} size overflows usize"))?;
-            for (rank, (communicator, replica)) in
-                communicators.iter().zip(&self.replicas).enumerate()
-            {
-                let mut state = replica.state.lock().map_err(|_| {
-                    format!("CUDA data-parallel replica {rank} state lock is poisoned")
+            // One thread drives every rank, so NCCL requires group semantics:
+            // an ungrouped per-rank call may block waiting for the other ranks.
+            group_start().map_err(|error| {
+                format!("NCCL group start failed for node {node_id}: {error:?}")
+            })?;
+            let enqueued =
+                self.enqueue_all_reduce(&communicators, *node_id, &operation, expected_len);
+            let ended = group_end()
+                .map_err(|error| format!("NCCL group end failed for node {node_id}: {error:?}"));
+            enqueued?;
+            ended?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda-nccl")]
+    fn enqueue_all_reduce(
+        &self,
+        communicators: &[NcclComm],
+        node_id: TensorNodeId,
+        operation: &NcclReduceOp,
+        expected_len: usize,
+    ) -> Result<(), String> {
+        for (rank, (communicator, replica)) in communicators.iter().zip(&self.replicas).enumerate()
+        {
+            let mut state = replica
+                .state
+                .lock()
+                .map_err(|_| format!("CUDA data-parallel replica {rank} state lock is poisoned"))?;
+            let buffer = state
+                .values
+                .get_mut(node_id)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| {
+                    format!(
+                        "CUDA data-parallel replica {rank} output node {node_id} was not retained"
+                    )
                 })?;
-                let buffer = state
-                    .values
-                    .get_mut(*node_id)
-                    .and_then(Option::as_mut)
-                    .ok_or_else(|| {
-                        format!(
-                            "CUDA data-parallel replica {rank} output node {node_id} was not retained"
-                        )
-                    })?;
-                if buffer.len() != expected_len {
-                    return Err(format!(
-                        "CUDA data-parallel replica {rank} output node {node_id} has {} elements, expected {expected_len}",
-                        buffer.len()
-                    ));
-                }
-                communicator
-                    .all_reduce_in_place(buffer, &operation)
-                    .map_err(|error| {
-                        format!(
-                            "NCCL all-reduce failed for output node {node_id} on replica {rank}: {error:?}"
-                        )
-                    })?;
+            if buffer.len() != expected_len {
+                return Err(format!(
+                    "CUDA data-parallel replica {rank} output node {node_id} has {} elements, expected {expected_len}",
+                    buffer.len()
+                ));
             }
+            communicator
+                .all_reduce_in_place(buffer, operation)
+                .map_err(|error| {
+                    format!(
+                        "NCCL all-reduce failed for output node {node_id} on replica {rank}: {error:?}"
+                    )
+                })?;
         }
         Ok(())
     }

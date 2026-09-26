@@ -37,4 +37,16 @@ echo "job=${SLURM_JOB_ID} node=${SLURMD_NODENAME:-unknown} cuda_visible=${CUDA_V
 nvidia-smi -L
 cargo --version
 rustc --version
-.venv/bin/python -u examples/validate_data_parallel_cuda.py
+
+# Run both checks so one failure does not hide the other result.
+status=0
+echo "=== caller-reduction parity (Python value-and-grad)"
+.venv/bin/python -u examples/validate_data_parallel_cuda.py || status=$?
+# Prebuild on the head node with
+#   cargo test --offline -p nabla-core --features cuda-nccl --test tensor_ir --no-run
+# so this step only runs the already compiled test.
+echo "=== sharding-plan schedule parity (Rust, mixed Sum/Mean)"
+NABLA_CUDA_NCCL_TEST=1 cargo test --offline -p nabla-core --features cuda-nccl \
+  --test tensor_ir cuda_data_parallel_sharded_schedule_matches_cpu_oracle_on_two_gpus \
+  -- --exact --nocapture || status=$?
+exit "$status"

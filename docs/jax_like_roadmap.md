@@ -1135,6 +1135,39 @@ all-reduced. On `cuda-host`, Linux feature compilation, the core device contract
 and the Python constructor contract pass; the host exposes one GTX 1660 SUPER
 and no NCCL library, so no collective or two-GPU numerical result is claimed.
 
+Implementation status (2026-09-27): remaining item 2 is implemented for the
+first data-parallel subset. `TensorExecutionPlan::cuda_data_parallel_program(
+sharding, device_ordinals)` is a backend-neutral check and lowering: it
+re-derives the schedule from the plan to prove provenance, then returns the
+axis-zero shard specialization with unchanged node ids plus the ordered
+`(node, Sum|Mean)` collectives taken from `TensorShardingPlan::all_reduces`.
+It rejects schedules without a collective; meshes that are not 1-D, contain
+non-CUDA devices, or whose ordinals differ from `device_ordinals` in rank
+order or count; inputs sharded on a non-zero axis or with different batch
+extents; all-reduces on non-output or consumed nodes, which would need a
+mid-graph collective; retained outputs without an all-reduce; concatenation
+along the sharded axis; and replica shapes that disagree with placement, such
+as a replicated full-batch operand combined with a shard.
+`CudaBackend::compile_data_parallel_sharded(plan, &sharding, device_ordinals)`
+binds that list, and `CudaDataParallelExecutionPlan::execute_sharded(...)`
+issues one NCCL all-reduce per entry in schedule order, so mixed `Sum`/`Mean`
+schedules are executable. `compile_data_parallel` and `execute_replicas(...,
+reduction)` keep their caller-selected contract; on a schedule-bound plan,
+`execute_replicas` rejects a reduction that disagrees with any scheduled
+collective. Each collective's per-rank NCCL calls are now issued inside an
+NCCL group, because one thread drives every rank; this also changes the
+existing caller-reduction path. The Python value-and-gradient callable still
+uses its explicit `reduction`: its parameter gradients are replica-local
+partial sums, which `TensorShardingPlan` cannot express because partial
+placements and sharded matmul propagation are not modeled.
+Verification boundary: macOS CPU tests cover the lowering, a CPU simulation of
+the mixed schedule against the global CPU plan, and every rejection above.
+On `cuda-host`, the `cuda` suite, `cuda` and `cuda-nccl` clippy, the
+`cuda-nccl` test build, and the Python matrix pass; that host has one GPU and
+no NCCL library, so the NCCL-gated two-GPU test returns early there. Slurm job
+6008 on `gpu-cluster` runs the existing Python `Sum`/`Mean` parity and the
+mixed-schedule Rust parity test on two GPUs; its result is pending.
+
 Remaining implementation order:
 
 1. Validate the Python scalar value-and-gradient callable on two GPUs against
@@ -1142,7 +1175,8 @@ Remaining implementation order:
    mapped-input gradient concatenation as a separate output contract.
 2. Bind `TensorShardingPlan::all_reduces` to CUDA lowering, preserving its
    operation order and rejecting schedules not represented by the first
-   data-parallel subset.
+   data-parallel subset. Implemented (2026-09-27); two-GPU parity is pending
+   job 6008.
 3. Add failure-handling and communicator-lifecycle coverage before considering
    multi-node transport or tensor-parallel matmul.
 
