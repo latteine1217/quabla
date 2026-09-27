@@ -4,8 +4,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
-    sqrt_derivative_coefficient, DynamicTensor, TensorBackend, TensorDType, TensorDeviceBackend,
-    TensorExecutionPlan, TensorForiExecutionPlan, TensorOp,
+    sqrt_derivative_coefficient, DynamicTensor, TensorBackend, TensorComparison, TensorDType,
+    TensorDeviceBackend, TensorExecutionPlan, TensorForiExecutionPlan, TensorOp,
 };
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
@@ -515,6 +515,21 @@ impl MlxBackend {
                     .gt_device(mlx_value(&values, *rhs)?, &stream)
                     .and_then(|mask| mask.as_dtype_device(Dtype::Float32, &stream))
                     .map_err(|error| error.to_string()),
+                // Bool 節點同樣以 f32 0/1 跨越節點邊界（execution_dtype(Bool) = f32）。
+                TensorOp::Compare { lhs, rhs, kind } => {
+                    let lhs = mlx_value(&values, *lhs)?;
+                    let rhs = mlx_value(&values, *rhs)?;
+                    match kind {
+                        TensorComparison::Greater => lhs.gt_device(rhs, &stream),
+                        TensorComparison::GreaterEqual => lhs.ge_device(rhs, &stream),
+                        TensorComparison::Less => lhs.lt_device(rhs, &stream),
+                        TensorComparison::LessEqual => lhs.le_device(rhs, &stream),
+                        TensorComparison::Equal => lhs.eq_device(rhs, &stream),
+                        TensorComparison::NotEqual => lhs.ne_device(rhs, &stream),
+                    }
+                    .and_then(|mask| mask.as_dtype_device(Dtype::Float32, &stream))
+                    .map_err(|error| error.to_string())
+                }
                 TensorOp::Where {
                     condition,
                     on_true,
@@ -1737,6 +1752,7 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Div { .. } => "div",
         TensorOp::Mul { .. } => "mul",
         TensorOp::Greater { .. } => "greater",
+        TensorOp::Compare { kind, .. } => kind.name(),
         TensorOp::Where { .. } => "where",
         TensorOp::Cond { .. } => "cond",
         TensorOp::Fori { .. } => "fori",

@@ -1,11 +1,12 @@
 use nabla_core::tensor_ir::TensorDType;
 use pyo3::prelude::*;
 
-/// Element type object exposed as `nabla.float32` and `nabla.float64`.
+/// Element type object exposed as `nabla.float32`, `nabla.float64`, and
+/// `nabla.bool_`.
 ///
 /// Objects compare and hash by their dtype, so they can be used as dictionary
 /// keys and compared with `==`. `str()` gives the short IR spelling
-/// (`"f32"`/`"f64"`) used by `kernel_ir()` records.
+/// (`"f32"`/`"f64"`/`"bool"`) used by `kernel_ir()` records.
 #[pyclass(name = "dtype", module = "nabla", frozen, eq, hash, from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PyDType {
@@ -25,11 +26,17 @@ impl PyDType {
         match self.dtype {
             TensorDType::F32 => "float32",
             TensorDType::F64 => "float64",
+            TensorDType::Bool => "bool",
         }
     }
 
+    /// The module attribute holding this dtype (`bool_` avoids shadowing the
+    /// Python builtin, as in NumPy).
     pub(crate) fn __repr__(&self) -> String {
-        format!("nabla.{}", self.name())
+        match self.dtype {
+            TensorDType::Bool => "nabla.bool_".to_string(),
+            _ => format!("nabla.{}", self.name()),
+        }
     }
 
     fn __str__(&self) -> String {

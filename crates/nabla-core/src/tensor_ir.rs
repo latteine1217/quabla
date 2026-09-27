@@ -433,6 +433,13 @@ enum TensorOp {
         lhs: TensorNodeId,
         rhs: TensorNodeId,
     },
+    /// IEEE comparison with a `Bool` result. Unlike the legacy `Greater`
+    /// float mask, its operands are promoted like arithmetic operands.
+    Compare {
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+        kind: TensorComparison,
+    },
     Where {
         condition: TensorNodeId,
         on_true: TensorNodeId,
@@ -1082,20 +1089,32 @@ impl TensorPlacement {
 /// Host storage stays `f64`; an `F32` value is the correctly rounded `f32` of
 /// its `f64` computation. CUDA and MLX map each logical dtype to an execution
 /// dtype through [`TensorDeviceBackend::execution_dtype`].
+///
+/// `Bool` is stored as `0.0`/`1.0` and produced by comparisons; it is not an
+/// arithmetic dtype (see [`TensorIr::compare`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TensorDType {
     F32,
     F64,
+    Bool,
 }
 
 impl TensorDType {
     /// Rounds an `f64` value to the nearest value representable in this dtype.
+    ///
+    /// For `Bool` this is the float-to-bool conversion: every non-zero value,
+    /// including `NaN`, becomes `1.0` (NumPy `astype(bool)` semantics).
     pub fn round(self, value: f64) -> f64 {
         match self {
             // `as f32` 為 IEEE round-to-nearest-even，溢位得 ±inf，與裝置 f32 一致。
             Self::F32 => value as f32 as f64,
             Self::F64 => value,
+            Self::Bool => f64::from(value != 0.0),
         }
+    }
+
+    pub fn is_floating(self) -> bool {
+        matches!(self, Self::F32 | Self::F64)
     }
 }
 
@@ -1104,7 +1123,57 @@ impl std::fmt::Display for TensorDType {
         formatter.write_str(match self {
             Self::F32 => "f32",
             Self::F64 => "f64",
+            Self::Bool => "bool",
         })
+    }
+}
+
+/// Elementwise comparison kind of [`TensorIr::compare`]. Comparisons follow
+/// IEEE semantics: any comparison with `NaN` is false except `NotEqual`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TensorComparison {
+    Greater,
+    GreaterEqual,
+    Less,
+    LessEqual,
+    Equal,
+    NotEqual,
+}
+
+impl TensorComparison {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Greater => "greater",
+            Self::GreaterEqual => "greater_equal",
+            Self::Less => "less",
+            Self::LessEqual => "less_equal",
+            Self::Equal => "equal",
+            Self::NotEqual => "not_equal",
+        }
+    }
+
+    /// C spelling shared by the CUDA code generators.
+    fn operator(self) -> &'static str {
+        match self {
+            Self::Greater => ">",
+            Self::GreaterEqual => ">=",
+            Self::Less => "<",
+            Self::LessEqual => "<=",
+            Self::Equal => "==",
+            Self::NotEqual => "!=",
+        }
+    }
+
+    /// The IEEE comparison itself; host tensors store the result as 0/1.
+    pub fn evaluate(self, lhs: f64, rhs: f64) -> bool {
+        match self {
+            Self::Greater => lhs > rhs,
+            Self::GreaterEqual => lhs >= rhs,
+            Self::Less => lhs < rhs,
+            Self::LessEqual => lhs <= rhs,
+            Self::Equal => lhs == rhs,
+            Self::NotEqual => lhs != rhs,
+        }
     }
 }
 
@@ -1133,12 +1202,15 @@ impl TensorDeviceBackend {
     /// Maps a logical IR dtype to the element type this backend executes.
     ///
     /// CUDA and MLX lower `F64` programs to `f32` kernels (native device `f64`
-    /// is not implemented) and execute `F32` natively; the CPU executes every
-    /// dtype as its logical type.
+    /// is not implemented), execute `F32` natively, and hold `Bool` as `f32`
+    /// `0`/`1`; the CPU executes every dtype as its logical type.
     pub fn execution_dtype(self, logical: TensorDType) -> Result<TensorDType, String> {
         Ok(match (self, logical) {
             (Self::Cpu, dtype) => dtype,
-            (Self::Cuda | Self::Mlx, TensorDType::F64 | TensorDType::F32) => TensorDType::F32,
+            // Bool 以 f32 的 0/1 值執行；真正的位元/u8 儲存屬於 D4 之後的工作。
+            (Self::Cuda | Self::Mlx, TensorDType::F64 | TensorDType::F32 | TensorDType::Bool) => {
+                TensorDType::F32
+            }
         })
     }
 }
@@ -1237,7 +1309,10 @@ impl TensorKernelProgram {
             if node.shape.contains(&0) {
                 return Err(format!("kernel node {} has a zero tensor extent", node.id));
             }
-            if !matches!(node.dtype, TensorDType::F64 | TensorDType::F32) {
+            if !matches!(
+                node.dtype,
+                TensorDType::F64 | TensorDType::F32 | TensorDType::Bool
+            ) {
                 return Err(format!(
                     "kernel node {} has unsupported dtype {:?}",
                     node.id, node.dtype
@@ -1471,6 +1546,10 @@ impl DynamicTensor {
 
     fn greater(&self, rhs: &Self) -> Result<Self, String> {
         self.elementwise(rhs, |lhs, rhs| f64::from(lhs > rhs))
+    }
+
+    fn compare(&self, rhs: &Self, kind: TensorComparison) -> Result<Self, String> {
+        self.elementwise(rhs, |lhs, rhs| f64::from(kind.evaluate(lhs, rhs)))
     }
 
     fn where_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
@@ -2032,6 +2111,7 @@ impl TensorIr {
         output: TensorNodeId,
         differentiated_input: &str,
     ) -> Result<SymbolicJvp, String> {
+        self.ensure_differentiable_input(differentiated_input)?;
         let mut found_input = false;
         let transformed = self.symbolic_jvp_with_seed(output, |transformed, name, value, _| {
             if name == differentiated_input {
@@ -2074,6 +2154,7 @@ impl TensorIr {
             if !original_inputs.contains(input_name) {
                 return Err(format!("input {input_name:?} does not exist"));
             }
+            self.ensure_differentiable_input(input_name)?;
             if original_inputs.contains(tangent_name) {
                 return Err(format!(
                     "tangent input name {tangent_name:?} conflicts with an existing input"
@@ -2120,6 +2201,7 @@ impl TensorIr {
             if !original_inputs.contains(input_name) {
                 return Err(format!("input {input_name:?} does not exist"));
             }
+            self.ensure_differentiable_input(input_name)?;
             if original_inputs.contains(tangent_name) {
                 return Err(format!(
                     "tangent input name {tangent_name:?} conflicts with an existing input"
@@ -2202,9 +2284,14 @@ impl TensorIr {
                 TensorOp::Input { name } => {
                     let value =
                         transformed.input_typed(name.clone(), node.shape.clone(), node.dtype)?;
-                    let tangent = match input_tangent(&mut transformed, name, value, &node.shape)? {
-                        Some(tangent) => tangent,
-                        None => transformed.sub(value, value)?,
+                    // Bool 輸入沒有切向量；要求其切向量的呼叫端已在入口被拒絕。
+                    let tangent = if node.dtype == TensorDType::Bool {
+                        symbolic_zero_tangent(&mut transformed, &node.shape)?
+                    } else {
+                        match input_tangent(&mut transformed, name, value, &node.shape)? {
+                            Some(tangent) => tangent,
+                            None => transformed.sub(value, value)?,
+                        }
                     };
                     (value, tangent)
                 }
@@ -2264,6 +2351,16 @@ impl TensorIr {
                     let value = transformed.greater(lhs_value, rhs_value)?;
                     let tangent = transformed.scalar_constant(0.0);
                     (value, tangent)
+                }
+                // Bool 結果的切向量是與值同形狀的弱 f64 零，讓 reshape/concat 等
+                // 資料搬移與 Bool->浮點 cast 照常傳遞零切向量。
+                TensorOp::Compare { lhs, rhs, kind } => {
+                    let (lhs_value, _) = pairs[*lhs];
+                    let (rhs_value, _) = pairs[*rhs];
+                    (
+                        transformed.compare(lhs_value, rhs_value, *kind)?,
+                        symbolic_zero_tangent(&mut transformed, &node.shape)?,
+                    )
                 }
                 TensorOp::Where {
                     condition,
@@ -2576,7 +2673,7 @@ impl TensorIr {
         output: TensorNodeId,
         cotangent_name: &str,
     ) -> Result<SymbolicVjp, String> {
-        self.node(output)?;
+        ensure_differentiable_output(self.node(output)?)?;
         if self
             .nodes
             .iter()
@@ -2605,6 +2702,9 @@ impl TensorIr {
                 TensorOp::Mul { lhs, rhs } => transformed.mul(values[*lhs], values[*rhs])?,
                 TensorOp::Greater { lhs, rhs } => {
                     transformed.greater(values[*lhs], values[*rhs])?
+                }
+                TensorOp::Compare { lhs, rhs, kind } => {
+                    transformed.compare(values[*lhs], values[*rhs], *kind)?
                 }
                 TensorOp::Where {
                     condition,
@@ -2771,11 +2871,20 @@ impl TensorIr {
             match &node.op {
                 TensorOp::Input { .. }
                 | TensorOp::ScalarConstant { .. }
-                | TensorOp::Greater { .. } => {}
-                // cast 的 VJP 把餘切轉回來源 dtype。
+                | TensorOp::Greater { .. }
+                | TensorOp::Compare { .. } => {}
+                // cast 的 VJP 把餘切轉回來源 dtype；Bool 來源不可微，不回傳梯度。
                 TensorOp::Cast { input } => {
-                    let contribution = transformed.cast(upstream, self.node(*input)?.dtype)?;
-                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
+                    let source_dtype = self.node(*input)?.dtype;
+                    if source_dtype != TensorDType::Bool {
+                        let contribution = transformed.cast(upstream, source_dtype)?;
+                        symbolic_accumulate(
+                            &mut transformed,
+                            &mut cotangents,
+                            *input,
+                            contribution,
+                        )?;
+                    }
                 }
                 TensorOp::Cond {
                     predicate,
@@ -3269,6 +3378,10 @@ impl TensorIr {
         let mut gradients = BTreeMap::new();
         for (node_id, node) in self.nodes.iter().enumerate() {
             if let TensorOp::Input { name } = &node.op {
+                // Bool 輸入不可微，不出現在梯度表中。
+                if node.dtype == TensorDType::Bool {
+                    continue;
+                }
                 let gradient = cotangents[node_id]
                     .unwrap_or(symbolic_zero_like(&mut transformed, values[node_id])?);
                 gradients.insert(name.clone(), gradient);
@@ -3329,17 +3442,40 @@ impl TensorIr {
 
     /// Converts `input` to `dtype`. Same-dtype casts are kept here and removed
     /// when a plan is compiled; lossy round trips are never folded.
+    ///
+    /// A float-to-`Bool` conversion is emitted as `not_equal(input, 0)`, so
+    /// `NaN` becomes true and no `Cast` node ever targets `Bool` from a float;
+    /// `Cast` therefore stays an identity on CUDA and MLX, where `Bool` is
+    /// held as `f32` `0`/`1`.
     pub fn cast(
         &mut self,
         input: TensorNodeId,
         dtype: TensorDType,
     ) -> Result<TensorNodeId, String> {
-        let shape = self.node(input)?.shape.clone();
+        let source = self.node(input)?;
+        if dtype == TensorDType::Bool && source.dtype != TensorDType::Bool {
+            let zero = self.scalar_constant(0.0);
+            return self.compare(input, zero, TensorComparison::NotEqual);
+        }
+        let shape = source.shape.clone();
         Ok(self.push_node(TensorOp::Cast { input }, shape, dtype, false))
     }
 
     pub fn node_dtype(&self, id: TensorNodeId) -> Result<TensorDType, String> {
         Ok(self.node(id)?.dtype)
+    }
+
+    /// Rejects differentiation with respect to a `Bool` input: bool values
+    /// have no tangent, and VJP gradient maps omit them.
+    pub fn ensure_differentiable_input(&self, name: &str) -> Result<(), String> {
+        let is_bool = self.nodes.iter().any(|node| {
+            node.dtype == TensorDType::Bool
+                && matches!(&node.op, TensorOp::Input { name: candidate } if candidate == name)
+        });
+        if is_bool {
+            return Err(bool_input_derivative_error(name));
+        }
+        Ok(())
     }
 
     pub fn add(&mut self, lhs: TensorNodeId, rhs: TensorNodeId) -> Result<TensorNodeId, String> {
@@ -3368,6 +3504,143 @@ impl TensorIr {
             lhs,
             rhs,
         })
+    }
+
+    /// Elementwise IEEE comparison producing `Bool`. Operands follow the
+    /// arithmetic promotion rule (strict floats, weak scalars, `Bool` promoted
+    /// to the other operand's float dtype); two `Bool` operands compare as 0/1.
+    pub fn compare(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+        kind: TensorComparison,
+    ) -> Result<TensorNodeId, String> {
+        let shape = broadcast_shape(&self.node(lhs)?.shape, &self.node(rhs)?.shape)?;
+        let [lhs, rhs] = self.coerce_operands(kind.name(), [lhs, rhs])?;
+        Ok(self.push_node(
+            TensorOp::Compare { lhs, rhs, kind },
+            shape,
+            TensorDType::Bool,
+            false,
+        ))
+    }
+
+    /// Elementwise `lhs && rhs` of two `Bool` tensors, lowered as
+    /// `where(lhs, rhs, lhs)` so every backend reuses its select kernel.
+    pub fn logical_and(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, String> {
+        self.ensure_bool_operands("logical_and", &[lhs, rhs])?;
+        self.where_select(lhs, rhs, lhs)
+    }
+
+    /// Elementwise `lhs || rhs` of two `Bool` tensors, lowered as
+    /// `where(lhs, lhs, rhs)`.
+    pub fn logical_or(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, String> {
+        self.ensure_bool_operands("logical_or", &[lhs, rhs])?;
+        self.where_select(lhs, lhs, rhs)
+    }
+
+    /// Elementwise negation of a `Bool` tensor, lowered as `equal(input, false)`.
+    pub fn logical_not(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        self.ensure_bool_operands("logical_not", &[input])?;
+        let false_value = self.push_node(
+            TensorOp::ScalarConstant { value: 0.0 },
+            vec![],
+            TensorDType::Bool,
+            false,
+        );
+        self.compare(input, false_value, TensorComparison::Equal)
+    }
+
+    /// Elementwise `NaN` test, lowered as the IEEE identity `input != input`.
+    pub fn isnan(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        self.ensure_float_operand("isnan", input)?;
+        self.compare(input, input, TensorComparison::NotEqual)
+    }
+
+    /// Elementwise finiteness test, lowered as `input - input == 0`: the
+    /// difference is `0` for finite values and `NaN` for `±inf` and `NaN`.
+    pub fn isfinite(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        self.ensure_float_operand("isfinite", input)?;
+        let difference = self.sub(input, input)?;
+        let zero = self.scalar_constant(0.0);
+        self.compare(difference, zero, TensorComparison::Equal)
+    }
+
+    /// True when any element of a `Bool` tensor is true (scalar `Bool`).
+    ///
+    /// Lowered as `sum(cast(input, f64)) > 0`: a sum of non-negative 0/1
+    /// values is zero only when every term is zero, even when a device
+    /// accumulates in `f32`, so no dedicated reduction kernel is needed.
+    pub fn any(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        self.bool_count_reduction("any", input, None, false)
+    }
+
+    pub fn any_axis(&mut self, input: TensorNodeId, axis: isize) -> Result<TensorNodeId, String> {
+        self.bool_count_reduction("any", input, Some(axis), false)
+    }
+
+    /// True when every element of a `Bool` tensor is true (scalar `Bool`),
+    /// lowered as `sum(cast(logical_not(input), f64)) == 0`.
+    pub fn all(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        self.bool_count_reduction("all", input, None, true)
+    }
+
+    pub fn all_axis(&mut self, input: TensorNodeId, axis: isize) -> Result<TensorNodeId, String> {
+        self.bool_count_reduction("all", input, Some(axis), true)
+    }
+
+    fn bool_count_reduction(
+        &mut self,
+        op_name: &str,
+        input: TensorNodeId,
+        axis: Option<isize>,
+        all: bool,
+    ) -> Result<TensorNodeId, String> {
+        self.ensure_bool_operands(op_name, &[input])?;
+        let counted = if all { self.logical_not(input)? } else { input };
+        let counted = self.cast(counted, TensorDType::F64)?;
+        let count = match axis {
+            Some(axis) => self.sum_axis(counted, axis)?,
+            None => self.sum(counted)?,
+        };
+        let zero = self.scalar_constant(0.0);
+        let kind = if all {
+            TensorComparison::Equal
+        } else {
+            TensorComparison::Greater
+        };
+        self.compare(count, zero, kind)
+    }
+
+    fn ensure_bool_operands(&self, op_name: &str, operands: &[TensorNodeId]) -> Result<(), String> {
+        for operand in operands {
+            let dtype = self.node(*operand)?.dtype;
+            if dtype != TensorDType::Bool {
+                return Err(format!(
+                    "{op_name} requires bool operands, got dtype {dtype}; \
+                     build a mask with a comparison or convert explicitly with astype"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_float_operand(&self, op_name: &str, operand: TensorNodeId) -> Result<(), String> {
+        let dtype = self.node(operand)?.dtype;
+        if !dtype.is_floating() {
+            return Err(format!(
+                "{op_name} requires a floating operand, got dtype {dtype}"
+            ));
+        }
+        Ok(())
     }
 
     pub fn where_select(
@@ -4418,6 +4691,7 @@ impl TensorIr {
             .iter()
             .map(|(output, cotangent)| {
                 let output_node = self.node(*output)?;
+                ensure_differentiable_output(output_node)?;
                 if cotangent.shape != output_node.shape {
                     return Err(format!(
                         "output cotangent shape {:?} does not match output shape {:?}",
@@ -4444,8 +4718,11 @@ impl TensorIr {
             match &self.nodes[node_id].op {
                 TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } => {}
                 TensorOp::Cast { input } => {
-                    let contribution = cotangent.astype(self.node(*input)?.dtype);
-                    accumulate(&mut cotangents[*input], contribution)?;
+                    // Bool 來源不可微：遮罩轉成浮點後不回傳梯度。
+                    let source_dtype = self.node(*input)?.dtype;
+                    if source_dtype != TensorDType::Bool {
+                        accumulate(&mut cotangents[*input], cotangent.astype(source_dtype))?;
+                    }
                 }
                 TensorOp::Add { lhs, rhs } => {
                     let lhs_contribution = cotangent.reduce_to_shape(&self.node(*lhs)?.shape)?;
@@ -4496,7 +4773,7 @@ impl TensorIr {
                     accumulate(&mut cotangents[*lhs], lhs_contribution)?;
                     accumulate(&mut cotangents[*rhs], rhs_contribution)?;
                 }
-                TensorOp::Greater { .. } => {}
+                TensorOp::Greater { .. } | TensorOp::Compare { .. } => {}
                 TensorOp::Where {
                     condition,
                     on_true,
@@ -4844,6 +5121,10 @@ impl TensorIr {
         let mut gradients = BTreeMap::new();
         for (node_id, node) in self.nodes.iter().enumerate() {
             if let TensorOp::Input { name } = &node.op {
+                // Bool 輸入不可微，不出現在梯度表中（與符號式 VJP 一致）。
+                if node.dtype == TensorDType::Bool {
+                    continue;
+                }
                 let gradient = match cotangents[node_id].clone() {
                     Some(value) => value,
                     None => DynamicTensor::filled(node.shape.clone(), 0.0)?,
@@ -4867,6 +5148,12 @@ impl TensorIr {
 
         for (node_id, node) in self.nodes.iter().enumerate() {
             let tangent = match &node.op {
+                TensorOp::Input { name } if node.dtype == TensorDType::Bool => {
+                    if input_tangents.contains_key(name) {
+                        return Err(bool_input_derivative_error(name));
+                    }
+                    DynamicTensor::filled(node.shape.clone(), 0.0)?
+                }
                 TensorOp::Input { name } => {
                     let input_tangent = input_tangents
                         .get(name)
@@ -4937,7 +5224,9 @@ impl TensorIr {
                         .mul(rhs_value)?
                         .add(&lhs_value.mul(rhs_tangent)?)?
                 }
-                TensorOp::Greater { .. } => DynamicTensor::filled(node.shape.clone(), 0.0)?,
+                TensorOp::Greater { .. } | TensorOp::Compare { .. } => {
+                    DynamicTensor::filled(node.shape.clone(), 0.0)?
+                }
                 TensorOp::Where {
                     condition,
                     on_true,
@@ -5218,12 +5507,17 @@ impl TensorIr {
             .get(output)
             .cloned()
             .ok_or_else(|| format!("output node {output} has no value"))?;
-        // 與 VJP 相同：導數算術以 f64 進行，輸出切向量依輸出 dtype 捨入。
+        // 與 VJP 相同：導數算術以 f64 進行，輸出切向量依輸出 dtype 捨入；
+        // Bool 輸出的切向量是 f64 零（與符號式 JVP 的弱 f64 零一致）。
+        let tangent_dtype = match self.node(output)?.dtype {
+            TensorDType::Bool => TensorDType::F64,
+            dtype => dtype,
+        };
         let tangent = tangents
             .get(output)
             .cloned()
             .ok_or_else(|| format!("output node {output} has no tangent"))?
-            .into_dtype(self.node(output)?.dtype);
+            .into_dtype(tangent_dtype);
         Ok((value, tangent))
     }
 
@@ -5233,6 +5527,7 @@ impl TensorIr {
         input_name: &str,
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<Vec<Vec<f64>>, String> {
+        self.ensure_differentiable_input(input_name)?;
         if !self.node(output)?.shape.is_empty() {
             return Err(format!(
                 "hessian_scalar requires a scalar output, got shape {:?}",
@@ -5284,6 +5579,7 @@ impl TensorIr {
         inputs: &BTreeMap<String, DynamicTensor>,
         input_tangent: DynamicTensor,
     ) -> Result<DynamicTensor, String> {
+        self.ensure_differentiable_input(input_name)?;
         if !self.node(output)?.shape.is_empty() {
             return Err(format!(
                 "hvp_scalar requires a scalar output, got shape {:?}",
@@ -5483,6 +5779,11 @@ impl TensorIr {
                     "%{id} = greater(%{lhs}, %{rhs}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
+                TensorOp::Compare { lhs, rhs, kind } => format!(
+                    "%{id} = compare(%{lhs}, %{rhs}, kind={}) : {}",
+                    kind.name(),
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
                 TensorOp::Where {
                     condition,
                     on_true,
@@ -5677,9 +5978,13 @@ impl TensorIr {
     /// Applies the promotion rule (strict tensors, weak scalars) to operands
     /// that must share one dtype.
     ///
-    /// Strong operands of different dtypes are rejected; weak operands whose
-    /// dtype differs from the strong one receive an explicit `Cast`. Nothing
-    /// is appended to the graph when the operands are rejected.
+    /// Strong float operands of different dtypes are rejected; weak operands
+    /// whose dtype differs from the strong one receive an explicit `Cast`.
+    /// `Bool` operands mixed with float operands are cast to 0/1 values of
+    /// the strong float dtype, or to a weak `f64` when every float operand is
+    /// weak (so `mask * 2.0` still adopts a later `f32` operand). Operands
+    /// that are all `Bool` are left unchanged for the op to accept or reject.
+    /// Nothing is appended to the graph when the operands are rejected.
     fn coerce_operands<const N: usize>(
         &mut self,
         op_name: &str,
@@ -5695,8 +6000,15 @@ impl TensorIr {
         operands: &mut [TensorNodeId],
     ) -> Result<(), String> {
         let mut strong: Option<TensorDType> = None;
+        let mut has_bool = false;
+        let mut has_float = false;
         for operand in operands.iter() {
             let node = self.node(*operand)?;
+            if node.dtype == TensorDType::Bool {
+                has_bool = true;
+                continue;
+            }
+            has_float = true;
             if node.weak {
                 continue;
             }
@@ -5709,6 +6021,18 @@ impl TensorIr {
                     ))
                 }
                 _ => strong = Some(node.dtype),
+            }
+        }
+        if has_bool && has_float {
+            // Bool 與浮點混用時視為 0/1 浮點；只遇到弱純量時結果保持弱型別（預設 f64）。
+            let (target, weak) = strong.map_or((TensorDType::F64, true), |dtype| (dtype, false));
+            for operand in operands.iter_mut() {
+                let node = self.node(*operand)?;
+                if node.dtype == TensorDType::Bool {
+                    let shape = node.shape.clone();
+                    *operand =
+                        self.push_node(TensorOp::Cast { input: *operand }, shape, target, weak);
+                }
             }
         }
         let Some(target) = strong else {
@@ -5751,6 +6075,25 @@ impl TensorIr {
             )
         })?;
         let dtype = self.node(first)?.dtype;
+        // Bool 只允許資料搬移與 select；算術、reduction 與數學函式須先明確轉型。
+        if dtype == TensorDType::Bool
+            && !matches!(
+                op,
+                TensorOp::Where { .. }
+                    | TensorOp::Reshape { .. }
+                    | TensorOp::Transpose { .. }
+                    | TensorOp::Concat { .. }
+                    | TensorOp::Slice { .. }
+                    | TensorOp::PadSlice { .. }
+                    | TensorOp::Broadcast { .. }
+            )
+        {
+            return Err(format!(
+                "{} is not defined for bool tensors; use logical_and/logical_or/logical_not \
+                 (& | ~) or convert explicitly with astype",
+                tensor_op_name(&op)
+            ));
+        }
         let mut weak = true;
         for operand in &operands {
             let node = self.node(*operand)?;
@@ -5843,6 +6186,15 @@ impl TensorIr {
                         values
                             .get(*rhs)
                             .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
+                    )?,
+                TensorOp::Compare { lhs, rhs, kind } => values
+                    .get(*lhs)
+                    .ok_or_else(|| format!("node {lhs} has no evaluated value"))?
+                    .compare(
+                        values
+                            .get(*rhs)
+                            .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
+                        *kind,
                     )?,
                 TensorOp::Where {
                     condition,
@@ -6586,6 +6938,20 @@ impl TensorIr {
                         mixed: DynamicTensor::filled(node.shape.clone(), 0.0)?,
                     }
                 }
+                TensorOp::Compare { lhs, rhs, kind } => {
+                    let lhs = values
+                        .get(*lhs)
+                        .ok_or_else(|| format!("node {lhs} has no evaluated value"))?;
+                    let rhs = values
+                        .get(*rhs)
+                        .ok_or_else(|| format!("node {rhs} has no evaluated value"))?;
+                    MixedTangent {
+                        value: lhs.value.compare(&rhs.value, *kind)?,
+                        first: DynamicTensor::filled(node.shape.clone(), 0.0)?,
+                        second: DynamicTensor::filled(node.shape.clone(), 0.0)?,
+                        mixed: DynamicTensor::filled(node.shape.clone(), 0.0)?,
+                    }
+                }
                 TensorOp::Where {
                     condition,
                     on_true,
@@ -7210,6 +7576,8 @@ fn symbolic_cond_tangent_names(
     let captures = branches.captures();
     captures
         .keys()
+        // Bool 捕獲沒有切向量，不建立切向量輸入。
+        .filter(|name| branches.on_true.plan.input_dtype(name).ok() != Some(TensorDType::Bool))
         .enumerate()
         .map(|(index, name)| {
             let mut tangent_name = format!("{namespace}_tangent_{index}");
@@ -7582,6 +7950,10 @@ fn symbolic_vjp_cond(
     let true_gradients = symbolic_vjp_region(&branches.on_true.plan, &cotangent_name)?;
     let false_gradients = symbolic_vjp_region(&branches.on_false.plan, &cotangent_name)?;
     for (capture_name, parent_node_id) in context.captures {
+        // Bool 捕獲不可微，區域 VJP 不為其產生梯度。
+        if branches.on_true.plan.input_dtype(capture_name)? == TensorDType::Bool {
+            continue;
+        }
         let on_true = true_gradients.get(capture_name).ok_or_else(|| {
             format!("true conditional region has no gradient for capture {capture_name:?}")
         })?;
@@ -7718,6 +8090,16 @@ fn symbolic_vjp_cond_captures(
 
 fn symbolic_zero_like(graph: &mut TensorIr, value: TensorNodeId) -> Result<TensorNodeId, String> {
     graph.sub(value, value)
+}
+
+/// Weak `f64` zero of `shape`: the tangent of a `Bool` value.
+fn symbolic_zero_tangent(graph: &mut TensorIr, shape: &[usize]) -> Result<TensorNodeId, String> {
+    let zero = graph.scalar_constant(0.0);
+    if shape.is_empty() {
+        Ok(zero)
+    } else {
+        graph.broadcast_to(zero, shape.to_vec())
+    }
 }
 
 fn symbolic_broadcast_like(
@@ -7892,6 +8274,13 @@ impl TensorCondExecutionPlan {
                 "conditional branches must capture identical named inputs and shapes".to_string(),
             );
         }
+        if !on_true.plan.output_dtype()?.is_floating() {
+            return Err(format!(
+                "conditional branches must return a floating dtype, got {}; \
+                 convert bool results explicitly with astype",
+                on_true.plan.output_dtype()?
+            ));
+        }
         if on_true.plan.output_dtype()? != on_false.plan.output_dtype()? {
             return Err(format!(
                 "conditional branch output dtypes differ: {} versus {}",
@@ -8021,6 +8410,7 @@ impl TensorForiExecutionPlan {
                 carry_shape
             ));
         }
+        check_loop_region_inputs(&body.plan, "fori loop")?;
         check_region_output_dtype(
             &body.plan,
             body.plan.output_node_id,
@@ -8713,12 +9103,20 @@ impl TensorScanExecutionPlan {
         if body.output_shapes()[0] != *carry_shape {
             return Err("scan body next carry shape does not match carry shape".to_string());
         }
+        check_loop_region_inputs(&body.plan, "scan")?;
         check_region_output_dtype(
             &body.plan,
             body.plan.output_node_ids[0],
             &carry_name,
             "scan",
         )?;
+        let output_dtype = body.plan.node_dtype(body.plan.output_node_ids[1])?;
+        if !output_dtype.is_floating() {
+            return Err(format!(
+                "scan outputs must have a floating dtype, got {output_dtype}; \
+                 convert bool values explicitly with astype"
+            ));
+        }
         if let Some(index_shape) = body.captures().get(&index_name) {
             if !index_shape.is_empty() {
                 return Err("scan index capture must be scalar".to_string());
@@ -9021,6 +9419,7 @@ impl TensorForiMultiExecutionPlan {
                 ));
             }
         }
+        check_loop_region_inputs(&body.plan, "multi-carry fori")?;
         for (name, output) in carry_names.iter().zip(&body.plan.output_node_ids) {
             check_region_output_dtype(&body.plan, *output, name, "multi-carry fori")?;
         }
@@ -10023,6 +10422,9 @@ extern \"C\" __global__ void nabla_fused_elementwise({parameters}) {{\n\
                 TensorOp::Greater { lhs, rhs } => {
                     specialized.greater(mapped(*lhs)?, mapped(*rhs)?)?
                 }
+                TensorOp::Compare { lhs, rhs, kind } => {
+                    specialized.compare(mapped(*lhs)?, mapped(*rhs)?, *kind)?
+                }
                 TensorOp::Where {
                     condition,
                     on_true,
@@ -10165,6 +10567,12 @@ fn cuda_expression(nodes: &[TensorNode], node_id: TensorNodeId) -> Result<String
             child(*lhs)?,
             child(*rhs)?
         )),
+        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
+            "(({} {} {}) ? 1.0f : 0.0f)",
+            child(*lhs)?,
+            kind.operator(),
+            child(*rhs)?
+        )),
         TensorOp::Where {
             condition,
             on_true,
@@ -10253,6 +10661,12 @@ fn cuda_region_expression(
         TensorOp::Greater { lhs, rhs } => Ok(format!(
             "(({} > {}) ? 1.0f : 0.0f)",
             child(*lhs)?,
+            child(*rhs)?
+        )),
+        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
+            "(({} {} {}) ? 1.0f : 0.0f)",
+            child(*lhs)?,
+            kind.operator(),
             child(*rhs)?
         )),
         TensorOp::Where {
@@ -10363,7 +10777,8 @@ fn is_fusable_elementwise_subgraph(nodes: &[TensorNode], node_id: TensorNodeId) 
         TensorOp::Add { lhs, rhs }
         | TensorOp::Sub { lhs, rhs }
         | TensorOp::Mul { lhs, rhs }
-        | TensorOp::Greater { lhs, rhs } => {
+        | TensorOp::Greater { lhs, rhs }
+        | TensorOp::Compare { lhs, rhs, .. } => {
             is_fusable_elementwise_subgraph(nodes, *lhs)
                 && is_fusable_elementwise_subgraph(nodes, *rhs)
         }
@@ -10417,6 +10832,7 @@ fn is_fusable_elementwise_compute_op(op: &TensorOp) -> bool {
             | TensorOp::Sub { .. }
             | TensorOp::Mul { .. }
             | TensorOp::Greater { .. }
+            | TensorOp::Compare { .. }
             | TensorOp::Where { .. }
             | TensorOp::Tanh { .. }
             | TensorOp::Exp { .. }
@@ -10498,6 +10914,9 @@ fn evaluate_fused_element(
         }
         TensorOp::Mul { lhs, rhs } => Ok(child(*lhs)? * child(*rhs)?),
         TensorOp::Greater { lhs, rhs } => Ok(f64::from(child(*lhs)? > child(*rhs)?)),
+        TensorOp::Compare { lhs, rhs, kind } => {
+            Ok(f64::from(kind.evaluate(child(*lhs)?, child(*rhs)?)))
+        }
         TensorOp::Where {
             condition,
             on_true,
@@ -10573,6 +10992,7 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         | TensorOp::Div { lhs, rhs }
         | TensorOp::Mul { lhs, rhs }
         | TensorOp::Greater { lhs, rhs }
+        | TensorOp::Compare { lhs, rhs, .. }
         | TensorOp::Matmul { lhs, rhs } => {
             vec![*lhs, *rhs]
         }
@@ -10700,6 +11120,38 @@ fn tensor_value_operands(op: &TensorOp) -> Vec<TensorNodeId> {
     }
 }
 
+/// `Bool` values have no tangent or cotangent; differentiating one is an error
+/// rather than a silent zero.
+fn ensure_differentiable_output(node: &TensorNode) -> Result<(), String> {
+    if node.dtype == TensorDType::Bool {
+        return Err(
+            "cannot differentiate a bool output; convert it explicitly with astype".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn bool_input_derivative_error(name: &str) -> String {
+    format!("cannot differentiate with respect to bool input {name:?}; bool values have no tangent")
+}
+
+/// Loop-region AD transforms pair every body input with a tangent or
+/// gradient, so D2 keeps `Bool` values out of loop regions entirely.
+fn check_loop_region_inputs(plan: &TensorExecutionPlan, context: &str) -> Result<(), String> {
+    for node in &plan.nodes {
+        if let TensorOp::Input { name } = &node.op {
+            if !node.dtype.is_floating() {
+                return Err(format!(
+                    "{context} input {name:?} has dtype {}; loop regions accept only floating \
+                     values, so convert masks explicitly with astype",
+                    node.dtype
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Loop regions feed each body output back into its carry input, so both
 /// must share one dtype.
 fn check_region_output_dtype(
@@ -10787,7 +11239,8 @@ fn infer_tensor_placement(
         | TensorOp::Sub { lhs, rhs }
         | TensorOp::Div { lhs, rhs }
         | TensorOp::Mul { lhs, rhs }
-        | TensorOp::Greater { lhs, rhs } => merge(&[*lhs, *rhs]),
+        | TensorOp::Greater { lhs, rhs }
+        | TensorOp::Compare { lhs, rhs, .. } => merge(&[*lhs, *rhs]),
         TensorOp::Where {
             condition,
             on_true,
@@ -11200,6 +11653,7 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Div { .. } => "div",
         TensorOp::Mul { .. } => "mul",
         TensorOp::Greater { .. } => "greater",
+        TensorOp::Compare { kind, .. } => kind.name(),
         TensorOp::Where { .. } => "where",
         TensorOp::Cond { .. } => "cond",
         TensorOp::Fori { .. } => "fori",
@@ -11257,6 +11711,9 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
             }
         }
         TensorOp::Greater { lhs, rhs } => Some(f64::from(scalar(*lhs)? > scalar(*rhs)?)),
+        TensorOp::Compare { lhs, rhs, kind } => {
+            Some(f64::from(kind.evaluate(scalar(*lhs)?, scalar(*rhs)?)))
+        }
         // 呼叫端依目標 dtype 捨入；f64->f32->f64 因此保留 f32 捨入誤差而不被抵銷。
         TensorOp::Cast { input } => scalar(*input),
         TensorOp::Tanh { input } => Some(scalar(*input)?.tanh()),
@@ -11520,6 +11977,9 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<String> {
         TensorOp::Div { lhs, rhs } => format!("div:{lhs}:{rhs}:{shape:?}"),
         TensorOp::Mul { lhs, rhs } => format!("mul:{lhs}:{rhs}:{shape:?}"),
         TensorOp::Greater { lhs, rhs } => format!("greater:{lhs}:{rhs}:{shape:?}"),
+        TensorOp::Compare { lhs, rhs, kind } => {
+            format!("compare:{}:{lhs}:{rhs}:{shape:?}", kind.name())
+        }
         TensorOp::Where {
             condition,
             on_true,
@@ -11606,6 +12066,11 @@ fn remap_tensor_op(
         TensorOp::Greater { lhs, rhs } => Ok(TensorOp::Greater {
             lhs: remap_node(*lhs)?,
             rhs: remap_node(*rhs)?,
+        }),
+        TensorOp::Compare { lhs, rhs, kind } => Ok(TensorOp::Compare {
+            lhs: remap_node(*lhs)?,
+            rhs: remap_node(*rhs)?,
+            kind: *kind,
         }),
         TensorOp::Where {
             condition,
@@ -12117,7 +12582,12 @@ fn broadcast_offset(
     offset
 }
 
+/// MLIR-style tensor type; `Bool` prints as `i1` like StableHLO predicates.
 fn format_tensor_type(shape: &[usize], dtype: TensorDType) -> String {
+    let dtype = match dtype {
+        TensorDType::Bool => "i1".to_string(),
+        dtype => dtype.to_string(),
+    };
     if shape.is_empty() {
         return format!("tensor<{dtype}>");
     }

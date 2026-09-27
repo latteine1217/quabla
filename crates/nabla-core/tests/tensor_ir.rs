@@ -5852,3 +5852,713 @@ fn cond_region_transforms_do_not_leak_non_finite_captures() {
         &[1.0]
     );
 }
+
+// ---- Dtype phase D2: Bool masks, comparisons, and logical reductions ----
+
+use nabla_core::tensor_ir::TensorComparison;
+
+const BOOL_X: [f64; 6] = [1.0, 2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 2.0];
+const BOOL_Y: [f64; 6] = [0.5, 2.0, 2.0, f64::INFINITY, 0.0, f64::NAN];
+const BOOL_W: [f64; 6] = [0.5, -1.5, 2.0, 0.25, 1.0, -0.75];
+const BOOL_R: [f64; 6] = [0.1, -0.2, 0.3, 0.4, -0.5, 0.6];
+
+fn bool_inputs(x: &[f64]) -> BTreeMap<String, DynamicTensor> {
+    let mut inputs = f32_inputs(&[
+        ("x", vec![2, 3], x.to_vec()),
+        ("y", vec![2, 3], BOOL_Y.to_vec()),
+        ("w", vec![2, 3], BOOL_W.to_vec()),
+        ("seed", vec![], vec![1.0]),
+    ]);
+    inputs.insert(
+        "r".to_string(),
+        DynamicTensor::with_dtype(vec![2, 3], BOOL_R.to_vec(), TensorDType::F32)
+            .expect("valid test tensor"),
+    );
+    inputs
+}
+
+/// Output nodes paired with their expected CPU values.
+type ExpectedOutputs = Vec<(TensorNodeId, Vec<f64>)>;
+
+/// Every D2 primitive over `x`/`y` (NaN, ±inf and ties) plus the promotion
+/// rules against an `f32` residual `r`. Outputs are exact 0/1 masks or
+/// finite values, paired with their expected CPU results.
+fn bool_primitive_program() -> Result<(TensorIr, ExpectedOutputs), String> {
+    use TensorComparison::*;
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![2, 3])?;
+    let y = graph.input("y", vec![2, 3])?;
+    let r = graph.input_typed("r", vec![2, 3], TensorDType::F32)?;
+    let mut outputs = Vec::new();
+    let expected_compare = [
+        (Greater, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        (GreaterEqual, [1.0, 1.0, 0.0, 1.0, 0.0, 0.0]),
+        (Less, [0.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+        (LessEqual, [0.0, 1.0, 0.0, 1.0, 1.0, 0.0]),
+        (Equal, [0.0, 1.0, 0.0, 1.0, 0.0, 0.0]),
+        (NotEqual, [1.0, 0.0, 1.0, 0.0, 1.0, 1.0]),
+    ];
+    for (kind, expected) in expected_compare {
+        outputs.push((graph.compare(x, y, kind)?, expected.to_vec()));
+    }
+    let greater = outputs[0].0;
+    let less = outputs[2].0;
+    let equal = outputs[4].0;
+    let x_finite = graph.isfinite(x)?;
+    let y_finite = graph.isfinite(y)?;
+    let x_nan = graph.isnan(x)?;
+    let y_nan = graph.isnan(y)?;
+    outputs.extend([
+        (x_finite, vec![1.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+        (x_nan, vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0]),
+        (
+            graph.logical_and(greater, x_finite)?,
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ),
+        (
+            graph.logical_or(less, y_nan)?,
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+        ),
+        (
+            graph.logical_not(equal)?,
+            vec![1.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+        ),
+        (graph.any(x_nan)?, vec![1.0]),
+        (graph.all(y_finite)?, vec![0.0]),
+        (graph.any_axis(greater, 1)?, vec![1.0, 0.0]),
+        (graph.all_axis(y_finite, 0)?, vec![0.0, 1.0, 0.0]),
+    ]);
+    // f32 殘差乘 Bool 遮罩得 f32；mask * 2.0 為弱 f64，遇到 f32 殘差後採用 f32。
+    let masked = graph.mul(r, x_finite)?;
+    let two = graph.scalar_constant(2.0);
+    let weak = graph.mul(x_finite, two)?;
+    let shifted = graph.add(weak, r)?;
+    let r32 = BOOL_R.map(|value| value as f32);
+    let finite32 = [1.0_f32, 1.0, 0.0, 0.0, 0.0, 1.0];
+    outputs.push((
+        masked,
+        (0..6).map(|i| f64::from(r32[i] * finite32[i])).collect(),
+    ));
+    outputs.push((
+        shifted,
+        (0..6)
+            .map(|i| f64::from(finite32[i] * 2.0 + r32[i]))
+            .collect(),
+    ));
+    Ok((graph, outputs))
+}
+
+/// `loss(x, w)` guards non-finite `x` with `where(isfinite(x), x, 0)` before
+/// any arithmetic, then masks a weighted residual with `safe > 0.5`.
+fn masked_loss_graph() -> Result<(TensorIr, TensorNodeId), String> {
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![2, 3])?;
+    let w = graph.input("w", vec![2, 3])?;
+    let finite = graph.isfinite(x)?;
+    let zero = graph.scalar_constant(0.0);
+    let safe = graph.where_select(finite, x, zero)?;
+    let half = graph.scalar_constant(0.5);
+    let active = graph.compare(safe, half, TensorComparison::Greater)?;
+    let weighted = graph.mul(safe, w)?;
+    let one = graph.scalar_constant(1.0);
+    let shifted = graph.sub(weighted, one)?;
+    let residual = graph.where_select(active, shifted, zero)?;
+    let squared = graph.powi(residual, 2)?;
+    let data_loss = graph.mean(squared)?;
+    let safe_squared = graph.powi(safe, 2)?;
+    let penalty = graph.sum(safe_squared)?;
+    let tenth = graph.scalar_constant(0.1);
+    let penalty = graph.mul(penalty, tenth)?;
+    let loss = graph.add(data_loss, penalty)?;
+    Ok((graph, loss))
+}
+
+/// Analytic value and gradients of `masked_loss_graph` at `BOOL_X`, `BOOL_W`:
+/// safe = [1, 2, 0, 0, 0, 2], active = [1, 1, 0, 0, 0, 1].
+const MASKED_LOSS: f64 = 22.5 / 6.0 + 0.9;
+const MASKED_GRAD_X: [f64; 6] = [-1.0 / 12.0 + 0.2, 2.0 + 0.4, 0.0, 0.0, 0.0, 0.625 + 0.4];
+const MASKED_GRAD_W: [f64; 6] = [-1.0 / 6.0, -8.0 / 3.0, 0.0, 0.0, 0.0, -5.0 / 3.0];
+
+fn assert_close(actual: &[f64], expected: &[f64], tolerance: f64) {
+    assert_eq!(actual.len(), expected.len(), "{actual:?} vs {expected:?}");
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{actual} differs from {expected} (tolerance {tolerance})"
+        );
+    }
+}
+
+#[test]
+fn bool_dtype_rounds_to_zero_one_and_lowers_to_f32_on_devices() {
+    assert_eq!(TensorDType::Bool.to_string(), "bool");
+    assert_eq!(TensorDType::Bool.round(f64::NAN), 1.0);
+    assert_eq!(TensorDType::Bool.round(-0.0), 0.0);
+    assert_eq!(TensorDType::Bool.round(-2.5), 1.0);
+    let tensor = must!(DynamicTensor::with_dtype(
+        vec![4],
+        vec![0.0, 3.0, f64::NAN, f64::NEG_INFINITY],
+        TensorDType::Bool,
+    ));
+    assert_eq!(tensor.data(), &[0.0, 1.0, 1.0, 1.0]);
+    assert_eq!(tensor.dtype(), TensorDType::Bool);
+    assert_eq!(
+        TensorDeviceBackend::Cpu.execution_dtype(TensorDType::Bool),
+        Ok(TensorDType::Bool)
+    );
+    for backend in [TensorDeviceBackend::Cuda, TensorDeviceBackend::Mlx] {
+        assert_eq!(
+            backend.execution_dtype(TensorDType::Bool),
+            Ok(TensorDType::F32)
+        );
+    }
+}
+
+#[test]
+fn comparisons_logical_ops_and_reductions_follow_ieee_semantics_on_cpu() {
+    let (graph, outputs) = must!(bool_primitive_program());
+    let inputs = bool_inputs(&BOOL_X);
+    let text = graph.lower_text();
+    assert!(
+        text.contains("compare(%0, %1, kind=greater_equal) : tensor<2x3xi1>"),
+        "{text}"
+    );
+    assert!(text.contains(": tensor<i1>"), "{text}");
+    for (index, (output, expected)) in outputs.iter().enumerate() {
+        let dtype = if index < 15 {
+            TensorDType::Bool
+        } else {
+            TensorDType::F32
+        };
+        assert_eq!(graph.node_dtype(*output), Ok(dtype), "output {index}");
+        // 逐節點直譯器與（可融合時的）融合直譯器必須一致。
+        let evaluated = must!(graph.evaluate(*output, &inputs));
+        let plan = must!(graph.compile_cpu(*output));
+        let executed = must!(CpuBackend.execute(&plan, &inputs));
+        for value in [&evaluated, &executed] {
+            assert_eq!(value.dtype(), dtype, "output {index}");
+            assert_eq!(value.data(), expected.as_slice(), "output {index}");
+        }
+        let program = plan.kernel_ir();
+        must!(program.validate());
+    }
+    let compare_plan = must!(graph.compile_cpu(outputs[1].0));
+    assert!(compare_plan.uses_fused_elementwise_kernel());
+    let kernel = compare_plan.kernel_ir();
+    let compare_node = kernel.nodes.last().expect("kernel node");
+    assert_eq!(compare_node.op, "greater_equal");
+    assert_eq!(compare_node.dtype, TensorDType::Bool);
+
+    // StableHLO 探針以 i1 表示 Bool；比較本身不在已驗證子集中而明確拒絕。
+    let mut probe = TensorIr::new();
+    let mask = must!(probe.input_typed("mask", vec![3], TensorDType::Bool));
+    let numeric = must!(probe.cast(mask, TensorDType::F64));
+    let stablehlo = must!(probe.stablehlo_text(numeric));
+    assert!(
+        stablehlo.contains("stablehlo.convert %arg0 : (tensor<3xi1>) -> tensor<3xf64>"),
+        "{stablehlo}"
+    );
+    let zero = probe.scalar_constant(0.0);
+    let compared = must!(probe.compare(numeric, zero, TensorComparison::Less));
+    assert!(probe.stablehlo_text(compared).is_err());
+
+    // 常數比較在計畫編譯時折疊為 Bool 常數。
+    let mut constant = TensorIr::new();
+    let one = constant.scalar_constant(1.0);
+    let two = constant.scalar_constant(2.0);
+    let less = must!(constant.compare(one, two, TensorComparison::Less));
+    let plan = must!(constant.compile_cpu(less));
+    assert_eq!(plan.node_count(), 1);
+    assert_eq!(
+        must!(CpuBackend.execute(&plan, &BTreeMap::new())).data(),
+        &[1.0]
+    );
+}
+
+#[test]
+fn bool_operands_promote_like_arithmetic_and_reject_bool_arithmetic() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let r = must!(graph.input_typed("r", vec![2], TensorDType::F32));
+    let zero = graph.scalar_constant(0.0);
+    let mask = must!(graph.compare(x, zero, TensorComparison::Greater));
+    let other = must!(graph.compare(x, zero, TensorComparison::Less));
+    assert_eq!(graph.node_dtype(mask), Ok(TensorDType::Bool));
+
+    let masked = must!(graph.mul(r, mask));
+    assert_eq!(graph.node_dtype(masked), Ok(TensorDType::F32));
+    let two = graph.scalar_constant(2.0);
+    let weak = must!(graph.mul(mask, two));
+    assert_eq!(graph.node_dtype(weak), Ok(TensorDType::F64));
+    let adopted = must!(graph.add(weak, r));
+    assert_eq!(graph.node_dtype(adopted), Ok(TensorDType::F32));
+    let strong = must!(graph.add(weak, x));
+    assert_eq!(graph.node_dtype(strong), Ok(TensorDType::F64));
+
+    let node_count = graph.lower_text().lines().count();
+    for (name, result) in [
+        ("add", graph.add(mask, other)),
+        ("mul", graph.mul(mask, other)),
+        ("tanh", graph.tanh(mask)),
+        ("sum", graph.sum(mask)),
+        ("greater", graph.greater(mask, other)),
+    ] {
+        let error = result.expect_err("bool arithmetic must be rejected");
+        assert!(error.contains(name) && error.contains("bool"), "{error}");
+        assert!(error.contains("astype"), "{error}");
+    }
+    assert_eq!(graph.lower_text().lines().count(), node_count);
+    for error in [
+        graph.logical_and(mask, x).expect_err("float operand"),
+        graph.logical_not(x).expect_err("float operand"),
+        graph.any(x).expect_err("float operand"),
+    ] {
+        assert!(error.contains("requires bool operands"), "{error}");
+    }
+    assert!(graph.isnan(mask).is_err());
+
+    // Bool 可參與資料搬移、select 與比較；兩個 Bool 以 0/1 比較。
+    let same = must!(graph.compare(mask, other, TensorComparison::Equal));
+    let reshaped = must!(graph.reshape(same, vec![2, 1]));
+    let selected = must!(graph.where_select(mask, same, other));
+    assert_eq!(graph.node_dtype(reshaped), Ok(TensorDType::Bool));
+    assert_eq!(graph.node_dtype(selected), Ok(TensorDType::Bool));
+
+    // float->bool 以非零為真（NaN 亦為真）；bool->float 得 0/1；舊 greater 仍是浮點遮罩。
+    let truthy = must!(graph.cast(x, TensorDType::Bool));
+    let numeric = must!(graph.cast(mask, TensorDType::F32));
+    let legacy = must!(graph.greater(r, zero));
+    assert_eq!(graph.node_dtype(truthy), Ok(TensorDType::Bool));
+    assert_eq!(graph.node_dtype(numeric), Ok(TensorDType::F32));
+    assert_eq!(graph.node_dtype(legacy), Ok(TensorDType::F32));
+    let inputs = f32_inputs(&[
+        ("x", vec![2], vec![f64::NAN, 0.0]),
+        ("r", vec![2], vec![1.0, 1.0]),
+    ]);
+    assert_eq!(must!(graph.evaluate(truthy, &inputs)).data(), &[1.0, 0.0]);
+    let inputs = f32_inputs(&[
+        ("x", vec![2], vec![3.0, -1.0]),
+        ("r", vec![2], vec![1.0, 1.0]),
+    ]);
+    assert_eq!(must!(graph.evaluate(numeric, &inputs)).data(), &[1.0, 0.0]);
+}
+
+#[test]
+fn where_and_cond_accept_bool_and_legacy_float_predicates() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3]));
+    let zero = graph.scalar_constant(0.0);
+    let bool_mask = must!(graph.compare(x, zero, TensorComparison::GreaterEqual));
+    let float_mask = must!(graph.greater(x, zero));
+    let negated = must!(graph.sub(zero, x));
+    let bool_abs = must!(graph.where_select(bool_mask, x, negated));
+    let float_abs = must!(graph.where_select(float_mask, x, negated));
+    let inputs = f32_inputs(&[("x", vec![3], vec![-2.0, 0.0, 3.0])]);
+    assert_eq!(
+        must!(graph.evaluate(bool_abs, &inputs)).data(),
+        &[2.0, 0.0, 3.0]
+    );
+    assert_eq!(
+        must!(graph.evaluate(float_abs, &inputs)).data(),
+        &[2.0, -0.0, 3.0]
+    );
+
+    // all(isfinite(x)) 作為 Cond 謂詞；false 分支自行防護非有限值。
+    let (graph, output) = must!(finite_guard_cond_graph());
+    let finite = f32_inputs(&[("x", vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]);
+    assert_eq!(must!(graph.evaluate(output, &finite)).data(), &[91.0]);
+    let guarded = f32_inputs(&[("x", vec![2, 3], BOOL_X.to_vec())]);
+    assert_eq!(must!(graph.evaluate(output, &guarded)).data(), &[4.5]);
+
+    // Bool 分支結果與 Bool 迴圈 carry 在 D2 明確拒絕。
+    let mut branch = TensorIr::new();
+    let captured = must!(branch.input("x", vec![]));
+    let branch_zero = branch.scalar_constant(0.0);
+    let branch_mask = must!(branch.compare(captured, branch_zero, TensorComparison::Less));
+    let plan = must!(branch.compile_cpu(branch_mask));
+    let error = TensorCondExecutionPlan::new(plan.clone(), plan)
+        .expect_err("bool branch results are not supported");
+    assert!(error.contains("astype"), "{error}");
+    // 迴圈區域的 AD 會為每個輸入配對切向量，因此 Bool carry 與 Bool 捕獲都拒絕。
+    let mut body = TensorIr::new();
+    let carry = must!(body.input_typed("carry", vec![], TensorDType::Bool));
+    must!(body.input("index", vec![]));
+    let error =
+        TensorForiExecutionPlan::new(0, 2, must!(body.compile_cpu(carry)), "carry", "index")
+            .expect_err("bool carries are not supported");
+    assert!(error.contains("floating"), "{error}");
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![3]));
+    must!(body.input("index", vec![]));
+    let mask = must!(body.input_typed("mask", vec![3], TensorDType::Bool));
+    let next = must!(body.where_select(mask, carry, carry));
+    let error = TensorForiExecutionPlan::new(0, 2, must!(body.compile_cpu(next)), "carry", "index")
+        .expect_err("bool captures are not supported");
+    assert!(
+        error.contains("\"mask\"") && error.contains("astype"),
+        "{error}"
+    );
+}
+
+fn finite_guard_cond_graph() -> Result<(TensorIr, TensorNodeId), String> {
+    let mut on_true = TensorIr::new();
+    let true_x = on_true.input("x", vec![2, 3])?;
+    let true_squared = on_true.mul(true_x, true_x)?;
+    let true_output = on_true.sum(true_squared)?;
+    let mut on_false = TensorIr::new();
+    let false_x = on_false.input("x", vec![2, 3])?;
+    let finite = on_false.isfinite(false_x)?;
+    let zero = on_false.scalar_constant(0.0);
+    let safe = on_false.where_select(finite, false_x, zero)?;
+    let safe_squared = on_false.mul(safe, safe)?;
+    let summed = on_false.sum(safe_squared)?;
+    let half = on_false.scalar_constant(0.5);
+    let false_output = on_false.mul(summed, half)?;
+    let branches = TensorCondExecutionPlan::new(
+        on_true.compile_cpu(true_output)?,
+        on_false.compile_cpu(false_output)?,
+    )?;
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![2, 3])?;
+    let finite = graph.isfinite(x)?;
+    let predicate = graph.all(finite)?;
+    let output = graph.cond(predicate, branches)?;
+    Ok((graph, output))
+}
+
+#[test]
+fn bool_masks_have_no_derivatives_and_nan_guards_keep_gradients_finite() {
+    let (graph, loss) = must!(masked_loss_graph());
+    let inputs = bool_inputs(&BOOL_X);
+    let seed = must!(DynamicTensor::new(vec![], vec![1.0]));
+    let (value, eager) = must!(graph.value_and_vjp(loss, &inputs, seed.clone()));
+    assert_close(value.data(), &[MASKED_LOSS], 1e-12);
+    let symbolic = must!(graph.symbolic_vjp(loss, "seed"));
+    for gradients in [
+        [eager["x"].data().to_vec(), eager["w"].data().to_vec()],
+        [
+            must!(symbolic.graph.evaluate(symbolic.gradients["x"], &inputs))
+                .data()
+                .to_vec(),
+            must!(symbolic.graph.evaluate(symbolic.gradients["w"], &inputs))
+                .data()
+                .to_vec(),
+        ],
+    ] {
+        assert_close(&gradients[0], &MASKED_GRAD_X, 1e-12);
+        assert_close(&gradients[1], &MASKED_GRAD_W, 1e-12);
+    }
+
+    // 中央差分：遮罩邊界（0.5）遠離各點，因此損失在各座標局部平滑。
+    let finite_x = [1.0, 2.0, -0.3, 0.7, 0.2, 2.0];
+    let finite_inputs = bool_inputs(&finite_x);
+    let symbolic_gradient = must!(symbolic
+        .graph
+        .evaluate(symbolic.gradients["x"], &finite_inputs));
+    let (_, tangent_graph_value) = {
+        let transformed = must!(graph.symbolic_jvp(loss, "x"));
+        let value = must!(transformed
+            .graph
+            .evaluate(transformed.tangent, &finite_inputs));
+        ((), value)
+    };
+    let step = 1e-6;
+    let mut directional = 0.0;
+    for index in 0..6 {
+        let mut plus = finite_x;
+        let mut minus = finite_x;
+        plus[index] += step;
+        minus[index] -= step;
+        let loss_at =
+            |point: &[f64]| must_value(graph.evaluate(loss, &bool_inputs(point))).data()[0];
+        let difference = (loss_at(&plus) - loss_at(&minus)) / (2.0 * step);
+        directional += difference;
+        assert!(
+            (symbolic_gradient.data()[index] - difference).abs() < 1e-6,
+            "gradient {} differs from finite difference {difference}",
+            symbolic_gradient.data()[index]
+        );
+    }
+    // symbolic_jvp 以全 1 方向播種，因此切向量等於各座標偏導之和。
+    assert!((tangent_graph_value.data()[0] - directional).abs() < 1e-5);
+
+    // 舊的浮點遮罩寫法 sum(x.gt(0) * x) 讓 0 * NaN 滲入值與梯度。
+    let mut legacy = TensorIr::new();
+    let x = must!(legacy.input("x", vec![2, 3]));
+    let zero = legacy.scalar_constant(0.0);
+    let mask = must!(legacy.greater(x, zero));
+    let masked = must!(legacy.mul(mask, x));
+    let legacy_loss = must!(legacy.sum(masked));
+    let (legacy_value, legacy_gradients) =
+        must!(legacy.value_and_vjp(legacy_loss, &inputs, seed.clone()));
+    assert!(legacy_value.data()[0].is_nan());
+    assert!(legacy_gradients["x"]
+        .data()
+        .iter()
+        .all(|value| value.is_finite()));
+
+    // Cond 謂詞 all(isfinite(x))：選中的防護分支在含 NaN/inf 時仍給有限梯度。
+    let (cond_graph, cond_output) = must!(finite_guard_cond_graph());
+    let transformed = must!(cond_graph.symbolic_vjp(cond_output, "seed"));
+    let gradient = must!(transformed
+        .graph
+        .evaluate(transformed.gradients["x"], &inputs));
+    assert_eq!(gradient.data(), &[1.0, 2.0, 0.0, 0.0, 0.0, 2.0]);
+    let tangent = must!(cond_graph.symbolic_jvp(cond_output, "x"));
+    assert_eq!(
+        must!(tangent.graph.evaluate(tangent.tangent, &inputs)).data(),
+        &[5.0]
+    );
+    let plan = must!(cond_graph.compile_cpu(cond_output));
+    let eager = must!(plan.vjp(&inputs, seed.clone()));
+    assert_eq!(eager["x"].data(), &[1.0, 2.0, 0.0, 0.0, 0.0, 2.0]);
+}
+
+fn must_value(result: Result<DynamicTensor, String>) -> DynamicTensor {
+    result.expect("evaluation succeeds")
+}
+
+#[test]
+fn differentiating_bool_values_is_an_error_and_bool_inputs_have_no_gradient() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3]));
+    let mask = must!(graph.input_typed("mask", vec![3], TensorDType::Bool));
+    let zero = graph.scalar_constant(0.0);
+    let positive = must!(graph.compare(x, zero, TensorComparison::Greater));
+    let both = must!(graph.logical_and(mask, positive));
+    let squared = must!(graph.mul(x, x));
+    let selected = must!(graph.where_select(both, squared, zero));
+    let loss = must!(graph.sum(selected));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![-1.0, 2.0, 3.0])),
+        ),
+        (
+            "mask".to_string(),
+            must!(DynamicTensor::with_dtype(
+                vec![3],
+                vec![1.0, 1.0, 0.0],
+                TensorDType::Bool
+            )),
+        ),
+    ]);
+    let seed = must!(DynamicTensor::new(vec![], vec![1.0]));
+    let (value, gradients) = must!(graph.value_and_vjp(loss, &inputs, seed.clone()));
+    assert_eq!(value.data(), &[4.0]);
+    assert_eq!(gradients["x"].data(), &[0.0, 4.0, 0.0]);
+    assert!(!gradients.contains_key("mask"));
+    let symbolic = must!(graph.symbolic_vjp(loss, "seed"));
+    assert!(!symbolic.gradients.contains_key("mask"));
+    let mut seeded = inputs.clone();
+    seeded.insert("seed".to_string(), seed.clone());
+    assert_eq!(
+        must!(symbolic.graph.evaluate(symbolic.gradients["x"], &seeded)).data(),
+        &[0.0, 4.0, 0.0]
+    );
+
+    let tangents = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![3], vec![1.0, 1.0, 1.0])),
+    )]);
+    let (_, tangent) = must!(graph.jvp(loss, &inputs, &tangents));
+    assert_eq!(tangent.data(), &[4.0]);
+    let (_, mask_tangent) = must!(graph.jvp(both, &inputs, &tangents));
+    assert_eq!(mask_tangent.data(), &[0.0, 0.0, 0.0]);
+    assert_eq!(mask_tangent.dtype(), TensorDType::F64);
+
+    let mut with_mask = tangents.clone();
+    with_mask.insert(
+        "mask".to_string(),
+        must!(DynamicTensor::filled(vec![3], 1.0)),
+    );
+    for error in [
+        graph
+            .jvp(loss, &inputs, &with_mask)
+            .map(|_| ())
+            .expect_err("bool tangent"),
+        graph
+            .symbolic_jvp(loss, "mask")
+            .map(|_| ())
+            .expect_err("bool input"),
+        graph
+            .hessian_scalar(loss, "mask", &inputs)
+            .map(|_| ())
+            .expect_err("bool input"),
+        graph
+            .symbolic_jvp_with_tangent_inputs(
+                loss,
+                &BTreeMap::from([("mask".to_string(), "mask_tangent".to_string())]),
+            )
+            .map(|_| ())
+            .expect_err("bool input"),
+    ] {
+        assert!(error.contains("bool input \"mask\""), "{error}");
+    }
+    for error in [
+        graph
+            .value_and_vjp(both, &inputs, must!(DynamicTensor::filled(vec![3], 1.0)))
+            .map(|_| ())
+            .expect_err("bool output"),
+        graph
+            .symbolic_vjp(both, "seed")
+            .map(|_| ())
+            .expect_err("bool output"),
+    ] {
+        assert!(error.contains("bool output"), "{error}");
+    }
+
+    // Bool 資料搬移（any_axis 的 reshape/cast/sum 組合）上的切向量為零。
+    let all_positive = must!(graph.all_axis(positive, 0));
+    let weights = must!(graph.cast(all_positive, TensorDType::F64));
+    let weighted = must!(graph.mul(weights, squared));
+    let total = must!(graph.sum(weighted));
+    let transformed = must!(graph.symbolic_jvp(total, "x"));
+    let (_, eager_tangent) = must!(graph.jvp(total, &inputs, &tangents));
+    assert_eq!(
+        must!(transformed.graph.evaluate(transformed.tangent, &inputs)).data(),
+        eager_tangent.data()
+    );
+    assert_eq!(eager_tangent.data(), &[0.0]);
+    let hessian = must!(graph.hessian_scalar(loss, "x", &inputs));
+    assert_eq!(hessian[1][1], 2.0);
+    assert_eq!(hessian[0][0], 0.0);
+}
+
+#[test]
+fn cond_regions_capture_bool_masks_without_differentiating_them() {
+    let branch = |masked: bool| -> Result<TensorExecutionPlan, String> {
+        let mut region = TensorIr::new();
+        let x = region.input("x", vec![3])?;
+        let mask = region.input_typed("mask", vec![3], TensorDType::Bool)?;
+        let squared = region.mul(x, x)?;
+        let zero = region.scalar_constant(0.0);
+        let selected = if masked {
+            region.where_select(mask, squared, zero)?
+        } else {
+            let numeric = region.cast(mask, TensorDType::F64)?;
+            region.add(squared, numeric)?
+        };
+        let output = region.sum(selected)?;
+        region.compile_cpu(output)
+    };
+    let branches = must!(TensorCondExecutionPlan::new(
+        must!(branch(true)),
+        must!(branch(false))
+    ));
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3]));
+    let mask = must!(graph.input_typed("mask", vec![3], TensorDType::Bool));
+    let zero = graph.scalar_constant(0.0);
+    let positive = must!(graph.compare(x, zero, TensorComparison::Greater));
+    let predicate = must!(graph.any(positive));
+    let output = must!(graph.cond_with_captures(
+        predicate,
+        branches,
+        vec![("x".to_string(), x), ("mask".to_string(), mask)],
+    ));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![1.0, -2.0, 3.0])),
+        ),
+        (
+            "mask".to_string(),
+            must!(DynamicTensor::with_dtype(
+                vec![3],
+                vec![1.0, 0.0, 1.0],
+                TensorDType::Bool
+            )),
+        ),
+        (
+            "seed".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    assert_eq!(must!(graph.evaluate(output, &inputs)).data(), &[10.0]);
+    let vjp = must!(graph.symbolic_vjp(output, "seed"));
+    assert!(!vjp.gradients.contains_key("mask"));
+    assert_eq!(
+        must!(vjp.graph.evaluate(vjp.gradients["x"], &inputs)).data(),
+        &[2.0, 0.0, 6.0]
+    );
+    let jvp = must!(graph.symbolic_jvp(output, "x"));
+    assert_eq!(
+        must!(jvp.graph.evaluate(jvp.tangent, &inputs)).data(),
+        &[8.0]
+    );
+}
+
+/// Runs the D2 primitive program, the masked-loss value and symbolic
+/// gradients, and the `all(isfinite(x))` Cond on a device against the CPU.
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn assert_bool_parity(target: NablaTarget) {
+    let compiler = NablaCompiler;
+    let inputs = bool_inputs(&BOOL_X);
+    let (graph, outputs) = must!(bool_primitive_program());
+    let program = must!(NablaMultiOutputProgram::new(
+        graph,
+        outputs.iter().map(|(output, _)| *output).collect()
+    ));
+    let device = must!(must!(compiler.compile_many(&program, target)).execute(&inputs));
+    for ((actual, (_, expected)), index) in device.iter().zip(&outputs).zip(0..) {
+        // Bool 回讀標記為 bool，值與 CPU 完全相同；f32 輸出同為原生 f32 運算。
+        assert_eq!(
+            actual.data(),
+            expected.as_slice(),
+            "{target:?} output {index}"
+        );
+        let dtype = if index < 15 {
+            TensorDType::Bool
+        } else {
+            TensorDType::F32
+        };
+        assert_eq!(actual.dtype(), dtype, "{target:?} output {index}");
+    }
+
+    let (graph, loss) = must!(masked_loss_graph());
+    let vjp = must!(graph.symbolic_vjp(loss, "seed"));
+    let outputs = vec![vjp.value, vjp.gradients["x"], vjp.gradients["w"]];
+    let program = must!(NablaMultiOutputProgram::new(vjp.graph, outputs));
+    let cpu = must!(must!(compiler.compile_many(&program, NablaTarget::Cpu)).execute(&inputs));
+    let device = must!(must!(compiler.compile_many(&program, target)).execute(&inputs));
+    let error = max_scaled_error(&device, &cpu);
+    println!("{target:?} masked loss and gradients: scaled error {error:e}");
+    assert!(error <= 1e-5, "device masked loss error {error:e}");
+    assert!(device
+        .iter()
+        .all(|value| value.data().iter().all(|entry| entry.is_finite())));
+
+    let (graph, output) = must!(finite_guard_cond_graph());
+    let vjp = must!(graph.symbolic_vjp(output, "seed"));
+    let program = must!(NablaMultiOutputProgram::new(
+        vjp.graph,
+        vec![vjp.value, vjp.gradients["x"]]
+    ));
+    for x in [BOOL_X.to_vec(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]] {
+        let inputs = bool_inputs(&x);
+        let cpu = must!(must!(compiler.compile_many(&program, NablaTarget::Cpu)).execute(&inputs));
+        let device = must!(must!(compiler.compile_many(&program, target)).execute(&inputs));
+        for (actual, expected) in device.iter().zip(&cpu) {
+            assert_eq!(actual.data(), expected.data(), "{target:?} cond");
+        }
+    }
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_bool_masks_comparisons_and_guarded_gradients_match_cpu() {
+    assert_bool_parity(NablaTarget::Mlx);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_bool_masks_comparisons_and_guarded_gradients_match_cpu_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    assert_bool_parity(NablaTarget::Cuda { device_ordinal: 0 });
+}

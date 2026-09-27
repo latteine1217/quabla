@@ -2248,6 +2248,7 @@ fn execute_cuda_device_program(
             | TensorOp::Div { .. }
             | TensorOp::Mul { .. }
             | TensorOp::Greater { .. }
+            | TensorOp::Compare { .. }
             | TensorOp::Where { .. }
             | TensorOp::Tanh { .. }
             | TensorOp::Exp { .. }
@@ -2855,7 +2856,8 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
         | TensorOp::Sub { lhs, rhs }
         | TensorOp::Div { lhs, rhs }
         | TensorOp::Mul { lhs, rhs }
-        | TensorOp::Greater { lhs, rhs } => {
+        | TensorOp::Greater { lhs, rhs }
+        | TensorOp::Compare { lhs, rhs, .. } => {
             launch.arg(cuda_value(values, *lhs)?);
             launch.arg(cuda_value(values, *rhs)?);
             launch.arg(output);
@@ -3683,6 +3685,7 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
             | TensorOp::Div { .. }
             | TensorOp::Mul { .. }
             | TensorOp::Greater { .. }
+            | TensorOp::Compare { .. }
             | TensorOp::Where { .. }
             | TensorOp::Tanh { .. }
             | TensorOp::Exp { .. }
@@ -3762,6 +3765,7 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
             | TensorOp::Div { .. }
             | TensorOp::Mul { .. }
             | TensorOp::Greater { .. }
+            | TensorOp::Compare { .. }
             | TensorOp::Where { .. }
             | TensorOp::Tanh { .. }
             | TensorOp::Exp { .. }
@@ -3907,6 +3911,12 @@ fn cuda_fori_body_expression(
             child(*lhs)?,
             child(*rhs)?
         )),
+        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
+            "(({} {} {}) ? 1.0f : 0.0f)",
+            child(*lhs)?,
+            kind.operator(),
+            child(*rhs)?
+        )),
         TensorOp::Where {
             condition,
             on_true,
@@ -4036,6 +4046,12 @@ fn cuda_scan_body_expression_in_half(
             child(*lhs)?,
             child(*rhs)?
         )),
+        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
+            "(({} {} {}) ? 1.0f : 0.0f)",
+            child(*lhs)?,
+            kind.operator(),
+            child(*rhs)?
+        )),
         TensorOp::Where {
             condition,
             on_true,
@@ -4155,6 +4171,12 @@ fn cuda_elementwise_plan_expression_with_index(
         TensorOp::Greater { lhs, rhs } => Ok(format!(
             "(({} > {}) ? 1.0f : 0.0f)",
             child(*lhs)?,
+            child(*rhs)?
+        )),
+        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
+            "(({} {} {}) ? 1.0f : 0.0f)",
+            child(*lhs)?,
+            kind.operator(),
             child(*rhs)?
         )),
         TensorOp::Where {
@@ -6280,7 +6302,8 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
             | TensorOp::Sub { lhs, rhs }
             | TensorOp::Div { lhs, rhs }
             | TensorOp::Mul { lhs, rhs }
-            | TensorOp::Greater { lhs, rhs } => {
+            | TensorOp::Greater { lhs, rhs }
+            | TensorOp::Compare { lhs, rhs, .. } => {
                 let lhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*lhs].shape);
                 let rhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*rhs].shape);
                 let expression = match &node.op {
@@ -6291,6 +6314,10 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                     TensorOp::Greater { .. } => {
                         format!("lhs[{lhs_offset}] > rhs[{rhs_offset}] ? 1.0f : 0.0f")
                     }
+                    TensorOp::Compare { kind, .. } => format!(
+                        "lhs[{lhs_offset}] {} rhs[{rhs_offset}] ? 1.0f : 0.0f",
+                        kind.operator()
+                    ),
                     _ => unreachable!(),
                 };
                 format!(
@@ -6729,6 +6756,7 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Div { .. } => "div",
         TensorOp::Mul { .. } => "mul",
         TensorOp::Greater { .. } => "greater",
+        TensorOp::Compare { kind, .. } => kind.name(),
         TensorOp::Where { .. } => "where",
         TensorOp::Cond { .. } => "cond",
         TensorOp::Fori { .. } => "fori",
