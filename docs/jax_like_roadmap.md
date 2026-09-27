@@ -1221,9 +1221,10 @@ mixed-schedule Rust test matches the global CPU plan within `1.7e-7`
 reported collective durations (0.63-1.08 s) are not steady-state collective
 costs. Job 6005 ran the same Python parity against the pre-`b38b987`
 extension, whose per-rank NCCL calls were not grouped, and hit its 20-minute
-limit; with grouping, job 6008 finished in 7 s. Later commits changed how
-the data-parallel path freezes its program (`920ee7d`) and have not yet been
-rerun on two GPUs.
+limit; with grouping, job 6008 finished in 7 s. Commit `920ee7d` later
+changed how the data-parallel path freezes its program; job 6009 reran both
+checks at `535ef84` on the same node and reproduced the same values and
+errors.
 
 Remaining implementation order:
 
