@@ -3,6 +3,8 @@ name = "nabla-core"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Tensor IR, autodiff transforms, and CPU/CUDA/MLX backends for Nabla"
 
 [lib]
 name = "nabla_core"

@@ -7,6 +7,11 @@ name = "nabla"
 version = "0.1.0"
 description = "Rust-backed SciML runtime experiment exposed to Python"
 requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+
+[project.urls]
+Repository = "https://github.com/latteine1217/quabla"
 
 [tool.maturin]
 manifest-path = "crates/nabla-python/Cargo.toml"
