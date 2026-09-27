@@ -317,8 +317,11 @@ loss/gradient readbacks, so neither is a CUDA/JAX comparison.
   all-reduces only requested replicated parameter gradients. It reports
   enqueue, collective, and output-readback timing after a call. On two RTX
   3090s, single calls match the deterministic CPU reference exactly for `Sum`
-  and `Mean`; multi-step training and steady-state collective timing are not
-  yet measured.
+  and `Mean`, and 200 SGD steps of a small MLP
+  (`examples/validate_data_parallel_training_cuda.py`) stay within `2.1e-8`
+  normwise parameter error of the single-GPU run. NCCL communicators are
+  created once per compiled callable; the steady-state collective takes about
+  0.1 ms per step there.
 - `TensorBackend` defines the rank-N plan execution contract. `CpuBackend` is
   the default implementation. On Linux, the optional `cuda` feature adds an
   NVRTC-compiled FP32 `CudaBackend` and immutable `TensorCudaExecutionPlan`.

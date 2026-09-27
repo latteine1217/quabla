@@ -1226,24 +1226,77 @@ changed how the data-parallel path freezes its program; job 6009 reran both
 checks at `535ef84` on the same node and reproduced the same values and
 errors.
 
+Two-GPU training verification (2026-09-27): the data-parallel plan created
+its NCCL communicators (`ncclCommInitAll`) on every call and dropped them,
+issuing `ncclCommAbort`, before synchronizing the replicas; the single-call
+collective durations above were mostly that initialization. Commit
+`b9131a2` creates the communicators once in `compile_data_parallel` and
+keeps them for the plan's lifetime behind a mutex that serializes
+invocations. `examples/validate_data_parallel_training_cuda.py` trains a
+2-32-32-1 tanh MLP on a fixed 16x16 grid (256 rows, mapped `x`/`target`)
+for 200 host-side SGD steps (learning rate 0.1) from identical f32-rounded
+Glorot weights and zero biases in four modes: the two-GPU callable with
+`mean`, the same with `sum` (loss and learning rate divided by 2), the
+single-GPU callable on the full batch, and the full-batch f64 CPU
+value-and-gradient.
+A pair fails if any step's loss differs by more than `1e-4` relative to the
+second mode of the pair, or if the final parameters differ by more than
+`1e-4` in `max|a - b| / max|b|` over all parameters. `1e-4` is about 6.5
+times the f32 worst-case rounding bound for the 256-row batch mean
+(`256 * 2^-24`), while reduction bugs such as a `Sum`/`Mean` mix-up give
+O(1) differences. Slurm job 6011 (`scripts/slurm/nabla_p7_training.sbatch`,
+node gpu-node, 2x RTX 3090, driver 560.35.05, CUDA 12.6, NCCL 2.24.3) ran the
+tree of `66ef989` and passed; job 6010 produced identical differences but
+exited non-zero because its 50-step baseline run did not meet the
+loss-halving check. Loss fell from 0.3024 to 0.1335 in every mode.
+
+| Pair | Max loss rel. error | Max param abs. error | Param normwise rel. error |
+| --- | --- | --- | --- |
+| two-GPU mean vs single GPU | 1.9e-7 | 1.9e-8 | 2.1e-8 |
+| two-GPU mean vs CPU (f64) | 2.7e-7 | 1.4e-7 | 1.6e-7 |
+| single GPU vs CPU (f64) | 3.1e-7 | 1.4e-7 | 1.6e-7 |
+| two-GPU sum vs two-GPU mean | 0 | 0 | 0 |
+
+Timing is host-observed per call; steady state is steps 10-199 (median,
+min-max). The baseline row is the pre-fix extension (`4d99716`) run in the
+same job with the same 200 steps; it reproduced the final loss exactly.
+
+| Two-GPU `mean` | First step | Steady median | Steady min-max |
+| --- | --- | --- | --- |
+| collective, pre-fix | 1.03 s | 0.634 s | 0.619-0.653 s |
+| collective | 62.7 ms | 0.106 ms | 0.103-0.325 ms |
+| replica enqueue | 98.2 ms | 0.401 ms | 0.382-3.91 ms |
+| output readback | 0.087 ms | 0.049 ms | 0.047-0.142 ms |
+| call wall | 161 ms | 0.581 ms | 0.557-4.51 ms |
+
+The single-GPU call takes 0.239 ms (steady median) on the full batch, so
+at this problem size two GPUs are slower per step; the check establishes
+correctness and the collective cost, not a speedup. Parameter updates run
+on the host, gradients return to the host every step, and only one node
+with two GPUs was measured.
+
 Remaining implementation order:
 
 1. Validate the Python scalar value-and-gradient callable on two GPUs against
    the deterministic CPU oracle for both `Sum` and `Mean`; only then consider
    mapped-input gradient concatenation as a separate output contract.
-   Single-call parity verified (2026-09-27, job 6008); a multi-step
-   training loop with steady-state collective timing is still unmeasured.
+   Single-call parity verified (2026-09-27, job 6008); 200-step training
+   parity and steady-state collective timing verified (2026-09-27, job
+   6011).
 2. Bind `TensorShardingPlan::all_reduces` to CUDA lowering, preserving its
    operation order and rejecting schedules not represented by the first
    data-parallel subset. Implemented and two-GPU parity verified
    (2026-09-27, job 6008).
 3. Add failure-handling and communicator-lifecycle coverage before considering
-   multi-node transport or tensor-parallel matmul.
+   multi-node transport or tensor-parallel matmul. Communicators are now
+   created once per compiled plan (2026-09-27); recovery after a failed
+   collective and drop during in-flight work remain untested.
 
 Acceptance checks:
 
 - Two-GPU data-parallel training matches the single-GPU reference within
-  documented tolerance and records collective timing separately.
+  documented tolerance and records collective timing separately. Met
+  (2026-09-27, job 6011) for the host-SGD MLP check above.
 
 ### Research Track: Rust Source-To-Source AD
 
