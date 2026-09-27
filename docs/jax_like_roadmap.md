@@ -1004,7 +1004,10 @@ recorded in P6.
 2. P7 needs a host exposing at least two CUDA devices and NCCL. When that
    prerequisite is available, connect the typed sharding schedule to the
    Python training interface, add two-GPU loss/gradient parity, then measure
-   collective and readback boundaries separately.
+   collective and readback boundaries separately. Status (2026-09-27):
+   `gpu-cluster` provides two RTX 3090s with NCCL; single-call two-GPU
+   parity passes (see P7). Multi-step training and steady-state collective
+   timing remain.
 
 Implementation note (2026-07-29): `TensorForiTape` retains the fixed-bound
 forward carry sequence and is reused by direct and symbolic reverse paths.
@@ -1206,19 +1209,33 @@ Verification boundary: macOS CPU tests cover the lowering, a CPU simulation of
 the mixed schedule against the global CPU plan, and every rejection above.
 On `cuda-host`, the `cuda` suite, `cuda` and `cuda-nccl` clippy, the
 `cuda-nccl` test build, and the Python matrix pass; that host has one GPU and
-no NCCL library, so the NCCL-gated two-GPU test returns early there. Slurm job
-6008 on `gpu-cluster` runs the existing Python `Sum`/`Mean` parity and the
-mixed-schedule Rust parity test on two GPUs; its result is pending.
+no NCCL library, so the NCCL-gated two-GPU test returns early there.
+
+Two-GPU verification (2026-09-27): slurm job 6008 on `gpu-cluster` (node
+gpu-node, 2x RTX 3090, driver 560.35.05, CUDA 12.6 module) ran commit
+`b38b987`. The Python caller-reduction callable matches the deterministic
+CPU oracle exactly for both reductions (`Sum`: loss 35.75, weight gradient
+-45.0; `Mean`: loss 17.875, gradient -22.5; absolute error 0.0). The
+mixed-schedule Rust test matches the global CPU plan within `1.7e-7`
+(`Sum` output) and `5.0e-9` (`Mean` output). Each is a single call, so the
+reported collective durations (0.63-1.08 s) are not steady-state collective
+costs. Job 6005 ran the same Python parity against the pre-`b38b987`
+extension, whose per-rank NCCL calls were not grouped, and hit its 20-minute
+limit; with grouping, job 6008 finished in 7 s. Later commits changed how
+the data-parallel path freezes its program (`920ee7d`) and have not yet been
+rerun on two GPUs.
 
 Remaining implementation order:
 
 1. Validate the Python scalar value-and-gradient callable on two GPUs against
    the deterministic CPU oracle for both `Sum` and `Mean`; only then consider
    mapped-input gradient concatenation as a separate output contract.
+   Single-call parity verified (2026-09-27, job 6008); a multi-step
+   training loop with steady-state collective timing is still unmeasured.
 2. Bind `TensorShardingPlan::all_reduces` to CUDA lowering, preserving its
    operation order and rejecting schedules not represented by the first
-   data-parallel subset. Implemented (2026-09-27); two-GPU parity is pending
-   job 6008.
+   data-parallel subset. Implemented and two-GPU parity verified
+   (2026-09-27, job 6008).
 3. Add failure-handling and communicator-lifecycle coverage before considering
    multi-node transport or tensor-parallel matmul.
 
