@@ -1049,18 +1049,21 @@ def test_compiler_facade_cuda_rejects_every_unsupported_scan_lane_form():
     def hvp(body, carry_shape, capture_shape):
         return gradient(body, carry_shape, capture_shape, "capture").jvp("capture")
 
-    reshaped_capture = lambda index, current, capture: (
-        (current * capture.reshape([1, 2])).tanh(),
-        (current * capture.reshape([1, 2])).tanh(),
-    )
-    scalar_capture = lambda index, current, capture: (
-        current * capture.tanh(),
-        current * capture.tanh(),
-    )
-    linear = lambda index, current, capture: (
-        current * capture + index,
-        current * capture + index,
-    )
+    def reshaped_capture(index, current, capture):
+        return (
+            (current * capture.reshape([1, 2])).tanh(),
+            (current * capture.reshape([1, 2])).tanh(),
+        )
+    def scalar_capture(index, current, capture):
+        return (
+            current * capture.tanh(),
+            current * capture.tanh(),
+        )
+    def linear(index, current, capture):
+        return (
+            current * capture + index,
+            current * capture + index,
+        )
     cases = [
         # Primal Scan: lane shapes and capture shapes.
         (
@@ -3556,13 +3559,14 @@ def test_tensor_vmap_scan_region_places_batch_axis_after_time_axis():
 
 
 def test_tensor_vmap_fori_region_vjp_preserves_per_example_gradients():
-    function = lambda initial, scale: nabla.tensor_fori_loop_region(
-        0,
-        3,
-        lambda index, carry, captured_scale: carry + index * captured_scale,
-        initial,
-        [scale],
-    )
+    def function(initial, scale):
+        return nabla.tensor_fori_loop_region(
+            0,
+            3,
+            lambda index, carry, captured_scale: carry + index * captured_scale,
+            initial,
+            [scale],
+        )
     values = {
         "initial": nabla.Tensor([2], [1.0, 2.0]),
         "scale": nabla.Tensor([2], [2.0, 3.0]),
@@ -3651,16 +3655,17 @@ def test_tensor_vmap_scan_region_jvp_preserves_batch_major_output_layout():
 
 
 def test_tensor_vmap_scan_region_vjp_matches_cpu_on_cuda():
-    function = lambda initial, scale: nabla.tensor_scan_region(
-        0,
-        3,
-        lambda index, carry, captured_scale: (
-            (carry * captured_scale + index).tanh(),
-            (carry * captured_scale + index).tanh(),
-        ),
-        initial,
-        [scale],
-    )[1]
+    def function(initial, scale):
+        return nabla.tensor_scan_region(
+            0,
+            3,
+            lambda index, carry, captured_scale: (
+                (carry * captured_scale + index).tanh(),
+                (carry * captured_scale + index).tanh(),
+            ),
+            initial,
+            [scale],
+        )[1]
     values = {
         "initial": nabla.Tensor([2], [0.2, -0.3]),
         "scale": nabla.Tensor([2], [0.8, 1.1]),
@@ -3690,16 +3695,17 @@ def test_tensor_vmap_scan_region_vjp_matches_cpu_on_cuda():
 
 
 def test_tensor_vmap_hvp_scalar_scan_region_matches_finite_difference_and_cuda():
-    function = lambda initial, scale: nabla.tensor_scan_region(
-        0,
-        3,
-        lambda index, carry, captured_scale: (
-            (carry * captured_scale + index).tanh(),
-            (carry * captured_scale + index).tanh(),
-        ),
-        initial,
-        [scale],
-    )[0]
+    def function(initial, scale):
+        return nabla.tensor_scan_region(
+            0,
+            3,
+            lambda index, carry, captured_scale: (
+                (carry * captured_scale + index).tanh(),
+                (carry * captured_scale + index).tanh(),
+            ),
+            initial,
+            [scale],
+        )[0]
     specs = [("initial", []), ("scale", [])]
     values = {
         "initial": nabla.Tensor([2], [0.2, -0.3]),
@@ -3739,7 +3745,8 @@ def test_tensor_vmap_hvp_scalar_scan_region_matches_finite_difference_and_cuda()
 
 
 def test_tensor_vmap_hvp_scalar_restores_nonleading_input_axis_on_cuda():
-    function = lambda x, scale: (x * x * scale).sum()
+    def function(x, scale):
+        return (x * x * scale).sum()
     values = {
         "x": nabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
         "scale": nabla.Tensor([2], [0.5, -1.0]),
@@ -3767,16 +3774,17 @@ def test_tensor_vmap_hvp_scalar_restores_nonleading_input_axis_on_cuda():
 
 
 def test_tensor_vmap_hvp_scalar_scan_capture_matches_finite_difference_and_cuda():
-    function = lambda initial, scale: nabla.tensor_scan_region(
-        0,
-        3,
-        lambda index, carry, captured_scale: (
-            (carry * captured_scale + index).tanh(),
-            (carry * captured_scale + index).tanh(),
-        ),
-        initial,
-        [scale],
-    )[0]
+    def function(initial, scale):
+        return nabla.tensor_scan_region(
+            0,
+            3,
+            lambda index, carry, captured_scale: (
+                (carry * captured_scale + index).tanh(),
+                (carry * captured_scale + index).tanh(),
+            ),
+            initial,
+            [scale],
+        )[0]
     specs = [("initial", []), ("scale", [])]
     values = {
         "initial": nabla.Tensor([2], [0.2, -0.3]),
@@ -3816,13 +3824,14 @@ def test_tensor_vmap_hvp_scalar_scan_capture_matches_finite_difference_and_cuda(
 
 
 def test_tensor_vmap_hvp_scalar_fori_capture_matches_exact_hessian_and_cuda():
-    function = lambda initial, scale: nabla.tensor_fori_loop_region(
-        0,
-        3,
-        lambda index, carry, captured_scale: carry * captured_scale + index,
-        initial,
-        [scale],
-    )
+    def function(initial, scale):
+        return nabla.tensor_fori_loop_region(
+            0,
+            3,
+            lambda index, carry, captured_scale: carry * captured_scale + index,
+            initial,
+            [scale],
+        )
     values = {
         "initial": nabla.Tensor([2], [1.0, 2.0]),
         "scale": nabla.Tensor([2], [0.5, 1.5]),
@@ -3846,13 +3855,14 @@ def test_tensor_vmap_hvp_scalar_fori_capture_matches_exact_hessian_and_cuda():
 
 
 def test_tensor_vmap_hvp_scalar_fori_capture_restores_nonleading_axis_on_cuda():
-    function = lambda initial, scale: nabla.tensor_fori_loop_region(
-        0,
-        3,
-        lambda index, carry, captured_scale: carry * captured_scale + index,
-        initial,
-        [scale],
-    ).sum()
+    def function(initial, scale):
+        return nabla.tensor_fori_loop_region(
+            0,
+            3,
+            lambda index, carry, captured_scale: carry * captured_scale + index,
+            initial,
+            [scale],
+        ).sum()
     specs = [("initial", [2]), ("scale", [2])]
     values = {
         "initial": nabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
@@ -3881,13 +3891,14 @@ def test_tensor_vmap_hvp_scalar_fori_capture_restores_nonleading_axis_on_cuda():
 
 
 def test_tensor_vmap_fori_jvp_preserves_mapped_capture_and_nonleading_axes():
-    function = lambda initial, scale: nabla.tensor_fori_loop_region(
-        0,
-        3,
-        lambda index, carry, captured_scale: carry + index * captured_scale,
-        initial,
-        [scale],
-    )
+    def function(initial, scale):
+        return nabla.tensor_fori_loop_region(
+            0,
+            3,
+            lambda index, carry, captured_scale: carry + index * captured_scale,
+            initial,
+            [scale],
+        )
     values = {
         "initial": nabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
         "scale": nabla.Tensor([2, 3], [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]),
@@ -4155,7 +4166,8 @@ def test_tensor_vmap_cuda_vjp_matches_cpu_single_batched_plan():
     if os.environ.get("NABLA_CUDA_TEST") is None:
         return
 
-    function = lambda x, weight: (x * weight).tanh().sum()
+    def function(x, weight):
+        return (x * weight).tanh().sum()
     input_specs = [("x", [2]), ("weight", [2])]
     values = {
         "x": nabla.Tensor([2, 3], [0.0, 0.5, -1.0, 1.0, -0.5, 2.0]),
@@ -4182,7 +4194,8 @@ def test_tensor_vmap_cuda_vjp_matches_cpu_single_batched_plan():
 
 
 def test_tensor_vmap_batched_mlp_gradients_match_loop_on_cpu_and_cuda():
-    function = lambda x, weight: (x.matmul(weight).tanh()).sum()
+    def function(x, weight):
+        return (x.matmul(weight).tanh()).sum()
     input_specs = [("x", [2]), ("weight", [2, 1])]
     values = {
         "x": nabla.Tensor([3, 2], [1.0, 2.0, -1.0, 0.5, 0.25, -2.0]),
@@ -4329,13 +4342,14 @@ def test_tensor_value_and_grad_mlx_fn_supports_fixed_fori_regions():
     if os.environ.get("NABLA_MLX_TEST") is None:
         return
 
-    function = lambda initial, scale: nabla.tensor_fori_loop_region(
-        0,
-        3,
-        lambda index, carry, captured_scale: carry * captured_scale + index,
-        initial,
-        [scale],
-    ).powi(2).mean()
+    def function(initial, scale):
+        return nabla.tensor_fori_loop_region(
+            0,
+            3,
+            lambda index, carry, captured_scale: carry * captured_scale + index,
+            initial,
+            [scale],
+        ).powi(2).mean()
     inputs = {
         "initial": nabla.Tensor([], [1.0]),
         "scale": nabla.Tensor([], [2.0]),
@@ -4411,7 +4425,8 @@ def test_tensor_value_and_grad_batch_mlx_fn_specializes_collocation_batches():
     if os.environ.get("NABLA_MLX_TEST") is None:
         return
 
-    function = lambda x, target, weight: ((x * weight - target).powi(2)).mean()
+    def function(x, target, weight):
+        return ((x * weight - target).powi(2)).mean()
     mlx = nabla.tensor_value_and_grad_batch_mlx_fn(
         function,
         ["x", "target", "weight"],
@@ -4917,7 +4932,8 @@ def test_two_layer_mlp_poisson_training_converges():
         ("x", [4, 1]), ("w1", [1, 2]), ("b1", [1, 2]),
         ("w2", [2, 1]), ("b2", [1, 1]), ("forcing", [4, 1]),
     ]
-    model = lambda x, w1, b1, w2, b2, forcing: (x.matmul(w1) + b1).tanh().matmul(w2) + b2
+    def model(x, w1, b1, w2, b2, forcing):
+        return (x.matmul(w1) + b1).tanh().matmul(w2) + b2
     residual_trace = nabla.trace_tensor(model, parameter_specs)
     second_derivative = residual_trace.symbolic_jvp("x").symbolic_jvp("x")
     residual = second_derivative.output + second_derivative.graph.input("forcing")
@@ -5492,7 +5508,7 @@ def test_cpu_execution_plan_evaluates_vjp():
 
 def test_cpu_execution_plan_eliminates_unreachable_trace_nodes():
     def model(a):
-        unused = a.exp()
+        _unreachable = a.exp()
         return a + 1.0
 
     traced = nabla.trace(model, [("a", (2, 2))])

@@ -39,7 +39,8 @@ def benchmark(
     lhs_shape = [rows, inner] if rank_two else [batch, rows, inner]
     rhs_shape = [inner, cols] if rank_two else [1, inner, cols]
     if elementwise:
-        model = lambda x: ((x * 0.75 + 0.125).tanh().sin().exp())
+        def model(x):
+            return ((x * 0.75 + 0.125).tanh().sin().exp())
         traced = nabla.trace_tensor(model, [("x", lhs_shape)])
         inputs = {"x": tensor(lhs_shape, 0)}
     else:
