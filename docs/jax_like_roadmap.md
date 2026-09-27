@@ -1275,6 +1275,84 @@ correctness and the collective cost, not a speedup. Parameter updates run
 on the host, gradients return to the host every step, and only one node
 with two GPUs was measured.
 
+Failure handling and communicator lifecycle (2026-09-27): a failed
+data-parallel call kept its communicators, although a failure while
+enqueuing one rank's all-reduce inside the NCCL group can leave the
+collective launched on the other ranks only. Commit `a132f2a` defines the
+contract: any error after the communicator lock is taken is returned with
+the note that the communicators were aborted, the failed call drops them
+(`ncclCommAbort`), and the next call on the plan or any clone creates new
+ones before enqueuing; a panic while the lock is held still poisons it and
+rejects every later call. The natural trigger is a replica whose input map
+lacks its shard: it fails input validation after replica 0 has enqueued
+its work. No fault-injection seam was added, so an error returned by NCCL
+itself takes the same path but is not exercised. Slurm job 6015
+(`scripts/slurm/nabla_p7_robustness.sbatch`, node gpu-node, 2x RTX 3090,
+driver 560.35.05, NCCL 2.24.3) ran the tree of `ff0735e`:
+
+- Recovery: after a successful call, two consecutive failed calls each
+  returned `missing input "x"` with the reset note (the second first
+  recreated the communicators); the next three calls through a clone
+  matched the CPU plan within `1e-5`. The first recovered call took
+  109 ms wall, which includes creating the communicators and a 67.6 ms
+  first collective on them (first collectives of fresh plans in the same
+  job take 43-71 ms); the next two took 0.33 ms and 0.25 ms.
+- Lifecycle: 50 compile, execute, drop cycles in 37.9 s, each matching
+  the CPU plan within `1e-5`; odd cycles dropped the plan right after a
+  failed call that left replica 0's work enqueued. With the test holding
+  both primary contexts, free device memory after every cycle was
+  24,929,959,936 bytes on both GPUs: zero drift, 116 MiB below the level
+  before the first plan. `nvidia-smi` reported 2 MiB used on both GPUs
+  before and after the tests. No call or drop hung; every step ran under
+  a 300 s timeout.
+
+Larger-scale training (2026-09-27): the same job ran the validation at
+16,384 and 65,536 rows (`--grid 128`/`256`) and widths 256 and 512 for 50
+SGD steps (learning rate 0.1, steady state steps 10-49), comparing the
+two-GPU callable with the single-GPU callable; the f64 CPU mode is too
+slow at these sizes. The tolerance, fixed before the run, keeps its ratio
+to the worst-case rounding bound of the batch mean and so grows linearly
+above 256 rows (`6.4e-3` at 16,384, `2.56e-2` at 65,536). At that level a
+50-step trajectory whose loss barely moves would not expose a `Sum`/`Mean`
+mix-up (a CPU simulation with doubled learning rate stays at `7.0e-3`
+loss and `2.1e-2` parameter error), so every pair now also compares the
+first step's gradients, evaluated at identical inputs, where such a bug is
+an O(1) normwise error. Plain SGD at these widths only leaves its initial
+plateau after a few hundred steps, so these runs require only that the
+loss does not increase (`--max-loss-ratio 1.0`). The default 256-row run
+in the same job reproduced job 6011 (loss 0.3024 to 0.1335, identical
+error levels, first-step gradient error at most `2.0e-7`).
+
+| Rows | Width | Loss | Max loss rel. error | Param normwise rel. error | First-step gradient rel. error |
+| --- | --- | --- | --- | --- | --- |
+| 16,384 | 256 | 0.2656 to 0.2501 | 3.6e-7 | 2.0e-8 | 3.2e-6 |
+| 16,384 | 512 | 0.2527 to 0.2498 | 3.6e-7 | 3.6e-8 | 5.0e-6 |
+| 65,536 | 256 | 0.2657 to 0.2501 | 7.1e-7 | 3.8e-8 | 3.2e-6 |
+| 65,536 | 512 | 0.2526 to 0.2499 | 7.8e-7 | 2.9e-8 | 5.3e-6 |
+
+The errors are two-GPU `mean` against the single GPU. Two-GPU `sum`
+against `mean` gives zero parameter and first-step gradient error in
+every configuration and at most `2.4e-7` loss error, consistent with the
+atomic accumulation of the scalar loss.
+
+| Rows | Width | Single-GPU call | Two-GPU call | Enqueue | Collective | Readback | Two-GPU speedup |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 256 | 32 | 0.250 ms | 0.591 ms | 0.402 ms | 0.107 ms | 0.049 ms | 0.42x |
+| 16,384 | 256 | 3.04 ms | 2.84 ms | 0.76 ms | 1.01 ms | 0.17 ms | 1.07x |
+| 16,384 | 512 | 8.43 ms | 14.8 ms | 1.66 ms | 2.07 ms | 1.61 ms | 0.57x |
+| 65,536 | 256 | 10.8 ms | 6.68 ms | 1.03 ms | 3.79 ms | 0.18 ms | 1.62x |
+| 65,536 | 512 | 24.9 ms | 22.6 ms | 1.85 ms | 7.78 ms | 1.64 ms | 1.10x |
+
+All values are steady-state medians of host-observed call time for
+two-GPU `mean`; speedup is the single-GPU call divided by the two-GPU
+call. The collective interval includes waiting for the replicas' compute,
+because enqueue returns before the kernels finish, so at these sizes it is
+not the NCCL cost alone. Two GPUs are faster at 16,384 rows and width 256
+and at both 65,536-row sizes, and slower at 16,384 rows and width 512,
+where about 9 ms of the two-GPU call lies outside the three recorded
+intervals and is not attributed. One node, one job, and host-side
+parameter updates were measured.
+
 Remaining implementation order:
 
 1. Validate the Python scalar value-and-gradient callable on two GPUs against
@@ -1289,8 +1367,11 @@ Remaining implementation order:
    (2026-09-27, job 6008).
 3. Add failure-handling and communicator-lifecycle coverage before considering
    multi-node transport or tensor-parallel matmul. Communicators are now
-   created once per compiled plan (2026-09-27); recovery after a failed
-   collective and drop during in-flight work remain untested.
+   created once per compiled plan (2026-09-27). Failure recovery and 50
+   compile/execute/drop cycles verified on two GPUs (2026-09-27, job 6015);
+   an error returned by NCCL itself and a drop while a collective is in
+   flight are not exercised, because the public API cannot reach them
+   without fault injection.
 
 Acceptance checks:
 
