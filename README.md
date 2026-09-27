@@ -148,7 +148,8 @@ loss/gradient readbacks, so neither is a CUDA/JAX comparison.
   parameters. Its rules cover every current rank-N `TensorIr` primitive.
   A `TraceTensor` cannot be used as a Python boolean, preventing accidental
   data-dependent host branches during tracing; use `nabla.where` for
-  elementwise selection while structured `cond`/loop IR is pending.
+  elementwise selection, or the structured `tensor_cond` and loop-region APIs
+  described below.
   `tensor_fori_loop(lower, upper, body, init)` statically unrolls a
   fixed-bounds, shape-preserving TraceTensor carry into that same IR.
   `tensor_fori_loop_region(lower, upper, body, init, operands)` instead
@@ -314,9 +315,10 @@ loss/gradient readbacks, so neither is a CUDA/JAX comparison.
   data-parallel path. `tensor_value_and_grad_data_parallel_cuda_fn(...)`
   shards named axis-zero batch inputs across explicit CUDA ordinals and
   all-reduces only requested replicated parameter gradients. It reports
-  enqueue, collective, and output-readback timing after a call. This interface
-  has feature and single-device rejection coverage, but not yet a verified
-  two-GPU numerical result.
+  enqueue, collective, and output-readback timing after a call. On two RTX
+  3090s, single calls match the deterministic CPU reference exactly for `Sum`
+  and `Mean`; multi-step training and steady-state collective timing are not
+  yet measured.
 - `TensorBackend` defines the rank-N plan execution contract. `CpuBackend` is
   the default implementation. On Linux, the optional `cuda` feature adds an
   NVRTC-compiled FP32 `CudaBackend` and immutable `TensorCudaExecutionPlan`.
