@@ -91,10 +91,13 @@ Current state:
   no general machine-code JIT.
 - Linux has an NVRTC CUDA path for rank-N plans, including device-resident
   symbolic VJP/JVP evaluation and parameter updates.
-- Apple silicon has an experimental MLX primal-plan backend. It executes
-  supported frozen Tensor IR nodes on `StreamOrDevice::gpu()` and deliberately
-  reports unsupported reverse-only nodes rather than falling back to CPU.
-- There is no distributed runtime.
+- Apple silicon has an MLX backend that executes supported frozen Tensor IR
+  plans, including reverse-mode and device-resident Adam training (P6), on
+  `StreamOrDevice::gpu()`, and reports unsupported nodes rather than falling
+  back to CPU.
+- The optional Linux `cuda-nccl` feature provides single-node data-parallel
+  execution with NCCL all-reduce, verified on two GPUs (P7); there is no
+  multi-node or tensor-parallel runtime.
 
 Target direction:
 

@@ -125,8 +125,8 @@ f32 [0.4608122408390045]
 [0.0, -0.09867792576551437, 0.19735585153102875, 1.484932780265808]
 ```
 
-The same function goes through the compiler facade, which compiles one traced
-program for every target in the build:
+Continuing in the same session, the same function goes through the compiler
+facade, which compiles one traced program for every target in the build:
 
 ```python
 compiler = nabla.Compiler()
