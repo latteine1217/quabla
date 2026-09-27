@@ -2566,6 +2566,66 @@ fn mlx_backend_executes_only_the_selected_cond_region_with_ad_parity() {
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
+fn mlx_backend_returns_float_masks_from_greater_like_cpu() {
+    // greater 在 IR 中是 0/1 浮點遮罩；MLX 回讀、累加與 Cond 謂詞都須與 CPU 一致。
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3]));
+    let y = must!(graph.input("y", vec![3]));
+    let mask = must!(graph.greater(x, y));
+    let doubled = must!(graph.add(mask, mask));
+    let count = must!(graph.sum(doubled));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![1.0, 2.0, 3.0])),
+        ),
+        (
+            "y".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![2.0, 2.0, 2.0])),
+        ),
+    ]);
+    let mask_plan = must!(graph.compile_cpu(mask));
+    let cpu_mask = must!(CpuBackend.execute(&mask_plan, &inputs));
+    let cpu_count = must!(CpuBackend.execute(&must!(graph.compile_cpu(count)), &inputs));
+    assert_eq!(cpu_mask.data(), &[0.0, 0.0, 1.0]);
+    assert_eq!(cpu_count.data(), &[2.0]);
+    assert_eq!(
+        must!(MlxBackend.execute(&mask_plan, &inputs)).data(),
+        cpu_mask.data()
+    );
+    let (plan, outputs) = must!(graph.compile_cpu_many(&[mask, count]));
+    let mlx = must!(MlxBackend.execute_many(&plan, &outputs, &inputs));
+    assert_eq!(mlx[0].data(), cpu_mask.data());
+    assert_eq!(mlx[1].data(), cpu_count.data());
+
+    let mut true_branch = TensorIr::new();
+    let true_x = must!(true_branch.input("x", vec![]));
+    let true_output = must!(true_branch.mul(true_x, true_x));
+    let mut false_branch = TensorIr::new();
+    let false_x = must!(false_branch.input("x", vec![]));
+    let false_output = must!(false_branch.add(false_x, false_x));
+    let branches = must!(TensorCondExecutionPlan::new(
+        must!(true_branch.compile_cpu(true_output)),
+        must!(false_branch.compile_cpu(false_output)),
+    ));
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![]));
+    let zero = graph.scalar_constant(0.0);
+    let predicate = must!(graph.greater(x, zero));
+    let output = must!(graph.cond(predicate, branches));
+    let plan = must!(graph.compile_cpu(output));
+    for (value, expected) in [(3.0, 9.0), (-3.0, -6.0)] {
+        let inputs = BTreeMap::from([(
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![], vec![value])),
+        )]);
+        assert_eq!(must!(CpuBackend.execute(&plan, &inputs)).data(), &[expected]);
+        assert_eq!(must!(MlxBackend.execute(&plan, &inputs)).data(), &[expected]);
+    }
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
 fn mlx_backend_executes_nested_cond_regions_and_rejects_non_finite_predicates() {
     let mut inner_true = TensorIr::new();
     let inner_true_x = must!(inner_true.input("x", vec![]));

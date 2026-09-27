@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use mlx_rs::{ops, transforms, Array, StreamOrDevice};
+use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
     sqrt_derivative_coefficient, DynamicTensor, TensorBackend, TensorExecutionPlan,
@@ -499,8 +499,11 @@ impl MlxBackend {
                 TensorOp::Mul { lhs, rhs } => mlx_value(&values, *lhs)?
                     .multiply_device(mlx_value(&values, *rhs)?, &stream)
                     .map_err(|error| error.to_string()),
+                // IR 的 greater 是 0/1 浮點遮罩（與 CPU 一致）；MLX 比較產生 bool，
+                // 必須轉回 f32，否則回讀、累加與 Cond 謂詞都會遇到 dtype 不符。
                 TensorOp::Greater { lhs, rhs } => mlx_value(&values, *lhs)?
                     .gt_device(mlx_value(&values, *rhs)?, &stream)
+                    .and_then(|mask| mask.as_dtype_device(Dtype::Float32, &stream))
                     .map_err(|error| error.to_string()),
                 TensorOp::Where {
                     condition,

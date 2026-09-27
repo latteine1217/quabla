@@ -1573,6 +1573,23 @@ def test_mlx_symbolic_vjp_executes_masked_loss_gradient():
     assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
 
+def test_mlx_greater_returns_float_mask_like_cpu():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+
+    inputs = {
+        "x": nabla.Tensor([3], [1.0, 2.0, 3.0]),
+        "y": nabla.Tensor([3], [2.0, 2.0, 2.0]),
+    }
+    for function, expected in [
+        (lambda x, y: x.gt(y), [0.0, 0.0, 1.0]),
+        (lambda x, y: (x.gt(y) + x.gt(y)).sum(), [2.0]),
+    ]:
+        traced = nabla.trace_tensor(function, [("x", [3]), ("y", [3])])
+        assert traced.output.compile_cpu().evaluate(inputs).to_flat_list() == expected
+        assert traced.output.compile_mlx().evaluate(inputs).to_flat_list() == expected
+
+
 def test_cuda_trace_tensor_slice_keeps_primal_and_symbolic_vjp_on_device():
     if os.environ.get("NABLA_CUDA_TEST") is None:
         return
