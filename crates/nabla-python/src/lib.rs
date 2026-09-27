@@ -1,7 +1,9 @@
+use nabla_core::tensor_ir::TensorDType;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PySequence};
 
 mod compiler;
+mod dtype;
 mod matrix;
 mod optim;
 mod tensor;
@@ -9,6 +11,7 @@ mod tensor_trace;
 mod trace;
 
 pub use compiler::{PyNablaCompiler, PyNablaExecutable, PyNablaProgram};
+pub use dtype::PyDType;
 pub use matrix::PyMatrix;
 pub use optim::{sum_gradients, PyAdam};
 pub use tensor::{PyTensor, PyTensorView};
@@ -255,6 +258,9 @@ fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMatrix>()?;
     m.add_class::<PyAdam>()?;
     m.add_function(wrap_pyfunction!(optim::sum_gradients, m)?)?;
+    m.add_class::<PyDType>()?;
+    m.add("float32", PyDType::from(TensorDType::F32))?;
+    m.add("float64", PyDType::from(TensorDType::F64))?;
     m.add_class::<PyTensor>()?;
     m.add_class::<PyTensorView>()?;
     m.add_class::<TensorTraceGraph>()?;

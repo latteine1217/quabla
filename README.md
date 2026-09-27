@@ -126,6 +126,22 @@ loss/gradient readbacks, so neither is a CUDA/JAX comparison.
   zero-copy, read-only `TensorView` with explicit shape, strides, and offset;
   source tensors and views share immutable storage, while every arithmetic
   operation returns a new contiguous allocation.
+- Element dtypes `nabla.float32` and `nabla.float64` (dtype phase D1).
+  `Tensor(shape, data, dtype=nabla.float32)` rounds `data` to `f32`, and
+  `Tensor.dtype`/`Tensor.astype(dtype)` and `TraceTensor.dtype`/
+  `TraceTensor.astype(dtype)` inspect and convert; `to_flat_list()` of a
+  `float32` tensor returns the rounded values. Input specs accept `(name,
+  shape)` (still `float64`) or `(name, shape, dtype)`. Mixing `float32` and
+  `float64` tensors raises an error that asks for an explicit `astype`, while
+  Python scalars adopt the tensor's dtype. Host data bound to a `float32`
+  input is rounded like a JAX jit argument. On the CPU each `float32` op is the
+  `f64` result rounded to `f32` (bit-exact IEEE for `+ - * / sqrt`), which
+  serves as the reference for CUDA and MLX; both execute `float32` natively and
+  keep lowering `float64` programs to `f32` kernels as before. `kernel_ir()`
+  reports `"f32"`/`"f64"`. Host storage stays `f64`, factories such as
+  `zeros`/`arange` create `float64`, and batch-specialized functions
+  (`tensor_jit_batch_fn` and its value-and-grad variants) trace `float64`
+  inputs.
 - Python `trace_tensor(fn, input_specs)` bridge for the rank-N `TensorIr` core.
   `TensorTraceGraph.stablehlo_text(output_node_id)` exports the verified static
   `f64` input/add/multiply/tanh subset as deterministic textual StableHLO for

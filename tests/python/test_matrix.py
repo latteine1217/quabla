@@ -1,3 +1,4 @@
+import array
 import math
 import os
 import runpy
@@ -6419,6 +6420,196 @@ def test_grad_fn_evaluates_composed_add_matmul_vjp():
     assert gradients["a"].to_list() == [[11.0, 14.0, 17.0], [9.0, 11.0, 13.0]]
     assert gradients["b"].to_list() == [[-3.0, 8.5], [-3.0, 11.0], [-3.0, 13.5]]
     assert gradients["bias"].to_list() == [[1.0, 0.5], [-1.0, 2.0]]
+
+
+def f32(values):
+    # Python 端的 IEEE f32 捨入參考：array("f") 以 C float 儲存。
+    return array.array("f", values).tolist()
+
+
+def test_dtype_objects_compare_hash_and_print():
+    assert nabla.float32 == nabla.float32
+    assert nabla.float32 != nabla.float64
+    assert {nabla.float32: "single", nabla.float64: "double"}[nabla.float32] == "single"
+    assert repr(nabla.float32) == "nabla.float32"
+    assert str(nabla.float64) == "f64"
+    assert nabla.float32.name == "float32"
+
+
+def test_float32_tensor_rounds_values_and_converts_with_astype():
+    single = nabla.Tensor([2], [0.1, 0.2], dtype=nabla.float32)
+    assert single.to_flat_list() == f32([0.1, 0.2])
+    assert single.dtype == nabla.float32
+    assert nabla.Tensor([2], [0.1, 0.2]).dtype == nabla.float64
+    assert "float32" in repr(single)
+
+    widened = single.astype(nabla.float64)
+    assert widened.dtype == nabla.float64
+    assert widened.to_flat_list() == f32([0.1, 0.2])
+    narrowed = nabla.Tensor([1], [0.1]).astype(nabla.float32)
+    assert narrowed.to_flat_list() == f32([0.1])
+
+    # 即時運算：f32 張量與弱純量維持 f32，結果逐元素捨入；不同 dtype 的張量需明確轉換。
+    other = nabla.Tensor([2], [0.3, 0.7], dtype=nabla.float32)
+    expected = [f32([f32([a * b])[0] + f32([0.1])[0]])[0] for a, b in zip(f32([0.1, 0.2]), f32([0.3, 0.7]))]
+    result = single * other + 0.1
+    assert result.dtype == nabla.float32
+    assert result.to_flat_list() == expected
+    assert (single.reshape([1, 2]) @ other.reshape([2, 1])).dtype == nabla.float32
+    assert single.sum().dtype == nabla.float32
+    try:
+        single + nabla.Tensor([2], [0.3, 0.7])
+    except ValueError as error:
+        assert "astype" in str(error)
+    else:
+        raise AssertionError("mixing float32 and float64 tensors must fail")
+
+
+def test_trace_tensor_accepts_typed_specs_and_keeps_two_tuple_specs_float64():
+    traced = nabla.trace_tensor(
+        lambda x, y: x * y + 0.1,
+        [("x", [2], nabla.float32), ("y", [2], nabla.float32)],
+    )
+    assert traced.output.dtype == nabla.float32
+    assert "tensor<2xf32>" in traced.graph.lower_text()
+    plan = traced.output.compile_cpu()
+    plan.validate_kernel_ir()
+    assert {node["dtype"] for node in plan.kernel_ir()} == {"f32"}
+    inputs = {
+        "x": nabla.Tensor([2], [0.1, 1.0 / 3.0]),
+        "y": nabla.Tensor([2], [0.3, 3.0]),
+    }
+    value = plan.evaluate(inputs)
+    assert value.dtype == nabla.float32
+    x, y = f32([0.1, 1.0 / 3.0]), f32([0.3, 3.0])
+    assert value.to_flat_list() == [
+        f32([f32([a * b])[0] + f32([0.1])[0]])[0] for a, b in zip(x, y)
+    ]
+
+    legacy = nabla.trace_tensor(lambda x: x + 1.0, [("x", [2])])
+    assert legacy.output.dtype == nabla.float64
+    assert "f32" not in legacy.graph.lower_text()
+    assert {node["dtype"] for node in legacy.output.compile_cpu().kernel_ir()} == {"f64"}
+
+    try:
+        nabla.trace_tensor(lambda x, y: x + y, [("x", [2], nabla.float32), ("y", [2])])
+    except ValueError as error:
+        assert "astype" in str(error)
+    else:
+        raise AssertionError("mixing float32 and float64 traced tensors must fail")
+    try:
+        nabla.trace_tensor(lambda x: x, [("x", [2], "f32")])
+    except TypeError as error:
+        assert "(name, shape, dtype)" in str(error)
+    else:
+        raise AssertionError("a string dtype must be rejected")
+
+
+def test_trace_tensor_astype_rounds_and_differentiates_through_casts():
+    traced = nabla.trace_tensor(
+        lambda x: x.astype(nabla.float32).powi(2).sum(), [("x", [3])]
+    )
+    assert traced.output.dtype == nabla.float32
+    point = [0.3, -1.7, 2.2]
+    inputs = {"x": nabla.Tensor([3], point), "seed": nabla.Tensor([], [1.0])}
+    gradient = traced.symbolic_vjp("seed")["x"]
+    assert gradient.output.dtype == nabla.float64
+    values = gradient.output.compile_cpu().evaluate(inputs).to_flat_list()
+    assert_close_rows([values], [[2.0 * value for value in f32(point)]], tol=1e-6)
+
+    round_trip = nabla.trace_tensor(
+        lambda x: x.astype(nabla.float32).astype(nabla.float64), [("x", [1])]
+    )
+    result = round_trip.output.compile_cpu().evaluate({"x": nabla.Tensor([1], [0.1])})
+    assert result.dtype == nabla.float64
+    assert result.to_flat_list() == [0.10000000149011612]
+
+    value_and_grad = nabla.tensor_value_and_grad_fn(
+        lambda w: (w * w).sum(), [("w", [2], nabla.float32)]
+    )
+    value, gradients = value_and_grad({"w": nabla.Tensor([2], [0.1, 0.2])})
+    assert value.dtype == nabla.float32
+    assert gradients["w"].dtype == nabla.float32
+    assert_close_rows([gradients["w"].to_flat_list()], [[0.2, 0.4]], tol=1e-7)
+
+
+def test_float32_fori_region_uses_a_float32_loop_index():
+    traced = nabla.trace_tensor(
+        lambda initial: nabla.tensor_fori_loop_region(
+            0, 4, lambda index, carry: carry + index * 0.1, initial, []
+        ),
+        [("initial", [], nabla.float32)],
+    )
+    assert traced.output.dtype == nabla.float32
+    result = traced.output.compile_cpu().evaluate({"initial": nabla.Tensor([], [1.0])})
+    expected = 1.0
+    for index in range(4):
+        expected = f32([expected + f32([f32([float(index)])[0] * f32([0.1])[0]])[0]])[0]
+    assert result.to_flat_list() == [expected]
+
+
+def f32_mlp_value_and_gradients(dtype):
+    specs = [
+        ("x", [8, 3], dtype),
+        ("w1", [3, 16], dtype),
+        ("b1", [1, 16], dtype),
+        ("w2", [16, 1], dtype),
+        ("b2", [1, 1], dtype),
+    ]
+    traced = nabla.trace_tensor(
+        lambda x, w1, b1, w2, b2: (((x @ w1 + b1).tanh() @ w2 + b2) * 0.5).powi(2).mean(),
+        specs,
+    )
+    gradients = traced.symbolic_vjp("seed")
+    outputs = [traced.output] + [gradients[name].output for name, _, _ in specs[1:]]
+
+    def values(count, seed):
+        return [math.sin((index + 1.0) * seed) * 0.9 for index in range(count)]
+
+    inputs = {
+        "x": nabla.Tensor([8, 3], values(24, 0.37)),
+        "w1": nabla.Tensor([3, 16], values(48, 1.13)),
+        "b1": nabla.Tensor([1, 16], values(16, 0.71)),
+        "w2": nabla.Tensor([16, 1], values(16, 2.03)),
+        "b2": nabla.Tensor([1, 1], [0.1]),
+        "seed": nabla.Tensor([], [1.0]),
+    }
+    return outputs, inputs
+
+
+def max_scaled_error(actual, expected):
+    return max(
+        abs(a - e) / max(1.0, abs(e))
+        for actual_row, expected_row in zip(actual, expected)
+        for a, e in zip(actual_row, expected_row)
+    )
+
+
+def assert_float32_mlp_device_parity(compile_device):
+    # 裝置與 CPU f32 參考共用同一組已捨入輸入，只差在逐運算捨入與歸約順序；
+    # 每運算數個 f32 ulp（單位尺度約 6e-8）在約 10 層深的圖上仍低於 1e-6，
+    # 比既有 f64 參考的 1e-5 容差緊十倍。
+    outputs, inputs = f32_mlp_value_and_gradients(nabla.float32)
+    reference_outputs, _ = f32_mlp_value_and_gradients(nabla.float64)
+    cpu = [output.compile_cpu().evaluate(inputs) for output in outputs]
+    device = [compile_device(output).evaluate(inputs) for output in outputs]
+    reference = [output.compile_cpu().evaluate(inputs) for output in reference_outputs]
+    assert all(value.dtype == nabla.float32 for value in cpu + device)
+    device_rows = [value.to_flat_list() for value in device]
+    assert max_scaled_error(device_rows, [value.to_flat_list() for value in cpu]) <= 1e-6
+    assert max_scaled_error(device_rows, [value.to_flat_list() for value in reference]) <= 1e-5
+
+
+def test_mlx_float32_mlp_matches_the_cpu_float32_reference():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+    assert_float32_mlp_device_parity(lambda output: output.compile_mlx())
+
+
+def test_cuda_float32_mlp_matches_the_cpu_float32_reference():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+    assert_float32_mlp_device_parity(lambda output: output.compile_cuda())
 
 
 if __name__ == "__main__":

@@ -1,13 +1,21 @@
+use nabla_core::tensor_ir::TensorDType;
 use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PySlice, PySliceMethods, PyTuple};
 use std::sync::Arc;
 
+use crate::dtype::PyDType;
+
+/// Eager host tensor. Storage is `f64`; a `float32` tensor holds only values
+/// rounded to `f32`, and every eager op on it rounds its `f64` result the way
+/// the CPU Tensor IR backend rounds an `f32` node. Python scalars are weak:
+/// they are rounded to the tensor dtype before the op.
 #[pyclass(name = "Tensor", skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyTensor {
     shape: Vec<usize>,
     data: Arc<Vec<f64>>,
+    dtype: TensorDType,
 }
 
 #[pyclass(name = "TensorView", skip_from_py_object)]
@@ -17,6 +25,7 @@ pub struct PyTensorView {
     shape: Vec<usize>,
     strides: Vec<usize>,
     offset: usize,
+    dtype: TensorDType,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -353,7 +362,21 @@ impl PyTensor {
         Ok(Self {
             shape,
             data: Arc::new(data),
+            dtype: TensorDType::F64,
         })
+    }
+
+    /// Builds a tensor of `dtype`, rounding each value to that dtype.
+    pub fn from_shape_data_typed(
+        shape: Vec<usize>,
+        data: Vec<f64>,
+        dtype: TensorDType,
+    ) -> Result<Self, String> {
+        Self::from_shape_data(shape, data).map(|tensor| tensor.typed(dtype))
+    }
+
+    pub fn dtype(&self) -> TensorDType {
+        self.dtype
     }
 
     pub fn shape_data(&self) -> (&[usize], &[f64]) {
@@ -361,13 +384,44 @@ impl PyTensor {
     }
 
     pub fn to_dynamic_tensor(&self) -> Result<nabla_core::tensor_ir::DynamicTensor, String> {
-        nabla_core::tensor_ir::DynamicTensor::new(self.shape.clone(), self.data.as_ref().clone())
+        nabla_core::tensor_ir::DynamicTensor::with_dtype(
+            self.shape.clone(),
+            self.data.as_ref().clone(),
+            self.dtype,
+        )
     }
 
     pub fn from_dynamic_tensor(
         tensor: nabla_core::tensor_ir::DynamicTensor,
     ) -> Result<Self, String> {
-        Self::from_shape_data(tensor.shape().to_vec(), tensor.data().to_vec())
+        Self::from_shape_data_typed(
+            tensor.shape().to_vec(),
+            tensor.data().to_vec(),
+            tensor.dtype(),
+        )
+    }
+
+    /// Rounds the values to `dtype` and records it (exact for widening).
+    fn typed(mut self, dtype: TensorDType) -> Self {
+        if dtype != TensorDType::F64 {
+            for value in Arc::make_mut(&mut self.data) {
+                *value = dtype.round(*value);
+            }
+        }
+        self.dtype = dtype;
+        self
+    }
+
+    /// Strict promotion for two tensors: dtypes must match exactly.
+    fn result_dtype(&self, rhs: &Self, op: &str) -> Result<TensorDType, String> {
+        if self.dtype != rhs.dtype {
+            return Err(format!(
+                "tensor {op} operands have mismatched dtypes {} and {}; \
+                 convert one of them explicitly with astype",
+                self.dtype, rhs.dtype
+            ));
+        }
+        Ok(self.dtype)
     }
 
     fn try_elementwise(
@@ -376,6 +430,7 @@ impl PyTensor {
         op: &str,
         f: impl Fn(f64, f64) -> Result<f64, String>,
     ) -> Result<Self, String> {
+        let dtype = self.result_dtype(rhs, op)?;
         let shape = broadcast_shape(&self.shape, &rhs.shape)?;
         let output_size = element_count(&shape)?;
         let lhs_strides = contiguous_strides(&self.shape);
@@ -387,19 +442,21 @@ impl PyTensor {
             let rhs_index = broadcast_offset(index, &shape, &rhs.shape, &rhs_strides);
             let value = f(self.data[lhs_index], rhs.data[rhs_index])
                 .map_err(|err| format!("failed to evaluate tensor {op}: {err}"))?;
-            data.push(value);
+            data.push(dtype.round(value));
         }
 
         Ok(Self {
             shape,
             data: Arc::new(data),
+            dtype,
         })
     }
 
     fn try_map(&self, f: impl Fn(f64) -> f64) -> Result<Self, String> {
-        Self::from_shape_data(
+        Self::from_shape_data_typed(
             self.shape.clone(),
             self.data.iter().copied().map(f).collect(),
+            self.dtype,
         )
     }
 
@@ -408,6 +465,7 @@ impl PyTensor {
     }
 
     pub fn try_add_scalar(&self, rhs: f64) -> Result<Self, String> {
+        let rhs = self.dtype.round(rhs);
         self.try_map(|lhs| lhs + rhs)
     }
 
@@ -416,10 +474,12 @@ impl PyTensor {
     }
 
     pub fn try_sub_scalar(&self, rhs: f64) -> Result<Self, String> {
+        let rhs = self.dtype.round(rhs);
         self.try_map(|lhs| lhs - rhs)
     }
 
     pub fn try_scalar_sub(&self, lhs: f64) -> Result<Self, String> {
+        let lhs = self.dtype.round(lhs);
         self.try_map(|rhs| lhs - rhs)
     }
 
@@ -428,6 +488,7 @@ impl PyTensor {
     }
 
     pub fn try_mul_scalar(&self, rhs: f64) -> Result<Self, String> {
+        let rhs = self.dtype.round(rhs);
         self.try_map(|lhs| lhs * rhs)
     }
 
@@ -442,6 +503,7 @@ impl PyTensor {
     }
 
     pub fn try_div_scalar(&self, rhs: f64) -> Result<Self, String> {
+        let rhs = self.dtype.round(rhs);
         if rhs == 0.0 {
             return Err("division by zero scalar is not supported".to_string());
         }
@@ -449,6 +511,7 @@ impl PyTensor {
     }
 
     pub fn try_scalar_div(&self, lhs: f64) -> Result<Self, String> {
+        let lhs = self.dtype.round(lhs);
         if self.data.contains(&0.0) {
             return Err("division by zero is not supported".to_string());
         }
@@ -460,6 +523,7 @@ impl PyTensor {
     }
 
     pub fn try_gt_scalar(&self, rhs: f64) -> Result<Self, String> {
+        let rhs = self.dtype.round(rhs);
         self.try_map(|lhs| if lhs > rhs { 1.0 } else { 0.0 })
     }
 
@@ -469,6 +533,7 @@ impl PyTensor {
     }
 
     pub fn try_maximum_scalar(&self, rhs: f64) -> Result<Self, String> {
+        let rhs = self.dtype.round(rhs);
         self.try_map(|lhs| if lhs > rhs { lhs } else { rhs })
     }
 
@@ -478,10 +543,13 @@ impl PyTensor {
     }
 
     pub fn try_minimum_scalar(&self, rhs: f64) -> Result<Self, String> {
+        let rhs = self.dtype.round(rhs);
         self.try_map(|lhs| if rhs > lhs { lhs } else { rhs })
     }
 
     pub fn try_where(mask: &Self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
+        // 遮罩只看是否非零，不參與 dtype 統一。
+        let dtype = on_true.result_dtype(on_false, "where")?;
         let value_shape = broadcast_shape(&on_true.shape, &on_false.shape)?;
         let shape = broadcast_shape(&mask.shape, &value_shape)?;
         let count = element_count(&shape)?;
@@ -501,10 +569,11 @@ impl PyTensor {
             });
         }
 
-        Self::from_shape_data(shape, data)
+        Self::from_shape_data_typed(shape, data, dtype)
     }
 
     pub fn try_matmul(&self, rhs: &Self) -> Result<Self, String> {
+        let dtype = self.result_dtype(rhs, "matmul")?;
         if self.shape.len() < 2 || rhs.shape.len() < 2 {
             return Err(format!(
                 "matmul requires tensors with at least two dimensions, got {:?} and {:?}",
@@ -563,13 +632,11 @@ impl PyTensor {
             }
         }
 
-        Ok(Self {
-            shape,
-            data: Arc::new(data),
-        })
+        Self::from_shape_data_typed(shape, data, dtype)
     }
 
     pub fn try_solve(&self, rhs: &Self) -> Result<Self, String> {
+        let dtype = self.result_dtype(rhs, "solve")?;
         if self.shape.len() != 2 || rhs.shape.len() != 2 {
             return Err(format!(
                 "solve requires rank-2 matrix and right-hand side tensors, got {:?} and {:?}",
@@ -626,10 +693,7 @@ impl PyTensor {
                 result[row * columns + column] = value / factor[row * n + row];
             }
         }
-        Ok(Self {
-            shape: rhs.shape.clone(),
-            data: Arc::new(result),
-        })
+        Self::from_shape_data_typed(rhs.shape.clone(), result, dtype)
     }
 
     pub fn try_solve_triangular(
@@ -680,7 +744,7 @@ impl PyTensor {
                 }
             }
         }
-        Self::from_shape_data(self.shape.clone(), factor)
+        Self::from_shape_data_typed(self.shape.clone(), factor, self.dtype)
     }
 
     pub fn try_reshape(&self, shape: Vec<usize>) -> Result<Self, String> {
@@ -696,6 +760,7 @@ impl PyTensor {
         Ok(Self {
             shape,
             data: self.data.clone(),
+            dtype: self.dtype,
         })
     }
 
@@ -711,7 +776,7 @@ impl PyTensor {
         let data = (0..count)
             .map(|index| self.data[broadcast_offset(index, &shape, &self.shape, &strides)])
             .collect();
-        Self::from_shape_data(shape, data)
+        Self::from_shape_data_typed(shape, data, self.dtype)
     }
 
     pub fn try_transpose(&self, axes: Option<Vec<isize>>) -> Result<Self, String> {
@@ -734,12 +799,16 @@ impl PyTensor {
             *output_value = self.data[input_index];
         }
 
-        Self::from_shape_data(shape, data)
+        Self::from_shape_data_typed(shape, data, self.dtype)
     }
 
     fn try_reduce(&self, axis: Option<isize>, scale: f64) -> Result<Self, String> {
         let Some(axis) = axis else {
-            return Self::from_shape_data(vec![], vec![self.data.iter().sum::<f64>() * scale]);
+            return Self::from_shape_data_typed(
+                vec![],
+                vec![self.data.iter().sum::<f64>() * scale],
+                self.dtype,
+            );
         };
         let axis = normalize_axis(axis, self.shape.len())?;
         let mut shape = self.shape.clone();
@@ -765,7 +834,7 @@ impl PyTensor {
             data[output_index] += value * scale;
         }
 
-        Self::from_shape_data(shape, data)
+        Self::from_shape_data_typed(shape, data, self.dtype)
     }
 
     pub fn try_sum(&self, axis: Option<isize>) -> Result<Self, String> {
@@ -880,7 +949,7 @@ impl PyTensor {
                         current
                     }
                 });
-            return Self::from_shape_data(vec![], vec![value]);
+            return Self::from_shape_data_typed(vec![], vec![value], self.dtype);
         };
         let axis = normalize_axis(axis, self.shape.len())?;
         if self.shape[axis] == 0 {
@@ -913,11 +982,12 @@ impl PyTensor {
             }
         }
 
-        Self::from_shape_data(
+        Self::from_shape_data_typed(
             shape,
             data.into_iter()
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(|| "max/min reduction produced an empty output".to_string())?,
+            self.dtype,
         )
     }
 
@@ -978,7 +1048,7 @@ impl PyTensor {
                 }
             })
             .collect();
-        Self::from_shape_data(self.shape.clone(), data)
+        Self::from_shape_data_typed(self.shape.clone(), data, self.dtype)
     }
 
     pub fn try_sin(&self) -> Result<Self, String> {
@@ -1001,6 +1071,9 @@ impl PyTensor {
         let first = tensors
             .first()
             .ok_or_else(|| "concat requires at least one tensor".to_string())?;
+        for tensor in &tensors[1..] {
+            first.result_dtype(tensor, "concat")?;
+        }
         if axis >= first.shape.len() {
             return Err(format!(
                 "concat axis {axis} is out of bounds for rank {}",
@@ -1044,7 +1117,7 @@ impl PyTensor {
                 data.extend_from_slice(&tensor.data[start..start + block]);
             }
         }
-        Self::from_shape_data(shape, data)
+        Self::from_shape_data_typed(shape, data, first.dtype)
     }
 
     pub fn try_stack(tensors: &[PyTensor], axis: isize) -> Result<Self, String> {
@@ -1083,6 +1156,7 @@ impl PyTensor {
             shape,
             strides,
             offset,
+            dtype: self.dtype,
         })
     }
 
@@ -1132,6 +1206,7 @@ impl PyTensor {
         updates: &Self,
         axis: isize,
     ) -> Result<Self, String> {
+        let dtype = self.result_dtype(updates, "scatter_add")?;
         let axis = normalize_axis(axis, self.shape.len())?;
         if indices.is_empty() {
             return Err("scatter indices must not be empty".to_string());
@@ -1175,15 +1250,18 @@ impl PyTensor {
             }
             data[destination_index] += value;
         }
-        Self::from_shape_data(self.shape.clone(), data)
+        Self::from_shape_data_typed(self.shape.clone(), data, dtype)
     }
 }
 
 #[pymethods]
 impl PyTensor {
+    /// `dtype` defaults to `nabla.float64`; `nabla.float32` rounds `data`.
     #[new]
-    fn py_new(shape: Vec<usize>, data: Vec<f64>) -> PyResult<Self> {
-        Self::from_shape_data(shape, data).map_err(PyValueError::new_err)
+    #[pyo3(signature = (shape, data, dtype = None))]
+    fn py_new(shape: Vec<usize>, data: Vec<f64>, dtype: Option<PyDType>) -> PyResult<Self> {
+        let dtype = dtype.map_or(TensorDType::F64, |dtype| dtype.dtype);
+        Self::from_shape_data_typed(shape, data, dtype).map_err(PyValueError::new_err)
     }
 
     #[staticmethod]
@@ -1193,6 +1271,7 @@ impl PyTensor {
         Ok(Self {
             shape,
             data: Arc::new(vec![0.0; size]),
+            dtype: TensorDType::F64,
         })
     }
 
@@ -1207,6 +1286,7 @@ impl PyTensor {
         Ok(Self {
             shape,
             data: Arc::new(vec![value; size]),
+            dtype: TensorDType::F64,
         })
     }
 
@@ -1330,6 +1410,16 @@ impl PyTensor {
     #[getter]
     fn ndim(&self) -> usize {
         self.shape.len()
+    }
+
+    #[getter(dtype)]
+    fn py_dtype(&self) -> PyDType {
+        self.dtype.into()
+    }
+
+    /// Converts to `dtype` with round-to-nearest-even (exact for widening).
+    fn astype(&self, dtype: PyDType) -> Self {
+        self.clone().typed(dtype.dtype)
     }
 
     fn to_flat_list(&self) -> Vec<f64> {
@@ -1647,7 +1737,14 @@ impl PyTensor {
     }
 
     fn __repr__(&self) -> String {
-        format!("Tensor(shape={:?})", self.shape)
+        match self.dtype {
+            TensorDType::F64 => format!("Tensor(shape={:?})", self.shape),
+            dtype => format!(
+                "Tensor(shape={:?}, dtype={})",
+                self.shape,
+                PyDType::from(dtype).__repr__()
+            ),
+        }
     }
 }
 
@@ -1674,6 +1771,7 @@ impl PyTensorView {
             shape,
             strides,
             offset,
+            dtype: self.dtype,
         })
     }
 
@@ -1685,7 +1783,7 @@ impl PyTensorView {
     }
 
     fn materialize(&self) -> Result<PyTensor, String> {
-        PyTensor::from_shape_data(self.shape.clone(), self.to_flat_vec()?)
+        PyTensor::from_shape_data_typed(self.shape.clone(), self.to_flat_vec()?, self.dtype)
     }
 }
 

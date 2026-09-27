@@ -6,8 +6,8 @@ use std::time::Instant;
 use nabla_core::tensor_ir::{
     CudaBackend, CudaDataParallelExecutionPlan, CudaDataParallelTiming, CudaExecutionPlan,
     DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs, TensorBackend,
-    TensorCondExecutionPlan, TensorExecutionPlan, TensorForiExecutionPlan, TensorIr, TensorNodeId,
-    TensorReplicaReduction, TensorScanExecutionPlan,
+    TensorCondExecutionPlan, TensorDType, TensorExecutionPlan, TensorForiExecutionPlan, TensorIr,
+    TensorNodeId, TensorReplicaReduction, TensorScanExecutionPlan,
 };
 use nabla_core::{
     NablaCompiler, NablaExecutable, NablaMultiOutputExecutable, NablaMultiOutputProgram,
@@ -17,7 +17,41 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyString, PyTuple};
 
+use crate::dtype::PyDType;
 use crate::tensor::{parse_axis_indices, parse_tensor_indices, PyTensor, TensorIndex};
+
+/// One traced input declaration: `(name, shape)` for `float64`, or
+/// `(name, shape, dtype)` with a `nabla.float32`/`nabla.float64` object.
+#[derive(Clone, Debug)]
+pub struct TensorInputSpec {
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub dtype: TensorDType,
+}
+
+impl TensorInputSpec {
+    fn new(name: String, shape: Vec<usize>, dtype: TensorDType) -> Self {
+        Self { name, shape, dtype }
+    }
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for TensorInputSpec {
+    type Error = PyErr;
+
+    fn extract(spec: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if let Ok((name, shape)) = spec.extract::<(String, Vec<usize>)>() {
+            return Ok(Self::new(name, shape, TensorDType::F64));
+        }
+        let (name, shape, dtype) = spec
+            .extract::<(String, Vec<usize>, PyDType)>()
+            .map_err(|_| {
+                PyTypeError::new_err(
+                    "tensor input spec must be (name, shape) or (name, shape, dtype) with a nabla dtype",
+                )
+            })?;
+        Ok(Self::new(name, shape, dtype.dtype))
+    }
+}
 
 fn normalize_reduction_axes(axes: Vec<isize>, rank: usize) -> Result<Vec<usize>, String> {
     let rank = isize::try_from(rank).map_err(|_| "tensor rank exceeds isize".to_string())?;
@@ -201,7 +235,7 @@ struct CudaBatchValueAndGradPlan {
     gradient_node_ids: BTreeMap<String, TensorNodeId>,
 }
 
-type BatchSpecializationSignature = (usize, Vec<Vec<usize>>, Vec<(String, Vec<usize>)>);
+type BatchSpecializationSignature = (usize, Vec<Vec<usize>>, Vec<TensorInputSpec>);
 
 #[pyclass(name = "TensorBatchMlxValueAndGradFunction", unsendable)]
 pub struct TensorBatchMlxValueAndGradFunction {
@@ -385,12 +419,17 @@ impl TensorTraceGraph {
         Self::default()
     }
 
-    pub fn add_input(&self, name: &str, shape: Vec<usize>) -> Result<TraceTensor, String> {
+    pub fn add_input(
+        &self,
+        name: &str,
+        shape: Vec<usize>,
+        dtype: TensorDType,
+    ) -> Result<TraceTensor, String> {
         let mut ir = self
             .ir
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
-        let node_id = ir.input(name, shape)?;
+        let node_id = ir.input_typed(name, shape, dtype)?;
         let shape = ir.node_shape(node_id)?;
         Ok(TraceTensor {
             graph: self.clone(),
@@ -400,8 +439,13 @@ impl TensorTraceGraph {
         })
     }
 
-    fn add_batched_input(&self, name: &str, shape: Vec<usize>) -> Result<TraceTensor, String> {
-        let mut tensor = self.add_input(name, shape)?;
+    fn add_batched_input(
+        &self,
+        name: &str,
+        shape: Vec<usize>,
+        dtype: TensorDType,
+    ) -> Result<TraceTensor, String> {
+        let mut tensor = self.add_input(name, shape, dtype)?;
         tensor.batch_axis = Some(0);
         Ok(tensor)
     }
@@ -689,6 +733,29 @@ impl TraceTensor {
             }
             None => shape,
         }
+    }
+
+    pub(crate) fn dtype(&self) -> Result<TensorDType, String> {
+        self.graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+            .node_dtype(self.node_id)
+    }
+
+    fn astype_tensor(&self, dtype: TensorDType) -> Result<Self, String> {
+        let mut ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let node_id = ir.cast(self.node_id, dtype)?;
+        Ok(Self::from_node(
+            self.graph.clone(),
+            node_id,
+            self.shape.clone(),
+            self.batch_axis,
+        ))
     }
 
     fn same_graph(&self, rhs: &Self) -> Result<(), String> {
@@ -1598,11 +1665,23 @@ impl TensorTraceGraph {
         Self::new()
     }
 
-    #[pyo3(signature = (name, shape = None))]
-    fn input(&self, name: &str, shape: Option<Vec<usize>>) -> PyResult<TraceTensor> {
-        match shape {
-            Some(shape) => self.add_input(name, shape),
-            None => self.existing_input(name),
+    /// Adds an input when `shape` is given (`dtype` defaults to float64), or
+    /// returns the existing input `name` otherwise.
+    #[pyo3(signature = (name, shape = None, dtype = None))]
+    fn input(
+        &self,
+        name: &str,
+        shape: Option<Vec<usize>>,
+        dtype: Option<PyDType>,
+    ) -> PyResult<TraceTensor> {
+        match (shape, dtype) {
+            (Some(shape), dtype) => self.add_input(
+                name,
+                shape,
+                dtype.map_or(TensorDType::F64, |dtype| dtype.dtype),
+            ),
+            (None, None) => self.existing_input(name),
+            (None, Some(_)) => Err("an existing input cannot be retyped; use astype".to_string()),
         }
         .map_err(PyValueError::new_err)
     }
@@ -1739,6 +1818,19 @@ impl TraceTensor {
     #[getter]
     fn shape(&self) -> Vec<usize> {
         self.shape.clone()
+    }
+
+    #[getter(dtype)]
+    fn py_dtype(&self) -> PyResult<PyDType> {
+        self.dtype()
+            .map(PyDType::from)
+            .map_err(PyValueError::new_err)
+    }
+
+    /// Traces an explicit dtype conversion (see `TensorIr::cast`).
+    fn astype(&self, dtype: PyDType) -> PyResult<Self> {
+        self.astype_tensor(dtype.dtype)
+            .map_err(PyValueError::new_err)
     }
 
     fn __add__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
@@ -3129,7 +3221,8 @@ impl TensorBatchJitFunction {
                 shape.clone()
             };
             static_shapes.push(static_shape);
-            input_specs.push((name.clone(), shape));
+            // 批次特化以批次大小為快取鍵，因此一律以 f64 追蹤；f32 值會無損放寬。
+            input_specs.push(TensorInputSpec::new(name.clone(), shape, TensorDType::F64));
         }
         let batch_size = batch_size.ok_or_else(|| {
             PyValueError::new_err("tensor_jit_batch_fn requires at least one mapped input axis")
@@ -3230,7 +3323,8 @@ impl TensorBatchValueAndGradFunction {
                 shape.clone()
             };
             static_shapes.push(static_shape);
-            input_specs.push((name.clone(), shape));
+            // 批次特化以批次大小為快取鍵，因此一律以 f64 追蹤；f32 值會無損放寬。
+            input_specs.push(TensorInputSpec::new(name.clone(), shape, TensorDType::F64));
         }
         let batch_size = batch_size.ok_or_else(|| {
             PyValueError::new_err(
@@ -3354,7 +3448,8 @@ impl TensorBatchMlxValueAndGradFunction {
                 shape.clone()
             };
             static_shapes.push(static_shape);
-            input_specs.push((name.clone(), shape));
+            // 批次特化以批次大小為快取鍵，因此一律以 f64 追蹤；f32 值會無損放寬。
+            input_specs.push(TensorInputSpec::new(name.clone(), shape, TensorDType::F64));
         }
         let batch_size = batch_size.ok_or_else(|| {
             PyValueError::new_err(
@@ -3560,7 +3655,8 @@ fn batch_specialization_signature(
             shape.clone()
         };
         static_shapes.push(static_shape);
-        input_specs.push((name.clone(), shape));
+        // 批次特化以批次大小為快取鍵，因此一律以 f64 追蹤；f32 值會無損放寬。
+        input_specs.push(TensorInputSpec::new(name.clone(), shape, TensorDType::F64));
     }
     let batch_size = batch_size.ok_or_else(|| {
         PyValueError::new_err(format!(
@@ -4028,14 +4124,14 @@ impl TensorJacobianFunction {
 pub fn trace_tensor_python_function(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
 ) -> PyResult<TensorTraceResult> {
     let graph = TensorTraceGraph::new();
     let mut inputs = Vec::with_capacity(input_specs.len());
-    for (name, shape) in input_specs {
+    for spec in input_specs {
         inputs.push(
             graph
-                .add_input(&name, shape)
+                .add_input(&spec.name, spec.shape, spec.dtype)
                 .map_err(PyValueError::new_err)?,
         );
     }
@@ -4086,12 +4182,13 @@ pub fn tensor_cond(
         .iter()
         .enumerate()
         .map(|(index, operand)| {
-            (
+            Ok(TensorInputSpec::new(
                 format!("__nabla_cond_capture_{index}"),
                 operand.shape.clone(),
-            )
+                operand.dtype().map_err(PyValueError::new_err)?,
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<PyResult<Vec<_>>>()?;
     let on_true = trace_tensor_python_function(py, on_true, input_specs.clone())?;
     let on_false = trace_tensor_python_function(py, on_false, input_specs)?;
     let branches = TensorCondExecutionPlan::new(
@@ -4152,7 +4249,7 @@ fn normalize_vmap_axis(axis: isize, rank: usize, label: &str) -> PyResult<usize>
 }
 
 fn make_vmap_signature(
-    input_specs: &[(String, Vec<usize>)],
+    input_specs: &[TensorInputSpec],
     in_axes: Option<Vec<Option<isize>>>,
     out_axis: isize,
     output_rank: usize,
@@ -4168,13 +4265,13 @@ fn make_vmap_signature(
     let in_axes = input_specs
         .iter()
         .zip(in_axes)
-        .map(|((name, shape), axis)| match axis {
-            Some(axis) => normalize_vmap_axis(axis, shape.len() + 1, name).map(Some),
+        .map(|(spec, axis)| match axis {
+            Some(axis) => normalize_vmap_axis(axis, spec.shape.len() + 1, &spec.name).map(Some),
             None => Ok(None),
         })
         .collect::<PyResult<Vec<_>>>()?;
     Ok(VmapSignature {
-        input_names: input_specs.iter().map(|(name, _)| name.clone()).collect(),
+        input_names: input_specs.iter().map(|spec| spec.name.clone()).collect(),
         in_axes,
         out_axis: normalize_vmap_axis(out_axis, output_rank, "out_axes")?,
     })
@@ -4183,7 +4280,7 @@ fn make_vmap_signature(
 fn trace_tensor_vmap_python_function(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     batch_size: usize,
     in_axes: Option<Vec<Option<isize>>>,
     out_axis: isize,
@@ -4205,14 +4302,14 @@ fn trace_tensor_vmap_python_function(
     }
     let graph = TensorTraceGraph::new();
     let mut inputs = Vec::with_capacity(input_specs.len());
-    for ((name, shape), axis) in input_specs.iter().zip(&input_axes) {
+    for (spec, axis) in input_specs.iter().zip(&input_axes) {
         let tensor = if axis.is_some() {
-            let mut batched_shape = Vec::with_capacity(shape.len() + 1);
+            let mut batched_shape = Vec::with_capacity(spec.shape.len() + 1);
             batched_shape.push(batch_size);
-            batched_shape.extend(shape.iter().copied());
-            graph.add_batched_input(name, batched_shape)
+            batched_shape.extend(spec.shape.iter().copied());
+            graph.add_batched_input(&spec.name, batched_shape, spec.dtype)
         } else {
-            graph.add_input(name, shape.clone())
+            graph.add_input(&spec.name, spec.shape.clone(), spec.dtype)
         }
         .map_err(PyValueError::new_err)?;
         inputs.push(tensor);
@@ -4249,7 +4346,7 @@ fn trace_tensor_vmap_python_function(
 pub fn trace_tensor(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
 ) -> PyResult<TensorTraceResult> {
     trace_tensor_python_function(py, function, input_specs)
 }
@@ -4342,28 +4439,33 @@ pub fn tensor_fori_loop_region(
     }
 
     let body_graph = TensorTraceGraph::new();
+    // 迴圈索引採用 carry 的 dtype，行為如同弱純量：f32 carry 的迴圈維持 f32。
+    let carry_dtype = init.dtype().map_err(PyValueError::new_err)?;
     let carry = if init.batch_axis.is_some() {
-        body_graph.add_batched_input("__nabla_fori_carry", init.shape.clone())
+        body_graph.add_batched_input("__nabla_fori_carry", init.shape.clone(), carry_dtype)
     } else {
-        body_graph.add_input("__nabla_fori_carry", init.shape.clone())
+        body_graph.add_input("__nabla_fori_carry", init.shape.clone(), carry_dtype)
     }
     .map_err(PyValueError::new_err)?;
     let index = body_graph
-        .add_input("__nabla_fori_index", vec![])
+        .add_input("__nabla_fori_index", vec![], carry_dtype)
         .map_err(PyValueError::new_err)?;
     let captures = operands
         .iter()
         .enumerate()
         .map(|(index, operand)| {
+            let dtype = operand.dtype().map_err(PyValueError::new_err)?;
             if operand.batch_axis.is_some() {
                 body_graph.add_batched_input(
                     &format!("__nabla_fori_capture_{index}"),
                     operand.shape.clone(),
+                    dtype,
                 )
             } else {
                 body_graph.add_input(
                     &format!("__nabla_fori_capture_{index}"),
                     operand.shape.clone(),
+                    dtype,
                 )
             }
             .map_err(PyValueError::new_err)
@@ -4472,28 +4574,33 @@ pub fn tensor_scan_region(
     }
 
     let body_graph = TensorTraceGraph::new();
+    // 迴圈索引採用 carry 的 dtype，行為如同弱純量：f32 carry 的迴圈維持 f32。
+    let carry_dtype = init.dtype().map_err(PyValueError::new_err)?;
     let carry = if init.batch_axis.is_some() {
-        body_graph.add_batched_input("__nabla_scan_carry", init.shape.clone())
+        body_graph.add_batched_input("__nabla_scan_carry", init.shape.clone(), carry_dtype)
     } else {
-        body_graph.add_input("__nabla_scan_carry", init.shape.clone())
+        body_graph.add_input("__nabla_scan_carry", init.shape.clone(), carry_dtype)
     }
     .map_err(PyValueError::new_err)?;
     let index = body_graph
-        .add_input("__nabla_scan_index", vec![])
+        .add_input("__nabla_scan_index", vec![], carry_dtype)
         .map_err(PyValueError::new_err)?;
     let body_captures = operands
         .iter()
         .enumerate()
         .map(|(index, operand)| {
+            let dtype = operand.dtype().map_err(PyValueError::new_err)?;
             if operand.batch_axis.is_some() {
                 body_graph.add_batched_input(
                     &format!("__nabla_scan_capture_{index}"),
                     operand.shape.clone(),
+                    dtype,
                 )
             } else {
                 body_graph.add_input(
                     &format!("__nabla_scan_capture_{index}"),
                     operand.shape.clone(),
+                    dtype,
                 )
             }
             .map_err(PyValueError::new_err)
@@ -4667,7 +4774,7 @@ pub fn tensor_scan(
 pub fn tensor_grad_scalar_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
 ) -> PyResult<TensorGradScalarFunction> {
     let traced = trace_tensor_python_function(py, function, input_specs)?;
     if !traced.output.shape.is_empty() {
@@ -4688,7 +4795,7 @@ pub fn tensor_grad_scalar_fn(
 pub fn tensor_value_and_grad_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
 ) -> PyResult<TensorValueAndGradFunction> {
     let traced = trace_tensor_python_function(py, function, input_specs)?;
     if !traced.output.shape.is_empty() {
@@ -4709,7 +4816,7 @@ pub fn tensor_value_and_grad_fn(
 pub fn tensor_hessian_scalar_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     input_name: String,
 ) -> PyResult<TensorHessianScalarFunction> {
     let traced = trace_tensor_python_function(py, function, input_specs)?;
@@ -4733,7 +4840,7 @@ pub fn tensor_hessian_scalar_fn(
 pub fn tensor_hvp_scalar_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     input_name: String,
 ) -> PyResult<TensorHvpScalarFunction> {
     let traced = trace_tensor_python_function(py, function, input_specs)?;
@@ -4757,7 +4864,7 @@ pub fn tensor_hvp_scalar_fn(
 pub fn tensor_jit_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
 ) -> PyResult<TensorJitFunction> {
     let traced = trace_tensor_python_function(py, function, input_specs)?;
     let plan = traced
@@ -4779,7 +4886,7 @@ pub fn tensor_cond_fn(
     py: Python<'_>,
     on_true: &Bound<'_, PyAny>,
     on_false: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
 ) -> PyResult<TensorCondFunction> {
     let on_true = trace_tensor_python_function(py, on_true, input_specs.clone())?;
     let on_false = trace_tensor_python_function(py, on_false, input_specs)?;
@@ -4812,7 +4919,7 @@ pub fn tensor_cond_value_and_grad_fn(
     py: Python<'_>,
     on_true: &Bound<'_, PyAny>,
     on_false: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
 ) -> PyResult<TensorCondValueAndGradFunction> {
     let on_true = trace_tensor_python_function(py, on_true, input_specs.clone())?;
     let on_false = trace_tensor_python_function(py, on_false, input_specs)?;
@@ -4845,7 +4952,7 @@ pub fn tensor_cond_jvp_fn(
     py: Python<'_>,
     on_true: &Bound<'_, PyAny>,
     on_false: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
 ) -> PyResult<TensorCondJvpFunction> {
     let on_true = trace_tensor_python_function(py, on_true, input_specs.clone())?;
     let on_false = trace_tensor_python_function(py, on_false, input_specs)?;
@@ -5247,7 +5354,7 @@ fn vmap_hvp_output(output: DynamicTensor, input_axis: usize) -> PyResult<PyTenso
 pub fn tensor_vmap_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     batch_size: usize,
     in_axes: Option<Vec<Option<isize>>>,
     out_axis: isize,
@@ -5273,7 +5380,7 @@ pub fn tensor_vmap_fn(
 pub fn tensor_jit_cuda_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     device_ordinal: usize,
 ) -> PyResult<TensorCudaExecutionPlan> {
     let traced = trace_tensor_python_function(py, function, input_specs)?;
@@ -5372,13 +5479,13 @@ fn build_cuda_scalar_value_and_grad_program(
 pub fn tensor_value_and_grad_cuda_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     parameter_names: Vec<String>,
     device_ordinal: usize,
 ) -> PyResult<TensorCudaValueAndGradFunction> {
     if input_specs
         .iter()
-        .any(|(name, _)| name == CUDA_LOSS_COTANGENT_NAME)
+        .any(|spec| spec.name == CUDA_LOSS_COTANGENT_NAME)
     {
         return Err(PyValueError::new_err(format!(
             "tensor_value_and_grad_cuda_fn reserves input name {CUDA_LOSS_COTANGENT_NAME:?}"
@@ -5403,7 +5510,7 @@ pub fn tensor_value_and_grad_cuda_fn(
 pub fn tensor_value_and_grad_data_parallel_cuda_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     parameter_names: Vec<String>,
     mapped_input_names: Vec<String>,
     device_ordinals: Vec<usize>,
@@ -5411,7 +5518,7 @@ pub fn tensor_value_and_grad_data_parallel_cuda_fn(
 ) -> PyResult<TensorCudaDataParallelValueAndGradFunction> {
     if input_specs
         .iter()
-        .any(|(name, _)| name == CUDA_LOSS_COTANGENT_NAME)
+        .any(|spec| spec.name == CUDA_LOSS_COTANGENT_NAME)
     {
         return Err(PyValueError::new_err(format!(
             "tensor_value_and_grad_data_parallel_cuda_fn reserves input name {CUDA_LOSS_COTANGENT_NAME:?}"
@@ -5447,7 +5554,7 @@ pub fn tensor_value_and_grad_data_parallel_cuda_fn(
     }
 
     let mut input_shapes = BTreeMap::new();
-    for (name, shape) in &input_specs {
+    for TensorInputSpec { name, shape, .. } in &input_specs {
         if input_shapes.insert(name.clone(), shape.clone()).is_some() {
             return Err(PyValueError::new_err(format!(
                 "duplicate CUDA data-parallel input name {name:?}"
@@ -5465,7 +5572,7 @@ pub fn tensor_value_and_grad_data_parallel_cuda_fn(
     }
 
     let mut shard_input_specs = input_specs;
-    for (name, shape) in &mut shard_input_specs {
+    for TensorInputSpec { name, shape, .. } in &mut shard_input_specs {
         if !mapped_input_names.contains(name) {
             continue;
         }
@@ -5681,12 +5788,12 @@ fn compile_mlx_scalar_value_and_grad(
 pub fn tensor_value_and_grad_mlx_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     parameter_names: Vec<String>,
 ) -> PyResult<TensorMlxValueAndGradFunction> {
     if input_specs
         .iter()
-        .any(|(name, _)| name == MLX_LOSS_COTANGENT_NAME)
+        .any(|spec| spec.name == MLX_LOSS_COTANGENT_NAME)
     {
         return Err(PyValueError::new_err(format!(
             "tensor_value_and_grad_mlx_fn reserves input name {MLX_LOSS_COTANGENT_NAME:?}"
@@ -5769,7 +5876,7 @@ pub fn mlx_adam_loss_optimizer(
 pub fn tensor_vmap_cuda_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     batch_size: usize,
     in_axes: Option<Vec<Option<isize>>>,
     out_axis: isize,
@@ -5796,7 +5903,7 @@ pub fn tensor_vmap_cuda_fn(
 pub fn tensor_vmap_mlx_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     batch_size: usize,
     in_axes: Option<Vec<Option<isize>>>,
     out_axis: isize,
@@ -5822,14 +5929,14 @@ pub fn tensor_vmap_mlx_fn(
 pub fn tensor_vmap_vjp_mlx_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     batch_size: usize,
     in_axes: Option<Vec<Option<isize>>>,
     out_axis: isize,
 ) -> PyResult<TensorVmapMlxVjpFunction> {
     if input_specs
         .iter()
-        .any(|(name, _)| name == MLX_LOSS_COTANGENT_NAME)
+        .any(|spec| spec.name == MLX_LOSS_COTANGENT_NAME)
     {
         return Err(PyValueError::new_err(format!(
             "tensor_vmap_vjp_mlx_fn reserves input name {MLX_LOSS_COTANGENT_NAME:?}"
@@ -5879,14 +5986,14 @@ const CUDA_VMAP_TANGENT_PREFIX: &str = "__nabla_cuda_vmap_tangent_";
 pub fn tensor_vmap_jvp_mlx_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     batch_size: usize,
     in_axes: Option<Vec<Option<isize>>>,
     out_axis: isize,
 ) -> PyResult<TensorVmapMlxJvpFunction> {
     let input_names = input_specs
         .iter()
-        .map(|(name, _)| name.clone())
+        .map(|spec| spec.name.clone())
         .collect::<BTreeSet<_>>();
     let tangent_names = input_names
         .iter()
@@ -5941,7 +6048,7 @@ pub fn tensor_vmap_jvp_mlx_fn(
 pub fn tensor_vmap_jvp_cuda_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     batch_size: usize,
     in_axes: Option<Vec<Option<isize>>>,
     out_axis: isize,
@@ -5949,7 +6056,7 @@ pub fn tensor_vmap_jvp_cuda_fn(
 ) -> PyResult<TensorVmapCudaJvpFunction> {
     let input_names = input_specs
         .iter()
-        .map(|(name, _)| name.clone())
+        .map(|spec| spec.name.clone())
         .collect::<BTreeSet<_>>();
     let tangent_names = input_names
         .iter()
@@ -6079,7 +6186,7 @@ fn build_vmap_hvp_scalar_graph(
 pub fn tensor_vmap_hvp_scalar_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     batch_size: usize,
     input_name: String,
     in_axes: Option<Vec<Option<isize>>>,
@@ -6117,7 +6224,7 @@ pub fn tensor_vmap_hvp_scalar_fn(
 pub fn tensor_vmap_hvp_scalar_cuda_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     batch_size: usize,
     input_name: String,
     in_axes: Option<Vec<Option<isize>>>,
@@ -6152,7 +6259,7 @@ pub fn tensor_vmap_hvp_scalar_cuda_fn(
 pub fn tensor_vmap_vjp_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     batch_size: usize,
     in_axes: Option<Vec<Option<isize>>>,
     out_axis: isize,
@@ -6180,7 +6287,7 @@ const CUDA_VMAP_COTANGENT_NAME: &str = "__nabla_vmap_cotangent";
 pub fn tensor_vmap_vjp_cuda_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     batch_size: usize,
     in_axes: Option<Vec<Option<isize>>>,
     out_axis: isize,
@@ -6188,7 +6295,7 @@ pub fn tensor_vmap_vjp_cuda_fn(
 ) -> PyResult<TensorVmapCudaVjpFunction> {
     if input_specs
         .iter()
-        .any(|(name, _)| name == CUDA_VMAP_COTANGENT_NAME)
+        .any(|spec| spec.name == CUDA_VMAP_COTANGENT_NAME)
     {
         return Err(PyValueError::new_err(format!(
             "tensor_vmap_vjp_cuda_fn reserves input name {CUDA_VMAP_COTANGENT_NAME:?}"
@@ -6236,7 +6343,7 @@ pub fn tensor_vmap_vjp_cuda_fn(
 pub fn tensor_vmap_jvp_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     batch_size: usize,
     in_axes: Option<Vec<Option<isize>>>,
     out_axis: isize,
@@ -6261,7 +6368,7 @@ pub fn tensor_vmap_jvp_fn(
 pub fn tensor_vjp_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
 ) -> PyResult<TensorVjpFunction> {
     let traced = trace_tensor_python_function(py, function, input_specs)?;
     let plan = traced
@@ -6276,7 +6383,7 @@ pub fn tensor_vjp_fn(
 pub fn tensor_jvp_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
 ) -> PyResult<TensorJvpFunction> {
     let traced = trace_tensor_python_function(py, function, input_specs)?;
     let plan = traced
@@ -6291,10 +6398,10 @@ pub fn tensor_jvp_fn(
 pub fn tensor_jacobian_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<(String, Vec<usize>)>,
+    input_specs: Vec<TensorInputSpec>,
     input_name: String,
 ) -> PyResult<TensorJacobianFunction> {
-    if !input_specs.iter().any(|(name, _)| name == &input_name) {
+    if !input_specs.iter().any(|spec| spec.name == input_name) {
         return Err(PyValueError::new_err(format!(
             "input {:?} is not declared in input_specs",
             input_name

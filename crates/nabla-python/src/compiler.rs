@@ -14,7 +14,7 @@ use pyo3::types::{PyAny, PyDict};
 use crate::tensor::PyTensor;
 use crate::tensor_trace::{
     extract_tensor_map, trace_tensor, TensorCpuExecutionPlan, TensorCudaExecutionPlan,
-    TensorMlxExecutionPlan, TensorTraceResult,
+    TensorInputSpec, TensorMlxExecutionPlan, TensorTraceResult,
 };
 
 #[pyclass(name = "Compiler", skip_from_py_object)]
@@ -80,7 +80,7 @@ impl PyNablaCompiler {
         &self,
         py: Python<'_>,
         function: &Bound<'_, PyAny>,
-        input_specs: Vec<(String, Vec<usize>)>,
+        input_specs: Vec<TensorInputSpec>,
     ) -> PyResult<PyNablaProgram> {
         trace_tensor(py, function, input_specs).map(|traced| PyNablaProgram { traced })
     }

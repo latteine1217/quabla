@@ -154,9 +154,11 @@ impl PyAdam {
                             / ((*second / correction2).sqrt() + self.epsilon),
                 );
             }
+            // 動量狀態維持 f64；更新後的參數保留原 dtype。
             updated.insert(
                 name,
-                PyTensor::from_shape_data(shape.to_vec(), values).map_err(PyValueError::new_err)?,
+                PyTensor::from_shape_data_typed(shape.to_vec(), values, parameter.dtype())
+                    .map_err(PyValueError::new_err)?,
             );
         }
         Ok(updated)

@@ -649,7 +649,9 @@ only exposes `linalg::solve` on a CPU stream, so Nabla rejects it on the MLX GPU
 backend rather than silently falling back. `relu`, `abs`, `sigmoid`, and a
 numerically stable `softplus` are available on eager and traced tensors; `relu`
 uses a zero subgradient at zero, while `abs` follows the existing `where`
-tie-rule and has derivative -1 at zero. Dtype/device APIs remain pending.
+tie-rule and has derivative -1 at zero. Dtype phase D1 (`float32`/`float64`,
+see Dtype Support below) is implemented; device-placement APIs and the
+remaining dtype phases are pending.
 `tril` and `triu` now project the last two axes of rank-N tensors across CPU,
 CUDA, and MLX, with direct/symbolic JVP/VJP and mixed-tangent propagation; they
 provide the gradient masking primitive required before triangular solve and
@@ -669,6 +671,67 @@ Acceptance checks:
   model body.
 - Each new primitive has CPU finite-difference or analytic AD checks and
   backend parity coverage.
+
+### Dtype Support
+
+Goal: make element types a checked property of every Tensor IR node instead of
+an implicit backend lowering, with a CPU reference for each dtype a device
+executes.
+
+- D1. `F32`/`F64` logical dtypes on IR nodes and host tensors, an explicit
+  `Cast` op, strict tensor promotion with weak Python/AD scalars, CPU `f32`
+  reference semantics, native `f32` execution on CUDA and MLX with `f64`
+  programs still lowered to `f32`, and Python dtype objects.
+- D2. `Bool` and `I32` dtypes for masks and indices: comparisons produce
+  `Bool`, `where` consumes it, and gather/scatter take integer index tensors
+  (the dtype/index IR that P3's dynamic indexing waits for).
+- D3. `F16`/`BF16` storage and compute on MLX and CUDA with an explicit
+  accumulation dtype; backends must materialize weak constants in the
+  consumer's dtype (MLX `from_f32` constants must not promote half arrays).
+- D4. Native device `f64` as an opt-in execution dtype (CUDA double kernels,
+  MLX where supported); `execution_dtype(F64)` then stops mapping to `f32`.
+- D5. Typed host storage: `DynamicTensor`/`Tensor` stop storing `f32` values
+  in `f64`, uploads avoid the conversion, and batch specialization keys its
+  plan cache by dtype as well as batch size.
+- D6. Mixed-precision training policies: master weights, loss scaling, and
+  dtype-aware optimizer state on device.
+
+Implementation status (2026-09-27): D1 is implemented. `TensorNode` carries a
+dtype and a JAX-style weak flag inferred at construction; `TensorIr::input`
+keeps the `f64` default and `input_typed` declares other dtypes. Combining
+strong `f32` and `f64` tensors is a construction error that names `astype`.
+When a weak scalar meets a strong operand of another dtype the builder inserts
+an explicit `Cast` of the scalar, so existing AD rules built from
+`scalar_constant` are unchanged and `f32` graphs are never promoted. `Cast`
+takes its target from the node dtype; its JVP casts the tangent to the target
+and its VJP casts the cotangent back to the source. Plan compilation removes
+strong same-dtype casts, folds constant casts with the target rounding (a
+`0.1` round trip through `f32` yields `0.10000000149011612`), and keys CSE on
+dtype and weakness. Loop regions require matching body-output and carry
+dtypes; Python loop regions give the index the carry dtype, and region
+captures must match the region input dtype. The CPU keeps `f64` storage and
+rounds every node result to its dtype in all interpreters; eager CPU AD does
+its derivative arithmetic in `f64` and rounds at casts and returned gradients,
+while symbolic AD follows node dtypes exactly.
+`TensorDeviceBackend::execution_dtype` maps `F64` and `F32` to `f32` on CUDA
+and MLX; both reject any node whose dtype does not lower to `f32`, execute
+`Cast` as an identity, and tag readbacks with the node dtype. Python exposes
+`nabla.float32`/`nabla.float64`, `Tensor(..., dtype=...)`, `astype`, `dtype`
+properties, and `(name, shape, dtype)` input specs; eager `Tensor` ops follow
+the same promotion and rounding rules.
+
+Verification (2026-09-27): Rust tests cover weak-scalar adoption and `f32`
+lowering text, strict mixing errors, bitwise `f32` agreement of CPU
+`x * y + z`, `x / y`, and `sqrt` on both interpreter paths, cast round trips
+and same-dtype cast removal, cast JVP/VJP dtypes with finite-difference
+checks, CSE separation of casts, `f32` `kernel_ir()` validation with
+unchanged `f64` goldens, input rounding, and an `f32` loop region. A float32
+MLP value-and-gradient program matches the CPU `f32` reference with a scaled
+error of 2.2e-8 on MLX (Apple silicon) and on CUDA (GTX 1660 SUPER), within
+the 1e-6 bound; the same device runs stay within the existing 1e-5 bound
+against the `f64` reference. `benchmark_pinn_mlx.py` shows no `f64` slowdown
+(medians of five interleaved runs: step 0.836 -> 0.826 ms, compile 36.10 ->
+36.32 ms).
 
 ### P4. Compiler Passes And Kernel Performance
 
