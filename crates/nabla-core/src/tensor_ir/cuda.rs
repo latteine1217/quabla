@@ -85,7 +85,30 @@ pub struct CudaDataParallelExecutionPlan {
     /// original contract where the caller selects one reduction per call.
     #[cfg(feature = "cuda-nccl")]
     collectives: Option<Vec<(TensorNodeId, TensorReplicaReduction)>>,
+    /// Rank-ordered NCCL communicators created once at compile time and
+    /// shared by clones. `ncclCommInitAll` costs far more than a small
+    /// all-reduce, so creating it per call dominated every training step.
+    /// The mutex also serializes invocations: NCCL forbids concurrent use of
+    /// a communicator, and clones share the replicas' retained buffers.
+    #[cfg(feature = "cuda-nccl")]
+    communicators: Arc<Mutex<CudaNcclCommunicators>>,
 }
+
+/// Rank-ordered NCCL communicators of one data-parallel plan.
+///
+/// `Comm` wraps a raw `ncclComm_t` and is therefore not `Send`. The handle is
+/// not bound to its creating thread; NCCL only forbids concurrent use, which
+/// the owning `Mutex` enforces. Each `Comm` holds an `Arc` of its replica's
+/// stream and context, so those outlive the `ncclCommAbort` issued on drop.
+/// Successful invocations synchronize every replica before returning, so no
+/// collective is in flight when the last clone is dropped.
+#[cfg(feature = "cuda-nccl")]
+#[derive(Debug)]
+struct CudaNcclCommunicators(Vec<NcclComm>);
+
+// SAFETY: see `CudaNcclCommunicators`; all access goes through its `Mutex`.
+#[cfg(feature = "cuda-nccl")]
+unsafe impl Send for CudaNcclCommunicators {}
 
 /// Host-observed boundaries for one data-parallel invocation.
 ///
@@ -164,7 +187,8 @@ impl CudaBackend {
         self.device_ordinal
     }
 
-    /// Compiles one identical retained-output plan per explicitly selected GPU.
+    /// Compiles one identical retained-output plan per explicitly selected GPU
+    /// and creates the plan's NCCL communicators once, for its lifetime.
     ///
     /// This API is available in all CUDA builds so callers get a deterministic
     /// feature error instead of an implicit single-device fallback. Actual
@@ -181,10 +205,18 @@ impl CudaBackend {
             .into_iter()
             .map(|ordinal| CudaBackend::new(ordinal).compile(plan.clone()))
             .collect::<Result<Vec<_>, _>>()?;
+        let communicators = NcclComm::from_devices(
+            replicas
+                .iter()
+                .map(|replica| replica.context.default_stream())
+                .collect(),
+        )
+        .map_err(|error| format!("failed to initialize NCCL communicators: {error:?}"))?;
         Ok(CudaDataParallelExecutionPlan {
             replicas,
             output_node_ids,
             collectives: None,
+            communicators: Arc::new(Mutex::new(CudaNcclCommunicators(communicators))),
         })
     }
 
@@ -467,6 +499,12 @@ impl CudaDataParallelExecutionPlan {
                 replica_inputs.len()
             ));
         }
+        // Held for the whole invocation so concurrent callers cannot
+        // interleave replica work with another call's collectives.
+        let communicators = self
+            .communicators
+            .lock()
+            .map_err(|_| "CUDA data-parallel NCCL communicator lock is poisoned".to_string())?;
 
         let enqueue_start = Instant::now();
         for (replica, inputs) in self.replicas.iter().zip(replica_inputs) {
@@ -475,7 +513,7 @@ impl CudaDataParallelExecutionPlan {
         let replica_enqueue = enqueue_start.elapsed();
 
         let collective_start = Instant::now();
-        self.all_reduce_retained_outputs(collectives)?;
+        self.all_reduce_retained_outputs(&communicators.0, collectives)?;
         for replica in &self.replicas {
             replica.synchronize()?;
         }
@@ -523,15 +561,9 @@ impl CudaDataParallelExecutionPlan {
     #[cfg(feature = "cuda-nccl")]
     fn all_reduce_retained_outputs(
         &self,
+        communicators: &[NcclComm],
         collectives: &[(TensorNodeId, TensorReplicaReduction)],
     ) -> Result<(), String> {
-        let communicators = NcclComm::from_devices(
-            self.replicas
-                .iter()
-                .map(|replica| replica.context.default_stream())
-                .collect(),
-        )
-        .map_err(|error| format!("failed to initialize NCCL communicators: {error:?}"))?;
         for (node_id, reduction) in collectives {
             let operation = match reduction {
                 TensorReplicaReduction::Sum => NcclReduceOp::Sum,
@@ -552,7 +584,7 @@ impl CudaDataParallelExecutionPlan {
                 format!("NCCL group start failed for node {node_id}: {error:?}")
             })?;
             let enqueued =
-                self.enqueue_all_reduce(&communicators, *node_id, &operation, expected_len);
+                self.enqueue_all_reduce(communicators, *node_id, &operation, expected_len);
             let ended = group_end()
                 .map_err(|error| format!("NCCL group end failed for node {node_id}: {error:?}"));
             enqueued?;
