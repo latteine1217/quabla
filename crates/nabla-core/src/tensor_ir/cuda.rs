@@ -341,7 +341,9 @@ impl CudaBackend {
                         format!("CUDA Scan VJP JVP node {node_id} cannot lower to a device loop: {error}")
                     })?;
                     cuda_scan_vjp_jvp_group(&plan, *group).map_err(|error| {
-                        format!("CUDA Scan VJP JVP node {node_id} has invalid group bindings: {error}")
+                        format!(
+                            "CUDA Scan VJP JVP node {node_id} has invalid group bindings: {error}"
+                        )
                     })?;
                 }
                 _ => {}
@@ -605,7 +607,9 @@ impl CudaDataParallelExecutionPlan {
                 .shape
                 .iter()
                 .try_fold(1usize, |count, extent| count.checked_mul(*extent))
-                .ok_or_else(|| format!("CUDA data-parallel output node {node_id} size overflows usize"))?;
+                .ok_or_else(|| {
+                    format!("CUDA data-parallel output node {node_id} size overflows usize")
+                })?;
             // One thread drives every rank, so NCCL requires group semantics:
             // an ungrouped per-rank call may block waiting for the other ranks.
             group_start().map_err(|error| {
@@ -676,17 +680,26 @@ fn create_nccl_communicators(replicas: &[CudaExecutionPlan]) -> Result<Vec<NcclC
 #[cfg(feature = "cuda-nccl")]
 fn validate_cuda_data_parallel_devices(device_ordinals: &[usize]) -> Result<(), String> {
     if device_ordinals.len() < 2 {
-        return Err("CUDA data-parallel execution requires at least two device ordinals".to_string());
+        return Err(
+            "CUDA data-parallel execution requires at least two device ordinals".to_string(),
+        );
     }
     let mut unique = BTreeSet::new();
-    if device_ordinals.iter().any(|ordinal| !unique.insert(*ordinal)) {
+    if device_ordinals
+        .iter()
+        .any(|ordinal| !unique.insert(*ordinal))
+    {
         return Err("CUDA data-parallel device ordinals must be unique".to_string());
     }
     let available = CudaContext::device_count()
         .map_err(|error| format!("failed to query CUDA device count: {error:?}"))?;
     let available = usize::try_from(available)
         .map_err(|_| "CUDA driver reported a negative device count".to_string())?;
-    if let Some(ordinal) = device_ordinals.iter().copied().find(|ordinal| *ordinal >= available) {
+    if let Some(ordinal) = device_ordinals
+        .iter()
+        .copied()
+        .find(|ordinal| *ordinal >= available)
+    {
         return Err(format!(
             "CUDA data-parallel device ordinal {ordinal} is unavailable; CUDA reports {available} device(s)"
         ));
@@ -1599,11 +1612,12 @@ fn execute_cuda_device_program(
                 let (before, current_and_after) = values.split_at_mut(node_id);
                 // 主機同步邊界：clone_dtoh 會等 stream 完成並讀回一個 f32 謂詞；
                 // 之後只啟動被選分支的 kernels，未選分支不在 device 上求值。
-                let predicate = stream
-                    .clone_dtoh(cuda_value(before, *predicate)?)
-                    .map_err(|error| {
-                        format!("failed to read CUDA Cond node {node_id} predicate: {error:?}")
-                    })?;
+                let predicate =
+                    stream
+                        .clone_dtoh(cuda_value(before, *predicate)?)
+                        .map_err(|error| {
+                            format!("failed to read CUDA Cond node {node_id} predicate: {error:?}")
+                        })?;
                 let region = if cuda_scalar_predicate(&predicate)? {
                     &branches.on_true
                 } else {
@@ -1939,12 +1953,11 @@ fn execute_cuda_device_program(
                     let carry_count = element_count(&scan_plan.carry_shape()?)?;
                     let output_shape = scan_plan.output_shape()?;
                     let output_count = element_count(&output_shape)?;
-                    let output_step_count =
-                        element_count(&scan_plan.body.output_shapes()[1])?;
+                    let output_step_count = element_count(&scan_plan.body.output_shapes()[1])?;
                     let launch_count =
                         u32::try_from(carry_count.max(output_step_count)).map_err(|_| {
-                        format!("CUDA Scan node {node_id} launch exceeds u32 element count")
-                    })?;
+                            format!("CUDA Scan node {node_id} launch exceeds u32 element count")
+                        })?;
                     if slot.is_none() {
                         *slot = Some(take_cuda_buffer(stream, free_buffers, count, node_id)?);
                     }
@@ -2185,20 +2198,27 @@ fn execute_cuda_device_program(
                             [scan_hvp.scan_plan.body.plan.output_node_ids[1]]
                             .shape,
                     )?;
-                    let tape_count = scan_hvp.scan_plan.upper
+                    let tape_count = scan_hvp
+                        .scan_plan
+                        .upper
                         .checked_sub(scan_hvp.scan_plan.lower)
                         .and_then(|steps| steps.checked_add(1))
                         .and_then(|states| states.checked_mul(carry_count))
-                        .ok_or_else(|| "CUDA Scan VJP JVP carry tape size overflowed usize".to_string())?;
-                    let mut carry_tape = take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
-                    let mut tangent_tape = take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
+                        .ok_or_else(|| {
+                            "CUDA Scan VJP JVP carry tape size overflowed usize".to_string()
+                        })?;
+                    let mut carry_tape =
+                        take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
+                    let mut tangent_tape =
+                        take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
                     let launch_count = u32::try_from(carry_count).map_err(|_| {
                         format!("CUDA Scan VJP JVP node {node_id} launch exceeds u32 element count")
                     })?;
                     let mut outputs = Vec::with_capacity(members.len());
                     for (member_id, member_target) in &members {
                         let member_count = element_count(&plan.nodes[*member_id].shape)?;
-                        let mut output = take_cuda_buffer(stream, free_buffers, member_count, *member_id)?;
+                        let mut output =
+                            take_cuda_buffer(stream, free_buffers, member_count, *member_id)?;
                         if matches!(member_target, TensorScanVjpTarget::External(_))
                             && output.len() != carry_count
                         {
@@ -2208,18 +2228,39 @@ fn execute_cuda_device_program(
                         }
                         outputs.push(output);
                     }
-                    let kernel = module.load_function(&cuda_node_function_name(node_id)).map_err(|error| {
-                        format!("failed to load CUDA Scan VJP JVP node {node_id} kernel: {error:?}")
-                    })?;
+                    let kernel = module
+                        .load_function(&cuda_node_function_name(node_id))
+                        .map_err(|error| {
+                            format!(
+                                "failed to load CUDA Scan VJP JVP node {node_id} kernel: {error:?}"
+                            )
+                        })?;
                     launch_cuda_scan_vjp_jvp_group(
-                        stream, &kernel, &mut outputs, &mut carry_tape, &mut tangent_tape,
-                        before, *carry, *carry_tangent, *final_carry_cotangent,
-                        *final_carry_cotangent_tangent, *output_cotangent,
-                        *output_cotangent_tangent, captures, tangent_captures, launch_count,
+                        stream,
+                        &kernel,
+                        &mut outputs,
+                        &mut carry_tape,
+                        &mut tangent_tape,
+                        before,
+                        *carry,
+                        *carry_tangent,
+                        *final_carry_cotangent,
+                        *final_carry_cotangent_tangent,
+                        *output_cotangent,
+                        *output_cotangent_tangent,
+                        captures,
+                        tangent_captures,
+                        launch_count,
                         output_count as u64,
                     )?;
-                    free_buffers.entry(carry_tape.len()).or_default().push(carry_tape);
-                    free_buffers.entry(tangent_tape.len()).or_default().push(tangent_tape);
+                    free_buffers
+                        .entry(carry_tape.len())
+                        .or_default()
+                        .push(carry_tape);
+                    free_buffers
+                        .entry(tangent_tape.len())
+                        .or_default()
+                        .push(tangent_tape);
                     let mut cached = CudaScanVjpJvpCache::default();
                     for ((member_id, _), output) in members.into_iter().zip(outputs) {
                         if member_id == node_id {
@@ -3249,18 +3290,31 @@ fn launch_cuda_scan_vjp_group(
 
 #[allow(clippy::too_many_arguments)]
 fn launch_cuda_scan_vjp_jvp_group(
-    stream: &Arc<CudaStream>, kernel: &CudaFunction, outputs: &mut [CudaSlice<f32>],
-    carry_tape: &mut CudaSlice<f32>, carry_tangent_tape: &mut CudaSlice<f32>,
-    values: &[Option<CudaSlice<f32>>], carry: TensorNodeId, carry_tangent: TensorNodeId,
-    final_carry_cotangent: TensorNodeId, final_carry_cotangent_tangent: TensorNodeId,
-    output_cotangent: TensorNodeId, output_cotangent_tangent: TensorNodeId,
-    captures: &[(String, TensorNodeId)], tangent_captures: &[(String, TensorNodeId)],
-    launch_count: u32, output_count: u64,
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    outputs: &mut [CudaSlice<f32>],
+    carry_tape: &mut CudaSlice<f32>,
+    carry_tangent_tape: &mut CudaSlice<f32>,
+    values: &[Option<CudaSlice<f32>>],
+    carry: TensorNodeId,
+    carry_tangent: TensorNodeId,
+    final_carry_cotangent: TensorNodeId,
+    final_carry_cotangent_tangent: TensorNodeId,
+    output_cotangent: TensorNodeId,
+    output_cotangent_tangent: TensorNodeId,
+    captures: &[(String, TensorNodeId)],
+    tangent_captures: &[(String, TensorNodeId)],
+    launch_count: u32,
+    output_count: u64,
 ) -> Result<(), String> {
     let carry_count = cuda_value(values, carry)?.len() as u64;
     let mut launch = stream.launch_builder(kernel);
-    for (_, value) in captures { launch.arg(cuda_value(values, *value)?); }
-    for (_, value) in tangent_captures { launch.arg(cuda_value(values, *value)?); }
+    for (_, value) in captures {
+        launch.arg(cuda_value(values, *value)?);
+    }
+    for (_, value) in tangent_captures {
+        launch.arg(cuda_value(values, *value)?);
+    }
     launch.arg(cuda_value(values, carry)?);
     launch.arg(cuda_value(values, carry_tangent)?);
     launch.arg(cuda_value(values, final_carry_cotangent)?);
@@ -3269,13 +3323,17 @@ fn launch_cuda_scan_vjp_jvp_group(
     launch.arg(cuda_value(values, output_cotangent_tangent)?);
     launch.arg(carry_tape);
     launch.arg(carry_tangent_tape);
-    for output in outputs { launch.arg(output); }
+    for output in outputs {
+        launch.arg(output);
+    }
     launch.arg(&carry_count);
     launch.arg(&output_count);
     unsafe {
-        launch.launch(LaunchConfig::for_num_elems(launch_count)).map_err(|error| {
-            format!("failed to launch grouped CUDA Scan VJP JVP device loop: {error:?}")
-        })?;
+        launch
+            .launch(LaunchConfig::for_num_elems(launch_count))
+            .map_err(|error| {
+                format!("failed to launch grouped CUDA Scan VJP JVP device loop: {error:?}")
+            })?;
     }
     Ok(())
 }
@@ -3717,8 +3775,7 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
         .output_shapes()
         .get(1)
         .ok_or_else(|| "Scan body output is missing".to_string())?;
-    let output_matches_carry_lanes =
-        element_count(output_shape)? == element_count(&carry_shape)?;
+    let output_matches_carry_lanes = element_count(output_shape)? == element_count(&carry_shape)?;
     if !output_matches_carry_lanes && !cuda_shapes_broadcastable(output_shape, &carry_shape) {
         return Err(format!(
             "Scan body output shape {output_shape:?} must broadcast the carry shape {carry_shape:?}"
@@ -4284,7 +4341,9 @@ fn cuda_fori_jvp_tangent_names(loop_plan: &TensorForiExecutionPlan) -> BTreeMap<
         }
         let mut tangent_name = format!("__nabla_cuda_fori_jvp_tangent_{index}");
         while loop_plan.body.captures.contains_key(&tangent_name)
-            || tangent_names.values().any(|candidate| candidate == &tangent_name)
+            || tangent_names
+                .values()
+                .any(|candidate| candidate == &tangent_name)
         {
             tangent_name.push('_');
         }
@@ -4301,10 +4360,8 @@ fn cuda_fori_jvp_expressions(
     let carry_shape = loop_plan.carry_shape()?;
     let tangent_names = cuda_fori_jvp_tangent_names(loop_plan);
     let body = loop_plan.body.plan.as_ir();
-    let forward = body.symbolic_jvp_with_tangent_inputs(
-        loop_plan.body.plan.output_node_id,
-        &tangent_names,
-    )?;
+    let forward =
+        body.symbolic_jvp_with_tangent_inputs(loop_plan.body.plan.output_node_id, &tangent_names)?;
     let (forward_plan, outputs) = forward
         .graph
         .compile_cpu_many(&[forward.value, forward.tangent])?;
@@ -4902,7 +4959,9 @@ fn cuda_scan_vjp_jvp_group(
         );
         if let Some(expected) = signature.as_ref() {
             if *expected != current_signature {
-                return Err(format!("CUDA Scan VJP JVP group {group} mixes incompatible bindings"));
+                return Err(format!(
+                    "CUDA Scan VJP JVP group {group} mixes incompatible bindings"
+                ));
             }
         } else {
             signature = Some(current_signature);
@@ -4910,7 +4969,9 @@ fn cuda_scan_vjp_jvp_group(
         members.push((node_id, target));
     }
     if members.is_empty() {
-        return Err(format!("CUDA Scan VJP JVP group {group} has no result nodes"));
+        return Err(format!(
+            "CUDA Scan VJP JVP group {group} has no result nodes"
+        ));
     }
     Ok(members)
 }
@@ -6132,17 +6193,18 @@ fn cuda_scan_vjp_jvp_group_kernel_source(
                 .cloned()
                 .ok_or_else(|| format!("CUDA Scan VJP JVP has no capture {name:?}"))?,
         };
-        let carry_directional = plan
-            .carry_gradient_tangent_plans
-            .get(name)
-            .ok_or_else(|| format!("CUDA Scan VJP JVP has no carry directional plan for {name:?}"))?;
+        let carry_directional = plan.carry_gradient_tangent_plans.get(name).ok_or_else(|| {
+            format!("CUDA Scan VJP JVP has no carry directional plan for {name:?}")
+        })?;
         let output_directional = if direct_broadcast_output {
             cuda_scan_vjp_jvp_direct_broadcast_output_directional_plan(plan, target)?
         } else {
             plan.output_gradient_tangent_plans
                 .get(name)
                 .cloned()
-                .ok_or_else(|| format!("CUDA Scan VJP JVP has no output directional plan for {name:?}"))?
+                .ok_or_else(|| {
+                    format!("CUDA Scan VJP JVP has no output directional plan for {name:?}")
+                })?
         };
         let directional = format!(
             "({} + {})",

@@ -1695,8 +1695,14 @@ fn cuda_backend_executes_structural_fori_jvp_when_enabled() {
         &BTreeMap::from([("scale".to_string(), "scale_tangent".to_string())]),
     ));
     let inputs = BTreeMap::from([
-        ("initial".to_string(), must!(DynamicTensor::new(vec![], vec![1.0]))),
-        ("scale".to_string(), must!(DynamicTensor::new(vec![], vec![2.0]))),
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(vec![], vec![2.0])),
+        ),
         (
             "scale_tangent".to_string(),
             must!(DynamicTensor::new(vec![], vec![1.0])),
@@ -2782,8 +2788,14 @@ fn mlx_backend_returns_float_masks_from_greater_like_cpu() {
             "x".to_string(),
             must!(DynamicTensor::new(vec![], vec![value])),
         )]);
-        assert_eq!(must!(CpuBackend.execute(&plan, &inputs)).data(), &[expected]);
-        assert_eq!(must!(MlxBackend.execute(&plan, &inputs)).data(), &[expected]);
+        assert_eq!(
+            must!(CpuBackend.execute(&plan, &inputs)).data(),
+            &[expected]
+        );
+        assert_eq!(
+            must!(MlxBackend.execute(&plan, &inputs)).data(),
+            &[expected]
+        );
     }
 }
 

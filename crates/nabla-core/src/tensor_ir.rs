@@ -2222,7 +2222,6 @@ impl TensorIr {
         })
     }
 
-
     fn symbolic_jvp_with_seed<F>(
         &self,
         output: TensorNodeId,
@@ -2241,12 +2240,12 @@ impl TensorIr {
             mut values,
             mut tangents,
         } = self.symbolic_jvp_many_with_seed(&[output], input_tangent)?;
-        let value = values.pop().ok_or_else(|| {
-            "symbolic JVP transform has no requested value output".to_string()
-        })?;
-        let tangent = tangents.pop().ok_or_else(|| {
-            "symbolic JVP transform has no requested tangent output".to_string()
-        })?;
+        let value = values
+            .pop()
+            .ok_or_else(|| "symbolic JVP transform has no requested value output".to_string())?;
+        let tangent = tangents
+            .pop()
+            .ok_or_else(|| "symbolic JVP transform has no requested tangent output".to_string())?;
         Ok(SymbolicJvp {
             graph,
             value,
@@ -2401,7 +2400,7 @@ impl TensorIr {
                 )?,
                 TensorOp::ForiJvp { .. } => {
                     return Err(
-                        "symbolic JVP through a Fori JVP result is not implemented".to_string(),
+                        "symbolic JVP through a Fori JVP result is not implemented".to_string()
                     )
                 }
                 TensorOp::ForiVjp {
@@ -3848,10 +3847,7 @@ impl TensorIr {
             ));
         }
         let expected_captures = loop_plan.external_captures();
-        for (kind, bound_captures) in [
-            ("primal", &captures),
-            ("tangent", &tangent_captures),
-        ] {
+        for (kind, bound_captures) in [("primal", &captures), ("tangent", &tangent_captures)] {
             if bound_captures.len() != expected_captures.len() {
                 return Err(format!(
                     "fori JVP {kind} captures must bind every external body capture exactly once"
@@ -3860,7 +3856,9 @@ impl TensorIr {
             let mut seen = BTreeSet::new();
             for (name, capture) in bound_captures {
                 if !seen.insert(name.as_str()) {
-                    return Err(format!("fori JVP {kind} capture {name:?} is bound more than once"));
+                    return Err(format!(
+                        "fori JVP {kind} capture {name:?} is bound more than once"
+                    ));
                 }
                 let expected_shape = expected_captures
                     .get(name)
@@ -4034,7 +4032,6 @@ impl TensorIr {
             false,
         ))
     }
-
 
     fn fori_vjp_jvp(
         &mut self,
@@ -6251,13 +6248,13 @@ impl TensorIr {
                     tangent_captures,
                 } => {
                     let external_inputs = tensor_fori_capture_values(captures, &values)?;
-                    let external_tangents =
-                        tensor_fori_capture_values(tangent_captures, &values)?;
+                    let external_tangents = tensor_fori_capture_values(tangent_captures, &values)?;
                     loop_plan
                         .jvp(
-                            values.get(*carry).cloned().ok_or_else(|| {
-                                format!("node {carry} has no evaluated value")
-                            })?,
+                            values
+                                .get(*carry)
+                                .cloned()
+                                .ok_or_else(|| format!("node {carry} has no evaluated value"))?,
                             values.get(*carry_tangent).cloned().ok_or_else(|| {
                                 format!("node {carry_tangent} has no evaluated value")
                             })?,

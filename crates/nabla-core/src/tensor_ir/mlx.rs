@@ -1189,7 +1189,9 @@ fn mlx_fori_jvp(
         }
         let mut tangent_name = format!("__nabla_mlx_fori_jvp_tangent_{index}");
         while loop_plan.body.captures.contains_key(&tangent_name)
-            || tangent_names.values().any(|candidate| candidate == &tangent_name)
+            || tangent_names
+                .values()
+                .any(|candidate| candidate == &tangent_name)
         {
             tangent_name.push('_');
         }
@@ -1207,7 +1209,9 @@ fn mlx_fori_jvp(
                 .transpose()
         },
     )?;
-    let (forward_plan, outputs) = forward.graph.compile_cpu_many(&[forward.value, forward.tangent])?;
+    let (forward_plan, outputs) = forward
+        .graph
+        .compile_cpu_many(&[forward.value, forward.tangent])?;
     let mut carry = initial_carry;
     let mut carry_tangent = initial_tangent;
     for index in loop_plan.lower..loop_plan.upper {
