@@ -42,6 +42,17 @@ fn backend_precision_contract_keeps_cpu_reference_and_gpu_execution_explicit() {
     for backend in [TensorDeviceBackend::Cuda, TensorDeviceBackend::Mlx] {
         assert_eq!(backend.precision().logical, TensorDType::F64);
         assert_eq!(backend.precision().execution, TensorDType::F32);
+        assert_eq!(
+            backend.execution_dtype(TensorDType::F64),
+            Ok(TensorDType::F32)
+        );
+        assert_eq!(
+            backend.execution_dtype(TensorDType::F32),
+            Ok(TensorDType::F32)
+        );
+    }
+    for dtype in [TensorDType::F32, TensorDType::F64] {
+        assert_eq!(TensorDeviceBackend::Cpu.execution_dtype(dtype), Ok(dtype));
     }
 }
 
@@ -279,6 +290,158 @@ fn assert_multi_output_parity(target: NablaTarget) {
             );
         }
     }
+}
+
+/// f32 MLP value and gradients for device parity against the CPU f32
+/// reference; `dtype` selects the logical dtype of every input.
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn mlp_value_and_grad_program(
+    dtype: TensorDType,
+) -> Result<(NablaMultiOutputProgram, BTreeMap<String, DynamicTensor>), String> {
+    let mut graph = TensorIr::new();
+    let x = graph.input_typed("x", vec![8, 3], dtype)?;
+    let w1 = graph.input_typed("w1", vec![3, 16], dtype)?;
+    let b1 = graph.input_typed("b1", vec![1, 16], dtype)?;
+    let w2 = graph.input_typed("w2", vec![16, 1], dtype)?;
+    let b2 = graph.input_typed("b2", vec![1, 1], dtype)?;
+    let hidden = graph.matmul(x, w1)?;
+    let hidden = graph.add(hidden, b1)?;
+    let hidden = graph.tanh(hidden)?;
+    let output = graph.matmul(hidden, w2)?;
+    let output = graph.add(output, b2)?;
+    let scale = graph.scalar_constant(0.5);
+    let scaled = graph.mul(output, scale)?;
+    let squared = graph.powi(scaled, 2)?;
+    let loss = graph.mean(squared)?;
+    let vjp = graph.symbolic_vjp(loss, "cotangent")?;
+    let outputs = vec![
+        vjp.value,
+        vjp.gradients["w1"],
+        vjp.gradients["b1"],
+        vjp.gradients["w2"],
+        vjp.gradients["b2"],
+    ];
+    // 決定性的非整數輸入，使 f32 捨入在每個節點都實際發生。
+    let values = |count: usize, seed: f64| -> Vec<f64> {
+        (0..count)
+            .map(|index| ((index as f64 + 1.0) * seed).sin() * 0.9)
+            .collect()
+    };
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            DynamicTensor::new(vec![8, 3], values(24, 0.37))?,
+        ),
+        (
+            "w1".to_string(),
+            DynamicTensor::new(vec![3, 16], values(48, 1.13))?,
+        ),
+        (
+            "b1".to_string(),
+            DynamicTensor::new(vec![1, 16], values(16, 0.71))?,
+        ),
+        (
+            "w2".to_string(),
+            DynamicTensor::new(vec![16, 1], values(16, 2.03))?,
+        ),
+        ("b2".to_string(), DynamicTensor::new(vec![1, 1], vec![0.1])?),
+        (
+            "cotangent".to_string(),
+            DynamicTensor::new(vec![], vec![1.0])?,
+        ),
+    ]);
+    Ok((NablaMultiOutputProgram::new(vjp.graph, outputs)?, inputs))
+}
+
+/// Largest `|actual - expected| / max(1, |expected|)` over all outputs.
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn max_scaled_error(actual: &[DynamicTensor], expected: &[DynamicTensor]) -> f64 {
+    assert_eq!(actual.len(), expected.len());
+    actual
+        .iter()
+        .zip(expected)
+        .flat_map(|(actual, expected)| {
+            assert_eq!(actual.shape(), expected.shape());
+            actual
+                .data()
+                .iter()
+                .zip(expected.data())
+                .map(|(actual, expected)| (actual - expected).abs() / expected.abs().max(1.0))
+                .collect::<Vec<_>>()
+        })
+        .fold(0.0, f64::max)
+}
+
+/// f32 programs run natively on the device, so the CPU f32 reference sees the
+/// same rounded inputs and only per-op rounding, transcendental accuracy and
+/// reduction order differ: a few f32 ulps (6e-8 each at unit scale) per op over
+/// this ~10-op-deep graph stay below 1e-6, ten times tighter than the existing
+/// f64-reference 1e-5 contract.
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn assert_f32_mlp_parity(target: NablaTarget) {
+    let compiler = NablaCompiler;
+    let (program, inputs) = must!(mlp_value_and_grad_program(TensorDType::F32));
+    let cpu = must!(must!(compiler.compile_many(&program, NablaTarget::Cpu)).execute(&inputs));
+    let device = must!(must!(compiler.compile_many(&program, target)).execute(&inputs));
+    assert!(cpu
+        .iter()
+        .chain(&device)
+        .all(|value| value.dtype() == TensorDType::F32));
+    let (reference_program, _) = must!(mlp_value_and_grad_program(TensorDType::F64));
+    let reference =
+        must!(must!(compiler.compile_many(&reference_program, NablaTarget::Cpu)).execute(&inputs));
+    let f32_error = max_scaled_error(&device, &cpu);
+    let f64_error = max_scaled_error(&device, &reference);
+    println!("{target:?} f32 MLP: error vs CPU f32 {f32_error:e}, vs CPU f64 {f64_error:e}");
+    assert!(f32_error <= 1e-6, "device vs CPU f32 error {f32_error:e}");
+    assert!(f64_error <= 1e-5, "device vs CPU f64 error {f64_error:e}");
+
+    // cast 在裝置上是 f32 恆等；f64->f32->f64 往返與 CPU 位元一致並保留 dtype 標記。
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3]));
+    let single = must!(graph.cast(x, TensorDType::F32));
+    let doubled = must!(graph.add(single, single));
+    let round_trip = must!(graph.cast(doubled, TensorDType::F64));
+    let program = must!(NablaMultiOutputProgram::new(
+        graph,
+        vec![doubled, round_trip]
+    ));
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![3], vec![0.1, -2.5e-3, 7.0 / 3.0])),
+    )]);
+    let cpu = must!(must!(compiler.compile_many(&program, NablaTarget::Cpu)).execute(&inputs));
+    let device = must!(must!(compiler.compile_many(&program, target)).execute(&inputs));
+    for (actual, expected) in device.iter().zip(&cpu) {
+        assert_eq!(actual.dtype(), expected.dtype());
+        assert_eq!(actual.data(), expected.data());
+    }
+    assert_eq!(device[0].dtype(), TensorDType::F32);
+    assert_eq!(device[1].dtype(), TensorDType::F64);
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_f32_mlp_value_and_gradients_match_the_cpu_f32_reference() {
+    assert_f32_mlp_parity(NablaTarget::Mlx);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_f32_mlp_value_and_gradients_match_the_cpu_f32_reference_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    assert_f32_mlp_parity(NablaTarget::Cuda { device_ordinal: 0 });
 }
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
@@ -5331,4 +5494,321 @@ fn compile_cpu_many_preserves_every_requested_output_node() {
     assert_eq!(outputs.len(), 2);
     assert_eq!(plan.output_node_ids(), outputs.as_slice());
     assert_ne!(outputs[0], outputs[1]);
+}
+
+fn f32_inputs(values: &[(&str, Vec<usize>, Vec<f64>)]) -> BTreeMap<String, DynamicTensor> {
+    values
+        .iter()
+        .map(|(name, shape, data)| {
+            (
+                name.to_string(),
+                DynamicTensor::new(shape.clone(), data.clone()).expect("valid test tensor"),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn typed_f32_input_adopts_weak_scalars_and_lowers_as_f32() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input_typed("x", vec![2], TensorDType::F32));
+    let tenth = graph.scalar_constant(0.1);
+    let output = must!(graph.add(x, tenth));
+    assert_eq!(graph.node_dtype(output), Ok(TensorDType::F32));
+    assert!(graph.lower_text().contains("tensor<2xf32>"));
+    assert!(graph.lower_text().contains("cast("));
+
+    // 弱純量先轉成 f32(0.1)，再與 f32 輸入相加並捨入。
+    let inputs = f32_inputs(&[("x", vec![2], vec![1.0, 2.5])]);
+    let plan = must!(graph.compile_cpu(output));
+    assert_eq!(plan.output_dtype(), Ok(TensorDType::F32));
+    let value = must!(CpuBackend.execute(&plan, &inputs));
+    assert_eq!(value.dtype(), TensorDType::F32);
+    let expected = [1.0_f32 + 0.1_f32, 2.5_f32 + 0.1_f32];
+    for (actual, expected) in value.data().iter().zip(expected) {
+        assert_eq!(actual.to_bits(), f64::from(expected).to_bits());
+    }
+}
+
+#[test]
+fn mixing_strong_f32_and_f64_tensors_is_a_trace_time_error() {
+    let mut graph = TensorIr::new();
+    let single = must!(graph.input_typed("single", vec![2], TensorDType::F32));
+    let double = must!(graph.input("double", vec![2]));
+    let node_count = graph.lower_text().lines().count();
+    let error = graph
+        .add(single, double)
+        .expect_err("strong tensors of different dtypes must not be promoted");
+    assert!(error.contains("astype"), "{error}");
+    assert!(error.contains("f32") && error.contains("f64"), "{error}");
+    assert_eq!(graph.lower_text().lines().count(), node_count);
+    let error = graph
+        .concat(vec![single, double], 0)
+        .expect_err("concat must follow the same promotion rule");
+    assert!(error.contains("astype"), "{error}");
+
+    let cast = must!(graph.cast(double, TensorDType::F32));
+    let sum = must!(graph.add(single, cast));
+    assert_eq!(graph.node_dtype(sum), Ok(TensorDType::F32));
+}
+
+#[test]
+fn cpu_f32_arithmetic_matches_ieee_single_precision_bitwise() {
+    let xs = [0.1, 1.0 / 3.0, -7.25e-3, 12345.678, 3.0e38];
+    let ys = [0.3, 2.0 / 7.0, 1.5e4, -0.001, 10.0];
+    let zs = [0.7, -1.0e-8, 3.1, 99.5, -1.0];
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input_typed("x", vec![5], TensorDType::F32));
+    let y = must!(graph.input_typed("y", vec![5], TensorDType::F32));
+    let z = must!(graph.input_typed("z", vec![5], TensorDType::F32));
+    let product = must!(graph.mul(x, y));
+    let fused = must!(graph.add(product, z));
+    let quotient = must!(graph.div(x, y));
+    let root = must!(graph.sqrt(product));
+    let inputs = f32_inputs(&[
+        ("x", vec![5], xs.to_vec()),
+        ("y", vec![5], ys.to_vec()),
+        ("z", vec![5], zs.to_vec()),
+    ]);
+    let expected_fused = (0..5)
+        .map(|i| (xs[i] as f32) * (ys[i] as f32) + zs[i] as f32)
+        .collect::<Vec<_>>();
+    // 逐元素融合路徑與一般直譯路徑都必須逐節點捨入。
+    let fused_plan = must!(graph.compile_cpu(fused));
+    assert!(fused_plan.uses_fused_elementwise_kernel());
+    for value in [
+        must!(CpuBackend.execute(&fused_plan, &inputs)),
+        must!(graph.evaluate(fused, &inputs)),
+    ] {
+        assert_eq!(value.dtype(), TensorDType::F32);
+        for (actual, expected) in value.data().iter().zip(&expected_fused) {
+            assert_eq!(actual.to_bits(), f64::from(*expected).to_bits());
+        }
+    }
+    let quotient = must!(graph.evaluate(quotient, &inputs));
+    let root = must!(graph.evaluate(root, &inputs));
+    for i in 0..5 {
+        let (x, y) = (xs[i] as f32, ys[i] as f32);
+        assert_eq!(quotient.data()[i].to_bits(), f64::from(x / y).to_bits());
+        let product = x * y;
+        let expected_root = if product < 0.0 {
+            f32::NAN
+        } else {
+            product.sqrt()
+        };
+        if expected_root.is_nan() {
+            assert!(root.data()[i].is_nan());
+        } else {
+            assert_eq!(root.data()[i].to_bits(), f64::from(expected_root).to_bits());
+        }
+    }
+}
+
+#[test]
+fn cast_round_trips_are_kept_and_same_dtype_casts_are_removed() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![]));
+    let single = must!(graph.cast(x, TensorDType::F32));
+    let double = must!(graph.cast(single, TensorDType::F64));
+    let plan = must!(graph.compile_cpu(double));
+    let inputs = f32_inputs(&[("x", vec![], vec![0.1])]);
+    let value = must!(CpuBackend.execute(&plan, &inputs));
+    assert_eq!(value.dtype(), TensorDType::F64);
+    assert_eq!(value.data(), &[0.10000000149011612]);
+    assert_eq!(plan.node_count(), 3);
+
+    // 常數的有損往返同樣不可在折疊時被抵銷。
+    let mut graph = TensorIr::new();
+    let tenth = graph.scalar_constant(0.1);
+    let single = must!(graph.cast(tenth, TensorDType::F32));
+    let double = must!(graph.cast(single, TensorDType::F64));
+    let plan = must!(graph.compile_cpu(double));
+    assert_eq!(plan.node_count(), 1);
+    assert_eq!(
+        must!(CpuBackend.execute(&plan, &BTreeMap::new())).data(),
+        &[0.10000000149011612]
+    );
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let squared = must!(graph.mul(x, x));
+    let without_cast = must!(graph.compile_cpu(squared)).node_count();
+    let same = must!(graph.cast(x, TensorDType::F64));
+    let squared_after_cast = must!(graph.mul(same, same));
+    let plan = must!(graph.compile_cpu(squared_after_cast));
+    assert_eq!(plan.node_count(), without_cast);
+    assert!(!plan.lower_text().contains("cast("));
+}
+
+#[test]
+fn cast_ad_rules_convert_tangents_and_cotangents_between_dtypes() {
+    // loss(x) = sum(cast(x, f32)^2)，x 為 f64。
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3]));
+    let single = must!(graph.cast(x, TensorDType::F32));
+    let squared = must!(graph.powi(single, 2));
+    let loss = must!(graph.sum(squared));
+    assert_eq!(graph.node_dtype(loss), Ok(TensorDType::F32));
+    let point = [0.3, -1.7, 2.2];
+    let inputs = f32_inputs(&[("x", vec![3], point.to_vec())]);
+
+    let symbolic = must!(graph.symbolic_vjp(loss, "seed"));
+    let gradient = symbolic.gradients["x"];
+    assert_eq!(
+        symbolic.graph.node_dtype(symbolic.cotangent),
+        Ok(TensorDType::F32)
+    );
+    assert_eq!(symbolic.graph.node_dtype(gradient), Ok(TensorDType::F64));
+    let mut seeded = inputs.clone();
+    seeded.insert(
+        "seed".to_string(),
+        must!(DynamicTensor::new(vec![], vec![1.0])),
+    );
+    let symbolic_gradient = must!(symbolic.graph.evaluate(gradient, &seeded));
+    assert_eq!(symbolic_gradient.dtype(), TensorDType::F64);
+    let (_, eager_gradients) =
+        must!(graph.value_and_vjp(loss, &inputs, must!(DynamicTensor::new(vec![], vec![1.0]))));
+    assert_eq!(eager_gradients["x"].dtype(), TensorDType::F64);
+
+    let loss_at = |values: &[f64]| -> f64 {
+        values
+            .iter()
+            .map(|value| {
+                let single = *value as f32;
+                single * single
+            })
+            .sum::<f32>()
+            .into()
+    };
+    // 中央差分對二次函數無截斷誤差；剩餘誤差來自 f32 捨入 (~|f| 6e-8 / h)。
+    let step = 1e-2;
+    for index in 0..3 {
+        let mut plus = point;
+        let mut minus = point;
+        plus[index] += step;
+        minus[index] -= step;
+        let finite_difference = (loss_at(&plus) - loss_at(&minus)) / (2.0 * step);
+        for actual in [
+            symbolic_gradient.data()[index],
+            eager_gradients["x"].data()[index],
+        ] {
+            assert!(
+                (actual - finite_difference).abs() < 1e-4,
+                "gradient {actual} differs from finite difference {finite_difference}"
+            );
+        }
+    }
+
+    let tangent = must!(graph.symbolic_jvp(loss, "x"));
+    assert_eq!(
+        tangent.graph.node_dtype(tangent.tangent),
+        Ok(TensorDType::F32)
+    );
+    let tangent_value = must!(tangent.graph.evaluate(tangent.tangent, &inputs));
+    assert_eq!(tangent_value.dtype(), TensorDType::F32);
+    let plus = point.map(|value| value + step);
+    let minus = point.map(|value| value - step);
+    let directional = (loss_at(&plus) - loss_at(&minus)) / (2.0 * step);
+    assert!((tangent_value.data()[0] - directional).abs() < 1e-4);
+}
+
+#[test]
+fn cse_keeps_casts_distinct_from_their_sources_and_merges_identical_casts() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let first = must!(graph.cast(x, TensorDType::F32));
+    let second = must!(graph.cast(x, TensorDType::F32));
+    let (_, outputs) = must!(graph.compile_cpu_many(&[x, first, second]));
+    assert_ne!(outputs[0], outputs[1]);
+    assert_eq!(outputs[1], outputs[2]);
+
+    // 相同值、不同 dtype 的常數也不可合併。
+    let mut graph = TensorIr::new();
+    let tenth = graph.scalar_constant(0.1);
+    let single = must!(graph.cast(tenth, TensorDType::F32));
+    let (plan, outputs) = must!(graph.compile_cpu_many(&[tenth, single]));
+    assert_ne!(outputs[0], outputs[1]);
+    assert_eq!(plan.node_dtype(outputs[1]), Ok(TensorDType::F32));
+}
+
+#[test]
+fn f32_kernel_ir_validates_and_f64_kernel_ir_is_unchanged() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input_typed("x", vec![2], TensorDType::F32));
+    let doubled = must!(graph.add(x, x));
+    let output = must!(graph.tanh(doubled));
+    let program = must!(graph.compile_cpu(output)).kernel_ir();
+    must!(program.validate());
+    assert!(program
+        .nodes
+        .iter()
+        .all(|node| node.dtype == TensorDType::F32));
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let doubled = must!(graph.add(x, x));
+    let program = must!(graph.compile_cpu(doubled)).kernel_ir();
+    must!(program.validate());
+    assert!(program
+        .nodes
+        .iter()
+        .all(|node| node.dtype == TensorDType::F64));
+    assert!(graph.lower_text().contains("tensor<2xf64>"));
+    assert!(!graph.lower_text().contains("f32"));
+}
+
+#[test]
+fn f64_host_data_fed_to_an_f32_input_is_rounded() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input_typed("x", vec![2], TensorDType::F32));
+    let one = graph.scalar_constant(1.0);
+    let output = must!(graph.mul(x, one));
+    let inputs = f32_inputs(&[("x", vec![2], vec![0.1, 1.0 + 1e-12])]);
+    for value in [
+        must!(CpuBackend.execute(&must!(graph.compile_cpu(output)), &inputs)),
+        must!(graph.evaluate(x, &inputs)),
+    ] {
+        assert_eq!(value.dtype(), TensorDType::F32);
+        assert_eq!(value.data(), &[f64::from(0.1_f32), 1.0]);
+    }
+    let rounded = must!(DynamicTensor::with_dtype(
+        vec![1],
+        vec![0.1],
+        TensorDType::F32
+    ));
+    assert_eq!(rounded.data(), &[f64::from(0.1_f32)]);
+    assert_eq!(rounded.astype(TensorDType::F64).dtype(), TensorDType::F64);
+}
+
+#[test]
+fn f32_fori_carry_adopts_a_typed_index_and_rejects_mixed_captures() {
+    let mut body = TensorIr::new();
+    let carry = must!(body.input_typed("carry", vec![], TensorDType::F32));
+    let index = must!(body.input_typed("index", vec![], TensorDType::F32));
+    let tenth = body.scalar_constant(0.1);
+    let step = must!(body.mul(index, tenth));
+    let next = must!(body.add(carry, step));
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        4,
+        must!(body.compile_cpu(next)),
+        "carry",
+        "index"
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input_typed("initial", vec![], TensorDType::F32));
+    let output = must!(graph.fori(initial, loop_plan.clone(), vec![]));
+    assert_eq!(graph.node_dtype(output), Ok(TensorDType::F32));
+    let inputs = f32_inputs(&[("initial", vec![], vec![1.0])]);
+    let value = must!(graph.evaluate(output, &inputs));
+    let expected = (0..4).fold(1.0_f32, |carry, index| carry + index as f32 * 0.1_f32);
+    assert_eq!(value.dtype(), TensorDType::F32);
+    assert_eq!(value.data(), &[f64::from(expected)]);
+
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let error = graph
+        .fori(initial, loop_plan, vec![])
+        .expect_err("an f64 carry must not bind an f32 loop region");
+    assert!(error.contains("astype"), "{error}");
 }

@@ -391,10 +391,14 @@ impl TensorBackend for CudaBackend {
 
 pub type TensorNodeId = usize;
 
+/// Host tensor value. Storage is always `f64`; `dtype` records the logical
+/// element type, and an `F32` tensor only holds values exactly representable
+/// in `f32` (rounded to nearest-even on construction).
 #[derive(Clone, Debug, PartialEq)]
 pub struct DynamicTensor {
     shape: Vec<usize>,
     data: Vec<f64>,
+    dtype: TensorDType,
 }
 
 #[derive(Clone, Debug)]
@@ -404,6 +408,10 @@ enum TensorOp {
     },
     ScalarConstant {
         value: f64,
+    },
+    /// Element type conversion; the target dtype is the node's dtype.
+    Cast {
+        input: TensorNodeId,
     },
     Add {
         lhs: TensorNodeId,
@@ -668,10 +676,16 @@ struct TensorForiVjpJvpBindings {
 
 type SymbolicScanPair = ((TensorNodeId, TensorNodeId), (TensorNodeId, TensorNodeId));
 
+/// `weak` follows JAX's weak_type: a node derived only from Python scalars or
+/// AD-internal constants. When a weak node meets a strong node of another
+/// dtype, graph construction inserts an explicit `Cast` of the weak operand,
+/// so every non-mask operand of a built node already has the node's dtype.
 #[derive(Clone, Debug)]
 struct TensorNode {
     op: TensorOp,
     shape: Vec<usize>,
+    dtype: TensorDType,
+    weak: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1063,14 +1077,26 @@ impl TensorPlacement {
     }
 }
 
-/// Logical element type carried by compiler IR.
+/// Logical element type carried by compiler IR nodes and host tensors.
 ///
-/// Eager tensors remain `f64` today. CUDA and MLX lower `F32` explicitly;
-/// they must not be represented as a stringly-typed metadata exception.
+/// Host storage stays `f64`; an `F32` value is the correctly rounded `f32` of
+/// its `f64` computation. CUDA and MLX map each logical dtype to an execution
+/// dtype through [`TensorDeviceBackend::execution_dtype`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TensorDType {
     F32,
     F64,
+}
+
+impl TensorDType {
+    /// Rounds an `f64` value to the nearest value representable in this dtype.
+    pub fn round(self, value: f64) -> f64 {
+        match self {
+            // `as f32` 為 IEEE round-to-nearest-even，溢位得 ±inf，與裝置 f32 一致。
+            Self::F32 => value as f32 as f64,
+            Self::F64 => value,
+        }
+    }
 }
 
 impl std::fmt::Display for TensorDType {
@@ -1092,6 +1118,8 @@ pub struct TensorBackendPrecision {
 }
 
 impl TensorDeviceBackend {
+    /// Default-precision contract for `f64` programs, kept for callers that
+    /// predate typed IR; equivalent to `execution_dtype(TensorDType::F64)`.
     pub const fn precision(self) -> TensorBackendPrecision {
         TensorBackendPrecision {
             logical: TensorDType::F64,
@@ -1100,6 +1128,18 @@ impl TensorDeviceBackend {
                 Self::Cuda | Self::Mlx => TensorDType::F32,
             },
         }
+    }
+
+    /// Maps a logical IR dtype to the element type this backend executes.
+    ///
+    /// CUDA and MLX lower `F64` programs to `f32` kernels (native device `f64`
+    /// is not implemented) and execute `F32` natively; the CPU executes every
+    /// dtype as its logical type.
+    pub fn execution_dtype(self, logical: TensorDType) -> Result<TensorDType, String> {
+        Ok(match (self, logical) {
+            (Self::Cpu, dtype) => dtype,
+            (Self::Cuda | Self::Mlx, TensorDType::F64 | TensorDType::F32) => TensorDType::F32,
+        })
     }
 }
 
@@ -1197,7 +1237,7 @@ impl TensorKernelProgram {
             if node.shape.contains(&0) {
                 return Err(format!("kernel node {} has a zero tensor extent", node.id));
             }
-            if node.dtype != TensorDType::F64 {
+            if !matches!(node.dtype, TensorDType::F64 | TensorDType::F32) {
                 return Err(format!(
                     "kernel node {} has unsupported dtype {:?}",
                     node.id, node.dtype
@@ -1339,7 +1379,20 @@ impl DynamicTensor {
             ));
         }
 
-        Ok(Self { shape, data })
+        Ok(Self {
+            shape,
+            data,
+            dtype: TensorDType::F64,
+        })
+    }
+
+    /// Builds a tensor of `dtype`, rounding each value to that dtype.
+    pub fn with_dtype(
+        shape: Vec<usize>,
+        data: Vec<f64>,
+        dtype: TensorDType,
+    ) -> Result<Self, String> {
+        Self::new(shape, data).map(|tensor| tensor.into_dtype(dtype))
     }
 
     pub fn filled(shape: Vec<usize>, value: f64) -> Result<Self, String> {
@@ -1347,7 +1400,27 @@ impl DynamicTensor {
         Ok(Self {
             shape,
             data: vec![value; count],
+            dtype: TensorDType::F64,
         })
+    }
+
+    pub fn dtype(&self) -> TensorDType {
+        self.dtype
+    }
+
+    /// Converts to `dtype` with round-to-nearest-even (exact for widening).
+    pub fn astype(&self, dtype: TensorDType) -> Self {
+        self.clone().into_dtype(dtype)
+    }
+
+    fn into_dtype(mut self, dtype: TensorDType) -> Self {
+        if dtype != TensorDType::F64 {
+            for value in &mut self.data {
+                *value = dtype.round(*value);
+            }
+        }
+        self.dtype = dtype;
+        self
     }
 
     fn one_hot(shape: Vec<usize>, index: usize) -> Result<Self, String> {
@@ -1594,7 +1667,7 @@ impl DynamicTensor {
             let source_end = source_start + length * inner;
             data.extend_from_slice(&self.data[source_start..source_end]);
         }
-        Self::new(shape, data)
+        Self::new(shape, data).map(|slice| slice.into_dtype(self.dtype))
     }
 
     fn pad_slice(&self, output_shape: &[usize], axis: usize, start: usize) -> Result<Self, String> {
@@ -1872,6 +1945,7 @@ impl DynamicTensor {
     /// compiled execution plans remain responsible for backend lowering.
     pub fn permute(&self, axes: &[usize]) -> Result<Self, String> {
         self.transpose(axes)
+            .map(|permuted| permuted.into_dtype(self.dtype))
     }
 
     fn broadcast_to_shape(&self, target_shape: &[usize]) -> Result<Self, String> {
@@ -2009,10 +2083,13 @@ impl TensorIr {
                 return Err(format!("duplicate tangent input name {tangent_name:?}"));
             }
         }
-        self.symbolic_jvp_with_seed(output, |transformed, name, _, shape| {
+        self.symbolic_jvp_with_seed(output, |transformed, name, value, shape| {
             tangent_inputs
                 .get(name)
-                .map(|tangent_name| transformed.input(tangent_name.clone(), shape.to_vec()))
+                .map(|tangent_name| {
+                    let dtype = transformed.node_dtype(value)?;
+                    transformed.input_typed(tangent_name.clone(), shape.to_vec(), dtype)
+                })
                 .transpose()
         })
     }
@@ -2052,10 +2129,13 @@ impl TensorIr {
                 return Err(format!("duplicate tangent input name {tangent_name:?}"));
             }
         }
-        self.symbolic_jvp_many_with_seed(outputs, |transformed, name, _, shape| {
+        self.symbolic_jvp_many_with_seed(outputs, |transformed, name, value, shape| {
             tangent_inputs
                 .get(name)
-                .map(|tangent_name| transformed.input(tangent_name.clone(), shape.to_vec()))
+                .map(|tangent_name| {
+                    let dtype = transformed.node_dtype(value)?;
+                    transformed.input_typed(tangent_name.clone(), shape.to_vec(), dtype)
+                })
                 .transpose()
         })
     }
@@ -2120,7 +2200,8 @@ impl TensorIr {
         for (node_index, node) in self.nodes.iter().enumerate() {
             let pair = match &node.op {
                 TensorOp::Input { name } => {
-                    let value = transformed.input(name.clone(), node.shape.clone())?;
+                    let value =
+                        transformed.input_typed(name.clone(), node.shape.clone(), node.dtype)?;
                     let tangent = match input_tangent(&mut transformed, name, value, &node.shape)? {
                         Some(tangent) => tangent,
                         None => transformed.sub(value, value)?,
@@ -2128,9 +2209,17 @@ impl TensorIr {
                     (value, tangent)
                 }
                 TensorOp::ScalarConstant { value } => (
-                    transformed.scalar_constant(*value),
+                    transformed.constant_like(*value, node.dtype, node.weak),
                     transformed.scalar_constant(0.0),
                 ),
+                // d cast(x) = cast(dx)：切向量與原值同 dtype。
+                TensorOp::Cast { input } => {
+                    let (value, tangent) = pairs[*input];
+                    (
+                        transformed.cast(value, node.dtype)?,
+                        transformed.cast(tangent, node.dtype)?,
+                    )
+                }
                 TensorOp::Add { lhs, rhs } => {
                     let (lhs_value, lhs_tangent) = pairs[*lhs];
                     let (rhs_value, rhs_tangent) = pairs[*rhs];
@@ -2458,6 +2547,13 @@ impl TensorIr {
                     )
                 }
             };
+            if transformed.node(pair.0)?.dtype != node.dtype {
+                return Err(format!(
+                    "symbolic JVP rebuilt node {node_index} with dtype {}, expected {}",
+                    transformed.node(pair.0)?.dtype,
+                    node.dtype
+                ));
+            }
             pairs.push(pair);
         }
 
@@ -2496,8 +2592,13 @@ impl TensorIr {
         let mut scan_values = HashMap::new();
         for (node_index, node) in self.nodes.iter().enumerate() {
             let value = match &node.op {
-                TensorOp::Input { name } => transformed.input(name.clone(), node.shape.clone())?,
-                TensorOp::ScalarConstant { value } => transformed.scalar_constant(*value),
+                TensorOp::Input { name } => {
+                    transformed.input_typed(name.clone(), node.shape.clone(), node.dtype)?
+                }
+                TensorOp::ScalarConstant { value } => {
+                    transformed.constant_like(*value, node.dtype, node.weak)
+                }
+                TensorOp::Cast { input } => transformed.cast(values[*input], node.dtype)?,
                 TensorOp::Add { lhs, rhs } => transformed.add(values[*lhs], values[*rhs])?,
                 TensorOp::Sub { lhs, rhs } => transformed.sub(values[*lhs], values[*rhs])?,
                 TensorOp::Div { lhs, rhs } => transformed.div(values[*lhs], values[*rhs])?,
@@ -2642,10 +2743,22 @@ impl TensorIr {
                 }
             };
             debug_assert_eq!(values.len(), node_index);
+            if transformed.node(value)?.dtype != node.dtype {
+                return Err(format!(
+                    "symbolic VJP rebuilt node {node_index} with dtype {}, expected {}",
+                    transformed.node(value)?.dtype,
+                    node.dtype
+                ));
+            }
             values.push(value);
         }
 
-        let cotangent = transformed.input(cotangent_name, self.node(output)?.shape.clone())?;
+        let output_node = self.node(output)?;
+        let cotangent = transformed.input_typed(
+            cotangent_name,
+            output_node.shape.clone(),
+            output_node.dtype,
+        )?;
         let mut cotangents = vec![None; self.nodes.len()];
         cotangents[output] = Some(cotangent);
         let mut processed_scan_groups = HashSet::new();
@@ -2659,6 +2772,11 @@ impl TensorIr {
                 TensorOp::Input { .. }
                 | TensorOp::ScalarConstant { .. }
                 | TensorOp::Greater { .. } => {}
+                // cast 的 VJP 把餘切轉回來源 dtype。
+                TensorOp::Cast { input } => {
+                    let contribution = transformed.cast(upstream, self.node(*input)?.dtype)?;
+                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
+                }
                 TensorOp::Cond {
                     predicate,
                     branches,
@@ -3164,10 +3282,22 @@ impl TensorIr {
         })
     }
 
+    /// Adds an `f64` input; see [`TensorIr::input_typed`] for other dtypes.
     pub fn input(
         &mut self,
         name: impl Into<String>,
         shape: Vec<usize>,
+    ) -> Result<TensorNodeId, String> {
+        self.input_typed(name, shape, TensorDType::F64)
+    }
+
+    /// Adds a strong input of `dtype`. Host values bound to it are rounded to
+    /// `dtype` at execution, like JAX jit arguments.
+    pub fn input_typed(
+        &mut self,
+        name: impl Into<String>,
+        shape: Vec<usize>,
+        dtype: TensorDType,
     ) -> Result<TensorNodeId, String> {
         element_count(&shape)?;
         let name = name.into();
@@ -3177,45 +3307,67 @@ impl TensorIr {
             return Err(format!("input {name:?} already exists"));
         }
 
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Input { name },
-            shape,
-        });
-        Ok(id)
+        Ok(self.push_node(TensorOp::Input { name }, shape, dtype, false))
     }
 
+    /// Adds a weak `f64` scalar that adopts the dtype of a strong operand it is
+    /// combined with (Python scalars and AD-internal constants).
     pub fn scalar_constant(&mut self, value: f64) -> TensorNodeId {
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::ScalarConstant { value },
-            shape: vec![],
-        });
-        id
+        self.push_node(
+            TensorOp::ScalarConstant { value },
+            vec![],
+            TensorDType::F64,
+            true,
+        )
+    }
+
+    /// Recreates a constant with the dtype and weakness of an existing node,
+    /// for transforms that rebuild a graph node by node.
+    fn constant_like(&mut self, value: f64, dtype: TensorDType, weak: bool) -> TensorNodeId {
+        self.push_node(TensorOp::ScalarConstant { value }, vec![], dtype, weak)
+    }
+
+    /// Converts `input` to `dtype`. Same-dtype casts are kept here and removed
+    /// when a plan is compiled; lossy round trips are never folded.
+    pub fn cast(
+        &mut self,
+        input: TensorNodeId,
+        dtype: TensorDType,
+    ) -> Result<TensorNodeId, String> {
+        let shape = self.node(input)?.shape.clone();
+        Ok(self.push_node(TensorOp::Cast { input }, shape, dtype, false))
+    }
+
+    pub fn node_dtype(&self, id: TensorNodeId) -> Result<TensorDType, String> {
+        Ok(self.node(id)?.dtype)
     }
 
     pub fn add(&mut self, lhs: TensorNodeId, rhs: TensorNodeId) -> Result<TensorNodeId, String> {
-        self.binary(TensorOp::Add { lhs, rhs }, lhs, rhs)
+        self.binary("add", lhs, rhs, |lhs, rhs| TensorOp::Add { lhs, rhs })
     }
 
     pub fn mul(&mut self, lhs: TensorNodeId, rhs: TensorNodeId) -> Result<TensorNodeId, String> {
-        self.binary(TensorOp::Mul { lhs, rhs }, lhs, rhs)
+        self.binary("mul", lhs, rhs, |lhs, rhs| TensorOp::Mul { lhs, rhs })
     }
 
     pub fn sub(&mut self, lhs: TensorNodeId, rhs: TensorNodeId) -> Result<TensorNodeId, String> {
-        self.binary(TensorOp::Sub { lhs, rhs }, lhs, rhs)
+        self.binary("sub", lhs, rhs, |lhs, rhs| TensorOp::Sub { lhs, rhs })
     }
 
     pub fn div(&mut self, lhs: TensorNodeId, rhs: TensorNodeId) -> Result<TensorNodeId, String> {
-        self.binary(TensorOp::Div { lhs, rhs }, lhs, rhs)
+        self.binary("div", lhs, rhs, |lhs, rhs| TensorOp::Div { lhs, rhs })
     }
 
+    /// Elementwise `lhs > rhs` as a 0/1 mask in the operands' dtype.
     pub fn greater(
         &mut self,
         lhs: TensorNodeId,
         rhs: TensorNodeId,
     ) -> Result<TensorNodeId, String> {
-        self.binary(TensorOp::Greater { lhs, rhs }, lhs, rhs)
+        self.binary("greater", lhs, rhs, |lhs, rhs| TensorOp::Greater {
+            lhs,
+            rhs,
+        })
     }
 
     pub fn where_select(
@@ -3231,16 +3383,16 @@ impl TensorIr {
             &broadcast_shape(&condition_shape, &true_shape)?,
             &false_shape,
         )?;
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Where {
+        // 條件只看是否非零，不參與 dtype 統一；兩個分支值必須同 dtype。
+        let [on_true, on_false] = self.coerce_operands("where", [on_true, on_false])?;
+        self.push_derived(
+            TensorOp::Where {
                 condition,
                 on_true,
                 on_false,
             },
             shape,
-        });
-        Ok(id)
+        )
     }
 
     /// Adds a lazy scalar conditional whose branch regions are frozen CPU
@@ -3300,18 +3452,40 @@ impl TensorIr {
                     expected_shape
                 ));
             }
+            self.check_region_binding_dtype("conditional", name, *capture, &branches.on_true.plan)?;
         }
         let shape = branches.output_shape()?;
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Cond {
+        let dtype = branches.on_true.plan.output_dtype()?;
+        Ok(self.push_node(
+            TensorOp::Cond {
                 predicate,
                 branches,
                 captures,
             },
             shape,
-        });
-        Ok(id)
+            dtype,
+            false,
+        ))
+    }
+
+    /// Region captures are strict: a parent value bound to a region input
+    /// must already have that input's dtype.
+    fn check_region_binding_dtype(
+        &self,
+        context: &str,
+        name: &str,
+        value: TensorNodeId,
+        region: &TensorExecutionPlan,
+    ) -> Result<(), String> {
+        let expected = region.input_dtype(name)?;
+        let actual = self.node(value)?.dtype;
+        if actual != expected {
+            return Err(format!(
+                "{context} binds {name:?} of dtype {actual} to a region input of dtype {expected}; \
+                 convert it explicitly with astype"
+            ));
+        }
+        Ok(())
     }
 
     /// Adds a fixed-bound loop whose body owns an explicit carry/index region.
@@ -3353,17 +3527,25 @@ impl TensorIr {
                     expected_shape
                 ));
             }
+            self.check_region_binding_dtype("fori loop", name, *capture, &loop_plan.body.plan)?;
         }
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Fori {
+        self.check_region_binding_dtype(
+            "fori loop",
+            &loop_plan.carry_name,
+            carry,
+            &loop_plan.body.plan,
+        )?;
+        let dtype = loop_plan.body.plan.input_dtype(&loop_plan.carry_name)?;
+        Ok(self.push_node(
+            TensorOp::Fori {
                 carry,
                 loop_plan,
                 captures,
             },
-            shape: carry_shape,
-        });
-        Ok(id)
+            carry_shape,
+            dtype,
+            false,
+        ))
     }
 
     /// Adds the tangent result for a fixed-bound loop. The primal result is
@@ -3419,18 +3601,19 @@ impl TensorIr {
                 }
             }
         }
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::ForiJvp {
+        let dtype = loop_plan.body.plan.input_dtype(&loop_plan.carry_name)?;
+        Ok(self.push_node(
+            TensorOp::ForiJvp {
                 carry,
                 carry_tangent,
                 loop_plan,
                 captures,
                 tangent_captures,
             },
-            shape: carry_shape,
-        });
-        Ok(id)
+            carry_shape,
+            dtype,
+            false,
+        ))
     }
 
     /// Adds a fixed-bound scan whose body returns `(next_carry, output)`.
@@ -3471,32 +3654,46 @@ impl TensorIr {
                     expected_shape
                 ));
             }
+            self.check_region_binding_dtype("scan", name, *capture, &scan_plan.body.plan)?;
         }
+        self.check_region_binding_dtype(
+            "scan",
+            &scan_plan.carry_name,
+            carry,
+            &scan_plan.body.plan,
+        )?;
 
         let output_shape = scan_plan.output_shape()?;
+        let carry_dtype = scan_plan.body.plan.input_dtype(&scan_plan.carry_name)?;
+        let output_dtype = scan_plan
+            .body
+            .plan
+            .node_dtype(scan_plan.body.plan.output_node_ids[1])?;
         let group = self.nodes.len();
-        let carry_id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Scan {
+        let carry_id = self.push_node(
+            TensorOp::Scan {
                 carry,
                 scan_plan: scan_plan.clone(),
                 captures: captures.clone(),
                 target: TensorScanTarget::Carry,
                 group,
             },
-            shape: carry_shape,
-        });
-        let outputs_id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Scan {
+            carry_shape,
+            carry_dtype,
+            false,
+        );
+        let outputs_id = self.push_node(
+            TensorOp::Scan {
                 carry,
                 scan_plan,
                 captures,
                 target: TensorScanTarget::Outputs,
                 group,
             },
-            shape: output_shape,
-        });
+            output_shape,
+            output_dtype,
+            false,
+        );
         Ok((carry_id, outputs_id))
     }
 
@@ -3546,9 +3743,12 @@ impl TensorIr {
                 .cloned()
                 .ok_or_else(|| format!("fori VJP has no external capture {name:?}"))?,
         };
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::ForiVjp {
+        let dtype = loop_plan.body.plan.input_dtype(match &target {
+            TensorForiVjpTarget::Carry => &loop_plan.carry_name,
+            TensorForiVjpTarget::External(name) => name,
+        })?;
+        Ok(self.push_node(
+            TensorOp::ForiVjp {
                 carry,
                 output_cotangent,
                 loop_plan,
@@ -3557,8 +3757,9 @@ impl TensorIr {
                 group,
             },
             shape,
-        });
-        Ok(id)
+            dtype,
+            false,
+        ))
     }
 
 
@@ -3627,9 +3828,12 @@ impl TensorIr {
                 .cloned()
                 .ok_or_else(|| format!("fori VJP JVP has no external capture {name:?}"))?,
         };
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::ForiVjpJvp {
+        let dtype = loop_plan.body.plan.input_dtype(match &target {
+            TensorForiVjpTarget::Carry => &loop_plan.carry_name,
+            TensorForiVjpTarget::External(name) => name,
+        })?;
+        Ok(self.push_node(
+            TensorOp::ForiVjpJvp {
                 carry,
                 carry_tangent,
                 output_cotangent,
@@ -3641,8 +3845,9 @@ impl TensorIr {
                 group,
             },
             shape,
-        });
-        Ok(id)
+            dtype,
+            false,
+        ))
     }
 
     fn scan_vjp(
@@ -3702,9 +3907,12 @@ impl TensorIr {
                 .cloned()
                 .ok_or_else(|| format!("scan VJP has no external capture {name:?}"))?,
         };
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::ScanVjp {
+        let dtype = scan_plan.body.plan.input_dtype(match &target {
+            TensorScanVjpTarget::Carry => &scan_plan.carry_name,
+            TensorScanVjpTarget::External(name) => name,
+        })?;
+        Ok(self.push_node(
+            TensorOp::ScanVjp {
                 carry,
                 final_carry_cotangent,
                 output_cotangent,
@@ -3714,8 +3922,9 @@ impl TensorIr {
                 group,
             },
             shape,
-        });
-        Ok(id)
+            dtype,
+            false,
+        ))
     }
 
     fn scan_vjp_jvp(
@@ -3796,9 +4005,12 @@ impl TensorIr {
                 .cloned()
                 .ok_or_else(|| format!("scan VJP JVP has no external capture {name:?}"))?,
         };
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::ScanVjpJvp {
+        let dtype = scan_plan.body.plan.input_dtype(match &target {
+            TensorScanVjpTarget::Carry => &scan_plan.carry_name,
+            TensorScanVjpTarget::External(name) => name,
+        })?;
+        Ok(self.push_node(
+            TensorOp::ScanVjpJvp {
                 carry,
                 carry_tangent,
                 final_carry_cotangent,
@@ -3812,39 +4024,29 @@ impl TensorIr {
                 group,
             },
             shape,
-        });
-        Ok(id)
+            dtype,
+            false,
+        ))
     }
 
     pub fn sum(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
         self.node(input)?;
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Sum { input },
-            shape: vec![],
-        });
-        Ok(id)
+        self.push_derived(TensorOp::Sum { input }, vec![])
     }
 
     pub fn sum_axis(&mut self, input: TensorNodeId, axis: isize) -> Result<TensorNodeId, String> {
         let input_shape = self.node(input)?.shape.clone();
         let axis = normalize_axis(axis, input_shape.len())?;
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::SumAxis { input, axis },
-            shape: reduced_shape(&input_shape, axis)?,
-        });
-        Ok(id)
+        self.push_derived(
+            TensorOp::SumAxis { input, axis },
+            reduced_shape(&input_shape, axis)?,
+        )
     }
 
     pub fn matmul(&mut self, lhs: TensorNodeId, rhs: TensorNodeId) -> Result<TensorNodeId, String> {
         let shape = matmul_shape(&self.node(lhs)?.shape, &self.node(rhs)?.shape)?;
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Matmul { lhs, rhs },
-            shape,
-        });
-        Ok(id)
+        let [lhs, rhs] = self.coerce_operands("matmul", [lhs, rhs])?;
+        self.push_derived(TensorOp::Matmul { lhs, rhs }, shape)
     }
 
     pub fn solve(
@@ -3853,12 +4055,8 @@ impl TensorIr {
         rhs: TensorNodeId,
     ) -> Result<TensorNodeId, String> {
         let shape = solve_shape(&self.node(matrix)?.shape, &self.node(rhs)?.shape)?;
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Solve { matrix, rhs },
-            shape,
-        });
-        Ok(id)
+        let [matrix, rhs] = self.coerce_operands("solve", [matrix, rhs])?;
+        self.push_derived(TensorOp::Solve { matrix, rhs }, shape)
     }
 
     pub fn triangular(&mut self, input: TensorNodeId, lower: bool) -> Result<TensorNodeId, String> {
@@ -3869,52 +4067,27 @@ impl TensorIr {
                 shape
             ));
         }
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Triangular { input, lower },
-            shape,
-        });
-        Ok(id)
+        self.push_derived(TensorOp::Triangular { input, lower }, shape)
     }
 
     pub fn tanh(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
         let shape = self.node(input)?.shape.clone();
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Tanh { input },
-            shape,
-        });
-        Ok(id)
+        self.push_derived(TensorOp::Tanh { input }, shape)
     }
 
     pub fn exp(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
         let shape = self.node(input)?.shape.clone();
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Exp { input },
-            shape,
-        });
-        Ok(id)
+        self.push_derived(TensorOp::Exp { input }, shape)
     }
 
     pub fn sqrt(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
         let shape = self.node(input)?.shape.clone();
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Sqrt { input },
-            shape,
-        });
-        Ok(id)
+        self.push_derived(TensorOp::Sqrt { input }, shape)
     }
 
     fn sqrt_derivative(&mut self, input: TensorNodeId, order: u32) -> Result<TensorNodeId, String> {
         let shape = self.node(input)?.shape.clone();
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::SqrtDerivative { input, order },
-            shape,
-        });
-        Ok(id)
+        self.push_derived(TensorOp::SqrtDerivative { input, order }, shape)
     }
 
     pub fn reshape(
@@ -3929,53 +4102,31 @@ impl TensorIr {
                 input_shape, shape
             ));
         }
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Reshape { input },
-            shape,
-        });
-        Ok(id)
+        self.push_derived(TensorOp::Reshape { input }, shape)
     }
 
     pub fn mean(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
         self.node(input)?;
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Mean { input },
-            shape: vec![],
-        });
-        Ok(id)
+        self.push_derived(TensorOp::Mean { input }, vec![])
     }
 
     pub fn mean_axis(&mut self, input: TensorNodeId, axis: isize) -> Result<TensorNodeId, String> {
         let input_shape = self.node(input)?.shape.clone();
         let axis = normalize_axis(axis, input_shape.len())?;
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::MeanAxis { input, axis },
-            shape: reduced_shape(&input_shape, axis)?,
-        });
-        Ok(id)
+        self.push_derived(
+            TensorOp::MeanAxis { input, axis },
+            reduced_shape(&input_shape, axis)?,
+        )
     }
 
     pub fn sin(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
         let shape = self.node(input)?.shape.clone();
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Sin { input },
-            shape,
-        });
-        Ok(id)
+        self.push_derived(TensorOp::Sin { input }, shape)
     }
 
     pub fn cos(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
         let shape = self.node(input)?.shape.clone();
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Cos { input },
-            shape,
-        });
-        Ok(id)
+        self.push_derived(TensorOp::Cos { input }, shape)
     }
 
     pub fn powi(&mut self, input: TensorNodeId, exponent: u32) -> Result<TensorNodeId, String> {
@@ -3983,12 +4134,7 @@ impl TensorIr {
             return Err("powi exponent must fit in a signed 32-bit integer".to_string());
         }
         let shape = self.node(input)?.shape.clone();
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Powi { input, exponent },
-            shape,
-        });
-        Ok(id)
+        self.push_derived(TensorOp::Powi { input, exponent }, shape)
     }
 
     pub fn transpose(
@@ -3999,22 +4145,12 @@ impl TensorIr {
         let input_shape = self.node(input)?.shape.clone();
         let axes = normalize_permutation(axes, input_shape.len())?;
         let shape = axes.iter().map(|axis| input_shape[*axis]).collect();
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Transpose { input, axes },
-            shape,
-        });
-        Ok(id)
+        self.push_derived(TensorOp::Transpose { input, axes }, shape)
     }
 
     pub fn log(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
         let shape = self.node(input)?.shape.clone();
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Log { input },
-            shape,
-        });
-        Ok(id)
+        self.push_derived(TensorOp::Log { input }, shape)
     }
 
     pub fn concat(
@@ -4031,12 +4167,9 @@ impl TensorIr {
             .collect::<Result<Vec<_>, _>>()?;
         let axis = normalize_axis(axis, shapes[0].len())?;
         let shape = concat_shape(&shapes, axis)?;
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Concat { inputs, axis },
-            shape,
-        });
-        Ok(id)
+        let mut inputs = inputs;
+        self.coerce_operand_slice("concat", &mut inputs)?;
+        self.push_derived(TensorOp::Concat { inputs, axis }, shape)
     }
 
     pub fn broadcast_to(
@@ -4050,12 +4183,7 @@ impl TensorIr {
                 "cannot broadcast tensor shape {input_shape:?} to {shape:?}"
             ));
         }
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Broadcast { input },
-            shape,
-        });
-        Ok(id)
+        self.push_derived(TensorOp::Broadcast { input }, shape)
     }
 
     fn slice(
@@ -4078,17 +4206,15 @@ impl TensorIr {
         }
         let mut shape = input_shape;
         shape[axis] = length;
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::Slice {
+        self.push_derived(
+            TensorOp::Slice {
                 input,
                 axis,
                 start,
                 length,
             },
             shape,
-        });
-        Ok(id)
+        )
     }
 
     pub fn slice_axis(
@@ -4128,12 +4254,7 @@ impl TensorIr {
                 "cannot pad tensor shape {input_shape:?} into {output_shape:?} along axis {axis}"
             ));
         }
-        let id = self.nodes.len();
-        self.nodes.push(TensorNode {
-            op: TensorOp::PadSlice { input, axis, start },
-            shape: output_shape,
-        });
-        Ok(id)
+        self.push_derived(TensorOp::PadSlice { input, axis, start }, output_shape)
     }
 
     pub fn evaluate(
@@ -4200,14 +4321,19 @@ impl TensorIr {
                 continue;
             }
             let mut op = remap_tensor_op(&node.op, &remap)?;
-            if let Some(alias) = canonicalize_tensor_op(&mut op, &node.shape, &nodes)? {
+            if let Some(alias) = canonicalize_tensor_op(&mut op, &node.shape, node.dtype, &nodes)? {
                 remap.insert(old_id, alias);
                 continue;
             }
             if let Some(value) = fold_scalar_constant_op(&op, &nodes) {
-                op = TensorOp::ScalarConstant { value };
+                // 折疊值依節點 dtype 捨入，與逐節點執行語意一致。
+                op = TensorOp::ScalarConstant {
+                    value: node.dtype.round(value),
+                };
             }
             if let Some(key) = pure_tensor_op_cse_key(&op, &node.shape) {
+                // dtype 與弱型別屬於值的身分：cast(x, f32) 不可與 x 合併。
+                let key = format!("{key}:{}:{}", node.dtype, node.weak);
                 if let Some(existing_id) = cse_nodes.get(&key) {
                     remap.insert(old_id, *existing_id);
                     continue;
@@ -4218,6 +4344,8 @@ impl TensorIr {
             nodes.push(TensorNode {
                 op,
                 shape: node.shape.clone(),
+                dtype: node.dtype,
+                weak: node.weak,
             });
         }
         let output_node_ids = outputs
@@ -4315,6 +4443,10 @@ impl TensorIr {
             };
             match &self.nodes[node_id].op {
                 TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } => {}
+                TensorOp::Cast { input } => {
+                    let contribution = cotangent.astype(self.node(*input)?.dtype);
+                    accumulate(&mut cotangents[*input], contribution)?;
+                }
                 TensorOp::Add { lhs, rhs } => {
                     let lhs_contribution = cotangent.reduce_to_shape(&self.node(*lhs)?.shape)?;
                     let rhs_contribution = cotangent.reduce_to_shape(&self.node(*rhs)?.shape)?;
@@ -4707,6 +4839,8 @@ impl TensorIr {
             }
         }
 
+        // 即時（eager）反向傳播的導數算術以 f64 進行，僅在 cast 與輸入梯度處
+        // 依 dtype 捨入；逐節點 dtype 語意由符號式 VJP 提供。
         let mut gradients = BTreeMap::new();
         for (node_id, node) in self.nodes.iter().enumerate() {
             if let TensorOp::Input { name } = &node.op {
@@ -4714,7 +4848,7 @@ impl TensorIr {
                     Some(value) => value,
                     None => DynamicTensor::filled(node.shape.clone(), 0.0)?,
                 };
-                gradients.insert(name.clone(), gradient);
+                gradients.insert(name.clone(), gradient.into_dtype(node.dtype));
             }
         }
         Ok((output_values, gradients))
@@ -4743,9 +4877,13 @@ impl TensorIr {
                             input_tangent.shape, node.shape
                         ));
                     }
-                    input_tangent.clone()
+                    input_tangent.astype(node.dtype)
                 }
                 TensorOp::ScalarConstant { .. } => DynamicTensor::filled(vec![], 0.0)?,
+                TensorOp::Cast { input } => tangents
+                    .get(*input)
+                    .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
+                    .astype(node.dtype),
                 TensorOp::Add { lhs, rhs } => tangents
                     .get(*lhs)
                     .ok_or_else(|| format!("node {lhs} has no evaluated tangent"))?
@@ -5080,10 +5218,12 @@ impl TensorIr {
             .get(output)
             .cloned()
             .ok_or_else(|| format!("output node {output} has no value"))?;
+        // 與 VJP 相同：導數算術以 f64 進行，輸出切向量依輸出 dtype 捨入。
         let tangent = tangents
             .get(output)
             .cloned()
-            .ok_or_else(|| format!("output node {output} has no tangent"))?;
+            .ok_or_else(|| format!("output node {output} has no tangent"))?
+            .into_dtype(self.node(output)?.dtype);
         Ok((value, tangent))
     }
 
@@ -5248,25 +5388,29 @@ impl TensorIr {
             .enumerate()
             .map(|(id, node)| match &node.op {
                 TensorOp::Input { name } => {
-                    format!("%{id} = input[name={name}] : {}", format_shape(&node.shape))
+                    format!("%{id} = input[name={name}] : {}", format_tensor_type(&node.shape, node.dtype))
                 }
                 TensorOp::ScalarConstant { value } => {
                     format!(
                         "%{id} = constant[value={value}] : {}",
-                        format_shape(&node.shape)
+                        format_tensor_type(&node.shape, node.dtype)
                     )
                 }
+                TensorOp::Cast { input } => format!(
+                    "%{id} = cast(%{input}) : {}",
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
                 TensorOp::Add { lhs, rhs } => format!(
                     "%{id} = add(%{lhs}, %{rhs}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::ScanVjp { target, group, .. } => format!(
                     "%{id} = scan_vjp(group={group}, target={target:?}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::ScanVjpJvp { target, group, .. } => format!(
                     "%{id} = scan_vjp_jvp(group={group}, target={target:?}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Cond {
                     predicate,
@@ -5276,7 +5420,7 @@ impl TensorIr {
                     "%{id} = cond(%{predicate}, captures={captures:?}, true_nodes={}, false_nodes={}) : {}",
                     branches.true_node_count(),
                     branches.false_node_count(),
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Fori {
                     carry,
@@ -5287,7 +5431,7 @@ impl TensorIr {
                     loop_plan.lower,
                     loop_plan.upper,
                     loop_plan.body.plan.node_count(),
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::ForiJvp {
                     carry,
@@ -5300,15 +5444,15 @@ impl TensorIr {
                     loop_plan.lower,
                     loop_plan.upper,
                     loop_plan.body.plan.node_count(),
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::ForiVjp { target, group, .. } => format!(
                     "%{id} = fori_vjp(group={group}, target={target:?}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::ForiVjpJvp { target, group, .. } => format!(
                     "%{id} = fori_vjp_jvp(group={group}, target={target:?}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Scan {
                     scan_plan,
@@ -5321,23 +5465,23 @@ impl TensorIr {
                     scan_plan.lower,
                     scan_plan.upper,
                     scan_plan.body.plan.node_count(),
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Sub { lhs, rhs } => format!(
                     "%{id} = sub(%{lhs}, %{rhs}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Div { lhs, rhs } => format!(
                     "%{id} = div(%{lhs}, %{rhs}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Mul { lhs, rhs } => format!(
                     "%{id} = mul(%{lhs}, %{rhs}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Greater { lhs, rhs } => format!(
                     "%{id} = greater(%{lhs}, %{rhs}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Where {
                     condition,
@@ -5345,67 +5489,67 @@ impl TensorIr {
                     on_false,
                 } => format!(
                     "%{id} = where(%{condition}, %{on_true}, %{on_false}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Sum { input } => {
-                    format!("%{id} = sum(%{input}) : {}", format_shape(&node.shape))
+                    format!("%{id} = sum(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
                 }
                 TensorOp::SumAxis { input, axis } => format!(
                     "%{id} = sum(%{input}, axis={axis}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Matmul { lhs, rhs } => format!(
                     "%{id} = matmul(%{lhs}, %{rhs}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Solve { matrix, rhs } => format!(
                     "%{id} = solve(%{matrix}, %{rhs}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Triangular { input, lower } => format!(
                     "%{id} = {}(%{input}) : {}",
                     if *lower { "tril" } else { "triu" },
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Tanh { input } => {
-                    format!("%{id} = tanh(%{input}) : {}", format_shape(&node.shape))
+                    format!("%{id} = tanh(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
                 }
                 TensorOp::Exp { input } => {
-                    format!("%{id} = exp(%{input}) : {}", format_shape(&node.shape))
+                    format!("%{id} = exp(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
                 }
                 TensorOp::Sqrt { input } => {
-                    format!("%{id} = sqrt(%{input}) : {}", format_shape(&node.shape))
+                    format!("%{id} = sqrt(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
                 }
                 TensorOp::SqrtDerivative { input, order } => format!(
                     "%{id} = sqrt_derivative(%{input}, order={order}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Reshape { input } => {
-                    format!("%{id} = reshape(%{input}) : {}", format_shape(&node.shape))
+                    format!("%{id} = reshape(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
                 }
                 TensorOp::Mean { input } => {
-                    format!("%{id} = mean(%{input}) : {}", format_shape(&node.shape))
+                    format!("%{id} = mean(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
                 }
                 TensorOp::MeanAxis { input, axis } => format!(
                     "%{id} = mean(%{input}, axis={axis}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Sin { input } => {
-                    format!("%{id} = sin(%{input}) : {}", format_shape(&node.shape))
+                    format!("%{id} = sin(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
                 }
                 TensorOp::Cos { input } => {
-                    format!("%{id} = cos(%{input}) : {}", format_shape(&node.shape))
+                    format!("%{id} = cos(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
                 }
                 TensorOp::Powi { input, exponent } => format!(
                     "%{id} = powi(%{input}, {exponent}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Transpose { input, axes } => format!(
                     "%{id} = transpose(%{input}, axes={axes:?}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Log { input } => {
-                    format!("%{id} = log(%{input}) : {}", format_shape(&node.shape))
+                    format!("%{id} = log(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
                 }
                 TensorOp::Concat { inputs, axis } => format!(
                     "%{id} = concat({}) axis={axis} : {}",
@@ -5414,7 +5558,7 @@ impl TensorIr {
                         .map(|input| format!("%{input}"))
                         .collect::<Vec<_>>()
                         .join(", "),
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Slice {
                     input,
@@ -5423,15 +5567,15 @@ impl TensorIr {
                     length,
                 } => format!(
                     "%{id} = slice(%{input}, axis={axis}, start={start}, length={length}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::PadSlice { input, axis, start } => format!(
                     "%{id} = pad_slice(%{input}, axis={axis}, start={start}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Broadcast { input } => format!(
                     "%{id} = broadcast(%{input}) : {}",
-                    format_shape(&node.shape)
+                    format_tensor_type(&node.shape, node.dtype)
                 ),
             })
             .collect::<Vec<_>>()
@@ -5445,34 +5589,21 @@ impl TensorIr {
     /// being silently rewritten with different semantics.
     pub fn stablehlo_text(&self, output: TensorNodeId) -> Result<String, String> {
         self.node(output)?;
-        let tensor_type = |shape: &[usize]| {
-            if shape.is_empty() {
-                "tensor<f64>".to_string()
-            } else {
-                format!(
-                    "tensor<{}xf64>",
-                    shape
-                        .iter()
-                        .map(usize::to_string)
-                        .collect::<Vec<_>>()
-                        .join("x")
-                )
-            }
-        };
+        let tensor_type = |node: &TensorNode| format_tensor_type(&node.shape, node.dtype);
         let inputs = self
             .nodes
             .iter()
             .enumerate()
             .filter_map(|(id, node)| match &node.op {
-                TensorOp::Input { name } => Some((id, name, &node.shape)),
+                TensorOp::Input { name } => Some((id, name, node)),
                 _ => None,
             })
             .collect::<Vec<_>>();
         let arguments = inputs
             .iter()
             .enumerate()
-            .map(|(position, (_, name, shape))| {
-                format!("%arg{position}: {} // {name}", tensor_type(shape))
+            .map(|(position, (_, name, node))| {
+                format!("%arg{position}: {} // {name}", tensor_type(node))
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -5488,18 +5619,24 @@ impl TensorIr {
                     "%v{id} = stablehlo.add {}, {} : {}",
                     values[lhs],
                     values[rhs],
-                    tensor_type(&node.shape)
+                    tensor_type(node)
                 ),
                 TensorOp::Mul { lhs, rhs } => format!(
                     "%v{id} = stablehlo.multiply {}, {} : {}",
                     values[lhs],
                     values[rhs],
-                    tensor_type(&node.shape)
+                    tensor_type(node)
                 ),
                 TensorOp::Tanh { input } => format!(
                     "%v{id} = stablehlo.tanh {} : {}",
                     values[input],
-                    tensor_type(&node.shape)
+                    tensor_type(node)
+                ),
+                TensorOp::Cast { input } => format!(
+                    "%v{id} = stablehlo.convert {} : ({}) -> {}",
+                    values[input],
+                    tensor_type(self.node(*input)?),
+                    tensor_type(node)
                 ),
                 _ => {
                     return Err(format!(
@@ -5516,25 +5653,118 @@ impl TensorIr {
             .ok_or_else(|| format!("StableHLO output node {output} has no value"))?;
         body.push(format!(
             "return {result} : {}",
-            tensor_type(&self.node(output)?.shape)
+            tensor_type(self.node(output)?)
         ));
         Ok(format!(
             "module {{\n  func.func @main({arguments}) -> {} {{\n    {}\n  }}\n}}\n",
-            tensor_type(&self.node(output)?.shape),
+            tensor_type(self.node(output)?),
             body.join("\n    ")
         ))
     }
 
     fn binary(
         &mut self,
-        op: TensorOp,
+        name: &str,
         lhs: TensorNodeId,
         rhs: TensorNodeId,
+        op: impl FnOnce(TensorNodeId, TensorNodeId) -> TensorOp,
     ) -> Result<TensorNodeId, String> {
         let shape = broadcast_shape(&self.node(lhs)?.shape, &self.node(rhs)?.shape)?;
+        let [lhs, rhs] = self.coerce_operands(name, [lhs, rhs])?;
+        self.push_derived(op(lhs, rhs), shape)
+    }
+
+    /// Applies the promotion rule (strict tensors, weak scalars) to operands
+    /// that must share one dtype.
+    ///
+    /// Strong operands of different dtypes are rejected; weak operands whose
+    /// dtype differs from the strong one receive an explicit `Cast`. Nothing
+    /// is appended to the graph when the operands are rejected.
+    fn coerce_operands<const N: usize>(
+        &mut self,
+        op_name: &str,
+        mut operands: [TensorNodeId; N],
+    ) -> Result<[TensorNodeId; N], String> {
+        self.coerce_operand_slice(op_name, &mut operands)?;
+        Ok(operands)
+    }
+
+    fn coerce_operand_slice(
+        &mut self,
+        op_name: &str,
+        operands: &mut [TensorNodeId],
+    ) -> Result<(), String> {
+        let mut strong: Option<TensorDType> = None;
+        for operand in operands.iter() {
+            let node = self.node(*operand)?;
+            if node.weak {
+                continue;
+            }
+            match strong {
+                Some(dtype) if dtype != node.dtype => {
+                    return Err(format!(
+                        "{op_name} operands have mismatched dtypes {dtype} and {}; \
+                         convert one of them explicitly with astype",
+                        node.dtype
+                    ))
+                }
+                _ => strong = Some(node.dtype),
+            }
+        }
+        let Some(target) = strong else {
+            // 全為弱純量時維持各自 dtype（皆為預設 f64）。
+            return Ok(());
+        };
+        for operand in operands.iter_mut() {
+            if self.node(*operand)?.dtype != target {
+                *operand = self.cast(*operand, target)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn push_node(
+        &mut self,
+        op: TensorOp,
+        shape: Vec<usize>,
+        dtype: TensorDType,
+        weak: bool,
+    ) -> TensorNodeId {
         let id = self.nodes.len();
-        self.nodes.push(TensorNode { op, shape });
-        Ok(id)
+        self.nodes.push(TensorNode {
+            op,
+            shape,
+            dtype,
+            weak,
+        });
+        id
+    }
+
+    /// Appends an op whose dtype is that of its value operands (already
+    /// coerced to one dtype); it is weak only when every value operand is.
+    fn push_derived(&mut self, op: TensorOp, shape: Vec<usize>) -> Result<TensorNodeId, String> {
+        let operands = tensor_value_operands(&op);
+        let first = *operands.first().ok_or_else(|| {
+            format!(
+                "{} has no value operand to derive a dtype from",
+                tensor_op_name(&op)
+            )
+        })?;
+        let dtype = self.node(first)?.dtype;
+        let mut weak = true;
+        for operand in &operands {
+            let node = self.node(*operand)?;
+            if node.dtype != dtype {
+                return Err(format!(
+                    "{} operands have mismatched dtypes {dtype} and {}; \
+                     convert one of them explicitly with astype",
+                    tensor_op_name(&op),
+                    node.dtype
+                ));
+            }
+            weak &= node.weak;
+        }
+        Ok(self.push_node(op, shape, dtype, weak))
     }
 
     fn evaluate_all(
@@ -5570,6 +5800,10 @@ impl TensorIr {
                     input.clone()
                 }
                 TensorOp::ScalarConstant { value } => DynamicTensor::filled(vec![], *value)?,
+                TensorOp::Cast { input } => values
+                    .get(*input)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .clone(),
                 TensorOp::Add { lhs, rhs } => values
                     .get(*lhs)
                     .ok_or_else(|| format!("node {lhs} has no evaluated value"))?
@@ -6007,7 +6241,9 @@ impl TensorIr {
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .broadcast_to_shape(&node.shape)?,
             };
-            values.push(value);
+            // 每個節點以 f64 計算後捨入到節點 dtype：輸入自動捨入、cast 轉換，
+            // f32 節點得到 f64 結果的正確捨入值（+ - * / sqrt 與 IEEE f32 位元一致）。
+            values.push(value.into_dtype(node.dtype));
         }
         Ok(values)
     }
@@ -6237,6 +6473,17 @@ impl TensorIr {
                     second: DynamicTensor::filled(vec![], 0.0)?,
                     mixed: DynamicTensor::filled(vec![], 0.0)?,
                 },
+                TensorOp::Cast { input } => {
+                    let input = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    MixedTangent {
+                        value: input.value.astype(node.dtype),
+                        first: input.first.astype(node.dtype),
+                        second: input.second.astype(node.dtype),
+                        mixed: input.mixed.astype(node.dtype),
+                    }
+                }
                 TensorOp::Add { lhs, rhs } => {
                     let lhs = values
                         .get(*lhs)
@@ -6606,7 +6853,11 @@ impl TensorIr {
                     }
                 }
             };
-            values.push(value);
+            // 原值依節點 dtype 捨入（與 evaluate 一致）；導數分量以 f64 保留。
+            values.push(MixedTangent {
+                value: value.value.into_dtype(node.dtype),
+                ..value
+            });
         }
 
         values
@@ -6766,10 +7017,13 @@ fn symbolic_jvp_scan_plan(
         tangent_names.insert(name.clone(), tangent_name);
     }
     let transform_output = |output| {
-        body.symbolic_jvp_with_seed(output, |graph, name, _, shape| {
+        body.symbolic_jvp_with_seed(output, |graph, name, value, shape| {
             tangent_names
                 .get(name)
-                .map(|tangent_name| graph.input(tangent_name.clone(), shape.to_vec()))
+                .map(|tangent_name| {
+                    let dtype = graph.node_dtype(value)?;
+                    graph.input_typed(tangent_name.clone(), shape.to_vec(), dtype)
+                })
                 .transpose()
         })
     };
@@ -6786,7 +7040,11 @@ fn symbolic_jvp_scan_plan(
     let mut packed_carry_shape = vec![2];
     packed_carry_shape.extend_from_slice(&carry_shape);
     let mut augmented = TensorIr::new();
-    let packed_carry = augmented.input("__nabla_scan_jvp_carry", packed_carry_shape)?;
+    let packed_carry = augmented.input_typed(
+        "__nabla_scan_jvp_carry",
+        packed_carry_shape,
+        body_plan.input_dtype(&scan_plan.carry_name)?,
+    )?;
     let (primal_carry, tangent_carry) =
         symbolic_unpack_tensor_pair(&mut augmented, packed_carry, &carry_shape)?;
     let mut replacements = BTreeMap::new();
@@ -6794,9 +7052,9 @@ fn symbolic_jvp_scan_plan(
         let replacement = if name == &scan_plan.carry_name {
             primal_carry
         } else if name == &scan_plan.index_name {
-            augmented.input(name.clone(), vec![])?
+            augmented.input_typed(name.clone(), vec![], body_plan.input_dtype(name)?)?
         } else {
-            augmented.input(name.clone(), shape.clone())?
+            augmented.input_typed(name.clone(), shape.clone(), body_plan.input_dtype(name)?)?
         };
         replacements.insert(name.clone(), replacement);
     }
@@ -6804,12 +7062,13 @@ fn symbolic_jvp_scan_plan(
         let replacement = if source == &scan_plan.carry_name {
             tangent_carry
         } else {
-            augmented.input(
+            augmented.input_typed(
                 tangent_name.clone(),
                 captures
                     .get(source)
                     .cloned()
                     .ok_or_else(|| format!("scan body capture {source:?} is missing"))?,
+                body_plan.input_dtype(source)?,
             )?
         };
         replacements.insert(tangent_name.clone(), replacement);
@@ -6870,12 +7129,7 @@ fn symbolic_clone_with_input_replacements(
             })?,
             _ => {
                 let op = remap_tensor_op(&node.op, &remap)?;
-                let id = destination.nodes.len();
-                destination.nodes.push(TensorNode {
-                    op,
-                    shape: node.shape.clone(),
-                });
-                id
+                destination.push_node(op, node.shape.clone(), node.dtype, node.weak)
             }
         };
         remap.insert(node_id, mapped);
@@ -7407,7 +7661,12 @@ fn symbolic_retain_region_inputs(
     for input_name in input_names {
         let input = graph.input_node_id(input_name)?;
         let zero = graph.sub(input, input)?;
-        let scalar_zero = graph.sum(zero)?;
+        let mut scalar_zero = graph.sum(zero)?;
+        // 區域可混用 dtype（例如 f32 carry 與 f64 capture），零項需轉成輸出 dtype。
+        let output_dtype = graph.node_dtype(output)?;
+        if graph.node_dtype(scalar_zero)? != output_dtype {
+            scalar_zero = graph.cast(scalar_zero, output_dtype)?;
+        }
         let zero_like_output = symbolic_broadcast_like(graph, scalar_zero, output)?;
         output = graph.add(output, zero_like_output)?;
     }
@@ -7628,6 +7887,20 @@ impl TensorCondExecutionPlan {
                 "conditional branches must capture identical named inputs and shapes".to_string(),
             );
         }
+        if on_true.plan.output_dtype()? != on_false.plan.output_dtype()? {
+            return Err(format!(
+                "conditional branch output dtypes differ: {} versus {}",
+                on_true.plan.output_dtype()?,
+                on_false.plan.output_dtype()?
+            ));
+        }
+        for name in on_true.captures.keys() {
+            if on_true.plan.input_dtype(name)? != on_false.plan.input_dtype(name)? {
+                return Err(format!(
+                    "conditional branches capture {name:?} with different dtypes"
+                ));
+            }
+        }
         Ok(Self { on_true, on_false })
     }
 
@@ -7743,6 +8016,12 @@ impl TensorForiExecutionPlan {
                 carry_shape
             ));
         }
+        check_region_output_dtype(
+            &body.plan,
+            body.plan.output_node_id,
+            &carry_name,
+            "fori loop",
+        )?;
         if let Some(index_shape) = body.captures.get(&index_name) {
             if !index_shape.is_empty() {
                 return Err(format!(
@@ -8429,6 +8708,12 @@ impl TensorScanExecutionPlan {
         if body.output_shapes()[0] != *carry_shape {
             return Err("scan body next carry shape does not match carry shape".to_string());
         }
+        check_region_output_dtype(
+            &body.plan,
+            body.plan.output_node_ids[0],
+            &carry_name,
+            "scan",
+        )?;
         if let Some(index_shape) = body.captures().get(&index_name) {
             if !index_shape.is_empty() {
                 return Err("scan index capture must be scalar".to_string());
@@ -8731,6 +9016,9 @@ impl TensorForiMultiExecutionPlan {
                 ));
             }
         }
+        for (name, output) in carry_names.iter().zip(&body.plan.output_node_ids) {
+            check_region_output_dtype(&body.plan, *output, name, "multi-carry fori")?;
+        }
         let index_shape = body.captures().get(&index_name).ok_or_else(|| {
             format!("multi-carry fori body does not capture index {index_name:?}")
         })?;
@@ -9008,6 +9296,27 @@ impl TensorExecutionPlan {
             .ok_or_else(|| format!("execution plan input {name:?} does not exist"))
     }
 
+    pub fn input_dtype(&self, name: &str) -> Result<TensorDType, String> {
+        self.nodes
+            .iter()
+            .find_map(|node| match &node.op {
+                TensorOp::Input { name: candidate } if candidate == name => Some(node.dtype),
+                _ => None,
+            })
+            .ok_or_else(|| format!("execution plan input {name:?} does not exist"))
+    }
+
+    pub fn node_dtype(&self, id: TensorNodeId) -> Result<TensorDType, String> {
+        self.nodes
+            .get(id)
+            .map(|node| node.dtype)
+            .ok_or_else(|| format!("execution plan node {id} does not exist"))
+    }
+
+    pub fn output_dtype(&self) -> Result<TensorDType, String> {
+        self.node_dtype(self.output_node_id)
+    }
+
     pub fn lower_text(&self) -> String {
         self.as_ir().lower_text()
     }
@@ -9022,7 +9331,7 @@ impl TensorExecutionPlan {
                     id,
                     op: tensor_op_name(&node.op).to_string(),
                     shape: node.shape.clone(),
-                    dtype: TensorDType::F64,
+                    dtype: node.dtype,
                     layout: if node.shape.is_empty() {
                         "scalar".to_string()
                     } else {
@@ -9696,9 +10005,12 @@ extern \"C\" __global__ void nabla_fused_elementwise({parameters}) {{\n\
                         })?;
                         *extent = shard_extent;
                     }
-                    specialized.input(name.clone(), shape)?
+                    specialized.input_typed(name.clone(), shape, node.dtype)?
                 }
-                TensorOp::ScalarConstant { value } => specialized.scalar_constant(*value),
+                TensorOp::ScalarConstant { value } => {
+                    specialized.constant_like(*value, node.dtype, node.weak)
+                }
+                TensorOp::Cast { input } => specialized.cast(mapped(*input)?, node.dtype)?,
                 TensorOp::Add { lhs, rhs } => specialized.add(mapped(*lhs)?, mapped(*rhs)?)?,
                 TensorOp::Sub { lhs, rhs } => specialized.sub(mapped(*lhs)?, mapped(*rhs)?)?,
                 TensorOp::Div { lhs, rhs } => specialized.div(mapped(*lhs)?, mapped(*rhs)?)?,
@@ -9813,6 +10125,13 @@ extern \"C\" __global__ void nabla_fused_elementwise({parameters}) {{\n\
                     )
                 }
             };
+            if specialized.node(node_id)?.dtype != node.dtype {
+                return Err(format!(
+                    "data-parallel specialization changed node dtype from {} to {}",
+                    node.dtype,
+                    specialized.node(node_id)?.dtype
+                ));
+            }
             remap.push(node_id);
         }
         Ok(specialized)
@@ -9830,6 +10149,9 @@ fn cuda_expression(nodes: &[TensorNode], node_id: TensorNodeId) -> Result<String
         TensorOp::ScalarConstant { .. } => Err(
             "CUDA lowering does not support non-finite scalar constants".to_string(),
         ),
+        // f32 與 f64 在 CUDA 都以 float 執行（TensorDeviceBackend::execution_dtype），
+        // 因此 cast 是恆等式。
+        TensorOp::Cast { input } => child(*input),
         TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
         TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
         TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
@@ -9919,6 +10241,7 @@ fn cuda_region_expression(
         TensorOp::ScalarConstant { .. } => {
             Err("CUDA fusion region does not support non-finite scalar constants".to_string())
         }
+        TensorOp::Cast { input } => child(*input),
         TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
         TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
         TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
@@ -10054,7 +10377,8 @@ fn is_fusable_elementwise_subgraph(nodes: &[TensorNode], node_id: TensorNodeId) 
         | TensorOp::SqrtDerivative { input, .. }
         | TensorOp::Sin { input }
         | TensorOp::Cos { input }
-        | TensorOp::Powi { input, .. } => is_fusable_elementwise_subgraph(nodes, *input),
+        | TensorOp::Powi { input, .. }
+        | TensorOp::Cast { input } => is_fusable_elementwise_subgraph(nodes, *input),
         TensorOp::Sum { .. }
         | TensorOp::SumAxis { .. }
         | TensorOp::Matmul { .. }
@@ -10096,6 +10420,7 @@ fn is_fusable_elementwise_compute_op(op: &TensorOp) -> bool {
             | TensorOp::Sin { .. }
             | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
+            | TensorOp::Cast { .. }
     )
 }
 
@@ -10132,7 +10457,7 @@ fn evaluate_fused_elementwise(
             inputs,
         )?);
     }
-    DynamicTensor::new(output.shape.clone(), data)
+    DynamicTensor::new(output.shape.clone(), data).map(|value| value.into_dtype(output.dtype))
 }
 
 fn evaluate_fused_element(
@@ -10147,7 +10472,7 @@ fn evaluate_fused_element(
         .ok_or_else(|| format!("node {node_id} does not exist"))?;
     let child =
         |child_id| evaluate_fused_element(nodes, child_id, output_index, output_shape, inputs);
-    match &node.op {
+    let value = match &node.op {
         TensorOp::Input { name } => {
             let input = inputs
                 .get(name)
@@ -10156,6 +10481,7 @@ fn evaluate_fused_element(
             Ok(input.data[broadcast_offset(output_index, output_shape, &node.shape, &strides)])
         }
         TensorOp::ScalarConstant { value } => Ok(*value),
+        TensorOp::Cast { input } => child(*input),
         TensorOp::Add { lhs, rhs } => Ok(child(*lhs)? + child(*rhs)?),
         TensorOp::Sub { lhs, rhs } => Ok(child(*lhs)? - child(*rhs)?),
         TensorOp::Div { lhs, rhs } => {
@@ -10229,7 +10555,9 @@ fn evaluate_fused_element(
         | TensorOp::ScanVjpJvp { .. } => Err(format!(
             "node {node_id} is not supported by the fused elementwise evaluator"
         )),
-    }
+    };
+    // 與逐節點直譯器相同：每個融合節點都捨入到自身 dtype。
+    value.map(|value| node.dtype.round(value))
 }
 
 fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
@@ -10348,11 +10676,42 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         | TensorOp::Log { input }
         | TensorOp::Slice { input, .. }
         | TensorOp::PadSlice { input, .. }
-        | TensorOp::Broadcast { input } => {
+        | TensorOp::Broadcast { input }
+        | TensorOp::Cast { input } => {
             vec![*input]
         }
         TensorOp::Concat { inputs, .. } => inputs.clone(),
     }
+}
+
+/// Operands whose dtype an ordinary op's result inherits. A `where` mask
+/// is only tested for non-zero values and therefore does not participate.
+fn tensor_value_operands(op: &TensorOp) -> Vec<TensorNodeId> {
+    match op {
+        TensorOp::Where {
+            on_true, on_false, ..
+        } => vec![*on_true, *on_false],
+        _ => tensor_op_inputs(op),
+    }
+}
+
+/// Loop regions feed each body output back into its carry input, so both
+/// must share one dtype.
+fn check_region_output_dtype(
+    plan: &TensorExecutionPlan,
+    output: TensorNodeId,
+    carry_name: &str,
+    context: &str,
+) -> Result<(), String> {
+    let output_dtype = plan.node_dtype(output)?;
+    let carry_dtype = plan.input_dtype(carry_name)?;
+    if output_dtype != carry_dtype {
+        return Err(format!(
+            "{context} body returns dtype {output_dtype} for carry {carry_name:?} of dtype {carry_dtype}; \
+             convert it explicitly with astype"
+        ));
+    }
+    Ok(())
 }
 
 fn tensor_scalar_predicate(value: &DynamicTensor) -> Result<bool, String> {
@@ -10447,7 +10806,8 @@ fn infer_tensor_placement(
         | TensorOp::Sin { input }
         | TensorOp::Cos { input }
         | TensorOp::Powi { input, .. }
-        | TensorOp::Log { input } => unary(*input),
+        | TensorOp::Log { input }
+        | TensorOp::Cast { input } => unary(*input),
         TensorOp::Sum { input } => {
             let placement = unary(*input)?;
             plan_full_reduction_placement(
@@ -10829,6 +11189,7 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
     match op {
         TensorOp::Input { .. } => "input",
         TensorOp::ScalarConstant { .. } => "constant",
+        TensorOp::Cast { .. } => "cast",
         TensorOp::Add { .. } => "add",
         TensorOp::Sub { .. } => "sub",
         TensorOp::Div { .. } => "div",
@@ -10873,6 +11234,7 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
             TensorNode {
                 op: TensorOp::ScalarConstant { value },
                 shape,
+                ..
             } if shape.is_empty() => Some(*value),
             _ => None,
         })
@@ -10890,6 +11252,8 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
             }
         }
         TensorOp::Greater { lhs, rhs } => Some(f64::from(scalar(*lhs)? > scalar(*rhs)?)),
+        // 呼叫端依目標 dtype 捨入；f64->f32->f64 因此保留 f32 捨入誤差而不被抵銷。
+        TensorOp::Cast { input } => scalar(*input),
         TensorOp::Tanh { input } => Some(scalar(*input)?.tanh()),
         TensorOp::Exp { input } => Some(scalar(*input)?.exp()),
         TensorOp::Sin { input } => Some(scalar(*input)?.sin()),
@@ -10909,9 +11273,18 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
 fn canonicalize_tensor_op(
     op: &mut TensorOp,
     output_shape: &[usize],
+    output_dtype: TensorDType,
     nodes: &[TensorNode],
 ) -> Result<Option<TensorNodeId>, String> {
     match op {
+        // 只移除同 dtype 的強型別 cast；有損往返（f64->f32->f64）保留兩個 cast。
+        // 弱來源的 cast 會把節點轉為強型別，別名化會改變之後的提升語意，故保留。
+        TensorOp::Cast { input } => {
+            let source = nodes
+                .get(*input)
+                .ok_or_else(|| format!("cast source node {input} is missing"))?;
+            Ok((source.dtype == output_dtype && !source.weak).then_some(*input))
+        }
         TensorOp::Reshape { input } => loop {
             let source = nodes
                 .get(*input)
@@ -11032,6 +11405,8 @@ fn prune_unreachable_tensor_nodes(
         compacted.push(TensorNode {
             op: remap_tensor_op(&node.op, &remap)?,
             shape: node.shape.clone(),
+            dtype: node.dtype,
+            weak: node.weak,
         });
     }
     let remapped_outputs = outputs
@@ -11134,6 +11509,7 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<String> {
     let key = match op {
         TensorOp::Input { .. } => return None,
         TensorOp::ScalarConstant { value } => format!("constant:{value}:{shape:?}"),
+        TensorOp::Cast { input } => format!("cast:{input}:{shape:?}"),
         TensorOp::Add { lhs, rhs } => format!("add:{lhs}:{rhs}:{shape:?}"),
         TensorOp::Sub { lhs, rhs } => format!("sub:{lhs}:{rhs}:{shape:?}"),
         TensorOp::Div { lhs, rhs } => format!("div:{lhs}:{rhs}:{shape:?}"),
@@ -11203,6 +11579,9 @@ fn remap_tensor_op(
     match op {
         TensorOp::Input { name } => Ok(TensorOp::Input { name: name.clone() }),
         TensorOp::ScalarConstant { value } => Ok(TensorOp::ScalarConstant { value: *value }),
+        TensorOp::Cast { input } => Ok(TensorOp::Cast {
+            input: remap_node(*input)?,
+        }),
         TensorOp::Add { lhs, rhs } => Ok(TensorOp::Add {
             lhs: remap_node(*lhs)?,
             rhs: remap_node(*rhs)?,
@@ -11733,14 +12112,14 @@ fn broadcast_offset(
     offset
 }
 
-fn format_shape(shape: &[usize]) -> String {
+fn format_tensor_type(shape: &[usize], dtype: TensorDType) -> String {
     if shape.is_empty() {
-        return "tensor<f64>".to_string();
+        return format!("tensor<{dtype}>");
     }
     let dimensions = shape
         .iter()
         .map(usize::to_string)
         .collect::<Vec<_>>()
         .join("x");
-    format!("tensor<{dimensions}xf64>")
+    format!("tensor<{dimensions}x{dtype}>")
 }

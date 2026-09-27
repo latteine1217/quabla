@@ -20,10 +20,10 @@ use cudarc::nccl::{group_end, group_start, Comm as NcclComm, ReduceOp as NcclRed
 
 use super::{
     contiguous_strides, element_count, sqrt_derivative_coefficient, tensor_op_inputs,
-    DynamicTensor, TensorBackend, TensorExecutionPlan, TensorForiExecutionPlan,
-    TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget, TensorFusionRegion, TensorNodeId, TensorOp,
-    TensorReplicaReduction, TensorScanExecutionPlan, TensorScanTarget, TensorScanVjpJvpExecutionPlan,
-    TensorScanVjpTarget, TensorShardingPlan,
+    DynamicTensor, TensorBackend, TensorDType, TensorDeviceBackend, TensorExecutionPlan,
+    TensorForiExecutionPlan, TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget,
+    TensorFusionRegion, TensorNodeId, TensorOp, TensorReplicaReduction, TensorScanExecutionPlan,
+    TensorScanTarget, TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget, TensorShardingPlan,
 };
 
 const CUDA_MATMUL_TILE: usize = 32;
@@ -287,6 +287,7 @@ impl CudaBackend {
         plan: TensorExecutionPlan,
         region_context: Option<&Arc<CudaContext>>,
     ) -> Result<CudaExecutionPlan, String> {
+        ensure_cuda_f32_execution(&plan)?;
         for (node_id, node) in plan.nodes.iter().enumerate() {
             match &node.op {
                 TensorOp::Fori { loop_plan, .. } => {
@@ -798,10 +799,7 @@ impl CudaExecutionPlan {
                 let data = stream.clone_dtoh(buffer).map_err(|error| {
                     format!("failed to copy CUDA multi-output node {output_node_id}: {error:?}")
                 })?;
-                DynamicTensor::new(
-                    self.plan.nodes[*output_node_id].shape.clone(),
-                    data.into_iter().map(f64::from).collect(),
-                )
+                cuda_host_tensor(&self.plan, *output_node_id, data)
             })
             .collect()
     }
@@ -1115,7 +1113,6 @@ impl CudaExecutionPlan {
 
     pub fn retained_input_to_host(&self, name: &str) -> Result<DynamicTensor, String> {
         let node_id = input_node_id(&self.plan, name)?;
-        let shape = self.plan.nodes[node_id].shape.clone();
         let stream = self.context.default_stream();
         let state = self
             .state
@@ -1129,13 +1126,12 @@ impl CudaExecutionPlan {
         let data = stream
             .clone_dtoh(buffer)
             .map_err(|error| format!("failed to copy CUDA input {name:?} to host: {error:?}"))?;
-        DynamicTensor::new(shape, data.into_iter().map(f64::from).collect())
+        cuda_host_tensor(&self.plan, node_id, data)
     }
 
     /// Materializes an already-evaluated node from a multi-output plan.
     pub fn computed_node_to_host(&self, node_id: usize) -> Result<DynamicTensor, String> {
-        let node = self
-            .plan
+        self.plan
             .nodes
             .get(node_id)
             .ok_or_else(|| format!("CUDA node {node_id} does not exist"))?;
@@ -1152,10 +1148,7 @@ impl CudaExecutionPlan {
         let data = stream
             .clone_dtoh(buffer)
             .map_err(|error| format!("failed to copy CUDA node {node_id} to host: {error:?}"))?;
-        DynamicTensor::new(
-            node.shape.clone(),
-            data.into_iter().map(f64::from).collect(),
-        )
+        cuda_host_tensor(&self.plan, node_id, data)
     }
 
     /// Copies a retained input directly into another CUDA plan's retained input.
@@ -1226,6 +1219,7 @@ impl TensorBackend for CudaBackend {
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<DynamicTensor, String> {
         ensure_nvrtc_runtime_available()?;
+        ensure_cuda_f32_execution(plan)?;
         if let Some((lhs, rhs)) = direct_rank_two_matmul_inputs(plan)? {
             return self.execute_rank_two_matmul(plan, inputs, lhs, rhs);
         }
@@ -1311,7 +1305,7 @@ impl TensorBackend for CudaBackend {
         let data = stream
             .clone_dtoh(&device_output)
             .map_err(|error| format!("failed to copy CUDA output to host: {error:?}"))?;
-        DynamicTensor::new(output_shape, data.into_iter().map(f64::from).collect())
+        cuda_host_tensor(plan, plan.output_node_id, data)
     }
 }
 
@@ -2313,7 +2307,8 @@ fn execute_cuda_device_program(
                 )?;
                 continue;
             }
-            TensorOp::Reshape { input } => {
+            // cast 與 reshape 一樣只複製 float 緩衝區：兩端的執行 dtype 相同。
+            TensorOp::Reshape { input } | TensorOp::Cast { input } => {
                 let (before, current_and_after) = values.split_at_mut(node_id);
                 let input = cuda_value(before, *input)?;
                 let slot = current_and_after
@@ -2343,7 +2338,6 @@ fn execute_cuda_device_program(
     if !copy_output {
         return Ok(None);
     }
-    let output_shape = plan.output_shape()?;
     let output = values
         .get(plan.output_node_id)
         .and_then(Option::as_ref)
@@ -2351,7 +2345,7 @@ fn execute_cuda_device_program(
     let data = stream
         .clone_dtoh(output)
         .map_err(|error| format!("failed to copy CUDA program output to host: {error:?}"))?;
-    DynamicTensor::new(output_shape, data.into_iter().map(f64::from).collect()).map(Some)
+    cuda_host_tensor(plan, plan.output_node_id, data).map(Some)
 }
 
 fn execute_cuda_fusion_region(
@@ -2497,7 +2491,7 @@ fn execute_cuda_fused_elementwise_program(
             release_cuda_value(values, free_buffers, node_id)?;
         }
     }
-    data.map(|data| DynamicTensor::new(output_shape, data.into_iter().map(f64::from).collect()))
+    data.map(|data| cuda_host_tensor(plan, plan.output_node_id, data))
         .transpose()
 }
 
@@ -2589,13 +2583,8 @@ fn execute_cuda_matmul_bias_tanh_program(
             release_cuda_value(values, free_buffers, node_id)?;
         }
     }
-    data.map(|data| {
-        DynamicTensor::new(
-            plan.output_shape()?,
-            data.into_iter().map(f64::from).collect(),
-        )
-    })
-    .transpose()
+    data.map(|data| cuda_host_tensor(plan, plan.output_node_id, data))
+        .transpose()
 }
 
 impl CudaBackend {
@@ -2696,8 +2685,40 @@ impl CudaBackend {
         let data = stream
             .clone_dtoh(&output_device)
             .map_err(|error| format!("failed to copy CUDA matmul output to host: {error:?}"))?;
-        DynamicTensor::new(output_shape, data.into_iter().map(f64::from).collect())
+        cuda_host_tensor(plan, plan.output_node_id, data)
     }
+}
+
+/// Wraps an `f32` device readback as a host tensor of the node's logical
+/// dtype (an `f64` node carries the result of its `f32` lowering).
+fn cuda_host_tensor(
+    plan: &TensorExecutionPlan,
+    node_id: TensorNodeId,
+    data: Vec<f32>,
+) -> Result<DynamicTensor, String> {
+    let node = plan
+        .nodes
+        .get(node_id)
+        .ok_or_else(|| format!("CUDA readback node {node_id} is missing"))?;
+    DynamicTensor::with_dtype(
+        node.shape.clone(),
+        data.into_iter().map(f64::from).collect(),
+        node.dtype,
+    )
+}
+
+/// Every CUDA buffer and kernel is `float`; a logical dtype must lower to
+/// `f32` (see `TensorDeviceBackend::execution_dtype`) or be rejected here.
+fn ensure_cuda_f32_execution(plan: &TensorExecutionPlan) -> Result<(), String> {
+    for (node_id, node) in plan.nodes.iter().enumerate() {
+        if TensorDeviceBackend::Cuda.execution_dtype(node.dtype)? != TensorDType::F32 {
+            return Err(format!(
+                "CUDA backend cannot execute node {node_id} of dtype {}",
+                node.dtype
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_cuda_program_inputs(
@@ -3644,6 +3665,7 @@ fn cuda_matmul_batch_offset_source(
 
 fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<(), String> {
     let body = &loop_plan.body.plan;
+    ensure_cuda_f32_execution(body)?;
     let carry_shape = loop_plan.carry_shape()?;
     if body.output_shape()? != carry_shape {
         return Err("body output shape does not match carry shape".to_string());
@@ -3670,7 +3692,8 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
             | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
             | TensorOp::Log { .. }
-            | TensorOp::Broadcast { .. } => {}
+            | TensorOp::Broadcast { .. }
+            | TensorOp::Cast { .. } => {}
             TensorOp::Reshape { input } if body.nodes[*input].shape == node.shape => {}
             _ => {
                 return Err(format!(
@@ -3684,6 +3707,7 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
 }
 
 fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<(), String> {
+    ensure_cuda_f32_execution(&scan_plan.body.plan)?;
     let carry_shape = scan_plan.carry_shape()?;
     let output_shape = scan_plan
         .body
@@ -3747,7 +3771,8 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
             | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
             | TensorOp::Log { .. }
-            | TensorOp::Broadcast { .. } => {}
+            | TensorOp::Broadcast { .. }
+            | TensorOp::Cast { .. } => {}
             TensorOp::Reshape { input }
                 if cuda_shapes_match_without_leading_units(
                     &scan_plan.body.plan.nodes[*input].shape,
@@ -3909,7 +3934,10 @@ fn cuda_fori_body_expression(
             Ok(format!("nabla_powi({}, {exponent}U)", child(*input)?))
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
-        TensorOp::Broadcast { input } | TensorOp::Reshape { input } => child(*input),
+        // cast 的來源與目標都以 float 執行，因此為恆等。
+        TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
+            child(*input)
+        }
         _ => Err(format!(
             "CUDA Fori body {} is not elementwise-lowerable",
             cuda_op_name(&node.op)
@@ -4035,7 +4063,10 @@ fn cuda_scan_body_expression_in_half(
             Ok(format!("nabla_powi({}, {exponent}U)", child(*input)?))
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
-        TensorOp::Broadcast { input } | TensorOp::Reshape { input } => child(*input),
+        // cast 的來源與目標都以 float 執行，因此為恆等。
+        TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
+            child(*input)
+        }
         // The lowerability check restricts slices to one packed half of a
         // carry-shaped value, so the slice reads that half at the same lane.
         TensorOp::Slice { input, start, .. } => {
@@ -4153,7 +4184,10 @@ fn cuda_elementwise_plan_expression_with_index(
             Ok(format!("nabla_powi({}, {exponent}U)", child(*input)?))
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
-        TensorOp::Broadcast { input } | TensorOp::Reshape { input } => child(*input),
+        // cast 的來源與目標都以 float 執行，因此為恆等。
+        TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
+            child(*input)
+        }
         _ => Err(format!(
             "CUDA Fori VJP body uses unsupported {} operation",
             cuda_op_name(&node.op)
@@ -6221,7 +6255,7 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
         let function = cuda_node_function_name(node_id);
         let count = element_count(&node.shape)?;
         let kernel = match &node.op {
-            TensorOp::Input { .. } | TensorOp::Reshape { .. } => continue,
+            TensorOp::Input { .. } | TensorOp::Reshape { .. } | TensorOp::Cast { .. } => continue,
             TensorOp::ScalarConstant { value } if value.is_finite() => format!(
                 "extern \"C\" __global__ void {function}(float* out, unsigned long long count) {{\n\
                     unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
@@ -6689,6 +6723,7 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
     match op {
         TensorOp::Input { .. } => "input",
         TensorOp::ScalarConstant { .. } => "constant",
+        TensorOp::Cast { .. } => "cast",
         TensorOp::Add { .. } => "add",
         TensorOp::Sub { .. } => "sub",
         TensorOp::Div { .. } => "div",

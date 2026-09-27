@@ -4,8 +4,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
-    sqrt_derivative_coefficient, DynamicTensor, TensorBackend, TensorExecutionPlan,
-    TensorForiExecutionPlan, TensorOp,
+    sqrt_derivative_coefficient, DynamicTensor, TensorBackend, TensorDType, TensorDeviceBackend,
+    TensorExecutionPlan, TensorForiExecutionPlan, TensorOp,
 };
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
@@ -346,7 +346,7 @@ impl MlxAdamPlan {
             .values
             .get(name)
             .ok_or_else(|| format!("MLX Adam parameter {name:?} is not retained"))?;
-        DynamicTensor::new(
+        DynamicTensor::with_dtype(
             node.shape.clone(),
             parameter
                 .as_slice::<f32>()
@@ -354,6 +354,7 @@ impl MlxAdamPlan {
                 .copied()
                 .map(f64::from)
                 .collect(),
+            node.dtype,
         )
     }
 }
@@ -418,20 +419,20 @@ impl MlxBackend {
             .iter()
             .zip(outputs)
             .map(|(node_id, output)| {
-                let shape = plan
+                let node = plan
                     .nodes
                     .get(*node_id)
-                    .ok_or_else(|| format!("MLX output node {node_id} is missing"))?
-                    .shape
-                    .clone();
-                DynamicTensor::new(
-                    shape,
+                    .ok_or_else(|| format!("MLX output node {node_id} is missing"))?;
+                // 讀回值為 f32；依節點邏輯 dtype 標記（f64 節點即 f32 降階執行的結果）。
+                DynamicTensor::with_dtype(
+                    node.shape.clone(),
                     output
                         .as_slice::<f32>()
                         .iter()
                         .copied()
                         .map(f64::from)
                         .collect(),
+                    node.dtype,
                 )
             })
             .collect()
@@ -457,6 +458,13 @@ impl MlxBackend {
         let mut scan_vjp_jvp_cache: HashMap<usize, MlxScanVjpJvpEvaluation> = HashMap::new();
 
         for (node_id, node) in plan.nodes.iter().enumerate() {
+            // 本後端所有陣列皆為 f32；任何無法降階為 f32 的邏輯 dtype 必須明確拒絕。
+            if TensorDeviceBackend::Mlx.execution_dtype(node.dtype)? != TensorDType::F32 {
+                return Err(format!(
+                    "MLX backend cannot execute node {node_id} of dtype {}",
+                    node.dtype
+                ));
+            }
             let value = match &node.op {
                 TensorOp::Input { name } => {
                     if let Some(input) = retained_inputs.get(name) {
@@ -487,6 +495,8 @@ impl MlxBackend {
                 TensorOp::ScalarConstant { .. } => {
                     return Err("MLX backend does not support non-finite constants".to_string())
                 }
+                // 來源與目標都以 f32 執行（見上方檢查），cast 為恆等。
+                TensorOp::Cast { input } => Ok(mlx_value(&values, *input)?.clone()),
                 TensorOp::Add { lhs, rhs } => mlx_value(&values, *lhs)?
                     .add_device(mlx_value(&values, *rhs)?, &stream)
                     .map_err(|error| error.to_string()),
@@ -1172,10 +1182,13 @@ fn mlx_fori_jvp(
     }
     let forward = body.symbolic_jvp_with_seed(
         loop_plan.body.plan.output_node_id,
-        |graph, name, _, shape| {
+        |graph, name, value, shape| {
             tangent_names
                 .get(name)
-                .map(|tangent_name| graph.input(tangent_name.clone(), shape.to_vec()))
+                .map(|tangent_name| {
+                    let dtype = graph.node_dtype(value)?;
+                    graph.input_typed(tangent_name.clone(), shape.to_vec(), dtype)
+                })
                 .transpose()
         },
     )?;
@@ -1718,6 +1731,7 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
     match op {
         TensorOp::Input { .. } => "input",
         TensorOp::ScalarConstant { .. } => "constant",
+        TensorOp::Cast { .. } => "cast",
         TensorOp::Add { .. } => "add",
         TensorOp::Sub { .. } => "sub",
         TensorOp::Div { .. } => "div",
