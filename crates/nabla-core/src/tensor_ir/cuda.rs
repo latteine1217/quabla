@@ -100,11 +100,17 @@ pub struct CudaDataParallelExecutionPlan {
 /// not bound to its creating thread; NCCL only forbids concurrent use, which
 /// the owning `Mutex` enforces. Each `Comm` holds an `Arc` of its replica's
 /// stream and context, so those outlive the `ncclCommAbort` issued on drop.
-/// Successful invocations synchronize every replica before returning, so no
-/// collective is in flight when the last clone is dropped.
+///
+/// `None` means a previous invocation failed. A failure can leave a
+/// collective launched on some ranks but not others, which would block the
+/// next collective or synchronization on those streams, so the failed call
+/// drops (aborts) the communicators and the next call creates new ones.
+/// Successful invocations synchronize every replica and failed ones abort
+/// their communicators, so no collective is in flight when the last clone
+/// is dropped.
 #[cfg(feature = "cuda-nccl")]
 #[derive(Debug)]
-struct CudaNcclCommunicators(Vec<NcclComm>);
+struct CudaNcclCommunicators(Option<Vec<NcclComm>>);
 
 // SAFETY: see `CudaNcclCommunicators`; all access goes through its `Mutex`.
 #[cfg(feature = "cuda-nccl")]
@@ -205,18 +211,12 @@ impl CudaBackend {
             .into_iter()
             .map(|ordinal| CudaBackend::new(ordinal).compile(plan.clone()))
             .collect::<Result<Vec<_>, _>>()?;
-        let communicators = NcclComm::from_devices(
-            replicas
-                .iter()
-                .map(|replica| replica.context.default_stream())
-                .collect(),
-        )
-        .map_err(|error| format!("failed to initialize NCCL communicators: {error:?}"))?;
+        let communicators = create_nccl_communicators(&replicas)?;
         Ok(CudaDataParallelExecutionPlan {
             replicas,
             output_node_ids,
             collectives: None,
-            communicators: Arc::new(Mutex::new(CudaNcclCommunicators(communicators))),
+            communicators: Arc::new(Mutex::new(CudaNcclCommunicators(Some(communicators)))),
         })
     }
 
@@ -501,11 +501,38 @@ impl CudaDataParallelExecutionPlan {
         }
         // Held for the whole invocation so concurrent callers cannot
         // interleave replica work with another call's collectives.
-        let communicators = self
+        let mut guard = self
             .communicators
             .lock()
             .map_err(|_| "CUDA data-parallel NCCL communicator lock is poisoned".to_string())?;
+        let communicators = match guard.0.take() {
+            Some(communicators) => communicators,
+            None => create_nccl_communicators(&self.replicas)
+                .map_err(|error| format!("failed to recreate NCCL communicators: {error}"))?,
+        };
+        match self.run_collectives(replica_inputs, collectives, &communicators) {
+            Ok(result) => {
+                guard.0 = Some(communicators);
+                Ok(result)
+            }
+            Err(error) => {
+                // Aborts any collective this call left partially launched.
+                drop(communicators);
+                Err(format!(
+                    "{error}; the plan's NCCL communicators were aborted and the next call recreates them"
+                ))
+            }
+        }
+    }
 
+    /// Enqueues every replica, all-reduces, synchronizes, and reads rank zero.
+    #[cfg(feature = "cuda-nccl")]
+    fn run_collectives(
+        &self,
+        replica_inputs: &[BTreeMap<String, DynamicTensor>],
+        collectives: &[(TensorNodeId, TensorReplicaReduction)],
+        communicators: &[NcclComm],
+    ) -> Result<CudaDataParallelResult, String> {
         let enqueue_start = Instant::now();
         for (replica, inputs) in self.replicas.iter().zip(replica_inputs) {
             replica.execute_retaining_without_output(inputs, &BTreeSet::new())?;
@@ -513,7 +540,7 @@ impl CudaDataParallelExecutionPlan {
         let replica_enqueue = enqueue_start.elapsed();
 
         let collective_start = Instant::now();
-        self.all_reduce_retained_outputs(&communicators.0, collectives)?;
+        self.all_reduce_retained_outputs(communicators, collectives)?;
         for replica in &self.replicas {
             replica.synchronize()?;
         }
@@ -632,6 +659,17 @@ impl CudaDataParallelExecutionPlan {
         }
         Ok(())
     }
+}
+
+#[cfg(feature = "cuda-nccl")]
+fn create_nccl_communicators(replicas: &[CudaExecutionPlan]) -> Result<Vec<NcclComm>, String> {
+    NcclComm::from_devices(
+        replicas
+            .iter()
+            .map(|replica| replica.context.default_stream())
+            .collect(),
+    )
+    .map_err(|error| format!("failed to initialize NCCL communicators: {error:?}"))
 }
 
 #[cfg(feature = "cuda-nccl")]

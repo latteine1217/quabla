@@ -3644,6 +3644,180 @@ fn cuda_data_parallel_sharded_schedule_matches_cpu_oracle_on_two_gpus() {
     }
 }
 
+/// Splits the mixed-reduction inputs into two replica maps with a four-row
+/// `x` shard each, plus a copy whose replica 1 lacks its shard. That replica
+/// fails input validation after replica 0 has enqueued its work, which is an
+/// execution failure after the plan's communicators exist.
+#[cfg(all(feature = "cuda-nccl", target_os = "linux"))]
+#[allow(clippy::type_complexity)]
+fn two_gpu_replica_inputs(
+    inputs: &BTreeMap<String, DynamicTensor>,
+) -> Result<
+    (
+        Vec<BTreeMap<String, DynamicTensor>>,
+        Vec<BTreeMap<String, DynamicTensor>>,
+    ),
+    String,
+> {
+    let mut replica_inputs = Vec::new();
+    for replica in 0..2 {
+        let mut shard_inputs = inputs.clone();
+        shard_inputs.insert("x".to_string(), inputs["x"].slice_axis(0, replica * 4, 4)?);
+        replica_inputs.push(shard_inputs);
+    }
+    let mut failing_inputs = replica_inputs.clone();
+    failing_inputs[1].remove("x");
+    Ok((replica_inputs, failing_inputs))
+}
+
+#[cfg(all(feature = "cuda-nccl", target_os = "linux"))]
+fn assert_data_parallel_outputs_match(
+    actual: &[DynamicTensor],
+    expected: &[DynamicTensor],
+    label: &str,
+) {
+    assert_eq!(actual.len(), expected.len(), "{label}");
+    for (position, (actual, reference)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(
+            actual.shape(),
+            reference.shape(),
+            "{label} output {position}"
+        );
+        let max_error = actual
+            .data()
+            .iter()
+            .zip(reference.data())
+            .map(|(actual, reference)| (actual - reference).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_error <= 1e-5, "{label} output {position}: {max_error}");
+    }
+}
+
+/// Failure contract: an error inside a data-parallel call is returned, the
+/// call aborts the plan's NCCL communicators, and the next call on the plan
+/// or any clone recreates them. Requires `NABLA_CUDA_NCCL_TEST=1`, a loadable
+/// NCCL library, and CUDA ordinals 0 and 1.
+#[cfg(all(feature = "cuda-nccl", target_os = "linux"))]
+#[test]
+fn cuda_data_parallel_recreates_communicators_after_a_failed_call_on_two_gpus() {
+    if std::env::var_os("NABLA_CUDA_NCCL_TEST").is_none() {
+        return;
+    }
+    let (plan, sharding, _, _) = must!(mixed_reduction_data_parallel_plan());
+    let inputs = must!(mixed_reduction_data_parallel_inputs());
+    let expected = must!(plan.evaluate_many(&inputs));
+    let (replica_inputs, failing_inputs) = must!(two_gpu_replica_inputs(&inputs));
+    let parallel =
+        must!(CudaBackend::new(0).compile_data_parallel_sharded(plan, &sharding, vec![0, 1]));
+
+    let before = must!(parallel.execute_sharded(&replica_inputs));
+    assert_data_parallel_outputs_match(&before.outputs, &expected, "before failure");
+    // The second failure first recreates the communicators the first aborted.
+    for attempt in 0..2 {
+        let error = parallel
+            .execute_sharded(&failing_inputs)
+            .expect_err("a replica without its shard must fail");
+        println!("failure-contract attempt={attempt} error={error}");
+        assert!(error.contains("missing input \"x\""), "{error}");
+        assert!(error.contains("next call recreates them"), "{error}");
+    }
+    // Clones share the communicators, so the clone observes the reset.
+    let clone = parallel.clone();
+    for call in 0..3 {
+        let start = std::time::Instant::now();
+        let result = must!(clone.execute_sharded(&replica_inputs));
+        println!(
+            "failure-contract recovered call={call} wall={:?} timing={:?}",
+            start.elapsed(),
+            result.timing
+        );
+        assert_data_parallel_outputs_match(&result.outputs, &expected, "after failure");
+    }
+}
+
+#[cfg(all(feature = "cuda-nccl", target_os = "linux"))]
+fn cuda_free_bytes(
+    contexts: &[std::sync::Arc<cudarc::driver::CudaContext>],
+) -> Result<Vec<usize>, String> {
+    contexts
+        .iter()
+        .map(|context| {
+            context
+                .synchronize()
+                .and_then(|()| context.mem_get_info())
+                .map(|(free, _)| free)
+                .map_err(|error| format!("failed to query CUDA memory: {error:?}"))
+        })
+        .collect()
+}
+
+/// Communicator lifecycle: 50 compile, execute, drop cycles on two GPUs.
+/// Even cycles drop the plan right after a successful call; odd cycles right
+/// after a failed call that left replica 0's work enqueued. Every result
+/// must match the CPU plan and device memory must return to its level after
+/// the first cycle of each kind. Requires `NABLA_CUDA_NCCL_TEST=1`.
+#[cfg(all(feature = "cuda-nccl", target_os = "linux"))]
+#[test]
+fn cuda_data_parallel_compile_execute_drop_cycles_keep_device_memory_stable_on_two_gpus() {
+    if std::env::var_os("NABLA_CUDA_NCCL_TEST").is_none() {
+        return;
+    }
+    const CYCLES: usize = 50;
+    const BASELINE_CYCLE: usize = 1;
+    // A leaked communicator pair, NVRTC module, or replica buffer set per
+    // cycle would exceed this over the remaining 48 cycles.
+    const MAX_DRIFT_BYTES: usize = 64 << 20;
+    let (plan, sharding, _, _) = must!(mixed_reduction_data_parallel_plan());
+    let inputs = must!(mixed_reduction_data_parallel_inputs());
+    let expected = must!(plan.evaluate_many(&inputs));
+    let (replica_inputs, failing_inputs) = must!(two_gpu_replica_inputs(&inputs));
+    // Holding the primary contexts keeps them alive between cycles, so the
+    // measurement sees allocations inside them rather than context teardown.
+    let contexts = must!([0, 1]
+        .into_iter()
+        .map(cudarc::driver::CudaContext::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to create CUDA contexts: {error:?}")));
+    let before = must!(cuda_free_bytes(&contexts));
+    println!("lifecycle before free_bytes={before:?}");
+
+    let start = std::time::Instant::now();
+    let mut baseline = Vec::new();
+    let mut after = Vec::new();
+    for cycle in 0..CYCLES {
+        let parallel = must!(CudaBackend::new(0).compile_data_parallel_sharded(
+            plan.clone(),
+            &sharding,
+            vec![0, 1]
+        ));
+        let result = must!(parallel.execute_sharded(&replica_inputs));
+        assert_data_parallel_outputs_match(&result.outputs, &expected, &format!("cycle {cycle}"));
+        if cycle % 2 == 1 {
+            let error = parallel
+                .execute_sharded(&failing_inputs)
+                .expect_err("a replica without its shard must fail");
+            assert!(error.contains("next call recreates them"), "{error}");
+        }
+        drop(parallel);
+        after = must!(cuda_free_bytes(&contexts));
+        println!("lifecycle cycle={cycle} free_bytes={after:?}");
+        if cycle == BASELINE_CYCLE {
+            baseline = after.clone();
+        }
+    }
+    println!(
+        "lifecycle cycles={CYCLES} elapsed={:?} baseline_free_bytes={baseline:?} final_free_bytes={after:?}",
+        start.elapsed()
+    );
+    for (device, (baseline, after)) in baseline.iter().zip(&after).enumerate() {
+        let drift = baseline.saturating_sub(*after);
+        assert!(
+            drift <= MAX_DRIFT_BYTES,
+            "device {device} lost {drift} bytes after cycle {BASELINE_CYCLE}"
+        );
+    }
+}
+
 #[test]
 fn data_parallel_vjp_matches_single_device_mean_loss() {
     let mut graph = TensorIr::new();
