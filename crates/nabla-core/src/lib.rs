@@ -8,7 +8,7 @@ pub mod tensor_ir;
 
 pub use autodiff::{Dual, ForwardGradient};
 pub use compiler::{
-    NablaCapability, NablaCompiler, NablaExecutable, NablaJvpProgram, NablaProgram, NablaTarget,
-    NablaVjpProgram,
+    NablaCapability, NablaCompiler, NablaExecutable, NablaJvpProgram, NablaMultiOutputExecutable,
+    NablaMultiOutputProgram, NablaProgram, NablaTarget, NablaVjpProgram,
 };
 pub use nabla_macros::{forward_diff, forward_gradient};

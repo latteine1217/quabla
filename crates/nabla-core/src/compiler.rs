@@ -123,6 +123,48 @@ impl NablaProgram {
     }
 }
 
+/// A Tensor IR program with an ordered list of results frozen into one plan.
+///
+/// Backends evaluate the shared prefix once, which value-and-gradient and
+/// primal/tangent helpers rely on. Freezing prunes and deduplicates nodes, so
+/// the frozen node ids differ from [`Self::output_node_ids`];
+/// [`NablaMultiOutputExecutable::output_node_ids`] reports them in the same
+/// order. Symbolic transforms stay on the single-output [`NablaProgram`].
+#[derive(Clone, Debug)]
+pub struct NablaMultiOutputProgram {
+    ir: TensorIr,
+    outputs: Vec<TensorNodeId>,
+}
+
+impl NablaMultiOutputProgram {
+    pub fn new(ir: TensorIr, outputs: Vec<TensorNodeId>) -> Result<Self, String> {
+        if outputs.is_empty() {
+            return Err("execution plan requires at least one output".to_string());
+        }
+        for output in &outputs {
+            ir.node_shape(*output)?;
+        }
+        Ok(Self { ir, outputs })
+    }
+
+    /// Source-IR node ids of the results, in program order.
+    pub fn output_node_ids(&self) -> &[TensorNodeId] {
+        &self.outputs
+    }
+
+    pub fn ir(&self) -> &TensorIr {
+        &self.ir
+    }
+
+    /// Freezes every result into one plan whose `output_node_ids()` follow
+    /// program order.
+    pub fn freeze(&self) -> Result<TensorExecutionPlan, String> {
+        self.ir
+            .compile_cpu_many(&self.outputs)
+            .map(|(plan, _)| plan)
+    }
+}
+
 /// A forward-mode transformed program. The primal is the embedded program's
 /// output; `tangent_node_id` is evaluated from the same transformed IR.
 #[derive(Clone, Debug)]
@@ -209,6 +251,49 @@ impl NablaExecutable {
     }
 }
 
+/// One backend compilation of a frozen multi-output program.
+///
+/// The facade owns the source-to-frozen node remapping: position `i` of
+/// [`Self::output_node_ids`] and of [`Self::execute`] is program output `i`.
+#[derive(Clone, Debug)]
+pub struct NablaMultiOutputExecutable {
+    executable: NablaExecutable,
+}
+
+impl NablaMultiOutputExecutable {
+    pub fn target(&self) -> NablaTarget {
+        self.executable.target()
+    }
+
+    /// Frozen node ids of the program outputs, in program order.
+    pub fn output_node_ids(&self) -> &[TensorNodeId] {
+        self.executable.plan().output_node_ids()
+    }
+
+    /// Executes the plan once and returns every output in program order.
+    pub fn execute(
+        &self,
+        inputs: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<Vec<DynamicTensor>, String> {
+        match &self.executable {
+            NablaExecutable::Cpu(plan) => plan.evaluate_many(inputs),
+            NablaExecutable::Cuda(plan) => plan.execute_many(inputs),
+            NablaExecutable::Mlx(plan) => {
+                MlxBackend.execute_many(plan, plan.output_node_ids(), inputs)
+            }
+        }
+    }
+
+    /// Returns the backend plan for executors that keep state across calls.
+    ///
+    /// Retained MLX input arrays, device-resident CUDA buffers, and Adam
+    /// state live in those executors, not in the facade; they address
+    /// results through [`Self::output_node_ids`].
+    pub fn into_executable(self) -> NablaExecutable {
+        self.executable
+    }
+}
+
 /// Stateless entrypoint for constructing, transforming, and compiling programs.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NablaCompiler;
@@ -233,12 +318,7 @@ impl NablaCompiler {
         program: &NablaProgram,
         target: NablaTarget,
     ) -> Result<NablaExecutable, String> {
-        if !target.is_built() {
-            return Err(format!(
-                "{} target is unavailable in this build",
-                target.name()
-            ));
-        }
+        ensure_built(target)?;
         self.compile_without_build_check(program, target)
     }
 
@@ -254,13 +334,48 @@ impl NablaCompiler {
         program: &NablaProgram,
         target: NablaTarget,
     ) -> Result<NablaExecutable, String> {
-        let plan = program.freeze()?;
-        match target {
-            NablaTarget::Cpu => Ok(NablaExecutable::Cpu(plan)),
-            NablaTarget::Cuda { device_ordinal } => CudaBackend::new(device_ordinal)
-                .compile(plan)
-                .map(NablaExecutable::Cuda),
-            NablaTarget::Mlx => Ok(NablaExecutable::Mlx(plan)),
-        }
+        lower(program.freeze()?, target)
+    }
+
+    /// Multi-output counterpart of [`Self::compile`]; one lowering path serves
+    /// both program kinds.
+    pub fn compile_many(
+        &self,
+        program: &NablaMultiOutputProgram,
+        target: NablaTarget,
+    ) -> Result<NablaMultiOutputExecutable, String> {
+        ensure_built(target)?;
+        self.compile_many_without_build_check(program, target)
+    }
+
+    /// Multi-output counterpart of [`Self::compile_without_build_check`], with
+    /// the same restriction to Python compatibility helpers.
+    pub fn compile_many_without_build_check(
+        &self,
+        program: &NablaMultiOutputProgram,
+        target: NablaTarget,
+    ) -> Result<NablaMultiOutputExecutable, String> {
+        lower(program.freeze()?, target).map(|executable| NablaMultiOutputExecutable { executable })
+    }
+}
+
+fn ensure_built(target: NablaTarget) -> Result<(), String> {
+    if target.is_built() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} target is unavailable in this build",
+            target.name()
+        ))
+    }
+}
+
+fn lower(plan: TensorExecutionPlan, target: NablaTarget) -> Result<NablaExecutable, String> {
+    match target {
+        NablaTarget::Cpu => Ok(NablaExecutable::Cpu(plan)),
+        NablaTarget::Cuda { device_ordinal } => CudaBackend::new(device_ordinal)
+            .compile(plan)
+            .map(NablaExecutable::Cuda),
+        NablaTarget::Mlx => Ok(NablaExecutable::Mlx(plan)),
     }
 }

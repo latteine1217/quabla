@@ -7,7 +7,7 @@ use nabla_core::tensor_ir::{
     TensorFusionRegion, TensorIr, TensorNodeId, TensorPartitionSpec, TensorPlacement,
     TensorReplicaReduction, TensorScanExecutionPlan, TensorShardingPlan,
 };
-use nabla_core::{NablaCompiler, NablaTarget};
+use nabla_core::{NablaCompiler, NablaMultiOutputProgram, NablaTarget};
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 use nabla_core::tensor_ir::CudaBackend;
@@ -132,6 +132,168 @@ fn compiler_build_check_bypass_leaves_unbuilt_errors_to_the_backend() {
             .expect_err("an unbuilt MLX backend must reject execution");
         assert!(error.contains("--features mlx"));
     }
+}
+
+#[test]
+fn compiler_facade_multi_output_program_keeps_order_and_owns_frozen_ids() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    // A pruned node before the outputs shifts every frozen id away from its
+    // source id, and a duplicate tanh is aliased by structural CSE.
+    let _unused = must!(graph.add(x, x));
+    let hidden = must!(graph.tanh(x));
+    let duplicate = must!(graph.tanh(x));
+    let squared = must!(graph.mul(hidden, hidden));
+    let loss = must!(graph.sum(squared));
+    let outputs = vec![loss, duplicate, hidden];
+    let compiler = NablaCompiler;
+    let program = must!(NablaMultiOutputProgram::new(graph.clone(), outputs.clone()));
+    assert_eq!(program.output_node_ids(), outputs.as_slice());
+
+    let executable = must!(compiler.compile_many(&program, NablaTarget::Cpu));
+    assert_eq!(executable.target(), NablaTarget::Cpu);
+    let frozen = executable.output_node_ids().to_vec();
+    assert_eq!(frozen.len(), outputs.len());
+    assert_eq!(frozen[1], frozen[2], "CSE aliases the duplicate output");
+    assert_ne!(frozen, outputs, "freezing remaps pruned source ids");
+
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![2], vec![0.5, -1.25])),
+    )]);
+    let values = must!(executable.execute(&inputs));
+    assert_eq!(values.len(), outputs.len());
+    for (value, output) in values.iter().zip(&outputs) {
+        let single = must!(compiler.compile(
+            &must!(compiler.program(graph.clone(), *output)),
+            NablaTarget::Cpu
+        ));
+        assert_eq!(*value, must!(single.execute(&inputs)));
+    }
+
+    assert_eq!(
+        NablaMultiOutputProgram::new(graph.clone(), Vec::new()).unwrap_err(),
+        "execution plan requires at least one output"
+    );
+    assert_eq!(
+        NablaMultiOutputProgram::new(graph, vec![loss, 999]).unwrap_err(),
+        "node 999 does not exist"
+    );
+}
+
+#[test]
+fn compiler_facade_multi_output_build_check_matches_single_output() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let doubled = must!(graph.add(x, x));
+    let squared = must!(graph.mul(x, x));
+    let compiler = NablaCompiler;
+    let program = must!(NablaMultiOutputProgram::new(graph, vec![doubled, squared]));
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![2], vec![1.0, 2.0])),
+    )]);
+
+    for target in [NablaTarget::Cuda { device_ordinal: 0 }, NablaTarget::Mlx] {
+        if target.is_built() {
+            continue;
+        }
+        let error = compiler
+            .compile_many(&program, target)
+            .expect_err("the facade must reject a target missing from this build");
+        assert_eq!(
+            error,
+            format!("{} target is unavailable in this build", target.name())
+        );
+    }
+    let cuda = NablaTarget::Cuda { device_ordinal: 0 };
+    if !cuda.is_built() {
+        let error = compiler
+            .compile_many_without_build_check(&program, cuda)
+            .expect_err("an unbuilt CUDA backend must reject compilation");
+        assert!(error.contains("build Nabla on Linux with --features cuda"));
+    }
+    if !NablaTarget::Mlx.is_built() {
+        let executable =
+            must!(compiler.compile_many_without_build_check(&program, NablaTarget::Mlx));
+        let error = executable
+            .execute(&inputs)
+            .expect_err("an unbuilt MLX backend must reject execution");
+        assert!(error.contains("--features mlx"));
+    }
+}
+
+/// A scalar value with two named gradients, frozen as one ordered program,
+/// mirroring the value-and-gradient Python helpers.
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn multi_output_value_and_grad_program(
+) -> Result<(NablaMultiOutputProgram, BTreeMap<String, DynamicTensor>), String> {
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![3, 2])?;
+    let weight = graph.input("weight", vec![2, 1])?;
+    let hidden = graph.matmul(x, weight)?;
+    let activated = graph.tanh(hidden)?;
+    let loss = graph.sum(activated)?;
+    let vjp = graph.symbolic_vjp(loss, "cotangent")?;
+    let outputs = vec![vjp.value, vjp.gradients["weight"], vjp.gradients["x"]];
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            DynamicTensor::new(vec![3, 2], vec![0.5, -1.0, 0.25, 0.75, -0.5, 1.5])?,
+        ),
+        (
+            "weight".to_string(),
+            DynamicTensor::new(vec![2, 1], vec![0.3, -0.7])?,
+        ),
+        (
+            "cotangent".to_string(),
+            DynamicTensor::new(vec![], vec![1.0])?,
+        ),
+    ]);
+    Ok((NablaMultiOutputProgram::new(vjp.graph, outputs)?, inputs))
+}
+
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn assert_multi_output_parity(target: NablaTarget) {
+    let (program, inputs) = must!(multi_output_value_and_grad_program());
+    let compiler = NablaCompiler;
+    let cpu = must!(compiler.compile_many(&program, NablaTarget::Cpu));
+    let device = must!(compiler.compile_many(&program, target));
+    assert_eq!(device.target(), target);
+    assert_eq!(device.output_node_ids(), cpu.output_node_ids());
+    let expected = must!(cpu.execute(&inputs));
+    let actual = must!(device.execute(&inputs));
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(&expected) {
+        assert_eq!(actual.shape(), expected.shape());
+        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "actual={actual}, expected={expected}"
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn compiler_facade_multi_output_mlx_matches_cpu() {
+    assert_multi_output_parity(NablaTarget::Mlx);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn compiler_facade_multi_output_cuda_matches_cpu_when_enabled() {
+    if std::env::var_os("NABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    assert_multi_output_parity(NablaTarget::Cuda { device_ordinal: 0 });
 }
 
 #[test]

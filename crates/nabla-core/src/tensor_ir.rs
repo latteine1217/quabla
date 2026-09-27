@@ -286,6 +286,13 @@ impl CudaExecutionPlan {
         self.execute(_inputs)
     }
 
+    pub fn execute_many(
+        &self,
+        inputs: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<Vec<DynamicTensor>, String> {
+        self.execute(inputs).map(|value| vec![value])
+    }
+
     pub fn sgd_step_input_from_output(
         &self,
         _parameter_name: &str,

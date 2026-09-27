@@ -226,14 +226,27 @@ without `NABLA_CUDA_TEST=1` pass after the migration; a facade-routed
 `tensor_jit_cuda_fn` runs on the GPU (`backend == "cublas"`) and matches CPU
 within `2e-8`.
 
-Category (b) helpers freeze a value together with selected gradients or a
-primal/tangent pair into one plan and consume remapped output node ids. They
-need a facade extension for ordered multi-output programs, which would replace
-the three `compile_*_multi_plan` bridge functions. MLX retained-input state
-currently lives in the Python `TensorMlxExecutionPlan`, not in
-`NablaExecutable`, so executing these helpers through the facade also needs
-a retained-state contract. Both change the documented single-output
-`NablaProgram` contract and are left as the next design step. Category (c)
+Multi-output programs (2026-09-27): category (b) helpers freeze a value
+together with selected gradients or a primal/tangent pair into one plan and
+consume the frozen output node ids. `NablaMultiOutputProgram::new(ir, outputs)`
+records that output order next to, not inside, the single-output
+`NablaProgram`, whose API and symbolic JVP/VJP transforms are unchanged.
+`NablaCompiler::compile_many` freezes it through the same lowering step as
+`compile` and returns a `NablaMultiOutputExecutable`;
+`compile_many_without_build_check` is the matching bypass, again reserved for
+the Python compatibility helpers. Freezing prunes and deduplicates nodes, so
+the executable owns the source-to-frozen remapping: `output_node_ids()[i]` is
+the frozen id of program output `i`, and `execute` returns every output in
+program order from one evaluation. Retained state stays with its executors:
+MLX retained input arrays (`TensorMlxExecutionPlan`, `MlxAdamPlan`),
+device-resident CUDA buffers, and Adam moments are not part of
+`NablaExecutable`. `into_executable()` hands those executors the backend plan
+they already consume, which keeps one lowering path without redesigning
+retained execution; moving retained state into the facade executable remains
+a separate design step. Rust tests cover output order, frozen-id remapping,
+rejection of empty or unknown outputs, the build-check contract, CPU parity
+with per-output single-output compilation, and MLX and CUDA value-and-gradient
+parity against CPU (`1e-5`, CUDA on the GTX 1660 SUPER). Category (c)
 helpers either target a replica set rather than one `NablaTarget`
 (data-parallel CUDA), only consume already-compiled plans (CUDA Adam), build
 IR regions during tracing rather than executables (single-output `tensor_cond`
