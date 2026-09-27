@@ -142,6 +142,36 @@ loss/gradient readbacks, so neither is a CUDA/JAX comparison.
   `zeros`/`arange` create `float64`, and batch-specialized functions
   (`tensor_jit_batch_fn` and its value-and-grad variants) trace `float64`
   inputs.
+- Boolean masks with dtype `nabla.bool_` (dtype phase D2; `str` is `"bool"`,
+  and `lower_text`/`stablehlo_text` print it as `i1`). `Tensor` and
+  `TraceTensor` provide `greater`, `greater_equal`, `less`, `less_equal`,
+  `equal`, `not_equal` (also as `nabla.greater(a, b)` etc.) and the
+  operators `<`, `<=`, `>`, `>=`; comparisons follow IEEE semantics, so any
+  comparison with `NaN` is false except `not_equal`. `==`/`!=` are not
+  overloaded: tensors keep identity equality and stay hashable. Bool masks
+  combine with `logical_and`/`logical_or`/`logical_not` or `&`/`|`/`~`
+  (bool operands only), `isfinite()`/`isnan()` classify float tensors, and
+  `any`/`all` reduce with the `axis`/`keepdims` contract of `sum`. `where`
+  and `tensor_cond` accept bool predicates as well as the existing 0/1
+  float masks, and `nabla.where` accepts Python scalar branches, so
+  `nabla.where(x.isfinite(), x, 0.0)` guards `NaN`/`inf` before any
+  arithmetic (a float mask product such as `x.gt(0.0) * x` still yields
+  `NaN`, because `0 * NaN` is `NaN`). `gt()` keeps returning a 0/1 float mask
+  of the operand dtype. In arithmetic a bool operand becomes 0/1 of the
+  other operand's float dtype (`residual_f32 * mask` is `float32`); with a
+  Python scalar it becomes a weak `float64` that still adopts a later
+  `float32` operand (`mask * 2.0 + residual_f32` is `float32`). Arithmetic
+  between two bool tensors, unary math, and reductions other than
+  `any`/`all` on bool raise an error that names `astype`, which converts in
+  both directions (nonzero and `NaN` become true). A single-element eager
+  bool tensor works in `if`; larger ones raise like NumPy, float tensors
+  keep their previous always-true truthiness, and `TraceTensor` still
+  refuses Python control flow. Comparisons, logical ops, and `any`/`all`
+  have zero derivatives, `where` gives no gradient to its predicate, bool
+  inputs are omitted from gradient dictionaries, and requesting a
+  derivative with respect to a bool input or of a bool output is an error.
+  CUDA and MLX hold bool values as `f32` `0`/`1`; `cond` results and loop
+  (`fori`/`scan`) region inputs must stay floating for now.
 - Python `trace_tensor(fn, input_specs)` bridge for the rank-N `TensorIr` core.
   `TensorTraceGraph.stablehlo_text(output_node_id)` exports the verified static
   `f64` input/add/multiply/tanh subset as deterministic textual StableHLO for
@@ -150,7 +180,7 @@ loss/gradient readbacks, so neither is a CUDA/JAX comparison.
 - `tensor_jacobian_fn(fn, input_specs, input_name)` freezes one rank-N trace
   and returns an output-flat by input-flat dense Jacobian for the selected input.
   Its `TraceTensor` values currently support broadcasted add/subtract/multiply/divide,
-  batched `matmul`, rank-N `concat`, `stack([...], axis=...)`, `slice(axis, start, stop)`, `broadcast_to(shape)`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `log`, reshape, global or single-axis `sum`/`mean`/L2 `norm`, `maximum`/`minimum`, and `gt`/`where` masks. `stack` is composed from reshape plus concat, so it inherits the same direct and symbolic CPU/CUDA AD rules. `concat` is linear: direct and symbolic VJP split the upstream cotangent with internal slice nodes, while its JVP and mixed second-direction transform concatenate the corresponding tangents. `slice` supports normalized negative axes and uses a zero-padded internal reverse node, keeping direct and symbolic gradients on the selected original coordinates. `broadcast_to` is a dedicated shape node whose VJP reduces repeated axes back to the input shape. `sqrt` is a native IR primitive: negative values follow IEEE floating-point `NaN` semantics, while every derivative order at zero is defined as zero, avoiding `log(0)` during higher-order AD. Comparisons are explicitly non-differentiable; `where` routes VJP/JVP contributions only through the selected data branch. `maximum` and `minimum` are composed from those primitives and route equality subgradients to their right operand. `TensorTraceGraph.evaluate_vjp(...)` and
+  batched `matmul`, rank-N `concat`, `stack([...], axis=...)`, `slice(axis, start, stop)`, `broadcast_to(shape)`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `log`, reshape, global or single-axis `sum`/`mean`/L2 `norm`, `maximum`/`minimum`, `gt`/`where` masks, and the bool comparison, logical, `isfinite`/`isnan`, and `any`/`all` operations. `stack` is composed from reshape plus concat, so it inherits the same direct and symbolic CPU/CUDA AD rules. `concat` is linear: direct and symbolic VJP split the upstream cotangent with internal slice nodes, while its JVP and mixed second-direction transform concatenate the corresponding tangents. `slice` supports normalized negative axes and uses a zero-padded internal reverse node, keeping direct and symbolic gradients on the selected original coordinates. `broadcast_to` is a dedicated shape node whose VJP reduces repeated axes back to the input shape. `sqrt` is a native IR primitive: negative values follow IEEE floating-point `NaN` semantics, while every derivative order at zero is defined as zero, avoiding `log(0)` during higher-order AD. Comparisons are explicitly non-differentiable; `where` routes VJP/JVP contributions only through the selected data branch. `maximum` and `minimum` are composed from those primitives and route equality subgradients to their right operand. `TensorTraceGraph.evaluate_vjp(...)` and
   `TensorTraceGraph.evaluate_jvp(...)` execute the corresponding rank-N CPU
   reverse and forward transforms. `TensorTraceGraph.hessian_scalar(...)`
   computes an exact dense Hessian for one named input and a scalar output using

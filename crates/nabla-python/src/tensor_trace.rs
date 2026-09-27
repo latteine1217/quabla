@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use nabla_core::tensor_ir::{
     CudaBackend, CudaDataParallelExecutionPlan, CudaDataParallelTiming, CudaExecutionPlan,
-    DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs, TensorBackend,
+    DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs, TensorBackend, TensorComparison,
     TensorCondExecutionPlan, TensorDType, TensorExecutionPlan, TensorForiExecutionPlan, TensorIr,
     TensorNodeId, TensorReplicaReduction, TensorScanExecutionPlan,
 };
@@ -18,6 +18,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyString, PyTuple};
 
 use crate::dtype::PyDType;
+use crate::tensor::bool_operation_error;
 use crate::tensor::{parse_axis_indices, parse_tensor_indices, PyTensor, TensorIndex};
 
 /// One traced input declaration: `(name, shape)` for `float64`, or
@@ -878,7 +879,7 @@ impl TraceTensor {
         ))
     }
 
-    fn scalar_tensor(&self, value: f64) -> Result<Self, String> {
+    pub(crate) fn scalar_tensor(&self, value: f64) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -1062,6 +1063,108 @@ impl TraceTensor {
         ))
     }
 
+    /// Appends one node built from `self` and `others` (same graph), keeping
+    /// the merged vmap batch axis.
+    fn apply(
+        &self,
+        others: &[&Self],
+        build: impl FnOnce(&mut TensorIr) -> Result<TensorNodeId, String>,
+    ) -> Result<Self, String> {
+        for other in others {
+            self.same_graph(other)?;
+        }
+        let mut ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let node_id = build(&mut ir)?;
+        let shape = ir.node_shape(node_id)?;
+        let tensors = std::iter::once(self)
+            .chain(others.iter().copied())
+            .collect::<Vec<_>>();
+        Ok(Self::from_node(
+            self.graph.clone(),
+            node_id,
+            shape,
+            Self::merged_batch_axis(&tensors)?,
+        ))
+    }
+
+    fn ensure_not_bool(&self, op: &str) -> Result<(), String> {
+        if self.dtype()? == TensorDType::Bool {
+            return Err(bool_operation_error(op));
+        }
+        Ok(())
+    }
+
+    fn compare_tensor(&self, rhs: &Self, kind: TensorComparison) -> Result<Self, String> {
+        self.apply(&[rhs], |ir| ir.compare(self.node_id, rhs.node_id, kind))
+    }
+
+    fn compare_scalar(&self, value: f64, kind: TensorComparison) -> Result<Self, String> {
+        self.apply(&[], |ir| {
+            let scalar = ir.scalar_constant(value);
+            ir.compare(self.node_id, scalar, kind)
+        })
+    }
+
+    fn logical_tensor(&self, rhs: &Self, and: bool) -> Result<Self, String> {
+        self.apply(&[rhs], |ir| {
+            if and {
+                ir.logical_and(self.node_id, rhs.node_id)
+            } else {
+                ir.logical_or(self.node_id, rhs.node_id)
+            }
+        })
+    }
+
+    fn logical_not_tensor(&self) -> Result<Self, String> {
+        self.apply(&[], |ir| ir.logical_not(self.node_id))
+    }
+
+    fn classify_tensor(&self, nan: bool) -> Result<Self, String> {
+        self.apply(&[], |ir| {
+            if nan {
+                ir.isnan(self.node_id)
+            } else {
+                ir.isfinite(self.node_id)
+            }
+        })
+    }
+
+    /// `any`/`all` with the multi-axis, keepdims and vmap handling of `sum`:
+    /// `sum(cast(b)) > 0` and `sum(cast(!b)) == 0`, as `TensorIr::any`/`all`.
+    fn any_all_tensor(
+        &self,
+        axes: Option<Vec<isize>>,
+        keepdims: bool,
+        any: bool,
+    ) -> Result<Self, String> {
+        let dtype = self.dtype()?;
+        if dtype != TensorDType::Bool {
+            return Err(format!(
+                "{} requires bool operands, got dtype {dtype}; \
+                 build a mask with a comparison or convert explicitly with astype",
+                if any { "any" } else { "all" }
+            ));
+        }
+        let counted = if any {
+            self.clone()
+        } else {
+            self.logical_not_tensor()?
+        };
+        let counts = counted
+            .astype_tensor(TensorDType::F64)?
+            .reduce_axes_tensor(axes, keepdims, false)?;
+        let kind = if any {
+            TensorComparison::Greater
+        } else {
+            TensorComparison::Equal
+        };
+        counts.compare_scalar(0.0, kind)
+    }
+
     fn maximum_tensor(&self, rhs: &Self) -> Result<Self, String> {
         let mask = self.binary(rhs, "greater")?;
         mask.where_tensor(self, rhs)
@@ -1101,16 +1204,19 @@ impl TraceTensor {
     }
 
     fn relu_tensor(&self) -> Result<Self, String> {
+        self.ensure_not_bool("relu")?;
         self.maximum_scalar(0.0)
     }
 
     fn abs_tensor(&self) -> Result<Self, String> {
+        self.ensure_not_bool("abs")?;
         let mask = self.scalar_binary(0.0, "greater")?;
         let negative = self.scalar_left_binary(0.0, "sub")?;
         mask.where_tensor(self, &negative)
     }
 
     fn sigmoid_tensor(&self) -> Result<Self, String> {
+        self.ensure_not_bool("sigmoid")?;
         self.scalar_binary(-1.0, "mul")?
             .exp_tensor()?
             .scalar_binary(1.0, "add")?
@@ -1118,6 +1224,7 @@ impl TraceTensor {
     }
 
     fn softplus_tensor(&self) -> Result<Self, String> {
+        self.ensure_not_bool("softplus")?;
         let linear = self.maximum_scalar(0.0)?;
         let correction = self
             .abs_tensor()?
@@ -1388,6 +1495,7 @@ impl TraceTensor {
     }
 
     fn norm_tensor(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        self.ensure_not_bool("norm")?;
         self.powi_tensor(2)?
             .reduce_axes_tensor(axes, keepdims, false)?
             .sqrt_tensor()
@@ -1399,6 +1507,7 @@ impl TraceTensor {
         keepdims: bool,
         maximum: bool,
     ) -> Result<Self, String> {
+        self.ensure_not_bool(if maximum { "max" } else { "min" })?;
         let example_rank = self.shape.len() - usize::from(self.batch_axis.is_some());
         let Some(axes) = axes else {
             let mut reduced = self.clone();
@@ -1913,6 +2022,102 @@ impl TraceTensor {
         trace_tensor_or_scalar_operand(self, rhs, "greater")
     }
 
+    /// Elementwise `self > rhs` as a `bool` tensor (unlike `gt`, which keeps
+    /// returning a 0/1 float mask).
+    fn greater(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        trace_compare_operand(self, rhs, TensorComparison::Greater)
+    }
+
+    fn greater_equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        trace_compare_operand(self, rhs, TensorComparison::GreaterEqual)
+    }
+
+    fn less(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        trace_compare_operand(self, rhs, TensorComparison::Less)
+    }
+
+    fn less_equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        trace_compare_operand(self, rhs, TensorComparison::LessEqual)
+    }
+
+    fn equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        trace_compare_operand(self, rhs, TensorComparison::Equal)
+    }
+
+    fn not_equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        trace_compare_operand(self, rhs, TensorComparison::NotEqual)
+    }
+
+    // `==`/`!=` stay identity comparisons (see `Tensor`).
+    fn __gt__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.greater(rhs)
+    }
+
+    fn __ge__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.greater_equal(rhs)
+    }
+
+    fn __lt__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.less(rhs)
+    }
+
+    fn __le__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.less_equal(rhs)
+    }
+
+    /// Defining ordering operators installs a rich comparison, which drops
+    /// Python's default identity hash; restore it so tensors stay usable as
+    /// dictionary keys.
+    fn __hash__(slf: &Bound<'_, Self>) -> isize {
+        slf.as_ptr() as isize
+    }
+
+    fn logical_and(&self, rhs: &Self) -> PyResult<Self> {
+        self.logical_tensor(rhs, true)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn logical_or(&self, rhs: &Self) -> PyResult<Self> {
+        self.logical_tensor(rhs, false)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn logical_not(&self) -> PyResult<Self> {
+        self.logical_not_tensor().map_err(PyValueError::new_err)
+    }
+
+    fn __and__(&self, rhs: &Self) -> PyResult<Self> {
+        self.logical_and(rhs)
+    }
+
+    fn __or__(&self, rhs: &Self) -> PyResult<Self> {
+        self.logical_or(rhs)
+    }
+
+    fn __invert__(&self) -> PyResult<Self> {
+        self.logical_not()
+    }
+
+    fn isnan(&self) -> PyResult<Self> {
+        self.classify_tensor(true).map_err(PyValueError::new_err)
+    }
+
+    fn isfinite(&self) -> PyResult<Self> {
+        self.classify_tensor(false).map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn any(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.any_all_tensor(extract_reduction_axes(axis)?, keepdims, true)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn all(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.any_all_tensor(extract_reduction_axes(axis)?, keepdims, false)
+            .map_err(PyValueError::new_err)
+    }
+
     fn maximum(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
         if let Ok(rhs) = rhs.extract::<PyRef<'_, TraceTensor>>() {
             return self.maximum_tensor(&rhs).map_err(PyValueError::new_err);
@@ -2116,6 +2321,48 @@ fn trace_tensor_or_scalar_operand(
     }
     if let Ok(value) = rhs.extract::<f64>() {
         return lhs.scalar_binary(value, op).map_err(PyValueError::new_err);
+    }
+    Err(PyTypeError::new_err(
+        "expected a TraceTensor or numeric scalar operand",
+    ))
+}
+
+fn trace_input_is_bool(graph: &TensorTraceGraph, name: &str) -> PyResult<bool> {
+    let ir = graph
+        .ir
+        .lock()
+        .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?;
+    Ok(ir
+        .input_node_id(name)
+        .and_then(|node_id| ir.node_dtype(node_id))
+        .is_ok_and(|dtype| dtype == TensorDType::Bool))
+}
+
+/// Symbolic VJP gradient maps omit `bool` inputs; report a request for one
+/// as such instead of as a missing input.
+fn ensure_differentiable_trace_input(graph: &TensorTraceGraph, name: &str) -> PyResult<()> {
+    graph
+        .ir
+        .lock()
+        .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
+        .ensure_differentiable_input(name)
+        .map_err(PyValueError::new_err)
+}
+
+fn trace_compare_operand(
+    lhs: &TraceTensor,
+    rhs: &Bound<'_, PyAny>,
+    kind: TensorComparison,
+) -> PyResult<TraceTensor> {
+    if let Ok(rhs) = rhs.extract::<PyRef<'_, TraceTensor>>() {
+        return lhs
+            .compare_tensor(&rhs, kind)
+            .map_err(PyValueError::new_err);
+    }
+    if let Ok(value) = rhs.extract::<f64>() {
+        return lhs
+            .compare_scalar(value, kind)
+            .map_err(PyValueError::new_err);
     }
     Err(PyTypeError::new_err(
         "expected a TraceTensor or numeric scalar operand",
@@ -5460,6 +5707,7 @@ fn build_cuda_scalar_value_and_grad_program(
                 "duplicate parameter name {parameter_name:?}"
             )));
         }
+        ensure_differentiable_trace_input(&loss.graph, &parameter_name)?;
         let gradient_node_id = gradients.get(&parameter_name).copied().ok_or_else(|| {
             PyValueError::new_err(format!(
                 "parameter {parameter_name:?} is not declared in the loss trace"
@@ -5766,6 +6014,7 @@ fn compile_mlx_scalar_value_and_grad(
                 "duplicate parameter name {parameter_name:?}"
             )));
         }
+        ensure_differentiable_trace_input(&loss.graph, &parameter_name)?;
         let gradient_node_id = gradients.get(&parameter_name).copied().ok_or_else(|| {
             PyValueError::new_err(format!(
                 "parameter {parameter_name:?} is not declared in the loss trace"
@@ -5956,6 +6205,10 @@ pub fn tensor_vmap_vjp_mlx_fn(
     let mut output_node_ids = vec![output_node_id];
     let mut gradient_names = Vec::with_capacity(signature.input_names.len());
     for name in &signature.input_names {
+        // bool 輸入不可微，VJP 梯度表不含它們，回傳結果亦略過。
+        if trace_input_is_bool(&traced.graph, name)? {
+            continue;
+        }
         let node_id = gradients.get(name).copied().ok_or_else(|| {
             PyValueError::new_err(format!("vmap VJP input {name:?} is absent from the trace"))
         })?;
@@ -5995,9 +6248,16 @@ pub fn tensor_vmap_jvp_mlx_fn(
         .iter()
         .map(|spec| spec.name.clone())
         .collect::<BTreeSet<_>>();
-    let tangent_names = input_names
+    // bool 輸入沒有切向量，不建立切向量輸入。
+    let tangent_names = input_specs
         .iter()
-        .map(|name| (name.clone(), format!("{MLX_VMAP_TANGENT_PREFIX}{name}")))
+        .filter(|spec| spec.dtype.is_floating())
+        .map(|spec| {
+            (
+                spec.name.clone(),
+                format!("{MLX_VMAP_TANGENT_PREFIX}{}", spec.name),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     if tangent_names
         .values()
@@ -6058,9 +6318,16 @@ pub fn tensor_vmap_jvp_cuda_fn(
         .iter()
         .map(|spec| spec.name.clone())
         .collect::<BTreeSet<_>>();
-    let tangent_names = input_names
+    // bool 輸入沒有切向量，不建立切向量輸入。
+    let tangent_names = input_specs
         .iter()
-        .map(|name| (name.clone(), format!("{CUDA_VMAP_TANGENT_PREFIX}{name}")))
+        .filter(|spec| spec.dtype.is_floating())
+        .map(|spec| {
+            (
+                spec.name.clone(),
+                format!("{CUDA_VMAP_TANGENT_PREFIX}{}", spec.name),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     if tangent_names
         .values()
@@ -6126,6 +6393,7 @@ fn build_vmap_hvp_scalar_graph(
         .ok_or_else(|| {
             PyValueError::new_err(format!("input {input_name:?} is absent from the trace"))
         })?;
+    ensure_differentiable_trace_input(&traced.graph, input_name)?;
     let input_axis = signature.in_axes[input_index].ok_or_else(|| {
         PyValueError::new_err(format!(
             "tensor_vmap_hvp_scalar_fn requires input {input_name:?} to be mapped"
@@ -6315,6 +6583,10 @@ pub fn tensor_vmap_vjp_cuda_fn(
     let mut output_node_ids = vec![value_node_id];
     let mut gradient_names = Vec::with_capacity(signature.input_names.len());
     for name in &signature.input_names {
+        // bool 輸入不可微，VJP 梯度表不含它們，回傳結果亦略過。
+        if trace_input_is_bool(&traced.graph, name)? {
+            continue;
+        }
         let node_id = gradients.get(name).copied().ok_or_else(|| {
             PyValueError::new_err(format!("vmap VJP input {name:?} is absent from the trace"))
         })?;

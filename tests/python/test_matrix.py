@@ -6612,6 +6612,446 @@ def test_cuda_float32_mlp_matches_the_cpu_float32_reference():
     assert_float32_mlp_device_parity(lambda output: output.compile_cuda())
 
 
+# ---- Dtype phase D2: bool masks, comparisons, and logical reductions ----
+
+NAN = float("nan")
+INF = float("inf")
+BOOL_X = [1.0, 2.0, NAN, INF, -INF, 2.0]
+BOOL_Y = [0.5, 2.0, 2.0, INF, 0.0, NAN]
+# (method, operator or None, expected mask of x ? y)
+COMPARISONS = [
+    ("greater", lambda a, b: a > b, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    ("greater_equal", lambda a, b: a >= b, [1.0, 1.0, 0.0, 1.0, 0.0, 0.0]),
+    ("less", lambda a, b: a < b, [0.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+    ("less_equal", lambda a, b: a <= b, [0.0, 1.0, 0.0, 1.0, 1.0, 0.0]),
+    ("equal", None, [0.0, 1.0, 0.0, 1.0, 0.0, 0.0]),
+    ("not_equal", None, [1.0, 0.0, 1.0, 0.0, 1.0, 1.0]),
+]
+
+
+def bool_xy():
+    return nabla.Tensor([2, 3], BOOL_X), nabla.Tensor([2, 3], BOOL_Y)
+
+
+def expect_error(action, *fragments, error=ValueError):
+    try:
+        action()
+    except error as caught:
+        for fragment in fragments:
+            assert fragment in str(caught), (fragment, str(caught))
+    else:
+        raise AssertionError(f"expected {error.__name__} containing {fragments}")
+
+
+def test_bool_dtype_object_and_eager_comparisons_follow_ieee_semantics():
+    assert repr(nabla.bool_) == "nabla.bool_"
+    assert str(nabla.bool_) == "bool"
+    assert nabla.bool_.name == "bool"
+    assert {nabla.bool_: "mask"}[nabla.bool_] == "mask"
+    assert nabla.bool_ != nabla.float64
+    mask = nabla.Tensor([4], [0.0, 3.0, NAN, -INF], dtype=nabla.bool_)
+    assert mask.dtype == nabla.bool_
+    assert mask.to_flat_list() == [0.0, 1.0, 1.0, 1.0]
+    assert "nabla.bool_" in repr(mask)
+
+    x, y = bool_xy()
+    for name, operator, expected in COMPARISONS:
+        results = [getattr(x, name)(y), getattr(nabla, name)(x, y)]
+        if operator is not None:
+            results.append(operator(x, y))
+        for result in results:
+            assert result.dtype == nabla.bool_, name
+            assert result.to_flat_list() == expected, name
+    # Python 純量為弱型別；左側純量走反射運算子與反射函式。
+    assert (x > 1.5).to_flat_list() == [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+    assert (1.5 < x).to_flat_list() == (x > 1.5).to_flat_list()
+    assert nabla.greater(1.5, x).to_flat_list() == (x < 1.5).to_flat_list()
+    single = nabla.Tensor([2], [0.1, 0.2], dtype=nabla.float32)
+    assert single.equal(0.1).to_flat_list() == [1.0, 0.0]
+    assert x.astype(nabla.bool_).to_flat_list() == [1.0] * 6
+    assert (x > 1.5).astype(nabla.float32).dtype == nabla.float32
+
+
+def test_bool_logical_ops_and_reductions_match_between_eager_and_traced():
+    x, y = bool_xy()
+
+    def program(x, y):
+        greater = x > y
+        return [
+            x.isfinite(),
+            nabla.isnan(x),
+            greater & x.isfinite(),
+            nabla.logical_or(x < y, y.isnan()),
+            ~x.equal(y),
+            nabla.logical_not(greater),
+            x.isnan().any(),
+            y.isfinite().all(),
+            greater.any(axis=1),
+            y.isfinite().all(axis=0, keepdims=True),
+            x.isfinite().all(axis=[0, 1]),
+        ]
+
+    expected = [
+        [1.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+        [1.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+        [0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        [1.0],
+        [0.0],
+        [1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0],
+    ]
+    eager = program(x, y)
+    assert [value.to_flat_list() for value in eager] == expected
+    assert all(value.dtype == nabla.bool_ for value in eager)
+    assert eager[9].shape == [1, 3]
+
+    inputs = {"x": x, "y": y}
+    for index, row in enumerate(expected):
+        traced = nabla.trace_tensor(
+            lambda x, y, index=index: program(x, y)[index],
+            [("x", [2, 3]), ("y", [2, 3])],
+        )
+        assert traced.output.dtype == nabla.bool_
+        plan = traced.output.compile_cpu()
+        plan.validate_kernel_ir()
+        assert plan.kernel_ir()[-1]["dtype"] == "bool"
+        value = plan.evaluate(inputs)
+        assert value.dtype == nabla.bool_
+        assert value.to_flat_list() == row, index
+    assert (
+        "xi1>" in nabla.trace_tensor(lambda x: x > 0.0, [("x", [2])]).graph.lower_text()
+    )
+
+    expect_error(lambda: x & y, "logical_and requires bool operands")
+    expect_error(lambda: x.any(), "any requires bool operands")
+    expect_error(lambda: x.isfinite().isnan(), "isnan is not defined for bool tensors")
+    expect_error(
+        lambda: nabla.trace_tensor(lambda x: x.all(), [("x", [2])]),
+        "all requires bool operands",
+    )
+
+
+def test_tensor_ordering_operators_keep_identity_equality_and_hashing():
+    x, y = bool_xy()
+    assert x == x and not (x == y) and x != y
+    assert {x: "x", y: "y"}[x] == "x"
+    seen = []
+
+    def record(a, b):
+        seen.extend([a == a, a == b, {a: 1}[a]])
+        return a > b
+
+    nabla.trace_tensor(record, [("a", [2]), ("b", [2])])
+    assert seen == [True, False, 1]
+
+
+def test_legacy_gt_masks_and_extrema_tie_rules_are_unchanged():
+    x = nabla.Tensor([4], [-1.0, 0.0, 2.0, NAN])
+    mask = x.gt(0.0)
+    assert mask.dtype == nabla.float64
+    assert mask.to_flat_list() == [0.0, 0.0, 1.0, 0.0]
+    single = nabla.Tensor([2], [0.5, -0.5], dtype=nabla.float32)
+    assert single.gt(0.0).dtype == nabla.float32
+    traced = nabla.trace_tensor(lambda x: x.gt(0.0), [("x", [4])])
+    assert traced.output.dtype == nabla.float64
+    assert traced.output.compile_cpu().evaluate({"x": x}).to_flat_list() == [
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+    ]
+
+    ties = nabla.Tensor([3], [-1.0, 0.0, 1.0])
+    other = nabla.Tensor([3], [1.0, 0.0, -1.0])
+    assert ties.abs().to_flat_list() == [1.0, -0.0, 1.0]
+    for name, expected_gradient in [
+        ("relu", [0.0, 0.0, 1.0]),
+        ("abs", [-1.0, -1.0, 1.0]),
+    ]:
+        _, gradients = nabla.tensor_value_and_grad_fn(
+            lambda x, name=name: getattr(x, name)().sum(), [("x", [3])]
+        )({"x": ties})
+        assert gradients["x"].to_flat_list() == expected_gradient
+    # maximum/minimum 的相等次梯度仍路由到右運算元。
+    _, gradients = nabla.tensor_value_and_grad_fn(
+        lambda a, b: a.maximum(b).sum() + a.minimum(b).sum(), [("a", [3]), ("b", [3])]
+    )({"a": ties, "b": other})
+    assert gradients["a"].to_flat_list() == [1.0, 0.0, 1.0]
+    assert gradients["b"].to_flat_list() == [1.0, 2.0, 1.0]
+
+
+def test_bool_operands_promote_to_float_and_bool_arithmetic_is_rejected():
+    residual = nabla.Tensor([3], [0.1, -0.2, 0.3], dtype=nabla.float32)
+    x = nabla.Tensor([3], [1.0, -1.0, 2.0])
+    mask = x > 0.0
+    masked = residual * mask
+    assert masked.dtype == nabla.float32
+    assert masked.to_flat_list() == f32([0.1, 0.0, 0.3])
+    weak = mask * 2.0
+    assert weak.dtype == nabla.float64
+    adopted = weak + residual
+    assert adopted.dtype == nabla.float32
+    assert adopted.to_flat_list() == f32(
+        [f32([2.0])[0] + f32([0.1])[0], -0.2, f32([2.0])[0] + f32([0.3])[0]]
+    )
+    expect_error(lambda: weak + weak.astype(nabla.float32) + x, "astype")
+
+    specs = [("r", [3], nabla.float32), ("x", [3])]
+    traced = nabla.trace_tensor(lambda r, x: r * (x > 0.0), specs)
+    assert traced.output.dtype == nabla.float32
+    traced = nabla.trace_tensor(lambda r, x: (x > 0.0) * 2.0 + r, specs)
+    assert traced.output.dtype == nabla.float32
+    values = traced.output.compile_cpu().evaluate({"r": residual, "x": x})
+    assert values.to_flat_list() == adopted.to_flat_list()
+
+    for action in [lambda m: m + m, lambda m: m * m]:
+        expect_error(lambda: action(mask), "not defined for bool tensors", "astype")
+        expect_error(
+            lambda: nabla.trace_tensor(lambda x: action(x > 0.0), [("x", [3])]),
+            "not defined for bool tensors",
+        )
+    for name in [
+        "tanh",
+        "exp",
+        "sqrt",
+        "sum",
+        "relu",
+        "abs",
+        "sigmoid",
+        "softplus",
+        "norm",
+        "max",
+    ]:
+        expect_error(
+            lambda: getattr(mask, name)(), f"{name} is not defined for bool tensors"
+        )
+        expect_error(
+            lambda: nabla.trace_tensor(
+                lambda x: getattr(x > 0.0, name)(), [("x", [3])]
+            ),
+            f"{name} is not defined for bool tensors",
+        )
+    expect_error(lambda: -mask, "not defined for bool tensors")
+
+
+def test_eager_bool_truthiness_follows_numpy_and_traced_tensors_refuse():
+    x = nabla.Tensor([2], [1.0, -1.0])
+    taken = "yes" if (x.sum() > 0.5) else "no"
+    assert taken == "no"
+    assert bool((x > 0.0).any())
+    assert not bool((x > 0.0).all())
+    expect_error(lambda: bool(x > 0.0), "ambiguous", ".any()")
+    # 浮點張量維持原本的物件真值（永遠為真）。
+    assert bool(nabla.Tensor([1], [0.0]))
+    expect_error(
+        lambda: nabla.trace_tensor(lambda x: x if bool(x > 0.0) else x, [("x", [])]),
+        "control flow",
+        error=TypeError,
+    )
+
+
+def test_nan_guards_keep_values_and_gradients_finite_while_float_masks_leak():
+    x = nabla.Tensor([2, 3], BOOL_X)
+    guarded = nabla.tensor_value_and_grad_fn(
+        lambda x: nabla.where(x.isfinite(), x, 0.0).powi(2).sum(), [("x", [2, 3])]
+    )
+    value, gradients = guarded({"x": x})
+    assert value.to_flat_list() == [9.0]
+    assert gradients["x"].to_flat_list() == [2.0, 4.0, 0.0, 0.0, 0.0, 4.0]
+
+    # all(isfinite(x)) 作為 Cond 謂詞：非有限輸入走防護分支，值與梯度皆有限。
+    traced = nabla.trace_tensor(
+        lambda x: nabla.tensor_cond(
+            x.isfinite().all(),
+            lambda a: (a * a).sum(),
+            lambda a: nabla.where(a.isfinite(), a, 0.0).powi(2).sum() * 0.5,
+            [x],
+        ),
+        [("x", [2, 3])],
+    )
+    gradient = traced.symbolic_vjp("seed")["x"].output
+    for values, expected_value, expected_gradient in [
+        (BOOL_X, 4.5, [1.0, 2.0, 0.0, 0.0, 0.0, 2.0]),
+        ([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 91.0, [2.0, 4.0, 6.0, 8.0, 10.0, 12.0]),
+    ]:
+        inputs = {"x": nabla.Tensor([2, 3], values), "seed": nabla.Tensor([], [1.0])}
+        assert traced.output.compile_cpu().evaluate(inputs).to_flat_list() == [
+            expected_value
+        ]
+        assert (
+            gradient.compile_cpu().evaluate(inputs).to_flat_list() == expected_gradient
+        )
+
+    # 舊寫法：浮點遮罩相乘時 0 * NaN = NaN，gt 也無法辨識 NaN。
+    leaked = (x.gt(0.0) * x).sum().to_flat_list()[0]
+    assert math.isnan(leaked)
+
+
+def test_where_and_cond_accept_bool_and_legacy_float_predicates():
+    x = nabla.Tensor([3], [-2.0, 0.0, 3.0])
+    for mask in [x >= 0.0, x.gt(0.0)]:
+        selected = nabla.where(mask, x, 0.0 - x)
+        assert selected.to_flat_list() == [2.0, 0.0, 3.0]
+        traced = nabla.trace_tensor(
+            lambda x, float_mask=(mask.dtype == nabla.float64): nabla.where(
+                x.gt(0.0) if float_mask else x >= 0.0, x, 0.0 - x
+            ),
+            [("x", [3])],
+        )
+        assert traced.output.compile_cpu().evaluate({"x": x}).to_flat_list() == [
+            2.0,
+            0.0,
+            3.0,
+        ]
+
+    for predicate in [lambda x: (x > 0.0).any(), lambda x: x.sum().gt(0.0)]:
+        traced = nabla.trace_tensor(
+            lambda x, predicate=predicate: nabla.tensor_cond(
+                predicate(x), lambda a: a.sum(), lambda a: (a * 2.0).sum(), [x]
+            ),
+            [("x", [3])],
+        )
+        for values, expected in [([-2.0, 0.0, 3.0], 1.0), ([-2.0, -1.0, 0.0], -6.0)]:
+            result = traced.output.compile_cpu().evaluate(
+                {"x": nabla.Tensor([3], values)}
+            )
+            assert result.to_flat_list() == [expected]
+
+
+def masked_residual_loss(x, w, mask):
+    # PINN 風格：遮罩選出殘差較大的點，Bool 遮罩輸入另外限制作用點。
+    active = (x > 0.5) & mask
+    residual = nabla.where(active, x * w - 1.0, 0.0)
+    return residual.powi(2).mean() + (x * w).powi(2).sum() * 0.1
+
+
+MASKED_SPECS = [("x", [2, 3]), ("w", [2, 3]), ("mask", [2, 3], nabla.bool_)]
+
+
+def masked_inputs():
+    return {
+        "x": nabla.Tensor([2, 3], [1.0, 2.0, -0.3, 0.7, 0.2, 2.0]),
+        "w": nabla.Tensor([2, 3], [0.5, -1.5, 2.0, 0.25, 1.0, -0.75]),
+        "mask": nabla.Tensor([2, 3], [1.0, 1.0, 1.0, 0.0, 1.0, 1.0], dtype=nabla.bool_),
+    }
+
+
+def test_masked_loss_gradients_match_finite_differences_and_skip_bool_inputs():
+    inputs = masked_inputs()
+    value, gradients = nabla.tensor_value_and_grad_fn(
+        masked_residual_loss, MASKED_SPECS
+    )(inputs)
+    assert sorted(gradients) == ["w", "x"]
+    step = 1e-6
+    for name in ["x", "w"]:
+        base = inputs[name].to_flat_list()
+        for index in range(6):
+            shifted = []
+            for delta in (step, -step):
+                point = list(base)
+                point[index] += delta
+                moved = dict(inputs, **{name: nabla.Tensor([2, 3], point)})
+                shifted.append(
+                    masked_residual_loss(moved["x"], moved["w"], moved["mask"])
+                )
+            difference = (shifted[0] - shifted[1]).to_flat_list()[0] / (2.0 * step)
+            assert abs(gradients[name].to_flat_list()[index] - difference) < 1e-6
+    assert value.to_flat_list() == masked_residual_loss(**inputs).to_flat_list()
+
+    expect_error(
+        lambda: nabla.tensor_hessian_scalar_fn(
+            masked_residual_loss, MASKED_SPECS, "mask"
+        )(inputs),
+        'bool input "mask"',
+    )
+    traced = nabla.trace_tensor(masked_residual_loss, MASKED_SPECS)
+    expect_error(lambda: traced.symbolic_jvp("mask"), 'bool input "mask"')
+    expect_error(
+        lambda: nabla.trace_tensor(lambda x: x > 0.0, [("x", [2])]).symbolic_vjp(
+            "seed"
+        ),
+        "bool output",
+    )
+    if os.environ.get("NABLA_MLX_TEST") is not None:
+        expect_error(
+            lambda: nabla.tensor_value_and_grad_mlx_fn(
+                masked_residual_loss, MASKED_SPECS, ["mask"]
+            ),
+            'bool input "mask"',
+        )
+
+
+def assert_bool_device_parity(compile_device):
+    x, y = bool_xy()
+    inputs = {"x": x, "y": y}
+    outputs = [
+        lambda x, y: x > y,
+        lambda x, y: x >= y,
+        lambda x, y: x < y,
+        lambda x, y: x <= y,
+        lambda x, y: x.equal(y),
+        lambda x, y: x.not_equal(y),
+        lambda x, y: (x > y) & x.isfinite(),
+        lambda x, y: (x < y) | y.isnan(),
+        lambda x, y: ~x.isfinite(),
+        lambda x, y: (x > y).any(axis=1),
+        lambda x, y: y.isfinite().all(axis=0, keepdims=True),
+        lambda x, y: nabla.where(x.isfinite(), x, 0.0) * (x > 0.5),
+    ]
+    for index, function in enumerate(outputs):
+        traced = nabla.trace_tensor(function, [("x", [2, 3]), ("y", [2, 3])])
+        cpu = traced.output.compile_cpu().evaluate(inputs)
+        device = compile_device(traced.output).evaluate(inputs)
+        assert device.dtype == cpu.dtype, index
+        assert device.to_flat_list() == cpu.to_flat_list(), index
+
+    # any/all 作為 Cond 謂詞，並比對 NaN 防護分支的值與梯度。
+    traced = nabla.trace_tensor(
+        lambda x: nabla.tensor_cond(
+            x.isfinite().all(),
+            lambda a: (a * a).sum(),
+            lambda a: nabla.where(a.isfinite(), a, 0.0).powi(2).sum() * 0.5,
+            [x],
+        ),
+        [("x", [2, 3])],
+    )
+    gradient = traced.symbolic_vjp("seed")["x"].output
+    for values in [BOOL_X, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]:
+        cond_inputs = {
+            "x": nabla.Tensor([2, 3], values),
+            "seed": nabla.Tensor([], [1.0]),
+        }
+        for output in [traced.output, gradient]:
+            assert (
+                compile_device(output).evaluate(cond_inputs).to_flat_list()
+                == output.compile_cpu().evaluate(cond_inputs).to_flat_list()
+            )
+
+    traced = nabla.trace_tensor(masked_residual_loss, MASKED_SPECS)
+    gradients = traced.symbolic_vjp("seed")
+    inputs = dict(masked_inputs(), seed=nabla.Tensor([], [1.0]))
+    for output in [traced.output, gradients["x"].output, gradients["w"].output]:
+        cpu = output.compile_cpu().evaluate(inputs).to_flat_list()
+        device = compile_device(output).evaluate(inputs).to_flat_list()
+        assert max_scaled_error([device], [cpu]) <= 1e-5
+
+
+def test_mlx_bool_masks_and_guarded_gradients_match_cpu():
+    if os.environ.get("NABLA_MLX_TEST") is None:
+        return
+    assert_bool_device_parity(lambda output: output.compile_mlx())
+
+
+def test_cuda_bool_masks_and_guarded_gradients_match_cpu():
+    if os.environ.get("NABLA_CUDA_TEST") is None:
+        return
+    assert_bool_device_parity(lambda output: output.compile_cuda())
+
+
 if __name__ == "__main__":
     # 依定義順序執行所有 test_* 函式，避免手動清單漏列新測試
     for name, test in list(globals().items()):

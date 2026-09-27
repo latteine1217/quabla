@@ -649,9 +649,10 @@ only exposes `linalg::solve` on a CPU stream, so Nabla rejects it on the MLX GPU
 backend rather than silently falling back. `relu`, `abs`, `sigmoid`, and a
 numerically stable `softplus` are available on eager and traced tensors; `relu`
 uses a zero subgradient at zero, while `abs` follows the existing `where`
-tie-rule and has derivative -1 at zero. Dtype phase D1 (`float32`/`float64`,
-see Dtype Support below) is implemented; device-placement APIs and the
-remaining dtype phases are pending.
+tie-rule and has derivative -1 at zero. Dtype phase D1 (`float32`/`float64`)
+and the `Bool` half of D2 (comparisons, logical ops, `isfinite`/`isnan`,
+`any`/`all`; see Dtype Support below) are implemented; device-placement APIs,
+`I32` index tensors, and the remaining dtype phases are pending.
 `tril` and `triu` now project the last two axes of rank-N tensors across CPU,
 CUDA, and MLX, with direct/symbolic JVP/VJP and mixed-tangent propagation; they
 provide the gradient masking primitive required before triangular solve and
@@ -732,6 +733,54 @@ the 1e-6 bound; the same device runs stay within the existing 1e-5 bound
 against the `f64` reference. `benchmark_pinn_mlx.py` shows no `f64` slowdown
 (medians of five interleaved runs: step 0.836 -> 0.826 ms, compile 36.10 ->
 36.32 ms).
+
+Implementation status (2026-09-28): the `Bool` part of D2 is implemented;
+`I32` dtypes and integer index tensors for gather/scatter remain pending.
+`TensorDType::Bool` stores `0.0`/`1.0`, and rounding to it is the float to
+bool conversion (nonzero and `NaN` become true). The only new IR op is
+`Compare` with IEEE `greater`/`greater_equal`/`less`/`less_equal`/`equal`/
+`not_equal` kinds and a `Bool` result; the legacy `Greater` float mask and
+the Python `gt()` it backs are unchanged. The other operations compose
+existing primitives, so no backend needs a new kernel: `logical_and`/`or`
+are `where(a, b, a)`/`where(a, a, b)`, `logical_not` is `equal(a, false)`,
+`isnan` is `x != x`, `isfinite` is `x - x == 0`, `any` is
+`sum(cast(b)) > 0`, `all` is `sum(cast(!b)) == 0` (a sum of non-negative 0/1
+terms is zero only when all are, even in `f32`), and `cast(x, bool)` is
+`x != 0`, so a `Cast` never targets `Bool` from a float. Promotion treats
+`Bool` as 0/1 of the other operand's float dtype, or as a weak `f64` next to
+weak scalars only (`mask * 2.0` then adopts a later `f32` operand); bool is
+accepted by comparisons, `where`, and data movement only, and arithmetic,
+math, or reductions on it name `astype`. `where` and `cond` keep accepting
+0/1 float predicates. Comparisons have zero tangents, no cotangent reaches a
+bool node, bool inputs are omitted from gradient maps, and differentiating
+a bool output or with respect to a bool input is an error. Cond regions may
+capture bool masks; cond results and loop-region inputs must stay floating
+until region AD pairs non-differentiable values. Region AD now retains
+captures with `where(0, x, 0)` instead of `x - x`, so a `NaN`/`inf` capture no
+longer poisons cond tangents and gradients. `execution_dtype(Bool)` is `f32`
+on CUDA and MLX; CUDA lowers `Compare` in per-node, fused, region, and loop
+body kernels, and MLX casts its native bool comparison back to `f32` at the
+node. `lower_text`/`stablehlo_text` print `i1` and `kernel_ir()` reports
+`"bool"`. Python exposes `nabla.bool_`, comparison methods and functions,
+`<`/`<=`/`>`/`>=`, `&`/`|`/`~`, `isfinite`/`isnan`, `any`/`all` with
+`axis`/`keepdims`, scalar `where` branches, and NumPy-style truthiness for
+single-element eager bool tensors; `==`/`!=` keep identity semantics.
+
+Verification (2026-09-28): Rust tests cover every comparison with `NaN`,
+`inf`, and ties on the per-node and fused CPU interpreters, logical ops and
+axis reductions, the promotion and rejection rules, `i1` lowering text and
+`kernel_ir()` validation, bool and legacy float predicates in `where` and
+`cond`, zero derivatives and the bool input/output errors, cond regions with
+bool captures, and a `NaN`-guarded masked loss whose symbolic and eager
+gradients match analytic values and central differences. On MLX (Apple
+silicon) and CUDA (GTX 1660 SUPER) the same program matches the CPU exactly
+for masks, an `all(isfinite(x))` cond and its gradient match exactly, and
+the masked loss and gradients agree within a scaled error of 4.8e-8. The
+Python matrix repeats these checks for eager and traced tensors, including
+the MLX/CUDA parity cases. `benchmark_pinn_mlx.py` shows no slowdown
+(medians of seven interleaved runs against the D1 build: step 0.687 ->
+0.686 ms and compile 20.73 -> 20.78 ms by default; 3.879 -> 3.741 ms and
+22.12 -> 22.49 ms with `--hidden-layers 3 --hidden-width 64`).
 
 ### P4. Compiler Passes And Kernel Performance
 

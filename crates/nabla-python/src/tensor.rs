@@ -1,4 +1,4 @@
-use nabla_core::tensor_ir::TensorDType;
+use nabla_core::tensor_ir::{TensorComparison, TensorDType};
 use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PySlice, PySliceMethods, PyTuple};
@@ -9,13 +9,18 @@ use crate::dtype::PyDType;
 /// Eager host tensor. Storage is `f64`; a `float32` tensor holds only values
 /// rounded to `f32`, and every eager op on it rounds its `f64` result the way
 /// the CPU Tensor IR backend rounds an `f32` node. Python scalars are weak:
-/// they are rounded to the tensor dtype before the op.
+/// they are rounded to the tensor dtype before the op. A `bool` tensor holds
+/// `0.0`/`1.0` and follows the Tensor IR promotion rule.
 #[pyclass(name = "Tensor", skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyTensor {
     shape: Vec<usize>,
     data: Arc<Vec<f64>>,
     dtype: TensorDType,
+    /// JAX-style weak type: set only when a `bool` tensor meets a Python
+    /// scalar (`mask * 2.0`), so the result still adopts a later strong
+    /// operand's dtype. Elementwise arithmetic propagates it.
+    weak: bool,
 }
 
 #[pyclass(name = "TensorView", skip_from_py_object)]
@@ -127,6 +132,14 @@ pub fn parse_axis_indices(indices: &Bound<'_, PyAny>, axis_extent: usize) -> PyR
                 })
         })
         .collect()
+}
+
+/// Same wording as the Tensor IR builder error for arithmetic on `bool`.
+pub(crate) fn bool_operation_error(op: &str) -> String {
+    format!(
+        "{op} is not defined for bool tensors; use logical_and/logical_or/logical_not \
+         (& | ~) or convert explicitly with astype"
+    )
 }
 
 fn element_count(shape: &[usize]) -> Result<usize, String> {
@@ -363,7 +376,18 @@ impl PyTensor {
             shape,
             data: Arc::new(data),
             dtype: TensorDType::F64,
+            weak: false,
         })
+    }
+
+    /// A weak `f64` scalar, the eager form of a Python scalar operand.
+    pub fn weak_scalar(value: f64) -> Self {
+        Self {
+            shape: vec![],
+            data: Arc::new(vec![value]),
+            dtype: TensorDType::F64,
+            weak: true,
+        }
     }
 
     /// Builds a tensor of `dtype`, rounding each value to that dtype.
@@ -401,7 +425,8 @@ impl PyTensor {
         )
     }
 
-    /// Rounds the values to `dtype` and records it (exact for widening).
+    /// Rounds the values to `dtype` and records it as a strong dtype (exact
+    /// for widening; nonzero and `NaN` become `1.0` for `bool`).
     fn typed(mut self, dtype: TensorDType) -> Self {
         if dtype != TensorDType::F64 {
             for value in Arc::make_mut(&mut self.data) {
@@ -409,6 +434,7 @@ impl PyTensor {
             }
         }
         self.dtype = dtype;
+        self.weak = false;
         self
     }
 
@@ -424,13 +450,103 @@ impl PyTensor {
         Ok(self.dtype)
     }
 
-    fn try_elementwise(
+    /// Result dtype and weakness under the Tensor IR promotion rule: strong
+    /// floats must match, weak floats adopt the strong dtype, and `bool`
+    /// joins a float operand as 0/1 values of its dtype and weakness. Two
+    /// `bool` operands are accepted only when `allow_bool` (comparisons,
+    /// `where`, concatenation).
+    fn promotion(
+        tensors: &[&Self],
+        op: &str,
+        allow_bool: bool,
+    ) -> Result<(TensorDType, bool), String> {
+        let mut result: Option<(TensorDType, bool)> = None;
+        for tensor in tensors {
+            if tensor.dtype == TensorDType::Bool {
+                continue;
+            }
+            result = Some(match result {
+                None => (tensor.dtype, tensor.weak),
+                Some((dtype, weak)) if dtype == tensor.dtype => (dtype, weak && tensor.weak),
+                Some((_, true)) if !tensor.weak => (tensor.dtype, false),
+                Some((dtype, false)) if tensor.weak => (dtype, false),
+                Some((dtype, _)) => {
+                    return Err(format!(
+                        "tensor {op} operands have mismatched dtypes {dtype} and {}; \
+                         convert one of them explicitly with astype",
+                        tensor.dtype
+                    ))
+                }
+            });
+        }
+        match result {
+            Some(result) => Ok(result),
+            None if allow_bool => Ok((TensorDType::Bool, false)),
+            None => Err(bool_operation_error(op)),
+        }
+    }
+
+    /// Operands converted to their promoted dtype, or `None` when they
+    /// already share it; callers retry the op on the converted pair.
+    fn promoted_pair(
         &self,
         rhs: &Self,
         op: &str,
+        allow_bool: bool,
+    ) -> Result<Option<(Self, Self)>, String> {
+        let (dtype, _) = Self::promotion(&[self, rhs], op, allow_bool)?;
+        if self.dtype == dtype && rhs.dtype == dtype {
+            return Ok(None);
+        }
+        Ok(Some((self.converted(dtype), rhs.converted(dtype))))
+    }
+
+    fn converted(&self, dtype: TensorDType) -> Self {
+        if self.dtype == dtype {
+            self.clone()
+        } else {
+            self.clone().typed(dtype)
+        }
+    }
+
+    /// A `bool` tensor enters scalar arithmetic as weak `f64` 0/1 values.
+    fn arithmetic_base(&self) -> Self {
+        if self.dtype == TensorDType::Bool {
+            let mut base = self.clone().typed(TensorDType::F64);
+            base.weak = true;
+            base
+        } else {
+            self.clone()
+        }
+    }
+
+    fn ensure_not_bool(&self, op: &str) -> Result<(), String> {
+        if self.dtype == TensorDType::Bool {
+            return Err(bool_operation_error(op));
+        }
+        Ok(())
+    }
+
+    fn ensure_bool(&self, op: &str) -> Result<(), String> {
+        if self.dtype != TensorDType::Bool {
+            return Err(format!(
+                "{op} requires bool operands, got dtype {}; \
+                 build a mask with a comparison or convert explicitly with astype",
+                self.dtype
+            ));
+        }
+        Ok(())
+    }
+
+    /// Broadcasts two same-dtype operands through `f`, rounding each result
+    /// to `dtype`.
+    fn zip_broadcast(
+        &self,
+        rhs: &Self,
+        op: &str,
+        dtype: TensorDType,
         f: impl Fn(f64, f64) -> Result<f64, String>,
     ) -> Result<Self, String> {
-        let dtype = self.result_dtype(rhs, op)?;
         let shape = broadcast_shape(&self.shape, &rhs.shape)?;
         let output_size = element_count(&shape)?;
         let lhs_strides = contiguous_strides(&self.shape);
@@ -449,15 +565,117 @@ impl PyTensor {
             shape,
             data: Arc::new(data),
             dtype,
+            weak: false,
         })
     }
 
+    fn try_elementwise(
+        &self,
+        rhs: &Self,
+        op: &str,
+        f: impl Fn(f64, f64) -> Result<f64, String>,
+    ) -> Result<Self, String> {
+        let (dtype, weak) = Self::promotion(&[self, rhs], op, false)?;
+        let lhs = self.converted(dtype);
+        let rhs = rhs.converted(dtype);
+        let mut output = lhs.zip_broadcast(&rhs, op, dtype, f)?;
+        output.weak = weak;
+        Ok(output)
+    }
+
     fn try_map(&self, f: impl Fn(f64) -> f64) -> Result<Self, String> {
-        Self::from_shape_data_typed(
+        let mut output = Self::from_shape_data_typed(
             self.shape.clone(),
             self.data.iter().copied().map(f).collect(),
             self.dtype,
+        )?;
+        output.weak = self.weak;
+        Ok(output)
+    }
+
+    /// Elementwise float math; `bool` tensors must be converted explicitly.
+    fn try_unary(&self, op: &str, f: impl Fn(f64) -> f64) -> Result<Self, String> {
+        self.ensure_not_bool(op)?;
+        self.try_map(f)
+    }
+
+    /// IEEE comparison producing a strong `bool` tensor.
+    pub fn try_compare(&self, rhs: &Self, kind: TensorComparison) -> Result<Self, String> {
+        let (dtype, _) = Self::promotion(&[self, rhs], kind.name(), true)?;
+        self.converted(dtype).zip_broadcast(
+            &rhs.converted(dtype),
+            kind.name(),
+            TensorDType::Bool,
+            |lhs, rhs| Ok(f64::from(kind.evaluate(lhs, rhs))),
         )
+    }
+
+    /// Compares with a weak Python scalar, which adopts the tensor dtype.
+    pub fn try_compare_scalar(&self, rhs: f64, kind: TensorComparison) -> Result<Self, String> {
+        let base = self.arithmetic_base();
+        let rhs = base.dtype.round(rhs);
+        Self::from_shape_data_typed(
+            base.shape.clone(),
+            base.data
+                .iter()
+                .map(|lhs| f64::from(kind.evaluate(*lhs, rhs)))
+                .collect(),
+            TensorDType::Bool,
+        )
+    }
+
+    pub fn try_logical(&self, rhs: &Self, and: bool) -> Result<Self, String> {
+        let op = if and { "logical_and" } else { "logical_or" };
+        self.ensure_bool(op)?;
+        rhs.ensure_bool(op)?;
+        self.zip_broadcast(rhs, op, TensorDType::Bool, |lhs, rhs| {
+            let (lhs, rhs) = (lhs != 0.0, rhs != 0.0);
+            Ok(f64::from(if and { lhs && rhs } else { lhs || rhs }))
+        })
+    }
+
+    pub fn try_logical_not(&self) -> Result<Self, String> {
+        self.ensure_bool("logical_not")?;
+        self.try_map(|value| f64::from(value == 0.0))
+    }
+
+    /// `isnan`/`isfinite` of a float tensor as a `bool` tensor.
+    pub fn try_classify(&self, op: &str, test: impl Fn(f64) -> bool) -> Result<Self, String> {
+        self.ensure_not_bool(op)?;
+        Self::from_shape_data_typed(
+            self.shape.clone(),
+            self.data
+                .iter()
+                .map(|value| f64::from(test(*value)))
+                .collect(),
+            TensorDType::Bool,
+        )
+    }
+
+    /// `any`/`all` as max/min reductions of the 0/1 values.
+    pub fn try_any_all(
+        &self,
+        axes: Option<Vec<isize>>,
+        keepdims: bool,
+        any: bool,
+    ) -> Result<Self, String> {
+        self.ensure_bool(if any { "any" } else { "all" })?;
+        self.try_extrema_axes(axes, keepdims, any)
+    }
+
+    /// Python truthiness: a single-element `bool` tensor converts like
+    /// NumPy; float tensors keep the default object truthiness (always true).
+    pub fn truthiness(&self) -> Result<bool, String> {
+        if self.dtype != TensorDType::Bool {
+            return Ok(true);
+        }
+        match self.data.as_slice() {
+            [value] => Ok(*value != 0.0),
+            _ => Err(format!(
+                "the truth value of a bool tensor with shape {:?} is ambiguous; use .any() or .all()",
+                self.shape
+            )),
+        }
     }
 
     pub fn try_add(&self, rhs: &Self) -> Result<Self, String> {
@@ -465,8 +683,9 @@ impl PyTensor {
     }
 
     pub fn try_add_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let rhs = self.dtype.round(rhs);
-        self.try_map(|lhs| lhs + rhs)
+        let base = self.arithmetic_base();
+        let rhs = base.dtype.round(rhs);
+        base.try_map(|lhs| lhs + rhs)
     }
 
     pub fn try_sub(&self, rhs: &Self) -> Result<Self, String> {
@@ -474,13 +693,15 @@ impl PyTensor {
     }
 
     pub fn try_sub_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let rhs = self.dtype.round(rhs);
-        self.try_map(|lhs| lhs - rhs)
+        let base = self.arithmetic_base();
+        let rhs = base.dtype.round(rhs);
+        base.try_map(|lhs| lhs - rhs)
     }
 
     pub fn try_scalar_sub(&self, lhs: f64) -> Result<Self, String> {
-        let lhs = self.dtype.round(lhs);
-        self.try_map(|rhs| lhs - rhs)
+        let base = self.arithmetic_base();
+        let lhs = base.dtype.round(lhs);
+        base.try_map(|rhs| lhs - rhs)
     }
 
     pub fn try_mul(&self, rhs: &Self) -> Result<Self, String> {
@@ -488,8 +709,9 @@ impl PyTensor {
     }
 
     pub fn try_mul_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let rhs = self.dtype.round(rhs);
-        self.try_map(|lhs| lhs * rhs)
+        let base = self.arithmetic_base();
+        let rhs = base.dtype.round(rhs);
+        base.try_map(|lhs| lhs * rhs)
     }
 
     pub fn try_div(&self, rhs: &Self) -> Result<Self, String> {
@@ -503,19 +725,21 @@ impl PyTensor {
     }
 
     pub fn try_div_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let rhs = self.dtype.round(rhs);
+        let base = self.arithmetic_base();
+        let rhs = base.dtype.round(rhs);
         if rhs == 0.0 {
             return Err("division by zero scalar is not supported".to_string());
         }
-        self.try_map(|lhs| lhs / rhs)
+        base.try_map(|lhs| lhs / rhs)
     }
 
     pub fn try_scalar_div(&self, lhs: f64) -> Result<Self, String> {
-        let lhs = self.dtype.round(lhs);
-        if self.data.contains(&0.0) {
+        let base = self.arithmetic_base();
+        let lhs = base.dtype.round(lhs);
+        if base.data.contains(&0.0) {
             return Err("division by zero is not supported".to_string());
         }
-        self.try_map(|rhs| lhs / rhs)
+        base.try_map(|rhs| lhs / rhs)
     }
 
     pub fn try_gt(&self, rhs: &Self) -> Result<Self, String> {
@@ -523,8 +747,9 @@ impl PyTensor {
     }
 
     pub fn try_gt_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let rhs = self.dtype.round(rhs);
-        self.try_map(|lhs| if lhs > rhs { 1.0 } else { 0.0 })
+        let base = self.arithmetic_base();
+        let rhs = base.dtype.round(rhs);
+        base.try_map(|lhs| if lhs > rhs { 1.0 } else { 0.0 })
     }
 
     pub fn try_maximum(&self, rhs: &Self) -> Result<Self, String> {
@@ -533,8 +758,9 @@ impl PyTensor {
     }
 
     pub fn try_maximum_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let rhs = self.dtype.round(rhs);
-        self.try_map(|lhs| if lhs > rhs { lhs } else { rhs })
+        let base = self.arithmetic_base();
+        let rhs = base.dtype.round(rhs);
+        base.try_map(|lhs| if lhs > rhs { lhs } else { rhs })
     }
 
     pub fn try_minimum(&self, rhs: &Self) -> Result<Self, String> {
@@ -543,12 +769,16 @@ impl PyTensor {
     }
 
     pub fn try_minimum_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let rhs = self.dtype.round(rhs);
-        self.try_map(|lhs| if rhs > lhs { lhs } else { rhs })
+        let base = self.arithmetic_base();
+        let rhs = base.dtype.round(rhs);
+        base.try_map(|lhs| if rhs > lhs { lhs } else { rhs })
     }
 
     pub fn try_where(mask: &Self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
-        // 遮罩只看是否非零，不參與 dtype 統一。
+        // 遮罩只看是否非零（bool 或舊的浮點遮罩），不參與 dtype 統一。
+        if let Some((on_true, on_false)) = on_true.promoted_pair(on_false, "where", true)? {
+            return Self::try_where(mask, &on_true, &on_false);
+        }
         let dtype = on_true.result_dtype(on_false, "where")?;
         let value_shape = broadcast_shape(&on_true.shape, &on_false.shape)?;
         let shape = broadcast_shape(&mask.shape, &value_shape)?;
@@ -573,6 +803,9 @@ impl PyTensor {
     }
 
     pub fn try_matmul(&self, rhs: &Self) -> Result<Self, String> {
+        if let Some((lhs, rhs)) = self.promoted_pair(rhs, "matmul", false)? {
+            return lhs.try_matmul(&rhs);
+        }
         let dtype = self.result_dtype(rhs, "matmul")?;
         if self.shape.len() < 2 || rhs.shape.len() < 2 {
             return Err(format!(
@@ -636,6 +869,9 @@ impl PyTensor {
     }
 
     pub fn try_solve(&self, rhs: &Self) -> Result<Self, String> {
+        if let Some((lhs, rhs)) = self.promoted_pair(rhs, "solve", false)? {
+            return lhs.try_solve(&rhs);
+        }
         let dtype = self.result_dtype(rhs, "solve")?;
         if self.shape.len() != 2 || rhs.shape.len() != 2 {
             return Err(format!(
@@ -712,6 +948,7 @@ impl PyTensor {
     }
 
     pub fn try_cholesky(&self) -> Result<Self, String> {
+        self.ensure_not_bool("cholesky")?;
         if self.shape.len() != 2 || self.shape[0] != self.shape[1] {
             return Err(format!(
                 "cholesky requires a square rank-2 tensor, got {:?}",
@@ -761,6 +998,7 @@ impl PyTensor {
             shape,
             data: self.data.clone(),
             dtype: self.dtype,
+            weak: self.weak,
         })
     }
 
@@ -803,6 +1041,7 @@ impl PyTensor {
     }
 
     fn try_reduce(&self, axis: Option<isize>, scale: f64) -> Result<Self, String> {
+        self.ensure_not_bool(if scale == 1.0 { "sum" } else { "mean" })?;
         let Some(axis) = axis else {
             return Self::from_shape_data_typed(
                 vec![],
@@ -858,14 +1097,17 @@ impl PyTensor {
     }
 
     pub fn try_norm(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        self.ensure_not_bool("norm")?;
         self.try_powi(2)?.try_sum_axes(axes, keepdims)?.try_sqrt()
     }
 
     pub fn try_max_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        self.ensure_not_bool("max")?;
         self.try_extrema_axes(axes, keepdims, true)
     }
 
     pub fn try_min_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        self.ensure_not_bool("min")?;
         self.try_extrema_axes(axes, keepdims, false)
     }
 
@@ -992,40 +1234,45 @@ impl PyTensor {
     }
 
     pub fn try_tanh(&self) -> Result<Self, String> {
-        self.try_map(f64::tanh)
+        self.try_unary("tanh", f64::tanh)
     }
 
     pub fn try_exp(&self) -> Result<Self, String> {
-        self.try_map(f64::exp)
+        self.try_unary("exp", f64::exp)
     }
 
     pub fn try_log(&self) -> Result<Self, String> {
-        self.try_map(f64::ln)
+        self.try_unary("log", f64::ln)
     }
 
     pub fn try_sqrt(&self) -> Result<Self, String> {
-        self.try_map(f64::sqrt)
+        self.try_unary("sqrt", f64::sqrt)
     }
 
     pub fn try_relu(&self) -> Result<Self, String> {
+        self.ensure_not_bool("relu")?;
         self.try_maximum_scalar(0.0)
     }
 
     pub fn try_abs(&self) -> Result<Self, String> {
+        self.ensure_not_bool("abs")?;
         let mask = self.try_gt_scalar(0.0)?;
         let negative = self.try_mul_scalar(-1.0)?;
         Self::try_where(&mask, self, &negative)
     }
 
     pub fn try_sigmoid(&self) -> Result<Self, String> {
-        self.try_map(|value| 1.0 / (1.0 + (-value).exp()))
+        self.try_unary("sigmoid", |value| 1.0 / (1.0 + (-value).exp()))
     }
 
     pub fn try_softplus(&self) -> Result<Self, String> {
-        self.try_map(|value| value.max(0.0) + (-value.abs()).exp().ln_1p())
+        self.try_unary("softplus", |value| {
+            value.max(0.0) + (-value.abs()).exp().ln_1p()
+        })
     }
 
     pub fn try_triangular(&self, lower: bool) -> Result<Self, String> {
+        self.ensure_not_bool(if lower { "tril" } else { "triu" })?;
         if self.shape.len() < 2 {
             return Err(format!(
                 "triangular projection requires at least rank two, got {:?}",
@@ -1052,27 +1299,32 @@ impl PyTensor {
     }
 
     pub fn try_sin(&self) -> Result<Self, String> {
-        self.try_map(f64::sin)
+        self.try_unary("sin", f64::sin)
     }
 
     pub fn try_cos(&self) -> Result<Self, String> {
-        self.try_map(f64::cos)
+        self.try_unary("cos", f64::cos)
     }
 
     pub fn try_powi(&self, exponent: u32) -> Result<Self, String> {
-        self.try_map(|value| value.powf(exponent as f64))
+        self.try_unary("powi", |value| value.powf(exponent as f64))
     }
 
     pub fn try_powf(&self, exponent: f64) -> Result<Self, String> {
-        self.try_map(|value| value.powf(exponent))
+        self.try_unary("pow", |value| value.powf(exponent))
     }
 
     pub fn try_concat(tensors: &[PyTensor], axis: usize) -> Result<Self, String> {
         let first = tensors
             .first()
             .ok_or_else(|| "concat requires at least one tensor".to_string())?;
-        for tensor in &tensors[1..] {
-            first.result_dtype(tensor, "concat")?;
+        let (dtype, _) = Self::promotion(&tensors.iter().collect::<Vec<_>>(), "concat", true)?;
+        if tensors.iter().any(|tensor| tensor.dtype != dtype) {
+            let converted = tensors
+                .iter()
+                .map(|tensor| tensor.converted(dtype))
+                .collect::<Vec<_>>();
+            return Self::try_concat(&converted, axis);
         }
         if axis >= first.shape.len() {
             return Err(format!(
@@ -1206,6 +1458,9 @@ impl PyTensor {
         updates: &Self,
         axis: isize,
     ) -> Result<Self, String> {
+        if let Some((base, updates)) = self.promoted_pair(updates, "scatter_add", false)? {
+            return base.try_scatter_add(indices, &updates, axis);
+        }
         let dtype = self.result_dtype(updates, "scatter_add")?;
         let axis = normalize_axis(axis, self.shape.len())?;
         if indices.is_empty() {
@@ -1272,6 +1527,7 @@ impl PyTensor {
             shape,
             data: Arc::new(vec![0.0; size]),
             dtype: TensorDType::F64,
+            weak: false,
         })
     }
 
@@ -1287,6 +1543,7 @@ impl PyTensor {
             shape,
             data: Arc::new(vec![value; size]),
             dtype: TensorDType::F64,
+            weak: false,
         })
     }
 
@@ -1656,7 +1913,9 @@ impl PyTensor {
     }
 
     fn __neg__(&self) -> PyResult<Self> {
-        self.try_mul_scalar(-1.0).map_err(PyValueError::new_err)
+        self.ensure_not_bool("negative")
+            .and_then(|_| self.try_mul_scalar(-1.0))
+            .map_err(PyValueError::new_err)
     }
 
     fn __pow__(
@@ -1688,6 +1947,107 @@ impl PyTensor {
         Err(PyTypeError::new_err(
             "expected Tensor or numeric scalar operand",
         ))
+    }
+
+    /// Elementwise `self > rhs` as a `bool` tensor (unlike `gt`, which keeps
+    /// returning a 0/1 float mask).
+    fn greater(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.compare_operand(rhs, TensorComparison::Greater)
+    }
+
+    fn greater_equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.compare_operand(rhs, TensorComparison::GreaterEqual)
+    }
+
+    fn less(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.compare_operand(rhs, TensorComparison::Less)
+    }
+
+    fn less_equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.compare_operand(rhs, TensorComparison::LessEqual)
+    }
+
+    fn equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.compare_operand(rhs, TensorComparison::Equal)
+    }
+
+    fn not_equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.compare_operand(rhs, TensorComparison::NotEqual)
+    }
+
+    // `==`/`!=` are deliberately not overloaded: tensors keep identity
+    // equality and stay hashable; use `equal`/`not_equal` for elementwise.
+    fn __gt__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.greater(rhs)
+    }
+
+    fn __ge__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.greater_equal(rhs)
+    }
+
+    fn __lt__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.less(rhs)
+    }
+
+    fn __le__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        self.less_equal(rhs)
+    }
+
+    /// Defining ordering operators installs a rich comparison, which drops
+    /// Python's default identity hash; restore it so tensors stay usable as
+    /// dictionary keys.
+    fn __hash__(slf: &Bound<'_, Self>) -> isize {
+        slf.as_ptr() as isize
+    }
+
+    fn logical_and(&self, rhs: &Self) -> PyResult<Self> {
+        self.try_logical(rhs, true).map_err(PyValueError::new_err)
+    }
+
+    fn logical_or(&self, rhs: &Self) -> PyResult<Self> {
+        self.try_logical(rhs, false).map_err(PyValueError::new_err)
+    }
+
+    fn logical_not(&self) -> PyResult<Self> {
+        self.try_logical_not().map_err(PyValueError::new_err)
+    }
+
+    fn __and__(&self, rhs: &Self) -> PyResult<Self> {
+        self.logical_and(rhs)
+    }
+
+    fn __or__(&self, rhs: &Self) -> PyResult<Self> {
+        self.logical_or(rhs)
+    }
+
+    fn __invert__(&self) -> PyResult<Self> {
+        self.logical_not()
+    }
+
+    fn isnan(&self) -> PyResult<Self> {
+        self.try_classify("isnan", f64::is_nan)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn isfinite(&self) -> PyResult<Self> {
+        self.try_classify("isfinite", f64::is_finite)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn any(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.try_any_all(extract_reduction_axes(axis)?, keepdims, true)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn all(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.try_any_all(extract_reduction_axes(axis)?, keepdims, false)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn __bool__(&self) -> PyResult<bool> {
+        self.truthiness().map_err(PyValueError::new_err)
     }
 
     fn maximum(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
@@ -1745,6 +2105,22 @@ impl PyTensor {
                 PyDType::from(dtype).__repr__()
             ),
         }
+    }
+}
+
+impl PyTensor {
+    fn compare_operand(&self, rhs: &Bound<'_, PyAny>, kind: TensorComparison) -> PyResult<Self> {
+        if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
+            return self.try_compare(&rhs, kind).map_err(PyValueError::new_err);
+        }
+        if let Ok(rhs) = rhs.extract::<f64>() {
+            return self
+                .try_compare_scalar(rhs, kind)
+                .map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected Tensor or numeric scalar operand",
+        ))
     }
 }
 

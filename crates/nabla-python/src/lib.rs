@@ -51,10 +51,17 @@ fn py_where(
         return Ok(output.into_pyobject(py)?.into_any().unbind());
     }
 
-    if let (Ok(mask), Ok(on_true), Ok(on_false)) = (
+    // Tensor 與 TraceTensor 的分支可為 Python 純量（弱型別，採用另一分支的 dtype）。
+    let eager_branch = |value: &Bound<'_, PyAny>| -> Option<PyTensor> {
+        if let Ok(tensor) = value.extract::<PyRef<'_, PyTensor>>() {
+            return Some(tensor.clone());
+        }
+        value.extract::<f64>().ok().map(PyTensor::weak_scalar)
+    };
+    if let (Ok(mask), Some(on_true), Some(on_false)) = (
         mask.extract::<PyRef<'_, PyTensor>>(),
-        on_true.extract::<PyRef<'_, PyTensor>>(),
-        on_false.extract::<PyRef<'_, PyTensor>>(),
+        eager_branch(on_true),
+        eager_branch(on_false),
     ) {
         let output = PyTensor::try_where(&mask, &on_true, &on_false)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -71,20 +78,119 @@ fn py_where(
         return Ok(output.into_pyobject(py)?.into_any().unbind());
     }
 
-    if let (Ok(mask), Ok(on_true), Ok(on_false)) = (
-        mask.extract::<PyRef<'_, TraceTensor>>(),
-        on_true.extract::<PyRef<'_, TraceTensor>>(),
-        on_false.extract::<PyRef<'_, TraceTensor>>(),
-    ) {
-        let output = mask
-            .where_tensor(&on_true, &on_false)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        return Ok(output.into_pyobject(py)?.into_any().unbind());
+    if let Ok(mask) = mask.extract::<PyRef<'_, TraceTensor>>() {
+        let traced_branch = |value: &Bound<'_, PyAny>| -> Option<PyResult<TraceTensor>> {
+            if let Ok(tensor) = value.extract::<PyRef<'_, TraceTensor>>() {
+                return Some(Ok(tensor.clone()));
+            }
+            value.extract::<f64>().ok().map(|value| {
+                mask.scalar_tensor(value)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)
+            })
+        };
+        if let (Some(on_true), Some(on_false)) = (traced_branch(on_true), traced_branch(on_false)) {
+            let output = mask
+                .where_tensor(&on_true?, &on_false?)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            return Ok(output.into_pyobject(py)?.into_any().unbind());
+        }
     }
 
     Err(pyo3::exceptions::PyTypeError::new_err(
-        "where expects three Matrix, Tensor, TraceMatrix, or TraceTensor operands",
+        "where expects three Matrix or TraceMatrix operands, or a Tensor or TraceTensor mask \
+         with same-kind or numeric scalar branches",
     ))
+}
+
+fn is_tensor(value: &Bound<'_, PyAny>) -> bool {
+    value.is_instance_of::<PyTensor>() || value.is_instance_of::<TraceTensor>()
+}
+
+/// Module-level comparison: `nabla.greater(a, b)` is `a.greater(b)`, and a
+/// scalar left operand uses the reflected method (`b.less(a)`).
+fn compare_function(
+    lhs: &Bound<'_, PyAny>,
+    rhs: &Bound<'_, PyAny>,
+    name: &str,
+    reflected: &str,
+) -> PyResult<Py<PyAny>> {
+    if is_tensor(lhs) {
+        return Ok(lhs.call_method1(name, (rhs,))?.unbind());
+    }
+    if is_tensor(rhs) {
+        return Ok(rhs.call_method1(reflected, (lhs,))?.unbind());
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "{name} expects a Tensor or TraceTensor operand"
+    )))
+}
+
+fn tensor_method<'py>(
+    value: &Bound<'py, PyAny>,
+    name: &str,
+    args: impl pyo3::call::PyCallArgs<'py>,
+) -> PyResult<Py<PyAny>> {
+    if !is_tensor(value) {
+        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "{name} expects a Tensor or TraceTensor operand"
+        )));
+    }
+    Ok(value.call_method1(name, args)?.unbind())
+}
+
+#[pyfunction(name = "greater")]
+fn py_greater(lhs: &Bound<'_, PyAny>, rhs: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    compare_function(lhs, rhs, "greater", "less")
+}
+
+#[pyfunction(name = "greater_equal")]
+fn py_greater_equal(lhs: &Bound<'_, PyAny>, rhs: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    compare_function(lhs, rhs, "greater_equal", "less_equal")
+}
+
+#[pyfunction(name = "less")]
+fn py_less(lhs: &Bound<'_, PyAny>, rhs: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    compare_function(lhs, rhs, "less", "greater")
+}
+
+#[pyfunction(name = "less_equal")]
+fn py_less_equal(lhs: &Bound<'_, PyAny>, rhs: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    compare_function(lhs, rhs, "less_equal", "greater_equal")
+}
+
+#[pyfunction(name = "equal")]
+fn py_equal(lhs: &Bound<'_, PyAny>, rhs: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    compare_function(lhs, rhs, "equal", "equal")
+}
+
+#[pyfunction(name = "not_equal")]
+fn py_not_equal(lhs: &Bound<'_, PyAny>, rhs: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    compare_function(lhs, rhs, "not_equal", "not_equal")
+}
+
+#[pyfunction(name = "logical_and")]
+fn py_logical_and(lhs: &Bound<'_, PyAny>, rhs: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    tensor_method(lhs, "logical_and", (rhs,))
+}
+
+#[pyfunction(name = "logical_or")]
+fn py_logical_or(lhs: &Bound<'_, PyAny>, rhs: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    tensor_method(lhs, "logical_or", (rhs,))
+}
+
+#[pyfunction(name = "logical_not")]
+fn py_logical_not(value: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    tensor_method(value, "logical_not", ())
+}
+
+#[pyfunction(name = "isnan")]
+fn py_isnan(value: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    tensor_method(value, "isnan", ())
+}
+
+#[pyfunction(name = "isfinite")]
+fn py_isfinite(value: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    tensor_method(value, "isfinite", ())
 }
 
 #[pyfunction(name = "concat")]
@@ -261,6 +367,22 @@ fn nabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDType>()?;
     m.add("float32", PyDType::from(TensorDType::F32))?;
     m.add("float64", PyDType::from(TensorDType::F64))?;
+    m.add("bool_", PyDType::from(TensorDType::Bool))?;
+    for function in [
+        wrap_pyfunction!(py_greater, m)?,
+        wrap_pyfunction!(py_greater_equal, m)?,
+        wrap_pyfunction!(py_less, m)?,
+        wrap_pyfunction!(py_less_equal, m)?,
+        wrap_pyfunction!(py_equal, m)?,
+        wrap_pyfunction!(py_not_equal, m)?,
+        wrap_pyfunction!(py_logical_and, m)?,
+        wrap_pyfunction!(py_logical_or, m)?,
+        wrap_pyfunction!(py_logical_not, m)?,
+        wrap_pyfunction!(py_isnan, m)?,
+        wrap_pyfunction!(py_isfinite, m)?,
+    ] {
+        m.add_function(function)?;
+    }
     m.add_class::<PyTensor>()?;
     m.add_class::<PyTensorView>()?;
     m.add_class::<TensorTraceGraph>()?;
