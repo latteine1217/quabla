@@ -555,10 +555,7 @@ impl TensorTraceGraph {
         device_ordinal: usize,
     ) -> Result<TensorCudaExecutionPlan, String> {
         let target = NablaTarget::Cuda { device_ordinal };
-        match self.compile_executable(output_node_id, target)? {
-            NablaExecutable::Cuda(plan) => Ok(TensorCudaExecutionPlan { plan }),
-            executable => Err(unexpected_executable(target, &executable)),
-        }
+        cuda_execution_plan(self.compile_executable(output_node_id, target)?, target)
     }
 
     pub(crate) fn compile_mlx_plan(
@@ -582,6 +579,19 @@ impl TensorTraceGraph {
         output_node_ids: Vec<TensorNodeId>,
         target: NablaTarget,
     ) -> Result<NablaMultiOutputExecutable, String> {
+        NablaCompiler.compile_many_without_build_check(
+            &self.into_multi_output_program(output_node_ids)?,
+            target,
+        )
+    }
+
+    /// Builds the ordered facade program behind
+    /// [`Self::compile_multi_output_executable`]; the CUDA data-parallel
+    /// helper freezes it directly because it targets a replica set.
+    fn into_multi_output_program(
+        self,
+        output_node_ids: Vec<TensorNodeId>,
+    ) -> Result<NablaMultiOutputProgram, String> {
         let ir = match Arc::try_unwrap(self.ir) {
             Ok(ir) => ir
                 .into_inner()
@@ -591,33 +601,19 @@ impl TensorTraceGraph {
                 .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
                 .clone(),
         };
-        NablaCompiler.compile_many_without_build_check(
-            &NablaMultiOutputProgram::new(ir, output_node_ids)?,
-            target,
-        )
+        NablaMultiOutputProgram::new(ir, output_node_ids)
     }
+}
 
-    fn compile_cuda_multi_plan(
-        &self,
-        output_node_ids: &[TensorNodeId],
-        device_ordinal: usize,
-    ) -> Result<(TensorCudaExecutionPlan, Vec<TensorNodeId>), String> {
-        let (plan, output_node_ids) = self.compile_cpu_multi_plan(output_node_ids)?;
-        CudaBackend::new(device_ordinal)
-            .compile(plan)
-            .map(|plan| (TensorCudaExecutionPlan { plan }, output_node_ids))
-    }
-
-    fn compile_cpu_multi_plan(
-        &self,
-        output_node_ids: &[TensorNodeId],
-    ) -> Result<(TensorExecutionPlan, Vec<TensorNodeId>), String> {
-        let (plan, output_node_ids) = self
-            .ir
-            .lock()
-            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
-            .compile_cpu_many(output_node_ids)?;
-        Ok((plan, output_node_ids))
+/// Unwraps a facade CUDA executable into the bridge plan whose device
+/// buffers retained-input and Adam executors reuse across calls.
+fn cuda_execution_plan(
+    executable: NablaExecutable,
+    target: NablaTarget,
+) -> Result<TensorCudaExecutionPlan, String> {
+    match executable {
+        NablaExecutable::Cuda(plan) => Ok(TensorCudaExecutionPlan { plan }),
+        executable => Err(unexpected_executable(target, &executable)),
     }
 }
 
@@ -5299,26 +5295,41 @@ fn compile_cuda_scalar_value_and_grad(
     TensorNodeId,
     BTreeMap<String, TensorNodeId>,
 )> {
-    let (plan, loss_node_id, gradient_node_ids) =
-        build_cuda_scalar_value_and_grad_plan(loss, parameter_names)?;
-    let plan = CudaBackend::new(device_ordinal)
-        .compile(plan)
+    let (program, parameter_names) =
+        build_cuda_scalar_value_and_grad_program(loss, parameter_names)?;
+    let target = NablaTarget::Cuda { device_ordinal };
+    let executable = NablaCompiler
+        .compile_many_without_build_check(&program, target)
         .map_err(PyValueError::new_err)?;
-    Ok((
-        TensorCudaExecutionPlan { plan },
-        loss_node_id,
-        gradient_node_ids,
-    ))
+    let (loss_node_id, gradient_node_ids) =
+        value_and_named_outputs(executable.output_node_ids(), parameter_names);
+    let plan =
+        cuda_execution_plan(executable.into_executable(), target).map_err(PyValueError::new_err)?;
+    Ok((plan, loss_node_id, gradient_node_ids))
 }
 
-fn build_cuda_scalar_value_and_grad_plan(
+/// Splits the frozen output ids of a program ordered as a value followed by
+/// one gradient per name, as the value-and-gradient and vmap VJP helpers
+/// build them.
+fn value_and_named_outputs(
+    frozen_output_node_ids: &[TensorNodeId],
+    names: Vec<String>,
+) -> (TensorNodeId, BTreeMap<String, TensorNodeId>) {
+    (
+        frozen_output_node_ids[0],
+        names
+            .into_iter()
+            .zip(frozen_output_node_ids[1..].iter().copied())
+            .collect(),
+    )
+}
+
+/// Returns the loss followed by each requested gradient as one ordered
+/// program, together with the requested names in output order.
+fn build_cuda_scalar_value_and_grad_program(
     loss: &TensorTraceResult,
     parameter_names: Vec<String>,
-) -> PyResult<(
-    TensorExecutionPlan,
-    TensorNodeId,
-    BTreeMap<String, TensorNodeId>,
-)> {
+) -> PyResult<(NablaMultiOutputProgram, Vec<String>)> {
     if parameter_names.is_empty() {
         return Err(PyValueError::new_err(
             "CUDA value-and-grad requires at least one parameter name",
@@ -5350,15 +5361,10 @@ fn build_cuda_scalar_value_and_grad_plan(
         requested_names.push(parameter_name);
         output_node_ids.push(gradient_node_id);
     }
-    let (plan, remapped_outputs) = graph
-        .compile_cpu_multi_plan(&output_node_ids)
+    let program = graph
+        .into_multi_output_program(output_node_ids)
         .map_err(PyValueError::new_err)?;
-    let loss_node_id = remapped_outputs[0];
-    let gradient_node_ids = requested_names
-        .into_iter()
-        .zip(remapped_outputs.into_iter().skip(1))
-        .collect();
-    Ok((plan, loss_node_id, gradient_node_ids))
+    Ok((program, requested_names))
 }
 
 #[pyfunction]
@@ -5478,8 +5484,11 @@ pub fn tensor_value_and_grad_data_parallel_cuda_fn(
     }
 
     let traced = trace_tensor_python_function(py, function, shard_input_specs)?;
-    let (plan, loss_node_id, gradient_node_ids) =
-        build_cuda_scalar_value_and_grad_plan(&traced, parameter_names)?;
+    let (program, parameter_names) =
+        build_cuda_scalar_value_and_grad_program(&traced, parameter_names)?;
+    let plan = program.freeze().map_err(PyValueError::new_err)?;
+    let (loss_node_id, gradient_node_ids) =
+        value_and_named_outputs(plan.output_node_ids(), parameter_names);
     let plan = CudaBackend::new(device_ordinals[0])
         .compile_data_parallel(plan, device_ordinals)
         .map_err(PyValueError::new_err)?;
@@ -5661,13 +5670,9 @@ fn compile_mlx_scalar_value_and_grad(
     let executable = graph
         .compile_multi_output_executable(output_node_ids, NablaTarget::Mlx)
         .map_err(PyValueError::new_err)?;
-    let frozen_outputs = executable.output_node_ids().to_vec();
+    let (loss_node_id, gradient_node_ids) =
+        value_and_named_outputs(executable.output_node_ids(), requested_names);
     let plan = mlx_execution_plan(executable.into_executable()).map_err(PyValueError::new_err)?;
-    let loss_node_id = frozen_outputs[0];
-    let gradient_node_ids = requested_names
-        .into_iter()
-        .zip(frozen_outputs.into_iter().skip(1))
-        .collect();
     Ok((plan, loss_node_id, gradient_node_ids))
 }
 
@@ -5853,13 +5858,9 @@ pub fn tensor_vmap_vjp_mlx_fn(
     let executable = graph
         .compile_multi_output_executable(output_node_ids, NablaTarget::Mlx)
         .map_err(PyValueError::new_err)?;
-    let output_node_ids = executable.output_node_ids().to_vec();
+    let (output_node_id, gradient_node_ids) =
+        value_and_named_outputs(executable.output_node_ids(), gradient_names);
     let plan = mlx_execution_plan(executable.into_executable()).map_err(PyValueError::new_err)?;
-    let output_node_id = output_node_ids[0];
-    let gradient_node_ids = gradient_names
-        .into_iter()
-        .zip(output_node_ids.into_iter().skip(1))
-        .collect();
     Ok(TensorVmapMlxVjpFunction {
         plan,
         output_node_id,
@@ -5980,9 +5981,13 @@ pub fn tensor_vmap_jvp_cuda_fn(
     let graph = TensorTraceGraph {
         ir: Arc::new(Mutex::new(transformed.graph)),
     };
-    let (plan, output_node_ids) = graph
-        .compile_cuda_multi_plan(&[transformed.value, transformed.tangent], device_ordinal)
+    let target = NablaTarget::Cuda { device_ordinal };
+    let executable = graph
+        .compile_multi_output_executable(vec![transformed.value, transformed.tangent], target)
         .map_err(PyValueError::new_err)?;
+    let output_node_ids = executable.output_node_ids().to_vec();
+    let plan =
+        cuda_execution_plan(executable.into_executable(), target).map_err(PyValueError::new_err)?;
     Ok(TensorVmapCudaJvpFunction {
         plan,
         value_node_id: output_node_ids[0],
@@ -6209,14 +6214,14 @@ pub fn tensor_vmap_vjp_cuda_fn(
         gradient_names.push(name.clone());
         output_node_ids.push(node_id);
     }
-    let (plan, output_node_ids) = graph
-        .compile_cuda_multi_plan(&output_node_ids, device_ordinal)
+    let target = NablaTarget::Cuda { device_ordinal };
+    let executable = graph
+        .compile_multi_output_executable(output_node_ids, target)
         .map_err(PyValueError::new_err)?;
-    let output_node_id = output_node_ids[0];
-    let gradient_node_ids = gradient_names
-        .into_iter()
-        .zip(output_node_ids.into_iter().skip(1))
-        .collect();
+    let (output_node_id, gradient_node_ids) =
+        value_and_named_outputs(executable.output_node_ids(), gradient_names);
+    let plan =
+        cuda_execution_plan(executable.into_executable(), target).map_err(PyValueError::new_err)?;
     Ok(TensorVmapCudaVjpFunction {
         plan,
         output_node_id,
@@ -6612,14 +6617,17 @@ pub fn cuda_adam_vjp_optimizer(
         .iter()
         .map(|(_, node_id)| *node_id)
         .collect::<Vec<_>>();
-    let (plan, remapped_output_node_ids) = graph
-        .compile_cuda_multi_plan(&output_node_ids, device_ordinal)
+    let target = NablaTarget::Cuda { device_ordinal };
+    let executable = graph
+        .compile_multi_output_executable(output_node_ids, target)
         .map_err(PyValueError::new_err)?;
     let gradient_node_ids = outputs
         .into_iter()
         .map(|(name, _)| name)
-        .zip(remapped_output_node_ids)
+        .zip(executable.output_node_ids().iter().copied())
         .collect::<BTreeMap<_, _>>();
+    let plan =
+        cuda_execution_plan(executable.into_executable(), target).map_err(PyValueError::new_err)?;
     let mut retained_inputs = retained_input_names
         .unwrap_or_default()
         .into_iter()

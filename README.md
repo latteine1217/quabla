@@ -537,12 +537,14 @@ Current migration status:
   (`tensor_jit_cuda_fn`, `tensor_vmap_cuda_fn`,
   `tensor_vmap_hvp_scalar_cuda_fn`, `tensor_jit_batch_cuda_fn`) compile
   through `NablaCompiler`; their public signatures and results are
-  unchanged. The MLX multi-output helpers (`tensor_value_and_grad_mlx_fn`,
-  its batch variant, `tensor_vmap_{vjp,jvp}_mlx_fn`, and
-  `mlx_adam_loss_optimizer`) compile one ordered multi-output program through
-  `NablaCompiler::compile_many`; retained MLX inputs and Adam state stay in
-  their executors. The CUDA multi-output helpers still construct their own
-  plans; `docs/jax_like_roadmap.md` lists the migration plan.
+  unchanged. The multi-output helpers (`tensor_value_and_grad_{mlx,cuda}_fn`,
+  their batch variants, `tensor_vmap_{vjp,jvp}_{mlx,cuda}_fn`,
+  `mlx_adam_loss_optimizer`, `cuda_adam_vjp_optimizer`, and
+  `cuda_adam_loss_optimizer`) compile one ordered multi-output program through
+  `NablaCompiler::compile_many` and read their outputs by position. Retained
+  MLX inputs, device-resident CUDA buffers, and Adam state stay in those
+  executors rather than in `NablaExecutable`; `docs/jax_like_roadmap.md`
+  records that remaining gap and the helpers that stay outside the facade.
 - The Rust `NablaCompiler::compile` rejects a target missing from the build
   before lowering. These Python entrypoints, including `Program.compile`, keep
   their earlier errors in such a build: MLX constructs and fails on first
