@@ -84,7 +84,29 @@ fn compiler_facade_owns_program_transform_and_cpu_execution_lifecycle() {
 }
 
 #[test]
-fn compiler_facade_leaves_unbuilt_backend_errors_to_the_backend() {
+fn compiler_facade_rejects_unbuilt_targets_up_front() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let doubled = must!(graph.add(x, x));
+    let compiler = NablaCompiler;
+    let program = must!(compiler.program(graph, doubled));
+
+    for target in [NablaTarget::Cuda { device_ordinal: 0 }, NablaTarget::Mlx] {
+        if target.is_built() {
+            continue;
+        }
+        let error = compiler
+            .compile(&program, target)
+            .expect_err("the facade must reject a target missing from this build");
+        assert_eq!(
+            error,
+            format!("{} target is unavailable in this build", target.name())
+        );
+    }
+}
+
+#[test]
+fn compiler_build_check_bypass_leaves_unbuilt_errors_to_the_backend() {
     let mut graph = TensorIr::new();
     let x = must!(graph.input("x", vec![2]));
     let doubled = must!(graph.add(x, x));
@@ -95,16 +117,16 @@ fn compiler_facade_leaves_unbuilt_backend_errors_to_the_backend() {
         must!(DynamicTensor::new(vec![2], vec![1.0, 2.0])),
     )]);
 
+    // The Python compatibility helpers keep their pre-facade error contract.
     let cuda = NablaTarget::Cuda { device_ordinal: 0 };
     if !cuda.is_built() {
         let error = compiler
-            .compile(&program, cuda)
+            .compile_without_build_check(&program, cuda)
             .expect_err("an unbuilt CUDA backend must reject compilation");
         assert!(error.contains("build Nabla on Linux with --features cuda"));
     }
     if !NablaTarget::Mlx.is_built() {
-        // Python MLX helpers construct lazily and fail on first execution.
-        let executable = must!(compiler.compile(&program, NablaTarget::Mlx));
+        let executable = must!(compiler.compile_without_build_check(&program, NablaTarget::Mlx));
         let error = executable
             .execute(&inputs)
             .expect_err("an unbuilt MLX backend must reject execution");

@@ -519,7 +519,9 @@ impl TensorTraceGraph {
     /// `Program.compile` funnels through here, so `NablaCompiler` owns program
     /// construction, freezing, and target selection for every target. The
     /// facade owns an immutable program, while tracing keeps a shared mutable
-    /// graph, so each compilation snapshots the traced IR once.
+    /// graph, so each compilation snapshots the traced IR once. It skips the
+    /// facade's build-availability check so these entrypoints keep their
+    /// pre-facade errors in builds without the target's backend.
     fn compile_executable(
         &self,
         output_node_id: TensorNodeId,
@@ -531,7 +533,7 @@ impl TensorTraceGraph {
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
             .clone();
         let compiler = NablaCompiler;
-        compiler.compile(&compiler.program(ir, output_node_id)?, target)
+        compiler.compile_without_build_check(&compiler.program(ir, output_node_id)?, target)
     }
 
     pub(crate) fn compile_cpu_plan(

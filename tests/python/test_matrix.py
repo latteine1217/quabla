@@ -669,6 +669,41 @@ def test_compiler_facade_unifies_trace_transform_compile_and_execute():
     assert gradient.to_flat_list() == [4.0, 5.0]
 
 
+def test_python_entrypoints_keep_backend_errors_for_unbuilt_targets():
+    # Python 入口在缺少後端的 build 中維持 facade 之前的錯誤時機與訊息：
+    # MLX 建構成功、首次執行才失敗；CUDA 在編譯時回報後端的 build 指示。
+    compiler = nabla.Compiler()
+    program = compiler.trace(lambda x: x * 2.0, [("x", [2])])
+    inputs = {"x": nabla.Tensor([2], [1.0, 2.0])}
+    mlx_message = "MLX backend is unavailable: build Nabla on macOS with --features mlx"
+    cuda_message = "CUDA backend is unavailable for device 0: build Nabla on Linux with --features cuda"
+
+    if not compiler.capability("mlx"):
+        executables = [
+            program.compile("mlx"),
+            nabla.tensor_vmap_mlx_fn(lambda x: x * 2.0, [("x", [2])], 1),
+        ]
+        batched_inputs = {"x": nabla.Tensor([1, 2], [1.0, 2.0])}
+        for executable, values in zip(executables, [inputs, batched_inputs]):
+            try:
+                executable(values)
+                assert False, "expected an unbuilt MLX backend to reject execution"
+            except ValueError as error:
+                assert mlx_message in str(error)
+
+    if not compiler.capability("cuda"):
+        compile_calls = [
+            lambda: program.compile("cuda"),
+            lambda: nabla.tensor_jit_cuda_fn(lambda x: x * 2.0, [("x", [2])]),
+        ]
+        for compile_call in compile_calls:
+            try:
+                compile_call()
+                assert False, "expected an unbuilt CUDA backend to reject compilation"
+            except ValueError as error:
+                assert cuda_message in str(error)
+
+
 def test_compiler_facade_cuda_matches_cpu_for_primal_jvp_and_vjp():
     if os.environ.get("NABLA_CUDA_TEST") is None:
         return

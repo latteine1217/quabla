@@ -194,11 +194,14 @@ against the current single-output facade contract. Category (a) helpers
 compile one traced output; migrated targets delegate through
 `TensorTraceGraph::compile_{cpu,mlx,cuda}_plan`, which build a
 `NablaProgram` from a snapshot of the traced IR and call
-`NablaCompiler::compile`. `Program.compile(...)` and the legacy
-`compile_cpu`/`compile_mlx`/`compile_cuda` methods share the same path. `NablaCompiler::compile` no longer rejects unbuilt
-targets up front: `capability()` reports build availability, and an unbuilt
-backend rejects the program itself (CUDA at compile time, MLX on first
-execution), which is the error contract the Python helpers already expose. The snapshot is one extra IR clone per compilation: constructing a
+`NablaCompiler::compile_without_build_check`. `Program.compile(...)` and the
+legacy `compile_cpu`/`compile_mlx`/`compile_cuda` methods share the same path.
+`NablaCompiler::compile` rejects a target missing from the build up front with
+`<target> target is unavailable in this build`; the bridge skips only that
+check, so the Python entrypoints keep their pre-facade errors in such a build
+(CUDA fails at compile time and MLX on first execution, each with its backend's
+build instructions) while the lowering stays in one place. The snapshot is one
+extra IR clone per compilation: constructing a
 `tensor_jit_fn` over a 2,000-step `tanh` chain moved from 2.38 ms to 2.55 ms
 median on the local Apple-silicon host; execution is unchanged. CPU
 derivative helpers keep evaluating their derivative with the frozen plan's

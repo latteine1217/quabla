@@ -226,13 +226,30 @@ impl NablaCompiler {
         }
     }
 
-    /// Freezes `program` and selects the backend for `target`.
-    ///
-    /// Build availability is reported by [`Self::capability`], not checked
-    /// here: an unbuilt backend rejects the program itself, CUDA at compile
-    /// time and MLX at execution, with its own build instructions. The Python
-    /// helpers compile through this method and rely on that error contract.
+    /// Freezes `program` and selects the backend for `target`, rejecting a
+    /// target this build does not include before any lowering.
     pub fn compile(
+        &self,
+        program: &NablaProgram,
+        target: NablaTarget,
+    ) -> Result<NablaExecutable, String> {
+        if !target.is_built() {
+            return Err(format!(
+                "{} target is unavailable in this build",
+                target.name()
+            ));
+        }
+        self.compile_without_build_check(program, target)
+    }
+
+    /// Same lowering as [`Self::compile`] without the build-availability
+    /// check: an unbuilt backend rejects the program itself, CUDA at compile
+    /// time and MLX on first execution, with its own build instructions.
+    ///
+    /// Only the Python compatibility helpers use this, because their public
+    /// error timing and messages predate the facade. New callers use
+    /// [`Self::compile`].
+    pub fn compile_without_build_check(
         &self,
         program: &NablaProgram,
         target: NablaTarget,

@@ -540,6 +540,11 @@ Current migration status:
   unchanged. Multi-output value-and-gradient, vmap VJP/JVP, and optimizer
   helpers still construct their own plans; `docs/jax_like_roadmap.md` lists
   the migration plan.
+- The Rust `NablaCompiler::compile` rejects a target missing from the build
+  before lowering. These Python entrypoints, including `Program.compile`, keep
+  their earlier errors in such a build: MLX constructs and fails on first
+  execution, CUDA fails at compile time, each with the backend's build
+  instructions. Check `Compiler.capability(target)` first when that matters.
 - `Program.jvp(...)` is the one-named-input symbolic coordinate derivative;
   `Program.vjp(...)` returns one `Program` per original input. Runtime tangent
   maps and multi-output compiler programs remain lower-level Rust APIs.
