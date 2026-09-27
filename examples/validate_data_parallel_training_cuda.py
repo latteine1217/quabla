@@ -17,7 +17,9 @@ backend and its floating-point evaluation order:
 
 The script fails when any compared pair exceeds the tolerances below or when
 training does not reduce the loss. Timing is reported for the first step and
-for the steady state after `--warmup` steps.
+for the steady state after `--warmup` steps. `--grid` and `--hidden` scale the
+batch (`grid * grid` rows) and the MLP width; the defaults are the original
+256-row, width-32 check.
 """
 
 import argparse
@@ -34,22 +36,10 @@ import time
 import nabla
 
 
-BATCH = 256
-GRID = 16  # GRID * GRID == BATCH input points on [-1, 1]^2.
-HIDDEN = 32
-PARAMETER_SHAPES = {
-    "w1": [2, HIDDEN],
-    "b1": [1, HIDDEN],
-    "w2": [HIDDEN, HIDDEN],
-    "b2": [1, HIDDEN],
-    "w3": [HIDDEN, 1],
-    "b3": [1, 1],
-}
-PARAMETER_NAMES = list(PARAMETER_SHAPES)
+DEFAULT_GRID = 16  # grid * grid == batch input points on [-1, 1]^2.
+DEFAULT_HIDDEN = 32
+PARAMETER_NAMES = ["w1", "b1", "w2", "b2", "w3", "b3"]
 MAPPED_INPUTS = ["x", "target"]
-INPUT_SPECS = [("x", [BATCH, 2]), ("target", [BATCH, 1])] + [
-    (name, shape) for name, shape in PARAMETER_SHAPES.items()
-]
 DEVICE_ORDINALS = [0, 1]
 PARAMETER_KEY = 2026
 ALL_MODES = ["two_gpu_mean", "two_gpu_sum", "single_gpu", "cpu"]
@@ -62,16 +52,25 @@ COMPARISONS = [
 
 # Tolerances are relative. CUDA evaluates in f32 (unit roundoff u = 2^-24,
 # about 6.0e-8); the CPU reference evaluates in f64. The longest reduction is
-# the 256-row batch mean, whose worst-case relative rounding bound is
-# gamma_256 = 256 u, about 1.5e-5. Two GPUs change only the summation order
-# (two 128-row partial means plus one NCCL reduction), so each step's
-# gradient may differ at that level, and SGD carries such differences into
-# later steps. 1e-4 (about 6.5 gamma_256) allows that accumulation over the
-# run while still rejecting reduction bugs such as a Sum/Mean mix-up or a
-# dropped shard, which produce O(1) relative differences.
-LOSS_REL_TOLERANCE = 1e-4
-PARAMETER_REL_TOLERANCE = 1e-4
+# the batch mean (256 rows by default), whose worst-case relative rounding
+# bound is gamma_256 = 256 u, about 1.5e-5. Two GPUs change only the
+# summation order (two 128-row partial means plus one NCCL reduction), so
+# each step's gradient may differ at that level, and SGD carries such
+# differences into later steps. 1e-4 (about 6.5 gamma_256) allows that
+# accumulation over the run while still rejecting reduction bugs such as a
+# Sum/Mean mix-up or a dropped shard, which produce O(1) relative
+# differences. Larger batches keep the same ratio to gamma_batch, so the
+# tolerance scales linearly with the batch above 256 rows; hidden widths up
+# to the batch size add shorter reductions than the batch mean. The same
+# tolerance applies to the first step's gradients, which every mode
+# evaluates at identical inputs: a reduction bug shifts them by O(1)
+# normwise, which keeps the check sensitive when a short, wide run barely
+# moves the loss and its trajectories alone would not expose the bug.
+BASE_REL_TOLERANCE = 1e-4
+BASE_TOLERANCE_BATCH = 256
 # The run must actually train, otherwise matching trajectories prove little.
+# `--max-loss-ratio` relaxes this for short scale runs that rely on the
+# first-step gradient comparison instead.
 MAX_FINAL_TO_INITIAL_LOSS = 0.5
 TIMING_KEYS = ["replica_enqueue", "collective", "output_readback"]
 
@@ -82,13 +81,34 @@ def loss_fn(x, target, w1, b1, w2, b2, w3, b3):
     return (hidden @ w3 + b3 - target).powi(2).mean()
 
 
+def parameter_shapes(hidden):
+    return {
+        "w1": [2, hidden],
+        "b1": [1, hidden],
+        "w2": [hidden, hidden],
+        "b2": [1, hidden],
+        "w3": [hidden, 1],
+        "b3": [1, 1],
+    }
+
+
+def input_specs(batch, hidden):
+    return [("x", [batch, 2]), ("target", [batch, 1])] + list(
+        parameter_shapes(hidden).items()
+    )
+
+
+def relative_tolerance(batch):
+    return BASE_REL_TOLERANCE * max(1.0, batch / BASE_TOLERANCE_BATCH)
+
+
 def to_f32(values):
     """Round to f32 so every backend starts from identical representable data."""
     return array.array("f", values).tolist()
 
 
-def build_problem():
-    coordinates = [-1.0 + 2.0 * index / (GRID - 1) for index in range(GRID)]
+def build_problem(grid, hidden):
+    coordinates = [-1.0 + 2.0 * index / (grid - 1) for index in range(grid)]
     points = [(u, v) for u in coordinates for v in coordinates]
     x = to_f32([value for point in points for value in point])
     target = to_f32(
@@ -96,7 +116,7 @@ def build_problem():
     )
     weight_keys = nabla.Tensor.split_key(PARAMETER_KEY, 3)
     parameters = {}
-    for name, shape in PARAMETER_SHAPES.items():
+    for name, shape in parameter_shapes(hidden).items():
         if name.startswith("w"):
             key = weight_keys[int(name[1]) - 1]
             values = nabla.Tensor.glorot_normal(shape, key).to_flat_list()
@@ -106,17 +126,17 @@ def build_problem():
     return x, target, parameters
 
 
-def build_callable(mode):
+def build_callable(mode, specs):
     if mode == "cpu":
-        return nabla.tensor_value_and_grad_fn(loss_fn, INPUT_SPECS)
+        return nabla.tensor_value_and_grad_fn(loss_fn, specs)
     if mode == "single_gpu":
         return nabla.tensor_value_and_grad_cuda_fn(
-            loss_fn, INPUT_SPECS, PARAMETER_NAMES, DEVICE_ORDINALS[0]
+            loss_fn, specs, PARAMETER_NAMES, DEVICE_ORDINALS[0]
         )
     reduction = mode.removeprefix("two_gpu_")
     return nabla.tensor_value_and_grad_data_parallel_cuda_fn(
         loss_fn,
-        INPUT_SPECS,
+        specs,
         PARAMETER_NAMES,
         MAPPED_INPUTS,
         DEVICE_ORDINALS,
@@ -124,25 +144,28 @@ def build_callable(mode):
     )
 
 
-def train(mode, steps, lr):
-    x, target, parameters = build_problem()
+def train(mode, steps, lr, grid, hidden):
+    batch = grid * grid
+    shapes = parameter_shapes(hidden)
+    x, target, parameters = build_problem(grid, hidden)
     # Sum returns replica_count times the mean loss and gradient.
     scale = len(DEVICE_ORDINALS) if mode == "two_gpu_sum" else 1
     step_lr = lr / scale
 
     construct_start = time.perf_counter()
-    value_and_grad = build_callable(mode)
+    value_and_grad = build_callable(mode, input_specs(batch, hidden))
     construct_seconds = time.perf_counter() - construct_start
 
     fixed = {
-        "x": nabla.Tensor([BATCH, 2], x),
-        "target": nabla.Tensor([BATCH, 1], target),
+        "x": nabla.Tensor([batch, 2], x),
+        "target": nabla.Tensor([batch, 1], target),
     }
     losses = []
     timings = []
+    first_gradient = None
     for _ in range(steps):
         inputs = dict(fixed)
-        for name, shape in PARAMETER_SHAPES.items():
+        for name, shape in shapes.items():
             inputs[name] = nabla.Tensor(shape, parameters[name])
         call_start = time.perf_counter()
         value, gradients = value_and_grad(inputs)
@@ -153,15 +176,21 @@ def train(mode, steps, lr):
         timings.append(timing)
         (loss,) = value.to_flat_list()
         losses.append(loss / scale)
+        gradients = {name: gradients[name].to_flat_list() for name in PARAMETER_NAMES}
+        if first_gradient is None:
+            # Dividing by the power-of-two scale is exact.
+            first_gradient = [
+                grad / scale for name in PARAMETER_NAMES for grad in gradients[name]
+            ]
         for name in PARAMETER_NAMES:
-            gradient = gradients[name].to_flat_list()
             parameters[name] = [
                 parameter - step_lr * grad
-                for parameter, grad in zip(parameters[name], gradient)
+                for parameter, grad in zip(parameters[name], gradients[name])
             ]
     return {
         "construct_seconds": construct_seconds,
         "losses": losses,
+        "first_gradient": first_gradient,
         "parameters": parameters,
         "timings": timings,
     }
@@ -179,12 +208,19 @@ def compare(candidate, reference):
     # the output bias near zero, so elementwise or per-tensor relative errors
     # would divide by values at the f32 noise floor.
     parameter_scale = max(abs(b) for b in expected)
+    gradient_abs = max(
+        abs(a - b)
+        for a, b in zip(candidate["first_gradient"], reference["first_gradient"])
+    )
+    gradient_scale = max(abs(b) for b in reference["first_gradient"])
     return {
         "loss_max_abs": max(loss_abs),
         "loss_max_rel": max(loss_rel),
         "parameter_max_abs": parameter_abs,
         "parameter_inf_norm": parameter_scale,
         "parameter_max_normwise_rel": parameter_abs / parameter_scale,
+        "first_gradient_max_abs": gradient_abs,
+        "first_gradient_max_normwise_rel": gradient_abs / gradient_scale,
     }
 
 
@@ -226,23 +262,26 @@ def nccl_version():
     return f"{code // 10000}.{code % 10000 // 100}.{code % 100}"
 
 
-def metadata(args, modes):
+def metadata(args, modes, tolerance):
+    batch = args.grid * args.grid
     return {
         "modes": modes,
         "steps": args.steps,
         "warmup_steps": args.warmup,
         "learning_rate": args.lr,
         "optimizer": "host-side SGD, identical in every mode",
-        "batch": BATCH,
+        "batch": batch,
+        "hidden": args.hidden,
         "mapped_inputs": MAPPED_INPUTS,
-        "parameter_shapes": PARAMETER_SHAPES,
+        "parameter_shapes": parameter_shapes(args.hidden),
         "device_ordinals": DEVICE_ORDINALS,
         "parameter_key": PARAMETER_KEY,
-        "data": f"{GRID}x{GRID} grid on [-1, 1]^2, target sin(pi u) cos(pi v)",
+        "data": f"{args.grid}x{args.grid} grid on [-1, 1]^2, target sin(pi u) cos(pi v)",
         "tolerances": {
-            "loss_max_rel": LOSS_REL_TOLERANCE,
-            "parameter_max_normwise_rel": PARAMETER_REL_TOLERANCE,
-            "max_final_to_initial_loss": MAX_FINAL_TO_INITIAL_LOSS,
+            "loss_max_rel": tolerance,
+            "parameter_max_normwise_rel": tolerance,
+            "first_gradient_max_normwise_rel": tolerance,
+            "max_final_to_initial_loss": args.max_loss_ratio,
         },
         "python": sys.version.split()[0],
         "platform": platform.platform(),
@@ -264,6 +303,16 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--lr", type=float, default=0.1)
+    parser.add_argument(
+        "--grid", type=int, default=DEFAULT_GRID, help="batch is grid * grid rows"
+    )
+    parser.add_argument("--hidden", type=int, default=DEFAULT_HIDDEN)
+    parser.add_argument(
+        "--max-loss-ratio",
+        type=float,
+        default=MAX_FINAL_TO_INITIAL_LOSS,
+        help="fail unless final loss <= ratio * initial loss",
+    )
     parser.add_argument("--output", help="also write the JSON report to this path")
     args = parser.parse_args()
     modes = [mode for mode in args.modes.split(",") if mode]
@@ -272,12 +321,18 @@ def parse_args():
         parser.error(f"unknown or empty --modes {unknown}; choose from {ALL_MODES}")
     if args.steps <= args.warmup:
         parser.error("--steps must exceed --warmup")
+    if args.grid < 2 or args.hidden < 1:
+        parser.error("--grid must be at least 2 and --hidden at least 1")
     return args, modes
 
 
 def main():
     args, modes = parse_args()
-    runs = {mode: train(mode, args.steps, args.lr) for mode in modes}
+    runs = {
+        mode: train(mode, args.steps, args.lr, args.grid, args.hidden)
+        for mode in modes
+    }
+    tolerance = relative_tolerance(args.grid * args.grid)
 
     failures = []
     comparisons = {}
@@ -286,18 +341,23 @@ def main():
             continue
         result = compare(runs[candidate], runs[reference])
         comparisons[f"{candidate} vs {reference}"] = result
-        if result["loss_max_rel"] > LOSS_REL_TOLERANCE:
+        if result["loss_max_rel"] > tolerance:
             failures.append(f"{candidate} vs {reference}: loss {result['loss_max_rel']:e}")
-        if result["parameter_max_normwise_rel"] > PARAMETER_REL_TOLERANCE:
+        if result["parameter_max_normwise_rel"] > tolerance:
             failures.append(
                 f"{candidate} vs {reference}: parameters "
                 f"{result['parameter_max_normwise_rel']:e}"
+            )
+        if result["first_gradient_max_normwise_rel"] > tolerance:
+            failures.append(
+                f"{candidate} vs {reference}: first-step gradients "
+                f"{result['first_gradient_max_normwise_rel']:e}"
             )
 
     report_runs = {}
     for mode, run in runs.items():
         initial, final = run["losses"][0], run["losses"][-1]
-        if not (math.isfinite(final) and final <= initial * MAX_FINAL_TO_INITIAL_LOSS):
+        if not (math.isfinite(final) and final <= initial * args.max_loss_ratio):
             failures.append(f"{mode}: loss did not train ({initial} -> {final})")
         report_runs[mode] = {
             "construct_seconds": run["construct_seconds"],
@@ -309,7 +369,7 @@ def main():
     report = {
         "status": "failed" if failures else "passed",
         "failures": failures,
-        "metadata": metadata(args, modes),
+        "metadata": metadata(args, modes, tolerance),
         "runs": report_runs,
         "comparisons": comparisons,
         "loss_trajectories": {mode: run["losses"] for mode, run in runs.items()},
