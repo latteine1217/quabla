@@ -5812,3 +5812,43 @@ fn f32_fori_carry_adopts_a_typed_index_and_rejects_mixed_captures() {
         .expect_err("an f64 carry must not bind an f32 loop region");
     assert!(error.contains("astype"), "{error}");
 }
+
+#[test]
+fn cond_region_transforms_do_not_leak_non_finite_captures() {
+    // false 分支以 greater 遮罩避開 NaN；區域 AD 保留捕獲時不可讀取其值。
+    let mut on_true = TensorIr::new();
+    let true_x = must!(on_true.input("x", vec![3]));
+    let true_squared = must!(on_true.mul(true_x, true_x));
+    let true_output = must!(on_true.sum(true_squared));
+    let mut on_false = TensorIr::new();
+    let false_x = must!(on_false.input("x", vec![3]));
+    let zero = on_false.scalar_constant(0.0);
+    let positive = must!(on_false.greater(false_x, zero));
+    let selected = must!(on_false.where_select(positive, false_x, zero));
+    let false_output = must!(on_false.sum(selected));
+    let branches = must!(TensorCondExecutionPlan::new(
+        must!(on_true.compile_cpu(true_output)),
+        must!(on_false.compile_cpu(false_output)),
+    ));
+    let mut graph = TensorIr::new();
+    let predicate = must!(graph.input("predicate", vec![]));
+    must!(graph.input("x", vec![3]));
+    let output = must!(graph.cond(predicate, branches));
+    let inputs = f32_inputs(&[
+        ("predicate", vec![], vec![0.0]),
+        ("x", vec![3], vec![1.0, f64::NAN, f64::NEG_INFINITY]),
+        ("seed", vec![], vec![1.0]),
+    ]);
+    assert_eq!(must!(graph.evaluate(output, &inputs)).data(), &[1.0]);
+    let vjp = must!(graph.symbolic_vjp(output, "seed"));
+    assert_eq!(
+        must!(vjp.graph.evaluate(vjp.gradients["x"], &inputs)).data(),
+        &[1.0, 0.0, 0.0]
+    );
+    let jvp = must!(graph.symbolic_jvp(output, "x"));
+    assert_eq!(must!(jvp.graph.evaluate(jvp.value, &inputs)).data(), &[1.0]);
+    assert_eq!(
+        must!(jvp.graph.evaluate(jvp.tangent, &inputs)).data(),
+        &[1.0]
+    );
+}

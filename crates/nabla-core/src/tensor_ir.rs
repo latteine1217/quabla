@@ -7658,9 +7658,14 @@ fn symbolic_retain_region_inputs(
 ) -> Result<TensorNodeId, String> {
     // A region's capture interface must not depend on which branch or AD
     // output happens to use an input after DCE.
+    //
+    // The retaining term is `where(0, input, 0)`: the constant-false mask
+    // references the input without reading its values, so a `NaN`/`inf`
+    // capture cannot leak into the output as `input - input` would.
     for input_name in input_names {
         let input = graph.input_node_id(input_name)?;
-        let zero = graph.sub(input, input)?;
+        let zero = graph.scalar_constant(0.0);
+        let zero = graph.where_select(zero, input, zero)?;
         let mut scalar_zero = graph.sum(zero)?;
         // 區域可混用 dtype（例如 f32 carry 與 f64 capture），零項需轉成輸出 dtype。
         let output_dtype = graph.node_dtype(output)?;
