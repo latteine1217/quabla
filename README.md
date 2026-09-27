@@ -537,9 +537,12 @@ Current migration status:
   (`tensor_jit_cuda_fn`, `tensor_vmap_cuda_fn`,
   `tensor_vmap_hvp_scalar_cuda_fn`, `tensor_jit_batch_cuda_fn`) compile
   through `NablaCompiler`; their public signatures and results are
-  unchanged. Multi-output value-and-gradient, vmap VJP/JVP, and optimizer
-  helpers still construct their own plans; `docs/jax_like_roadmap.md` lists
-  the migration plan.
+  unchanged. The MLX multi-output helpers (`tensor_value_and_grad_mlx_fn`,
+  its batch variant, `tensor_vmap_{vjp,jvp}_mlx_fn`, and
+  `mlx_adam_loss_optimizer`) compile one ordered multi-output program through
+  `NablaCompiler::compile_many`; retained MLX inputs and Adam state stay in
+  their executors. The CUDA multi-output helpers still construct their own
+  plans; `docs/jax_like_roadmap.md` lists the migration plan.
 - The Rust `NablaCompiler::compile` rejects a target missing from the build
   before lowering. These Python entrypoints, including `Program.compile`, keep
   their earlier errors in such a build: MLX constructs and fails on first
@@ -547,7 +550,8 @@ Current migration status:
   instructions. Check `Compiler.capability(target)` first when that matters.
 - `Program.jvp(...)` is the one-named-input symbolic coordinate derivative;
   `Program.vjp(...)` returns one `Program` per original input. Runtime tangent
-  maps and multi-output compiler programs remain lower-level Rust APIs.
+  maps and multi-output compiler programs (`NablaMultiOutputProgram`) remain
+  lower-level Rust APIs.
 - CPU facade execution is covered by Rust and installed-extension Python tests.
   CUDA facade parity is verified on the Linux GTX 1660 SUPER host for a
   nonlinear scalar loss, its symbolic coordinate JVP, and VJP programs for

@@ -214,7 +214,8 @@ numerics and operation coverage, so it is not part of this migration.
 | (a) CPU | `tensor_jit_fn`, `tensor_grad_scalar_fn`, `tensor_value_and_grad_fn`, `tensor_hessian_scalar_fn`, `tensor_hvp_scalar_fn`, `tensor_vjp_fn`, `tensor_jvp_fn`, `tensor_jacobian_fn`, `tensor_vmap_fn`, `tensor_vmap_vjp_fn`, `tensor_vmap_jvp_fn`, `tensor_vmap_hvp_scalar_fn`, `tensor_jit_batch_fn`, `tensor_value_and_grad_batch_fn` (per specialization), `tensor_cond_fn`, `tensor_cond_value_and_grad_fn`, `tensor_cond_jvp_fn` (one program per branch) | Delegates through the facade |
 | (a) MLX | `tensor_vmap_mlx_fn` | Delegates through the facade |
 | (a) CUDA | `tensor_jit_cuda_fn`, `tensor_vmap_cuda_fn`, `tensor_vmap_hvp_scalar_cuda_fn`, `tensor_jit_batch_cuda_fn` (per specialization) | Delegates through the facade |
-| (b) Multi-output program | `tensor_value_and_grad_{mlx,cuda}_fn`, `tensor_value_and_grad_batch_{mlx,cuda}_fn`, `tensor_vmap_{vjp,jvp}_{mlx,cuda}_fn`, `mlx_adam_loss_optimizer`, `cuda_adam_vjp_optimizer`, `cuda_adam_loss_optimizer` | Next step |
+| (b) MLX multi-output | `tensor_value_and_grad_mlx_fn`, `tensor_value_and_grad_batch_mlx_fn` (per specialization), `tensor_vmap_vjp_mlx_fn`, `tensor_vmap_jvp_mlx_fn`, `mlx_adam_loss_optimizer` | Delegates through the facade (`compile_many`); retained inputs stay in the bridge plan |
+| (b) CUDA multi-output | `tensor_value_and_grad_cuda_fn`, `tensor_value_and_grad_batch_cuda_fn`, `tensor_vmap_vjp_cuda_fn`, `tensor_vmap_jvp_cuda_fn`, `cuda_adam_vjp_optimizer`, `cuda_adam_loss_optimizer` | Next step |
 | (c) Separate | `tensor_value_and_grad_data_parallel_cuda_fn`, `cuda_adam_optimizer`, `cuda_adam_step`, trace-time region builders (`tensor_cond`, `tensor_fori_loop*`, `tensor_scan*`), eager graph evaluation methods, legacy 2D `TraceGraph` | Stays outside the facade |
 
 Verification (2026-09-27): the local Apple-silicon host runs workspace tests
@@ -246,7 +247,17 @@ retained execution; moving retained state into the facade executable remains
 a separate design step. Rust tests cover output order, frozen-id remapping,
 rejection of empty or unknown outputs, the build-check contract, CPU parity
 with per-output single-output compilation, and MLX and CUDA value-and-gradient
-parity against CPU (`1e-5`, CUDA on the GTX 1660 SUPER). Category (c)
+parity against CPU (`1e-5`, CUDA on the GTX 1660 SUPER). The MLX category
+(b) helpers now compile through
+`TensorTraceGraph::compile_multi_output_executable`, which builds the program
+from the transformed IR and calls `compile_many_without_build_check`, then read
+their loss, gradient, value, and tangent node ids from the executable by
+position; an unbuilt MLX backend still constructs and fails on first
+execution. The transformed graph is moved rather than cloned, and interleaved
+runs of `examples/benchmark_pinn_mlx.py` before and after the switch (three
+each, medians) stay within run-to-run noise: 33.1 vs 33.3 ms compile and
+0.815 vs 0.837 ms/step for the one-parameter model, 5.49 vs 5.53 ms/step for
+the 3x64 tanh MLP, where single runs vary by up to 0.12 ms/step. Category (c)
 helpers either target a replica set rather than one `NablaTarget`
 (data-parallel CUDA), only consume already-compiled plans (CUDA Adam), build
 IR regions during tracing rather than executables (single-output `tensor_cond`

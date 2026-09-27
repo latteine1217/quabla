@@ -679,14 +679,24 @@ def test_python_entrypoints_keep_backend_errors_for_unbuilt_targets():
     cuda_message = "CUDA backend is unavailable for device 0: build Nabla on Linux with --features cuda"
 
     if not compiler.capability("mlx"):
-        executables = [
-            program.compile("mlx"),
-            nabla.tensor_vmap_mlx_fn(lambda x: x * 2.0, [("x", [2])], 1),
-        ]
         batched_inputs = {"x": nabla.Tensor([1, 2], [1.0, 2.0])}
-        for executable, values in zip(executables, [inputs, batched_inputs]):
+        executables = [
+            (program.compile("mlx"), (inputs,)),
+            (nabla.tensor_vmap_mlx_fn(lambda x: x * 2.0, [("x", [2])], 1), (batched_inputs,)),
+            (
+                nabla.tensor_value_and_grad_mlx_fn(
+                    lambda x: (x * 2.0).sum(), [("x", [2])], ["x"]
+                ),
+                (inputs,),
+            ),
+            (
+                nabla.tensor_vmap_jvp_mlx_fn(lambda x: x * 2.0, [("x", [2])], 1),
+                (batched_inputs, batched_inputs),
+            ),
+        ]
+        for executable, arguments in executables:
             try:
-                executable(values)
+                executable(*arguments)
                 assert False, "expected an unbuilt MLX backend to reject execution"
             except ValueError as error:
                 assert mlx_message in str(error)
@@ -695,6 +705,10 @@ def test_python_entrypoints_keep_backend_errors_for_unbuilt_targets():
         compile_calls = [
             lambda: program.compile("cuda"),
             lambda: nabla.tensor_jit_cuda_fn(lambda x: x * 2.0, [("x", [2])]),
+            lambda: nabla.tensor_value_and_grad_cuda_fn(
+                lambda x: (x * 2.0).sum(), [("x", [2])], ["x"]
+            ),
+            lambda: nabla.tensor_vmap_jvp_cuda_fn(lambda x: x * 2.0, [("x", [2])], 1),
         ]
         for compile_call in compile_calls:
             try:

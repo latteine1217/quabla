@@ -9,7 +9,10 @@ use nabla_core::tensor_ir::{
     TensorCondExecutionPlan, TensorExecutionPlan, TensorForiExecutionPlan, TensorIr, TensorNodeId,
     TensorReplicaReduction, TensorScanExecutionPlan,
 };
-use nabla_core::{NablaCompiler, NablaExecutable, NablaTarget};
+use nabla_core::{
+    NablaCompiler, NablaExecutable, NablaMultiOutputExecutable, NablaMultiOutputProgram,
+    NablaTarget,
+};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyString, PyTuple};
@@ -562,13 +565,36 @@ impl TensorTraceGraph {
         &self,
         output_node_id: TensorNodeId,
     ) -> Result<TensorMlxExecutionPlan, String> {
-        match self.compile_executable(output_node_id, NablaTarget::Mlx)? {
-            NablaExecutable::Mlx(plan) => Ok(TensorMlxExecutionPlan {
-                plan,
-                retained_inputs: Arc::new(Mutex::new(MlxRetainedInputs::empty())),
-            }),
-            executable => Err(unexpected_executable(NablaTarget::Mlx, &executable)),
-        }
+        mlx_execution_plan(self.compile_executable(output_node_id, NablaTarget::Mlx)?)
+    }
+
+    /// Compiles several traced outputs as one ordered facade program.
+    ///
+    /// Value-and-gradient and primal/tangent helpers funnel through here, so
+    /// `NablaCompiler` owns freezing, frozen output ids, and target selection
+    /// for them as well. The handle is consumed: a graph built only for this
+    /// compilation, such as a symbolic transform result, moves into the
+    /// program, while a graph still shared with Python traces is snapshotted
+    /// like single-output compilation. It skips the build-availability check
+    /// for the same compatibility reason as [`Self::compile_executable`].
+    fn compile_multi_output_executable(
+        self,
+        output_node_ids: Vec<TensorNodeId>,
+        target: NablaTarget,
+    ) -> Result<NablaMultiOutputExecutable, String> {
+        let ir = match Arc::try_unwrap(self.ir) {
+            Ok(ir) => ir
+                .into_inner()
+                .map_err(|_| "tensor trace graph lock is poisoned".to_string())?,
+            Err(ir) => ir
+                .lock()
+                .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+                .clone(),
+        };
+        NablaCompiler.compile_many_without_build_check(
+            &NablaMultiOutputProgram::new(ir, output_node_ids)?,
+            target,
+        )
     }
 
     fn compile_cuda_multi_plan(
@@ -593,23 +619,17 @@ impl TensorTraceGraph {
             .compile_cpu_many(output_node_ids)?;
         Ok((plan, output_node_ids))
     }
+}
 
-    fn compile_mlx_multi_plan(
-        &self,
-        output_node_ids: &[TensorNodeId],
-    ) -> Result<(TensorMlxExecutionPlan, Vec<TensorNodeId>), String> {
-        let (plan, output_node_ids) = self
-            .ir
-            .lock()
-            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
-            .compile_cpu_many(output_node_ids)?;
-        Ok((
-            TensorMlxExecutionPlan {
-                plan,
-                retained_inputs: Arc::new(Mutex::new(MlxRetainedInputs::empty())),
-            },
-            output_node_ids,
-        ))
+/// Wraps a facade MLX executable in the bridge plan that owns retained
+/// input arrays, which stay outside `NablaExecutable`.
+fn mlx_execution_plan(executable: NablaExecutable) -> Result<TensorMlxExecutionPlan, String> {
+    match executable {
+        NablaExecutable::Mlx(plan) => Ok(TensorMlxExecutionPlan {
+            plan,
+            retained_inputs: Arc::new(Mutex::new(MlxRetainedInputs::empty())),
+        }),
+        executable => Err(unexpected_executable(NablaTarget::Mlx, &executable)),
     }
 }
 
@@ -5638,13 +5658,15 @@ fn compile_mlx_scalar_value_and_grad(
         requested_names.push(parameter_name);
         output_node_ids.push(gradient_node_id);
     }
-    let (plan, remapped_outputs) = graph
-        .compile_mlx_multi_plan(&output_node_ids)
+    let executable = graph
+        .compile_multi_output_executable(output_node_ids, NablaTarget::Mlx)
         .map_err(PyValueError::new_err)?;
-    let loss_node_id = remapped_outputs[0];
+    let frozen_outputs = executable.output_node_ids().to_vec();
+    let plan = mlx_execution_plan(executable.into_executable()).map_err(PyValueError::new_err)?;
+    let loss_node_id = frozen_outputs[0];
     let gradient_node_ids = requested_names
         .into_iter()
-        .zip(remapped_outputs.into_iter().skip(1))
+        .zip(frozen_outputs.into_iter().skip(1))
         .collect();
     Ok((plan, loss_node_id, gradient_node_ids))
 }
@@ -5828,9 +5850,11 @@ pub fn tensor_vmap_vjp_mlx_fn(
         gradient_names.push(name.clone());
         output_node_ids.push(node_id);
     }
-    let (plan, output_node_ids) = graph
-        .compile_mlx_multi_plan(&output_node_ids)
+    let executable = graph
+        .compile_multi_output_executable(output_node_ids, NablaTarget::Mlx)
         .map_err(PyValueError::new_err)?;
+    let output_node_ids = executable.output_node_ids().to_vec();
+    let plan = mlx_execution_plan(executable.into_executable()).map_err(PyValueError::new_err)?;
     let output_node_id = output_node_ids[0];
     let gradient_node_ids = gradient_names
         .into_iter()
@@ -5893,9 +5917,14 @@ pub fn tensor_vmap_jvp_mlx_fn(
     let graph = TensorTraceGraph {
         ir: Arc::new(Mutex::new(transformed.graph)),
     };
-    let (plan, output_node_ids) = graph
-        .compile_mlx_multi_plan(&[transformed.value, transformed.tangent])
+    let executable = graph
+        .compile_multi_output_executable(
+            vec![transformed.value, transformed.tangent],
+            NablaTarget::Mlx,
+        )
         .map_err(PyValueError::new_err)?;
+    let output_node_ids = executable.output_node_ids().to_vec();
+    let plan = mlx_execution_plan(executable.into_executable()).map_err(PyValueError::new_err)?;
     Ok(TensorVmapMlxJvpFunction {
         plan,
         value_node_id: output_node_ids[0],
