@@ -5148,8 +5148,13 @@ impl TensorIr {
 
         for (node_id, node) in self.nodes.iter().enumerate() {
             let tangent = match &node.op {
+                // Bool 輸入的切向量只能省略或為零（呼叫端常為每個輸入都提供
+                // 切向量，如 vmap JVP）；非零方向即要求對 bool 微分。
                 TensorOp::Input { name } if node.dtype == TensorDType::Bool => {
-                    if input_tangents.contains_key(name) {
+                    if input_tangents
+                        .get(name)
+                        .is_some_and(|tangent| tangent.data.iter().any(|value| *value != 0.0))
+                    {
                         return Err(bool_input_derivative_error(name));
                     }
                     DynamicTensor::filled(node.shape.clone(), 0.0)?

@@ -6367,7 +6367,16 @@ fn differentiating_bool_values_is_an_error_and_bool_inputs_have_no_gradient() {
     assert_eq!(mask_tangent.data(), &[0.0, 0.0, 0.0]);
     assert_eq!(mask_tangent.dtype(), TensorDType::F64);
 
+    // 零切向量等同省略（呼叫端常為每個輸入提供切向量）；非零方向是錯誤。
     let mut with_mask = tangents.clone();
+    with_mask.insert(
+        "mask".to_string(),
+        must!(DynamicTensor::filled(vec![3], 0.0)),
+    );
+    assert_eq!(
+        must!(graph.jvp(loss, &inputs, &with_mask)).1.data(),
+        tangent.data()
+    );
     with_mask.insert(
         "mask".to_string(),
         must!(DynamicTensor::filled(vec![3], 1.0)),
