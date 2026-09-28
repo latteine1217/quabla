@@ -58,7 +58,10 @@ Prerequisites:
 - Python 3.10 or newer and maturin 1.x (1.9.3 or later).
 - MLX builds: macOS on Apple silicon, CMake, and Xcode's Metal Toolchain
   (`xcodebuild -downloadComponent MetalToolchain`). The Python `mlx` wheel is
-  not used.
+  not used. The build writes the compiled Metal library to
+  `~/.mlx/lib/<key>/mlx.metallib`, or to `$MLX_RS_METAL_PATH` when that
+  variable is set at build time; the extension loads it from that path at run
+  time, so keep it in place (or rebuild after removing it).
 - CUDA builds: Linux with an NVIDIA driver. CUDA libraries are loaded at run
   time: `libnvrtc.so` is required, `libcublas` is used for rank-two `f32`
   GEMM when present (otherwise an NVRTC tiled kernel), and `libcusolver` is
