@@ -14,6 +14,11 @@ python examples/pinn_poisson.py
 python examples/benchmark_tensor_cpu.py
 ```
 
+`examples/plot_readme_figure.py` trains a small tanh-MLP Poisson PINN on the
+CPU backend and regenerates the README figure `docs/assets/pinn_poisson.png`.
+It needs matplotlib (`python -m pip install matplotlib`), which is not a
+Quabla dependency.
+
 MLX build (`--features mlx`): one-graph Poisson PINNs keep parameters and Adam
 moments on the MLX GPU stream; the two-layer MLP example checks PDE and
 boundary residuals plus trained parameters against CPU:
