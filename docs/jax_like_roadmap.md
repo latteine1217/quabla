@@ -162,19 +162,18 @@ delegate internally.
 Verification boundary (2026-07-29): the core lifecycle test checks CPU
 execution and generated JVP/VJP program structure. The installed PyO3
 extension test checks Python `Compiler.trace`, `Program.compile`, execution,
-and re-compilation of a VJP result. On `cuda-host` (GTX 1660 SUPER), the same
-facade test compiles a nonlinear scalar loss, its symbolic coordinate JVP, and
-one symbolic VJP program per input through CUDA, then compares all results to
-CPU at `1e-5` tolerance. The same GTX 1660 SUPER run validates a nonlinear
-fixed-bound Scan HVP through symbolic VJP then JVP: CUDA's paired carry result
-matches CPU at `2e-5` tolerance. A second parity case verifies an output reshape
-whose rank differs from the carry while preserving element count. The full
-CUDA Python matrix executes both acceptance paths and an indexed unequal-lane
-rejection path on that GPU; no Scan test is left outside the matrix runner.
-Workspace
-tests and all-feature Clippy pass on the local Apple-silicon host. MLX facade
-execution still requires a build with the `mlx` feature and target-host
-validation for each supported operation set.
+and re-compilation of a VJP result. On a single-GPU Linux host (GTX 1660
+SUPER), the same facade test compiles a nonlinear scalar loss, its symbolic
+coordinate JVP, and one symbolic VJP program per input through CUDA, then
+compares all results to CPU at `1e-5` tolerance. The same GTX 1660 SUPER run
+validates a nonlinear fixed-bound Scan HVP through symbolic VJP then JVP:
+CUDA's paired carry result matches CPU at `2e-5` tolerance. A second parity
+case verifies an output reshape whose rank differs from the carry while
+preserving element count. The full CUDA Python matrix executes both acceptance
+paths and an indexed unequal-lane rejection path on that GPU; no Scan test is
+left outside the matrix runner. Workspace tests and all-feature Clippy pass on
+the local Apple-silicon host. MLX facade execution still requires a build with
+the `mlx` feature and target-host validation for each supported operation set.
 
 Implementation status (2026-07-29, continued): CUDA primal Scan separates
 carry-lane and per-step-output-lane counts. For broadcast-compatible bodies,
@@ -223,12 +222,12 @@ numerics and operation coverage, so it is not part of this migration.
 
 Verification (2026-09-27): the local Apple-silicon host runs workspace tests
 and Clippy with and without `quabla-core/mlx`, plus the Python matrix with and
-without `QUABLA_MLX_TEST=1`. On `cuda-host` (GTX 1660 SUPER), `QUABLA_CUDA_TEST=1
-cargo test -p quabla-core --features cuda`, workspace Clippy with
-`quabla-core/cuda`, and the release CUDA extension's Python matrix with and
-without `QUABLA_CUDA_TEST=1` pass after the migration; a facade-routed
-`tensor_jit_cuda_fn` runs on the GPU (`backend == "cublas"`) and matches CPU
-within `2e-8`.
+without `QUABLA_MLX_TEST=1`. On a single-GPU Linux host (GTX 1660 SUPER),
+`QUABLA_CUDA_TEST=1 cargo test -p quabla-core --features cuda`, workspace
+Clippy with `quabla-core/cuda`, and the release CUDA extension's Python matrix
+with and without `QUABLA_CUDA_TEST=1` pass after the migration; a
+facade-routed `tensor_jit_cuda_fn` runs on the GPU (`backend == "cublas"`) and
+matches CPU within `2e-8`.
 
 Multi-output programs (2026-09-27): category (b) helpers freeze a value
 together with selected gradients or a primal/tangent pair into one plan and
@@ -833,27 +832,27 @@ backend lowers it to multi-device work yet.
 
 `examples/benchmark_pinn_cuda.py` records reproducible compilation, warm-up,
 and synchronized device-resident Poisson PINN Adam-step timings, including
-shape, transfer, and buffer-stability metadata. `cuda-host` has a visible GTX
-1660 SUPER and the CUDA runtime needed for functional parity tests. On
-2026-07-30, the release extension ran its width-16, four-collocation-point
-two-layer Poisson PINN for 1,000 timed steps after 100 warm-up steps at
-711.02 steps/s (1.406 ms/step). Compilation took 374.02 ms, loss decreased
-from `1.07943933e3` to `6.26469124e-3`, and the retained CUDA buffer count
-remained 58. Timed steps exclude diagnostic readback but are synchronized by
-the following `loss()` call. This is a small fixed-shape GTX baseline, not a
-cross-backend comparison or a large-model throughput claim. The same run with
-width 64 compiled in 1,248.56 ms and reached 693.11 steps/s (1.443 ms/step),
-with loss `4.54379500e5 -> 8.85865356e2` and the same 58 buffers. The 2.6%
-step-time difference at four collocation points shows that this harness is
-dominated by fixed launch/dispatch work; a larger-collocation benchmark is
-required before attributing throughput changes to GEMM or fusion scaling. The
-benchmark now accepts `--collocation` while retaining its fixed-shape/device
-resident contract. At width 64, 512 collocation points ran at 657.96 steps/s
-(1.520 ms/step; 1,338.54 ms compile) and 8,192 points ran at 368.81 steps/s
-(2.711 ms/step; 1,605.91 ms compile), both with 58 retained buffers. These
-measurements establish that the larger workload is no longer dominated solely
-by fixed dispatch cost; they remain one-device baselines, not evidence of a
-fusion speedup until a before/after comparison exists.
+shape, transfer, and buffer-stability metadata. The single-GPU Linux host has
+a visible GTX 1660 SUPER and the CUDA runtime needed for functional parity
+tests. On 2026-07-30, the release extension ran its width-16,
+four-collocation-point two-layer Poisson PINN for 1,000 timed steps after 100
+warm-up steps at 711.02 steps/s (1.406 ms/step). Compilation took 374.02 ms,
+loss decreased from `1.07943933e3` to `6.26469124e-3`, and the retained CUDA
+buffer count remained 58. Timed steps exclude diagnostic readback but are
+synchronized by the following `loss()` call. This is a small fixed-shape GTX
+baseline, not a cross-backend comparison or a large-model throughput claim.
+The same run with width 64 compiled in 1,248.56 ms and reached 693.11 steps/s
+(1.443 ms/step), with loss `4.54379500e5 -> 8.85865356e2` and the same 58
+buffers. The 2.6% step-time difference at four collocation points shows that
+this harness is dominated by fixed launch/dispatch work; a larger-collocation
+benchmark is required before attributing throughput changes to GEMM or fusion
+scaling. The benchmark now accepts `--collocation` while retaining its
+fixed-shape/device resident contract. At width 64, 512 collocation points ran
+at 657.96 steps/s (1.520 ms/step; 1,338.54 ms compile) and 8,192 points ran at
+368.81 steps/s (2.711 ms/step; 1,605.91 ms compile), both with 58 retained
+buffers. These measurements establish that the larger workload is no longer
+dominated solely by fixed dispatch cost; they remain one-device baselines, not
+evidence of a fusion speedup until a before/after comparison exists.
 
 `examples/benchmark_pinn_mlx.py` records the corresponding MLX compile,
 warm-up, fixed-shape training-step, dtype, device, synchronization, and
@@ -1120,7 +1119,7 @@ recorded in P6.
    prerequisite is available, connect the typed sharding schedule to the
    Python training interface, add two-GPU loss/gradient parity, then measure
    collective and readback boundaries separately. Status (2026-09-27):
-   `gpu-cluster` provides two RTX 3090s with NCCL; single-call two-GPU
+   a two-GPU node (2x RTX 3090) with NCCL is available; single-call two-GPU
    parity passes (see P7). Multi-step training and steady-state collective
    timing remain.
 
@@ -1290,9 +1289,10 @@ communicator setup. Python now exposes the same restricted contract through
 are split on axis zero, requested parameters must be replicated, and the
 callable returns only all-reduced parameter gradients plus timing diagnostics.
 Mapped-input gradients are deliberately rejected rather than incorrectly
-all-reduced. On `cuda-host`, Linux feature compilation, the core device contract,
-and the Python constructor contract pass; the host exposes one GTX 1660 SUPER
-and no NCCL library, so no collective or two-GPU numerical result is claimed.
+all-reduced. On the single-GPU Linux host, Linux feature compilation, the core
+device contract, and the Python constructor contract pass; the host exposes
+one GTX 1660 SUPER and no NCCL library, so no collective or two-GPU numerical
+result is claimed.
 
 Implementation status (2026-09-27): remaining item 2 is implemented for the
 first data-parallel subset. `TensorExecutionPlan::cuda_data_parallel_program(
@@ -1322,48 +1322,47 @@ partial sums, which `TensorShardingPlan` cannot express because partial
 placements and sharded matmul propagation are not modeled.
 Verification boundary: macOS CPU tests cover the lowering, a CPU simulation of
 the mixed schedule against the global CPU plan, and every rejection above.
-On `cuda-host`, the `cuda` suite, `cuda` and `cuda-nccl` clippy, the
-`cuda-nccl` test build, and the Python matrix pass; that host has one GPU and
-no NCCL library, so the NCCL-gated two-GPU test returns early there.
+On the single-GPU Linux host (GTX 1660 SUPER), the `cuda` suite, `cuda` and
+`cuda-nccl` clippy, the `cuda-nccl` test build, and the Python matrix pass;
+that host has one GPU and no NCCL library, so the NCCL-gated two-GPU test
+returns early there.
 
-Two-GPU verification (2026-09-27): slurm job 6008 on `gpu-cluster` (node
-gpu-node, 2x RTX 3090, driver 560.35.05, CUDA 12.6 module) ran commit
+Two-GPU verification (2026-09-27): the two-GPU parity run on a single
+Linux node (2x RTX 3090, driver 560.35.05, CUDA 12.6) tested commit
 `b38b987`. The Python caller-reduction callable matches the deterministic
 CPU oracle exactly for both reductions (`Sum`: loss 35.75, weight gradient
 -45.0; `Mean`: loss 17.875, gradient -22.5; absolute error 0.0). The
 mixed-schedule Rust test matches the global CPU plan within `1.7e-7`
 (`Sum` output) and `5.0e-9` (`Mean` output). Each is a single call, so the
 reported collective durations (0.63-1.08 s) are not steady-state collective
-costs. Job 6005 ran the same Python parity against the pre-`b38b987`
-extension, whose per-rank NCCL calls were not grouped, and hit its 20-minute
-limit; with grouping, job 6008 finished in 7 s. Commit `920ee7d` later
-changed how the data-parallel path freezes its program; job 6009 reran both
-checks at `535ef84` on the same node and reproduced the same values and
+costs. An earlier run of the same Python parity against the pre-`b38b987`
+extension, whose per-rank NCCL calls were not grouped, hit its 20-minute
+time limit; with grouping, the parity run finished in 7 s. Commit `920ee7d`
+later changed how the data-parallel path freezes its program; a rerun of
+both checks at `535ef84` on the same node reproduced the same values and
 errors.
 
-Two-GPU training verification (2026-09-27): the data-parallel plan created
-its NCCL communicators (`ncclCommInitAll`) on every call and dropped them,
-issuing `ncclCommAbort`, before synchronizing the replicas; the single-call
-collective durations above were mostly that initialization. Commit
-`b9131a2` creates the communicators once in `compile_data_parallel` and
-keeps them for the plan's lifetime behind a mutex that serializes
-invocations. `examples/validate_data_parallel_training_cuda.py` trains a
-2-32-32-1 tanh MLP on a fixed 16x16 grid (256 rows, mapped `x`/`target`)
-for 200 host-side SGD steps (learning rate 0.1) from identical f32-rounded
-Glorot weights and zero biases in four modes: the two-GPU callable with
-`mean`, the same with `sum` (loss and learning rate divided by 2), the
-single-GPU callable on the full batch, and the full-batch f64 CPU
-value-and-gradient.
-A pair fails if any step's loss differs by more than `1e-4` relative to the
-second mode of the pair, or if the final parameters differ by more than
-`1e-4` in `max|a - b| / max|b|` over all parameters. `1e-4` is about 6.5
-times the f32 worst-case rounding bound for the 256-row batch mean
-(`256 * 2^-24`), while reduction bugs such as a `Sum`/`Mean` mix-up give
-O(1) differences. Slurm job 6011 (`scripts/slurm/quabla_p7_training.sbatch`,
-node gpu-node, 2x RTX 3090, driver 560.35.05, CUDA 12.6, NCCL 2.24.3) ran the
-tree of `66ef989` and passed; job 6010 produced identical differences but
-exited non-zero because its 50-step baseline run did not meet the
-loss-halving check. Loss fell from 0.3024 to 0.1335 in every mode.
+Two-GPU training verification (2026-09-27): the data-parallel plan created its
+NCCL communicators (`ncclCommInitAll`) on every call and dropped them, issuing
+`ncclCommAbort`, before synchronizing the replicas; the single-call collective
+durations above were mostly that initialization. Commit `b9131a2` creates the
+communicators once in `compile_data_parallel` and keeps them for the plan's
+lifetime behind a mutex that serializes invocations.
+`examples/validate_data_parallel_training_cuda.py` trains a 2-32-32-1 tanh MLP
+on a fixed 16x16 grid (256 rows, mapped `x`/`target`) for 200 host-side SGD
+steps (learning rate 0.1) from identical f32-rounded Glorot weights and zero
+biases in four modes: the two-GPU callable with `mean`, the same with `sum`
+(loss and learning rate divided by 2), the single-GPU callable on the full
+batch, and the full-batch f64 CPU value-and-gradient. A pair fails if any
+step's loss differs by more than `1e-4` relative to the second mode of the
+pair, or if the final parameters differ by more than `1e-4` in `max|a - b| /
+max|b|` over all parameters. `1e-4` is about 6.5 times the f32 worst-case
+rounding bound for the 256-row batch mean (`256 * 2^-24`), while reduction
+bugs such as a `Sum`/`Mean` mix-up give O(1) differences. The two-GPU training
+run on the same node (2x RTX 3090, driver 560.35.05, CUDA 12.6, NCCL 2.24.3)
+tested the tree of `66ef989` and passed; an earlier run produced identical
+differences but exited non-zero because its 50-step baseline run did not meet
+the loss-halving check. Loss fell from 0.3024 to 0.1335 in every mode.
 
 | Pair | Max loss rel. error | Max param abs. error | Param normwise rel. error |
 | --- | --- | --- | --- |
@@ -1374,7 +1373,7 @@ loss-halving check. Loss fell from 0.3024 to 0.1335 in every mode.
 
 Timing is host-observed per call; steady state is steps 10-199 (median,
 min-max). The baseline row is the pre-fix extension (`4d99716`) run in the
-same job with the same 200 steps; it reproduced the final loss exactly.
+same run with the same 200 steps; it reproduced the final loss exactly.
 
 | Two-GPU `mean` | First step | Steady median | Steady min-max |
 | --- | --- | --- | --- |
@@ -1401,9 +1400,9 @@ ones before enqueuing; a panic while the lock is held still poisons it and
 rejects every later call. The natural trigger is a replica whose input map
 lacks its shard: it fails input validation after replica 0 has enqueued
 its work. No fault-injection seam was added, so an error returned by NCCL
-itself takes the same path but is not exercised. Slurm job 6015
-(`scripts/slurm/quabla_p7_robustness.sbatch`, node gpu-node, 2x RTX 3090,
-driver 560.35.05, NCCL 2.24.3) ran the tree of `ff0735e`:
+itself takes the same path but is not exercised. The two-GPU robustness run
+on the same node (2x RTX 3090, driver 560.35.05, NCCL 2.24.3) tested the
+tree of `ff0735e`:
 
 - Recovery: after a successful call, two consecutive failed calls each
   returned `missing input "x"` with the reset note (the second first
@@ -1411,7 +1410,7 @@ driver 560.35.05, NCCL 2.24.3) ran the tree of `ff0735e`:
   matched the CPU plan within `1e-5`. The first recovered call took
   109 ms wall, which includes creating the communicators and a 67.6 ms
   first collective on them (first collectives of fresh plans in the same
-  job take 43-71 ms); the next two took 0.33 ms and 0.25 ms.
+  run take 43-71 ms); the next two took 0.33 ms and 0.25 ms.
 - Lifecycle: 50 compile, execute, drop cycles in 37.9 s, each matching
   the CPU plan within `1e-5`; odd cycles dropped the plan right after a
   failed call that left replica 0's work enqueued. With the test holding
@@ -1421,7 +1420,7 @@ driver 560.35.05, NCCL 2.24.3) ran the tree of `ff0735e`:
   before and after the tests. No call or drop hung; every step ran under
   a 300 s timeout.
 
-Larger-scale training (2026-09-27): the same job ran the validation at
+Larger-scale training (2026-09-27): the same run executed the validation at
 16,384 and 65,536 rows (`--grid 128`/`256`) and widths 256 and 512 for 50
 SGD steps (learning rate 0.1, steady state steps 10-49), comparing the
 two-GPU callable with the single-GPU callable; the f64 CPU mode is too
@@ -1435,7 +1434,7 @@ first step's gradients, evaluated at identical inputs, where such a bug is
 an O(1) normwise error. Plain SGD at these widths only leaves its initial
 plateau after a few hundred steps, so these runs require only that the
 loss does not increase (`--max-loss-ratio 1.0`). The default 256-row run
-in the same job reproduced job 6011 (loss 0.3024 to 0.1335, identical
+in the same run reproduced the training run (loss 0.3024 to 0.1335, identical
 error levels, first-step gradient error at most `2.0e-7`).
 
 | Rows | Width | Loss | Max loss rel. error | Param normwise rel. error | First-step gradient rel. error |
@@ -1465,7 +1464,7 @@ because enqueue returns before the kernels finish, so at these sizes it is
 not the NCCL cost alone. Two GPUs are faster at 16,384 rows and width 256
 and at both 65,536-row sizes, and slower at 16,384 rows and width 512,
 where about 9 ms of the two-GPU call lies outside the three recorded
-intervals and is not attributed. One node, one job, and host-side
+intervals and is not attributed. One node, one run, and host-side
 parameter updates were measured.
 
 Remaining implementation order:
@@ -1473,17 +1472,18 @@ Remaining implementation order:
 1. Validate the Python scalar value-and-gradient callable on two GPUs against
    the deterministic CPU oracle for both `Sum` and `Mean`; only then consider
    mapped-input gradient concatenation as a separate output contract.
-   Single-call parity verified (2026-09-27, job 6008); 200-step training
-   parity and steady-state collective timing verified (2026-09-27, job
-   6011).
+   Single-call parity verified (2026-09-27, two-GPU parity run); 200-step
+   training parity and steady-state collective timing verified (2026-09-27,
+   two-GPU training run).
 2. Bind `TensorShardingPlan::all_reduces` to CUDA lowering, preserving its
    operation order and rejecting schedules not represented by the first
    data-parallel subset. Implemented and two-GPU parity verified
-   (2026-09-27, job 6008).
+   (2026-09-27, two-GPU parity run).
 3. Add failure-handling and communicator-lifecycle coverage before considering
    multi-node transport or tensor-parallel matmul. Communicators are now
    created once per compiled plan (2026-09-27). Failure recovery and 50
-   compile/execute/drop cycles verified on two GPUs (2026-09-27, job 6015);
+   compile/execute/drop cycles verified on two GPUs (2026-09-27, two-GPU
+   robustness run);
    an error returned by NCCL itself and a drop while a collective is in
    flight are not exercised, because the public API cannot reach them
    without fault injection.
@@ -1492,7 +1492,7 @@ Acceptance checks:
 
 - Two-GPU data-parallel training matches the single-GPU reference within
   documented tolerance and records collective timing separately. Met
-  (2026-09-27, job 6011) for the host-SGD MLP check above.
+  (2026-09-27, two-GPU training run) for the host-SGD MLP check above.
 
 ### Research Track: Rust Source-To-Source AD
 
