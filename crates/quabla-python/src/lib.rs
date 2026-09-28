@@ -51,7 +51,8 @@ fn py_where(
         return Ok(output.into_pyobject(py)?.into_any().unbind());
     }
 
-    // Tensor 與 TraceTensor 的分支可為 Python 純量（弱型別，採用另一分支的 dtype）。
+    // Tensor and TraceTensor branches may be Python scalars (weakly typed, adopting the other
+    // branch's dtype).
     let eager_branch = |value: &Bound<'_, PyAny>| -> Option<PyTensor> {
         if let Ok(tensor) = value.extract::<PyRef<'_, PyTensor>>() {
             return Some(tensor.clone());

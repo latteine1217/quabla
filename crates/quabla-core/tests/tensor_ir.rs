@@ -327,7 +327,7 @@ fn mlp_value_and_grad_program(
         vjp.gradients["w2"],
         vjp.gradients["b2"],
     ];
-    // 決定性的非整數輸入，使 f32 捨入在每個節點都實際發生。
+    // Deterministic non-integer inputs so that f32 rounding actually happens at every node.
     let values = |count: usize, seed: f64| -> Vec<f64> {
         (0..count)
             .map(|index| ((index as f64 + 1.0) * seed).sin() * 0.9)
@@ -408,7 +408,8 @@ fn assert_f32_mlp_parity(target: QuablaTarget) {
     assert!(f32_error <= 1e-6, "device vs CPU f32 error {f32_error:e}");
     assert!(f64_error <= 1e-5, "device vs CPU f64 error {f64_error:e}");
 
-    // cast 在裝置上是 f32 恆等；f64->f32->f64 往返與 CPU 位元一致並保留 dtype 標記。
+    // cast is an f32 identity on device; the f64->f32->f64 round trip matches the CPU bitwise and
+    // keeps the dtype tag.
     let mut graph = TensorIr::new();
     let x = must!(graph.input("x", vec![3]));
     let single = must!(graph.cast(x, TensorDType::F32));
@@ -1952,7 +1953,8 @@ fn cuda_backend_reuses_cond_regions_and_rejects_non_finite_predicates_when_enabl
     }
     let (graph, loss) = must!(log_guard_cond_graph());
     let compiled = must!(CudaBackend::new(0).compile(must!(graph.compile_cpu(loss))));
-    // 同一個已編譯計畫交替兩個分支，確認區域 buffer 回收後仍正確且不累積。
+    // Alternate both branches on one compiled plan to check that region buffers stay correct and do
+    // not accumulate after reuse.
     let mut buffer_counts = Vec::new();
     for (x, expected) in [
         (2.0, 6.0 * 2.0_f64.ln()),
@@ -2707,7 +2709,8 @@ fn assert_log_guard_cond_matches_cpu(
             }
         }
     }
-    // 未選分支不得影響梯度：x <= 0 時 log 分支完全不參與。
+    // The unselected branch must not affect the gradient: for x <= 0 the log branch does not
+    // participate at all.
     let negative = BTreeMap::from([
         ("x".to_string(), DynamicTensor::new(vec![], vec![-1.0])?),
         (
@@ -2739,7 +2742,8 @@ fn mlx_backend_executes_only_the_selected_cond_region_with_ad_parity() {
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
 fn mlx_backend_returns_float_masks_from_greater_like_cpu() {
-    // greater 在 IR 中是 0/1 浮點遮罩；MLX 回讀、累加與 Cond 謂詞都須與 CPU 一致。
+    // greater is a 0/1 float mask in the IR; MLX readback, accumulation, and Cond predicates must
+    // match the CPU.
     let mut graph = TensorIr::new();
     let x = must!(graph.input("x", vec![3]));
     let y = must!(graph.input("y", vec![3]));
@@ -4724,7 +4728,7 @@ fn cuda_matmul_bias_tanh_epilogue_only_fuses_plan_inputs_when_enabled() {
         ("w", vec![3, 2]),
         ("b", vec![1, 2]),
     ]));
-    // 依序為 raw 輸入、計算出的 lhs、rhs、bias；只有 raw 輸入可走融合 epilogue。
+    // In order: raw input, computed lhs, rhs, bias; only raw inputs may take the fused epilogue.
     for computed in [None, Some("x"), Some("w"), Some("b")] {
         let mut graph = TensorIr::new();
         let operand = |graph: &mut TensorIr, name: &str, shape| {
@@ -4786,7 +4790,8 @@ fn cuda_two_layer_mlp_matches_cpu_across_single_and_multi_output_plans_when_enab
         ("seed", vec![4, 2]),
     ]));
 
-    // 第一個輸出是 raw 輸入的 matmul-bias-tanh 時，其餘輸出仍須逐節點求值。
+    // When the first output is a matmul-bias-tanh of raw inputs, the remaining outputs must still
+    // be evaluated per node.
     let plans = [
         must!(graph.compile_cpu_many(&[output])),
         must!(graph.compile_cpu_many(&[hidden, output])),
@@ -5418,9 +5423,9 @@ fn mlx_backend_matches_cpu_for_concat_broadcast_and_tanh() {
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
 fn mlx_backend_serializes_concurrent_execution_across_threads() {
-    // MLX 的預設 GPU stream 為全行程共用；若後端未序列化，多執行緒同時 eval
-    // 會觸發 Metal "uncommitted encoder" assertion 或卡死。Fori 每步都會 eval，
-    // 可放大交錯機率。
+    // MLX's default GPU stream is process-wide; if the backend were not serialized, concurrent
+    // evals from multiple threads would trigger the Metal "uncommitted encoder" assertion or hang.
+    // Fori evaluates on every step, which raises the chance of interleaving.
     let mut body = TensorIr::new();
     let carry = must!(body.input("carry", vec![]));
     let index = must!(body.input("index", vec![]));
@@ -5533,7 +5538,7 @@ fn typed_f32_input_adopts_weak_scalars_and_lowers_as_f32() {
     assert!(graph.lower_text().contains("tensor<2xf32>"));
     assert!(graph.lower_text().contains("cast("));
 
-    // 弱純量先轉成 f32(0.1)，再與 f32 輸入相加並捨入。
+    // The weak scalar is first converted to f32(0.1), then added to the f32 input and rounded.
     let inputs = f32_inputs(&[("x", vec![2], vec![1.0, 2.5])]);
     let plan = must!(graph.compile_cpu(output));
     assert_eq!(plan.output_dtype(), Ok(TensorDType::F32));
@@ -5588,7 +5593,7 @@ fn cpu_f32_arithmetic_matches_ieee_single_precision_bitwise() {
     let expected_fused = (0..5)
         .map(|i| (xs[i] as f32) * (ys[i] as f32) + zs[i] as f32)
         .collect::<Vec<_>>();
-    // 逐元素融合路徑與一般直譯路徑都必須逐節點捨入。
+    // Both the fused elementwise path and the generic interpreter path must round per node.
     let fused_plan = must!(graph.compile_cpu(fused));
     assert!(fused_plan.uses_fused_elementwise_kernel());
     for value in [
@@ -5632,7 +5637,7 @@ fn cast_round_trips_are_kept_and_same_dtype_casts_are_removed() {
     assert_eq!(value.data(), &[0.10000000149011612]);
     assert_eq!(plan.node_count(), 3);
 
-    // 常數的有損往返同樣不可在折疊時被抵銷。
+    // A lossy round trip of a constant must not be cancelled during folding either.
     let mut graph = TensorIr::new();
     let tenth = graph.scalar_constant(0.1);
     let single = must!(graph.cast(tenth, TensorDType::F32));
@@ -5657,7 +5662,7 @@ fn cast_round_trips_are_kept_and_same_dtype_casts_are_removed() {
 
 #[test]
 fn cast_ad_rules_convert_tangents_and_cotangents_between_dtypes() {
-    // loss(x) = sum(cast(x, f32)^2)，x 為 f64。
+    // loss(x) = sum(cast(x, f32)^2), with x in f64.
     let mut graph = TensorIr::new();
     let x = must!(graph.input("x", vec![3]));
     let single = must!(graph.cast(x, TensorDType::F32));
@@ -5695,7 +5700,8 @@ fn cast_ad_rules_convert_tangents_and_cotangents_between_dtypes() {
             .sum::<f32>()
             .into()
     };
-    // 中央差分對二次函數無截斷誤差；剩餘誤差來自 f32 捨入 (~|f| 6e-8 / h)。
+    // Central differences have no truncation error on a quadratic; the remaining error comes from
+    // f32 rounding (~|f| 6e-8 / h).
     let step = 1e-2;
     for index in 0..3 {
         let mut plus = point;
@@ -5737,7 +5743,7 @@ fn cse_keeps_casts_distinct_from_their_sources_and_merges_identical_casts() {
     assert_ne!(outputs[0], outputs[1]);
     assert_eq!(outputs[1], outputs[2]);
 
-    // 相同值、不同 dtype 的常數也不可合併。
+    // Constants with the same value but different dtypes must not be merged either.
     let mut graph = TensorIr::new();
     let tenth = graph.scalar_constant(0.1);
     let single = must!(graph.cast(tenth, TensorDType::F32));
@@ -5830,7 +5836,8 @@ fn f32_fori_carry_adopts_a_typed_index_and_rejects_mixed_captures() {
 
 #[test]
 fn cond_region_transforms_do_not_leak_non_finite_captures() {
-    // false 分支以 greater 遮罩避開 NaN；區域 AD 保留捕獲時不可讀取其值。
+    // The false branch avoids NaN with a greater mask; when region AD retains a capture, it must
+    // not read the capture's value.
     let mut on_true = TensorIr::new();
     let true_x = must!(on_true.input("x", vec![3]));
     let true_squared = must!(on_true.mul(true_x, true_x));
@@ -5943,7 +5950,8 @@ fn bool_primitive_program() -> Result<(TensorIr, ExpectedOutputs), String> {
         (graph.any_axis(greater, 1)?, vec![1.0, 0.0]),
         (graph.all_axis(y_finite, 0)?, vec![0.0, 1.0, 0.0]),
     ]);
-    // f32 殘差乘 Bool 遮罩得 f32；mask * 2.0 為弱 f64，遇到 f32 殘差後採用 f32。
+    // An f32 residual times a Bool mask gives f32; mask * 2.0 is a weak f64 and adopts f32 when
+    // combined with the f32 residual.
     let masked = graph.mul(r, x_finite)?;
     let two = graph.scalar_constant(2.0);
     let weak = graph.mul(x_finite, two)?;
@@ -6046,7 +6054,7 @@ fn comparisons_logical_ops_and_reductions_follow_ieee_semantics_on_cpu() {
             TensorDType::F32
         };
         assert_eq!(graph.node_dtype(*output), Ok(dtype), "output {index}");
-        // 逐節點直譯器與（可融合時的）融合直譯器必須一致。
+        // The per-node interpreter and (when fusible) the fused interpreter must agree.
         let evaluated = must!(graph.evaluate(*output, &inputs));
         let plan = must!(graph.compile_cpu(*output));
         let executed = must!(CpuBackend.execute(&plan, &inputs));
@@ -6064,7 +6072,8 @@ fn comparisons_logical_ops_and_reductions_follow_ieee_semantics_on_cpu() {
     assert_eq!(compare_node.op, "greater_equal");
     assert_eq!(compare_node.dtype, TensorDType::Bool);
 
-    // StableHLO 探針以 i1 表示 Bool；比較本身不在已驗證子集中而明確拒絕。
+    // The StableHLO probe represents Bool as i1; comparisons are outside the verified subset and
+    // are rejected explicitly.
     let mut probe = TensorIr::new();
     let mask = must!(probe.input_typed("mask", vec![3], TensorDType::Bool));
     let numeric = must!(probe.cast(mask, TensorDType::F64));
@@ -6077,7 +6086,7 @@ fn comparisons_logical_ops_and_reductions_follow_ieee_semantics_on_cpu() {
     let compared = must!(probe.compare(numeric, zero, TensorComparison::Less));
     assert!(probe.stablehlo_text(compared).is_err());
 
-    // 常數比較在計畫編譯時折疊為 Bool 常數。
+    // Constant comparisons fold into Bool constants at plan compile time.
     let mut constant = TensorIr::new();
     let one = constant.scalar_constant(1.0);
     let two = constant.scalar_constant(2.0);
@@ -6132,14 +6141,15 @@ fn bool_operands_promote_like_arithmetic_and_reject_bool_arithmetic() {
     }
     assert!(graph.isnan(mask).is_err());
 
-    // Bool 可參與資料搬移、select 與比較；兩個 Bool 以 0/1 比較。
+    // Bool can take part in data movement, select, and comparisons; two Bools compare as 0/1.
     let same = must!(graph.compare(mask, other, TensorComparison::Equal));
     let reshaped = must!(graph.reshape(same, vec![2, 1]));
     let selected = must!(graph.where_select(mask, same, other));
     assert_eq!(graph.node_dtype(reshaped), Ok(TensorDType::Bool));
     assert_eq!(graph.node_dtype(selected), Ok(TensorDType::Bool));
 
-    // float->bool 以非零為真（NaN 亦為真）；bool->float 得 0/1；舊 greater 仍是浮點遮罩。
+    // float->bool treats non-zero as true (NaN included); bool->float gives 0/1; legacy greater is
+    // still a float mask.
     let truthy = must!(graph.cast(x, TensorDType::Bool));
     let numeric = must!(graph.cast(mask, TensorDType::F32));
     let legacy = must!(graph.greater(r, zero));
@@ -6178,14 +6188,14 @@ fn where_and_cond_accept_bool_and_legacy_float_predicates() {
         &[2.0, -0.0, 3.0]
     );
 
-    // all(isfinite(x)) 作為 Cond 謂詞；false 分支自行防護非有限值。
+    // all(isfinite(x)) as a Cond predicate; the false branch guards non-finite values itself.
     let (graph, output) = must!(finite_guard_cond_graph());
     let finite = f32_inputs(&[("x", vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]);
     assert_eq!(must!(graph.evaluate(output, &finite)).data(), &[91.0]);
     let guarded = f32_inputs(&[("x", vec![2, 3], BOOL_X.to_vec())]);
     assert_eq!(must!(graph.evaluate(output, &guarded)).data(), &[4.5]);
 
-    // Bool 分支結果與 Bool 迴圈 carry 在 D2 明確拒絕。
+    // Bool branch results and Bool loop carries are rejected explicitly in D2.
     let mut branch = TensorIr::new();
     let captured = must!(branch.input("x", vec![]));
     let branch_zero = branch.scalar_constant(0.0);
@@ -6194,7 +6204,8 @@ fn where_and_cond_accept_bool_and_legacy_float_predicates() {
     let error = TensorCondExecutionPlan::new(plan.clone(), plan)
         .expect_err("bool branch results are not supported");
     assert!(error.contains("astype"), "{error}");
-    // 迴圈區域的 AD 會為每個輸入配對切向量，因此 Bool carry 與 Bool 捕獲都拒絕。
+    // Loop-region AD pairs every input with a tangent, so both Bool carries and Bool captures are
+    // rejected.
     let mut body = TensorIr::new();
     let carry = must!(body.input_typed("carry", vec![], TensorDType::Bool));
     must!(body.input("index", vec![]));
@@ -6264,7 +6275,8 @@ fn bool_masks_have_no_derivatives_and_nan_guards_keep_gradients_finite() {
         assert_close(&gradients[1], &MASKED_GRAD_W, 1e-12);
     }
 
-    // 中央差分：遮罩邊界（0.5）遠離各點，因此損失在各座標局部平滑。
+    // Central differences: the mask boundary (0.5) is far from every point, so the loss is locally
+    // smooth in each coordinate.
     let finite_x = [1.0, 2.0, -0.3, 0.7, 0.2, 2.0];
     let finite_inputs = bool_inputs(&finite_x);
     let symbolic_gradient = must!(symbolic
@@ -6294,10 +6306,11 @@ fn bool_masks_have_no_derivatives_and_nan_guards_keep_gradients_finite() {
             symbolic_gradient.data()[index]
         );
     }
-    // symbolic_jvp 以全 1 方向播種，因此切向量等於各座標偏導之和。
+    // symbolic_jvp seeds an all-ones direction, so the tangent equals the sum of the partial
+    // derivatives.
     assert!((tangent_graph_value.data()[0] - directional).abs() < 1e-5);
 
-    // 舊的浮點遮罩寫法 sum(x.gt(0) * x) 讓 0 * NaN 滲入值與梯度。
+    // The legacy float-mask form sum(x.gt(0) * x) lets 0 * NaN leak into values and gradients.
     let mut legacy = TensorIr::new();
     let x = must!(legacy.input("x", vec![2, 3]));
     let zero = legacy.scalar_constant(0.0);
@@ -6312,7 +6325,8 @@ fn bool_masks_have_no_derivatives_and_nan_guards_keep_gradients_finite() {
         .iter()
         .all(|value| value.is_finite()));
 
-    // Cond 謂詞 all(isfinite(x))：選中的防護分支在含 NaN/inf 時仍給有限梯度。
+    // Cond predicate all(isfinite(x)): the selected guarded branch still gives finite gradients
+    // with NaN/inf present.
     let (cond_graph, cond_output) = must!(finite_guard_cond_graph());
     let transformed = must!(cond_graph.symbolic_vjp(cond_output, "seed"));
     let gradient = must!(transformed
@@ -6382,7 +6396,8 @@ fn differentiating_bool_values_is_an_error_and_bool_inputs_have_no_gradient() {
     assert_eq!(mask_tangent.data(), &[0.0, 0.0, 0.0]);
     assert_eq!(mask_tangent.dtype(), TensorDType::F64);
 
-    // 零切向量等同省略（呼叫端常為每個輸入提供切向量）；非零方向是錯誤。
+    // A zero tangent is equivalent to omitting it (callers often supply a tangent per input); a
+    // non-zero direction is an error.
     let mut with_mask = tangents.clone();
     with_mask.insert(
         "mask".to_string(),
@@ -6432,7 +6447,7 @@ fn differentiating_bool_values_is_an_error_and_bool_inputs_have_no_gradient() {
         assert!(error.contains("bool output"), "{error}");
     }
 
-    // Bool 資料搬移（any_axis 的 reshape/cast/sum 組合）上的切向量為零。
+    // The tangent through Bool data movement (the reshape/cast/sum chain of any_axis) is zero.
     let all_positive = must!(graph.all_axis(positive, 0));
     let weights = must!(graph.cast(all_positive, TensorDType::F64));
     let weighted = must!(graph.mul(weights, squared));
@@ -6529,7 +6544,8 @@ fn assert_bool_parity(target: QuablaTarget) {
     ));
     let device = must!(must!(compiler.compile_many(&program, target)).execute(&inputs));
     for ((actual, (_, expected)), index) in device.iter().zip(&outputs).zip(0..) {
-        // Bool 回讀標記為 bool，值與 CPU 完全相同；f32 輸出同為原生 f32 運算。
+        // Bool readback is tagged bool with values identical to the CPU; f32 outputs are likewise
+        // native f32 arithmetic.
         assert_eq!(
             actual.data(),
             expected.as_slice(),

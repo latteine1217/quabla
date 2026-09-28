@@ -3468,7 +3468,8 @@ impl TensorBatchJitFunction {
                 shape.clone()
             };
             static_shapes.push(static_shape);
-            // 批次特化以批次大小為快取鍵，因此一律以 f64 追蹤；f32 值會無損放寬。
+            // Batch specialization keys the cache by batch size, so inputs are always traced as
+            // f64; f32 values widen losslessly.
             input_specs.push(TensorInputSpec::new(name.clone(), shape, TensorDType::F64));
         }
         let batch_size = batch_size.ok_or_else(|| {
@@ -3570,7 +3571,8 @@ impl TensorBatchValueAndGradFunction {
                 shape.clone()
             };
             static_shapes.push(static_shape);
-            // 批次特化以批次大小為快取鍵，因此一律以 f64 追蹤；f32 值會無損放寬。
+            // Batch specialization keys the cache by batch size, so inputs are always traced as
+            // f64; f32 values widen losslessly.
             input_specs.push(TensorInputSpec::new(name.clone(), shape, TensorDType::F64));
         }
         let batch_size = batch_size.ok_or_else(|| {
@@ -3695,7 +3697,8 @@ impl TensorBatchMlxValueAndGradFunction {
                 shape.clone()
             };
             static_shapes.push(static_shape);
-            // 批次特化以批次大小為快取鍵，因此一律以 f64 追蹤；f32 值會無損放寬。
+            // Batch specialization keys the cache by batch size, so inputs are always traced as
+            // f64; f32 values widen losslessly.
             input_specs.push(TensorInputSpec::new(name.clone(), shape, TensorDType::F64));
         }
         let batch_size = batch_size.ok_or_else(|| {
@@ -3902,7 +3905,8 @@ fn batch_specialization_signature(
             shape.clone()
         };
         static_shapes.push(static_shape);
-        // 批次特化以批次大小為快取鍵，因此一律以 f64 追蹤；f32 值會無損放寬。
+        // Batch specialization keys the cache by batch size, so inputs are always traced as f64;
+        // f32 values widen losslessly.
         input_specs.push(TensorInputSpec::new(name.clone(), shape, TensorDType::F64));
     }
     let batch_size = batch_size.ok_or_else(|| {
@@ -4686,7 +4690,8 @@ pub fn tensor_fori_loop_region(
     }
 
     let body_graph = TensorTraceGraph::new();
-    // 迴圈索引採用 carry 的 dtype，行為如同弱純量：f32 carry 的迴圈維持 f32。
+    // The loop index adopts the carry dtype and behaves like a weak scalar: loops over an f32 carry
+    // stay f32.
     let carry_dtype = init.dtype().map_err(PyValueError::new_err)?;
     let carry = if init.batch_axis.is_some() {
         body_graph.add_batched_input("__quabla_fori_carry", init.shape.clone(), carry_dtype)
@@ -4821,7 +4826,8 @@ pub fn tensor_scan_region(
     }
 
     let body_graph = TensorTraceGraph::new();
-    // 迴圈索引採用 carry 的 dtype，行為如同弱純量：f32 carry 的迴圈維持 f32。
+    // The loop index adopts the carry dtype and behaves like a weak scalar: loops over an f32 carry
+    // stay f32.
     let carry_dtype = init.dtype().map_err(PyValueError::new_err)?;
     let carry = if init.batch_axis.is_some() {
         body_graph.add_batched_input("__quabla_scan_carry", init.shape.clone(), carry_dtype)
@@ -6205,7 +6211,8 @@ pub fn tensor_vmap_vjp_mlx_fn(
     let mut output_node_ids = vec![output_node_id];
     let mut gradient_names = Vec::with_capacity(signature.input_names.len());
     for name in &signature.input_names {
-        // bool 輸入不可微，VJP 梯度表不含它們，回傳結果亦略過。
+        // bool inputs are not differentiable: the VJP gradient table excludes them and they are
+        // skipped in the result.
         if trace_input_is_bool(&traced.graph, name)? {
             continue;
         }
@@ -6248,7 +6255,7 @@ pub fn tensor_vmap_jvp_mlx_fn(
         .iter()
         .map(|spec| spec.name.clone())
         .collect::<BTreeSet<_>>();
-    // bool 輸入沒有切向量，不建立切向量輸入。
+    // bool inputs have no tangent, so no tangent input is created.
     let tangent_names = input_specs
         .iter()
         .filter(|spec| spec.dtype.is_floating())
@@ -6318,7 +6325,7 @@ pub fn tensor_vmap_jvp_cuda_fn(
         .iter()
         .map(|spec| spec.name.clone())
         .collect::<BTreeSet<_>>();
-    // bool 輸入沒有切向量，不建立切向量輸入。
+    // bool inputs have no tangent, so no tangent input is created.
     let tangent_names = input_specs
         .iter()
         .filter(|spec| spec.dtype.is_floating())
@@ -6583,7 +6590,8 @@ pub fn tensor_vmap_vjp_cuda_fn(
     let mut output_node_ids = vec![value_node_id];
     let mut gradient_names = Vec::with_capacity(signature.input_names.len());
     for name in &signature.input_names {
-        // bool 輸入不可微，VJP 梯度表不含它們，回傳結果亦略過。
+        // bool inputs are not differentiable: the VJP gradient table excludes them and they are
+        // skipped in the result.
         if trace_input_is_bool(&traced.graph, name)? {
             continue;
         }

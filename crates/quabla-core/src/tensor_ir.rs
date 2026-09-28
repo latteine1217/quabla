@@ -1106,7 +1106,7 @@ impl TensorDType {
     /// including `NaN`, becomes `1.0` (NumPy `astype(bool)` semantics).
     pub fn round(self, value: f64) -> f64 {
         match self {
-            // `as f32` 為 IEEE round-to-nearest-even，溢位得 ±inf，與裝置 f32 一致。
+            // `as f32` is IEEE round-to-nearest-even and overflows to ±inf, matching device f32.
             Self::F32 => value as f32 as f64,
             Self::F64 => value,
             Self::Bool => f64::from(value != 0.0),
@@ -1207,7 +1207,7 @@ impl TensorDeviceBackend {
     pub fn execution_dtype(self, logical: TensorDType) -> Result<TensorDType, String> {
         Ok(match (self, logical) {
             (Self::Cpu, dtype) => dtype,
-            // Bool 以 f32 的 0/1 值執行；真正的位元/u8 儲存屬於 D4 之後的工作。
+            // Bool executes as f32 0/1 values; real bit/u8 storage is post-D4 work.
             (Self::Cuda | Self::Mlx, TensorDType::F64 | TensorDType::F32 | TensorDType::Bool) => {
                 TensorDType::F32
             }
@@ -2283,7 +2283,8 @@ impl TensorIr {
                 TensorOp::Input { name } => {
                     let value =
                         transformed.input_typed(name.clone(), node.shape.clone(), node.dtype)?;
-                    // Bool 輸入沒有切向量；要求其切向量的呼叫端已在入口被拒絕。
+                    // Bool inputs have no tangent; callers requesting one were rejected at the
+                    // entry point.
                     let tangent = if node.dtype == TensorDType::Bool {
                         symbolic_zero_tangent(&mut transformed, &node.shape)?
                     } else {
@@ -2298,7 +2299,7 @@ impl TensorIr {
                     transformed.constant_like(*value, node.dtype, node.weak),
                     transformed.scalar_constant(0.0),
                 ),
-                // d cast(x) = cast(dx)：切向量與原值同 dtype。
+                // d cast(x) = cast(dx): the tangent has the same dtype as the primal.
                 TensorOp::Cast { input } => {
                     let (value, tangent) = pairs[*input];
                     (
@@ -2351,8 +2352,9 @@ impl TensorIr {
                     let tangent = transformed.scalar_constant(0.0);
                     (value, tangent)
                 }
-                // Bool 結果的切向量是與值同形狀的弱 f64 零，讓 reshape/concat 等
-                // 資料搬移與 Bool->浮點 cast 照常傳遞零切向量。
+                // The tangent of a Bool result is a weak f64 zero shaped like the value, so data
+                // movement such as reshape/concat and Bool->float casts propagate zero tangents as
+                // usual.
                 TensorOp::Compare { lhs, rhs, kind } => {
                     let (lhs_value, _) = pairs[*lhs];
                     let (rhs_value, _) = pairs[*rhs];
@@ -2872,7 +2874,8 @@ impl TensorIr {
                 | TensorOp::ScalarConstant { .. }
                 | TensorOp::Greater { .. }
                 | TensorOp::Compare { .. } => {}
-                // cast 的 VJP 把餘切轉回來源 dtype；Bool 來源不可微，不回傳梯度。
+                // The cast VJP converts the cotangent back to the source dtype; Bool sources are
+                // not differentiable and get no gradient.
                 TensorOp::Cast { input } => {
                     let source_dtype = self.node(*input)?.dtype;
                     if source_dtype != TensorDType::Bool {
@@ -3377,7 +3380,7 @@ impl TensorIr {
         let mut gradients = BTreeMap::new();
         for (node_id, node) in self.nodes.iter().enumerate() {
             if let TensorOp::Input { name } = &node.op {
-                // Bool 輸入不可微，不出現在梯度表中。
+                // Bool inputs are not differentiable and do not appear in the gradient table.
                 if node.dtype == TensorDType::Bool {
                     continue;
                 }
@@ -3655,7 +3658,8 @@ impl TensorIr {
             &broadcast_shape(&condition_shape, &true_shape)?,
             &false_shape,
         )?;
-        // 條件只看是否非零，不參與 dtype 統一；兩個分支值必須同 dtype。
+        // The condition is only tested for non-zero and does not take part in dtype unification;
+        // both branch values must share a dtype.
         let [on_true, on_false] = self.coerce_operands("where", [on_true, on_false])?;
         self.push_derived(
             TensorOp::Where {
@@ -4596,13 +4600,15 @@ impl TensorIr {
                 continue;
             }
             if let Some(value) = fold_scalar_constant_op(&op, &nodes) {
-                // 折疊值依節點 dtype 捨入，與逐節點執行語意一致。
+                // Folded values are rounded to the node dtype, matching per-node execution
+                // semantics.
                 op = TensorOp::ScalarConstant {
                     value: node.dtype.round(value),
                 };
             }
             if let Some(key) = pure_tensor_op_cse_key(&op, &node.shape) {
-                // dtype 與弱型別屬於值的身分：cast(x, f32) 不可與 x 合併。
+                // dtype and weakness are part of a value's identity: cast(x, f32) must not be
+                // merged with x.
                 let key = format!("{key}:{}:{}", node.dtype, node.weak);
                 if let Some(existing_id) = cse_nodes.get(&key) {
                     remap.insert(old_id, *existing_id);
@@ -4715,7 +4721,8 @@ impl TensorIr {
             match &self.nodes[node_id].op {
                 TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } => {}
                 TensorOp::Cast { input } => {
-                    // Bool 來源不可微：遮罩轉成浮點後不回傳梯度。
+                    // Bool sources are not differentiable: a mask converted to float returns no
+                    // gradient.
                     let source_dtype = self.node(*input)?.dtype;
                     if source_dtype != TensorDType::Bool {
                         accumulate(&mut cotangents[*input], cotangent.astype(source_dtype))?;
@@ -5113,12 +5120,13 @@ impl TensorIr {
             }
         }
 
-        // 即時（eager）反向傳播的導數算術以 f64 進行，僅在 cast 與輸入梯度處
-        // 依 dtype 捨入；逐節點 dtype 語意由符號式 VJP 提供。
+        // Eager backpropagation does derivative arithmetic in f64 and rounds by dtype only at casts
+        // and input gradients; per-node dtype semantics are provided by the symbolic VJP.
         let mut gradients = BTreeMap::new();
         for (node_id, node) in self.nodes.iter().enumerate() {
             if let TensorOp::Input { name } = &node.op {
-                // Bool 輸入不可微，不出現在梯度表中（與符號式 VJP 一致）。
+                // Bool inputs are not differentiable and do not appear in the gradient table
+                // (matching the symbolic VJP).
                 if node.dtype == TensorDType::Bool {
                     continue;
                 }
@@ -5145,8 +5153,9 @@ impl TensorIr {
 
         for (node_id, node) in self.nodes.iter().enumerate() {
             let tangent = match &node.op {
-                // Bool 輸入的切向量只能省略或為零（呼叫端常為每個輸入都提供
-                // 切向量，如 vmap JVP）；非零方向即要求對 bool 微分。
+                // A Bool input's tangent may only be omitted or zero (callers often supply a
+                // tangent for every input, e.g. vmap JVP); a non-zero direction amounts to
+                // differentiating with respect to a bool.
                 TensorOp::Input { name } if node.dtype == TensorDType::Bool => {
                     if input_tangents
                         .get(name)
@@ -5509,8 +5518,9 @@ impl TensorIr {
             .get(output)
             .cloned()
             .ok_or_else(|| format!("output node {output} has no value"))?;
-        // 與 VJP 相同：導數算術以 f64 進行，輸出切向量依輸出 dtype 捨入；
-        // Bool 輸出的切向量是 f64 零（與符號式 JVP 的弱 f64 零一致）。
+        // As in the VJP: derivative arithmetic runs in f64 and output tangents are rounded to the
+        // output dtype; the tangent of a Bool output is an f64 zero (matching the weak f64 zero of
+        // the symbolic JVP).
         let tangent_dtype = match self.node(output)?.dtype {
             TensorDType::Bool => TensorDType::F64,
             dtype => dtype,
@@ -6026,7 +6036,8 @@ impl TensorIr {
             }
         }
         if has_bool && has_float {
-            // Bool 與浮點混用時視為 0/1 浮點；只遇到弱純量時結果保持弱型別（預設 f64）。
+            // Bool mixed with float is treated as 0/1 float; with only weak scalars the result
+            // stays weak (default f64).
             let (target, weak) = strong.map_or((TensorDType::F64, true), |dtype| (dtype, false));
             for operand in operands.iter_mut() {
                 let node = self.node(*operand)?;
@@ -6038,7 +6049,7 @@ impl TensorIr {
             }
         }
         let Some(target) = strong else {
-            // 全為弱純量時維持各自 dtype（皆為預設 f64）。
+            // With only weak scalars, each operand keeps its dtype (all default f64).
             return Ok(());
         };
         for operand in operands.iter_mut() {
@@ -6077,7 +6088,8 @@ impl TensorIr {
             )
         })?;
         let dtype = self.node(first)?.dtype;
-        // Bool 只允許資料搬移與 select；算術、reduction 與數學函式須先明確轉型。
+        // Bool only allows data movement and select; arithmetic, reductions and math functions need
+        // an explicit cast first.
         if dtype == TensorDType::Bool
             && !matches!(
                 op,
@@ -6595,8 +6607,9 @@ impl TensorIr {
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .broadcast_to_shape(&node.shape)?,
             };
-            // 每個節點以 f64 計算後捨入到節點 dtype：輸入自動捨入、cast 轉換，
-            // f32 節點得到 f64 結果的正確捨入值（+ - * / sqrt 與 IEEE f32 位元一致）。
+            // Each node computes in f64 and rounds to the node dtype: inputs are rounded
+            // automatically, casts convert, and f32 nodes get the correctly rounded f64 result
+            // (`+ - * / sqrt` are bit-identical to IEEE f32).
             values.push(value.into_dtype(node.dtype));
         }
         Ok(values)
@@ -7221,7 +7234,8 @@ impl TensorIr {
                     }
                 }
             };
-            // 原值依節點 dtype 捨入（與 evaluate 一致）；導數分量以 f64 保留。
+            // Primal values are rounded to the node dtype (matching evaluate); derivative
+            // components stay f64.
             values.push(MixedTangent {
                 value: value.value.into_dtype(node.dtype),
                 ..value
@@ -7578,7 +7592,7 @@ fn symbolic_cond_tangent_names(
     let captures = branches.captures();
     captures
         .keys()
-        // Bool 捕獲沒有切向量，不建立切向量輸入。
+        // Bool captures have no tangent, so no tangent input is created.
         .filter(|name| branches.on_true.plan.input_dtype(name).ok() != Some(TensorDType::Bool))
         .enumerate()
         .map(|(index, name)| {
@@ -7952,7 +7966,7 @@ fn symbolic_vjp_cond(
     let true_gradients = symbolic_vjp_region(&branches.on_true.plan, &cotangent_name)?;
     let false_gradients = symbolic_vjp_region(&branches.on_false.plan, &cotangent_name)?;
     for (capture_name, parent_node_id) in context.captures {
-        // Bool 捕獲不可微，區域 VJP 不為其產生梯度。
+        // Bool captures are not differentiable, so the region VJP produces no gradient for them.
         if branches.on_true.plan.input_dtype(capture_name)? == TensorDType::Bool {
             continue;
         }
@@ -8041,7 +8055,8 @@ fn symbolic_retain_region_inputs(
         let zero = graph.scalar_constant(0.0);
         let zero = graph.where_select(zero, input, zero)?;
         let mut scalar_zero = graph.sum(zero)?;
-        // 區域可混用 dtype（例如 f32 carry 與 f64 capture），零項需轉成輸出 dtype。
+        // Regions may mix dtypes (e.g. an f32 carry with an f64 capture), so the zero term is cast
+        // to the output dtype.
         let output_dtype = graph.node_dtype(output)?;
         if graph.node_dtype(scalar_zero)? != output_dtype {
             scalar_zero = graph.cast(scalar_zero, output_dtype)?;
@@ -10558,8 +10573,8 @@ fn cuda_expression(nodes: &[TensorNode], node_id: TensorNodeId) -> Result<String
         TensorOp::ScalarConstant { .. } => Err(
             "CUDA lowering does not support non-finite scalar constants".to_string(),
         ),
-        // f32 與 f64 在 CUDA 都以 float 執行（TensorDeviceBackend::execution_dtype），
-        // 因此 cast 是恆等式。
+        // f32 and f64 both execute as float on CUDA (TensorDeviceBackend::execution_dtype), so cast
+        // is the identity.
         TensorOp::Cast { input } => child(*input),
         TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
         TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
@@ -10982,7 +10997,7 @@ fn evaluate_fused_element(
             "node {node_id} is not supported by the fused elementwise evaluator"
         )),
     };
-    // 與逐節點直譯器相同：每個融合節點都捨入到自身 dtype。
+    // Same as the per-node interpreter: every fused node rounds to its own dtype.
     value.map(|value| node.dtype.round(value))
 }
 
@@ -11716,7 +11731,8 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
         TensorOp::Compare { lhs, rhs, kind } => {
             Some(f64::from(kind.evaluate(scalar(*lhs)?, scalar(*rhs)?)))
         }
-        // 呼叫端依目標 dtype 捨入；f64->f32->f64 因此保留 f32 捨入誤差而不被抵銷。
+        // The caller rounds to the target dtype, so f64->f32->f64 keeps the f32 rounding error
+        // instead of cancelling it.
         TensorOp::Cast { input } => scalar(*input),
         TensorOp::Tanh { input } => Some(scalar(*input)?.tanh()),
         TensorOp::Exp { input } => Some(scalar(*input)?.exp()),
@@ -11741,8 +11757,9 @@ fn canonicalize_tensor_op(
     nodes: &[TensorNode],
 ) -> Result<Option<TensorNodeId>, String> {
     match op {
-        // 只移除同 dtype 的強型別 cast；有損往返（f64->f32->f64）保留兩個 cast。
-        // 弱來源的 cast 會把節點轉為強型別，別名化會改變之後的提升語意，故保留。
+        // Only same-dtype strong casts are removed; a lossy round trip (f64->f32->f64) keeps both
+        // casts. A cast from a weak source makes the node strong; aliasing would change later
+        // promotion semantics, so it is kept.
         TensorOp::Cast { input } => {
             let source = nodes
                 .get(*input)

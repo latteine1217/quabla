@@ -775,7 +775,8 @@ impl PyTensor {
     }
 
     pub fn try_where(mask: &Self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
-        // 遮罩只看是否非零（bool 或舊的浮點遮罩），不參與 dtype 統一。
+        // The mask is only tested for non-zero (bool or legacy float mask) and does not take part
+        // in dtype unification.
         if let Some((on_true, on_false)) = on_true.promoted_pair(on_false, "where", true)? {
             return Self::try_where(mask, &on_true, &on_false);
         }

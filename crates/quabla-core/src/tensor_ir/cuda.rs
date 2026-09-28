@@ -280,8 +280,9 @@ impl CudaBackend {
         self.compile_in_context(plan, None)
     }
 
-    /// `region_context` 為 `Some` 時編譯 `Cond` 分支區域：共用父計畫的 CUDA
-    /// context，並固定走逐節點 device program，使捕獲值能以 device buffer 綁定。
+    /// When `region_context` is `Some`, compiles a `Cond` branch region: it shares the parent
+    /// plan's CUDA context and always uses the per-node device program so captures bind as device
+    /// buffers.
     fn compile_in_context(
         &self,
         plan: TensorExecutionPlan,
@@ -350,7 +351,8 @@ impl CudaBackend {
             }
         }
         ensure_nvrtc_runtime_available()?;
-        // 融合 epilogue 只綁定上傳的輸入，不會先執行 `Cond`；區域計畫則需要逐節點程式。
+        // The fused epilogue binds only uploaded inputs and never runs `Cond` first; region plans
+        // need the per-node program.
         let has_cond = plan
             .nodes
             .iter()
@@ -1338,7 +1340,8 @@ struct CudaProgramRuntime<'a> {
     blas: Option<&'a Arc<Mutex<CudaBlas>>>,
     solver: Option<&'a Arc<Mutex<DnHandle>>>,
     cond_branches: &'a BTreeMap<TensorNodeId, CudaCondBranches>,
-    /// 非空時本程式是 `Cond` 區域：每個輸入都由父計畫的 device buffer 綁定。
+    /// When non-empty, this program is a `Cond` region: every input is bound to a parent-plan
+    /// device buffer.
     region_captures: &'a BTreeMap<String, &'a CudaSlice<f32>>,
 }
 
@@ -1369,8 +1372,9 @@ fn cuda_matmul_bias_tanh_epilogue(
     let TensorOp::Matmul { lhs, rhs } = plan.nodes.get(matmul)?.op else {
         return None;
     };
-    // epilogue 只上傳計畫輸入並只寫入主輸出：計算出的運算元沒有 device
-    // buffer，其他輸出也不會被求值，這兩種情況都必須走逐節點程式。
+    // The epilogue uploads only plan inputs and writes only the primary output: computed operands
+    // have no device buffer and other outputs would not be evaluated, so both cases must use the
+    // per-node program.
     let is_input = |node_id: usize| matches!(plan.nodes[node_id].op, TensorOp::Input { .. });
     if plan.output_node_ids().len() != 1 || !is_input(lhs) || !is_input(rhs) || !is_input(bias) {
         return None;
@@ -1548,7 +1552,8 @@ fn execute_cuda_device_program(
         match &node.op {
             TensorOp::Input { name } => {
                 if let Some(capture) = region_captures.get(name) {
-                    // 區域捕獲在 device 端複製；父計畫保有原 buffer 的所有權。
+                    // Region captures are copied on the device; the parent plan keeps ownership of
+                    // the original buffer.
                     let slot = values.get_mut(node_id).ok_or_else(|| {
                         format!("CUDA region input node {node_id} is missing its buffer")
                     })?;
@@ -1610,8 +1615,9 @@ fn execute_cuda_device_program(
                     .get(&node_id)
                     .ok_or_else(|| format!("CUDA Cond node {node_id} has no compiled regions"))?;
                 let (before, current_and_after) = values.split_at_mut(node_id);
-                // 主機同步邊界：clone_dtoh 會等 stream 完成並讀回一個 f32 謂詞；
-                // 之後只啟動被選分支的 kernels，未選分支不在 device 上求值。
+                // Host synchronization point: clone_dtoh waits for the stream and reads back one
+                // f32 predicate; afterwards only the selected branch's kernels are launched, so the
+                // other branch is never evaluated on device.
                 let predicate =
                     stream
                         .clone_dtoh(cuda_value(before, *predicate)?)
@@ -2349,7 +2355,8 @@ fn execute_cuda_device_program(
                 )?;
                 continue;
             }
-            // cast 與 reshape 一樣只複製 float 緩衝區：兩端的執行 dtype 相同。
+            // Like reshape, cast only copies the float buffer: both sides share the same execution
+            // dtype.
             TensorOp::Reshape { input } | TensorOp::Cast { input } => {
                 let (before, current_and_after) = values.split_at_mut(node_id);
                 let input = cuda_value(before, *input)?;
@@ -2784,7 +2791,8 @@ fn validate_cuda_program_inputs(
     Ok(())
 }
 
-/// 區域程式的每個輸入都必須有元素數相符的父計畫 device buffer。
+/// Every input of a region program must have a parent-plan device buffer with a matching element
+/// count.
 fn validate_cuda_region_captures(
     plan: &TensorExecutionPlan,
     captures: &BTreeMap<String, &CudaSlice<f32>>,
@@ -2806,7 +2814,7 @@ fn validate_cuda_region_captures(
     Ok(())
 }
 
-/// 與 CPU `tensor_scalar_predicate` 相同：非有限值拒絕，非零為真。
+/// Same as the CPU `tensor_scalar_predicate`: non-finite values are rejected and non-zero is true.
 fn cuda_scalar_predicate(value: &[f32]) -> Result<bool, String> {
     let [value] = value else {
         return Err(format!(
@@ -3782,8 +3790,8 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
         ));
     }
     let packed_pair = cuda_scan_is_packed_pair_layout(scan_plan)?;
-    // 等長 lane 且每個 capture 只有 1 或 lane_count 個元素時，所有葉節點都以
-    // flat lane index 讀取，等元素數 reshape 才是恆等 lane 映射。
+    // With equal-length lanes and every capture holding 1 or lane_count elements, all leaves read
+    // by flat lane index, so only an element-count-preserving reshape is an identity lane mapping.
     let lane_count = element_count(&carry_shape)?;
     let mut identity_reshape_lanes = output_matches_carry_lanes.then_some(lane_count);
     for shape in scan_plan.external_captures().values() {
@@ -4001,7 +4009,7 @@ fn cuda_fori_body_expression(
             Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
-        // cast 的來源與目標都以 float 執行，因此為恆等。
+        // Cast source and target both execute as float, so the cast is the identity.
         TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
             child(*input)
         }
@@ -4136,7 +4144,7 @@ fn cuda_scan_body_expression_in_half(
             Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
-        // cast 的來源與目標都以 float 執行，因此為恆等。
+        // Cast source and target both execute as float, so the cast is the identity.
         TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
             child(*input)
         }
@@ -4263,7 +4271,7 @@ fn cuda_elementwise_plan_expression_with_index(
             Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
-        // cast 的來源與目標都以 float 執行，因此為恆等。
+        // Cast source and target both execute as float, so the cast is the identity.
         TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
             child(*input)
         }
@@ -6776,7 +6784,8 @@ fn cuda_offset_expression_with_index(
     }
 }
 
-/// 只差前導 1 軸的兩個 shape 在 trailing-aligned 廣播下有相同的 offset 映射。
+/// Two shapes that differ only in leading unit axes have the same offset mapping under
+/// trailing-aligned broadcasting.
 fn cuda_shapes_match_without_leading_units(lhs: &[usize], rhs: &[usize]) -> bool {
     let strip = |shape: &[usize]| -> Vec<usize> {
         shape

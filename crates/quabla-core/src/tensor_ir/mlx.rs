@@ -14,25 +14,28 @@ use super::{
 /// arrays on MLX's GPU stream and only materializes the final value for Quabla's
 /// host-facing `DynamicTensor` result.
 ///
-/// 執行緒安全：所有 MLX 圖建構、求值與回讀都經由行程層級的鎖序列化，
-/// 因此可從多條執行緒同時呼叫；GPU 工作本來就排在同一條預設 stream 上。
+/// Thread safety: all MLX graph construction, evaluation, and readback are serialized by a
+/// process-wide lock, so the backend can be called from multiple threads; GPU work already shares
+/// one default stream.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MlxBackend;
 
-/// 序列化本模組對 MLX 的所有存取。
+/// Serializes all access to MLX from this module.
 ///
-/// 所依賴的 MLX 0.25 在呼叫端執行緒上把 GPU 工作編碼進預設 GPU stream，
-/// 而該 stream 的 Metal command buffer / encoder 為全行程共用且無鎖保護；
-/// 兩條執行緒同時 eval 會交錯編碼同一個 command buffer，觸發 Metal
-/// assertion 中止或卡死。
+/// The MLX 0.25 dependency encodes GPU work into the default GPU stream on the calling thread, and
+/// that stream's Metal command buffer / encoder is process-wide and unguarded; two threads
+/// evaluating concurrently interleave encoding into the same command buffer, triggering a Metal
+/// assertion abort or a hang.
 static MLX_EXECUTION_LOCK: Mutex<()> = Mutex::new(());
 
-/// 取得 MLX 行程鎖。
+/// Acquires the MLX process lock.
 ///
-/// std `Mutex` 不可重入：只在公開進入點取得一次，內部 helper 一律假設已持有，
-/// 公開函式之間也只能委派給恰好一個會取鎖的公開函式。
+/// std `Mutex` is not reentrant: acquire it only once at public entry points, internal helpers
+/// always assume it is held, and a public function may delegate to exactly one other lock-acquiring
+/// public function.
 fn mlx_execution_guard() -> MutexGuard<'static, ()> {
-    // 鎖不保護任何 Rust 資料，poison 只表示先前持鎖者 panic；照常序列化即可。
+    // The lock guards no Rust data; poisoning only means a previous holder panicked, so keep
+    // serializing.
     MLX_EXECUTION_LOCK
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -423,7 +426,8 @@ impl MlxBackend {
                     .nodes
                     .get(*node_id)
                     .ok_or_else(|| format!("MLX output node {node_id} is missing"))?;
-                // 讀回值為 f32；依節點邏輯 dtype 標記（f64 節點即 f32 降階執行的結果）。
+                // Readback is f32; tag it with the node's logical dtype (an f64 node holds the
+                // result of f32-demoted execution).
                 DynamicTensor::with_dtype(
                     node.shape.clone(),
                     output
@@ -458,7 +462,8 @@ impl MlxBackend {
         let mut scan_vjp_jvp_cache: HashMap<usize, MlxScanVjpJvpEvaluation> = HashMap::new();
 
         for (node_id, node) in plan.nodes.iter().enumerate() {
-            // 本後端所有陣列皆為 f32；任何無法降階為 f32 的邏輯 dtype 必須明確拒絕。
+            // Every array in this backend is f32; any logical dtype that cannot be demoted to f32
+            // must be rejected explicitly.
             if TensorDeviceBackend::Mlx.execution_dtype(node.dtype)? != TensorDType::F32 {
                 return Err(format!(
                     "MLX backend cannot execute node {node_id} of dtype {}",
@@ -495,7 +500,8 @@ impl MlxBackend {
                 TensorOp::ScalarConstant { .. } => {
                     return Err("MLX backend does not support non-finite constants".to_string())
                 }
-                // 來源與目標都以 f32 執行（見上方檢查），cast 為恆等。
+                // Source and target both execute as f32 (see the check above), so cast is the
+                // identity.
                 TensorOp::Cast { input } => Ok(mlx_value(&values, *input)?.clone()),
                 TensorOp::Add { lhs, rhs } => mlx_value(&values, *lhs)?
                     .add_device(mlx_value(&values, *rhs)?, &stream)
@@ -509,13 +515,15 @@ impl MlxBackend {
                 TensorOp::Mul { lhs, rhs } => mlx_value(&values, *lhs)?
                     .multiply_device(mlx_value(&values, *rhs)?, &stream)
                     .map_err(|error| error.to_string()),
-                // IR 的 greater 是 0/1 浮點遮罩（與 CPU 一致）；MLX 比較產生 bool，
-                // 必須轉回 f32，否則回讀、累加與 Cond 謂詞都會遇到 dtype 不符。
+                // IR greater is a 0/1 float mask (matching the CPU); MLX comparisons produce bool,
+                // which must be converted back to f32 or readback, accumulation, and Cond
+                // predicates would hit a dtype mismatch.
                 TensorOp::Greater { lhs, rhs } => mlx_value(&values, *lhs)?
                     .gt_device(mlx_value(&values, *rhs)?, &stream)
                     .and_then(|mask| mask.as_dtype_device(Dtype::Float32, &stream))
                     .map_err(|error| error.to_string()),
-                // Bool 節點同樣以 f32 0/1 跨越節點邊界（execution_dtype(Bool) = f32）。
+                // Bool nodes likewise cross node boundaries as f32 0/1
+                // (`execution_dtype(Bool) = f32`).
                 TensorOp::Compare { lhs, rhs, kind } => {
                     let lhs = mlx_value(&values, *lhs)?;
                     let rhs = mlx_value(&values, *rhs)?;
@@ -546,8 +554,10 @@ impl MlxBackend {
                     branches,
                     captures,
                 } => {
-                    // 主機同步邊界：純量謂詞讀回一次，只在 GPU stream 上執行被選分支。
-                    // 不以 where 同時計算兩分支，避免未選分支的 NaN/Inf 滲入值與梯度。
+                    // Host synchronization point: the scalar predicate is read back once and only
+                    // the selected branch runs on the GPU stream. Computing both branches with
+                    // `where` is avoided so NaN/Inf from the unselected branch cannot leak into
+                    // values or gradients.
                     let predicate = mlx_scalar_predicate(mlx_value(&values, *predicate)?)?;
                     let branch_inputs = captures
                         .iter()
@@ -1727,9 +1737,10 @@ fn mlx_array_from_dynamic(input: &DynamicTensor) -> Result<Array, String> {
         .map_err(|error| error.to_string())
 }
 
-/// 讀回 `Cond` 的純量謂詞（評估並同步 GPU stream）。
+/// Reads back the scalar predicate of a `Cond` (evaluating and synchronizing the GPU stream).
 ///
-/// 語意與 CPU `tensor_scalar_predicate` 一致：非有限值拒絕，非零為真。
+/// Same semantics as the CPU `tensor_scalar_predicate`: non-finite values are rejected and non-zero
+/// is true.
 fn mlx_scalar_predicate(predicate: &Array) -> Result<bool, String> {
     let value = predicate
         .try_item::<f32>()

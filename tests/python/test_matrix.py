@@ -671,8 +671,9 @@ def test_compiler_facade_unifies_trace_transform_compile_and_execute():
 
 
 def test_python_entrypoints_keep_backend_errors_for_unbuilt_targets():
-    # Python 入口在缺少後端的 build 中維持 facade 之前的錯誤時機與訊息：
-    # MLX 建構成功、首次執行才失敗；CUDA 在編譯時回報後端的 build 指示。
+    # In builds without a backend, the Python entry points keep the pre-facade error timing and
+    # messages: MLX construction succeeds and the first execution fails; CUDA reports the backend
+    # build hint at compile time.
     compiler = quabla.Compiler()
     program = compiler.trace(lambda x: x * 2.0, [("x", [2])])
     inputs = {"x": quabla.Tensor([2], [1.0, 2.0])}
@@ -973,7 +974,7 @@ def test_compiler_facade_cuda_executes_packed_pair_scan_bodies():
     if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    # 非線性 JVP 的 tangent 半邊讀取 primal 半邊；row swap 讀取另一半邊。
+    # The nonlinear JVP tangent half reads the primal half; the row swap reads the other half.
     def scan_loss(initial, scale):
         carry, outputs = quabla.tensor_scan_region(
             0,
@@ -1772,7 +1773,7 @@ def test_cuda_matmul_bias_tanh_with_computed_operands_matches_cpu():
 
     specs = [("x", [4, 3]), ("w", [3, 2]), ("b", [1, 2])]
     inputs = {name: _cuda_mlp_tensor(shape, seed) for seed, (name, shape) in enumerate(specs)}
-    # 融合 epilogue 只綁定計畫輸入；計算出的運算元必須走逐節點程式。
+    # The fused epilogue binds only plan inputs; computed operands must use the per-node program.
     functions = {
         "lhs": lambda x, w, b: (x.tanh().matmul(w) + b).tanh(),
         "rhs": lambda x, w, b: (x.matmul(w.tanh()) + b).tanh(),
@@ -6439,7 +6440,7 @@ def test_grad_fn_evaluates_composed_add_matmul_vjp():
 
 
 def f32(values):
-    # Python 端的 IEEE f32 捨入參考：array("f") 以 C float 儲存。
+    # Python-side IEEE f32 rounding reference: array("f") stores C floats.
     return array.array("f", values).tolist()
 
 
@@ -6465,7 +6466,8 @@ def test_float32_tensor_rounds_values_and_converts_with_astype():
     narrowed = quabla.Tensor([1], [0.1]).astype(quabla.float32)
     assert narrowed.to_flat_list() == f32([0.1])
 
-    # 即時運算：f32 張量與弱純量維持 f32，結果逐元素捨入；不同 dtype 的張量需明確轉換。
+    # Eager ops: f32 tensors with weak scalars stay f32 and round per element; tensors of different
+    # dtypes need an explicit cast.
     other = quabla.Tensor([2], [0.3, 0.7], dtype=quabla.float32)
     expected = [f32([f32([a * b])[0] + f32([0.1])[0]])[0] for a, b in zip(f32([0.1, 0.2]), f32([0.3, 0.7]))]
     result = single * other + 0.1
@@ -6602,9 +6604,10 @@ def max_scaled_error(actual, expected):
 
 
 def assert_float32_mlp_device_parity(compile_device):
-    # 裝置與 CPU f32 參考共用同一組已捨入輸入，只差在逐運算捨入與歸約順序；
-    # 每運算數個 f32 ulp（單位尺度約 6e-8）在約 10 層深的圖上仍低於 1e-6，
-    # 比既有 f64 參考的 1e-5 容差緊十倍。
+    # Device and CPU f32 references share the same rounded inputs and differ only in per-op rounding
+    # and reduction order; a few f32 ulps per op (about 6e-8 at unit scale) stay below 1e-6 on a
+    # graph about 10 layers deep, ten times tighter than the existing 1e-5 tolerance against the f64
+    # reference.
     outputs, inputs = f32_mlp_value_and_gradients(quabla.float32)
     reference_outputs, _ = f32_mlp_value_and_gradients(quabla.float64)
     cpu = [output.compile_cpu().evaluate(inputs) for output in outputs]
@@ -6678,7 +6681,8 @@ def test_bool_dtype_object_and_eager_comparisons_follow_ieee_semantics():
         for result in results:
             assert result.dtype == quabla.bool_, name
             assert result.to_flat_list() == expected, name
-    # Python 純量為弱型別；左側純量走反射運算子與反射函式。
+    # Python scalars are weakly typed; a scalar on the left goes through the reflected operators and
+    # functions.
     assert (x > 1.5).to_flat_list() == [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
     assert (1.5 < x).to_flat_list() == (x > 1.5).to_flat_list()
     assert quabla.greater(1.5, x).to_flat_list() == (x < 1.5).to_flat_list()
@@ -6792,7 +6796,7 @@ def test_legacy_gt_masks_and_extrema_tie_rules_are_unchanged():
             lambda x, name=name: getattr(x, name)().sum(), [("x", [3])]
         )({"x": ties})
         assert gradients["x"].to_flat_list() == expected_gradient
-    # maximum/minimum 的相等次梯度仍路由到右運算元。
+    # The subgradient of maximum/minimum at ties is still routed to the right operand.
     _, gradients = quabla.tensor_value_and_grad_fn(
         lambda a, b: a.maximum(b).sum() + a.minimum(b).sum(), [("a", [3]), ("b", [3])]
     )({"a": ties, "b": other})
@@ -6861,7 +6865,7 @@ def test_eager_bool_truthiness_follows_numpy_and_traced_tensors_refuse():
     assert bool((x > 0.0).any())
     assert not bool((x > 0.0).all())
     expect_error(lambda: bool(x > 0.0), "ambiguous", ".any()")
-    # 浮點張量維持原本的物件真值（永遠為真）。
+    # Float tensors keep their original object truthiness (always true).
     assert bool(quabla.Tensor([1], [0.0]))
     expect_error(
         lambda: quabla.trace_tensor(lambda x: x if bool(x > 0.0) else x, [("x", [])]),
@@ -6879,7 +6883,8 @@ def test_nan_guards_keep_values_and_gradients_finite_while_float_masks_leak():
     assert value.to_flat_list() == [9.0]
     assert gradients["x"].to_flat_list() == [2.0, 4.0, 0.0, 0.0, 0.0, 4.0]
 
-    # all(isfinite(x)) 作為 Cond 謂詞：非有限輸入走防護分支，值與梯度皆有限。
+    # all(isfinite(x)) as a Cond predicate: non-finite inputs take the guarded branch, with finite
+    # values and gradients.
     traced = quabla.trace_tensor(
         lambda x: quabla.tensor_cond(
             x.isfinite().all(),
@@ -6902,7 +6907,7 @@ def test_nan_guards_keep_values_and_gradients_finite_while_float_masks_leak():
             gradient.compile_cpu().evaluate(inputs).to_flat_list() == expected_gradient
         )
 
-    # 舊寫法：浮點遮罩相乘時 0 * NaN = NaN，gt 也無法辨識 NaN。
+    # Legacy form: multiplying by a float mask gives 0 * NaN = NaN, and gt cannot detect NaN either.
     leaked = (x.gt(0.0) * x).sum().to_flat_list()[0]
     assert math.isnan(leaked)
 
@@ -6939,7 +6944,8 @@ def test_where_and_cond_accept_bool_and_legacy_float_predicates():
 
 
 def masked_residual_loss(x, w, mask):
-    # PINN 風格：遮罩選出殘差較大的點，Bool 遮罩輸入另外限制作用點。
+    # PINN style: the mask selects points with large residuals, and a Bool mask input further
+    # restricts the active points.
     active = (x > 0.5) & mask
     residual = quabla.where(active, x * w - 1.0, 0.0)
     return residual.powi(2).mean() + (x * w).powi(2).sum() * 0.1
@@ -7025,7 +7031,7 @@ def assert_bool_device_parity(compile_device):
         assert device.dtype == cpu.dtype, index
         assert device.to_flat_list() == cpu.to_flat_list(), index
 
-    # any/all 作為 Cond 謂詞，並比對 NaN 防護分支的值與梯度。
+    # any/all as Cond predicates, checking values and gradients of the NaN-guarded branch.
     traced = quabla.trace_tensor(
         lambda x: quabla.tensor_cond(
             x.isfinite().all(),
@@ -7069,7 +7075,7 @@ def test_cuda_bool_masks_and_guarded_gradients_match_cpu():
 
 
 if __name__ == "__main__":
-    # 依定義順序執行所有 test_* 函式，避免手動清單漏列新測試
+    # Run every test_* function in definition order so new tests cannot be left out of a manual list
     for name, test in list(globals().items()):
         if name.startswith("test_") and callable(test):
             test()
