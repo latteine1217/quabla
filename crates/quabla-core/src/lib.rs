@@ -1,3 +1,6 @@
+// Every unsafe block and impl must document its soundness invariant.
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 pub mod autodiff;
 pub mod compiler;
 pub mod models;

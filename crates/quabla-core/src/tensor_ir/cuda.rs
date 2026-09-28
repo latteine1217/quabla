@@ -721,6 +721,9 @@ fn ensure_nvrtc_runtime_available() -> Result<(), String> {
 
     let mut errors = Vec::with_capacity(LIBRARY_NAMES.len());
     for name in LIBRARY_NAMES {
+        // SAFETY: loading a fixed CUDA toolkit soname through the system dynamic linker only runs
+        // that library's own initializers, which cudarc runs anyway when it loads the same library;
+        // the handle is dropped immediately and no symbol is resolved from it.
         match unsafe { libloading::Library::new(name) } {
             Ok(library) => {
                 drop(library);
@@ -993,6 +996,10 @@ impl CudaExecutionPlan {
         launch.arg(gradient);
         launch.arg(&learning_rate);
         launch.arg(&count);
+        // SAFETY: the arguments match `quabla_sgd(float*, const float*, float, unsigned long long)`
+        // in `CUDA_OPTIMIZER_SOURCE`; `parameter` and `gradient` both hold `count` elements
+        // (checked above), the kernel guards `index < count`, and only the mutably passed
+        // `parameter` is written.
         unsafe {
             launch
                 .launch(LaunchConfig::for_num_elems(launch_count))
@@ -1118,6 +1125,11 @@ impl CudaExecutionPlan {
         launch.arg(&correction1);
         launch.arg(&correction2);
         launch.arg(&count_u64);
+        // SAFETY: the arguments match the eleven parameters of `quabla_adam` in
+        // `CUDA_OPTIMIZER_SOURCE` in order and type; the parameter, gradient, and both moment
+        // buffers hold `count` elements (the moments are allocated from the parameter length, which
+        // is fixed by the plan's input shape), the kernel guards `index < count`, and only the
+        // mutably passed buffers are written.
         unsafe {
             launch
                 .launch(LaunchConfig::for_num_elems(launch_count))
@@ -1312,6 +1324,11 @@ impl TensorBackend for CudaBackend {
         }
         launch.arg(&mut device_output);
         launch.arg(&device_count);
+        // SAFETY: `plan.cuda_source()` declares one `const float*` per `Input` node in node order,
+        // then `float* output` and the `unsigned long long` count, matching the pushes above;
+        // inputs were checked against their node shapes and are read through broadcast offsets into
+        // the output shape, `device_output` holds `count` elements, and the kernel guards
+        // `index < count`.
         unsafe {
             launch
                 .launch(LaunchConfig::for_num_elems(launch_count))
@@ -2440,6 +2457,10 @@ fn execute_cuda_fusion_region(
         .map_err(|_| format!("CUDA fusion node {output_node_id} count exceeds u64"))?;
     launch.arg(&mut *output);
     launch.arg(&count);
+    // SAFETY: `cuda_fusion_region_source` declares one `const float*` per `region.input_node_ids`
+    // entry in the same order, then the output pointer and count; each leaf is a node buffer sized
+    // by its node shape and read through broadcast offsets, the output buffer holds `count`
+    // elements, and the kernel guards `index < count`.
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(launch_count))
@@ -2518,6 +2539,10 @@ fn execute_cuda_fused_elementwise_program(
             .map_err(|_| "CUDA fused elementwise count exceeds u64".to_string())?;
         launch.arg(&mut *output);
         launch.arg(&device_count);
+        // SAFETY: same contract as `quabla_fused_elementwise` in `CudaBackend::execute`: one
+        // `const float*` per `Input` node in node order, then the output and count; input buffers
+        // were uploaded from shape-checked host tensors, the output holds `count` elements, and the
+        // kernel guards `index < count`.
         unsafe {
             launch
                 .launch(LaunchConfig::for_num_elems(launch_count))
@@ -2609,6 +2634,10 @@ fn execute_cuda_matmul_bias_tanh_program(
         launch.arg(&rows);
         launch.arg(&inner);
         launch.arg(&cols);
+        // SAFETY: the arguments match `quabla_matmul_bias_tanh` in `CUDA_MATMUL_BIAS_TANH_SOURCE`;
+        // `cuda_matmul_bias_tanh_epilogue` only matches rank-2 `lhs [rows, inner]`,
+        // `rhs [inner, cols]`, `bias [1, cols]` inputs and a `[rows, cols]` output, which is the
+        // buffer size and the bound the kernel guards.
         unsafe {
             launch
                 .launch(LaunchConfig::for_num_elems(
@@ -2722,6 +2751,11 @@ impl CudaBackend {
         launch.arg(&rows);
         launch.arg(&inner);
         launch.arg(&cols);
+        // SAFETY: the arguments match `quabla_rank_two_matmul` in `CUDA_RANK_TWO_MATMUL_SOURCE`;
+        // the host buffers hold `rows * inner` and `inner * cols` elements (`DynamicTensor`
+        // enforces data/shape agreement), the output holds `rows * cols`, the 16x16 block matches
+        // the kernel's `QUABLA_BLOCK` and 32-element shared tiles, and every load and store is
+        // bounds-checked against `rows`, `inner`, and `cols`.
         unsafe {
             launch
                 .launch(LaunchConfig {
@@ -3021,6 +3055,12 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
         }
         _ => LaunchConfig::for_num_elems(launch_count),
     };
+    // SAFETY: the argument pushes above follow the per-op signatures emitted by
+    // `cuda_program_source` for this node, and the launch shape matches the emitted variant: the
+    // 16x16 tiled grid only when `use_tiled_rank_two_matmul` also selected the tiled kernel,
+    // `CUDA_REDUCTION_BLOCK` (256) threads for the `partial[256]` reduction, and a flat grid
+    // otherwise. Operands are node buffers sized by their node shapes, the output holds `count`
+    // elements, and every kernel bounds its index by the count or dimensions it receives.
     unsafe {
         launch.launch(config).map_err(|error| {
             format!("failed to launch CUDA node {}: {error:?}", cuda_op_name(op))
@@ -3046,6 +3086,11 @@ fn launch_cuda_fori_node(
     launch.arg(cuda_value(values, carry)?);
     launch.arg(output);
     launch.arg(&count);
+    // SAFETY: the arguments follow the parameter list emitted by `cuda_fori_node_kernel_source`
+    // (captures in order, then `initial_carry`, `out`, then the `unsigned long long` counts); every
+    // operand is a node buffer of `element_count(node.shape)` elements read through offsets derived
+    // from those shapes, and the kernel returns for `index >= count`. Read-only operands are passed
+    // by shared reference and written buffers by `&mut`.
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(launch_count))
@@ -3078,6 +3123,12 @@ fn launch_cuda_fori_jvp_node(
     launch.arg(cuda_value(values, carry_tangent)?);
     launch.arg(output);
     launch.arg(&count);
+    // SAFETY: the arguments follow the parameter list emitted by `cuda_fori_jvp_node_kernel_source`
+    // (captures in order, then tangent captures, `initial_carry`, `initial_carry_tangent`, `out`,
+    // then the `unsigned long long` counts); every operand is a node buffer of
+    // `element_count(node.shape)` elements read through offsets derived from those shapes, and the
+    // kernel returns for `index >= count`. Read-only operands are passed by shared reference and
+    // written buffers by `&mut`.
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(launch_count))
@@ -3108,6 +3159,13 @@ fn launch_cuda_fori_vjp_node(
     launch.arg(tape);
     launch.arg(output);
     launch.arg(&count);
+    // SAFETY: the arguments follow the parameter list emitted by `cuda_fori_vjp_node_kernel_source`
+    // (captures in order, then `initial_carry`, `output_cotangent`, `carry_tape`, `out`, then the
+    // `unsigned long long` counts); every operand is a node buffer of `element_count(node.shape)`
+    // elements read through offsets derived from those shapes, the tape holds
+    // `(upper - lower + 1) * count` elements so every `(step - lower + 1) * count + index` write is
+    // in bounds and is written before it is read, and the kernel returns for `index >= count`.
+    // Read-only operands are passed by shared reference and written buffers by `&mut`.
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(launch_count))
@@ -3140,6 +3198,13 @@ fn launch_cuda_fori_vjp_group(
         launch.arg(output);
     }
     launch.arg(&count);
+    // SAFETY: the arguments follow the parameter list emitted by
+    // `cuda_fori_vjp_group_kernel_source` (captures in order, then `initial_carry`,
+    // `output_cotangent`, `carry_tape`, one `out_i` per group member, then the `unsigned long long`
+    // counts); every operand is a node buffer of `element_count(node.shape)` elements read through
+    // offsets derived from those shapes, the tape holds `(upper - lower + 1) * count` elements and
+    // is written before it is read, and the kernel returns for `index >= count`. Read-only operands
+    // are passed by shared reference and written buffers by `&mut`.
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(launch_count))
@@ -3182,6 +3247,14 @@ fn launch_cuda_fori_vjp_jvp_node(
     launch.arg(carry_tangent_tape);
     launch.arg(output);
     launch.arg(&count);
+    // SAFETY: the arguments follow the parameter list emitted by
+    // `cuda_fori_vjp_jvp_node_kernel_source` (captures in order, then tangent captures, the carry,
+    // carry tangent, output cotangent and its tangent, both tapes, `out`, then the
+    // `unsigned long long` counts); every operand is a node buffer of `element_count(node.shape)`
+    // elements read through offsets derived from those shapes, both tapes hold
+    // `(upper - lower + 1) * count` elements and are written before they are read, and the kernel
+    // returns for `index >= count`. Read-only operands are passed by shared reference and written
+    // buffers by `&mut`.
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(launch_count))
@@ -3216,6 +3289,13 @@ fn launch_cuda_scan_node(
     launch.arg(outputs);
     launch.arg(&carry_count);
     launch.arg(&output_count);
+    // SAFETY: the arguments follow the parameter list emitted by `cuda_scan_node_kernel_source`
+    // (captures in order, then `initial_carry`, `final_carry`, `outputs`, then the
+    // `unsigned long long` counts); every operand is a node buffer of `element_count(node.shape)`
+    // elements read through offsets derived from those shapes, `final_carry` holds `carry_count`
+    // elements and `outputs` holds `(upper - lower) * output_count`, and the kernel returns for
+    // `index >= carry_count && index >= output_count`. Read-only operands are passed by shared
+    // reference and written buffers by `&mut`.
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(launch_count))
@@ -3250,6 +3330,13 @@ fn launch_cuda_scan_vjp_node(
     launch.arg(output);
     launch.arg(&carry_count);
     launch.arg(&output_count);
+    // SAFETY: the arguments follow the parameter list emitted by `cuda_scan_vjp_node_kernel_source`
+    // (captures in order, then `initial_carry`, `final_carry_cotangent`, `output_cotangent`,
+    // `carry_tape`, `out`, then the `unsigned long long` counts); every operand is a node buffer of
+    // `element_count(node.shape)` elements read through offsets derived from those shapes, the tape
+    // holds `(upper - lower + 1) * carry_count` elements and is written before it is read, and the
+    // kernel returns for `index >= carry_count`. Read-only operands are passed by shared reference
+    // and written buffers by `&mut`.
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(launch_count))
@@ -3286,6 +3373,18 @@ fn launch_cuda_scan_vjp_group(
     }
     launch.arg(&carry_count);
     launch.arg(&output_count);
+    // SAFETY: the arguments follow the parameter list emitted by
+    // `cuda_scan_vjp_group_kernel_source` (captures in order, then `initial_carry`,
+    // `final_carry_cotangent`, `output_cotangent`, `carry_tape`, one `out_i` per group member, then
+    // the `unsigned long long` counts); every operand is a node buffer of
+    // `element_count(node.shape)` elements read through offsets derived from those shapes, the tape
+    // holds `(upper - lower + 1) * carry_count` elements and is written before it is read,
+    // `output_cotangent` is indexed by `carry_count` lanes and Scan lowering only admits output
+    // lanes that the carry broadcasts into (at least `carry_count` per step), and the kernel
+    // returns for `index >= carry_count`. Read-only operands are passed by shared reference and
+    // written buffers by `&mut`. That kernel declares only `carry_count`: the trailing
+    // `output_count` pushed here is an extra kernel parameter that the driver never reads, so it is
+    // harmless but does not match the signature.
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(launch_count))
@@ -3336,6 +3435,14 @@ fn launch_cuda_scan_vjp_jvp_group(
     }
     launch.arg(&carry_count);
     launch.arg(&output_count);
+    // SAFETY: the arguments follow the parameter list emitted by
+    // `cuda_scan_vjp_jvp_group_kernel_source` (captures in order, then tangent captures, the carry,
+    // carry tangent, both final-carry cotangents, both output cotangents, both tapes, one `out_i`
+    // per group member, then the `unsigned long long` counts); every operand is a node buffer of
+    // `element_count(node.shape)` elements read through offsets derived from those shapes, both
+    // tapes hold `(upper - lower + 1) * carry_count` elements and are written before they are read,
+    // and the kernel returns for `index >= carry_count`. Read-only operands are passed by shared
+    // reference and written buffers by `&mut`.
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(launch_count))
@@ -3409,6 +3516,9 @@ fn cuda_library_available(name: &str) -> bool {
         format!("lib{name}.so.11"),
     ]
     .iter()
+    // SAFETY: loading a fixed CUDA toolkit soname through the system dynamic linker only runs that
+    // library's own initializers, which cudarc runs anyway when it loads the same library; the
+    // handle is dropped immediately and no symbol is resolved from it.
     .any(|candidate| unsafe { libloading::Library::new(candidate).is_ok() })
 }
 
@@ -3436,6 +3546,10 @@ fn launch_cuda_transpose_copy(
     launch.arg(output);
     launch.arg(&rows);
     launch.arg(&columns);
+    // SAFETY: the arguments match
+    // `quabla_transpose_copy(const float*, float*, unsigned long long, unsigned long long)`;
+    // callers pass `input` and `output` buffers of `rows * columns` elements, and the kernel guards
+    // `index < rows * columns`.
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(count))
@@ -3458,13 +3572,18 @@ fn launch_cusolver_rank_two_solve(
     let n_i32 = i32::try_from(n).map_err(|_| "CUSOLVER solve dimension exceeds i32".to_string())?;
     let rhs_columns_i32 = i32::try_from(rhs_columns)
         .map_err(|_| "CUSOLVER solve right-hand-side columns exceed i32".to_string())?;
+    // SAFETY: the uninitialized factor is fully written by the `n x n` transpose copy below before
+    // CUSOLVER reads it.
     let mut factor = unsafe { stream.alloc::<f32>(n * n) }
         .map_err(|error| format!("failed to allocate CUSOLVER factor buffer: {error:?}"))?;
+    // SAFETY: the uninitialized right-hand side is fully written by the `n x rhs_columns` transpose
+    // copy below before CUSOLVER reads it.
     let mut column_rhs = unsafe { stream.alloc::<f32>(n * rhs_columns) }.map_err(|error| {
         format!("failed to allocate CUSOLVER right-hand-side buffer: {error:?}")
     })?;
     launch_cuda_transpose_copy(stream, module, matrix, &mut factor, n, n)?;
     launch_cuda_transpose_copy(stream, module, rhs, &mut column_rhs, n, rhs_columns)?;
+    // SAFETY: `cusolverDnSgetrf` writes all `n` pivots before `cusolverDnSgetrs` reads them.
     let mut pivots = unsafe { stream.alloc::<i32>(n) }
         .map_err(|error| format!("failed to allocate CUSOLVER pivot buffer: {error:?}"))?;
     let mut info = stream
@@ -3479,6 +3598,9 @@ fn launch_cusolver_rank_two_solve(
         let (pivot_ptr, _pivot_read) = pivots.device_ptr_mut(stream);
         let (info_ptr, _info_read) = info.device_ptr_mut(stream);
         let mut workspace_elements = 0_i32;
+        // SAFETY: `solver.cu()` is a live handle guarded by the `Mutex`, `factor_ptr` points to
+        // `n * n` floats with leading dimension `n`, and `workspace_elements` is a valid output
+        // location.
         unsafe {
             cusolver_sys::cusolverDnSgetrf_bufferSize(
                 solver.cu(),
@@ -3491,9 +3613,16 @@ fn launch_cusolver_rank_two_solve(
             .result()
             .map_err(|error| format!("CUSOLVER Sgetrf workspace query failed: {error:?}"))?;
         }
+        // SAFETY: the workspace is scratch memory that `cusolverDnSgetrf` writes before reading;
+        // its size comes from the buffer-size query above.
         let mut workspace = unsafe { stream.alloc::<f32>(workspace_elements as usize) }
             .map_err(|error| format!("failed to allocate CUSOLVER workspace: {error:?}"))?;
         let (workspace_ptr, _workspace_read) = workspace.device_ptr_mut(stream);
+        // SAFETY: all device pointers come from buffers of the sizes CUSOLVER expects (factor
+        // `n * n` with `lda = n`, right-hand side `n * rhs_columns` column-major with `ldb = n`,
+        // `n` pivots, one info word, and the queried workspace) whose `device_ptr_mut` guards stay
+        // alive across both calls; the handle is bound to the context's default stream, the same
+        // stream that ordered the transpose copies, so the inputs are written before they are read.
         unsafe {
             cusolver_sys::cusolverDnSgetrf(
                 solver.cu(),
@@ -3565,6 +3694,11 @@ fn launch_cublas_rank_two_matmul(
     let blas = blas
         .lock()
         .map_err(|_| "cuBLAS handle lock is poisoned".to_string())?;
+    // SAFETY: the row-major `[rows, inner] x [inner, cols]` product is issued as column-major
+    // `C^T = B^T * A^T`, so `rhs` is `cols x inner` with `lda = cols`, `lhs` is `inner x rows` with
+    // `ldb = inner`, and `output` is `cols x rows` with `ldc = cols`; the node buffers hold exactly
+    // those element counts because `matmul_shape` fixed the rank-2 shapes, and the handle is bound
+    // to the stream that produced them.
     unsafe { blas.gemm(config, rhs, lhs, output) }
         .map_err(|error| format!("cuBLAS SGEMM failed: {error:?}"))
 }
@@ -3673,6 +3807,10 @@ fn launch_cublas_batched_matmul(
     let blas = blas
         .lock()
         .map_err(|_| "cuBLAS handle lock is poisoned".to_string())?;
+    // SAFETY: each batch uses the rank-2 layout of `launch_cublas_rank_two_matmul`;
+    // `cublas_batch_stride` only accepts operands whose batch shape equals the output batch shape
+    // (stride = matrix size) or is all ones (stride 0), so batch `batch_count - 1` stays inside
+    // every buffer, and the output holds `batch_count * rows * cols` elements.
     unsafe { blas.gemm_strided_batched(config, rhs, lhs, output) }
         .map_err(|error| format!("cuBLAS strided-batched SGEMM failed: {error:?}"))
 }
