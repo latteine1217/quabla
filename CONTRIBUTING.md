@@ -17,9 +17,7 @@ builds and the `maturin develop` command for each.
 
 ## Development Gates
 
-Run the gates listed under
-[Development Gates](README.md#development-gates) in the README before opening
-a pull request. In brief:
+Run these before opening a pull request:
 
 ```sh
 cargo fmt --all --check
@@ -32,24 +30,31 @@ cargo clippy --workspace --all-targets --features quabla-core/cuda-nccl \
   -- -D warnings
 cargo test --workspace
 
-maturin develop --release
+maturin develop --release              # add --features mlx or --features cuda
 python tests/python/test_matrix.py
 ```
 
-CI (`.github/workflows/ci.yml`) runs the Linux gates on every pull request.
-The macOS MLX check (`.github/workflows/macos-mlx.yml`) runs on pull requests
-that touch the MLX backend or the Cargo manifests.
+CI (`.github/workflows/ci.yml`) runs the Linux gates on every push to `main`
+and every pull request. The macOS MLX check
+(`.github/workflows/macos-mlx.yml`) runs on pull requests that touch the MLX
+backend or the Cargo manifests, and on demand.
 
-GPU runtime suites are opt-in and need the matching hardware, so CI does not
-run them:
+GPU runtime suites are opt-in through environment variables and need the
+matching hardware, so CI does not run them:
 
-- `QUABLA_MLX_TEST=1`: MLX build on Apple silicon.
-- `QUABLA_CUDA_TEST=1`: CUDA build with an NVIDIA GPU.
-- `QUABLA_CUDA_NCCL_TEST=1`: CUDA + NCCL build with at least two GPUs and a
-  loadable `libnccl.so`.
+```sh
+# MLX build on Apple silicon:
+QUABLA_MLX_TEST=1 python tests/python/test_matrix.py
+# CUDA build with an NVIDIA GPU:
+QUABLA_CUDA_TEST=1 python tests/python/test_matrix.py
+QUABLA_CUDA_TEST=1 cargo test -p quabla-core --features cuda
+# Two CUDA GPUs and a loadable libnccl.so:
+QUABLA_CUDA_NCCL_TEST=1 cargo test -p quabla-core --features cuda-nccl
+```
 
-The README shows the exact command for each suite. If a change touches a GPU
-backend and you do not have the hardware, say so in the pull request.
+The Rust MLX tests run whenever `quabla-core/mlx` is enabled on macOS
+(`cargo test --workspace --features quabla-core/mlx`). If a change touches a
+GPU backend and you do not have the hardware, say so in the pull request.
 
 ## Commits and Pull Requests
 
