@@ -1009,7 +1009,9 @@ target offset, and atomically reducing on device. `ScanVjpJvp` supports the
 same direct-broadcast unequal-lane subset and broadcast-compatible captures;
 arbitrary unequal carry/output graphs remain explicit rejections. First-order VJP source groups now compile
 to one multi-output kernel, so all requested gradient targets reuse one reverse
-traversal and device carry tape. Linux CUDA
+traversal and device carry tape; for the direct-broadcast `ScanVjp` subset the
+grouped kernel sums each step's output cotangents onto the carry lane, as the
+single-target kernel does. Linux CUDA
 compilation and GTX 1660 SUPER CPU-parity coverage exercise nonlinear loops
 for both initial-carry and same-shape capture gradients.
 Symbolic JVP through `Fori` emits a paired primal `Fori` and structural
@@ -1134,8 +1136,8 @@ pass for all selected gradients in that source group. CUDA now fuses each
 restricted first-order `ForiVjp` and `ScanVjp` source group into one
 multi-output device kernel. CUDA `ForiVjpJvp` currently lowers one selected
 directional-gradient result per kernel. `ScanVjpJvp` also lowers the verified
-direct-broadcast unequal-lane subset, one selected directional-gradient result
-per kernel.
+direct-broadcast unequal-lane subset and emits every selected
+directional-gradient result of a source group from one kernel.
 MLX supports first-order reverse and forward-over-reverse `Fori`
 paths, but not higher derivatives of `ForiVjpJvp`.
 

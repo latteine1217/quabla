@@ -3379,12 +3379,10 @@ fn launch_cuda_scan_vjp_group(
     // the `unsigned long long` counts); every operand is a node buffer of
     // `element_count(node.shape)` elements read through offsets derived from those shapes, the tape
     // holds `(upper - lower + 1) * carry_count` elements and is written before it is read,
-    // `output_cotangent` is indexed by `carry_count` lanes and Scan lowering only admits output
-    // lanes that the carry broadcasts into (at least `carry_count` per step), and the kernel
-    // returns for `index >= carry_count`. Read-only operands are passed by shared reference and
-    // written buffers by `&mut`. That kernel declares only `carry_count`: the trailing
-    // `output_count` pushed here is an extra kernel parameter that the driver never reads, so it is
-    // harmless but does not match the signature.
+    // `output_cotangent` holds `(upper - lower) * output_count` elements and is read only at
+    // `(step - lower) * output_count + lane` with `lane < output_count`, and the kernel returns for
+    // `index >= carry_count`. Read-only operands are passed by shared reference and written
+    // buffers by `&mut`.
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(launch_count))
@@ -6111,6 +6109,32 @@ fn cuda_scan_vjp_group_kernel_source(
         &output_inputs,
         &carry_shape,
     )?;
+    let output_step_shape =
+        &scan_plan.body.plan.nodes[scan_plan.body.plan.output_node_ids[1]].shape;
+    // With unequal lanes `cuda_scan_vjp_plans` differentiates the carry-shaped source of the
+    // direct output broadcast (it rejects any other unequal-lane output), so each carry lane
+    // consumes the sum of the step's output cotangents over the output lanes it broadcasts into,
+    // as in `cuda_scan_vjp_node_kernel_source`. Equal lane counts map output lanes 1:1.
+    let output_cotangent_setup = if element_count(output_step_shape)?
+        != element_count(&carry_shape)?
+    {
+        let carry_offset =
+            cuda_offset_expression_with_index(output_step_shape, &carry_shape, "output_index");
+        format!(
+            "float output_cotangent_step = 0.0f;\n\\
+                for (unsigned long long output_index = 0ULL; output_index < output_count; ++output_index) {{\n\\
+                    if ({carry_offset} == index) {{\n\\
+                        output_cotangent_step += output_cotangent[(step - {}ULL) * output_count + output_index];\n\\
+                    }}\n\\
+                }}\n",
+            scan_plan.lower
+        )
+    } else {
+        format!(
+            "float output_cotangent_step = output_cotangent[(step - {}ULL) * output_count + index];\n",
+            scan_plan.lower
+        )
+    };
 
     let mut gradient_declarations = String::new();
     let mut contribution_updates = String::new();
@@ -6180,7 +6204,10 @@ fn cuda_scan_vjp_group_kernel_source(
                 .enumerate()
                 .map(|(index, _)| format!("float* out_{index}")),
         )
-        .chain(["unsigned long long carry_count".to_string()])
+        .chain([
+            "unsigned long long carry_count".to_string(),
+            "unsigned long long output_count".to_string(),
+        ])
         .collect::<Vec<_>>()
         .join(", ");
     Ok(format!(
@@ -6200,7 +6227,7 @@ fn cuda_scan_vjp_group_kernel_source(
                 unsigned long long step = reverse - 1ULL;\n\\
                 float loop_index = (float)step;\n\\
                 carry = carry_tape[(step - {}ULL) * carry_count + index];\n\\
-                float output_cotangent_step = output_cotangent[(step - {}ULL) * carry_count + index];\n\\
+                {output_cotangent_setup}\
                 {contribution_updates}\
                 carry_cotangent = ({carry_reverse_expression} + {output_reverse_expression});\n\\
             }}\n\\
@@ -6211,7 +6238,6 @@ fn cuda_scan_vjp_group_kernel_source(
         scan_plan.upper,
         scan_plan.lower,
         scan_plan.upper,
-        scan_plan.lower,
         scan_plan.lower,
         scan_plan.lower,
     ))
