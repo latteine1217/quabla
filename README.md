@@ -187,8 +187,6 @@ The full list is in [docs/api.md](docs/api.md#known-limitations).
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to propose changes and which
   [development gates](CONTRIBUTING.md#development-gates) to run.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability.
-- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): community standards and how to
-  report a conduct issue.
 - [CITATION.cff](CITATION.cff): citation metadata for academic use.
 
 ## License

@@ -67,10 +67,6 @@ GPU backend and you do not have the hardware, say so in the pull request.
   gate you could not run.
 - Keep a pull request to one logical change.
 
-## Code of Conduct
-
-Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md).
-
 ## License
 
 Quabla is licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE)
