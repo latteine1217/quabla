@@ -1,6 +1,6 @@
-# Nabla
+# Quabla
 
-Nabla is a Rust-native scientific machine learning (SciML) compiler and
+Quabla is a Rust-native scientific machine learning (SciML) compiler and
 runtime with a JAX-like programming model. Python functions are traced into a
 rank-N tensor IR, transformed with composable automatic differentiation
 (JVP, VJP, Jacobians, Hessians, Hessian-vector products, and `vmap`), and
@@ -9,19 +9,22 @@ compiled to frozen execution plans. Structured control flow (`cond`,
 Plans run on a CPU reference backend (`f64`), on CUDA (Linux; NVRTC kernels
 plus cuBLAS/cuSOLVER, with optional NCCL data parallelism), or on MLX (Apple
 silicon). The Python API is a PyO3 extension. "JAX-like" describes the API
-style only: Nabla does not depend on JAX and is not affiliated with JAX or
+style only: Quabla does not depend on JAX and is not affiliated with JAX or
 with the `nabla-ml` project.
+
+The project was formerly named Nabla and was renamed to Quabla (after □, the
+d'Alembert operator) before the v0.1 release.
 
 ## Status
 
-Nabla v0.1 is a research-grade, source-only pre-release: it is published as a
+Quabla v0.1 is a research-grade, source-only pre-release: it is published as a
 git tag and GitHub Release, with no prebuilt wheels. The 0.x API may change
 between releases. Backend support is validated operation by operation;
 unsupported operations fail explicitly instead of falling back to the host.
 
 The primary Python API is the rank-N path:
 
-- `nabla.Compiler` facade: `Compiler.trace(fn, input_specs) -> Program`,
+- `quabla.Compiler` facade: `Compiler.trace(fn, input_specs) -> Program`,
   `Program.jvp(...)` / `Program.vjp(...)`, `Program.compile(target) ->
   Executable` for `"cpu"`, `"cuda"`, or `"mlx"`.
 - `trace_tensor(...)` with `TraceTensor` values, the eager `Tensor` class, and
@@ -64,7 +67,7 @@ Prerequisites:
 - CUDA + NCCL builds: additionally NCCL loadable as `libnccl.so` (for example
   through `LD_LIBRARY_PATH`) and at least two CUDA devices.
   The Slurm scripts in `scripts/slurm/` set `LD_LIBRARY_PATH` from
-  `NABLA_NCCL_LIB_DIR` (default `.deps/nccl/lib`). Ordinary `cuda` builds
+  `QUABLA_NCCL_LIB_DIR` (default `.deps/nccl/lib`). Ordinary `cuda` builds
   neither link nor load NCCL.
 
 Create a virtual environment and build the extension in place:
@@ -82,7 +85,7 @@ maturin develop --release --features mlx         # macOS, Apple silicon
 maturin develop --release --features cuda        # Linux, CUDA
 maturin develop --release --features cuda-nccl   # Linux, CUDA + NCCL
 
-python -c "import nabla; print(nabla.Compiler().capabilities())"
+python -c "import quabla; print(quabla.Compiler().capabilities())"
 ```
 
 `Compiler.capabilities()` reports which targets this build contains, for
@@ -95,25 +98,25 @@ Trace a scalar loss in `float32`, mask it with a comparison, and evaluate its
 value and gradients on the CPU:
 
 ```python
-import nabla
+import quabla
 
 
 def loss(x, w):
     y = (x * w).tanh()
-    mask = x > 0.0  # comparison operators return nabla.bool_ masks
-    return nabla.where(mask, y, 0.0).powi(2).sum()
+    mask = x > 0.0  # comparison operators return quabla.bool_ masks
+    return quabla.where(mask, y, 0.0).powi(2).sum()
 
 
-specs = [("x", [4], nabla.float32), ("w", [4], nabla.float32)]
+specs = [("x", [4], quabla.float32), ("w", [4], quabla.float32)]
 inputs = {
-    "x": nabla.Tensor([4], [-1.0, 0.5, 1.0, 2.0], dtype=nabla.float32),
-    "w": nabla.Tensor([4], [0.3, -0.2, 0.1, 0.4], dtype=nabla.float32),
+    "x": quabla.Tensor([4], [-1.0, 0.5, 1.0, 2.0], dtype=quabla.float32),
+    "w": quabla.Tensor([4], [0.3, -0.2, 0.1, 0.4], dtype=quabla.float32),
 }
 
 mask = inputs["x"] > 0.0
 print(mask.dtype, mask.to_flat_list())
 
-value_and_grad = nabla.tensor_value_and_grad_fn(loss, specs)
+value_and_grad = quabla.tensor_value_and_grad_fn(loss, specs)
 value, grads = value_and_grad(inputs)
 print(value.dtype, value.to_flat_list())
 print(grads["w"].to_flat_list())
@@ -129,7 +132,7 @@ Continuing in the same session, the same function goes through the compiler
 facade, which compiles one traced program for every target in the build:
 
 ```python
-compiler = nabla.Compiler()
+compiler = quabla.Compiler()
 print(compiler.capabilities())
 
 program = compiler.trace(loss, specs)
@@ -139,7 +142,7 @@ for target in ("cpu", "mlx", "cuda"):
 
 # Symbolic VJP: one gradient Program per input, compiled like any other.
 grad_w = program.vjp("loss_bar")["w"].compile("cpu")
-seed = nabla.Tensor([], [1.0], dtype=nabla.float32)
+seed = quabla.Tensor([], [1.0], dtype=quabla.float32)
 print(grad_w({**inputs, "loss_bar": seed}).to_flat_list())
 ```
 
@@ -198,9 +201,9 @@ cargo fmt --all --check
 ruff check tests examples scripts
 cargo clippy --workspace --all-targets -- -D warnings
 # macOS:
-cargo clippy --workspace --all-targets --features nabla-core/mlx -- -D warnings
+cargo clippy --workspace --all-targets --features quabla-core/mlx -- -D warnings
 # Linux:
-cargo clippy --workspace --all-targets --features nabla-core/cuda-nccl \
+cargo clippy --workspace --all-targets --features quabla-core/cuda-nccl \
   -- -D warnings
 cargo test --workspace
 
@@ -212,16 +215,16 @@ Device suites are opt-in through environment variables:
 
 ```sh
 # MLX build on Apple silicon:
-NABLA_MLX_TEST=1 python tests/python/test_matrix.py
+QUABLA_MLX_TEST=1 python tests/python/test_matrix.py
 # CUDA build with an NVIDIA GPU:
-NABLA_CUDA_TEST=1 python tests/python/test_matrix.py
-NABLA_CUDA_TEST=1 cargo test -p nabla-core --features cuda
+QUABLA_CUDA_TEST=1 python tests/python/test_matrix.py
+QUABLA_CUDA_TEST=1 cargo test -p quabla-core --features cuda
 # Two CUDA GPUs and a loadable libnccl.so:
-NABLA_CUDA_NCCL_TEST=1 cargo test -p nabla-core --features cuda-nccl
+QUABLA_CUDA_NCCL_TEST=1 cargo test -p quabla-core --features cuda-nccl
 ```
 
-The Rust MLX tests run whenever `nabla-core/mlx` is enabled on macOS
-(`cargo test --workspace --features nabla-core/mlx`).
+The Rust MLX tests run whenever `quabla-core/mlx` is enabled on macOS
+(`cargo test --workspace --features quabla-core/mlx`).
 
 ## Documentation And License
 
@@ -229,7 +232,7 @@ The Rust MLX tests run whenever `nabla-core/mlx` is enabled on macOS
   per-phase status (P0-P7, dtype phases D1-D6), and validation records.
 - [docs/design.md](docs/design.md): original core design notes.
 
-Nabla is licensed under either of [Apache License, Version 2.0](LICENSE-APACHE)
+Quabla is licensed under either of [Apache License, Version 2.0](LICENSE-APACHE)
 or [MIT license](LICENSE-MIT), at your option.
 
 ## Examples And Benchmarks
@@ -300,8 +303,8 @@ parity against one GPU and CPU. The Slurm scripts in
 Rust-only examples of the core crate (no Python extension needed):
 
 ```sh
-cargo run -p nabla-core --example lotka_volterra
-cargo run -p nabla-core --example fit_lotka_volterra
+cargo run -p quabla-core --example lotka_volterra
+cargo run -p quabla-core --example fit_lotka_volterra
 ```
 
 The first prints the Lotka-Volterra loss and its four-parameter gradient; the
@@ -353,23 +356,23 @@ Current migration status:
   `tensor_vmap_mlx_fn`, and the single-output CUDA helpers
   (`tensor_jit_cuda_fn`, `tensor_vmap_cuda_fn`,
   `tensor_vmap_hvp_scalar_cuda_fn`, `tensor_jit_batch_cuda_fn`) compile
-  through `NablaCompiler`; their public signatures and results are
+  through `QuablaCompiler`; their public signatures and results are
   unchanged. The multi-output helpers (`tensor_value_and_grad_{mlx,cuda}_fn`,
   their batch variants, `tensor_vmap_{vjp,jvp}_{mlx,cuda}_fn`,
   `mlx_adam_loss_optimizer`, `cuda_adam_vjp_optimizer`, and
   `cuda_adam_loss_optimizer`) compile one ordered multi-output program through
-  `NablaCompiler::compile_many` and read their outputs by position. Retained
+  `QuablaCompiler::compile_many` and read their outputs by position. Retained
   MLX inputs, device-resident CUDA buffers, and Adam state stay in those
-  executors rather than in `NablaExecutable`; `docs/jax_like_roadmap.md`
+  executors rather than in `QuablaExecutable`; `docs/jax_like_roadmap.md`
   records that remaining gap and the helpers that stay outside the facade.
-- The Rust `NablaCompiler::compile` rejects a target missing from the build
+- The Rust `QuablaCompiler::compile` rejects a target missing from the build
   before lowering. These Python entrypoints, including `Program.compile`, keep
   their earlier errors in such a build: MLX constructs and fails on first
   execution, CUDA fails at compile time, each with the backend's build
   instructions. Check `Compiler.capability(target)` first when that matters.
 - `Program.jvp(...)` is the one-named-input symbolic coordinate derivative;
   `Program.vjp(...)` returns one `Program` per original input. Runtime tangent
-  maps and multi-output compiler programs (`NablaMultiOutputProgram`) remain
+  maps and multi-output compiler programs (`QuablaMultiOutputProgram`) remain
   lower-level Rust APIs.
 - CPU facade execution is covered by Rust and installed-extension Python tests.
   CUDA facade parity is verified on the Linux GTX 1660 SUPER host for a
@@ -380,11 +383,11 @@ Current migration status:
   parity for a direct `[2, 1] -> [2, 3]` broadcast Scan. `Program.compile`
   shares its MLX and CUDA lowering with `compile_mlx()`/`compile_cuda()`;
   MLX CPU parity for those plans is covered by the Rust MLX tests and the
-  Python matrix with `NABLA_MLX_TEST=1` on Apple silicon.
+  Python matrix with `QUABLA_MLX_TEST=1` on Apple silicon.
 
 The corresponding Rust lifecycle is
-`NablaCompiler -> NablaProgram -> NablaExecutable` in
-`nabla_core::compiler`. The ownership boundaries are:
+`QuablaCompiler -> QuablaProgram -> QuablaExecutable` in
+`quabla_core::compiler`. The ownership boundaries are:
 
 ```text
 Python frontend / PyO3 -> TensorTraceGraph -> TensorIr / AD transforms
@@ -395,7 +398,7 @@ Python frontend / PyO3 -> TensorTraceGraph -> TensorIr / AD transforms
 
 ### Rank-N Tensor API
 
-- Pure-Rust `TensorIr` compiler core (`nabla_core::tensor_ir`) for dynamic
+- Pure-Rust `TensorIr` compiler core (`quabla_core::tensor_ir`) for dynamic
   rank-N tensors with typed dtypes, CPU evaluation, direct JVP and
   reverse-mode VJP with cotangent reduction back through broadcast axes,
   symbolic JVP/VJP graph transforms, structured `Cond`/`Fori`/`Scan` regions,
@@ -406,10 +409,10 @@ Python frontend / PyO3 -> TensorTraceGraph -> TensorIr / AD transforms
   shape validation, rank-N trailing-axis broadcasting for add/subtract/multiply/divide,
   numeric scalars on either side of those arithmetic operations,
   scalar `**` exponents,
-  NumPy-style batched `matmul`, rank-N `nabla.concat([...], axis=...)`,
+  NumPy-style batched `matmul`, rank-N `quabla.concat([...], axis=...)`,
   permutation-validated `transpose(axes=None)`, global or single-axis `sum`/`mean`/L2 `norm`,
   common elementwise math (`tanh`, `exp`, `log`, `sqrt`, `sin`, `cos`, `powi`),
-  `gt(...)` masks, `maximum(...)`/`minimum(...)`, broadcasted `nabla.where(...)`, materialized `broadcast_to(shape)`,
+  `gt(...)` masks, `maximum(...)`/`minimum(...)`, broadcasted `quabla.where(...)`, materialized `broadcast_to(shape)`,
   and element-count-preserving reshape.
   Eager `Tensor` operations run immediately on the host; differentiation and
   compilation apply to traced functions, whose arguments are `TraceTensor`
@@ -424,8 +427,8 @@ Python frontend / PyO3 -> TensorTraceGraph -> TensorIr / AD transforms
   transpose=False)`, and `cholesky()`, each with JVP/VJP rules. `solve`
   rejects non-square, rank-mismatched, and singular inputs; on CUDA it lowers
   to cuSOLVER `Sgetrf`/`Sgetrs`, while MLX rejects it.
-- Element dtypes `nabla.float32` and `nabla.float64` (dtype phase D1).
-  `Tensor(shape, data, dtype=nabla.float32)` rounds `data` to `f32`, and
+- Element dtypes `quabla.float32` and `quabla.float64` (dtype phase D1).
+  `Tensor(shape, data, dtype=quabla.float32)` rounds `data` to `f32`, and
   `Tensor.dtype`/`Tensor.astype(dtype)` and `TraceTensor.dtype`/
   `TraceTensor.astype(dtype)` inspect and convert; `to_flat_list()` of a
   `float32` tensor returns the rounded values. Input specs accept `(name,
@@ -440,10 +443,10 @@ Python frontend / PyO3 -> TensorTraceGraph -> TensorIr / AD transforms
   `zeros`/`arange` create `float64`, and batch-specialized functions
   (`tensor_jit_batch_fn` and its value-and-grad variants) trace `float64`
   inputs.
-- Boolean masks with dtype `nabla.bool_` (dtype phase D2; `str` is `"bool"`,
+- Boolean masks with dtype `quabla.bool_` (dtype phase D2; `str` is `"bool"`,
   and `lower_text`/`stablehlo_text` print it as `i1`). `Tensor` and
   `TraceTensor` provide `greater`, `greater_equal`, `less`, `less_equal`,
-  `equal`, `not_equal` (also as `nabla.greater(a, b)` etc.) and the
+  `equal`, `not_equal` (also as `quabla.greater(a, b)` etc.) and the
   operators `<`, `<=`, `>`, `>=`; comparisons follow IEEE semantics, so any
   comparison with `NaN` is false except `not_equal`. `==`/`!=` are not
   overloaded: tensors keep identity equality and stay hashable. Bool masks
@@ -451,8 +454,8 @@ Python frontend / PyO3 -> TensorTraceGraph -> TensorIr / AD transforms
   (bool operands only), `isfinite()`/`isnan()` classify float tensors, and
   `any`/`all` reduce with the `axis`/`keepdims` contract of `sum`. `where`
   and `tensor_cond` accept bool predicates as well as the existing 0/1
-  float masks, and `nabla.where` accepts Python scalar branches, so
-  `nabla.where(x.isfinite(), x, 0.0)` guards `NaN`/`inf` before any
+  float masks, and `quabla.where` accepts Python scalar branches, so
+  `quabla.where(x.isfinite(), x, 0.0)` guards `NaN`/`inf` before any
   arithmetic (a float mask product such as `x.gt(0.0) * x` still yields
   `NaN`, because `0 * NaN` is `NaN`). `gt()` keeps returning a 0/1 float mask
   of the operand dtype. In arithmetic a bool operand becomes 0/1 of the
@@ -490,7 +493,7 @@ Python frontend / PyO3 -> TensorTraceGraph -> TensorIr / AD transforms
   second derivatives and then differentiated with VJP with respect to model
   parameters. Its rules cover every current rank-N `TensorIr` primitive.
   A `TraceTensor` cannot be used as a Python boolean, preventing accidental
-  data-dependent host branches during tracing; use `nabla.where` for
+  data-dependent host branches during tracing; use `quabla.where` for
   elementwise selection, or the structured `tensor_cond` and loop-region APIs
   described below.
   `tensor_fori_loop(lower, upper, body, init)` statically unrolls a
@@ -618,8 +621,8 @@ Python frontend / PyO3 -> TensorTraceGraph -> TensorIr / AD transforms
   repeated gather/scatter coordinates correctly. Dynamic tensor indices
   (pending `I32` index tensors), boolean-mask indexing, and assignment-style
   scatter are not yet supported.
-- `nabla.einsum("ij,jk->ik", [lhs, rhs])` and
-  `nabla.einsum("...ij,...jk->...ik", [lhs, rhs])` are scoped matrix-product
+- `quabla.einsum("ij,jk->ik", [lhs, rhs])` and
+  `quabla.einsum("...ij,...jk->...ik", [lhs, rhs])` are scoped matrix-product
   spellings that lower directly to the existing rank-N `matmul` plan. Other
   einsum equations are rejected rather than silently interpreted.
 - `Tensor` and `TraceTensor` support `__getitem__` with integer and

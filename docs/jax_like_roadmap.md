@@ -16,7 +16,7 @@ Current state:
 
 - Scalar forward-mode AD with `Dual`.
 - Model gradients are computed by seeding one parameter at a time.
-- `nabla-core::tensor_ir::TensorIr` now provides a pure-Rust dynamic rank-N IR
+- `quabla-core::tensor_ir::TensorIr` now provides a pure-Rust dynamic rank-N IR
   for input, broadcasted add/multiply, and scalar sum; it evaluates on CPU and
   generates both direct JVPs and VJPs that reduce cotangents over broadcast
   axes.
@@ -139,9 +139,9 @@ across tracing and backend-specific execution-plan classes:
 frontend trace -> Program -> JVP/VJP transform -> compile(target) -> Executable
 ```
 
-`nabla_core::compiler` owns the Rust-facing `NablaCompiler`, `NablaProgram`,
-and `NablaExecutable` contracts. The Python bridge exposes the same lifecycle
-as `nabla.Compiler`, `Program`, and `Executable`. Existing function-specific
+`quabla_core::compiler` owns the Rust-facing `QuablaCompiler`, `QuablaProgram`,
+and `QuablaExecutable` contracts. The Python bridge exposes the same lifecycle
+as `quabla.Compiler`, `Program`, and `Executable`. Existing function-specific
 helpers remain compatibility APIs while they migrate internally.
 
 This facade is a boundary, not a claim that every IR operation lowers on every
@@ -151,7 +151,7 @@ HVP lowering must not be represented as a general supported capability.
 
 Implementation status (2026-07-29): the core facade now owns immutable
 single-output programs and their `freeze`, symbolic tangent-input JVP, symbolic
-VJP, target selection, and execution contracts. `NablaTarget::is_built()` is a
+VJP, target selection, and execution contracts. `QuablaTarget::is_built()` is a
 compile-time feature/platform check; it is deliberately separate from
 per-program lowering validation. The Python facade traces rank-N functions,
 exposes `Program.jvp(input_name)` and `Program.vjp(cotangent_name)`, then
@@ -196,10 +196,10 @@ Helper migration plan (2026-09-27): every rank-N Python helper is classified
 against the current single-output facade contract. Category (a) helpers
 compile one traced output; migrated targets delegate through
 `TensorTraceGraph::compile_{cpu,mlx,cuda}_plan`, which build a
-`NablaProgram` from a snapshot of the traced IR and call
-`NablaCompiler::compile_without_build_check`. `Program.compile(...)` and the
+`QuablaProgram` from a snapshot of the traced IR and call
+`QuablaCompiler::compile_without_build_check`. `Program.compile(...)` and the
 legacy `compile_cpu`/`compile_mlx`/`compile_cuda` methods share the same path.
-`NablaCompiler::compile` rejects a target missing from the build up front with
+`QuablaCompiler::compile` rejects a target missing from the build up front with
 `<target> target is unavailable in this build`; the bridge skips only that
 check, so the Python entrypoints keep their pre-facade errors in such a build
 (CUDA fails at compile time and MLX on first execution, each with its backend's
@@ -222,21 +222,21 @@ numerics and operation coverage, so it is not part of this migration.
 | (c) Separate | `tensor_value_and_grad_data_parallel_cuda_fn`, `cuda_adam_optimizer`, `cuda_adam_step`, trace-time region builders (`tensor_cond`, `tensor_fori_loop*`, `tensor_scan*`), eager graph evaluation methods, legacy 2D `TraceGraph` | Stays outside the facade |
 
 Verification (2026-09-27): the local Apple-silicon host runs workspace tests
-and Clippy with and without `nabla-core/mlx`, plus the Python matrix with and
-without `NABLA_MLX_TEST=1`. On `cuda-host` (GTX 1660 SUPER), `NABLA_CUDA_TEST=1
-cargo test -p nabla-core --features cuda`, workspace Clippy with
-`nabla-core/cuda`, and the release CUDA extension's Python matrix with and
-without `NABLA_CUDA_TEST=1` pass after the migration; a facade-routed
+and Clippy with and without `quabla-core/mlx`, plus the Python matrix with and
+without `QUABLA_MLX_TEST=1`. On `cuda-host` (GTX 1660 SUPER), `QUABLA_CUDA_TEST=1
+cargo test -p quabla-core --features cuda`, workspace Clippy with
+`quabla-core/cuda`, and the release CUDA extension's Python matrix with and
+without `QUABLA_CUDA_TEST=1` pass after the migration; a facade-routed
 `tensor_jit_cuda_fn` runs on the GPU (`backend == "cublas"`) and matches CPU
 within `2e-8`.
 
 Multi-output programs (2026-09-27): category (b) helpers freeze a value
 together with selected gradients or a primal/tangent pair into one plan and
-consume the frozen output node ids. `NablaMultiOutputProgram::new(ir,
+consume the frozen output node ids. `QuablaMultiOutputProgram::new(ir,
 outputs)` records that output order next to, not inside, the single-output
-`NablaProgram`, whose API and symbolic JVP/VJP transforms are unchanged.
-`NablaCompiler::compile_many` freezes it through the same lowering step as
-`compile` and returns a `NablaMultiOutputExecutable`;
+`QuablaProgram`, whose API and symbolic JVP/VJP transforms are unchanged.
+`QuablaCompiler::compile_many` freezes it through the same lowering step as
+`compile` and returns a `QuablaMultiOutputExecutable`;
 `compile_many_without_build_check` is the matching bypass, again reserved for
 the Python compatibility helpers. Freezing prunes and deduplicates nodes, so
 the executable owns the source-to-frozen remapping: `output_node_ids()[i]` is
@@ -244,7 +244,7 @@ the frozen id of program output `i`, and `execute` returns every output in
 program order from one evaluation. Retained state stays with its executors:
 MLX retained input arrays (`TensorMlxExecutionPlan`, `MlxAdamPlan`),
 device-resident CUDA buffers, and Adam moments are not part of
-`NablaExecutable`. `into_executable()` hands those executors the backend plan
+`QuablaExecutable`. `into_executable()` hands those executors the backend plan
 they already consume, which keeps one lowering path without redesigning
 retained execution; moving retained state into the facade executable remains a
 separate design step. Rust tests cover output order, frozen-id remapping,
@@ -271,9 +271,9 @@ each, medians) are 1.12 vs 1.14 ms/step and 327 vs 312 ms compile at the
 default size, 1.17 vs 1.10 ms/step at `--width 64 --collocation 256`, with
 single runs spanning 1.03 to 1.40 ms/step.
 
-Category (c) helpers either target a replica set rather than one `NablaTarget`
+Category (c) helpers either target a replica set rather than one `QuablaTarget`
 (data-parallel CUDA, which still freezes its value-and-gradient program with
-`NablaMultiOutputProgram::freeze` before `compile_data_parallel`), only
+`QuablaMultiOutputProgram::freeze` before `compile_data_parallel`), only
 consume already-compiled plans (CUDA Adam), build IR regions during tracing
 rather than executables (single-output `tensor_cond` and
 `tensor_fori_loop_region` bodies still freeze through the facade CPU path),
@@ -284,7 +284,7 @@ separate 2D tracer.
 
 Current state:
 
-- `nabla-python` exposes a minimal `Matrix` class through PyO3.
+- `quabla-python` exposes a minimal `Matrix` class through PyO3.
 - Python can use Rust-owned matrix storage and call Rust add/sub/mul/div/powf/tanh/exp/log/sqrt/sin/cos/gt/where/concat/transpose/reshape/matmul/sum/mean.
 - `TraceGraph` and `TraceMatrix` can record input, scalar constant, add,
   subtract, multiply, divide, greater-than, `where`, concat, powf, tanh, exp,
@@ -306,7 +306,7 @@ Current state:
   `TraceGraph`, AD transforms, or CPU plan lowering; those paths remain 2D
   `Matrix`-based. The separate `TensorTraceGraph` provides a rank-N
   add/multiply/sum AD subset.
-- `nabla-core::TensorIr` is the rank-N compiler-core path, but it is not yet
+- `quabla-core::TensorIr` is the rank-N compiler-core path, but it is not yet
   exposed through the legacy Python tracer. `trace_tensor(...)` now exposes its
   add/subtract/multiply/divide/matmul/rank-N-concat/rank-N-transpose/tanh/exp/sin/cos/sqrt/non-negative-integer-powi/log/reshape/global-or-single-axis-sum/mean subset through separate `TensorTraceGraph` and
   `TraceTensor` classes, with Python-facing CPU VJP and JVP evaluation. This
@@ -567,7 +567,7 @@ Adam. Benchmark execution remains separate from correctness validation.
 
 Acceptance checks:
 
-- A Python example trains a two-layer PINN using only Nabla tensor APIs after
+- A Python example trains a two-layer PINN using only Quabla tensor APIs after
   initialization.
 - Profiling confirms no per-step parameter or gradient device-to-host copy.
 - CPU reference and CUDA loss/gradient checks agree within the documented
@@ -605,7 +605,7 @@ axis and an unmapped parameter. MLX also lowers batched primal/JVP pairs from
 explicit runtime tangent IR inputs in one multi-output GPU plan, with
 non-leading input and output axes covered against the CPU reference.
 CUDA now lowers the same explicit-tangent batched JVP union plan; its runtime
-parity test is gated on `NABLA_CUDA_TEST` until the configured CUDA host exposes
+parity test is gated on `QUABLA_CUDA_TEST` until the configured CUDA host exposes
 its NVIDIA driver and runtime libraries.
 
 ### P3. SciML Array And Linear-Algebra Surface
@@ -648,7 +648,7 @@ GTX 1660 SUPER on 2026-07-28.
 validation and as a static trace-time recurrence, so existing JVP/VJP machinery
 provides verified derivatives. Native CUDA/MLX factorization lowering and
 broader contractions remain pending. MLX 0.25.3
-only exposes `linalg::solve` on a CPU stream, so Nabla rejects it on the MLX GPU
+only exposes `linalg::solve` on a CPU stream, so Quabla rejects it on the MLX GPU
 backend rather than silently falling back. `relu`, `abs`, `sigmoid`, and a
 numerically stable `softplus` are available on eager and traced tensors; `relu`
 uses a zero subgradient at zero, while `abs` follows the existing `where`
@@ -720,7 +720,7 @@ while symbolic AD follows node dtypes exactly.
 `TensorDeviceBackend::execution_dtype` maps `F64` and `F32` to `f32` on CUDA
 and MLX; both reject any node whose dtype does not lower to `f32`, execute
 `Cast` as an identity, and tag readbacks with the node dtype. Python exposes
-`nabla.float32`/`nabla.float64`, `Tensor(..., dtype=...)`, `astype`, `dtype`
+`quabla.float32`/`quabla.float64`, `Tensor(..., dtype=...)`, `astype`, `dtype`
 properties, and `(name, shape, dtype)` input specs; eager `Tensor` ops follow
 the same promotion and rounding rules.
 
@@ -764,7 +764,7 @@ longer poisons cond tangents and gradients. `execution_dtype(Bool)` is `f32`
 on CUDA and MLX; CUDA lowers `Compare` in per-node, fused, region, and loop
 body kernels, and MLX casts its native bool comparison back to `f32` at the
 node. `lower_text`/`stablehlo_text` print `i1` and `kernel_ir()` reports
-`"bool"`. Python exposes `nabla.bool_`, comparison methods and functions,
+`"bool"`. Python exposes `quabla.bool_`, comparison methods and functions,
 `<`/`<=`/`>`/`>=`, `&`/`|`/`~`, `isfinite`/`isnan`, `any`/`all` with
 `axis`/`keepdims`, scalar `where` branches, and NumPy-style truthiness for
 single-element eager bool tensors; `==`/`!=` keep identity semantics.
@@ -934,7 +934,7 @@ selects the matching branch VJP, while `tensor_cond_jvp_fn(...)` selects its
 matching JVP. This establishes lazy branch semantics without misrepresenting
 `where` as control flow. `TensorRegion` and `TensorCondExecutionPlan` now own
 the identical-capture validation and selected-branch primal/JVP/VJP execution
-in `nabla-core`, rather than leaving this contract in the Python bridge.
+in `quabla-core`, rather than leaving this contract in the Python bridge.
 `TensorOp::Cond` now owns two frozen `TensorRegion` plans plus ordered,
 explicit named capture bindings to parent node IDs. CPU execution evaluates the
 scalar predicate first and materializes only the selected branch; DCE, remap,
@@ -1359,7 +1359,7 @@ second mode of the pair, or if the final parameters differ by more than
 `1e-4` in `max|a - b| / max|b|` over all parameters. `1e-4` is about 6.5
 times the f32 worst-case rounding bound for the 256-row batch mean
 (`256 * 2^-24`), while reduction bugs such as a `Sum`/`Mean` mix-up give
-O(1) differences. Slurm job 6011 (`scripts/slurm/nabla_p7_training.sbatch`,
+O(1) differences. Slurm job 6011 (`scripts/slurm/quabla_p7_training.sbatch`,
 node gpu-node, 2x RTX 3090, driver 560.35.05, CUDA 12.6, NCCL 2.24.3) ran the
 tree of `66ef989` and passed; job 6010 produced identical differences but
 exited non-zero because its 50-step baseline run did not meet the
@@ -1402,7 +1402,7 @@ rejects every later call. The natural trigger is a replica whose input map
 lacks its shard: it fails input validation after replica 0 has enqueued
 its work. No fault-injection seam was added, so an error returned by NCCL
 itself takes the same path but is not exercised. Slurm job 6015
-(`scripts/slurm/nabla_p7_robustness.sbatch`, node gpu-node, 2x RTX 3090,
+(`scripts/slurm/quabla_p7_robustness.sbatch`, node gpu-node, 2x RTX 3090,
 driver 560.35.05, NCCL 2.24.3) ran the tree of `ff0735e`:
 
 - Recovery: after a successful call, two consecutive failed calls each
@@ -1502,7 +1502,7 @@ Tensor IR AD and Enzyme. Do not claim support for arbitrary borrowing,
 mutation, dynamic dispatch, async code, or Python callbacks until their
 semantics are explicitly modeled and tested.
 
-Implementation status (2026-07-27): the `nabla-macros` procedural-macro crate
+Implementation status (2026-07-27): the `quabla-macros` procedural-macro crate
 exports `forward_diff!(|x| expression)`. It parses a one-argument closure and
 rewrites the parameter to a `Dual::variable` seed at expansion time, so Rust's
 operator and method resolution produces forward-mode value/derivative pairs

@@ -1,4 +1,4 @@
-# Nabla Core Design
+# Quabla Core Design
 
 ## Goal
 
