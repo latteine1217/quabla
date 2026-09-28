@@ -867,6 +867,7 @@ impl CudaExecutionPlan {
                 .take(self.plan.nodes.len())
                 .collect();
         }
+        recycle_cuda_computed_values(&self.plan, values, free_buffers);
         values[self.plan.output_node_id] = Some(output);
         execute_cuda_device_program(
             &self.plan,
@@ -906,6 +907,7 @@ impl CudaExecutionPlan {
             free_buffers,
             ..
         } = &mut *state;
+        recycle_cuda_computed_values(&self.plan, values, free_buffers);
         if let Some(epilogue) = self.matmul_bias_tanh {
             execute_cuda_matmul_bias_tanh_program(
                 &self.plan,
@@ -1471,6 +1473,31 @@ fn release_cuda_value(
         free_buffers.entry(buffer.len()).or_default().push(buffer);
     }
     Ok(())
+}
+
+/// Returns every computed-node buffer that a previous execution left in
+/// `values` to the pool, so each execution starts from the value table the
+/// first one saw.
+///
+/// Output nodes keep their buffers after a run for host readback, optimizer
+/// steps, and collectives. Structural Scan and loop-gradient groups place a
+/// result computed by a sibling node into an empty slot, so a slot still
+/// holding the previous run's output would otherwise be rejected. Input slots
+/// stay: retained inputs hold device-resident parameters, and the upload
+/// overwrites every other input.
+fn recycle_cuda_computed_values(
+    plan: &TensorExecutionPlan,
+    values: &mut [Option<CudaSlice<f32>>],
+    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+) {
+    for (slot, node) in values.iter_mut().zip(&plan.nodes) {
+        if matches!(node.op, TensorOp::Input { .. }) {
+            continue;
+        }
+        if let Some(buffer) = slot.take() {
+            free_buffers.entry(buffer.len()).or_default().push(buffer);
+        }
+    }
 }
 
 fn release_dead_cuda_values(

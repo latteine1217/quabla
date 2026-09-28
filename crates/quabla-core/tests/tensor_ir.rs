@@ -3037,6 +3037,280 @@ fn cuda_grouped_loop_capture_reductions_repeat_exactly_when_enabled() {
     ));
 }
 
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_compiled_grouped_scan_vjp_value_and_grad_plan_executes_repeatedly_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    // Retaining the value and every gradient as plan outputs keeps all grouped Scan VJP results
+    // alive after a run, as a compiled value-and-grad function does between training steps.
+    for broadcast_output in [true, false] {
+        let label = format!("grouped Scan VJP value and grad, broadcast_output={broadcast_output}");
+        let (graph, loss, inputs) = must!(cuda_group_scan_loss(broadcast_output, true));
+        let vjp = must!(graph.symbolic_vjp(loss, "cotangent"));
+        let (plan, _) = must!(vjp.graph.compile_cpu_many(&[
+            vjp.value,
+            vjp.gradients["initial"],
+            vjp.gradients["scale"],
+            vjp.gradients["bias"],
+        ]));
+        let alternate = must!(cuda_alternate_inputs(&inputs));
+        must!(assert_repeated_cuda_executions_match_cpu(
+            &label,
+            &plan,
+            &[inputs, alternate],
+            4,
+        ));
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_compiled_grouped_scan_vjp_jvp_plan_executes_repeatedly_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    for broadcast_output in [true, false] {
+        let label = format!("grouped Scan VJP JVP, broadcast_output={broadcast_output}");
+        let (graph, loss, mut inputs) = must!(cuda_group_scan_loss(broadcast_output, true));
+        let vjp = must!(graph.symbolic_vjp(loss, "cotangent"));
+        // Directional derivatives of every gradient as separate outputs keep each Scan VJP JVP
+        // group member alive after the run.
+        let directional = must!(vjp.graph.symbolic_jvp_many_with_tangent_inputs(
+            &[
+                vjp.gradients["initial"],
+                vjp.gradients["scale"],
+                vjp.gradients["bias"],
+            ],
+            &BTreeMap::from([
+                ("initial".to_string(), "initial_tangent".to_string()),
+                ("scale".to_string(), "scale_tangent".to_string()),
+            ]),
+        ));
+        assert_eq!(
+            directional
+                .graph
+                .lower_text()
+                .matches("scan_vjp_jvp(group=")
+                .count(),
+            3,
+            "{label}"
+        );
+        let shape = inputs["initial"].shape().to_vec();
+        let lanes = shape.iter().product::<usize>();
+        let initial_tangent = [0.3, -0.5, 0.2, 0.7, -0.1, 0.4][..lanes].to_vec();
+        let scale_tangent = [-0.2, 0.6, 0.1, 0.3, -0.4, 0.5][..lanes].to_vec();
+        inputs.insert(
+            "initial_tangent".to_string(),
+            must!(DynamicTensor::new(shape.clone(), initial_tangent)),
+        );
+        inputs.insert(
+            "scale_tangent".to_string(),
+            must!(DynamicTensor::new(shape, scale_tangent)),
+        );
+        let (plan, _) = must!(directional.graph.compile_cpu_many(&directional.tangents));
+        let alternate = must!(cuda_alternate_inputs(&inputs));
+        must!(assert_repeated_cuda_executions_match_cpu(
+            &label,
+            &plan,
+            &[inputs, alternate],
+            4,
+        ));
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_compiled_grouped_fori_vjp_plan_executes_repeatedly_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let (graph, loss, inputs) = must!(cuda_group_fori_loss());
+    let vjp = must!(graph.symbolic_vjp(loss, "cotangent"));
+    let (plan, _) = must!(vjp.graph.compile_cpu_many(&[
+        vjp.value,
+        vjp.gradients["initial"],
+        vjp.gradients["scale"],
+        vjp.gradients["bias"],
+    ]));
+    let alternate = must!(cuda_alternate_inputs(&inputs));
+    must!(assert_repeated_cuda_executions_match_cpu(
+        "grouped Fori VJP value and grad",
+        &plan,
+        &[inputs, alternate],
+        4,
+    ));
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_compiled_scan_plan_retaining_carry_and_outputs_executes_repeatedly_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![2, 3]));
+    let index = must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![2, 3]));
+    let scaled = must!(body.mul(carry, scale));
+    let activated = must!(body.tanh(scaled));
+    let next = must!(body.add(activated, index));
+    let output = must!(body.mul(next, scale));
+    let (body_plan, _) = must!(body.compile_cpu_many(&[next, output]));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0, 3, body_plan, "carry", "index"
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![2, 3]));
+    let scale = must!(graph.input("scale", vec![2, 3]));
+    let (final_carry, outputs) =
+        must!(graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)]));
+    // Both results of one Scan group stay alive as plan outputs after every run.
+    let (plan, _) = must!(graph.compile_cpu_many(&[final_carry, outputs]));
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            must!(DynamicTensor::new(
+                vec![2, 3],
+                vec![0.4, -0.6, 0.3, -0.2, 0.5, 0.1]
+            )),
+        ),
+        (
+            "scale".to_string(),
+            must!(DynamicTensor::new(
+                vec![2, 3],
+                vec![0.8, 1.1, 0.6, -0.7, 0.9, 1.2]
+            )),
+        ),
+    ]);
+    let alternate = must!(cuda_alternate_inputs(&inputs));
+    must!(assert_repeated_cuda_executions_match_cpu(
+        "Scan carry and outputs",
+        &plan,
+        &[inputs, alternate],
+        4,
+    ));
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_compiled_cond_plan_alternates_branches_across_executions_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let (graph, loss) = must!(log_guard_cond_graph());
+    let vjp = must!(graph.symbolic_vjp(loss, "seed"));
+    let (plan, _) =
+        must!(vjp
+            .graph
+            .compile_cpu_many(&[vjp.value, vjp.gradients["x"], vjp.gradients["y"],]));
+    let inputs_at = |x: f64| -> Result<BTreeMap<String, DynamicTensor>, String> {
+        Ok(BTreeMap::from([
+            ("x".to_string(), DynamicTensor::new(vec![], vec![x])?),
+            (
+                "y".to_string(),
+                DynamicTensor::new(vec![3], vec![1.0, 2.0, 3.0])?,
+            ),
+            ("seed".to_string(), DynamicTensor::new(vec![], vec![1.0])?),
+        ]))
+    };
+    // Alternating the predicate switches the executed branch region on every run.
+    must!(assert_repeated_cuda_executions_match_cpu(
+        "Cond value and grad",
+        &plan,
+        &[must!(inputs_at(2.0)), must!(inputs_at(-1.0))],
+        4,
+    ));
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_retained_adam_trains_through_grouped_scan_gradients_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    let (learning_rate, beta1, beta2, epsilon) = (0.05, 0.9, 0.999, 1e-8);
+    let (graph, loss, inputs) = must!(cuda_group_scan_loss(true, true));
+    let vjp = must!(graph.symbolic_vjp(loss, "cotangent"));
+    let names = ["initial", "scale", "bias"];
+    let mut outputs = vec![vjp.value];
+    outputs.extend(names.iter().map(|name| vjp.gradients[*name]));
+    let (plan, output_ids) = must!(vjp.graph.compile_cpu_many(&outputs));
+    let cuda = must!(CudaBackend::new(0).compile(plan.clone()));
+    let retained = names
+        .iter()
+        .map(|name| name.to_string())
+        .collect::<BTreeSet<_>>();
+
+    // Host Adam in f64 over CPU gradients is the reference trajectory.
+    let mut host_inputs = inputs.clone();
+    let mut moments = names
+        .iter()
+        .map(|name| {
+            let count = inputs[*name].data().len();
+            (vec![0.0f64; count], vec![0.0f64; count])
+        })
+        .collect::<Vec<_>>();
+    for step in 1..=4 {
+        let cpu = must!(plan.evaluate_many(&host_inputs));
+        must!(cuda.execute_retaining_without_output(&inputs, &retained));
+        let cuda_loss = must!(cuda.computed_node_to_host(output_ids[0]));
+        assert_cuda_outputs_match_cpu(
+            &format!("Adam step {step} loss"),
+            &[cuda_loss],
+            &cpu[..1],
+            1e-4,
+        );
+        for (index, name) in names.iter().enumerate() {
+            must!(cuda.adam_step_input_from_node(
+                name,
+                output_ids[index + 1],
+                learning_rate,
+                beta1,
+                beta2,
+                epsilon,
+            ));
+            let (first, second) = &mut moments[index];
+            let parameter = &host_inputs[*name];
+            let correction1 = 1.0 - f64::from(beta1).powi(step);
+            let correction2 = 1.0 - f64::from(beta2).powi(step);
+            let updated = parameter
+                .data()
+                .iter()
+                .zip(cpu[index + 1].data())
+                .enumerate()
+                .map(|(lane, (value, gradient))| {
+                    first[lane] =
+                        f64::from(beta1) * first[lane] + (1.0 - f64::from(beta1)) * gradient;
+                    second[lane] = f64::from(beta2) * second[lane]
+                        + (1.0 - f64::from(beta2)) * gradient * gradient;
+                    value
+                        - f64::from(learning_rate) * (first[lane] / correction1)
+                            / ((second[lane] / correction2).sqrt() + f64::from(epsilon))
+                })
+                .collect::<Vec<_>>();
+            let updated = must!(DynamicTensor::new(parameter.shape().to_vec(), updated));
+            host_inputs.insert(name.to_string(), updated);
+        }
+    }
+    for name in names {
+        let device = must!(cuda.retained_input_to_host(name));
+        assert_cuda_outputs_match_cpu(
+            &format!("Adam parameter {name}"),
+            &[device],
+            &[host_inputs[name].clone()],
+            1e-4,
+        );
+    }
+}
+
 /// Builds `sum(cond(x > 0, y * log(x), y * y + x * 0))`.
 ///
 /// The inactive log branch would inject NaN into the value and gradients for

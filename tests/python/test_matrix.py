@@ -987,6 +987,54 @@ def test_cuda_value_and_grad_groups_broadcast_scan_vjp_targets():
                 )
 
 
+def test_cuda_value_and_grad_reexecutes_grouped_scan_vjp_plan():
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
+        return
+
+    # Training loops call one compiled value-and-grad function per step, so its grouped Scan VJP
+    # plan must run any number of times; alternating inputs exposes state left by the prior call.
+    def body(index, current, scale):
+        nxt = (current * scale).tanh() + index
+        return nxt, nxt.broadcast_to([2, 3])
+
+    def loss(initial, scale):
+        carry, outputs = quabla.tensor_scan_region(0, 3, body, initial, [scale])
+        return carry.sum() + (outputs * outputs).sum()
+
+    specs = [("initial", [2, 1]), ("scale", [2, 1])]
+    input_sets = [
+        {
+            "initial": quabla.Tensor([2, 1], [0.4, -0.6]),
+            "scale": quabla.Tensor([2, 1], [0.8, 1.1]),
+        },
+        {
+            "initial": quabla.Tensor([2, 1], [-0.3, 0.5]),
+            "scale": quabla.Tensor([2, 1], [1.2, -0.7]),
+        },
+    ]
+    cpu = quabla.tensor_value_and_grad_fn(loss, specs)
+    cuda = quabla.tensor_value_and_grad_cuda_fn(loss, specs, ["initial", "scale"])
+    for call in range(3):
+        inputs = input_sets[call % len(input_sets)]
+        cpu_value, cpu_gradients = cpu(inputs)
+        value, gradients = cuda(inputs)
+        actual = [value.to_flat_list()] + [
+            gradients[name].to_flat_list() for name in ("initial", "scale")
+        ]
+        expected = [cpu_value.to_flat_list()] + [
+            cpu_gradients[name].to_flat_list() for name in ("initial", "scale")
+        ]
+        for actual_row, expected_row in zip(actual, expected):
+            assert len(actual_row) == len(expected_row)
+            for actual_value, expected_value in zip(actual_row, expected_row):
+                tolerance = 2e-5 * max(1.0, abs(expected_value))
+                assert abs(actual_value - expected_value) <= tolerance, (
+                    call,
+                    actual,
+                    expected,
+                )
+
+
 def test_compiler_facade_cuda_rejects_indexed_unequal_lane_scan_hvp():
     if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
