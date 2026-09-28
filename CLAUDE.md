@@ -22,7 +22,8 @@ was wrong, why the change fixes it, and which verification was actually run.
 ## Verification
 
 The required gates (fmt, clippy, tests, ruff, the Python matrix) are listed
-under "Development Gates" in `README.md`; run the ones that cover the change.
+under "Development Gates" in `CONTRIBUTING.md`; run the ones that cover the
+change.
 GPU runtime suites are opt-in through `QUABLA_MLX_TEST=1`,
 `QUABLA_CUDA_TEST=1`, and `QUABLA_CUDA_NCCL_TEST=1`, and CUDA code only
 compiles on Linux.
