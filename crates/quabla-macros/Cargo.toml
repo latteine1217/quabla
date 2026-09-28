@@ -4,6 +4,8 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# Quabla is released as source only; the crates are not published to crates.io.
+publish = false
 description = "Restricted source-level forward-mode autodiff macros for Quabla"
 
 [lib]

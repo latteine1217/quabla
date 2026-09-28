@@ -1,4 +1,20 @@
+# Build outputs and local environments
 /target/
 /.venv/
+/.venv-ci/
+/dist/
+*.whl
+*.so
+
+# Python and tool caches
 __pycache__/
 *.py[cod]
+/.ruff_cache/
+
+# Local validation logs and locally installed native dependencies
+/logs/
+/.deps/
+
+# macOS metadata
+.DS_Store
+._*

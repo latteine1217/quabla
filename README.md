@@ -55,7 +55,7 @@ validation records are in [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md).
 Prerequisites:
 
 - Rust stable toolchain (`rustup`).
-- Python 3.10 or newer and maturin 1.x.
+- Python 3.10 or newer and maturin 1.x (1.9.3 or later).
 - MLX builds: macOS on Apple silicon, CMake, and Xcode's Metal Toolchain
   (`xcodebuild -downloadComponent MetalToolchain`). The Python `mlx` wheel is
   not used.
@@ -75,7 +75,7 @@ git clone https://github.com/latteine1217/quabla.git
 cd quabla
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install "maturin>=1,<2"
+python -m pip install "maturin>=1.9.3,<2"
 
 # Pick one:
 maturin develop --release                        # CPU only

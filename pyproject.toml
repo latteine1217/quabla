@@ -1,17 +1,53 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
+# 1.9.3 is the first maturin release with complete PEP 639 support: 1.9.0
+# added `license`/`license-files`, 1.9.2 emits `License-Expression`, and 1.9.3
+# includes `license-files` in source distributions.
+requires = ["maturin>=1.9.3,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "quabla"
 version = "0.1.0"
 description = "Rust-backed SciML runtime experiment exposed to Python"
+readme = "README.md"
 requires-python = ">=3.10"
+# PEP 639 license expression; License :: classifiers must not be combined with it.
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "latteine" }]
+keywords = [
+    "automatic-differentiation",
+    "autodiff",
+    "sciml",
+    "pinn",
+    "compiler",
+    "cuda",
+    "mlx",
+    "rust",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
 
 [project.urls]
+Homepage = "https://github.com/latteine1217/quabla"
 Repository = "https://github.com/latteine1217/quabla"
+Issues = "https://github.com/latteine1217/quabla/issues"
+Changelog = "https://github.com/latteine1217/quabla/blob/main/CHANGELOG.md"
 
 [tool.maturin]
 manifest-path = "crates/quabla-python/Cargo.toml"
