@@ -1,14 +1,26 @@
-# On-demand macOS check: the mlx feature build plus the default gates on the
-# newest supported Python. Not triggered by pushes because macOS minutes are
-# billed at 10x for this private repository and a cold mlx build compiles MLX
-# C++ from source. Run it before a release or after changing the MLX backend.
+# macOS check: the mlx feature build plus the default gates on the newest
+# supported Python. A cold mlx build compiles MLX C++ from source through
+# mlx-rs and dominates the run time, so this workflow is not run on every push.
+# It runs on pull requests that touch the MLX backend, the Cargo manifests or
+# lockfile, or this workflow, and on demand (for example before a release).
 #
 # MLX is compiled and linted only: hosted macOS runners have no usable Metal
 # device, and with the mlx feature cargo test would execute MLX GPU tests.
 name: macOS MLX check
 
 on:
+  pull_request:
+    paths:
+      - crates/quabla-core/src/tensor_ir/mlx.rs
+      - "crates/**/Cargo.toml"
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/macos-mlx.yml
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -24,14 +36,18 @@ jobs:
     # A cold run builds MLX C++ through mlx-rs (cmake).
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Pinned to a master commit (the stable branch is not in master's
+      # history and may be garbage-collected); the toolchain input then
+      # selects stable.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
         with:
+          toolchain: stable
           components: clippy
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-targets --features quabla-core/mlx -- -D warnings
       - run: cargo test --workspace

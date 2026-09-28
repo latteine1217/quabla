@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Actions are pinned by commit SHA; Dependabot bumps the SHA together with
+  # the version comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # One grouped PR for compatible (minor and patch) updates; semver-major
+  # updates still arrive one per PR because they may need code changes.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo-compatible:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
