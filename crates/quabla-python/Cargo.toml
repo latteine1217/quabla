@@ -1,0 +1,22 @@
+[package]
+name = "quabla-python"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PyO3 Python bindings for the Quabla SciML runtime"
+
+[lib]
+name = "quabla"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[features]
+extension-module = ["pyo3/extension-module"]
+cuda = ["quabla-core/cuda"]
+cuda-nccl = ["cuda", "quabla-core/cuda-nccl"]
+mlx = ["quabla-core/mlx"]
+
+[dependencies]
+pyo3 = "0.29"
+quabla-core = { path = "../quabla-core" }

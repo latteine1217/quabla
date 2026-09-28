@@ -8,7 +8,7 @@
 # Deliberately NOT run here:
 # - CUDA, NCCL and MLX runtime tests. Hosted runners have no NVIDIA GPU and no
 #   usable Metal device; those suites run on the GPU hosts, gated by
-#   NABLA_CUDA_TEST / NABLA_CUDA_NCCL_TEST / NABLA_MLX_TEST (unset here).
+#   QUABLA_CUDA_TEST / QUABLA_CUDA_NCCL_TEST / QUABLA_MLX_TEST (unset here).
 # - macOS and the MLX build. macOS minutes are billed at 10x for this private
 #   repository and the mlx feature compiles MLX C++ from source; that check
 #   lives in macos-mlx.yml and runs on demand.
@@ -57,7 +57,7 @@ jobs:
       # Compile-only check of the CUDA/NCCL backend, which macOS development
       # machines cannot compile at all. cudarc is built with
       # fallback-dynamic-loading, so no CUDA toolkit is needed.
-      - run: cargo clippy --workspace --all-targets --features nabla-core/cuda-nccl -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features quabla-core/cuda-nccl -- -D warnings
       - run: cargo test --workspace
       - name: Build extension
         run: |

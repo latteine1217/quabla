@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "nabla"
+name = "quabla"
 version = "0.1.0"
 description = "Rust-backed SciML runtime experiment exposed to Python"
 requires-python = ">=3.10"
@@ -14,6 +14,6 @@ license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 Repository = "https://github.com/latteine1217/quabla"
 
 [tool.maturin]
-manifest-path = "crates/nabla-python/Cargo.toml"
+manifest-path = "crates/quabla-python/Cargo.toml"
 features = ["extension-module"]
-module-name = "nabla"
+module-name = "quabla"

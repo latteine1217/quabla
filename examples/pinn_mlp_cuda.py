@@ -8,7 +8,7 @@ does not construct VJP dictionaries or materialize gradients on the host.
 
 import math
 
-import nabla
+import quabla
 
 
 def main() -> None:
@@ -24,7 +24,7 @@ def main() -> None:
         ("forcing", [4, 1]),
         ("target", [4, 1]),
     ]
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, x_boundary, w1, b1, w2, b2, forcing, target: (
             (x @ w1 + b1).tanh() @ w2
         )
@@ -47,31 +47,31 @@ def main() -> None:
     parameter_names = ["w1", "b1", "w2", "b2"]
 
     teacher = {
-        "w1": nabla.Tensor([1, 2], [1.2, -0.7]),
-        "b1": nabla.Tensor([1, 2], [0.1, -0.2]),
-        "w2": nabla.Tensor([2, 1], [0.8, 0.5]),
-        "b2": nabla.Tensor([1, 1], [0.05]),
+        "w1": quabla.Tensor([1, 2], [1.2, -0.7]),
+        "b1": quabla.Tensor([1, 2], [0.1, -0.2]),
+        "w2": quabla.Tensor([2, 1], [0.8, 0.5]),
+        "b2": quabla.Tensor([1, 1], [0.05]),
     }
     teacher_inputs = {
-        "x": nabla.Tensor([4, 1], coordinates),
-        "x_boundary": nabla.Tensor([4, 1], boundary_coordinates),
-        "forcing": nabla.Tensor([4, 1], [0.0] * 4),
-        "target": nabla.Tensor([4, 1], [0.0] * 4),
+        "x": quabla.Tensor([4, 1], coordinates),
+        "x_boundary": quabla.Tensor([4, 1], boundary_coordinates),
+        "forcing": quabla.Tensor([4, 1], [0.0] * 4),
+        "target": quabla.Tensor([4, 1], [0.0] * 4),
         **teacher,
     }
     second_value = graph.evaluate(second_derivative.output.node_id, teacher_inputs)
     boundary_target = graph.evaluate(boundary.node_id, teacher_inputs)
     inputs = {
-        "x": nabla.Tensor([4, 1], coordinates),
-        "x_boundary": nabla.Tensor([4, 1], boundary_coordinates),
-        "forcing": nabla.Tensor([4, 1], [-value for value in second_value.to_flat_list()]),
+        "x": quabla.Tensor([4, 1], coordinates),
+        "x_boundary": quabla.Tensor([4, 1], boundary_coordinates),
+        "forcing": quabla.Tensor([4, 1], [-value for value in second_value.to_flat_list()]),
         "target": boundary_target,
-        "w1": nabla.Tensor.glorot_normal([1, 2], nabla.Tensor.split_key(2026, 2)[0]),
-        "b1": nabla.Tensor([1, 2], [0.0, 0.0]),
-        "w2": nabla.Tensor.glorot_normal([2, 1], nabla.Tensor.split_key(2026, 2)[1]),
-        "b2": nabla.Tensor([1, 1], [0.0]),
+        "w1": quabla.Tensor.glorot_normal([1, 2], quabla.Tensor.split_key(2026, 2)[0]),
+        "b1": quabla.Tensor([1, 2], [0.0, 0.0]),
+        "w2": quabla.Tensor.glorot_normal([2, 1], quabla.Tensor.split_key(2026, 2)[1]),
+        "b2": quabla.Tensor([1, 1], [0.0]),
     }
-    optimizer = nabla.cuda_adam_loss_optimizer(
+    optimizer = quabla.cuda_adam_loss_optimizer(
         loss,
         parameter_names,
         inputs,

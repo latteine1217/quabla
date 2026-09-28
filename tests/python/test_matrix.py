@@ -3,7 +3,7 @@ import math
 import os
 import runpy
 
-import nabla
+import quabla
 
 
 def assert_close_rows(actual, expected, tol=1e-12):
@@ -15,8 +15,8 @@ def assert_close_rows(actual, expected, tol=1e-12):
 
 
 def test_matrix_matmul():
-    a = nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-    b = nabla.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]])
+    a = quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    b = quabla.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]])
 
     c = a @ b
 
@@ -25,11 +25,11 @@ def test_matrix_matmul():
 
 
 def test_tensor_solve_and_jit_vjp():
-    matrix = nabla.Tensor([2, 2], [3.0, 1.0, 1.0, 2.0])
-    rhs = nabla.Tensor([2, 1], [9.0, 8.0])
+    matrix = quabla.Tensor([2, 2], [3.0, 1.0, 1.0, 2.0])
+    rhs = quabla.Tensor([2, 1], [9.0, 8.0])
     assert matrix.solve(rhs).to_flat_list() == [2.0, 3.0]
 
-    value_and_grad = nabla.tensor_value_and_grad_fn(
+    value_and_grad = quabla.tensor_value_and_grad_fn(
         lambda a, b: a.solve(b).sum(), [("a", [2, 2]), ("b", [2, 1])]
     )
     value, gradients = value_and_grad({"a": matrix, "b": rhs})
@@ -39,7 +39,7 @@ def test_tensor_solve_and_jit_vjp():
 
 
 def test_tensor_neural_primitives_and_trace_gradients():
-    values = nabla.Tensor([3], [-1.0, 0.0, 1.0])
+    values = quabla.Tensor([3], [-1.0, 0.0, 1.0])
     assert values.relu().to_flat_list() == [0.0, 0.0, 1.0]
     assert values.abs().to_flat_list() == [1.0, -0.0, 1.0]
 
@@ -50,7 +50,7 @@ def test_tensor_neural_primitives_and_trace_gradients():
     assert_close_rows(
         [softplus], [[math.log1p(math.exp(value)) for value in [-1.0, 0.0, 1.0]]]
     )
-    assert nabla.Tensor([2], [-1000.0, 1000.0]).softplus().to_flat_list() == [0.0, 1000.0]
+    assert quabla.Tensor([2], [-1000.0, 1000.0]).softplus().to_flat_list() == [0.0, 1000.0]
 
     for name, expected_gradient in [
         ("relu", [0.0, 0.0, 1.0]),
@@ -58,7 +58,7 @@ def test_tensor_neural_primitives_and_trace_gradients():
         ("sigmoid", [value * (1.0 - value) for value in expected_sigmoid]),
         ("softplus", expected_sigmoid),
     ]:
-        transform = nabla.tensor_value_and_grad_fn(
+        transform = quabla.tensor_value_and_grad_fn(
             lambda x, name=name: getattr(x, name)().sum(), [("x", [3])]
         )
         _, gradients = transform({"x": values})
@@ -66,7 +66,7 @@ def test_tensor_neural_primitives_and_trace_gradients():
 
 
 def test_tensor_triangular_projections_preserve_trace_gradients():
-    values = nabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    values = quabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
     assert values.tril().to_flat_list() == [1.0, 0.0, 0.0, 4.0, 5.0, 0.0]
     assert values.triu().to_flat_list() == [1.0, 2.0, 3.0, 0.0, 5.0, 6.0]
 
@@ -74,7 +74,7 @@ def test_tensor_triangular_projections_preserve_trace_gradients():
         ("tril", [1.0, 0.0, 0.0, 1.0, 1.0, 0.0]),
         ("triu", [1.0, 1.0, 1.0, 0.0, 1.0, 1.0]),
     ]:
-        transform = nabla.tensor_value_and_grad_fn(
+        transform = quabla.tensor_value_and_grad_fn(
             lambda x, name=name: getattr(x, name)().sum(), [("x", [2, 3])]
         )
         _, gradients = transform({"x": values})
@@ -82,14 +82,14 @@ def test_tensor_triangular_projections_preserve_trace_gradients():
 
 
 def test_tensor_triangular_solve_preserves_vjp_and_transpose_contract():
-    matrix = nabla.Tensor([2, 2], [2.0, 9.0, 3.0, 4.0])
-    rhs = nabla.Tensor([2, 1], [2.0, 11.0])
+    matrix = quabla.Tensor([2, 2], [2.0, 9.0, 3.0, 4.0])
+    rhs = quabla.Tensor([2, 1], [2.0, 11.0])
     assert matrix.solve_triangular(rhs).to_flat_list() == [1.0, 2.0]
     assert matrix.solve_triangular(
-        nabla.Tensor([2, 1], [8.0, 8.0]), transpose=True
+        quabla.Tensor([2, 1], [8.0, 8.0]), transpose=True
     ).to_flat_list() == [1.0, 2.0]
 
-    transform = nabla.tensor_value_and_grad_fn(
+    transform = quabla.tensor_value_and_grad_fn(
         lambda a, b: a.solve_triangular(b).sum(), [("a", [2, 2]), ("b", [2, 1])]
     )
     _, gradients = transform({"a": matrix, "b": rhs})
@@ -98,11 +98,11 @@ def test_tensor_triangular_solve_preserves_vjp_and_transpose_contract():
 
 
 def test_tensor_cholesky_reference_trace_preserves_vjp():
-    matrix = nabla.Tensor([2, 2], [4.0, 2.0, 2.0, 5.0])
+    matrix = quabla.Tensor([2, 2], [4.0, 2.0, 2.0, 5.0])
     expected = [2.0, 0.0, 1.0, 2.0]
     assert matrix.cholesky().to_flat_list() == expected
 
-    transform = nabla.tensor_value_and_grad_fn(
+    transform = quabla.tensor_value_and_grad_fn(
         lambda a: a.cholesky().sum(), [("a", [2, 2])]
     )
     value, gradients = transform({"a": matrix})
@@ -111,26 +111,26 @@ def test_tensor_cholesky_reference_trace_preserves_vjp():
 
 
 def test_tensor_stateless_random_keys_and_glorot_initializer_are_reproducible():
-    first_keys = nabla.Tensor.split_key(1234, 2)
-    second_keys = nabla.Tensor.split_key(1234, 2)
+    first_keys = quabla.Tensor.split_key(1234, 2)
+    second_keys = quabla.Tensor.split_key(1234, 2)
     assert first_keys == second_keys
     assert first_keys[0] != first_keys[1]
 
-    first = nabla.Tensor.random_normal([2, 3], first_keys[0])
-    second = nabla.Tensor.random_normal([2, 3], first_keys[0])
-    different = nabla.Tensor.random_normal([2, 3], first_keys[1])
+    first = quabla.Tensor.random_normal([2, 3], first_keys[0])
+    second = quabla.Tensor.random_normal([2, 3], first_keys[0])
+    different = quabla.Tensor.random_normal([2, 3], first_keys[1])
     assert first.shape == [2, 3]
     assert first.to_flat_list() == second.to_flat_list()
     assert first.to_flat_list() != different.to_flat_list()
 
-    glorot = nabla.Tensor.glorot_normal([2, 3], first_keys[0])
+    glorot = quabla.Tensor.glorot_normal([2, 3], first_keys[0])
     assert glorot.shape == [2, 3]
     assert all(math.isfinite(value) for value in glorot.to_flat_list())
 
 
 def test_matrix_add():
-    a = nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
-    b = nabla.Matrix([[0.5, 1.5], [2.5, 3.5]])
+    a = quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
+    b = quabla.Matrix([[0.5, 1.5], [2.5, 3.5]])
 
     c = a + b
 
@@ -139,8 +139,8 @@ def test_matrix_add():
 
 
 def test_matrix_sub():
-    a = nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
-    b = nabla.Matrix([[0.5, 1.5], [2.5, 3.5]])
+    a = quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
+    b = quabla.Matrix([[0.5, 1.5], [2.5, 3.5]])
 
     c = a - b
 
@@ -149,8 +149,8 @@ def test_matrix_sub():
 
 
 def test_matrix_mul():
-    a = nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
-    b = nabla.Matrix([[0.5, 1.5], [2.5, 3.5]])
+    a = quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
+    b = quabla.Matrix([[0.5, 1.5], [2.5, 3.5]])
 
     c = a * b
 
@@ -159,7 +159,7 @@ def test_matrix_mul():
 
 
 def test_matrix_transpose_method_and_property():
-    a = nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    a = quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
 
     transposed = a.transpose()
 
@@ -169,7 +169,7 @@ def test_matrix_transpose_method_and_property():
 
 
 def test_matrix_reshape_preserves_row_major_order():
-    a = nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    a = quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
 
     reshaped = a.reshape(3, 2)
 
@@ -178,7 +178,7 @@ def test_matrix_reshape_preserves_row_major_order():
 
 
 def test_matrix_reshape_rejects_size_change():
-    a = nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    a = quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
 
     try:
         a.reshape(4, 2)
@@ -189,13 +189,13 @@ def test_matrix_reshape_rejects_size_change():
 
 
 def test_matrix_concat_axis():
-    top = nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
-    bottom = nabla.Matrix([[5.0, 6.0]])
-    left = nabla.Matrix([[1.0], [2.0]])
-    right = nabla.Matrix([[3.0, 4.0], [5.0, 6.0]])
+    top = quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
+    bottom = quabla.Matrix([[5.0, 6.0]])
+    left = quabla.Matrix([[1.0], [2.0]])
+    right = quabla.Matrix([[3.0, 4.0], [5.0, 6.0]])
 
-    vertical = nabla.concat([top, bottom], axis=0)
-    horizontal = nabla.concat([left, right], axis=1)
+    vertical = quabla.concat([top, bottom], axis=0)
+    horizontal = quabla.concat([left, right], axis=1)
 
     assert vertical.shape == (3, 2)
     assert vertical.to_list() == [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
@@ -204,7 +204,7 @@ def test_matrix_concat_axis():
 
 
 def test_matrix_supports_scalar_literals():
-    a = nabla.Matrix([[1.0, -2.0], [3.0, -4.0]])
+    a = quabla.Matrix([[1.0, -2.0], [3.0, -4.0]])
 
     assert (a + 1.5).to_list() == [[2.5, -0.5], [4.5, -2.5]]
     assert (1.5 + a).to_list() == [[2.5, -0.5], [4.5, -2.5]]
@@ -215,8 +215,8 @@ def test_matrix_supports_scalar_literals():
 
 
 def test_matrix_broadcasts_scalar_matrix_for_elementwise_ops():
-    a = nabla.Matrix([[1.0, -2.0], [3.0, -4.0]])
-    scalar = nabla.Matrix([[2.0]])
+    a = quabla.Matrix([[1.0, -2.0], [3.0, -4.0]])
+    scalar = quabla.Matrix([[2.0]])
 
     assert (a + scalar).to_list() == [[3.0, 0.0], [5.0, -2.0]]
     assert (scalar + a).to_list() == [[3.0, 0.0], [5.0, -2.0]]
@@ -227,9 +227,9 @@ def test_matrix_broadcasts_scalar_matrix_for_elementwise_ops():
 
 
 def test_matrix_broadcasts_row_and_column_matrices_for_elementwise_ops():
-    a = nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
-    row = nabla.Matrix([[10.0, 20.0, 30.0]])
-    column = nabla.Matrix([[2.0], [3.0]])
+    a = quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    row = quabla.Matrix([[10.0, 20.0, 30.0]])
+    column = quabla.Matrix([[2.0], [3.0]])
 
     assert (a + row).to_list() == [[11.0, 22.0, 33.0], [14.0, 25.0, 36.0]]
     assert (row - a).to_list() == [[9.0, 18.0, 27.0], [6.0, 15.0, 24.0]]
@@ -238,8 +238,8 @@ def test_matrix_broadcasts_row_and_column_matrices_for_elementwise_ops():
 
 
 def test_tensor_broadcasts_trailing_axes_and_reshapes():
-    a = nabla.Tensor([2, 1, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-    b = nabla.Tensor([1, 4, 1], [10.0, 20.0, 30.0, 40.0])
+    a = quabla.Tensor([2, 1, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    b = quabla.Tensor([1, 4, 1], [10.0, 20.0, 30.0, 40.0])
 
     output = a + b
 
@@ -275,7 +275,7 @@ def test_tensor_broadcasts_trailing_axes_and_reshapes():
 
 def test_tensor_rejects_data_with_the_wrong_size():
     try:
-        nabla.Tensor([2, 2], [1.0, 2.0, 3.0])
+        quabla.Tensor([2, 2], [1.0, 2.0, 3.0])
     except ValueError as exc:
         assert "data length" in str(exc)
     else:
@@ -283,16 +283,16 @@ def test_tensor_rejects_data_with_the_wrong_size():
 
 
 def test_tensor_ones_and_full_validate_rank_n_shapes():
-    assert nabla.Tensor.ones([2, 3]).to_flat_list() == [1.0] * 6
-    assert nabla.Tensor.full([2, 1, 2], -0.25).to_flat_list() == [-0.25] * 4
+    assert quabla.Tensor.ones([2, 3]).to_flat_list() == [1.0] * 6
+    assert quabla.Tensor.full([2, 1, 2], -0.25).to_flat_list() == [-0.25] * 4
 
 
 def test_tensor_arange_creates_coordinate_vectors_and_rejects_invalid_ranges():
-    assert nabla.Tensor.arange(0.0, 1.0, 0.25).to_flat_list() == [0.0, 0.25, 0.5, 0.75]
-    assert nabla.Tensor.arange(1.0, -0.5, -0.5).to_flat_list() == [1.0, 0.5, 0.0]
+    assert quabla.Tensor.arange(0.0, 1.0, 0.25).to_flat_list() == [0.0, 0.25, 0.5, 0.75]
+    assert quabla.Tensor.arange(1.0, -0.5, -0.5).to_flat_list() == [1.0, 0.5, 0.0]
     for arguments in [(0.0, 1.0, 0.0), (1.0, 0.0, 1.0)]:
         try:
-            nabla.Tensor.arange(*arguments)
+            quabla.Tensor.arange(*arguments)
         except ValueError:
             pass
         else:
@@ -300,10 +300,10 @@ def test_tensor_arange_creates_coordinate_vectors_and_rejects_invalid_ranges():
 
 
 def test_tensor_linspace_includes_endpoints_for_collocation_grids():
-    assert nabla.Tensor.linspace(-1.0, 1.0, 5).to_flat_list() == [-1.0, -0.5, 0.0, 0.5, 1.0]
-    assert nabla.Tensor.linspace(2.0, 5.0, 1).to_flat_list() == [2.0]
+    assert quabla.Tensor.linspace(-1.0, 1.0, 5).to_flat_list() == [-1.0, -0.5, 0.0, 0.5, 1.0]
+    assert quabla.Tensor.linspace(2.0, 5.0, 1).to_flat_list() == [2.0]
     try:
-        nabla.Tensor.linspace(0.0, 1.0, 0)
+        quabla.Tensor.linspace(0.0, 1.0, 0)
     except ValueError:
         pass
     else:
@@ -311,10 +311,10 @@ def test_tensor_linspace_includes_endpoints_for_collocation_grids():
 
 
 def test_tensor_eye_creates_square_and_rectangular_identity_arrays():
-    assert nabla.Tensor.eye(3).to_flat_list() == [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-    assert nabla.Tensor.eye(2, 3).to_flat_list() == [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    assert quabla.Tensor.eye(3).to_flat_list() == [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    assert quabla.Tensor.eye(2, 3).to_flat_list() == [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
     try:
-        nabla.Tensor.eye(0)
+        quabla.Tensor.eye(0)
     except ValueError:
         pass
     else:
@@ -322,7 +322,7 @@ def test_tensor_eye_creates_square_and_rectangular_identity_arrays():
 
 
 def test_tensor_transpose_reorders_rank_n_axes_and_validates_permutations():
-    tensor = nabla.Tensor([2, 3, 2], [float(value) for value in range(12)])
+    tensor = quabla.Tensor([2, 3, 2], [float(value) for value in range(12)])
 
     reversed_axes = tensor.transpose()
     assert reversed_axes.shape == [2, 3, 2]
@@ -342,7 +342,7 @@ def test_tensor_transpose_reorders_rank_n_axes_and_validates_permutations():
 
 
 def test_tensor_reductions_match_trace_tensor_axis_semantics():
-    tensor = nabla.Tensor([2, 3, 2], [float(value) for value in range(1, 13)])
+    tensor = quabla.Tensor([2, 3, 2], [float(value) for value in range(1, 13)])
 
     assert tensor.sum().shape == []
     assert tensor.sum().to_flat_list() == [78.0]
@@ -393,7 +393,7 @@ def test_tensor_reductions_match_trace_tensor_axis_semantics():
 
 
 def test_tensor_elementwise_math_matches_python_math():
-    tensor = nabla.Tensor([2, 2], [0.0, 1.0, -1.0, 4.0])
+    tensor = quabla.Tensor([2, 2], [0.0, 1.0, -1.0, 4.0])
 
     assert_close_rows([tensor.tanh().to_flat_list()], [[math.tanh(value) for value in tensor.to_flat_list()]])
     assert_close_rows([tensor.exp().to_flat_list()], [[math.exp(value) for value in tensor.to_flat_list()]])
@@ -401,13 +401,13 @@ def test_tensor_elementwise_math_matches_python_math():
     assert_close_rows([tensor.cos().to_flat_list()], [[math.cos(value) for value in tensor.to_flat_list()]])
     assert tensor.powi(2).to_flat_list() == [0.0, 1.0, 1.0, 16.0]
 
-    positive = nabla.Tensor([2], [1.0, math.e**2])
+    positive = quabla.Tensor([2], [1.0, math.e**2])
     assert_close_rows([positive.log().to_flat_list()], [[0.0, 2.0]])
     assert positive.sqrt().to_flat_list() == [1.0, math.e]
 
 
 def test_tensor_supports_numeric_scalars_on_both_sides():
-    tensor = nabla.Tensor([2, 2], [1.0, -2.0, 3.0, 4.0])
+    tensor = quabla.Tensor([2, 2], [1.0, -2.0, 3.0, 4.0])
 
     assert (tensor + 2.0).to_flat_list() == [3.0, 0.0, 5.0, 6.0]
     assert (2.0 + tensor).to_flat_list() == [3.0, 0.0, 5.0, 6.0]
@@ -428,7 +428,7 @@ def test_tensor_supports_numeric_scalars_on_both_sides():
 
 
 def test_tensor_power_supports_integer_and_float_exponents():
-    tensor = nabla.Tensor([2], [4.0, 9.0])
+    tensor = quabla.Tensor([2], [4.0, 9.0])
 
     assert (tensor ** 2).to_flat_list() == [16.0, 81.0]
     assert_close_rows([(tensor ** 0.5).to_flat_list()], [[2.0, 3.0]])
@@ -442,15 +442,15 @@ def test_tensor_power_supports_integer_and_float_exponents():
 
 
 def test_tensor_comparisons_and_where_support_rank_n_broadcasting():
-    values = nabla.Tensor([2, 1, 3], [-1.0, 0.0, 1.0, 2.0, -2.0, 3.0])
+    values = quabla.Tensor([2, 1, 3], [-1.0, 0.0, 1.0, 2.0, -2.0, 3.0])
     mask = values.gt(0.0)
-    on_true = nabla.Tensor([1, 4, 1], [10.0, 20.0, 30.0, 40.0])
-    on_false = nabla.Tensor.full([2, 1, 3], -1.0)
+    on_true = quabla.Tensor([1, 4, 1], [10.0, 20.0, 30.0, 40.0])
+    on_false = quabla.Tensor.full([2, 1, 3], -1.0)
 
     assert mask.shape == [2, 1, 3]
     assert mask.to_flat_list() == [0.0, 0.0, 1.0, 1.0, 0.0, 1.0]
 
-    selected = nabla.where(mask, on_true, on_false)
+    selected = quabla.where(mask, on_true, on_false)
     assert selected.shape == [2, 4, 3]
     assert selected.to_flat_list() == [
         -1.0, -1.0, 10.0, -1.0, -1.0, 20.0, -1.0, -1.0, 30.0, -1.0, -1.0, 40.0,
@@ -459,8 +459,8 @@ def test_tensor_comparisons_and_where_support_rank_n_broadcasting():
 
 
 def test_tensor_maximum_and_minimum_broadcast_and_choose_rhs_on_ties():
-    left = nabla.Tensor([2, 1], [2.0, 0.0])
-    right = nabla.Tensor([1, 3], [2.0, 1.0, -1.0])
+    left = quabla.Tensor([2, 1], [2.0, 0.0])
+    right = quabla.Tensor([1, 3], [2.0, 1.0, -1.0])
 
     assert left.maximum(right).shape == [2, 3]
     assert left.maximum(right).to_flat_list() == [2.0, 2.0, 2.0, 2.0, 1.0, 0.0]
@@ -470,11 +470,11 @@ def test_tensor_maximum_and_minimum_broadcast_and_choose_rhs_on_ties():
 
 
 def test_tensor_gather_and_scatter_add_support_negative_and_repeated_indices():
-    source = nabla.Tensor([2, 3], [0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
+    source = quabla.Tensor([2, 3], [0.0, 1.0, 2.0, 3.0, 4.0, 5.0])
     assert source.gather([2, -3], axis=1).to_flat_list() == [2.0, 0.0, 5.0, 3.0]
 
-    base = nabla.Tensor.zeros([2, 3])
-    updates = nabla.Tensor([2, 3], [10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+    base = quabla.Tensor.zeros([2, 3])
+    updates = quabla.Tensor([2, 3], [10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
     assert base.scatter_add([1, 1, 0], updates, axis=1).to_flat_list() == [
         30.0,
         30.0,
@@ -494,16 +494,16 @@ def test_tensor_gather_and_scatter_add_support_negative_and_repeated_indices():
 
 
 def test_einsum_scoped_matmul_subset_matches_tensor_matmul():
-    left = nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])
-    right = nabla.Tensor([2, 3], [1.0, -1.0, 2.0, 0.0, 3.0, 1.0])
+    left = quabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])
+    right = quabla.Tensor([2, 3], [1.0, -1.0, 2.0, 0.0, 3.0, 1.0])
     expected = (left @ right).to_flat_list()
 
-    assert nabla.einsum("ij,jk->ik", [left, right]).to_flat_list() == expected
-    assert nabla.einsum("...ij,...jk->...ik", [left, right]).to_flat_list() == expected
+    assert quabla.einsum("ij,jk->ik", [left, right]).to_flat_list() == expected
+    assert quabla.einsum("...ij,...jk->...ik", [left, right]).to_flat_list() == expected
 
     for equation in ("ij,ij->ij", "ij,jk->ij"):
         try:
-            nabla.einsum(equation, [left, right])
+            quabla.einsum(equation, [left, right])
         except ValueError:
             pass
         else:
@@ -511,7 +511,7 @@ def test_einsum_scoped_matmul_subset_matches_tensor_matmul():
 
 
 def test_tensor_broadcast_to_materializes_rank_n_contiguous_storage():
-    tensor = nabla.Tensor([1, 2, 1], [2.0, -3.0])
+    tensor = quabla.Tensor([1, 2, 1], [2.0, -3.0])
     output = tensor.broadcast_to([3, 2, 4])
 
     assert output.shape == [3, 2, 4]
@@ -526,7 +526,7 @@ def test_tensor_broadcast_to_materializes_rank_n_contiguous_storage():
 
 
 def test_tensor_matmul_broadcasts_batch_axes():
-    lhs = nabla.Tensor(
+    lhs = quabla.Tensor(
         [2, 2, 3],
         [
             1.0,
@@ -543,7 +543,7 @@ def test_tensor_matmul_broadcasts_batch_axes():
             2.0,
         ],
     )
-    rhs = nabla.Tensor([1, 3, 2], [7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+    rhs = quabla.Tensor([1, 3, 2], [7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
 
     output = lhs.matmul(rhs)
 
@@ -552,14 +552,14 @@ def test_tensor_matmul_broadcasts_batch_axes():
 
 
 def test_tensor_concat_supports_rank_n_axes_and_validates_shapes():
-    lhs = nabla.Tensor([2, 1, 2], [1.0, 2.0, 5.0, 6.0])
-    rhs = nabla.Tensor([2, 2, 2], [3.0, 4.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
-    result = nabla.concat([lhs, rhs], axis=1)
+    lhs = quabla.Tensor([2, 1, 2], [1.0, 2.0, 5.0, 6.0])
+    rhs = quabla.Tensor([2, 2, 2], [3.0, 4.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
+    result = quabla.concat([lhs, rhs], axis=1)
 
     assert result.shape == [2, 3, 2]
     assert result.to_flat_list() == [1.0, 2.0, 3.0, 4.0, 7.0, 8.0, 5.0, 6.0, 9.0, 10.0, 11.0, 12.0]
     try:
-        nabla.concat([lhs, nabla.Tensor([2, 2, 3], [0.0] * 12)], axis=1)
+        quabla.concat([lhs, quabla.Tensor([2, 2, 3], [0.0] * 12)], axis=1)
     except ValueError as error:
         assert "cannot concatenate" in str(error)
     else:
@@ -567,7 +567,7 @@ def test_tensor_concat_supports_rank_n_axes_and_validates_shapes():
 
 
 def test_tensor_slice_creates_a_strided_read_only_view():
-    tensor = nabla.Tensor([3, 4], [float(value) for value in range(12)])
+    tensor = quabla.Tensor([3, 4], [float(value) for value in range(12)])
 
     view = tensor.slice(axis=1, start=1, length=2, step=2)
 
@@ -579,7 +579,7 @@ def test_tensor_slice_creates_a_strided_read_only_view():
 
 
 def test_tensor_getitem_supports_contiguous_slices_and_negative_indices():
-    tensor = nabla.Tensor([3, 4], [float(value) for value in range(12)])
+    tensor = quabla.Tensor([3, 4], [float(value) for value in range(12)])
 
     assert tensor[1, 1:3].shape == [2]
     assert tensor[1, 1:3].to_flat_list() == [5.0, 6.0]
@@ -598,9 +598,9 @@ def test_tensor_getitem_supports_contiguous_slices_and_negative_indices():
 
 
 def test_tensor_stack_supports_negative_axes():
-    first = nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])
-    second = nabla.Tensor([2, 2], [5.0, 6.0, 7.0, 8.0])
-    stacked = nabla.stack([first, second], axis=-1)
+    first = quabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])
+    second = quabla.Tensor([2, 2], [5.0, 6.0, 7.0, 8.0])
+    stacked = quabla.stack([first, second], axis=-1)
     assert stacked.shape == [2, 2, 2]
     assert stacked.to_flat_list() == [1.0, 5.0, 2.0, 6.0, 3.0, 7.0, 4.0, 8.0]
 
@@ -609,14 +609,14 @@ def test_trace_tensor_evaluates_rank_n_scalar_loss_vjp():
     def loss(x, y):
         return (x * y + x).sum()
 
-    traced = nabla.trace_tensor(loss, [("x", [2, 1, 3]), ("y", [1, 4, 1])])
+    traced = quabla.trace_tensor(loss, [("x", [2, 1, 3]), ("y", [1, 4, 1])])
     inputs = {
-        "x": nabla.Tensor([2, 1, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-        "y": nabla.Tensor([1, 4, 1], [10.0, 20.0, 30.0, 40.0]),
+        "x": quabla.Tensor([2, 1, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        "y": quabla.Tensor([1, 4, 1], [10.0, 20.0, 30.0, 40.0]),
     }
 
     value, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
 
     assert traced.output.shape == []
@@ -630,8 +630,8 @@ def test_trace_tensor_evaluates_rank_n_scalar_loss_vjp():
         traced.output.node_id,
         inputs,
         {
-            "x": nabla.Tensor([2, 1, 3], [1.0] * 6),
-            "y": nabla.Tensor([1, 4, 1], [1.0] * 4),
+            "x": quabla.Tensor([2, 1, 3], [1.0] * 6),
+            "y": quabla.Tensor([1, 4, 1], [1.0] * 4),
         },
     )
     assert tangent.shape == []
@@ -639,7 +639,7 @@ def test_trace_tensor_evaluates_rank_n_scalar_loss_vjp():
 
 
 def test_compiler_facade_unifies_trace_transform_compile_and_execute():
-    compiler = nabla.Compiler()
+    compiler = quabla.Compiler()
     assert compiler.capabilities()["cpu"] is True
 
     program = compiler.trace(
@@ -653,8 +653,8 @@ def test_compiler_facade_unifies_trace_transform_compile_and_execute():
     assert executable.target == "cpu"
     assert executable.node_count > 0
     value = executable({
-        "x": nabla.Tensor([2], [2.0, 3.0]),
-        "weight": nabla.Tensor([2], [4.0, 5.0]),
+        "x": quabla.Tensor([2], [2.0, 3.0]),
+        "weight": quabla.Tensor([2], [4.0, 5.0]),
     })
     assert value.to_flat_list() == [23.0]
 
@@ -663,9 +663,9 @@ def test_compiler_facade_unifies_trace_transform_compile_and_execute():
     gradients = program.vjp("loss_cotangent")
     assert set(gradients) == {"x", "weight"}
     gradient = gradients["x"].compile()({
-        "x": nabla.Tensor([2], [2.0, 3.0]),
-        "weight": nabla.Tensor([2], [4.0, 5.0]),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
+        "x": quabla.Tensor([2], [2.0, 3.0]),
+        "weight": quabla.Tensor([2], [4.0, 5.0]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
     })
     assert gradient.to_flat_list() == [4.0, 5.0]
 
@@ -673,25 +673,25 @@ def test_compiler_facade_unifies_trace_transform_compile_and_execute():
 def test_python_entrypoints_keep_backend_errors_for_unbuilt_targets():
     # Python 入口在缺少後端的 build 中維持 facade 之前的錯誤時機與訊息：
     # MLX 建構成功、首次執行才失敗；CUDA 在編譯時回報後端的 build 指示。
-    compiler = nabla.Compiler()
+    compiler = quabla.Compiler()
     program = compiler.trace(lambda x: x * 2.0, [("x", [2])])
-    inputs = {"x": nabla.Tensor([2], [1.0, 2.0])}
-    mlx_message = "MLX backend is unavailable: build Nabla on macOS with --features mlx"
-    cuda_message = "CUDA backend is unavailable for device 0: build Nabla on Linux with --features cuda"
+    inputs = {"x": quabla.Tensor([2], [1.0, 2.0])}
+    mlx_message = "MLX backend is unavailable: build Quabla on macOS with --features mlx"
+    cuda_message = "CUDA backend is unavailable for device 0: build Quabla on Linux with --features cuda"
 
     if not compiler.capability("mlx"):
-        batched_inputs = {"x": nabla.Tensor([1, 2], [1.0, 2.0])}
+        batched_inputs = {"x": quabla.Tensor([1, 2], [1.0, 2.0])}
         executables = [
             (program.compile("mlx"), (inputs,)),
-            (nabla.tensor_vmap_mlx_fn(lambda x: x * 2.0, [("x", [2])], 1), (batched_inputs,)),
+            (quabla.tensor_vmap_mlx_fn(lambda x: x * 2.0, [("x", [2])], 1), (batched_inputs,)),
             (
-                nabla.tensor_value_and_grad_mlx_fn(
+                quabla.tensor_value_and_grad_mlx_fn(
                     lambda x: (x * 2.0).sum(), [("x", [2])], ["x"]
                 ),
                 (inputs,),
             ),
             (
-                nabla.tensor_vmap_jvp_mlx_fn(lambda x: x * 2.0, [("x", [2])], 1),
+                quabla.tensor_vmap_jvp_mlx_fn(lambda x: x * 2.0, [("x", [2])], 1),
                 (batched_inputs, batched_inputs),
             ),
         ]
@@ -705,11 +705,11 @@ def test_python_entrypoints_keep_backend_errors_for_unbuilt_targets():
     if not compiler.capability("cuda"):
         compile_calls = [
             lambda: program.compile("cuda"),
-            lambda: nabla.tensor_jit_cuda_fn(lambda x: x * 2.0, [("x", [2])]),
-            lambda: nabla.tensor_value_and_grad_cuda_fn(
+            lambda: quabla.tensor_jit_cuda_fn(lambda x: x * 2.0, [("x", [2])]),
+            lambda: quabla.tensor_value_and_grad_cuda_fn(
                 lambda x: (x * 2.0).sum(), [("x", [2])], ["x"]
             ),
-            lambda: nabla.tensor_vmap_jvp_cuda_fn(lambda x: x * 2.0, [("x", [2])], 1),
+            lambda: quabla.tensor_vmap_jvp_cuda_fn(lambda x: x * 2.0, [("x", [2])], 1),
         ]
         for compile_call in compile_calls:
             try:
@@ -720,19 +720,19 @@ def test_python_entrypoints_keep_backend_errors_for_unbuilt_targets():
 
 
 def test_compiler_facade_cuda_matches_cpu_for_primal_jvp_and_vjp():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    compiler = nabla.Compiler()
+    compiler = quabla.Compiler()
     assert compiler.capability("cuda") is True
     program = compiler.trace(
         lambda x, weight, bias: (x * weight + bias).tanh().sum(),
         [("x", [2]), ("weight", [2]), ("bias", [1])],
     )
     inputs = {
-        "x": nabla.Tensor([2], [-0.5, 1.25]),
-        "weight": nabla.Tensor([2], [1.5, -0.75]),
-        "bias": nabla.Tensor([1], [0.25]),
+        "x": quabla.Tensor([2], [-0.5, 1.25]),
+        "weight": quabla.Tensor([2], [1.5, -0.75]),
+        "bias": quabla.Tensor([1], [0.25]),
     }
 
     cpu_value = program.compile("cpu")(inputs)
@@ -745,7 +745,7 @@ def test_compiler_facade_cuda_matches_cpu_for_primal_jvp_and_vjp():
     cuda_jvp = program.jvp("x").compile("cuda")({**inputs})
     assert_close_rows([cuda_jvp.to_flat_list()], [cpu_jvp.to_flat_list()], tol=1e-5)
 
-    cotangent = nabla.Tensor([], [1.0])
+    cotangent = quabla.Tensor([], [1.0])
     cpu_gradients = program.vjp("loss_cotangent")
     cuda_gradients = program.vjp("loss_cotangent")
     transformed_inputs = {**inputs, "loss_cotangent": cotangent}
@@ -758,11 +758,11 @@ def test_compiler_facade_cuda_matches_cpu_for_primal_jvp_and_vjp():
 
 
 def test_compiler_facade_cuda_executes_nonlinear_scan_hvp():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
     def scan_loss(initial, scale):
-        carry, outputs = nabla.tensor_scan_region(
+        carry, outputs = quabla.tensor_scan_region(
             0,
             3,
             lambda index, current, captured_scale: (
@@ -774,14 +774,14 @@ def test_compiler_facade_cuda_executes_nonlinear_scan_hvp():
         )
         return carry + outputs.sum()
 
-    compiler = nabla.Compiler()
+    compiler = quabla.Compiler()
     loss = compiler.trace(scan_loss, [("initial", []), ("scale", [])])
     # d/d(scale) [d(loss)/d(scale)] with the scalar VJP seed fixed at one.
     hvp = loss.vjp("loss_cotangent")["scale"].jvp("scale")
     inputs = {
-        "initial": nabla.Tensor([], [0.4]),
-        "scale": nabla.Tensor([], [0.8]),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
+        "initial": quabla.Tensor([], [0.4]),
+        "scale": quabla.Tensor([], [0.8]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
     }
     cpu = hvp.compile("cpu")(inputs)
     cuda = hvp.compile("cuda")(inputs)
@@ -789,11 +789,11 @@ def test_compiler_facade_cuda_executes_nonlinear_scan_hvp():
 
 
 def test_compiler_facade_cuda_executes_equal_count_reshaped_scan_hvp():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
     def scan_loss(initial, scale):
-        carry, outputs = nabla.tensor_scan_region(
+        carry, outputs = quabla.tensor_scan_region(
             0,
             3,
             lambda index, current, captured_scale: (
@@ -805,13 +805,13 @@ def test_compiler_facade_cuda_executes_equal_count_reshaped_scan_hvp():
         )
         return carry.sum() + outputs.sum()
 
-    compiler = nabla.Compiler()
+    compiler = quabla.Compiler()
     loss = compiler.trace(scan_loss, [("initial", [2]), ("scale", [2])])
     hvp = loss.vjp("loss_cotangent")["scale"].jvp("scale")
     inputs = {
-        "initial": nabla.Tensor([2], [0.4, -0.6]),
-        "scale": nabla.Tensor([2], [0.8, 1.1]),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
+        "initial": quabla.Tensor([2], [0.4, -0.6]),
+        "scale": quabla.Tensor([2], [0.8, 1.1]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
     }
     cpu = hvp.compile("cpu")(inputs)
     cuda = hvp.compile("cuda")(inputs)
@@ -819,11 +819,11 @@ def test_compiler_facade_cuda_executes_equal_count_reshaped_scan_hvp():
 
 
 def test_compiler_facade_cuda_executes_broadcast_scan_primal():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
     def scan_values(initial, scale):
-        _, outputs = nabla.tensor_scan_region(
+        _, outputs = quabla.tensor_scan_region(
             0,
             3,
             lambda index, current, captured_scale: (
@@ -835,11 +835,11 @@ def test_compiler_facade_cuda_executes_broadcast_scan_primal():
         )
         return outputs
 
-    compiler = nabla.Compiler()
+    compiler = quabla.Compiler()
     program = compiler.trace(scan_values, [("initial", [2, 1]), ("scale", [2, 1])])
     inputs = {
-        "initial": nabla.Tensor([2, 1], [0.4, -0.6]),
-        "scale": nabla.Tensor([2, 1], [0.8, 1.1]),
+        "initial": quabla.Tensor([2, 1], [0.4, -0.6]),
+        "scale": quabla.Tensor([2, 1], [0.8, 1.1]),
     }
     cpu = program.compile("cpu")(inputs)
     cuda = program.compile("cuda")(inputs)
@@ -847,11 +847,11 @@ def test_compiler_facade_cuda_executes_broadcast_scan_primal():
 
 
 def test_compiler_facade_cuda_aggregates_broadcast_scan_vjp():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
     def scan_loss(initial, scale):
-        carry, outputs = nabla.tensor_scan_region(
+        carry, outputs = quabla.tensor_scan_region(
             0,
             3,
             lambda index, current, captured_scale: (
@@ -863,12 +863,12 @@ def test_compiler_facade_cuda_aggregates_broadcast_scan_vjp():
         )
         return carry.sum() + outputs.sum()
 
-    compiler = nabla.Compiler()
+    compiler = quabla.Compiler()
     program = compiler.trace(scan_loss, [("initial", [2, 1]), ("scale", [2, 1])])
     inputs = {
-        "initial": nabla.Tensor([2, 1], [0.4, -0.6]),
-        "scale": nabla.Tensor([2, 1], [0.8, 1.1]),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
+        "initial": quabla.Tensor([2, 1], [0.4, -0.6]),
+        "scale": quabla.Tensor([2, 1], [0.8, 1.1]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
     }
     gradients = program.vjp("loss_cotangent")
     for name in ("initial", "scale"):
@@ -878,11 +878,11 @@ def test_compiler_facade_cuda_aggregates_broadcast_scan_vjp():
 
 
 def test_compiler_facade_cuda_executes_broadcast_scan_hvp():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
     def scan_loss(initial, scale):
-        carry, outputs = nabla.tensor_scan_region(
+        carry, outputs = quabla.tensor_scan_region(
             0,
             3,
             lambda index, current, captured_scale: (
@@ -894,14 +894,14 @@ def test_compiler_facade_cuda_executes_broadcast_scan_hvp():
         )
         return carry.sum() + outputs.sum()
 
-    program = nabla.Compiler().trace(
+    program = quabla.Compiler().trace(
         scan_loss, [("initial", [2, 1]), ("scale", [2, 1])]
     )
     hvp = program.vjp("loss_cotangent")["scale"].jvp("scale")
     inputs = {
-        "initial": nabla.Tensor([2, 1], [0.4, -0.6]),
-        "scale": nabla.Tensor([2, 1], [0.8, 1.1]),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
+        "initial": quabla.Tensor([2, 1], [0.4, -0.6]),
+        "scale": quabla.Tensor([2, 1], [0.8, 1.1]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
     }
     cpu = hvp.compile("cpu")(inputs)
     cuda = hvp.compile("cuda")(inputs)
@@ -909,11 +909,11 @@ def test_compiler_facade_cuda_executes_broadcast_scan_hvp():
 
 
 def test_compiler_facade_cuda_aggregates_broadcast_capture_scan_hvp():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
     def scan_loss(initial, scale):
-        carry, outputs = nabla.tensor_scan_region(
+        carry, outputs = quabla.tensor_scan_region(
             0,
             3,
             lambda index, current, captured_scale: (
@@ -925,14 +925,14 @@ def test_compiler_facade_cuda_aggregates_broadcast_capture_scan_hvp():
         )
         return carry.sum() + outputs.sum()
 
-    program = nabla.Compiler().trace(
+    program = quabla.Compiler().trace(
         scan_loss, [("initial", [2, 1]), ("scale", [1, 1])]
     )
     hvp = program.vjp("loss_cotangent")["scale"].jvp("scale")
     inputs = {
-        "initial": nabla.Tensor([2, 1], [0.4, -0.6]),
-        "scale": nabla.Tensor([1, 1], [0.8]),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
+        "initial": quabla.Tensor([2, 1], [0.4, -0.6]),
+        "scale": quabla.Tensor([1, 1], [0.8]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
     }
     cpu = hvp.compile("cpu")(inputs)
     cuda = hvp.compile("cuda")(inputs)
@@ -941,11 +941,11 @@ def test_compiler_facade_cuda_aggregates_broadcast_capture_scan_hvp():
 
 
 def test_compiler_facade_cuda_rejects_indexed_unequal_lane_scan_hvp():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
     def scan_loss(initial, scale):
-        carry, outputs = nabla.tensor_scan_region(
+        carry, outputs = quabla.tensor_scan_region(
             0,
             3,
             lambda index, current, captured_scale: (
@@ -957,7 +957,7 @@ def test_compiler_facade_cuda_rejects_indexed_unequal_lane_scan_hvp():
         )
         return carry.sum() + outputs.sum()
 
-    program = nabla.Compiler().trace(
+    program = quabla.Compiler().trace(
         scan_loss, [("initial", [2, 1]), ("scale", [2, 1])]
     )
     hvp = program.vjp("loss_cotangent")["scale"].jvp("scale")
@@ -970,12 +970,12 @@ def test_compiler_facade_cuda_rejects_indexed_unequal_lane_scan_hvp():
 
 
 def test_compiler_facade_cuda_executes_packed_pair_scan_bodies():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
     # 非線性 JVP 的 tangent 半邊讀取 primal 半邊；row swap 讀取另一半邊。
     def scan_loss(initial, scale):
-        carry, outputs = nabla.tensor_scan_region(
+        carry, outputs = quabla.tensor_scan_region(
             0,
             3,
             lambda index, current, captured_scale: (
@@ -987,10 +987,10 @@ def test_compiler_facade_cuda_executes_packed_pair_scan_bodies():
         )
         return carry.sum() + outputs.sum()
 
-    program = nabla.Compiler().trace(scan_loss, [("initial", [3]), ("scale", [3])])
+    program = quabla.Compiler().trace(scan_loss, [("initial", [3]), ("scale", [3])])
     inputs = {
-        "initial": nabla.Tensor([3], [0.2, -0.3, 0.5]),
-        "scale": nabla.Tensor([3], [0.8, 1.1, 0.6]),
+        "initial": quabla.Tensor([3], [0.2, -0.3, 0.5]),
+        "scale": quabla.Tensor([3], [0.8, 1.1, 0.6]),
     }
     for name in ("initial", "scale"):
         jvp = program.jvp(name)
@@ -999,13 +999,13 @@ def test_compiler_facade_cuda_executes_packed_pair_scan_bodies():
         assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=2e-5)
 
     def swap_rows(initial, scale):
-        _, outputs = nabla.tensor_scan_region(
+        _, outputs = quabla.tensor_scan_region(
             0,
             2,
             lambda index, current, captured_scale: (
-                nabla.concat([current.slice(0, 1, 2), current.slice(0, 0, 1)], 0)
+                quabla.concat([current.slice(0, 1, 2), current.slice(0, 0, 1)], 0)
                 * captured_scale,
-                nabla.concat([current.slice(0, 1, 2), current.slice(0, 0, 1)], 0)
+                quabla.concat([current.slice(0, 1, 2), current.slice(0, 0, 1)], 0)
                 * captured_scale,
             ),
             initial,
@@ -1013,10 +1013,10 @@ def test_compiler_facade_cuda_executes_packed_pair_scan_bodies():
         )
         return outputs
 
-    program = nabla.Compiler().trace(swap_rows, [("initial", [2, 3]), ("scale", [3])])
+    program = quabla.Compiler().trace(swap_rows, [("initial", [2, 3]), ("scale", [3])])
     inputs = {
-        "initial": nabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-        "scale": nabla.Tensor([3], [0.5, 1.0, 2.0]),
+        "initial": quabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        "scale": quabla.Tensor([3], [0.5, 1.0, 2.0]),
     }
     cpu = program.compile("cpu")(inputs)
     cuda = program.compile("cuda")(inputs)
@@ -1025,18 +1025,18 @@ def test_compiler_facade_cuda_executes_packed_pair_scan_bodies():
 
 def _scan_rejection_program(body, carry_shape, capture_shape, result="outputs"):
     def function(initial, capture):
-        carry, outputs = nabla.tensor_scan_region(0, 2, body, initial, [capture])
+        carry, outputs = quabla.tensor_scan_region(0, 2, body, initial, [capture])
         if result == "loss":
             return carry.sum() + outputs.sum()
         return outputs
 
-    return nabla.Compiler().trace(
+    return quabla.Compiler().trace(
         function, [("initial", carry_shape), ("capture", capture_shape)]
     )
 
 
 def test_compiler_facade_cuda_rejects_every_unsupported_scan_lane_form():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
     def primal(body, carry_shape, capture_shape):
@@ -1201,17 +1201,17 @@ def test_trace_tensor_batched_matmul_scalar_loss_vjp():
     def loss(x, y):
         return x.matmul(y).sum()
 
-    traced = nabla.trace_tensor(loss, [("x", [2, 2, 3]), ("y", [1, 3, 2])])
+    traced = quabla.trace_tensor(loss, [("x", [2, 2, 3]), ("y", [1, 3, 2])])
     inputs = {
-        "x": nabla.Tensor(
+        "x": quabla.Tensor(
             [2, 2, 3],
             [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 2.0, 0.0, 1.0, 1.0, 3.0, 2.0],
         ),
-        "y": nabla.Tensor([1, 3, 2], [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
+        "y": quabla.Tensor([1, 3, 2], [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
     }
 
     value, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
 
     assert value.to_flat_list() == [586.0]
@@ -1220,7 +1220,7 @@ def test_trace_tensor_batched_matmul_scalar_loss_vjp():
 
 
 def test_trace_tensor_symbolic_jvp_keeps_parameter_gradients():
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, forcing: (x * weight).tanh(),
         [("x", [1]), ("weight", [1]), ("forcing", [1])],
     )
@@ -1229,28 +1229,28 @@ def test_trace_tensor_symbolic_jvp_keeps_parameter_gradients():
     residual = second_derivative.output + second_derivative.graph.input("forcing")
     residual_loss = (residual * residual).sum()
     inputs = {
-        "x": nabla.Tensor([1], [0.3]),
-        "weight": nabla.Tensor([1], [1.2]),
-        "forcing": nabla.Tensor([1], [0.5]),
+        "x": quabla.Tensor([1], [0.3]),
+        "weight": quabla.Tensor([1], [1.2]),
+        "forcing": quabla.Tensor([1], [0.5]),
     }
     _, gradients = second_derivative.graph.evaluate_value_and_vjp(
         residual_loss.node_id,
         inputs,
-        nabla.Tensor([], [1.0]),
+        quabla.Tensor([], [1.0]),
     )
     assert abs(gradients["weight"].to_flat_list()[0]) > 1e-8
 
 
 def test_trace_tensor_symbolic_vjp_matches_cpu_vjp():
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, bias: (x + bias).tanh().sum(),
         [("x", [2, 1]), ("bias", [1, 3])],
     )
     inputs = {
-        "x": nabla.Tensor([2, 1], [-1.0, 2.0]),
-        "bias": nabla.Tensor([1, 3], [0.0, 1.0, -1.0]),
+        "x": quabla.Tensor([2, 1], [-1.0, 2.0]),
+        "bias": quabla.Tensor([1, 3], [0.0, 1.0, -1.0]),
     }
-    cotangent = nabla.Tensor([], [1.0])
+    cotangent = quabla.Tensor([], [1.0])
     _, direct = traced.graph.evaluate_value_and_vjp(
         traced.output.node_id, inputs, cotangent
     )
@@ -1267,7 +1267,7 @@ def test_trace_tensor_symbolic_vjp_matches_cpu_vjp():
 
 
 def test_trace_tensor_symbolic_vjp_supports_composed_loss_nodes():
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight: (x * weight).tanh(),
         [("x", [1]), ("weight", [1])],
     )
@@ -1275,9 +1275,9 @@ def test_trace_tensor_symbolic_vjp_supports_composed_loss_nodes():
     loss = second_derivative.output.powi(2).sum()
     gradients = loss.symbolic_vjp("loss_cotangent")
     inputs = {
-        "x": nabla.Tensor([1], [0.5]),
-        "weight": nabla.Tensor([1], [0.3]),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
+        "x": quabla.Tensor([1], [0.5]),
+        "weight": quabla.Tensor([1], [0.3]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
     }
     gradient = gradients["weight"].graph.evaluate(
         gradients["weight"].output.node_id, inputs
@@ -1287,15 +1287,15 @@ def test_trace_tensor_symbolic_vjp_supports_composed_loss_nodes():
 
 
 def test_trace_tensor_concat_supports_rank_n_ad_and_symbolic_transforms():
-    traced = nabla.trace_tensor(
-        lambda left, right: nabla.concat([left, right], axis=1).powi(2).sum(),
+    traced = quabla.trace_tensor(
+        lambda left, right: quabla.concat([left, right], axis=1).powi(2).sum(),
         [("left", [2, 1, 2]), ("right", [2, 2, 2])],
     )
     inputs = {
-        "left": nabla.Tensor([2, 1, 2], [1.0, 2.0, 3.0, 4.0]),
-        "right": nabla.Tensor([2, 2, 2], [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
+        "left": quabla.Tensor([2, 1, 2], [1.0, 2.0, 3.0, 4.0]),
+        "right": quabla.Tensor([2, 2, 2], [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
     }
-    cotangent = nabla.Tensor([], [1.0])
+    cotangent = quabla.Tensor([], [1.0])
     value, gradients = traced.graph.evaluate_value_and_vjp(
         traced.output.node_id, inputs, cotangent
     )
@@ -1316,8 +1316,8 @@ def test_trace_tensor_concat_supports_rank_n_ad_and_symbolic_transforms():
         traced.output.node_id,
         inputs,
         {
-            "left": nabla.Tensor.ones([2, 1, 2]),
-            "right": nabla.Tensor.zeros([2, 2, 2]),
+            "left": quabla.Tensor.ones([2, 1, 2]),
+            "right": quabla.Tensor.zeros([2, 2, 2]),
         },
     )
     assert tangent.to_flat_list() == [20.0]
@@ -1332,13 +1332,13 @@ def test_trace_tensor_concat_supports_rank_n_ad_and_symbolic_transforms():
 
 
 def test_trace_tensor_slice_supports_rank_n_ad_and_symbolic_transforms():
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x: x.slice(-2, 1, 3).powi(2).sum(),
         [("x", [2, 4, 2])],
     )
-    inputs = {"x": nabla.Tensor([2, 4, 2], [float(value) for value in range(1, 17)])}
+    inputs = {"x": quabla.Tensor([2, 4, 2], [float(value) for value in range(1, 17)])}
     value, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     assert value.to_flat_list() == [716.0]
     assert gradients["x"].to_flat_list() == [
@@ -1362,15 +1362,15 @@ def test_trace_tensor_slice_supports_rank_n_ad_and_symbolic_transforms():
     symbolic_gradient = traced.symbolic_vjp("loss_cotangent")["x"]
     assert symbolic_gradient.graph.evaluate(
         symbolic_gradient.output.node_id,
-        {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])},
+        {**inputs, "loss_cotangent": quabla.Tensor([], [1.0])},
     ).to_flat_list() == gradients["x"].to_flat_list()
 
 
 def test_trace_tensor_getitem_preserves_slice_ad_and_backend_parity():
-    traced = nabla.trace_tensor(lambda x: x[1, 1:3].powi(2).sum(), [("x", [3, 4])])
-    inputs = {"x": nabla.Tensor([3, 4], [float(value) for value in range(12)])}
+    traced = quabla.trace_tensor(lambda x: x[1, 1:3].powi(2).sum(), [("x", [3, 4])])
+    inputs = {"x": quabla.Tensor([3, 4], [float(value) for value in range(12)])}
     value, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     assert value.to_flat_list() == [61.0]
     assert gradients["x"].to_flat_list() == [0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 12.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -1378,27 +1378,27 @@ def test_trace_tensor_getitem_preserves_slice_ad_and_backend_parity():
     symbolic = traced.symbolic_vjp("loss_cotangent")["x"]
     symbolic_value = symbolic.graph.evaluate(
         symbolic.output.node_id,
-        {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])},
+        {**inputs, "loss_cotangent": quabla.Tensor([], [1.0])},
     )
     assert symbolic_value.to_flat_list() == gradients["x"].to_flat_list()
 
     cpu = traced.output.compile_cpu().evaluate(inputs)
-    if os.environ.get("NABLA_MLX_TEST") is not None:
+    if os.environ.get("QUABLA_MLX_TEST") is not None:
         mlx = traced.output.compile_mlx().evaluate(inputs)
         assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
         mlx_gradient = symbolic.output.compile_mlx().evaluate(
-            {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])}
+            {**inputs, "loss_cotangent": quabla.Tensor([], [1.0])}
         )
         assert_close_rows(
             [mlx_gradient.to_flat_list()], [gradients["x"].to_flat_list()], tol=1e-5
         )
-    if os.environ.get("NABLA_CUDA_TEST") is not None:
+    if os.environ.get("QUABLA_CUDA_TEST") is not None:
         cuda = traced.output.compile_cuda().evaluate(inputs)
         assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
 
 def test_trace_tensor_slice_rejects_invalid_ranges():
-    traced = nabla.trace_tensor(lambda x: x, [("x", [2, 3])])
+    traced = quabla.trace_tensor(lambda x: x, [("x", [2, 3])])
     for args in ((0, 3, 2), (1, 0, 4), (2, 0, 1)):
         try:
             traced.output.slice(*args)
@@ -1409,61 +1409,61 @@ def test_trace_tensor_slice_rejects_invalid_ranges():
 
 
 def test_trace_tensor_broadcast_to_supports_rank_n_ad_and_symbolic_transforms():
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x: x.broadcast_to([2, 3, 2]).powi(2).sum(), [("x", [1, 3, 1])]
     )
-    inputs = {"x": nabla.Tensor([1, 3, 1], [1.0, 2.0, 3.0])}
+    inputs = {"x": quabla.Tensor([1, 3, 1], [1.0, 2.0, 3.0])}
     value, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     assert value.to_flat_list() == [56.0]
     assert gradients["x"].to_flat_list() == [8.0, 16.0, 24.0]
     _, tangent = traced.graph.evaluate_jvp(
         traced.output.node_id,
         inputs,
-        {"x": nabla.Tensor.ones([1, 3, 1])},
+        {"x": quabla.Tensor.ones([1, 3, 1])},
     )
     assert tangent.to_flat_list() == [48.0]
     symbolic_gradient = traced.symbolic_vjp("loss_cotangent")["x"]
     assert symbolic_gradient.graph.evaluate(
         symbolic_gradient.output.node_id,
-        {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])},
+        {**inputs, "loss_cotangent": quabla.Tensor([], [1.0])},
     ).to_flat_list() == gradients["x"].to_flat_list()
 
 
 def test_trace_tensor_stack_supports_symbolic_vjp():
-    traced = nabla.trace_tensor(
-        lambda left, right: nabla.stack([left, right], axis=-1).powi(2).sum(),
+    traced = quabla.trace_tensor(
+        lambda left, right: quabla.stack([left, right], axis=-1).powi(2).sum(),
         [("left", [2, 2]), ("right", [2, 2])],
     )
     inputs = {
-        "left": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
-        "right": nabla.Tensor([2, 2], [5.0, 6.0, 7.0, 8.0]),
+        "left": quabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+        "right": quabla.Tensor([2, 2], [5.0, 6.0, 7.0, 8.0]),
     }
     gradient = traced.symbolic_vjp("loss_cotangent")["right"]
     result = gradient.graph.evaluate(
         gradient.output.node_id,
-        {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])},
+        {**inputs, "loss_cotangent": quabla.Tensor([], [1.0])},
     )
     assert result.to_flat_list() == [10.0, 12.0, 14.0, 16.0]
 
 
 def test_cuda_trace_tensor_concat_keeps_primal_and_symbolic_vjp_on_device():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
-        lambda left, right: nabla.concat([left, right], axis=1).powi(2).sum(),
+    traced = quabla.trace_tensor(
+        lambda left, right: quabla.concat([left, right], axis=1).powi(2).sum(),
         [("left", [2, 1, 2]), ("right", [2, 2, 2])],
     )
     inputs = {
-        "left": nabla.Tensor([2, 1, 2], [1.0, 2.0, 3.0, 4.0]),
-        "right": nabla.Tensor([2, 2, 2], [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
+        "left": quabla.Tensor([2, 1, 2], [1.0, 2.0, 3.0, 4.0]),
+        "right": quabla.Tensor([2, 2, 2], [5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
     }
     assert_close_rows([traced.output.compile_cuda().evaluate(inputs).to_flat_list()], [[650.0]], tol=1e-5)
 
     gradient = traced.symbolic_vjp("loss_cotangent")["right"].output.compile_cuda()
-    result = gradient.evaluate({**inputs, "loss_cotangent": nabla.Tensor([], [1.0])})
+    result = gradient.evaluate({**inputs, "loss_cotangent": quabla.Tensor([], [1.0])})
     assert_close_rows(
         [result.to_flat_list()],
         [[10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0]],
@@ -1472,20 +1472,20 @@ def test_cuda_trace_tensor_concat_keeps_primal_and_symbolic_vjp_on_device():
 
 
 def test_mlx_trace_tensor_compiles_and_matches_cpu():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
-        lambda x, y, bias: nabla.concat([x, y], axis=0)
+    traced = quabla.trace_tensor(
+        lambda x, y, bias: quabla.concat([x, y], axis=0)
         .add(bias.broadcast_to([2, 2]))
         .tanh()
         .sum(),
         [("x", [1, 2]), ("y", [1, 2]), ("bias", [1, 2])],
     )
     inputs = {
-        "x": nabla.Tensor([1, 2], [-1.0, 2.0]),
-        "y": nabla.Tensor([1, 2], [0.5, -0.25]),
-        "bias": nabla.Tensor([1, 2], [0.25, -0.5]),
+        "x": quabla.Tensor([1, 2], [-1.0, 2.0]),
+        "y": quabla.Tensor([1, 2], [0.5, -0.25]),
+        "bias": quabla.Tensor([1, 2], [0.25, -0.5]),
     }
     cpu = traced.output.compile_cpu().evaluate(inputs)
     plan = traced.output.compile_mlx()
@@ -1495,17 +1495,17 @@ def test_mlx_trace_tensor_compiles_and_matches_cpu():
 
 
 def test_mlx_execution_plan_retains_static_inputs_across_calls():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, bias: (x.matmul(weight) + bias).tanh(),
         [("x", [2, 2]), ("weight", [2, 2]), ("bias", [1, 2])],
     )
     inputs = {
-        "x": nabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
-        "weight": nabla.Tensor([2, 2], [1.0, -1.0, 0.5, 1.5]),
-        "bias": nabla.Tensor([1, 2], [0.25, -0.5]),
+        "x": quabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
+        "weight": quabla.Tensor([2, 2], [1.0, -1.0, 0.5, 1.5]),
+        "bias": quabla.Tensor([1, 2], [0.25, -0.5]),
     }
     cpu = traced.output.compile_cpu().evaluate(inputs)
     plan = traced.output.compile_mlx()
@@ -1528,18 +1528,18 @@ def test_mlx_execution_plan_retains_static_inputs_across_calls():
 
 
 def test_mlx_symbolic_vjp_executes_mlp_bias_gradient():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, bias: (x.matmul(weight) + bias).tanh().sum(),
         [("x", [2, 2]), ("weight", [2, 3]), ("bias", [1, 3])],
     )
     inputs = {
-        "x": nabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
-        "weight": nabla.Tensor([2, 3], [1.0, -1.0, 2.0, 0.5, 1.5, -0.5]),
-        "bias": nabla.Tensor([1, 3], [0.25, -0.5, 1.0]),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
+        "x": quabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
+        "weight": quabla.Tensor([2, 3], [1.0, -1.0, 2.0, 0.5, 1.5, -0.5]),
+        "bias": quabla.Tensor([1, 3], [0.25, -0.5, 1.0]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
     }
     gradient = traced.symbolic_vjp("loss_cotangent")["bias"].output
     cpu = gradient.compile_cpu().evaluate(inputs)
@@ -1548,28 +1548,28 @@ def test_mlx_symbolic_vjp_executes_mlp_bias_gradient():
 
 
 def test_mlx_trace_tensor_executes_masked_loss():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
-        lambda x: nabla.where(x.gt(0.0), x.powi(2), x).sum(), [("x", [2, 2])]
+    traced = quabla.trace_tensor(
+        lambda x: quabla.where(x.gt(0.0), x.powi(2), x).sum(), [("x", [2, 2])]
     )
-    inputs = {"x": nabla.Tensor([2, 2], [-2.0, -1.0, 1.0, 3.0])}
+    inputs = {"x": quabla.Tensor([2, 2], [-2.0, -1.0, 1.0, 3.0])}
     cpu = traced.output.compile_cpu().evaluate(inputs)
     mlx = traced.output.compile_mlx().evaluate(inputs)
     assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
 
 def test_mlx_symbolic_vjp_executes_masked_loss_gradient():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
-        lambda x: nabla.where(x.gt(0.0), x.powi(2), x).sum(), [("x", [2, 2])]
+    traced = quabla.trace_tensor(
+        lambda x: quabla.where(x.gt(0.0), x.powi(2), x).sum(), [("x", [2, 2])]
     )
     inputs = {
-        "x": nabla.Tensor([2, 2], [-2.0, -1.0, 1.0, 3.0]),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
+        "x": quabla.Tensor([2, 2], [-2.0, -1.0, 1.0, 3.0]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
     }
     gradient = traced.symbolic_vjp("loss_cotangent")["x"].output
     cpu = gradient.compile_cpu().evaluate(inputs)
@@ -1578,33 +1578,33 @@ def test_mlx_symbolic_vjp_executes_masked_loss_gradient():
 
 
 def test_mlx_greater_returns_float_mask_like_cpu():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
     inputs = {
-        "x": nabla.Tensor([3], [1.0, 2.0, 3.0]),
-        "y": nabla.Tensor([3], [2.0, 2.0, 2.0]),
+        "x": quabla.Tensor([3], [1.0, 2.0, 3.0]),
+        "y": quabla.Tensor([3], [2.0, 2.0, 2.0]),
     }
     for function, expected in [
         (lambda x, y: x.gt(y), [0.0, 0.0, 1.0]),
         (lambda x, y: (x.gt(y) + x.gt(y)).sum(), [2.0]),
     ]:
-        traced = nabla.trace_tensor(function, [("x", [3]), ("y", [3])])
+        traced = quabla.trace_tensor(function, [("x", [3]), ("y", [3])])
         assert traced.output.compile_cpu().evaluate(inputs).to_flat_list() == expected
         assert traced.output.compile_mlx().evaluate(inputs).to_flat_list() == expected
 
 
 def test_cuda_trace_tensor_slice_keeps_primal_and_symbolic_vjp_on_device():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x: x.slice(1, 1, 3).powi(2).sum(), [("x", [2, 4, 2])]
     )
-    inputs = {"x": nabla.Tensor([2, 4, 2], [float(value) for value in range(1, 17)])}
+    inputs = {"x": quabla.Tensor([2, 4, 2], [float(value) for value in range(1, 17)])}
     assert_close_rows([traced.output.compile_cuda().evaluate(inputs).to_flat_list()], [[716.0]], tol=1e-5)
     gradient = traced.symbolic_vjp("loss_cotangent")["x"].output.compile_cuda()
-    result = gradient.evaluate({**inputs, "loss_cotangent": nabla.Tensor([], [1.0])})
+    result = gradient.evaluate({**inputs, "loss_cotangent": quabla.Tensor([], [1.0])})
     assert_close_rows(
         [result.to_flat_list()],
         [[0.0, 0.0, 6.0, 8.0, 10.0, 12.0, 0.0, 0.0, 0.0, 0.0, 22.0, 24.0, 26.0, 28.0, 0.0, 0.0]],
@@ -1613,24 +1613,24 @@ def test_cuda_trace_tensor_slice_keeps_primal_and_symbolic_vjp_on_device():
 
 
 def test_cuda_trace_tensor_broadcast_to_keeps_primal_and_symbolic_vjp_on_device():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x: x.broadcast_to([2, 3, 2]).powi(2).sum(), [("x", [1, 3, 1])]
     )
-    inputs = {"x": nabla.Tensor([1, 3, 1], [1.0, 2.0, 3.0])}
+    inputs = {"x": quabla.Tensor([1, 3, 1], [1.0, 2.0, 3.0])}
     assert_close_rows([traced.output.compile_cuda().evaluate(inputs).to_flat_list()], [[56.0]], tol=1e-5)
     gradient = traced.symbolic_vjp("loss_cotangent")["x"].output.compile_cuda()
-    result = gradient.evaluate({**inputs, "loss_cotangent": nabla.Tensor([], [1.0])})
+    result = gradient.evaluate({**inputs, "loss_cotangent": quabla.Tensor([], [1.0])})
     assert_close_rows([result.to_flat_list()], [[8.0, 16.0, 24.0]], tol=1e-5)
 
 
 def test_cuda_multi_parameter_sgd_keeps_gradient_plans_synchronized():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, bias: (x * weight) + bias,
         [("x", [2]), ("weight", [1]), ("bias", [1])],
     )
@@ -1640,11 +1640,11 @@ def test_cuda_multi_parameter_sgd_keeps_gradient_plans_synchronized():
     weight_gradient = gradients["weight"].output.compile_cuda()
     bias_gradient = gradients["bias"].output.compile_cuda()
     inputs = {
-        "x": nabla.Tensor([2], [-1.0, 1.0]),
-        "target": nabla.Tensor([2], [-1.0, 3.0]),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
-        "weight": nabla.Tensor([1], [0.0]),
-        "bias": nabla.Tensor([1], [0.0]),
+        "x": quabla.Tensor([2], [-1.0, 1.0]),
+        "target": quabla.Tensor([2], [-1.0, 3.0]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
+        "weight": quabla.Tensor([1], [0.0]),
+        "bias": quabla.Tensor([1], [0.0]),
     }
     retained = ["x", "target", "loss_cotangent", "weight", "bias"]
 
@@ -1659,10 +1659,10 @@ def test_cuda_multi_parameter_sgd_keeps_gradient_plans_synchronized():
 
 
 def test_cuda_adam_keeps_optimizer_state_on_device():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight: x * weight,
         [("x", [1]), ("weight", [1])],
     )
@@ -1670,10 +1670,10 @@ def test_cuda_adam_keeps_optimizer_state_on_device():
     loss = (traced.output - target).powi(2).sum()
     gradient = loss.symbolic_vjp("loss_cotangent")["weight"].output.compile_cuda()
     inputs = {
-        "x": nabla.Tensor([1], [2.0]),
-        "weight": nabla.Tensor([1], [0.0]),
-        "target": nabla.Tensor([1], [6.0]),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
+        "x": quabla.Tensor([1], [2.0]),
+        "weight": quabla.Tensor([1], [0.0]),
+        "target": quabla.Tensor([1], [6.0]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
     }
 
     for _ in range(2):
@@ -1684,17 +1684,17 @@ def test_cuda_adam_keeps_optimizer_state_on_device():
 
 
 def test_cuda_plan_evaluates_with_static_inputs_retained_on_device():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, bias: (x + bias).tanh(),
         [("x", [2, 1]), ("bias", [1, 2])],
     )
     plan = traced.output.compile_cuda()
     inputs = {
-        "x": nabla.Tensor([2, 1], [-1.0, 2.0]),
-        "bias": nabla.Tensor([1, 2], [0.0, 1.0]),
+        "x": quabla.Tensor([2, 1], [-1.0, 2.0]),
+        "bias": quabla.Tensor([1, 2], [0.0, 1.0]),
     }
     plan.evaluate_device(inputs, ["x", "bias"])
     plan.evaluate_device(inputs, ["x", "bias"])
@@ -1708,18 +1708,18 @@ def test_cuda_plan_evaluates_with_static_inputs_retained_on_device():
 
 
 def test_cuda_plan_reuses_dead_temporary_buffers():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, bias: ((x.matmul(weight) + bias).tanh() + bias),
         [("x", [2, 2]), ("weight", [2, 2]), ("bias", [1, 2])],
     )
     plan = traced.output.compile_cuda()
     inputs = {
-        "x": nabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
-        "weight": nabla.Tensor([2, 2], [1.0, 2.0, -1.0, 1.0]),
-        "bias": nabla.Tensor([1, 2], [0.25, -0.5]),
+        "x": quabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
+        "weight": quabla.Tensor([2, 2], [1.0, 2.0, -1.0, 1.0]),
+        "bias": quabla.Tensor([1, 2], [0.25, -0.5]),
     }
 
     plan.evaluate(inputs)
@@ -1733,18 +1733,18 @@ def test_cuda_plan_reuses_dead_temporary_buffers():
 
 
 def test_cuda_fuses_rank_two_matmul_bias_tanh_epilogue():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, bias: (x.matmul(weight) + bias).tanh(),
         [("x", [2, 2]), ("weight", [2, 3]), ("bias", [1, 3])],
     )
     plan = traced.output.compile_cuda()
     inputs = {
-        "x": nabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
-        "weight": nabla.Tensor([2, 3], [1.0, -1.0, 2.0, 0.5, 1.5, -0.5]),
-        "bias": nabla.Tensor([1, 3], [0.25, -0.5, 1.0]),
+        "x": quabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
+        "weight": quabla.Tensor([2, 3], [1.0, -1.0, 2.0, 0.5, 1.5, -0.5]),
+        "bias": quabla.Tensor([1, 3], [0.25, -0.5, 1.0]),
     }
 
     actual = plan.evaluate(inputs).to_flat_list()
@@ -1763,11 +1763,11 @@ def test_cuda_fuses_rank_two_matmul_bias_tanh_epilogue():
 
 def _cuda_mlp_tensor(shape, seed):
     count = math.prod(shape)
-    return nabla.Tensor(shape, [((index * 7 + seed) % 11) * 0.1 - 0.5 for index in range(count)])
+    return quabla.Tensor(shape, [((index * 7 + seed) % 11) * 0.1 - 0.5 for index in range(count)])
 
 
 def test_cuda_matmul_bias_tanh_with_computed_operands_matches_cpu():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
     specs = [("x", [4, 3]), ("w", [3, 2]), ("b", [1, 2])]
@@ -1779,7 +1779,7 @@ def test_cuda_matmul_bias_tanh_with_computed_operands_matches_cpu():
         "bias": lambda x, w, b: (x.matmul(w) + b.tanh()).tanh(),
     }
     for name, function in functions.items():
-        traced = nabla.trace_tensor(function, specs)
+        traced = quabla.trace_tensor(function, specs)
         plan = traced.output.compile_cuda()
         cpu = traced.output.compile_cpu().evaluate(inputs).to_flat_list()
         assert not plan.fused_matmul_bias_tanh, name
@@ -1787,7 +1787,7 @@ def test_cuda_matmul_bias_tanh_with_computed_operands_matches_cpu():
 
 
 def test_cuda_two_layer_mlp_forward_and_value_and_grad_match_cpu():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
     specs = [
@@ -1803,7 +1803,7 @@ def test_cuda_two_layer_mlp_forward_and_value_and_grad_match_cpu():
     def forward(x, target, w1, b1, w2, b2):
         return ((x.matmul(w1) + b1).tanh().matmul(w2) + b2).tanh()
 
-    traced = nabla.trace_tensor(forward, specs)
+    traced = quabla.trace_tensor(forward, specs)
     cpu = traced.output.compile_cpu().evaluate(inputs).to_flat_list()
     cuda = traced.output.compile_cuda().evaluate(inputs).to_flat_list()
     assert_close_rows([cuda], [cpu], tol=1e-5)
@@ -1812,8 +1812,8 @@ def test_cuda_two_layer_mlp_forward_and_value_and_grad_match_cpu():
         return (forward(x, target, w1, b1, w2, b2) - target).powi(2).mean()
 
     parameters = ["w1", "b1", "w2", "b2"]
-    value, gradients = nabla.tensor_value_and_grad_cuda_fn(loss, specs, parameters)(inputs)
-    cpu_value, cpu_gradients = nabla.tensor_value_and_grad_fn(loss, specs)(inputs)
+    value, gradients = quabla.tensor_value_and_grad_cuda_fn(loss, specs, parameters)(inputs)
+    cpu_value, cpu_gradients = quabla.tensor_value_and_grad_fn(loss, specs)(inputs)
     assert_close_rows([value.to_flat_list()], [cpu_value.to_flat_list()], tol=1e-5)
     for name in parameters:
         assert_close_rows(
@@ -1824,17 +1824,17 @@ def test_cuda_two_layer_mlp_forward_and_value_and_grad_match_cpu():
 
 
 def test_cuda_fuses_elementwise_tail_after_matmul():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, bias: ((x.matmul(weight) + bias).tanh()).sin(),
         [("x", [2, 2]), ("weight", [2, 3]), ("bias", [1, 3])],
     )
     inputs = {
-        "x": nabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
-        "weight": nabla.Tensor([2, 3], [1.0, -1.0, 2.0, 0.5, 1.5, -0.5]),
-        "bias": nabla.Tensor([1, 3], [0.25, -0.5, 1.0]),
+        "x": quabla.Tensor([2, 2], [-1.0, 0.0, 1.0, 2.0]),
+        "weight": quabla.Tensor([2, 3], [1.0, -1.0, 2.0, 0.5, 1.5, -0.5]),
+        "bias": quabla.Tensor([1, 3], [0.25, -0.5, 1.0]),
     }
     cpu = traced.output.compile_cpu().evaluate(inputs).to_flat_list()
     plan = traced.output.compile_cuda()
@@ -1845,10 +1845,10 @@ def test_cuda_fuses_elementwise_tail_after_matmul():
 
 
 def test_cuda_multi_parameter_adam_keeps_gradient_plans_synchronized():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, bias: (x * weight) + bias,
         [("x", [2]), ("weight", [1]), ("bias", [1])],
     )
@@ -1858,14 +1858,14 @@ def test_cuda_multi_parameter_adam_keeps_gradient_plans_synchronized():
     weight_gradient = gradients["weight"].output.compile_cuda()
     bias_gradient = gradients["bias"].output.compile_cuda()
     inputs = {
-        "x": nabla.Tensor([2], [-1.0, 1.0]),
-        "target": nabla.Tensor([2], [-1.0, 3.0]),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
-        "weight": nabla.Tensor([1], [0.0]),
-        "bias": nabla.Tensor([1], [0.0]),
+        "x": quabla.Tensor([2], [-1.0, 1.0]),
+        "target": quabla.Tensor([2], [-1.0, 3.0]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
+        "weight": quabla.Tensor([1], [0.0]),
+        "bias": quabla.Tensor([1], [0.0]),
     }
     retained = ["x", "target", "loss_cotangent", "weight", "bias"]
-    optimizer = nabla.cuda_adam_optimizer(
+    optimizer = quabla.cuda_adam_optimizer(
         {"weight": weight_gradient, "bias": bias_gradient},
         inputs,
         0.05,
@@ -1881,10 +1881,10 @@ def test_cuda_multi_parameter_adam_keeps_gradient_plans_synchronized():
 
 
 def test_cuda_adam_optimizer_updates_minibatch_inputs_without_resetting_state():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight: x * weight,
         [("x", [1]), ("weight", [1])],
     )
@@ -1893,13 +1893,13 @@ def test_cuda_adam_optimizer_updates_minibatch_inputs_without_resetting_state():
     gradient = loss.symbolic_vjp("loss_cotangent")["weight"].output
 
     def make_optimizer() -> object:
-        return nabla.cuda_adam_optimizer(
+        return quabla.cuda_adam_optimizer(
             {"weight": gradient.compile_cuda()},
             {
-                "x": nabla.Tensor([1], [1.0]),
-                "target": nabla.Tensor([1], [1.0]),
-                "loss_cotangent": nabla.Tensor([], [1.0]),
-                "weight": nabla.Tensor([1], [0.0]),
+                "x": quabla.Tensor([1], [1.0]),
+                "target": quabla.Tensor([1], [1.0]),
+                "loss_cotangent": quabla.Tensor([], [1.0]),
+                "weight": quabla.Tensor([1], [0.0]),
             },
             0.1,
             ["x", "target", "loss_cotangent", "weight"],
@@ -1910,7 +1910,7 @@ def test_cuda_adam_optimizer_updates_minibatch_inputs_without_resetting_state():
     static.step()
     dynamic.step()
     static.step()
-    dynamic.step({"target": nabla.Tensor([1], [-10.0])})
+    dynamic.step({"target": quabla.Tensor([1], [-10.0])})
 
     static_weight = static.parameters()["weight"].to_flat_list()[0]
     dynamic_weight = dynamic.parameters()["weight"].to_flat_list()[0]
@@ -1918,24 +1918,24 @@ def test_cuda_adam_optimizer_updates_minibatch_inputs_without_resetting_state():
 
 
 def test_cuda_adam_vjp_optimizer_updates_parameters_from_one_shared_graph():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, bias: (x * weight) + bias,
         [("x", [2]), ("weight", [1]), ("bias", [1])],
     )
     target = traced.graph.input("target", [2])
     loss = (traced.output - target).powi(2).sum()
     gradients = loss.symbolic_vjp("loss_cotangent")
-    optimizer = nabla.cuda_adam_vjp_optimizer(
+    optimizer = quabla.cuda_adam_vjp_optimizer(
         {"weight": gradients["weight"], "bias": gradients["bias"]},
         {
-            "x": nabla.Tensor([2], [-1.0, 1.0]),
-            "target": nabla.Tensor([2], [-1.0, 3.0]),
-            "loss_cotangent": nabla.Tensor([], [1.0]),
-            "weight": nabla.Tensor([1], [0.0]),
-            "bias": nabla.Tensor([1], [0.0]),
+            "x": quabla.Tensor([2], [-1.0, 1.0]),
+            "target": quabla.Tensor([2], [-1.0, 3.0]),
+            "loss_cotangent": quabla.Tensor([], [1.0]),
+            "weight": quabla.Tensor([1], [0.0]),
+            "bias": quabla.Tensor([1], [0.0]),
         },
         0.05,
         ["x", "target", "loss_cotangent", "weight", "bias"],
@@ -1950,24 +1950,24 @@ def test_cuda_adam_vjp_optimizer_updates_parameters_from_one_shared_graph():
 
 
 def test_cuda_batched_matmul_vjp_matches_cpu_trace_evaluation():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda lhs, rhs: lhs @ rhs,
         [("lhs", [2, 3, 2]), ("rhs", [1, 2, 4])],
     )
     loss = traced.output.sum()
     gradients = loss.symbolic_vjp("loss_cotangent")
     inputs = {
-        "lhs": nabla.Tensor(
+        "lhs": quabla.Tensor(
             [2, 3, 2],
             [1.0, -2.0, 0.5, 3.0, -1.0, 4.0, 2.0, 1.0, -3.0, 0.25, 0.75, -2.0],
         ),
-        "rhs": nabla.Tensor(
+        "rhs": quabla.Tensor(
             [1, 2, 4], [0.2, -0.4, 0.6, 0.8, -0.1, 0.3, 0.5, -0.7]
         ),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
     }
 
     for name, gradient_trace in gradients.items():
@@ -1979,14 +1979,14 @@ def test_cuda_batched_matmul_vjp_matches_cpu_trace_evaluation():
 
 
 def test_cuda_global_reductions_match_cpu_and_reset_output_buffers():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
     values = [0.125 * (index % 13) for index in range(8192)]
-    inputs = {"x": nabla.Tensor([128, 64], values)}
+    inputs = {"x": quabla.Tensor([128, 64], values)}
 
     for fn in (lambda x: x.sum(), lambda x: x.mean()):
-        traced = nabla.trace_tensor(fn, [("x", [128, 64])])
+        traced = quabla.trace_tensor(fn, [("x", [128, 64])])
         cpu = traced.graph.evaluate(traced.output.node_id, inputs).to_flat_list()[0]
         cuda = traced.output.compile_cuda()
         first = cuda.evaluate(inputs).to_flat_list()[0]
@@ -1997,30 +1997,30 @@ def test_cuda_global_reductions_match_cpu_and_reset_output_buffers():
 
 
 def test_multi_axis_keepdims_reductions_match_cpu_on_mlx_and_cuda():
-    if os.environ.get("NABLA_MLX_TEST") is None and os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None and os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x: x.mean(axis=[0, 2], keepdims=True), [("x", [2, 3, 2])]
     )
-    inputs = {"x": nabla.Tensor([2, 3, 2], [float(value) for value in range(1, 13)])}
+    inputs = {"x": quabla.Tensor([2, 3, 2], [float(value) for value in range(1, 13)])}
     cpu = traced.output.compile_cpu().evaluate(inputs)
 
-    if os.environ.get("NABLA_MLX_TEST") is not None:
+    if os.environ.get("QUABLA_MLX_TEST") is not None:
         mlx = traced.output.compile_mlx().evaluate(inputs)
         assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
-    if os.environ.get("NABLA_CUDA_TEST") is not None:
+    if os.environ.get("QUABLA_CUDA_TEST") is not None:
         cuda = traced.output.compile_cuda().evaluate(inputs)
         assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
 
 def test_cuda_sqrt_composite_lowering_matches_cpu():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(lambda x: x.sqrt(), [("x", [2, 2])])
-    inputs = {"x": nabla.Tensor([2, 2], [0.25, 1.0, 4.0, 9.0])}
+    traced = quabla.trace_tensor(lambda x: x.sqrt(), [("x", [2, 2])])
+    inputs = {"x": quabla.Tensor([2, 2], [0.25, 1.0, 4.0, 9.0])}
     cpu = traced.graph.evaluate(traced.output.node_id, inputs)
     cuda = traced.output.compile_cuda().evaluate(inputs)
 
@@ -2029,16 +2029,16 @@ def test_cuda_sqrt_composite_lowering_matches_cpu():
 
 
 def test_cuda_checked_div_and_log_lowering_matches_cpu():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, scale: (x / scale).log(),
         [("x", [2, 2]), ("scale", [])],
     )
     inputs = {
-        "x": nabla.Tensor([2, 2], [0.5, 1.0, 2.0, 8.0]),
-        "scale": nabla.Tensor([], [0.5]),
+        "x": quabla.Tensor([2, 2], [0.5, 1.0, 2.0, 8.0]),
+        "scale": quabla.Tensor([], [0.5]),
     }
     cpu = traced.graph.evaluate(traced.output.node_id, inputs)
     cuda = traced.output.compile_cuda().evaluate(inputs)
@@ -2052,13 +2052,13 @@ def test_trace_tensor_tanh_scalar_loss_supports_jvp_and_vjp():
         return x.tanh().sum()
 
     values = [0.0, 1.0, -1.0, 0.5]
-    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
-    inputs = {"x": nabla.Tensor([2, 2], values)}
+    traced = quabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": quabla.Tensor([2, 2], values)}
     value, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 2], [1.0] * 4)}
     )
 
     expected_derivative = [1.0 - math.tanh(item) ** 2 for item in values]
@@ -2076,7 +2076,7 @@ def test_trace_tensor_tanh_scalar_loss_supports_jvp_and_vjp():
 
     direction = [1.0, 2.0, 3.0, 4.0]
     hvp = traced.graph.hvp_scalar(
-        traced.output.node_id, "x", inputs, nabla.Tensor([2, 2], direction)
+        traced.output.node_id, "x", inputs, quabla.Tensor([2, 2], direction)
     )
     assert_close_rows([hvp.to_flat_list()], [[second * direction_item for second, direction_item in zip(expected_second, direction)]])
 
@@ -2086,13 +2086,13 @@ def test_trace_tensor_subtraction_supports_jvp_and_vjp():
         return (x.tanh() - x).sum()
 
     values = [0.0, 1.0, -1.0, 0.5]
-    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
-    inputs = {"x": nabla.Tensor([2, 2], values)}
+    traced = quabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": quabla.Tensor([2, 2], values)}
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 2], [1.0] * 4)}
     )
 
     expected = [-math.tanh(item) ** 2 for item in values]
@@ -2104,13 +2104,13 @@ def test_trace_tensor_supports_numeric_scalar_literals():
     def loss(x):
         return (2.0 * x + 1.0).sum()
 
-    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
-    inputs = {"x": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])}
+    traced = quabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": quabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])}
     value, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 2], [1.0] * 4)}
     )
 
     assert value.to_flat_list() == [24.0]
@@ -2123,13 +2123,13 @@ def test_trace_tensor_division_supports_jvp_and_vjp():
         return (x / (x + 2.0)).sum()
 
     values = [1.0, 2.0, 3.0, 4.0]
-    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
-    inputs = {"x": nabla.Tensor([2, 2], values)}
+    traced = quabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": quabla.Tensor([2, 2], values)}
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 2], [1.0] * 4)}
     )
 
     expected = [2.0 / (value + 2.0) ** 2 for value in values]
@@ -2142,13 +2142,13 @@ def test_trace_tensor_exp_supports_jvp_and_vjp():
         return x.exp().sum()
 
     values = [0.0, 1.0, -1.0, 0.5]
-    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
-    inputs = {"x": nabla.Tensor([2, 2], values)}
+    traced = quabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": quabla.Tensor([2, 2], values)}
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 2], [1.0] * 4)}
     )
 
     expected = [math.exp(value) for value in values]
@@ -2161,13 +2161,13 @@ def test_trace_tensor_mean_supports_jvp_and_vjp():
         return x.exp().mean()
 
     values = [0.0, 1.0, -1.0, 0.5]
-    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
-    inputs = {"x": nabla.Tensor([2, 2], values)}
+    traced = quabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": quabla.Tensor([2, 2], values)}
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 2], [1.0] * 4)}
     )
 
     expected = [math.exp(value) / 4.0 for value in values]
@@ -2180,13 +2180,13 @@ def test_trace_tensor_sin_supports_jvp_and_vjp():
         return x.sin().sum()
 
     values = [0.0, 1.0, -1.0, 0.5]
-    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
-    inputs = {"x": nabla.Tensor([2, 2], values)}
+    traced = quabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": quabla.Tensor([2, 2], values)}
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 2], [1.0] * 4)}
     )
 
     expected = [math.cos(value) for value in values]
@@ -2199,13 +2199,13 @@ def test_trace_tensor_sqrt_supports_jvp_and_vjp():
         return x.sqrt().sum()
 
     values = [1.0, 4.0, 9.0, 16.0]
-    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
-    inputs = {"x": nabla.Tensor([2, 2], values)}
+    traced = quabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": quabla.Tensor([2, 2], values)}
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 2], [1.0] * 4)}
     )
 
     expected = [0.5, 0.25, 1.0 / 6.0, 0.125]
@@ -2214,13 +2214,13 @@ def test_trace_tensor_sqrt_supports_jvp_and_vjp():
 
 
 def test_trace_tensor_sqrt_and_norm_define_zero_subgradient_and_preserve_symbolic_ad():
-    traced = nabla.trace_tensor(lambda x: x.sqrt().sum(), [("x", [3])])
-    inputs = {"x": nabla.Tensor([3], [0.0, 1.0, 4.0])}
+    traced = quabla.trace_tensor(lambda x: x.sqrt().sum(), [("x", [3])])
+    inputs = {"x": quabla.Tensor([3], [0.0, 1.0, 4.0])}
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([3], [1.0, 1.0, 1.0])}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([3], [1.0, 1.0, 1.0])}
     )
     symbolic = traced.symbolic_vjp("loss_cotangent")["x"]
 
@@ -2228,7 +2228,7 @@ def test_trace_tensor_sqrt_and_norm_define_zero_subgradient_and_preserve_symboli
     assert tangent.to_flat_list() == [0.75]
     assert symbolic.graph.evaluate(
         symbolic.output.node_id,
-        {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])},
+        {**inputs, "loss_cotangent": quabla.Tensor([], [1.0])},
     ).to_flat_list() == [0.0, 0.5, 0.25]
     hessian = traced.graph.hessian_scalar(traced.output.node_id, "x", inputs)
     assert_close_rows(
@@ -2236,37 +2236,37 @@ def test_trace_tensor_sqrt_and_norm_define_zero_subgradient_and_preserve_symboli
         [[0.0, 0.0, 0.0], [0.0, -0.25, 0.0], [0.0, 0.0, -1.0 / 32.0]],
     )
 
-    symbolic_inputs = {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])}
+    symbolic_inputs = {**inputs, "loss_cotangent": quabla.Tensor([], [1.0])}
     cpu_gradient = symbolic.output.compile_cpu().evaluate(symbolic_inputs)
-    if os.environ.get("NABLA_MLX_TEST") is not None:
+    if os.environ.get("QUABLA_MLX_TEST") is not None:
         mlx_gradient = symbolic.output.compile_mlx().evaluate(symbolic_inputs)
         assert_close_rows(
             [mlx_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
         )
-    if os.environ.get("NABLA_CUDA_TEST") is not None:
+    if os.environ.get("QUABLA_CUDA_TEST") is not None:
         cuda_gradient = symbolic.output.compile_cuda().evaluate(symbolic_inputs)
         assert_close_rows(
             [cuda_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
         )
 
-    norm = nabla.trace_tensor(lambda x: x.norm(), [("x", [2])])
-    norm_inputs = {"x": nabla.Tensor([2], [3.0, 4.0])}
+    norm = quabla.trace_tensor(lambda x: x.norm(), [("x", [2])])
+    norm_inputs = {"x": quabla.Tensor([2], [3.0, 4.0])}
     value, norm_gradients = norm.graph.evaluate_value_and_vjp(
-        norm.output.node_id, norm_inputs, nabla.Tensor([], [1.0])
+        norm.output.node_id, norm_inputs, quabla.Tensor([], [1.0])
     )
     assert value.to_flat_list() == [5.0]
     assert_close_rows([norm_gradients["x"].to_flat_list()], [[0.6, 0.8]])
 
 
 def test_trace_tensor_reduction_extrema_choose_last_tied_coordinate_for_gradients():
-    inputs = {"x": nabla.Tensor([2, 3], [1.0, 5.0, 5.0, 2.0, 2.0, 0.0])}
-    cotangent = nabla.Tensor([], [1.0])
+    inputs = {"x": quabla.Tensor([2, 3], [1.0, 5.0, 5.0, 2.0, 2.0, 0.0])}
+    cotangent = quabla.Tensor([], [1.0])
 
     for operation, expected_value, expected_gradient in (
         ("max", [7.0], [0.0, 0.0, 1.0, 0.0, 1.0, 0.0]),
         ("min", [1.0], [1.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
     ):
-        traced = nabla.trace_tensor(
+        traced = quabla.trace_tensor(
             lambda x: getattr(x, operation)(axis=1).sum(), [("x", [2, 3])]
         )
         value, gradients = traced.graph.evaluate_value_and_vjp(
@@ -2282,12 +2282,12 @@ def test_trace_tensor_reduction_extrema_choose_last_tied_coordinate_for_gradient
         ).to_flat_list() == expected_gradient
 
         cpu_gradient = symbolic.output.compile_cpu().evaluate(symbolic_inputs)
-        if os.environ.get("NABLA_MLX_TEST") is not None:
+        if os.environ.get("QUABLA_MLX_TEST") is not None:
             mlx_gradient = symbolic.output.compile_mlx().evaluate(symbolic_inputs)
             assert_close_rows(
                 [mlx_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
             )
-        if os.environ.get("NABLA_CUDA_TEST") is not None:
+        if os.environ.get("QUABLA_CUDA_TEST") is not None:
             cuda_gradient = symbolic.output.compile_cuda().evaluate(symbolic_inputs)
             assert_close_rows(
                 [cuda_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
@@ -2295,43 +2295,43 @@ def test_trace_tensor_reduction_extrema_choose_last_tied_coordinate_for_gradient
 
 
 def test_trace_tensor_gather_and_scatter_add_preserve_repeated_index_gradients():
-    gather = nabla.trace_tensor(
+    gather = quabla.trace_tensor(
         lambda x: x.gather([2, 0, 2], axis=1).sum(), [("x", [2, 3])]
     )
-    gather_inputs = {"x": nabla.Tensor([2, 3], [0.0] * 6)}
+    gather_inputs = {"x": quabla.Tensor([2, 3], [0.0] * 6)}
     _, gather_gradients = gather.graph.evaluate_value_and_vjp(
-        gather.output.node_id, gather_inputs, nabla.Tensor([], [1.0])
+        gather.output.node_id, gather_inputs, quabla.Tensor([], [1.0])
     )
     assert gather_gradients["x"].to_flat_list() == [1.0, 0.0, 2.0, 1.0, 0.0, 2.0]
 
-    scatter = nabla.trace_tensor(
+    scatter = quabla.trace_tensor(
         lambda base, updates, weight: (base.scatter_add([1, 1, 0], updates, axis=1) * weight).sum(),
         [("base", [1, 3]), ("updates", [1, 3]), ("weight", [1, 3])],
     )
     scatter_inputs = {
-        "base": nabla.Tensor.zeros([1, 3]),
-        "updates": nabla.Tensor([1, 3], [2.0, 3.0, 5.0]),
-        "weight": nabla.Tensor([1, 3], [1.0, 2.0, 4.0]),
+        "base": quabla.Tensor.zeros([1, 3]),
+        "updates": quabla.Tensor([1, 3], [2.0, 3.0, 5.0]),
+        "weight": quabla.Tensor([1, 3], [1.0, 2.0, 4.0]),
     }
     _, scatter_gradients = scatter.graph.evaluate_value_and_vjp(
-        scatter.output.node_id, scatter_inputs, nabla.Tensor([], [1.0])
+        scatter.output.node_id, scatter_inputs, quabla.Tensor([], [1.0])
     )
     assert scatter_gradients["base"].to_flat_list() == [1.0, 2.0, 4.0]
     assert scatter_gradients["updates"].to_flat_list() == [2.0, 2.0, 1.0]
 
     symbolic = scatter.symbolic_vjp("loss_cotangent")["updates"]
-    symbolic_inputs = {**scatter_inputs, "loss_cotangent": nabla.Tensor([], [1.0])}
+    symbolic_inputs = {**scatter_inputs, "loss_cotangent": quabla.Tensor([], [1.0])}
     assert symbolic.graph.evaluate(
         symbolic.output.node_id, symbolic_inputs
     ).to_flat_list() == [2.0, 2.0, 1.0]
 
     cpu_gradient = symbolic.output.compile_cpu().evaluate(symbolic_inputs)
-    if os.environ.get("NABLA_MLX_TEST") is not None:
+    if os.environ.get("QUABLA_MLX_TEST") is not None:
         mlx_gradient = symbolic.output.compile_mlx().evaluate(symbolic_inputs)
         assert_close_rows(
             [mlx_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
         )
-    if os.environ.get("NABLA_CUDA_TEST") is not None:
+    if os.environ.get("QUABLA_CUDA_TEST") is not None:
         cuda_gradient = symbolic.output.compile_cuda().evaluate(symbolic_inputs)
         assert_close_rows(
             [cuda_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
@@ -2339,30 +2339,30 @@ def test_trace_tensor_gather_and_scatter_add_preserve_repeated_index_gradients()
 
 
 def test_trace_tensor_einsum_scoped_matmul_subset_preserves_backend_ad():
-    traced = nabla.trace_tensor(
-        lambda left, right: nabla.einsum("ij,jk->ik", [left, right]).sum(),
+    traced = quabla.trace_tensor(
+        lambda left, right: quabla.einsum("ij,jk->ik", [left, right]).sum(),
         [("left", [2, 2]), ("right", [2, 2])],
     )
     inputs = {
-        "left": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
-        "right": nabla.Tensor([2, 2], [1.0, 0.0, 2.0, 1.0]),
+        "left": quabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+        "right": quabla.Tensor([2, 2], [1.0, 0.0, 2.0, 1.0]),
     }
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     assert gradients["left"].to_flat_list() == [1.0, 3.0, 1.0, 3.0]
     assert gradients["right"].to_flat_list() == [4.0, 4.0, 6.0, 6.0]
 
     symbolic = traced.symbolic_vjp("loss_cotangent")["left"]
-    symbolic_inputs = {**inputs, "loss_cotangent": nabla.Tensor([], [1.0])}
+    symbolic_inputs = {**inputs, "loss_cotangent": quabla.Tensor([], [1.0])}
     cpu_gradient = symbolic.output.compile_cpu().evaluate(symbolic_inputs)
     assert cpu_gradient.to_flat_list() == gradients["left"].to_flat_list()
-    if os.environ.get("NABLA_MLX_TEST") is not None:
+    if os.environ.get("QUABLA_MLX_TEST") is not None:
         mlx_gradient = symbolic.output.compile_mlx().evaluate(symbolic_inputs)
         assert_close_rows(
             [mlx_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
         )
-    if os.environ.get("NABLA_CUDA_TEST") is not None:
+    if os.environ.get("QUABLA_CUDA_TEST") is not None:
         cuda_gradient = symbolic.output.compile_cuda().evaluate(symbolic_inputs)
         assert_close_rows(
             [cuda_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
@@ -2372,21 +2372,21 @@ def test_trace_tensor_einsum_scoped_matmul_subset_preserves_backend_ad():
 def test_trace_tensor_where_routes_gradients_and_masks_condition_derivatives():
     def loss(x):
         condition = x.gt(0.0)
-        return nabla.where(condition, x.powi(2), x * 3.0).sum()
+        return quabla.where(condition, x.powi(2), x * 3.0).sum()
 
-    traced = nabla.trace_tensor(loss, [("x", [4])])
-    inputs = {"x": nabla.Tensor([4], [-2.0, -1.0, 0.0, 2.0])}
+    traced = quabla.trace_tensor(loss, [("x", [4])])
+    inputs = {"x": quabla.Tensor([4], [-2.0, -1.0, 0.0, 2.0])}
     value, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([4], [1.0] * 4)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([4], [1.0] * 4)}
     )
     transformed = traced.symbolic_jvp("x")
     transformed_value = transformed.graph.evaluate(transformed.output.node_id, inputs)
     plan = traced.output.compile_cpu()
     plan_value, plan_gradients = plan.evaluate_value_and_vjp(
-        inputs, nabla.Tensor([], [1.0])
+        inputs, quabla.Tensor([], [1.0])
     )
 
     assert value.to_flat_list() == [-5.0]
@@ -2398,18 +2398,18 @@ def test_trace_tensor_where_routes_gradients_and_masks_condition_derivatives():
 
 
 def test_tensor_cpu_plan_data_parallel_value_and_grad_matches_single_plan():
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, target, weight: ((x * weight - target).powi(2)).mean(),
         [("x", [4, 1]), ("target", [4, 1]), ("weight", [1, 1])],
     )
     plan = traced.output.compile_cpu()
     inputs = {
-        "x": nabla.Tensor([4, 1], [-2.0, -1.0, 1.0, 2.0]),
-        "target": nabla.Tensor([4, 1], [-3.0, -1.0, 3.0, 5.0]),
-        "weight": nabla.Tensor([1, 1], [0.5]),
+        "x": quabla.Tensor([4, 1], [-2.0, -1.0, 1.0, 2.0]),
+        "target": quabla.Tensor([4, 1], [-3.0, -1.0, 3.0, 5.0]),
+        "weight": quabla.Tensor([1, 1], [0.5]),
     }
     single_value, single_gradients = plan.evaluate_value_and_vjp(
-        inputs, nabla.Tensor([], [1.0])
+        inputs, quabla.Tensor([], [1.0])
     )
     parallel_value, parallel_gradients = plan.value_and_grad_data_parallel(
         inputs, ["x", "target"], 2, "mean"
@@ -2423,7 +2423,7 @@ def test_tensor_cpu_plan_data_parallel_value_and_grad_matches_single_plan():
 
 def test_tensor_cuda_data_parallel_constructor_rejects_unavailable_collective_runtime():
     try:
-        nabla.tensor_value_and_grad_data_parallel_cuda_fn(
+        quabla.tensor_value_and_grad_data_parallel_cuda_fn(
             lambda x, weight: ((x * weight).powi(2)).mean(),
             [("x", [4, 1]), ("weight", [1, 1])],
             ["weight"],
@@ -2442,15 +2442,15 @@ def test_tensor_cuda_data_parallel_constructor_rejects_unavailable_collective_ru
 
 
 def test_trace_tensor_maximum_and_minimum_route_tie_gradients_to_rhs():
-    left = nabla.Tensor([3], [2.0, 3.0, 0.0])
-    right = nabla.Tensor([3], [2.0, 1.0, 4.0])
-    cotangent = nabla.Tensor([], [1.0])
+    left = quabla.Tensor([3], [2.0, 3.0, 0.0])
+    right = quabla.Tensor([3], [2.0, 1.0, 4.0])
+    cotangent = quabla.Tensor([], [1.0])
 
     for operation, expected_value, expected_left, expected_right in (
         ("maximum", [2.0, 3.0, 4.0], [0.0, 1.0, 0.0], [1.0, 0.0, 1.0]),
         ("minimum", [2.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 0.0]),
     ):
-        traced = nabla.trace_tensor(
+        traced = quabla.trace_tensor(
             lambda x, y: getattr(x, operation)(y).sum(),
             [("x", [3]), ("y", [3])],
         )
@@ -2472,10 +2472,10 @@ def test_trace_tensor_maximum_and_minimum_route_tie_gradients_to_rhs():
         ).to_flat_list() == expected_right
 
         cpu = traced.output.compile_cpu().evaluate(inputs)
-        if os.environ.get("NABLA_MLX_TEST") is not None:
+        if os.environ.get("QUABLA_MLX_TEST") is not None:
             mlx = traced.output.compile_mlx().evaluate(inputs)
             assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
-        if os.environ.get("NABLA_CUDA_TEST") is not None:
+        if os.environ.get("QUABLA_CUDA_TEST") is not None:
             cuda = traced.output.compile_cuda().evaluate(inputs)
             assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
@@ -2485,13 +2485,13 @@ def test_trace_tensor_log_supports_jvp_and_vjp():
         return x.log().sum()
 
     values = [1.0, 2.0, 3.0, 4.0]
-    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
-    inputs = {"x": nabla.Tensor([2, 2], values)}
+    traced = quabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": quabla.Tensor([2, 2], values)}
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 2], [1.0] * 4)}
     )
 
     expected = [1.0 / value for value in values]
@@ -2504,20 +2504,20 @@ def test_trace_tensor_cos_supports_jvp_and_vjp():
         return x.cos().sum()
 
     values = [0.0, 1.0, -1.0, 0.5]
-    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
-    inputs = {"x": nabla.Tensor([2, 2], values)}
+    traced = quabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": quabla.Tensor([2, 2], values)}
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 2], [1.0] * 4)}
     )
     hessian = traced.graph.hessian_scalar(traced.output.node_id, "x", inputs)
     hvp = traced.graph.hvp_scalar(
         traced.output.node_id,
         "x",
         inputs,
-        nabla.Tensor([2, 2], [1.0, 2.0, -1.0, 0.5]),
+        quabla.Tensor([2, 2], [1.0, 2.0, -1.0, 0.5]),
     )
 
     expected = [-math.sin(value) for value in values]
@@ -2542,13 +2542,13 @@ def test_trace_tensor_powi_supports_second_order_ad():
         return x.powi(3).sum()
 
     values = [0.0, 1.0, -2.0, 0.5]
-    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
-    inputs = {"x": nabla.Tensor([2, 2], values)}
+    traced = quabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": quabla.Tensor([2, 2], values)}
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 2], [1.0] * 4)}
     )
     hessian = traced.graph.hessian_scalar(traced.output.node_id, "x", inputs)
 
@@ -2570,13 +2570,13 @@ def test_trace_tensor_axis_reductions_support_ad():
         return x.mean(axis=0).powi(2).sum()
 
     values = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-    traced = nabla.trace_tensor(loss, [("x", [2, 3])])
-    inputs = {"x": nabla.Tensor([2, 3], values)}
+    traced = quabla.trace_tensor(loss, [("x", [2, 3])])
+    inputs = {"x": quabla.Tensor([2, 3], values)}
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 3], [1.0] * 6)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 3], [1.0] * 6)}
     )
     hessian = traced.graph.hessian_scalar(traced.output.node_id, "x", inputs)
 
@@ -2591,28 +2591,28 @@ def test_trace_tensor_axis_reductions_support_ad():
         ],
     )
 
-    output = nabla.trace_tensor(lambda x: x.sum(axis=1), [("x", [2, 3])])
+    output = quabla.trace_tensor(lambda x: x.sum(axis=1), [("x", [2, 3])])
     value, output_tangent = output.graph.evaluate_jvp(
         output.output.node_id,
         inputs,
-        {"x": nabla.Tensor([2, 3], [1.0] * 6)},
+        {"x": quabla.Tensor([2, 3], [1.0] * 6)},
     )
     _, output_gradients = output.graph.evaluate_value_and_vjp(
-        output.output.node_id, inputs, nabla.Tensor([2], [2.0, 3.0])
+        output.output.node_id, inputs, quabla.Tensor([2], [2.0, 3.0])
     )
     assert value.shape == [2]
     assert value.to_flat_list() == [6.0, 15.0]
     assert output_tangent.to_flat_list() == [3.0, 3.0]
     assert output_gradients["x"].to_flat_list() == [2.0, 2.0, 2.0, 3.0, 3.0, 3.0]
 
-    multi_axis = nabla.trace_tensor(
+    multi_axis = quabla.trace_tensor(
         lambda x: x.mean(axis=[0, 2], keepdims=True), [("x", [2, 3, 2])]
     )
-    multi_inputs = {"x": nabla.Tensor([2, 3, 2], [float(value) for value in range(1, 13)])}
+    multi_inputs = {"x": quabla.Tensor([2, 3, 2], [float(value) for value in range(1, 13)])}
     multi_value, multi_gradients = multi_axis.graph.evaluate_value_and_vjp(
         multi_axis.output.node_id,
         multi_inputs,
-        nabla.Tensor([1, 3, 1], [2.0, 3.0, 4.0]),
+        quabla.Tensor([1, 3, 1], [2.0, 3.0, 4.0]),
     )
     assert multi_value.shape == [1, 3, 1]
     assert multi_value.to_flat_list() == [4.5, 6.5, 8.5]
@@ -2631,7 +2631,7 @@ def test_trace_tensor_axis_reductions_support_ad():
         1.0,
     ]
 
-    last_axis = nabla.trace_tensor(lambda x: x.mean(axis=-1), [("x", [2, 3])])
+    last_axis = quabla.trace_tensor(lambda x: x.mean(axis=-1), [("x", [2, 3])])
     last_axis_value = last_axis.graph.evaluate(last_axis.output.node_id, inputs)
     assert last_axis_value.shape == [2]
     assert last_axis_value.to_flat_list() == [2.0, 5.0]
@@ -2642,20 +2642,20 @@ def test_trace_tensor_transpose_supports_rank_n_ad():
         return x.transpose([2, 0, 1]).powi(2).sum()
 
     values = [float(value) for value in range(1, 13)]
-    traced = nabla.trace_tensor(loss, [("x", [2, 2, 3])])
-    inputs = {"x": nabla.Tensor([2, 2, 3], values)}
+    traced = quabla.trace_tensor(loss, [("x", [2, 2, 3])])
+    inputs = {"x": quabla.Tensor([2, 2, 3], values)}
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2, 3], [1.0] * 12)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 2, 3], [1.0] * 12)}
     )
 
     expected = [2.0 * value for value in values]
     assert_close_rows([gradients["x"].to_flat_list()], [expected])
     assert abs(tangent.to_flat_list()[0] - sum(expected)) <= 1e-12
 
-    output = nabla.trace_tensor(lambda x: x.transpose(), [("x", [2, 2, 3])])
+    output = quabla.trace_tensor(lambda x: x.transpose(), [("x", [2, 2, 3])])
     value = output.graph.evaluate(output.output.node_id, inputs)
     assert value.shape == [3, 2, 2]
     assert value.to_flat_list() == [1.0, 7.0, 4.0, 10.0, 2.0, 8.0, 5.0, 11.0, 3.0, 9.0, 6.0, 12.0]
@@ -2666,13 +2666,13 @@ def test_trace_tensor_reshape_supports_jvp_and_vjp():
         return x.reshape([4]).exp().sum()
 
     values = [0.0, 1.0, -1.0, 0.5]
-    traced = nabla.trace_tensor(loss, [("x", [2, 2])])
-    inputs = {"x": nabla.Tensor([2, 2], values)}
+    traced = quabla.trace_tensor(loss, [("x", [2, 2])])
+    inputs = {"x": quabla.Tensor([2, 2], values)}
     _, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
-        traced.output.node_id, inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)}
+        traced.output.node_id, inputs, {"x": quabla.Tensor([2, 2], [1.0] * 4)}
     )
 
     expected = [math.exp(value) for value in values]
@@ -2682,32 +2682,32 @@ def test_trace_tensor_reshape_supports_jvp_and_vjp():
 
 
 def test_tensor_grad_scalar_fn_reuses_a_compiled_plan():
-    gradient = nabla.tensor_grad_scalar_fn(
+    gradient = quabla.tensor_grad_scalar_fn(
         lambda x: (2.0 * x).sum(), [("x", [2, 2])]
     )
 
-    first = gradient({"x": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])})
-    second = gradient({"x": nabla.Tensor([2, 2], [5.0, 6.0, 7.0, 8.0])})
+    first = gradient({"x": quabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])})
+    second = gradient({"x": quabla.Tensor([2, 2], [5.0, 6.0, 7.0, 8.0])})
 
     assert first["x"].to_flat_list() == [2.0] * 4
     assert second["x"].to_flat_list() == [2.0] * 4
 
 
 def test_tensor_value_and_grad_fn_returns_scalar_value_and_gradients():
-    value_and_grad = nabla.tensor_value_and_grad_fn(
+    value_and_grad = quabla.tensor_value_and_grad_fn(
         lambda x, scale: ((x * scale).sin()).sum(),
         [("x", [2, 2]), ("scale", [])],
     )
     first_value, first_gradients = value_and_grad(
         {
-            "x": nabla.Tensor([2, 2], [0.0, 0.5, 1.0, -0.25]),
-            "scale": nabla.Tensor([], [2.0]),
+            "x": quabla.Tensor([2, 2], [0.0, 0.5, 1.0, -0.25]),
+            "scale": quabla.Tensor([], [2.0]),
         }
     )
     second_value, second_gradients = value_and_grad(
         {
-            "x": nabla.Tensor([2, 2], [0.0, 0.5, 1.0, -0.25]),
-            "scale": nabla.Tensor([], [1.0]),
+            "x": quabla.Tensor([2, 2], [0.0, 0.5, 1.0, -0.25]),
+            "scale": quabla.Tensor([], [1.0]),
         }
     )
 
@@ -2729,18 +2729,18 @@ def test_tensor_value_and_grad_fn_returns_scalar_value_and_gradients():
 
 
 def test_tensor_hessian_and_hvp_scalar_fn_reuse_a_compiled_plan():
-    hessian = nabla.tensor_hessian_scalar_fn(
+    hessian = quabla.tensor_hessian_scalar_fn(
         lambda x: x.powi(3).sum(), [("x", [2, 2])], "x"
     )
-    hvp = nabla.tensor_hvp_scalar_fn(
+    hvp = quabla.tensor_hvp_scalar_fn(
         lambda x: x.powi(3).sum(), [("x", [2, 2])], "x"
     )
     values = [0.5, -1.0, 2.0, 0.25]
     direction = [1.0, 2.0, -0.5, 3.0]
-    inputs = {"x": nabla.Tensor([2, 2], values)}
+    inputs = {"x": quabla.Tensor([2, 2], values)}
 
     actual_hessian = hessian(inputs)
-    actual_hvp = hvp(inputs, nabla.Tensor([2, 2], direction))
+    actual_hvp = hvp(inputs, quabla.Tensor([2, 2], direction))
 
     assert len(actual_hessian) == len(values)
     for row, value in enumerate(values):
@@ -2755,7 +2755,7 @@ def test_tensor_hessian_and_hvp_scalar_fn_reuse_a_compiled_plan():
 
 def test_tensor_hessian_and_hvp_scalar_fn_support_fixed_fori_regions():
     def loop_loss(initial, scale):
-        return nabla.tensor_fori_loop_region(
+        return quabla.tensor_fori_loop_region(
             0,
             3,
             lambda index, carry, captured_scale: carry * captured_scale + index,
@@ -2763,24 +2763,24 @@ def test_tensor_hessian_and_hvp_scalar_fn_support_fixed_fori_regions():
             [scale],
         )
 
-    hessian = nabla.tensor_hessian_scalar_fn(
+    hessian = quabla.tensor_hessian_scalar_fn(
         loop_loss, [("initial", []), ("scale", [])], "scale"
     )
-    hvp = nabla.tensor_hvp_scalar_fn(
+    hvp = quabla.tensor_hvp_scalar_fn(
         loop_loss, [("initial", []), ("scale", [])], "scale"
     )
     inputs = {
-        "initial": nabla.Tensor([], [1.0]),
-        "scale": nabla.Tensor([], [2.0]),
+        "initial": quabla.Tensor([], [1.0]),
+        "scale": quabla.Tensor([], [2.0]),
     }
 
     assert hessian(inputs) == [[12.0]]
-    assert hvp(inputs, nabla.Tensor([], [3.0])).to_flat_list() == [36.0]
+    assert hvp(inputs, quabla.Tensor([], [3.0])).to_flat_list() == [36.0]
 
 
 def test_tensor_hvp_scalar_fn_supports_nonlinear_scan_regions():
     def scan_loss(initial, scale):
-        carry, outputs = nabla.tensor_scan_region(
+        carry, outputs = quabla.tensor_scan_region(
             0,
             3,
             lambda index, current, captured_scale: (
@@ -2792,21 +2792,21 @@ def test_tensor_hvp_scalar_fn_supports_nonlinear_scan_regions():
         )
         return carry + outputs.sum()
 
-    traced = nabla.trace_tensor(scan_loss, [("initial", []), ("scale", [])])
-    hvp = nabla.tensor_hvp_scalar_fn(
+    traced = quabla.trace_tensor(scan_loss, [("initial", []), ("scale", [])])
+    hvp = quabla.tensor_hvp_scalar_fn(
         scan_loss, [("initial", []), ("scale", [])], "scale"
     )
     inputs = {
-        "initial": nabla.Tensor([], [0.4]),
-        "scale": nabla.Tensor([], [0.8]),
+        "initial": quabla.Tensor([], [0.4]),
+        "scale": quabla.Tensor([], [0.8]),
     }
-    actual = hvp(inputs, nabla.Tensor([], [1.0])).to_flat_list()[0]
+    actual = hvp(inputs, quabla.Tensor([], [1.0])).to_flat_list()[0]
     step = 1e-4
 
     def evaluate(scale):
         return traced.graph.evaluate(
             traced.output.node_id,
-            {"initial": nabla.Tensor([], [0.4]), "scale": nabla.Tensor([], [scale])},
+            {"initial": quabla.Tensor([], [0.4]), "scale": quabla.Tensor([], [scale])},
         ).to_flat_list()[0]
 
     expected = (evaluate(0.8 + step) - 2.0 * evaluate(0.8) + evaluate(0.8 - step)) / (step * step)
@@ -2814,21 +2814,21 @@ def test_tensor_hvp_scalar_fn_supports_nonlinear_scan_regions():
 
 
 def test_tensor_jit_fn_reuses_a_compiled_plan():
-    compiled = nabla.tensor_jit_fn(
+    compiled = quabla.tensor_jit_fn(
         lambda x, y: (x.matmul(y)).tanh(),
         [("x", [2, 2]), ("y", [2, 2])],
     )
 
     first = compiled(
         {
-            "x": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
-            "y": nabla.Tensor([2, 2], [1.0, 0.0, 0.0, 1.0]),
+            "x": quabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+            "y": quabla.Tensor([2, 2], [1.0, 0.0, 0.0, 1.0]),
         }
     )
     second = compiled(
         {
-            "x": nabla.Tensor([2, 2], [0.0, 1.0, -1.0, 0.5]),
-            "y": nabla.Tensor([2, 2], [2.0, 0.0, 0.0, 2.0]),
+            "x": quabla.Tensor([2, 2], [0.0, 1.0, -1.0, 0.5]),
+            "y": quabla.Tensor([2, 2], [2.0, 0.0, 0.0, 2.0]),
         }
     )
 
@@ -2849,34 +2849,34 @@ def test_trace_tensor_rejects_data_dependent_python_branches():
         return x * -1.0
 
     try:
-        nabla.trace_tensor(model, [("x", [1])])
+        quabla.trace_tensor(model, [("x", [1])])
         assert False, "expected traced Python branch rejection"
     except TypeError as error:
         assert "cannot drive Python control flow" in str(error)
 
 
 def test_tensor_fori_loop_unrolls_differentiable_carry():
-    traced = nabla.trace_tensor(
-        lambda x: nabla.tensor_fori_loop(0, 3, lambda _, carry: carry * x, x),
+    traced = quabla.trace_tensor(
+        lambda x: quabla.tensor_fori_loop(0, 3, lambda _, carry: carry * x, x),
         [("x", [1])],
     )
-    inputs = {"x": nabla.Tensor([1], [2.0])}
+    inputs = {"x": quabla.Tensor([1], [2.0])}
     value, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([1], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([1], [1.0])
     )
 
     assert value.to_flat_list() == [16.0]
     assert gradients["x"].to_flat_list() == [32.0]
     try:
-        nabla.tensor_fori_loop(2, 1, lambda _, carry: carry, traced.output)
+        quabla.tensor_fori_loop(2, 1, lambda _, carry: carry, traced.output)
         assert False, "expected invalid loop bounds"
     except ValueError as error:
         assert "upper >= lower" in str(error)
 
 
 def test_tensor_fori_loop_region_traces_once_and_differentiates_parent_inputs():
-    traced = nabla.trace_tensor(
-        lambda initial, scale: nabla.tensor_fori_loop_region(
+    traced = quabla.trace_tensor(
+        lambda initial, scale: quabla.tensor_fori_loop_region(
             0,
             3,
             lambda index, carry, captured_scale: carry * captured_scale + index,
@@ -2886,18 +2886,18 @@ def test_tensor_fori_loop_region_traces_once_and_differentiates_parent_inputs():
         [("initial", [1]), ("scale", [1])],
     )
     inputs = {
-        "initial": nabla.Tensor([1], [1.0]),
-        "scale": nabla.Tensor([1], [2.0]),
+        "initial": quabla.Tensor([1], [1.0]),
+        "scale": quabla.Tensor([1], [2.0]),
     }
     value, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
         traced.output.node_id,
         inputs,
         {
-            "initial": nabla.Tensor([1], [1.0]),
-            "scale": nabla.Tensor([1], [0.0]),
+            "initial": quabla.Tensor([1], [1.0]),
+            "scale": quabla.Tensor([1], [0.0]),
         },
     )
 
@@ -2908,8 +2908,8 @@ def test_tensor_fori_loop_region_traces_once_and_differentiates_parent_inputs():
 
 
 def test_tensor_fori_loop_region_supports_symbolic_jvp():
-    traced = nabla.trace_tensor(
-        lambda initial, scale: nabla.tensor_fori_loop_region(
+    traced = quabla.trace_tensor(
+        lambda initial, scale: quabla.tensor_fori_loop_region(
             0,
             3,
             lambda index, carry, captured_scale: carry * captured_scale + index,
@@ -2922,16 +2922,16 @@ def test_tensor_fori_loop_region_supports_symbolic_jvp():
     value = tangent.graph.evaluate(
         tangent.output.node_id,
         {
-            "initial": nabla.Tensor([], [1.0]),
-            "scale": nabla.Tensor([], [2.0]),
+            "initial": quabla.Tensor([], [1.0]),
+            "scale": quabla.Tensor([], [2.0]),
         },
     )
     assert value.to_flat_list() == [8.0]
 
 
 def test_tensor_fori_loop_region_supports_symbolic_vjp():
-    traced = nabla.trace_tensor(
-        lambda initial, scale: nabla.tensor_fori_loop_region(
+    traced = quabla.trace_tensor(
+        lambda initial, scale: quabla.tensor_fori_loop_region(
             0,
             3,
             lambda index, carry, captured_scale: carry * captured_scale + index,
@@ -2942,9 +2942,9 @@ def test_tensor_fori_loop_region_supports_symbolic_vjp():
     )
     gradients = traced.symbolic_vjp("seed")
     inputs = {
-        "initial": nabla.Tensor([], [1.0]),
-        "scale": nabla.Tensor([], [2.0]),
-        "seed": nabla.Tensor([], [1.0]),
+        "initial": quabla.Tensor([], [1.0]),
+        "scale": quabla.Tensor([], [2.0]),
+        "seed": quabla.Tensor([], [1.0]),
     }
     assert (
         gradients["initial"].graph.evaluate(gradients["initial"].output.node_id, inputs).to_flat_list()
@@ -2957,21 +2957,21 @@ def test_tensor_fori_loop_region_supports_symbolic_vjp():
 
 
 def test_tensor_scan_unrolls_differentiable_outputs():
-    traced = nabla.trace_tensor(
-        lambda x: nabla.tensor_scan(3, lambda _, carry: (carry * x, carry * x), x)[1].sum(),
+    traced = quabla.trace_tensor(
+        lambda x: quabla.tensor_scan(3, lambda _, carry: (carry * x, carry * x), x)[1].sum(),
         [("x", [1])],
     )
     _, gradients = traced.graph.evaluate_value_and_vjp(
         traced.output.node_id,
-        {"x": nabla.Tensor([1], [2.0])},
-        nabla.Tensor([], [1.0]),
+        {"x": quabla.Tensor([1], [2.0])},
+        quabla.Tensor([], [1.0]),
     )
     assert gradients["x"].to_flat_list() == [48.0]
 
 
 def test_tensor_scan_region_traces_once_and_differentiates_carry_and_outputs():
     def scan_total(initial, scale):
-        carry, outputs = nabla.tensor_scan_region(
+        carry, outputs = quabla.tensor_scan_region(
             0,
             3,
             lambda index, current, captured_scale: (
@@ -2983,20 +2983,20 @@ def test_tensor_scan_region_traces_once_and_differentiates_carry_and_outputs():
         )
         return carry.sum() + outputs.sum()
 
-    traced = nabla.trace_tensor(scan_total, [("initial", [1]), ("scale", [1])])
+    traced = quabla.trace_tensor(scan_total, [("initial", [1]), ("scale", [1])])
     inputs = {
-        "initial": nabla.Tensor([1], [1.0]),
-        "scale": nabla.Tensor([1], [2.0]),
+        "initial": quabla.Tensor([1], [1.0]),
+        "scale": quabla.Tensor([1], [2.0]),
     }
     value, gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, inputs, quabla.Tensor([], [1.0])
     )
     _, tangent = traced.graph.evaluate_jvp(
         traced.output.node_id,
         inputs,
         {
-            "initial": nabla.Tensor([1], [0.0]),
-            "scale": nabla.Tensor([1], [1.0]),
+            "initial": quabla.Tensor([1], [0.0]),
+            "scale": quabla.Tensor([1], [1.0]),
         },
     )
 
@@ -3008,7 +3008,7 @@ def test_tensor_scan_region_traces_once_and_differentiates_carry_and_outputs():
 
 def test_tensor_scan_region_supports_symbolic_jvp():
     def scan_total(initial, scale):
-        carry, outputs = nabla.tensor_scan_region(
+        carry, outputs = quabla.tensor_scan_region(
             0,
             3,
             lambda index, current, captured_scale: (
@@ -3020,13 +3020,13 @@ def test_tensor_scan_region_supports_symbolic_jvp():
         )
         return carry.sum() + outputs.sum()
 
-    traced = nabla.trace_tensor(scan_total, [("initial", []), ("scale", [])])
+    traced = quabla.trace_tensor(scan_total, [("initial", []), ("scale", [])])
     tangent = traced.symbolic_jvp("initial")
     value = tangent.graph.evaluate(
         tangent.output.node_id,
         {
-            "initial": nabla.Tensor([], [1.0]),
-            "scale": nabla.Tensor([], [2.0]),
+            "initial": quabla.Tensor([], [1.0]),
+            "scale": quabla.Tensor([], [2.0]),
         },
     )
     assert value.to_flat_list() == [22.0]
@@ -3034,7 +3034,7 @@ def test_tensor_scan_region_supports_symbolic_jvp():
 
 def test_tensor_scan_region_supports_symbolic_vjp():
     def scan_total(initial, scale):
-        carry, outputs = nabla.tensor_scan_region(
+        carry, outputs = quabla.tensor_scan_region(
             0,
             3,
             lambda index, current, captured_scale: (
@@ -3046,12 +3046,12 @@ def test_tensor_scan_region_supports_symbolic_vjp():
         )
         return carry.sum() + outputs.sum()
 
-    traced = nabla.trace_tensor(scan_total, [("initial", []), ("scale", [])])
+    traced = quabla.trace_tensor(scan_total, [("initial", []), ("scale", [])])
     gradients = traced.symbolic_vjp("seed")
     inputs = {
-        "initial": nabla.Tensor([], [1.0]),
-        "scale": nabla.Tensor([], [2.0]),
-        "seed": nabla.Tensor([], [1.0]),
+        "initial": quabla.Tensor([], [1.0]),
+        "scale": quabla.Tensor([], [2.0]),
+        "seed": quabla.Tensor([], [1.0]),
     }
     assert (
         gradients["initial"].graph.evaluate(gradients["initial"].output.node_id, inputs).to_flat_list()
@@ -3064,12 +3064,12 @@ def test_tensor_scan_region_supports_symbolic_vjp():
 
 
 def test_tensor_cond_fn_only_executes_selected_branch():
-    condition = nabla.tensor_cond_fn(
+    condition = quabla.tensor_cond_fn(
         lambda x: x.log(),
         lambda x: x * 2.0,
         [("x", [1])],
     )
-    negative = {"x": nabla.Tensor([1], [-2.0])}
+    negative = {"x": quabla.Tensor([1], [-2.0])}
     assert condition(False, negative).to_flat_list() == [-4.0]
     try:
         condition(True, negative)
@@ -3078,19 +3078,19 @@ def test_tensor_cond_fn_only_executes_selected_branch():
         assert "log" in str(error)
 
     try:
-        nabla.tensor_cond_fn(lambda x: x, lambda x: x.sum(), [("x", [1])])
+        quabla.tensor_cond_fn(lambda x: x, lambda x: x.sum(), [("x", [1])])
         assert False, "expected mismatched branch output shapes"
     except ValueError as error:
         assert "branch output shapes differ" in str(error)
 
 
 def test_tensor_cond_value_and_grad_selects_matching_branch_vjp():
-    condition = nabla.tensor_cond_value_and_grad_fn(
+    condition = quabla.tensor_cond_value_and_grad_fn(
         lambda x: (x * x).sum(),
         lambda x: x.powi(3).sum(),
         [("x", [1])],
     )
-    values = {"x": nabla.Tensor([1], [3.0])}
+    values = {"x": quabla.Tensor([1], [3.0])}
     true_value, true_gradients = condition(True, values)
     false_value, false_gradients = condition(False, values)
     assert true_value.to_flat_list() == [9.0]
@@ -3100,13 +3100,13 @@ def test_tensor_cond_value_and_grad_selects_matching_branch_vjp():
 
 
 def test_tensor_cond_jvp_selects_matching_branch_direction():
-    condition = nabla.tensor_cond_jvp_fn(
+    condition = quabla.tensor_cond_jvp_fn(
         lambda x: x * x,
         lambda x: x.powi(3),
         [("x", [1])],
     )
-    values = {"x": nabla.Tensor([1], [3.0])}
-    tangents = {"x": nabla.Tensor([1], [2.0])}
+    values = {"x": quabla.Tensor([1], [3.0])}
+    tangents = {"x": quabla.Tensor([1], [2.0])}
     true_value, true_tangent = condition(True, values, tangents)
     false_value, false_tangent = condition(False, values, tangents)
     assert true_value.to_flat_list() == [9.0]
@@ -3116,8 +3116,8 @@ def test_tensor_cond_jvp_selects_matching_branch_direction():
 
 
 def test_tensor_cond_traces_a_lazy_tensor_predicate_with_explicit_captures():
-    traced = nabla.trace_tensor(
-        lambda predicate, x: nabla.tensor_cond(
+    traced = quabla.trace_tensor(
+        lambda predicate, x: quabla.tensor_cond(
             predicate,
             lambda captured: captured * captured,
             lambda captured: captured * 3.0,
@@ -3126,32 +3126,32 @@ def test_tensor_cond_traces_a_lazy_tensor_predicate_with_explicit_captures():
         [("predicate", []), ("x", [])],
     )
     true_inputs = {
-        "predicate": nabla.Tensor([], [1.0]),
-        "x": nabla.Tensor([], [2.0]),
+        "predicate": quabla.Tensor([], [1.0]),
+        "x": quabla.Tensor([], [2.0]),
     }
     true_value, true_gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, true_inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, true_inputs, quabla.Tensor([], [1.0])
     )
     assert true_value.to_flat_list() == [16.0]
     assert true_gradients["x"].to_flat_list() == [16.0]
     assert true_gradients["predicate"].to_flat_list() == [0.0]
 
     false_inputs = {
-        "predicate": nabla.Tensor([], [0.0]),
-        "x": nabla.Tensor([], [2.0]),
+        "predicate": quabla.Tensor([], [0.0]),
+        "x": quabla.Tensor([], [2.0]),
     }
     false_value, false_gradients = traced.graph.evaluate_value_and_vjp(
-        traced.output.node_id, false_inputs, nabla.Tensor([], [1.0])
+        traced.output.node_id, false_inputs, quabla.Tensor([], [1.0])
     )
     assert false_value.to_flat_list() == [12.0]
     assert false_gradients["x"].to_flat_list() == [6.0]
 
 
 def test_tensor_cond_supports_nested_tensor_predicates():
-    traced = nabla.trace_tensor(
-        lambda outer, inner, x: nabla.tensor_cond(
+    traced = quabla.trace_tensor(
+        lambda outer, inner, x: quabla.tensor_cond(
             outer,
-            lambda inner_predicate, captured: nabla.tensor_cond(
+            lambda inner_predicate, captured: quabla.tensor_cond(
                 inner_predicate,
                 lambda nested: nested * nested,
                 lambda nested: nested * 3.0,
@@ -3170,21 +3170,21 @@ def test_tensor_cond_supports_nested_tensor_predicates():
         value, gradients = traced.graph.evaluate_value_and_vjp(
             traced.output.node_id,
             {
-                "outer": nabla.Tensor([], [outer]),
-                "inner": nabla.Tensor([], [inner]),
-                "x": nabla.Tensor([], [2.0]),
+                "outer": quabla.Tensor([], [outer]),
+                "inner": quabla.Tensor([], [inner]),
+                "x": quabla.Tensor([], [2.0]),
             },
-            nabla.Tensor([], [1.0]),
+            quabla.Tensor([], [1.0]),
         )
         assert value.to_flat_list() == [expected_value]
         assert gradients["x"].to_flat_list() == [expected_gradient]
 
 
 def test_tensor_cond_symbolic_ad_supports_nested_regions():
-    traced = nabla.trace_tensor(
-        lambda outer, inner, x: nabla.tensor_cond(
+    traced = quabla.trace_tensor(
+        lambda outer, inner, x: quabla.tensor_cond(
             outer,
-            lambda inner_predicate, captured: nabla.tensor_cond(
+            lambda inner_predicate, captured: quabla.tensor_cond(
                 inner_predicate,
                 lambda nested: nested * nested,
                 lambda nested: nested * 3.0,
@@ -3203,22 +3203,22 @@ def test_tensor_cond_symbolic_ad_supports_nested_regions():
         (0.0, 1.0, 1.0),
     ]:
         inputs = {
-            "outer": nabla.Tensor([], [outer]),
-            "inner": nabla.Tensor([], [inner]),
-            "x": nabla.Tensor([], [2.0]),
+            "outer": quabla.Tensor([], [outer]),
+            "inner": quabla.Tensor([], [inner]),
+            "x": quabla.Tensor([], [2.0]),
         }
         jvp_value = symbolic_jvp.graph.evaluate(symbolic_jvp.output.node_id, inputs)
         assert jvp_value.to_flat_list() == [expected_gradient]
         vjp_value = symbolic_vjp.graph.evaluate(
             symbolic_vjp.output.node_id,
-            {**inputs, "seed": nabla.Tensor([], [1.0])},
+            {**inputs, "seed": quabla.Tensor([], [1.0])},
         )
         assert vjp_value.to_flat_list() == [expected_gradient]
 
 
 def test_tensor_cond_supports_second_order_ad_through_symbolic_regions():
-    traced = nabla.trace_tensor(
-        lambda predicate, x: nabla.tensor_cond(
+    traced = quabla.trace_tensor(
+        lambda predicate, x: quabla.tensor_cond(
             predicate,
             lambda captured: captured * captured,
             lambda captured: captured * 3.0,
@@ -3228,28 +3228,28 @@ def test_tensor_cond_supports_second_order_ad_through_symbolic_regions():
     )
     for predicate, expected in [(1.0, 8.0), (0.0, 0.0)]:
         inputs = {
-            "predicate": nabla.Tensor([], [predicate]),
-            "x": nabla.Tensor([], [2.0]),
+            "predicate": quabla.Tensor([], [predicate]),
+            "x": quabla.Tensor([], [2.0]),
         }
         assert traced.graph.hessian_scalar(traced.output.node_id, "x", inputs) == [[expected]]
         hvp = traced.graph.hvp_scalar(
-            traced.output.node_id, "x", inputs, nabla.Tensor([], [1.0])
+            traced.output.node_id, "x", inputs, quabla.Tensor([], [1.0])
         )
         assert hvp.to_flat_list() == [expected]
 
 
 def device_cond_compilers():
     compilers = []
-    if os.environ.get("NABLA_MLX_TEST") is not None:
+    if os.environ.get("QUABLA_MLX_TEST") is not None:
         compilers.append(("mlx", lambda output: output.compile_mlx()))
-    if os.environ.get("NABLA_CUDA_TEST") is not None:
+    if os.environ.get("QUABLA_CUDA_TEST") is not None:
         compilers.append(("cuda", lambda output: output.compile_cuda()))
     return compilers
 
 
 def test_device_tensor_cond_matches_cpu_without_inactive_branch_nan():
-    traced = nabla.trace_tensor(
-        lambda x, y: nabla.tensor_cond(
+    traced = quabla.trace_tensor(
+        lambda x, y: quabla.tensor_cond(
             x.gt(0.0),
             lambda a, b: b * a.log(),
             lambda a, b: b * b + a * 0.0,
@@ -3267,9 +3267,9 @@ def test_device_tensor_cond_matches_cpu_without_inactive_branch_nan():
     ]
     for x in (2.0, -1.0):
         inputs = {
-            "x": nabla.Tensor([], [x]),
-            "y": nabla.Tensor([3], [1.0, 2.0, 3.0]),
-            "seed": nabla.Tensor([], [1.0]),
+            "x": quabla.Tensor([], [x]),
+            "y": quabla.Tensor([3], [1.0, 2.0, 3.0]),
+            "seed": quabla.Tensor([], [1.0]),
         }
         for label, output in outputs:
             cpu = output.compile_cpu().evaluate(inputs).to_flat_list()
@@ -3279,9 +3279,9 @@ def test_device_tensor_cond_matches_cpu_without_inactive_branch_nan():
                 assert all(math.isfinite(value) for value in device), (backend, label, x)
                 assert_close_rows([device], [cpu], tol=1e-4)
     negative = {
-        "x": nabla.Tensor([], [-1.0]),
-        "y": nabla.Tensor([3], [1.0, 2.0, 3.0]),
-        "seed": nabla.Tensor([], [1.0]),
+        "x": quabla.Tensor([], [-1.0]),
+        "y": quabla.Tensor([3], [1.0, 2.0, 3.0]),
+        "seed": quabla.Tensor([], [1.0]),
     }
     assert gradients["x"].output.compile_cpu().evaluate(negative).to_flat_list() == [0.0]
     assert gradients["y"].output.compile_cpu().evaluate(negative).to_flat_list() == [
@@ -3292,10 +3292,10 @@ def test_device_tensor_cond_matches_cpu_without_inactive_branch_nan():
 
 
 def test_device_tensor_cond_matches_cpu_for_nested_regions():
-    traced = nabla.trace_tensor(
-        lambda outer, inner, x: nabla.tensor_cond(
+    traced = quabla.trace_tensor(
+        lambda outer, inner, x: quabla.tensor_cond(
             outer,
-            lambda inner_predicate, captured: nabla.tensor_cond(
+            lambda inner_predicate, captured: quabla.tensor_cond(
                 inner_predicate,
                 lambda nested: nested * nested,
                 lambda nested: nested * 3.0,
@@ -3313,10 +3313,10 @@ def test_device_tensor_cond_matches_cpu_for_nested_regions():
         (0.0, 1.0, 2.0, 1.0),
     ]:
         inputs = {
-            "outer": nabla.Tensor([], [outer]),
-            "inner": nabla.Tensor([], [inner]),
-            "x": nabla.Tensor([], [2.0]),
-            "seed": nabla.Tensor([], [1.0]),
+            "outer": quabla.Tensor([], [outer]),
+            "inner": quabla.Tensor([], [inner]),
+            "x": quabla.Tensor([], [2.0]),
+            "seed": quabla.Tensor([], [1.0]),
         }
         for _, compile_device in device_cond_compilers():
             assert_close_rows(
@@ -3332,15 +3332,15 @@ def test_device_tensor_cond_matches_cpu_for_nested_regions():
 
 
 def test_tensor_cond_rejects_vmapped_predicates_before_device_lowering():
-    vmap_functions = [nabla.tensor_vmap_fn]
-    if os.environ.get("NABLA_MLX_TEST") is not None:
-        vmap_functions.append(nabla.tensor_vmap_mlx_fn)
-    if os.environ.get("NABLA_CUDA_TEST") is not None:
-        vmap_functions.append(nabla.tensor_vmap_cuda_fn)
+    vmap_functions = [quabla.tensor_vmap_fn]
+    if os.environ.get("QUABLA_MLX_TEST") is not None:
+        vmap_functions.append(quabla.tensor_vmap_mlx_fn)
+    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+        vmap_functions.append(quabla.tensor_vmap_cuda_fn)
     for vmap_function in vmap_functions:
         try:
             vmap_function(
-                lambda x, flag: nabla.tensor_cond(
+                lambda x, flag: quabla.tensor_cond(
                     flag, lambda a: a, lambda a: a * 2.0, [x]
                 ),
                 [("x", [2]), ("flag", [])],
@@ -3353,16 +3353,16 @@ def test_tensor_cond_rejects_vmapped_predicates_before_device_lowering():
 
 
 def test_tensor_jit_batch_fn_bounds_batch_shape_specialization():
-    compiled = nabla.tensor_jit_batch_fn(
+    compiled = quabla.tensor_jit_batch_fn(
         lambda x, weight: (x.matmul(weight)).tanh(),
         ["x", "weight"],
         in_axes=[0, None],
         max_specializations=2,
     )
-    weight = nabla.Tensor([1, 1], [2.0])
-    first = compiled({"x": nabla.Tensor([2, 1], [0.5, -1.0]), "weight": weight})
+    weight = quabla.Tensor([1, 1], [2.0])
+    first = compiled({"x": quabla.Tensor([2, 1], [0.5, -1.0]), "weight": weight})
     second = compiled(
-        {"x": nabla.Tensor([3, 1], [0.0, 1.0, -0.5]), "weight": weight}
+        {"x": quabla.Tensor([3, 1], [0.0, 1.0, -0.5]), "weight": weight}
     )
 
     assert_close_rows(
@@ -3373,31 +3373,31 @@ def test_tensor_jit_batch_fn_bounds_batch_shape_specialization():
     )
     assert compiled.specialization_count == 2
     try:
-        compiled({"x": nabla.Tensor([4, 1], [0.0] * 4), "weight": weight})
+        compiled({"x": quabla.Tensor([4, 1], [0.0] * 4), "weight": weight})
         assert False, "expected bounded specialization error"
     except ValueError as error:
         assert "max_specializations" in str(error)
     try:
-        compiled({"x": nabla.Tensor([2, 2], [0.0] * 4), "weight": weight})
+        compiled({"x": quabla.Tensor([2, 2], [0.0] * 4), "weight": weight})
         assert False, "expected non-batch shape error"
     except ValueError as error:
         assert "non-batch shapes" in str(error)
 
 
 def test_tensor_value_and_grad_batch_fn_specializes_collocation_batches():
-    compiled = nabla.tensor_value_and_grad_batch_fn(
+    compiled = quabla.tensor_value_and_grad_batch_fn(
         lambda x, weight: (x * weight).powi(2).mean(),
         ["x", "weight"],
         in_axes=[0, None],
         max_specializations=2,
     )
-    weight = nabla.Tensor([1], [2.0])
+    weight = quabla.Tensor([1], [2.0])
 
     first_value, first_gradients = compiled(
-        {"x": nabla.Tensor([2, 1], [1.0, 2.0]), "weight": weight}
+        {"x": quabla.Tensor([2, 1], [1.0, 2.0]), "weight": weight}
     )
     second_value, second_gradients = compiled(
-        {"x": nabla.Tensor([3, 1], [1.0, 2.0, 3.0]), "weight": weight}
+        {"x": quabla.Tensor([3, 1], [1.0, 2.0, 3.0]), "weight": weight}
     )
 
     assert_close_rows([first_value.to_flat_list()], [[10.0]])
@@ -3410,26 +3410,26 @@ def test_tensor_value_and_grad_batch_fn_specializes_collocation_batches():
     assert_close_rows([second_gradients["weight"].to_flat_list()], [[56.0 / 3.0]])
     assert compiled.specialization_count == 2
     try:
-        compiled({"x": nabla.Tensor([4, 1], [1.0] * 4), "weight": weight})
+        compiled({"x": quabla.Tensor([4, 1], [1.0] * 4), "weight": weight})
         assert False, "expected bounded specialization error"
     except ValueError as error:
         assert "max_specializations" in str(error)
 
 
 def test_tensor_jit_batch_cuda_fn_specializes_bounded_batches():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    compiled = nabla.tensor_jit_batch_cuda_fn(
+    compiled = quabla.tensor_jit_batch_cuda_fn(
         lambda x, weight: (x.matmul(weight)).tanh(),
         ["x", "weight"],
         in_axes=[0, None],
         max_specializations=2,
     )
-    weight = nabla.Tensor([1, 1], [2.0])
-    first = compiled({"x": nabla.Tensor([2, 1], [0.5, -1.0]), "weight": weight})
+    weight = quabla.Tensor([1, 1], [2.0])
+    first = compiled({"x": quabla.Tensor([2, 1], [0.5, -1.0]), "weight": weight})
     second = compiled(
-        {"x": nabla.Tensor([3, 1], [0.0, 1.0, -0.5]), "weight": weight}
+        {"x": quabla.Tensor([3, 1], [0.0, 1.0, -0.5]), "weight": weight}
     )
 
     assert_close_rows(
@@ -3440,29 +3440,29 @@ def test_tensor_jit_batch_cuda_fn_specializes_bounded_batches():
     )
     assert compiled.specialization_count == 2
     try:
-        compiled({"x": nabla.Tensor([4, 1], [0.0] * 4), "weight": weight})
+        compiled({"x": quabla.Tensor([4, 1], [0.0] * 4), "weight": weight})
         assert False, "expected bounded CUDA specialization error"
     except ValueError as error:
         assert "max_specializations" in str(error)
 
 
 def test_tensor_value_and_grad_batch_cuda_fn_specializes_collocation_batches():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    compiled = nabla.tensor_value_and_grad_batch_cuda_fn(
+    compiled = quabla.tensor_value_and_grad_batch_cuda_fn(
         lambda x, weight: (x * weight).powi(2).mean(),
         ["x", "weight"],
         ["x", "weight"],
         in_axes=[0, None],
         max_specializations=2,
     )
-    weight = nabla.Tensor([1], [2.0])
+    weight = quabla.Tensor([1], [2.0])
     first_value, first_gradients = compiled(
-        {"x": nabla.Tensor([2, 1], [1.0, 2.0]), "weight": weight}
+        {"x": quabla.Tensor([2, 1], [1.0, 2.0]), "weight": weight}
     )
     second_value, second_gradients = compiled(
-        {"x": nabla.Tensor([3, 1], [1.0, 2.0, 3.0]), "weight": weight}
+        {"x": quabla.Tensor([3, 1], [1.0, 2.0, 3.0]), "weight": weight}
     )
 
     assert_close_rows([first_value.to_flat_list()], [[10.0]], tol=1e-5)
@@ -3477,7 +3477,7 @@ def test_tensor_value_and_grad_batch_cuda_fn_specializes_collocation_batches():
 
 
 def test_tensor_vmap_fn_traces_one_batched_plan():
-    mapped = nabla.tensor_vmap_fn(
+    mapped = quabla.tensor_vmap_fn(
         lambda x, weight: x.matmul(weight).tanh(),
         [("x", [2, 2]), ("weight", [2, 1])],
         3,
@@ -3485,11 +3485,11 @@ def test_tensor_vmap_fn_traces_one_batched_plan():
 
     result = mapped(
         {
-            "x": nabla.Tensor(
+            "x": quabla.Tensor(
                 [3, 2, 2],
                 [1.0, 0.0, 0.0, 1.0, 2.0, 1.0, 1.0, 2.0, 3.0, 0.0, 0.0, 3.0],
             ),
-            "weight": nabla.Tensor([3, 2, 1], [1.0, -1.0, 1.0, 0.5, 2.0, 1.0]),
+            "weight": quabla.Tensor([3, 2, 1], [1.0, -1.0, 1.0, 0.5, 2.0, 1.0]),
         }
     )
 
@@ -3500,7 +3500,7 @@ def test_tensor_vmap_fn_traces_one_batched_plan():
     )
 
     try:
-        nabla.tensor_vmap_fn(lambda x: x, [("x", [2])], 0)
+        quabla.tensor_vmap_fn(lambda x: x, [("x", [2])], 0)
     except ValueError as error:
         assert "batch_size" in str(error)
     else:
@@ -3508,8 +3508,8 @@ def test_tensor_vmap_fn_traces_one_batched_plan():
 
 
 def test_tensor_vmap_fori_loop_region_preserves_batched_carry_and_capture():
-    mapped = nabla.tensor_vmap_fn(
-        lambda initial, scale: nabla.tensor_fori_loop_region(
+    mapped = quabla.tensor_vmap_fn(
+        lambda initial, scale: quabla.tensor_fori_loop_region(
             0,
             3,
             lambda index, carry, captured_scale: carry + index * captured_scale,
@@ -3522,8 +3522,8 @@ def test_tensor_vmap_fori_loop_region_preserves_batched_carry_and_capture():
 
     result = mapped(
         {
-            "initial": nabla.Tensor([2], [1.0, 2.0]),
-            "scale": nabla.Tensor([2], [2.0, 3.0]),
+            "initial": quabla.Tensor([2], [1.0, 2.0]),
+            "scale": quabla.Tensor([2], [2.0, 3.0]),
         }
     )
 
@@ -3532,8 +3532,8 @@ def test_tensor_vmap_fori_loop_region_preserves_batched_carry_and_capture():
 
 
 def test_tensor_vmap_scan_region_places_batch_axis_after_time_axis():
-    mapped = nabla.tensor_vmap_fn(
-        lambda initial, scale: nabla.tensor_scan_region(
+    mapped = quabla.tensor_vmap_fn(
+        lambda initial, scale: quabla.tensor_scan_region(
             0,
             3,
             lambda _, carry, captured_scale: (
@@ -3549,8 +3549,8 @@ def test_tensor_vmap_scan_region_places_batch_axis_after_time_axis():
 
     result = mapped(
         {
-            "initial": nabla.Tensor([2], [1.0, 2.0]),
-            "scale": nabla.Tensor([2], [2.0, 3.0]),
+            "initial": quabla.Tensor([2], [1.0, 2.0]),
+            "scale": quabla.Tensor([2], [2.0, 3.0]),
         }
     )
 
@@ -3560,7 +3560,7 @@ def test_tensor_vmap_scan_region_places_batch_axis_after_time_axis():
 
 def test_tensor_vmap_fori_region_vjp_preserves_per_example_gradients():
     def function(initial, scale):
-        return nabla.tensor_fori_loop_region(
+        return quabla.tensor_fori_loop_region(
             0,
             3,
             lambda index, carry, captured_scale: carry + index * captured_scale,
@@ -3568,21 +3568,21 @@ def test_tensor_vmap_fori_region_vjp_preserves_per_example_gradients():
             [scale],
         )
     values = {
-        "initial": nabla.Tensor([2], [1.0, 2.0]),
-        "scale": nabla.Tensor([2], [2.0, 3.0]),
+        "initial": quabla.Tensor([2], [1.0, 2.0]),
+        "scale": quabla.Tensor([2], [2.0, 3.0]),
     }
-    cotangent = nabla.Tensor([2], [1.0, 1.0])
-    vjp = nabla.tensor_vmap_vjp_fn(function, [("initial", []), ("scale", [])], 2)
+    cotangent = quabla.Tensor([2], [1.0, 1.0])
+    vjp = quabla.tensor_vmap_vjp_fn(function, [("initial", []), ("scale", [])], 2)
     output, gradients = vjp(values, cotangent)
 
     assert_close_rows([output.to_flat_list()], [[7.0, 11.0]])
     assert_close_rows([gradients["initial"].to_flat_list()], [[1.0, 1.0]])
     assert_close_rows([gradients["scale"].to_flat_list()], [[3.0, 3.0]])
 
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    cuda = nabla.tensor_vmap_vjp_cuda_fn(function, [("initial", []), ("scale", [])], 2)
+    cuda = quabla.tensor_vmap_vjp_cuda_fn(function, [("initial", []), ("scale", [])], 2)
     cuda_output, cuda_gradients = cuda(values, cotangent)
     assert_close_rows([cuda_output.to_flat_list()], [output.to_flat_list()], tol=3e-5)
     for name in ["initial", "scale"]:
@@ -3594,11 +3594,11 @@ def test_tensor_vmap_fori_region_vjp_preserves_per_example_gradients():
 
 
 def test_tensor_vmap_fori_region_vjp_executes_on_mlx():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
-    vjp = nabla.tensor_vmap_vjp_mlx_fn(
-        lambda initial, scale: nabla.tensor_fori_loop_region(
+    vjp = quabla.tensor_vmap_vjp_mlx_fn(
+        lambda initial, scale: quabla.tensor_fori_loop_region(
             0,
             3,
             lambda index, carry, captured_scale: carry + index * captured_scale,
@@ -3610,10 +3610,10 @@ def test_tensor_vmap_fori_region_vjp_executes_on_mlx():
     )
     output, gradients = vjp(
         {
-            "initial": nabla.Tensor([2], [1.0, 2.0]),
-            "scale": nabla.Tensor([2], [2.0, 3.0]),
+            "initial": quabla.Tensor([2], [1.0, 2.0]),
+            "scale": quabla.Tensor([2], [2.0, 3.0]),
         },
-        nabla.Tensor([2], [1.0, 1.0]),
+        quabla.Tensor([2], [1.0, 1.0]),
     )
 
     assert vjp.backend == "mlx"
@@ -3623,8 +3623,8 @@ def test_tensor_vmap_fori_region_vjp_executes_on_mlx():
 
 
 def test_tensor_vmap_scan_region_jvp_preserves_batch_major_output_layout():
-    jvp = nabla.tensor_vmap_jvp_fn(
-        lambda initial, scale: nabla.tensor_scan_region(
+    jvp = quabla.tensor_vmap_jvp_fn(
+        lambda initial, scale: quabla.tensor_scan_region(
             0,
             3,
             lambda _, carry, captured_scale: (
@@ -3640,12 +3640,12 @@ def test_tensor_vmap_scan_region_jvp_preserves_batch_major_output_layout():
 
     output, tangent = jvp(
         {
-            "initial": nabla.Tensor([2], [1.0, 2.0]),
-            "scale": nabla.Tensor([2], [2.0, 3.0]),
+            "initial": quabla.Tensor([2], [1.0, 2.0]),
+            "scale": quabla.Tensor([2], [2.0, 3.0]),
         },
         {
-            "initial": nabla.Tensor([2], [1.0, 1.0]),
-            "scale": nabla.Tensor([2], [1.0, 1.0]),
+            "initial": quabla.Tensor([2], [1.0, 1.0]),
+            "scale": quabla.Tensor([2], [1.0, 1.0]),
         },
     )
 
@@ -3656,7 +3656,7 @@ def test_tensor_vmap_scan_region_jvp_preserves_batch_major_output_layout():
 
 def test_tensor_vmap_scan_region_vjp_matches_cpu_on_cuda():
     def function(initial, scale):
-        return nabla.tensor_scan_region(
+        return quabla.tensor_scan_region(
             0,
             3,
             lambda index, carry, captured_scale: (
@@ -3667,20 +3667,20 @@ def test_tensor_vmap_scan_region_vjp_matches_cpu_on_cuda():
             [scale],
         )[1]
     values = {
-        "initial": nabla.Tensor([2], [0.2, -0.3]),
-        "scale": nabla.Tensor([2], [0.8, 1.1]),
+        "initial": quabla.Tensor([2], [0.2, -0.3]),
+        "scale": quabla.Tensor([2], [0.8, 1.1]),
     }
-    cotangent = nabla.Tensor([2, 3], [1.0, -0.5, 0.25, -0.75, 0.5, 1.0])
-    cpu = nabla.tensor_vmap_vjp_fn(
+    cotangent = quabla.Tensor([2, 3], [1.0, -0.5, 0.25, -0.75, 0.5, 1.0])
+    cpu = quabla.tensor_vmap_vjp_fn(
         function, [("initial", []), ("scale", [])], 2
     )
     expected_value, expected_gradients = cpu(values, cotangent)
 
     assert expected_value.shape == [2, 3]
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    cuda = nabla.tensor_vmap_vjp_cuda_fn(
+    cuda = quabla.tensor_vmap_vjp_cuda_fn(
         function, [("initial", []), ("scale", [])], 2
     )
     value, gradients = cuda(values, cotangent)
@@ -3696,7 +3696,7 @@ def test_tensor_vmap_scan_region_vjp_matches_cpu_on_cuda():
 
 def test_tensor_vmap_hvp_scalar_scan_region_matches_finite_difference_and_cuda():
     def function(initial, scale):
-        return nabla.tensor_scan_region(
+        return quabla.tensor_scan_region(
             0,
             3,
             lambda index, carry, captured_scale: (
@@ -3708,25 +3708,25 @@ def test_tensor_vmap_hvp_scalar_scan_region_matches_finite_difference_and_cuda()
         )[0]
     specs = [("initial", []), ("scale", [])]
     values = {
-        "initial": nabla.Tensor([2], [0.2, -0.3]),
-        "scale": nabla.Tensor([2], [0.8, 1.1]),
+        "initial": quabla.Tensor([2], [0.2, -0.3]),
+        "scale": quabla.Tensor([2], [0.8, 1.1]),
     }
-    direction = nabla.Tensor([2], [0.7, -0.4])
-    hvp = nabla.tensor_vmap_hvp_scalar_fn(function, specs, 2, "initial")
+    direction = quabla.Tensor([2], [0.7, -0.4])
+    hvp = quabla.tensor_vmap_hvp_scalar_fn(function, specs, 2, "initial")
     actual = hvp(values, direction)
 
-    vjp = nabla.tensor_vmap_vjp_fn(function, specs, 2)
+    vjp = quabla.tensor_vmap_vjp_fn(function, specs, 2)
     epsilon = 1e-4
     plus_values = {
-        "initial": nabla.Tensor([2], [0.2 + epsilon * 0.7, -0.3 - epsilon * 0.4]),
+        "initial": quabla.Tensor([2], [0.2 + epsilon * 0.7, -0.3 - epsilon * 0.4]),
         "scale": values["scale"],
     }
     minus_values = {
-        "initial": nabla.Tensor([2], [0.2 - epsilon * 0.7, -0.3 + epsilon * 0.4]),
+        "initial": quabla.Tensor([2], [0.2 - epsilon * 0.7, -0.3 + epsilon * 0.4]),
         "scale": values["scale"],
     }
-    _, plus_gradients = vjp(plus_values, nabla.Tensor([2], [1.0, 1.0]))
-    _, minus_gradients = vjp(minus_values, nabla.Tensor([2], [1.0, 1.0]))
+    _, plus_gradients = vjp(plus_values, quabla.Tensor([2], [1.0, 1.0]))
+    _, minus_gradients = vjp(minus_values, quabla.Tensor([2], [1.0, 1.0]))
     expected = [
         (plus - minus) / (2.0 * epsilon)
         for plus, minus in zip(
@@ -3736,10 +3736,10 @@ def test_tensor_vmap_hvp_scalar_scan_region_matches_finite_difference_and_cuda()
     ]
     assert_close_rows([actual.to_flat_list()], [expected], tol=2e-3)
 
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    cuda = nabla.tensor_vmap_hvp_scalar_cuda_fn(function, specs, 2, "initial")
+    cuda = quabla.tensor_vmap_hvp_scalar_cuda_fn(function, specs, 2, "initial")
     cuda_actual = cuda(values, direction)
     assert_close_rows([cuda_actual.to_flat_list()], [actual.to_flat_list()], tol=3e-5)
 
@@ -3748,12 +3748,12 @@ def test_tensor_vmap_hvp_scalar_restores_nonleading_input_axis_on_cuda():
     def function(x, scale):
         return (x * x * scale).sum()
     values = {
-        "x": nabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-        "scale": nabla.Tensor([2], [0.5, -1.0]),
+        "x": quabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        "scale": quabla.Tensor([2], [0.5, -1.0]),
     }
-    direction = nabla.Tensor([2, 3], [0.1, 0.2, 0.3, -0.4, 0.5, -0.6])
+    direction = quabla.Tensor([2, 3], [0.1, 0.2, 0.3, -0.4, 0.5, -0.6])
     kwargs = {"in_axes": [-1, None], "out_axis": -1}
-    cpu = nabla.tensor_vmap_hvp_scalar_fn(
+    cpu = quabla.tensor_vmap_hvp_scalar_fn(
         function, [("x", [2]), ("scale", [2])], 3, "x", **kwargs
     )
     actual = cpu(values, direction)
@@ -3762,10 +3762,10 @@ def test_tensor_vmap_hvp_scalar_restores_nonleading_input_axis_on_cuda():
         [actual.to_flat_list()], [[0.1, 0.2, 0.3, 0.8, -1.0, 1.2]], tol=1e-12
     )
 
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    cuda = nabla.tensor_vmap_hvp_scalar_cuda_fn(
+    cuda = quabla.tensor_vmap_hvp_scalar_cuda_fn(
         function, [("x", [2]), ("scale", [2])], 3, "x", **kwargs
     )
     cuda_actual = cuda(values, direction)
@@ -3775,7 +3775,7 @@ def test_tensor_vmap_hvp_scalar_restores_nonleading_input_axis_on_cuda():
 
 def test_tensor_vmap_hvp_scalar_scan_capture_matches_finite_difference_and_cuda():
     def function(initial, scale):
-        return nabla.tensor_scan_region(
+        return quabla.tensor_scan_region(
             0,
             3,
             lambda index, carry, captured_scale: (
@@ -3787,25 +3787,25 @@ def test_tensor_vmap_hvp_scalar_scan_capture_matches_finite_difference_and_cuda(
         )[0]
     specs = [("initial", []), ("scale", [])]
     values = {
-        "initial": nabla.Tensor([2], [0.2, -0.3]),
-        "scale": nabla.Tensor([2], [0.8, 1.1]),
+        "initial": quabla.Tensor([2], [0.2, -0.3]),
+        "scale": quabla.Tensor([2], [0.8, 1.1]),
     }
-    direction = nabla.Tensor([2], [0.5, -0.6])
-    actual = nabla.tensor_vmap_hvp_scalar_fn(function, specs, 2, "scale")(
+    direction = quabla.Tensor([2], [0.5, -0.6])
+    actual = quabla.tensor_vmap_hvp_scalar_fn(function, specs, 2, "scale")(
         values, direction
     )
-    vjp = nabla.tensor_vmap_vjp_fn(function, specs, 2)
+    vjp = quabla.tensor_vmap_vjp_fn(function, specs, 2)
     epsilon = 1e-4
     plus_values = {
         "initial": values["initial"],
-        "scale": nabla.Tensor([2], [0.8 + epsilon * 0.5, 1.1 - epsilon * 0.6]),
+        "scale": quabla.Tensor([2], [0.8 + epsilon * 0.5, 1.1 - epsilon * 0.6]),
     }
     minus_values = {
         "initial": values["initial"],
-        "scale": nabla.Tensor([2], [0.8 - epsilon * 0.5, 1.1 + epsilon * 0.6]),
+        "scale": quabla.Tensor([2], [0.8 - epsilon * 0.5, 1.1 + epsilon * 0.6]),
     }
-    _, plus_gradients = vjp(plus_values, nabla.Tensor([2], [1.0, 1.0]))
-    _, minus_gradients = vjp(minus_values, nabla.Tensor([2], [1.0, 1.0]))
+    _, plus_gradients = vjp(plus_values, quabla.Tensor([2], [1.0, 1.0]))
+    _, minus_gradients = vjp(minus_values, quabla.Tensor([2], [1.0, 1.0]))
     expected = [
         (plus - minus) / (2.0 * epsilon)
         for plus, minus in zip(
@@ -3815,17 +3815,17 @@ def test_tensor_vmap_hvp_scalar_scan_capture_matches_finite_difference_and_cuda(
     ]
     assert_close_rows([actual.to_flat_list()], [expected], tol=2e-3)
 
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    cuda = nabla.tensor_vmap_hvp_scalar_cuda_fn(function, specs, 2, "scale")
+    cuda = quabla.tensor_vmap_hvp_scalar_cuda_fn(function, specs, 2, "scale")
     cuda_actual = cuda(values, direction)
     assert_close_rows([cuda_actual.to_flat_list()], [actual.to_flat_list()], tol=3e-5)
 
 
 def test_tensor_vmap_hvp_scalar_fori_capture_matches_exact_hessian_and_cuda():
     def function(initial, scale):
-        return nabla.tensor_fori_loop_region(
+        return quabla.tensor_fori_loop_region(
             0,
             3,
             lambda index, carry, captured_scale: carry * captured_scale + index,
@@ -3833,19 +3833,19 @@ def test_tensor_vmap_hvp_scalar_fori_capture_matches_exact_hessian_and_cuda():
             [scale],
         )
     values = {
-        "initial": nabla.Tensor([2], [1.0, 2.0]),
-        "scale": nabla.Tensor([2], [0.5, 1.5]),
+        "initial": quabla.Tensor([2], [1.0, 2.0]),
+        "scale": quabla.Tensor([2], [0.5, 1.5]),
     }
-    direction = nabla.Tensor([2], [0.7, -0.4])
-    actual = nabla.tensor_vmap_hvp_scalar_fn(
+    direction = quabla.Tensor([2], [0.7, -0.4])
+    actual = quabla.tensor_vmap_hvp_scalar_fn(
         function, [("initial", []), ("scale", [])], 2, "scale"
     )(values, direction)
     assert_close_rows([actual.to_flat_list()], [[2.1, -7.2]], tol=1e-12)
 
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    cuda = nabla.tensor_vmap_hvp_scalar_cuda_fn(
+    cuda = quabla.tensor_vmap_hvp_scalar_cuda_fn(
         function, [("initial", []), ("scale", [])], 2, "scale"
     )
     cuda_actual = cuda(values, direction)
@@ -3856,7 +3856,7 @@ def test_tensor_vmap_hvp_scalar_fori_capture_matches_exact_hessian_and_cuda():
 
 def test_tensor_vmap_hvp_scalar_fori_capture_restores_nonleading_axis_on_cuda():
     def function(initial, scale):
-        return nabla.tensor_fori_loop_region(
+        return quabla.tensor_fori_loop_region(
             0,
             3,
             lambda index, carry, captured_scale: carry * captured_scale + index,
@@ -3865,12 +3865,12 @@ def test_tensor_vmap_hvp_scalar_fori_capture_restores_nonleading_axis_on_cuda():
         ).sum()
     specs = [("initial", [2]), ("scale", [2])]
     values = {
-        "initial": nabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-        "scale": nabla.Tensor([2, 3], [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]),
+        "initial": quabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        "scale": quabla.Tensor([2, 3], [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]),
     }
-    direction = nabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    direction = quabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
     kwargs = {"in_axes": [1, 1], "out_axis": -1}
-    cpu = nabla.tensor_vmap_hvp_scalar_fn(
+    cpu = quabla.tensor_vmap_hvp_scalar_fn(
         function, specs, 3, "scale", **kwargs
     )
     actual = cpu(values, direction)
@@ -3879,10 +3879,10 @@ def test_tensor_vmap_hvp_scalar_fori_capture_restores_nonleading_axis_on_cuda():
         [actual.to_flat_list()], [[3.0, 24.0, 81.0, 192.0, 375.0, 648.0]], tol=1e-12
     )
 
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    cuda = nabla.tensor_vmap_hvp_scalar_cuda_fn(
+    cuda = quabla.tensor_vmap_hvp_scalar_cuda_fn(
         function, specs, 3, "scale", **kwargs
     )
     cuda_actual = cuda(values, direction)
@@ -3892,7 +3892,7 @@ def test_tensor_vmap_hvp_scalar_fori_capture_restores_nonleading_axis_on_cuda():
 
 def test_tensor_vmap_fori_jvp_preserves_mapped_capture_and_nonleading_axes():
     def function(initial, scale):
-        return nabla.tensor_fori_loop_region(
+        return quabla.tensor_fori_loop_region(
             0,
             3,
             lambda index, carry, captured_scale: carry + index * captured_scale,
@@ -3900,14 +3900,14 @@ def test_tensor_vmap_fori_jvp_preserves_mapped_capture_and_nonleading_axes():
             [scale],
         )
     values = {
-        "initial": nabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-        "scale": nabla.Tensor([2, 3], [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]),
+        "initial": quabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        "scale": quabla.Tensor([2, 3], [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]),
     }
     tangents = {
-        "initial": nabla.Tensor([2, 3], [0.0] * 6),
-        "scale": nabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        "initial": quabla.Tensor([2, 3], [0.0] * 6),
+        "scale": quabla.Tensor([2, 3], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
     }
-    jvp = nabla.tensor_vmap_jvp_fn(
+    jvp = quabla.tensor_vmap_jvp_fn(
         function,
         [("initial", [2]), ("scale", [2])],
         3,
@@ -3920,10 +3920,10 @@ def test_tensor_vmap_fori_jvp_preserves_mapped_capture_and_nonleading_axes():
     )
     assert_close_rows([tangent.to_flat_list()], [[3.0, 6.0, 9.0, 12.0, 15.0, 18.0]])
 
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    cuda = nabla.tensor_vmap_jvp_cuda_fn(
+    cuda = quabla.tensor_vmap_jvp_cuda_fn(
         function,
         [("initial", [2]), ("scale", [2])],
         3,
@@ -3941,7 +3941,7 @@ def test_tensor_vmap_fori_jvp_preserves_mapped_capture_and_nonleading_axes():
 
 
 def test_tensor_vmap_fn_supports_in_axes_out_axis_and_unmapped_inputs():
-    mapped = nabla.tensor_vmap_fn(
+    mapped = quabla.tensor_vmap_fn(
         lambda x, weight: (x * weight).sum(),
         [("x", [2]), ("weight", [2])],
         3,
@@ -3951,8 +3951,8 @@ def test_tensor_vmap_fn_supports_in_axes_out_axis_and_unmapped_inputs():
 
     result = mapped(
         {
-            "x": nabla.Tensor([2, 3], [1.0, 3.0, 5.0, 2.0, 4.0, 6.0]),
-            "weight": nabla.Tensor([2], [2.0, -1.0]),
+            "x": quabla.Tensor([2, 3], [1.0, 3.0, 5.0, 2.0, 4.0, 6.0]),
+            "weight": quabla.Tensor([2], [2.0, -1.0]),
         }
     )
 
@@ -3961,7 +3961,7 @@ def test_tensor_vmap_fn_supports_in_axes_out_axis_and_unmapped_inputs():
 
 
 def test_tensor_vmap_fn_reductions_and_transpose_preserve_batch_axis():
-    mapped = nabla.tensor_vmap_fn(
+    mapped = quabla.tensor_vmap_fn(
         lambda x: x.transpose().mean(axis=1),
         [("x", [2, 3])],
         2,
@@ -3971,7 +3971,7 @@ def test_tensor_vmap_fn_reductions_and_transpose_preserve_batch_axis():
 
     result = mapped(
         {
-            "x": nabla.Tensor(
+            "x": quabla.Tensor(
                 [2, 3, 2],
                 [1.0, 10.0, 2.0, 20.0, 3.0, 30.0, 4.0, 40.0, 5.0, 50.0, 6.0, 60.0],
             )
@@ -3985,36 +3985,36 @@ def test_tensor_vmap_fn_reductions_and_transpose_preserve_batch_axis():
 def test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace():
     input_specs = [("x", [2, 2]), ("weight", [2, 1])]
     values = {
-        "x": nabla.Tensor(
+        "x": quabla.Tensor(
             [3, 2, 2],
             [1.0, 0.0, 0.0, 1.0, 2.0, 1.0, 1.0, 2.0, 3.0, 0.0, 0.0, 3.0],
         ),
-        "weight": nabla.Tensor([3, 2, 1], [1.0, -1.0, 1.0, 0.5, 2.0, 1.0]),
+        "weight": quabla.Tensor([3, 2, 1], [1.0, -1.0, 1.0, 0.5, 2.0, 1.0]),
     }
     expected = [[math.tanh(value) for value in [1.0, -1.0, 2.5, 2.0, 6.0, 3.0]]]
-    nonleading_values = {"x": nabla.Tensor([2, 3], [1.0, 3.0, 5.0, 2.0, 4.0, 6.0])}
+    nonleading_values = {"x": quabla.Tensor([2, 3], [1.0, 3.0, 5.0, 2.0, 4.0, 6.0])}
     nonleading_expected = [[3.0, 7.0, 11.0]]
 
-    if os.environ.get("NABLA_MLX_TEST") is not None:
-        mlx_compiled = nabla.tensor_vmap_mlx_fn(
+    if os.environ.get("QUABLA_MLX_TEST") is not None:
+        mlx_compiled = quabla.tensor_vmap_mlx_fn(
             lambda x, weight: x.matmul(weight).tanh(), input_specs, 3
         )
         assert mlx_compiled.backend == "mlx"
         assert_close_rows([mlx_compiled(values).to_flat_list()], expected, tol=1e-5)
-        mlx_nonleading = nabla.tensor_vmap_mlx_fn(
+        mlx_nonleading = quabla.tensor_vmap_mlx_fn(
             lambda x: x.sum(), [("x", [2])], 3, in_axes=[1]
         )
         assert_close_rows(
             [mlx_nonleading(nonleading_values).to_flat_list()], nonleading_expected, tol=1e-5
         )
 
-    if os.environ.get("NABLA_CUDA_TEST") is not None:
-        cuda_compiled = nabla.tensor_vmap_cuda_fn(
+    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+        cuda_compiled = quabla.tensor_vmap_cuda_fn(
             lambda x, weight: x.matmul(weight).tanh(), input_specs, 3
         )
         assert cuda_compiled.backend in {"cublas", "nvrtc"}
         assert_close_rows([cuda_compiled(values).to_flat_list()], expected, tol=1e-5)
-        cuda_nonleading = nabla.tensor_vmap_cuda_fn(
+        cuda_nonleading = quabla.tensor_vmap_cuda_fn(
             lambda x: x.sum(), [("x", [2])], 3, in_axes=[1]
         )
         assert_close_rows(
@@ -4023,7 +4023,7 @@ def test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace():
 
 
 def test_tensor_vmap_vjp_matches_per_example_loop_and_aggregates_unmapped_gradient():
-    vjp = nabla.tensor_vmap_vjp_fn(
+    vjp = quabla.tensor_vmap_vjp_fn(
         lambda x, weight: (x * weight).tanh().sum(),
         [("x", [2]), ("weight", [2])],
         3,
@@ -4034,10 +4034,10 @@ def test_tensor_vmap_vjp_matches_per_example_loop_and_aggregates_unmapped_gradie
     cotangent_values = [1.0, 2.0, -0.5]
     output, gradients = vjp(
         {
-            "x": nabla.Tensor([2, 3], x_values),
-            "weight": nabla.Tensor([2], weight_values),
+            "x": quabla.Tensor([2, 3], x_values),
+            "weight": quabla.Tensor([2], weight_values),
         },
-        nabla.Tensor([3], cotangent_values),
+        quabla.Tensor([3], cotangent_values),
     )
 
     per_example = [
@@ -4069,8 +4069,8 @@ def test_tensor_vmap_vjp_matches_per_example_loop_and_aggregates_unmapped_gradie
     assert_close_rows([gradients["x"].to_flat_list()], [expected_x])
     assert_close_rows([gradients["weight"].to_flat_list()], [expected_weight])
 
-    if os.environ.get("NABLA_MLX_TEST") is not None:
-        mlx_vjp = nabla.tensor_vmap_vjp_mlx_fn(
+    if os.environ.get("QUABLA_MLX_TEST") is not None:
+        mlx_vjp = quabla.tensor_vmap_vjp_mlx_fn(
             lambda x, weight: (x * weight).tanh().sum(),
             [("x", [2]), ("weight", [2])],
             3,
@@ -4079,10 +4079,10 @@ def test_tensor_vmap_vjp_matches_per_example_loop_and_aggregates_unmapped_gradie
         assert mlx_vjp.backend == "mlx"
         mlx_output, mlx_gradients = mlx_vjp(
             {
-                "x": nabla.Tensor([2, 3], x_values),
-                "weight": nabla.Tensor([2], weight_values),
+                "x": quabla.Tensor([2, 3], x_values),
+                "weight": quabla.Tensor([2], weight_values),
             },
-            nabla.Tensor([3], cotangent_values),
+            quabla.Tensor([3], cotangent_values),
         )
         assert_close_rows([mlx_output.to_flat_list()], [expected_output], tol=1e-5)
         assert_close_rows([mlx_gradients["x"].to_flat_list()], [expected_x], tol=1e-5)
@@ -4092,7 +4092,7 @@ def test_tensor_vmap_vjp_matches_per_example_loop_and_aggregates_unmapped_gradie
 
 
 def test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes():
-    jvp = nabla.tensor_vmap_jvp_fn(
+    jvp = quabla.tensor_vmap_jvp_fn(
         lambda x: x.tanh(),
         [("x", [2])],
         3,
@@ -4102,8 +4102,8 @@ def test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes():
     values = [0.0, 0.5, -1.0, 1.0, -0.5, 2.0]
     tangents = [1.0, 2.0, 3.0, -1.0, 0.5, 2.0]
     output, output_tangent = jvp(
-        {"x": nabla.Tensor([2, 3], values)},
-        {"x": nabla.Tensor([2, 3], tangents)},
+        {"x": quabla.Tensor([2, 3], values)},
+        {"x": quabla.Tensor([2, 3], tangents)},
     )
 
     assert jvp.node_count > 0
@@ -4113,8 +4113,8 @@ def test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes():
         [[direction * (1.0 - math.tanh(value) ** 2) for value, direction in zip(values, tangents)]],
     )
 
-    if os.environ.get("NABLA_MLX_TEST") is not None:
-        mlx_jvp = nabla.tensor_vmap_jvp_mlx_fn(
+    if os.environ.get("QUABLA_MLX_TEST") is not None:
+        mlx_jvp = quabla.tensor_vmap_jvp_mlx_fn(
             lambda x: x.tanh(),
             [("x", [2])],
             3,
@@ -4123,8 +4123,8 @@ def test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes():
         )
         assert mlx_jvp.backend == "mlx"
         mlx_output, mlx_tangent = mlx_jvp(
-            {"x": nabla.Tensor([2, 3], values)},
-            {"x": nabla.Tensor([2, 3], tangents)},
+            {"x": quabla.Tensor([2, 3], values)},
+            {"x": quabla.Tensor([2, 3], tangents)},
         )
         assert_close_rows(
             [mlx_output.to_flat_list()],
@@ -4137,8 +4137,8 @@ def test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes():
             tol=1e-5,
         )
 
-    if os.environ.get("NABLA_CUDA_TEST") is not None:
-        cuda_jvp = nabla.tensor_vmap_jvp_cuda_fn(
+    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+        cuda_jvp = quabla.tensor_vmap_jvp_cuda_fn(
             lambda x: x.tanh(),
             [("x", [2])],
             3,
@@ -4147,8 +4147,8 @@ def test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes():
         )
         assert cuda_jvp.backend in {"cublas", "nvrtc"}
         cuda_output, cuda_tangent = cuda_jvp(
-            {"x": nabla.Tensor([2, 3], values)},
-            {"x": nabla.Tensor([2, 3], tangents)},
+            {"x": quabla.Tensor([2, 3], values)},
+            {"x": quabla.Tensor([2, 3], tangents)},
         )
         assert_close_rows(
             [cuda_output.to_flat_list()],
@@ -4163,19 +4163,19 @@ def test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes():
 
 
 def test_tensor_vmap_cuda_vjp_matches_cpu_single_batched_plan():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
     def function(x, weight):
         return (x * weight).tanh().sum()
     input_specs = [("x", [2]), ("weight", [2])]
     values = {
-        "x": nabla.Tensor([2, 3], [0.0, 0.5, -1.0, 1.0, -0.5, 2.0]),
-        "weight": nabla.Tensor([2], [2.0, -1.0]),
+        "x": quabla.Tensor([2, 3], [0.0, 0.5, -1.0, 1.0, -0.5, 2.0]),
+        "weight": quabla.Tensor([2], [2.0, -1.0]),
     }
-    cotangent = nabla.Tensor([3], [1.0, 2.0, -0.5])
-    cpu = nabla.tensor_vmap_vjp_fn(function, input_specs, 3, in_axes=[1, None])
-    cuda = nabla.tensor_vmap_vjp_cuda_fn(function, input_specs, 3, in_axes=[1, None])
+    cotangent = quabla.Tensor([3], [1.0, 2.0, -0.5])
+    cpu = quabla.tensor_vmap_vjp_fn(function, input_specs, 3, in_axes=[1, None])
+    cuda = quabla.tensor_vmap_vjp_cuda_fn(function, input_specs, 3, in_axes=[1, None])
 
     expected_value, expected_gradients = cpu(values, cotangent)
     value, gradients = cuda(values, cotangent)
@@ -4198,11 +4198,11 @@ def test_tensor_vmap_batched_mlp_gradients_match_loop_on_cpu_and_cuda():
         return (x.matmul(weight).tanh()).sum()
     input_specs = [("x", [2]), ("weight", [2, 1])]
     values = {
-        "x": nabla.Tensor([3, 2], [1.0, 2.0, -1.0, 0.5, 0.25, -2.0]),
-        "weight": nabla.Tensor([2, 1], [0.75, -0.5]),
+        "x": quabla.Tensor([3, 2], [1.0, 2.0, -1.0, 0.5, 0.25, -2.0]),
+        "weight": quabla.Tensor([2, 1], [0.75, -0.5]),
     }
-    cotangent = nabla.Tensor([3], [1.0, -0.25, 2.0])
-    cpu = nabla.tensor_vmap_vjp_fn(function, input_specs, 3, in_axes=[0, None])
+    cotangent = quabla.Tensor([3], [1.0, -0.25, 2.0])
+    cpu = quabla.tensor_vmap_vjp_fn(function, input_specs, 3, in_axes=[0, None])
     value, gradients = cpu(values, cotangent)
 
     examples = [[1.0, 2.0], [-1.0, 0.5], [0.25, -2.0]]
@@ -4229,8 +4229,8 @@ def test_tensor_vmap_batched_mlp_gradients_match_loop_on_cpu_and_cuda():
     assert_close_rows([gradients["x"].to_flat_list()], [expected_x])
     assert_close_rows([gradients["weight"].to_flat_list()], [expected_weight])
 
-    if os.environ.get("NABLA_CUDA_TEST") is not None:
-        cuda = nabla.tensor_vmap_vjp_cuda_fn(function, input_specs, 3, in_axes=[0, None])
+    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+        cuda = quabla.tensor_vmap_vjp_cuda_fn(function, input_specs, 3, in_axes=[0, None])
         cuda_value, cuda_gradients = cuda(values, cotangent)
         assert_close_rows([cuda_value.to_flat_list()], [expected_value], tol=2e-5)
         assert_close_rows([cuda_gradients["x"].to_flat_list()], [expected_x], tol=2e-5)
@@ -4240,25 +4240,25 @@ def test_tensor_vmap_batched_mlp_gradients_match_loop_on_cpu_and_cuda():
 
 
 def test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    compiled = nabla.tensor_jit_cuda_fn(
+    compiled = quabla.tensor_jit_cuda_fn(
         lambda x, weight, bias: (x @ weight + bias).tanh(),
         [("x", [2, 2]), ("weight", [2, 2]), ("bias", [1, 2])],
     )
     first = compiled(
         {
-            "x": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
-            "weight": nabla.Tensor([2, 2], [1.0, 0.0, 0.0, 1.0]),
-            "bias": nabla.Tensor([1, 2], [0.0, 1.0]),
+            "x": quabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0]),
+            "weight": quabla.Tensor([2, 2], [1.0, 0.0, 0.0, 1.0]),
+            "bias": quabla.Tensor([1, 2], [0.0, 1.0]),
         }
     )
     second = compiled(
         {
-            "x": nabla.Tensor([2, 2], [0.0, 1.0, -1.0, 0.5]),
-            "weight": nabla.Tensor([2, 2], [2.0, 0.0, 0.0, 2.0]),
-            "bias": nabla.Tensor([1, 2], [1.0, -1.0]),
+            "x": quabla.Tensor([2, 2], [0.0, 1.0, -1.0, 0.5]),
+            "weight": quabla.Tensor([2, 2], [2.0, 0.0, 0.0, 2.0]),
+            "bias": quabla.Tensor([1, 2], [1.0, -1.0]),
         }
     )
 
@@ -4272,23 +4272,23 @@ def test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan():
 
 
 def test_tensor_value_and_grad_cuda_fn_uses_one_callable_plan():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    value_and_grad = nabla.tensor_value_and_grad_cuda_fn(
+    value_and_grad = quabla.tensor_value_and_grad_cuda_fn(
         lambda x, target, weight, bias: ((x * weight + bias - target).powi(2)).mean(),
         [("x", [2]), ("target", [2]), ("weight", [1]), ("bias", [1])],
         ["weight", "bias"],
     )
     inputs = {
-        "x": nabla.Tensor([2], [-1.0, 1.0]),
-        "target": nabla.Tensor([2], [-1.0, 3.0]),
-        "weight": nabla.Tensor([1], [0.0]),
-        "bias": nabla.Tensor([1], [0.0]),
+        "x": quabla.Tensor([2], [-1.0, 1.0]),
+        "target": quabla.Tensor([2], [-1.0, 3.0]),
+        "weight": quabla.Tensor([1], [0.0]),
+        "bias": quabla.Tensor([1], [0.0]),
     }
 
     value, gradients = value_and_grad(inputs)
-    cpu_value_and_grad = nabla.tensor_value_and_grad_fn(
+    cpu_value_and_grad = quabla.tensor_value_and_grad_fn(
         lambda x, target, weight, bias: ((x * weight + bias - target).powi(2)).mean(),
         [("x", [2]), ("target", [2]), ("weight", [1]), ("bias", [1])],
     )
@@ -4308,22 +4308,22 @@ def test_tensor_value_and_grad_cuda_fn_uses_one_callable_plan():
 
 
 def test_tensor_value_and_grad_mlx_fn_uses_one_symbolic_plan():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
-    value_and_grad = nabla.tensor_value_and_grad_mlx_fn(
+    value_and_grad = quabla.tensor_value_and_grad_mlx_fn(
         lambda x, target, weight, bias: ((x * weight + bias - target).powi(2)).mean(),
         [("x", [2]), ("target", [2]), ("weight", [1]), ("bias", [1])],
         ["weight", "bias"],
     )
     inputs = {
-        "x": nabla.Tensor([2], [-1.0, 1.0]),
-        "target": nabla.Tensor([2], [-1.0, 3.0]),
-        "weight": nabla.Tensor([1], [0.0]),
-        "bias": nabla.Tensor([1], [0.0]),
+        "x": quabla.Tensor([2], [-1.0, 1.0]),
+        "target": quabla.Tensor([2], [-1.0, 3.0]),
+        "weight": quabla.Tensor([1], [0.0]),
+        "bias": quabla.Tensor([1], [0.0]),
     }
     value, gradients = value_and_grad(inputs)
-    cpu_value, cpu_gradients = nabla.tensor_value_and_grad_fn(
+    cpu_value, cpu_gradients = quabla.tensor_value_and_grad_fn(
         lambda x, target, weight, bias: ((x * weight + bias - target).powi(2)).mean(),
         [("x", [2]), ("target", [2]), ("weight", [1]), ("bias", [1])],
     )(inputs)
@@ -4339,11 +4339,11 @@ def test_tensor_value_and_grad_mlx_fn_uses_one_symbolic_plan():
 
 
 def test_tensor_value_and_grad_mlx_fn_supports_fixed_fori_regions():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
     def function(initial, scale):
-        return nabla.tensor_fori_loop_region(
+        return quabla.tensor_fori_loop_region(
             0,
             3,
             lambda index, carry, captured_scale: carry * captured_scale + index,
@@ -4351,15 +4351,15 @@ def test_tensor_value_and_grad_mlx_fn_supports_fixed_fori_regions():
             [scale],
         ).powi(2).mean()
     inputs = {
-        "initial": nabla.Tensor([], [1.0]),
-        "scale": nabla.Tensor([], [2.0]),
+        "initial": quabla.Tensor([], [1.0]),
+        "scale": quabla.Tensor([], [2.0]),
     }
-    mlx = nabla.tensor_value_and_grad_mlx_fn(
+    mlx = quabla.tensor_value_and_grad_mlx_fn(
         function,
         [("initial", []), ("scale", [])],
         ["initial", "scale"],
     )
-    cpu = nabla.tensor_value_and_grad_fn(
+    cpu = quabla.tensor_value_and_grad_fn(
         function,
         [("initial", []), ("scale", [])],
     )
@@ -4378,11 +4378,11 @@ def test_tensor_value_and_grad_mlx_fn_supports_fixed_fori_regions():
 
 
 def test_tensor_value_and_grad_mlx_fn_supports_fixed_scan_regions():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
     def function(initial, scale):
-        carry, outputs = nabla.tensor_scan_region(
+        carry, outputs = quabla.tensor_scan_region(
             0,
             3,
             lambda index, current, captured_scale: (
@@ -4395,15 +4395,15 @@ def test_tensor_value_and_grad_mlx_fn_supports_fixed_scan_regions():
         return carry + outputs.sum()
 
     inputs = {
-        "initial": nabla.Tensor([], [1.0]),
-        "scale": nabla.Tensor([], [2.0]),
+        "initial": quabla.Tensor([], [1.0]),
+        "scale": quabla.Tensor([], [2.0]),
     }
-    mlx = nabla.tensor_value_and_grad_mlx_fn(
+    mlx = quabla.tensor_value_and_grad_mlx_fn(
         function,
         [("initial", []), ("scale", [])],
         ["initial", "scale"],
     )
-    cpu = nabla.tensor_value_and_grad_fn(
+    cpu = quabla.tensor_value_and_grad_fn(
         function,
         [("initial", []), ("scale", [])],
     )
@@ -4422,33 +4422,33 @@ def test_tensor_value_and_grad_mlx_fn_supports_fixed_scan_regions():
 
 
 def test_tensor_value_and_grad_batch_mlx_fn_specializes_collocation_batches():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
     def function(x, target, weight):
         return ((x * weight - target).powi(2)).mean()
-    mlx = nabla.tensor_value_and_grad_batch_mlx_fn(
+    mlx = quabla.tensor_value_and_grad_batch_mlx_fn(
         function,
         ["x", "target", "weight"],
         ["weight"],
         in_axes=[0, 0, None],
         max_specializations=2,
     )
-    cpu = nabla.tensor_value_and_grad_batch_fn(
+    cpu = quabla.tensor_value_and_grad_batch_fn(
         function,
         ["x", "target", "weight"],
         in_axes=[0, 0, None],
         max_specializations=2,
     )
-    weight = nabla.Tensor([1], [0.5])
+    weight = quabla.Tensor([1], [0.5])
     first_inputs = {
-        "x": nabla.Tensor([2, 1], [-1.0, 2.0]),
-        "target": nabla.Tensor([2, 1], [-2.0, 3.0]),
+        "x": quabla.Tensor([2, 1], [-1.0, 2.0]),
+        "target": quabla.Tensor([2, 1], [-2.0, 3.0]),
         "weight": weight,
     }
     second_inputs = {
-        "x": nabla.Tensor([3, 1], [-2.0, 1.0, 3.0]),
-        "target": nabla.Tensor([3, 1], [-1.0, 2.0, 4.0]),
+        "x": quabla.Tensor([3, 1], [-2.0, 1.0, 3.0]),
+        "target": quabla.Tensor([3, 1], [-1.0, 2.0, 4.0]),
         "weight": weight,
     }
     for inputs in (first_inputs, second_inputs):
@@ -4466,8 +4466,8 @@ def test_tensor_value_and_grad_batch_mlx_fn_specializes_collocation_batches():
     try:
         mlx(
             {
-                "x": nabla.Tensor([4, 1], [0.0] * 4),
-                "target": nabla.Tensor([4, 1], [0.0] * 4),
+                "x": quabla.Tensor([4, 1], [0.0] * 4),
+                "target": quabla.Tensor([4, 1], [0.0] * 4),
                 "weight": weight,
             }
         )
@@ -4477,23 +4477,23 @@ def test_tensor_value_and_grad_batch_mlx_fn_specializes_collocation_batches():
 
 
 def test_cuda_adam_loss_optimizer_owns_scalar_loss_and_parameters():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, bias: (x * weight) + bias,
         [("x", [2]), ("weight", [1]), ("bias", [1])],
     )
     target = traced.graph.input("target", [2])
     loss = (traced.output - target).powi(2).mean()
-    optimizer = nabla.cuda_adam_loss_optimizer(
+    optimizer = quabla.cuda_adam_loss_optimizer(
         loss,
         ["weight", "bias"],
         {
-            "x": nabla.Tensor([2], [-1.0, 1.0]),
-            "target": nabla.Tensor([2], [-1.0, 3.0]),
-            "weight": nabla.Tensor([1], [0.0]),
-            "bias": nabla.Tensor([1], [0.0]),
+            "x": quabla.Tensor([2], [-1.0, 1.0]),
+            "target": quabla.Tensor([2], [-1.0, 3.0]),
+            "weight": quabla.Tensor([1], [0.0]),
+            "bias": quabla.Tensor([1], [0.0]),
         },
         0.05,
         ["x", "target"],
@@ -4513,23 +4513,23 @@ def test_cuda_adam_loss_optimizer_owns_scalar_loss_and_parameters():
 
 
 def test_mlx_adam_loss_optimizer_keeps_parameters_and_moments_on_device():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, bias: (x * weight) + bias,
         [("x", [2]), ("weight", [1]), ("bias", [1])],
     )
     target = traced.graph.input("target", [2])
     loss = (traced.output - target).powi(2).mean()
-    optimizer = nabla.mlx_adam_loss_optimizer(
+    optimizer = quabla.mlx_adam_loss_optimizer(
         loss,
         ["weight", "bias"],
         {
-            "x": nabla.Tensor([2], [-1.0, 1.0]),
-            "target": nabla.Tensor([2], [-1.0, 3.0]),
-            "weight": nabla.Tensor([1], [0.0]),
-            "bias": nabla.Tensor([1], [0.0]),
+            "x": quabla.Tensor([2], [-1.0, 1.0]),
+            "target": quabla.Tensor([2], [-1.0, 3.0]),
+            "weight": quabla.Tensor([1], [0.0]),
+            "bias": quabla.Tensor([1], [0.0]),
         },
         0.05,
         ["x", "target"],
@@ -4547,25 +4547,25 @@ def test_mlx_adam_loss_optimizer_keeps_parameters_and_moments_on_device():
 
 
 def test_mlx_adam_loss_optimizer_refreshes_dynamic_minibatches():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, target, weight, bias: (x * weight) + bias,
         [("x", [2]), ("target", [2]), ("weight", [1]), ("bias", [1])],
     )
     loss = ((traced.output - traced.graph.input("target")).powi(2)).mean()
     initial_batch = {
-        "x": nabla.Tensor([2], [-1.0, 1.0]),
-        "target": nabla.Tensor([2], [-1.0, 3.0]),
-        "weight": nabla.Tensor([1], [0.0]),
-        "bias": nabla.Tensor([1], [0.0]),
+        "x": quabla.Tensor([2], [-1.0, 1.0]),
+        "target": quabla.Tensor([2], [-1.0, 3.0]),
+        "weight": quabla.Tensor([1], [0.0]),
+        "bias": quabla.Tensor([1], [0.0]),
     }
     refreshed_batch = {
-        "x": nabla.Tensor([2], [-2.0, 2.0]),
-        "target": nabla.Tensor([2], [-3.0, 5.0]),
+        "x": quabla.Tensor([2], [-2.0, 2.0]),
+        "target": quabla.Tensor([2], [-3.0, 5.0]),
     }
-    optimizer = nabla.mlx_adam_loss_optimizer(
+    optimizer = quabla.mlx_adam_loss_optimizer(
         loss, ["weight", "bias"], initial_batch, 0.05, []
     )
 
@@ -4582,13 +4582,13 @@ def test_mlx_adam_loss_optimizer_refreshes_dynamic_minibatches():
 
 
 def test_mlx_poisson_pinn_matches_cpu_reference():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
     collocation = [0.15, 0.35, 0.55, 0.75, 0.9]
     coordinates = collocation + [0.0, 1.0]
     forcing = [math.pi**2 * math.sin(math.pi * x) for x in collocation] + [0.0, 0.0]
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, forcing, boundary_target, boundary_mask: (x * weight).sin(),
         [
             ("x", [7, 1]),
@@ -4604,32 +4604,32 @@ def test_mlx_poisson_pinn_matches_cpu_reference():
     weight = graph.input("weight")
     residual = second_derivative.output + graph.input("forcing")
     boundary_error = (x * weight).sin() - graph.input("boundary_target")
-    error = nabla.where(graph.input("boundary_mask").gt(0.0), boundary_error, residual)
+    error = quabla.where(graph.input("boundary_mask").gt(0.0), boundary_error, residual)
     loss = (error * error).mean()
     inputs = {
-        "x": nabla.Tensor([7, 1], coordinates),
-        "forcing": nabla.Tensor([7, 1], forcing),
-        "boundary_target": nabla.Tensor([7, 1], [0.0] * 7),
-        "boundary_mask": nabla.Tensor([7, 1], [0.0] * 5 + [1.0] * 2),
-        "weight": nabla.Tensor([1, 1], [2.5]),
+        "x": quabla.Tensor([7, 1], coordinates),
+        "forcing": quabla.Tensor([7, 1], forcing),
+        "boundary_target": quabla.Tensor([7, 1], [0.0] * 7),
+        "boundary_mask": quabla.Tensor([7, 1], [0.0] * 5 + [1.0] * 2),
+        "weight": quabla.Tensor([1, 1], [2.5]),
     }
 
-    cpu_optimizer = nabla.Adam(learning_rate=0.01)
+    cpu_optimizer = quabla.Adam(learning_rate=0.01)
     cpu_parameters = {"weight": inputs["weight"]}
     for _ in range(2000):
         _, gradients = graph.evaluate_value_and_vjp(
             loss.node_id,
             {**inputs, **cpu_parameters},
-            nabla.Tensor([], [1.0]),
+            quabla.Tensor([], [1.0]),
         )
         cpu_parameters = cpu_optimizer.step(cpu_parameters, {"weight": gradients["weight"]})
     cpu_loss, _ = graph.evaluate_value_and_vjp(
         loss.node_id,
         {**inputs, **cpu_parameters},
-        nabla.Tensor([], [1.0]),
+        quabla.Tensor([], [1.0]),
     )
 
-    mlx_optimizer = nabla.mlx_adam_loss_optimizer(
+    mlx_optimizer = quabla.mlx_adam_loss_optimizer(
         loss,
         ["weight"],
         inputs,
@@ -4649,7 +4649,7 @@ def test_mlx_poisson_pinn_matches_cpu_reference():
 
 
 def test_mlx_two_layer_poisson_pinn_matches_cpu_reference():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
 
     example = runpy.run_path(
@@ -4663,13 +4663,13 @@ def test_mlx_two_layer_poisson_pinn_matches_cpu_reference():
 
 
 def test_tensor_vjp_fn_reuses_a_compiled_plan_with_runtime_cotangent():
-    vjp = nabla.tensor_vjp_fn(lambda x: x.tanh(), [("x", [2, 2])])
+    vjp = quabla.tensor_vjp_fn(lambda x: x.tanh(), [("x", [2, 2])])
     values = [0.0, 1.0, -1.0, 0.5]
     cotangent = [1.0, 2.0, 3.0, 4.0]
 
     output, gradients = vjp(
-        {"x": nabla.Tensor([2, 2], values)},
-        nabla.Tensor([2, 2], cotangent),
+        {"x": quabla.Tensor([2, 2], values)},
+        quabla.Tensor([2, 2], cotangent),
     )
 
     assert_close_rows([output.to_flat_list()], [[math.tanh(value) for value in values]])
@@ -4680,13 +4680,13 @@ def test_tensor_vjp_fn_reuses_a_compiled_plan_with_runtime_cotangent():
 
 
 def test_tensor_jvp_fn_reuses_a_compiled_plan_with_runtime_tangent():
-    jvp = nabla.tensor_jvp_fn(lambda x: x.tanh(), [("x", [2, 2])])
+    jvp = quabla.tensor_jvp_fn(lambda x: x.tanh(), [("x", [2, 2])])
     values = [0.0, 1.0, -1.0, 0.5]
     tangent = [1.0, 2.0, 3.0, 4.0]
 
     output, output_tangent = jvp(
-        {"x": nabla.Tensor([2, 2], values)},
-        {"x": nabla.Tensor([2, 2], tangent)},
+        {"x": quabla.Tensor([2, 2], values)},
+        {"x": quabla.Tensor([2, 2], tangent)},
     )
 
     assert_close_rows([output.to_flat_list()], [[math.tanh(value) for value in values]])
@@ -4697,10 +4697,10 @@ def test_tensor_jvp_fn_reuses_a_compiled_plan_with_runtime_tangent():
 
 
 def test_tensor_jacobian_fn_reuses_a_compiled_plan():
-    jacobian = nabla.tensor_jacobian_fn(
+    jacobian = quabla.tensor_jacobian_fn(
         lambda x: x.powi(2), [("x", [2, 2])], "x"
     )
-    result = jacobian({"x": nabla.Tensor([2, 2], [1.0, 2.0, -3.0, 0.5])})
+    result = jacobian({"x": quabla.Tensor([2, 2], [1.0, 2.0, -3.0, 0.5])})
 
     assert_close_rows(
         result,
@@ -4714,9 +4714,9 @@ def test_tensor_jacobian_fn_reuses_a_compiled_plan():
 
 
 def test_adam_updates_tensor_parameters_with_persistent_moments():
-    optimizer = nabla.Adam(learning_rate=0.1)
-    parameters = {"weight": nabla.Tensor([2], [1.0, 2.0])}
-    gradients = {"weight": nabla.Tensor([2], [0.5, -0.5])}
+    optimizer = quabla.Adam(learning_rate=0.1)
+    parameters = {"weight": quabla.Tensor([2], [1.0, 2.0])}
+    gradients = {"weight": quabla.Tensor([2], [0.5, -0.5])}
 
     first = optimizer.step(parameters, gradients)
     second = optimizer.step(first, gradients)
@@ -4726,12 +4726,12 @@ def test_adam_updates_tensor_parameters_with_persistent_moments():
 
 
 def test_adam_invalid_step_does_not_advance_optimizer_state():
-    parameters = {"weight": nabla.Tensor([1], [1.0])}
-    gradients = {"weight": nabla.Tensor([1], [0.5])}
-    reference = nabla.Adam(learning_rate=0.1)
+    parameters = {"weight": quabla.Tensor([1], [1.0])}
+    gradients = {"weight": quabla.Tensor([1], [0.5])}
+    reference = quabla.Adam(learning_rate=0.1)
     expected = reference.step(reference.step(parameters, gradients), gradients)
 
-    optimizer = nabla.Adam(learning_rate=0.1)
+    optimizer = quabla.Adam(learning_rate=0.1)
     first = optimizer.step(parameters, gradients)
     try:
         optimizer.step(first, {})
@@ -4748,18 +4748,18 @@ def test_adam_invalid_step_does_not_advance_optimizer_state():
 
 
 def test_sum_gradients_combines_named_tensors():
-    combined = nabla.sum_gradients(
+    combined = quabla.sum_gradients(
         [
-            {"weight": nabla.Tensor([2], [1.0, -2.0])},
-            {"weight": nabla.Tensor([2], [0.5, 3.0])},
+            {"weight": quabla.Tensor([2], [1.0, -2.0])},
+            {"weight": quabla.Tensor([2], [0.5, 3.0])},
         ]
     )
 
     assert combined["weight"].to_flat_list() == [1.5, 1.0]
-    filtered = nabla.sum_gradients(
+    filtered = quabla.sum_gradients(
         [
-            {"weight": nabla.Tensor([1], [1.0]), "forcing": nabla.Tensor([1], [5.0])},
-            {"weight": nabla.Tensor([1], [2.0]), "target": nabla.Tensor([1], [7.0])},
+            {"weight": quabla.Tensor([1], [1.0]), "forcing": quabla.Tensor([1], [5.0])},
+            {"weight": quabla.Tensor([1], [2.0]), "target": quabla.Tensor([1], [7.0])},
         ],
         ["weight"],
     )
@@ -4771,25 +4771,25 @@ def test_poisson_residual_training_converges_with_symbolic_jvp_and_adam():
     target_weight = 1.0
     target_value = math.tanh(target_weight * coordinate)
     forcing = 2.0 * target_weight**2 * target_value * (1.0 - target_value**2)
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, forcing: (x * weight).tanh(),
         [("x", [1]), ("weight", [1]), ("forcing", [1])],
     )
     second_derivative = traced.symbolic_jvp("x").symbolic_jvp("x")
     residual = second_derivative.output + second_derivative.graph.input("forcing")
     loss = (residual * residual).sum()
-    parameters = {"weight": nabla.Tensor([1], [0.3])}
-    optimizer = nabla.Adam(learning_rate=0.03)
+    parameters = {"weight": quabla.Tensor([1], [0.3])}
+    optimizer = quabla.Adam(learning_rate=0.03)
 
     def value_and_grad(current):
         return second_derivative.graph.evaluate_value_and_vjp(
             loss.node_id,
             {
-                "x": nabla.Tensor([1], [coordinate]),
-                "forcing": nabla.Tensor([1], [forcing]),
+                "x": quabla.Tensor([1], [coordinate]),
+                "forcing": quabla.Tensor([1], [forcing]),
                 **current,
             },
-            nabla.Tensor([], [1.0]),
+            quabla.Tensor([], [1.0]),
         )
 
     initial_loss, _ = value_and_grad(parameters)
@@ -4812,25 +4812,25 @@ def test_batched_poisson_collocation_training_converges():
         * (1.0 - math.tanh(target_weight * coordinate) ** 2)
         for coordinate in coordinates
     ]
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, forcing: (x * weight).tanh(),
         [("x", [4, 1]), ("weight", [1, 1]), ("forcing", [4, 1])],
     )
     second_derivative = traced.symbolic_jvp("x").symbolic_jvp("x")
     residual = second_derivative.output + second_derivative.graph.input("forcing")
     loss = (residual * residual).mean()
-    parameters = {"weight": nabla.Tensor([1, 1], [0.3])}
-    optimizer = nabla.Adam(learning_rate=0.03)
+    parameters = {"weight": quabla.Tensor([1, 1], [0.3])}
+    optimizer = quabla.Adam(learning_rate=0.03)
 
     def value_and_grad(current):
         return second_derivative.graph.evaluate_value_and_vjp(
             loss.node_id,
             {
-                "x": nabla.Tensor([4, 1], coordinates),
-                "forcing": nabla.Tensor([4, 1], forcing_values),
+                "x": quabla.Tensor([4, 1], coordinates),
+                "forcing": quabla.Tensor([4, 1], forcing_values),
                 **current,
             },
-            nabla.Tensor([], [1.0]),
+            quabla.Tensor([], [1.0]),
         )
 
     initial_loss, _ = value_and_grad(parameters)
@@ -4852,7 +4852,7 @@ def test_poisson_training_aggregates_boundary_and_residual_gradients():
         * (1.0 - math.tanh(coordinate) ** 2)
         for coordinate in coordinates
     ]
-    residual_trace = nabla.trace_tensor(
+    residual_trace = quabla.trace_tensor(
         lambda x, weight, forcing: (x * weight).tanh(),
         [("x", [4, 1]), ("weight", [1, 1]), ("forcing", [4, 1])],
     )
@@ -4860,24 +4860,24 @@ def test_poisson_training_aggregates_boundary_and_residual_gradients():
     residual = second_derivative.output + second_derivative.graph.input("forcing")
     residual_loss = (residual * residual).mean()
     residual_plan = second_derivative.graph.compile_cpu(residual_loss.node_id)
-    boundary_trace = nabla.trace_tensor(
+    boundary_trace = quabla.trace_tensor(
         lambda x, weight, target: (x * weight).tanh(),
         [("x", [4, 1]), ("weight", [1, 1]), ("target", [4, 1])],
     )
     boundary_error = boundary_trace.output - boundary_trace.graph.input("target")
     boundary_loss = (boundary_error * boundary_error).mean()
     boundary_plan = boundary_trace.graph.compile_cpu(boundary_loss.node_id)
-    parameters = {"weight": nabla.Tensor([1, 1], [0.3])}
-    optimizer = nabla.Adam(learning_rate=0.03)
+    parameters = {"weight": quabla.Tensor([1, 1], [0.3])}
+    optimizer = quabla.Adam(learning_rate=0.03)
 
     def loss_and_gradient(current):
         residual_value, residual_gradients = residual_plan.evaluate_vjp(
-            {"x": nabla.Tensor([4, 1], coordinates), "forcing": nabla.Tensor([4, 1], forcing_values), **current},
-            nabla.Tensor([], [1.0]),
+            {"x": quabla.Tensor([4, 1], coordinates), "forcing": quabla.Tensor([4, 1], forcing_values), **current},
+            quabla.Tensor([], [1.0]),
         )
         boundary_value, boundary_gradients = boundary_plan.evaluate_vjp(
-            {"x": nabla.Tensor([4, 1], [1.0] * 4), "target": nabla.Tensor([4, 1], [math.tanh(1.0)] * 4), **current},
-            nabla.Tensor([], [1.0]),
+            {"x": quabla.Tensor([4, 1], [1.0] * 4), "target": quabla.Tensor([4, 1], [math.tanh(1.0)] * 4), **current},
+            quabla.Tensor([], [1.0]),
         )
         return residual_value.to_flat_list()[0] + boundary_value.to_flat_list()[0], {
             "weight": residual_gradients["weight"] + boundary_gradients["weight"]
@@ -4894,7 +4894,7 @@ def test_poisson_training_aggregates_boundary_and_residual_gradients():
 
 
 def test_symbolic_jvp_residual_backpropagates_through_two_layer_mlp():
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, w1, b1, w2, b2, forcing: (x.matmul(w1) + b1).tanh().matmul(w2)
         + b2,
         [
@@ -4912,14 +4912,14 @@ def test_symbolic_jvp_residual_backpropagates_through_two_layer_mlp():
     _, gradients = second_derivative.graph.evaluate_value_and_vjp(
         loss.node_id,
         {
-            "x": nabla.Tensor([4, 1], [0.2, 0.4, 0.6, 0.8]),
-            "w1": nabla.Tensor([1, 2], [0.7, -0.4]),
-            "b1": nabla.Tensor([1, 2], [0.1, -0.2]),
-            "w2": nabla.Tensor([2, 1], [0.5, -0.3]),
-            "b2": nabla.Tensor([1, 1], [0.05]),
-            "forcing": nabla.Tensor([4, 1], [0.2, -0.1, 0.3, -0.2]),
+            "x": quabla.Tensor([4, 1], [0.2, 0.4, 0.6, 0.8]),
+            "w1": quabla.Tensor([1, 2], [0.7, -0.4]),
+            "b1": quabla.Tensor([1, 2], [0.1, -0.2]),
+            "w2": quabla.Tensor([2, 1], [0.5, -0.3]),
+            "b2": quabla.Tensor([1, 1], [0.05]),
+            "forcing": quabla.Tensor([4, 1], [0.2, -0.1, 0.3, -0.2]),
         },
-        nabla.Tensor([], [1.0]),
+        quabla.Tensor([], [1.0]),
     )
 
     for name in ["w1", "b1", "w2"]:
@@ -4934,11 +4934,11 @@ def test_two_layer_mlp_poisson_training_converges():
     ]
     def model(x, w1, b1, w2, b2, forcing):
         return (x.matmul(w1) + b1).tanh().matmul(w2) + b2
-    residual_trace = nabla.trace_tensor(model, parameter_specs)
+    residual_trace = quabla.trace_tensor(model, parameter_specs)
     second_derivative = residual_trace.symbolic_jvp("x").symbolic_jvp("x")
     residual = second_derivative.output + second_derivative.graph.input("forcing")
     residual_loss = (residual * residual).mean()
-    boundary_trace = nabla.trace_tensor(
+    boundary_trace = quabla.trace_tensor(
         lambda x, w1, b1, w2, b2, target: (x.matmul(w1) + b1).tanh().matmul(w2) + b2,
         [
             ("x", [4, 1]), ("w1", [1, 2]), ("b1", [1, 2]),
@@ -4948,34 +4948,34 @@ def test_two_layer_mlp_poisson_training_converges():
     boundary_error = boundary_trace.output - boundary_trace.graph.input("target")
     boundary_loss = (boundary_error * boundary_error).mean()
     teacher = {
-        "w1": nabla.Tensor([1, 2], [1.2, -0.7]), "b1": nabla.Tensor([1, 2], [0.1, -0.2]),
-        "w2": nabla.Tensor([2, 1], [0.8, 0.5]), "b2": nabla.Tensor([1, 1], [0.05]),
+        "w1": quabla.Tensor([1, 2], [1.2, -0.7]), "b1": quabla.Tensor([1, 2], [0.1, -0.2]),
+        "w2": quabla.Tensor([2, 1], [0.8, 0.5]), "b2": quabla.Tensor([1, 1], [0.05]),
     }
     forcing = second_derivative.graph.evaluate(
         second_derivative.output.node_id,
-        {"x": nabla.Tensor([4, 1], coordinates), "forcing": nabla.Tensor([4, 1], [0.0] * 4), **teacher},
+        {"x": quabla.Tensor([4, 1], coordinates), "forcing": quabla.Tensor([4, 1], [0.0] * 4), **teacher},
     )
     boundary_coordinates = [0.0, 0.0, 1.0, 1.0]
     boundary_target = boundary_trace.graph.evaluate(
         boundary_trace.output.node_id,
-        {"x": nabla.Tensor([4, 1], boundary_coordinates), "target": nabla.Tensor([4, 1], [0.0] * 4), **teacher},
+        {"x": quabla.Tensor([4, 1], boundary_coordinates), "target": quabla.Tensor([4, 1], [0.0] * 4), **teacher},
     )
     parameters = {
-        "w1": nabla.Tensor([1, 2], [0.3, -0.1]), "b1": nabla.Tensor([1, 2], [0.0, 0.0]),
-        "w2": nabla.Tensor([2, 1], [0.2, 0.1]), "b2": nabla.Tensor([1, 1], [0.0]),
+        "w1": quabla.Tensor([1, 2], [0.3, -0.1]), "b1": quabla.Tensor([1, 2], [0.0, 0.0]),
+        "w2": quabla.Tensor([2, 1], [0.2, 0.1]), "b2": quabla.Tensor([1, 1], [0.0]),
     }
-    optimizer = nabla.Adam(learning_rate=0.02)
+    optimizer = quabla.Adam(learning_rate=0.02)
 
     def loss_and_grad(current):
         residual_value, residual_gradients = second_derivative.graph.evaluate_value_and_vjp(
             residual_loss.node_id,
-            {"x": nabla.Tensor([4, 1], coordinates), "forcing": nabla.Tensor([4, 1], [-value for value in forcing.to_flat_list()]), **current},
-            nabla.Tensor([], [1.0]),
+            {"x": quabla.Tensor([4, 1], coordinates), "forcing": quabla.Tensor([4, 1], [-value for value in forcing.to_flat_list()]), **current},
+            quabla.Tensor([], [1.0]),
         )
         boundary_value, boundary_gradients = boundary_trace.graph.evaluate_value_and_vjp(
             boundary_loss.node_id,
-            {"x": nabla.Tensor([4, 1], boundary_coordinates), "target": boundary_target, **current},
-            nabla.Tensor([], [1.0]),
+            {"x": quabla.Tensor([4, 1], boundary_coordinates), "target": boundary_target, **current},
+            quabla.Tensor([], [1.0]),
         )
         return residual_value.to_flat_list()[0] + boundary_value.to_flat_list()[0], {
             name: residual_gradients[name] + boundary_gradients[name] for name in current
@@ -4993,32 +4993,32 @@ def test_two_layer_mlp_poisson_training_converges():
 def test_standard_sine_poisson_training_recovers_pi():
     coordinates = [0.15, 0.35, 0.55, 0.75, 0.9]
     forcing = [math.pi**2 * math.sin(math.pi * coordinate) for coordinate in coordinates]
-    residual_trace = nabla.trace_tensor(
+    residual_trace = quabla.trace_tensor(
         lambda x, weight, forcing: (x * weight).sin(),
         [("x", [5, 1]), ("weight", [1, 1]), ("forcing", [5, 1])],
     )
     second_derivative = residual_trace.symbolic_jvp("x").symbolic_jvp("x")
     residual = second_derivative.output + second_derivative.graph.input("forcing")
     residual_loss = (residual * residual).mean()
-    boundary_trace = nabla.trace_tensor(
+    boundary_trace = quabla.trace_tensor(
         lambda x, weight, target: (x * weight).sin(),
         [("x", [2, 1]), ("weight", [1, 1]), ("target", [2, 1])],
     )
     boundary_error = boundary_trace.output - boundary_trace.graph.input("target")
     boundary_loss = (boundary_error * boundary_error).mean()
-    parameters = {"weight": nabla.Tensor([1, 1], [2.5])}
-    optimizer = nabla.Adam(learning_rate=0.01)
+    parameters = {"weight": quabla.Tensor([1, 1], [2.5])}
+    optimizer = quabla.Adam(learning_rate=0.01)
 
     def loss_and_grad(current):
         residual_value, residual_gradients = second_derivative.graph.evaluate_value_and_vjp(
             residual_loss.node_id,
-            {"x": nabla.Tensor([5, 1], coordinates), "forcing": nabla.Tensor([5, 1], forcing), **current},
-            nabla.Tensor([], [1.0]),
+            {"x": quabla.Tensor([5, 1], coordinates), "forcing": quabla.Tensor([5, 1], forcing), **current},
+            quabla.Tensor([], [1.0]),
         )
         boundary_value, boundary_gradients = boundary_trace.graph.evaluate_value_and_vjp(
             boundary_loss.node_id,
-            {"x": nabla.Tensor([2, 1], [0.0, 1.0]), "target": nabla.Tensor([2, 1], [0.0, 0.0]), **current},
-            nabla.Tensor([], [1.0]),
+            {"x": quabla.Tensor([2, 1], [0.0, 1.0]), "target": quabla.Tensor([2, 1], [0.0, 0.0]), **current},
+            quabla.Tensor([], [1.0]),
         )
         return residual_value.to_flat_list()[0] + boundary_value.to_flat_list()[0], {
             "weight": residual_gradients["weight"] + boundary_gradients["weight"]
@@ -5039,7 +5039,7 @@ def test_trace_tensor_compile_cpu_eliminates_unreachable_nodes():
         x.tanh()
         return x + x
 
-    traced = nabla.trace_tensor(model, [("x", [2, 2])])
+    traced = quabla.trace_tensor(model, [("x", [2, 2])])
     plan = traced.graph.compile_cpu(traced.output.node_id)
     direct_plan = traced.output.compile_cpu()
 
@@ -5077,20 +5077,20 @@ def test_trace_tensor_compile_cpu_eliminates_unreachable_nodes():
         },
     ]
     plan.validate_kernel_ir()
-    inputs = {"x": nabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])}
+    inputs = {"x": quabla.Tensor([2, 2], [1.0, 2.0, 3.0, 4.0])}
     assert plan.evaluate(inputs).to_flat_list() == [2.0, 4.0, 6.0, 8.0]
-    _, gradients = plan.evaluate_vjp(inputs, nabla.Tensor([2, 2], [1.0] * 4))
+    _, gradients = plan.evaluate_vjp(inputs, quabla.Tensor([2, 2], [1.0] * 4))
     assert gradients["x"].to_flat_list() == [2.0] * 4
     _, alias_gradients = plan.evaluate_value_and_vjp(
-        inputs, nabla.Tensor([2, 2], [1.0] * 4)
+        inputs, quabla.Tensor([2, 2], [1.0] * 4)
     )
     assert alias_gradients["x"].to_flat_list() == [2.0] * 4
-    _, tangent = plan.evaluate_jvp(inputs, {"x": nabla.Tensor([2, 2], [1.0] * 4)})
+    _, tangent = plan.evaluate_jvp(inputs, {"x": quabla.Tensor([2, 2], [1.0] * 4)})
     assert tangent.to_flat_list() == [2.0] * 4
 
 
 def test_kernel_ir_marks_reshape_as_logical_alias_candidate():
-    traced = nabla.trace_tensor(lambda x: x.reshape([4]), [("x", [2, 2])])
+    traced = quabla.trace_tensor(lambda x: x.reshape([4]), [("x", [2, 2])])
     plan = traced.output.compile_cpu()
     assert plan.kernel_ir()[1]["alias_of"] == 0
     plan.validate_kernel_ir()
@@ -5103,7 +5103,7 @@ def test_cpu_execution_plan_exposes_liveness_buffer_schedule():
         third = second + q
         return third + r
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         model,
         [("x", [2]), ("y", [2]), ("z", [2]), ("q", [2]), ("r", [2])],
     )
@@ -5118,7 +5118,7 @@ def test_cpu_execution_plan_exposes_liveness_buffer_schedule():
 
 
 def test_cpu_execution_plan_exposes_elementwise_fusion_regions():
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, bias: ((x @ weight + bias).tanh()).sin(),
         [("x", [2, 3]), ("weight", [3, 4]), ("bias", [1, 4])],
     )
@@ -5132,19 +5132,19 @@ def test_trace_tensor_compile_cpu_commons_identical_pure_nodes():
     def model(x):
         return x.tanh() + x.tanh()
 
-    traced = nabla.trace_tensor(model, [("x", [2, 2])])
+    traced = quabla.trace_tensor(model, [("x", [2, 2])])
     plan = traced.graph.compile_cpu(traced.output.node_id)
 
     assert plan.node_count == 3
     assert plan.kernel_ir()[2]["inputs"] == [1, 1]
     assert_close_rows(
-        [plan.evaluate({"x": nabla.Tensor([2, 2], [0.0, 1.0, -1.0, 0.5])}).to_flat_list()],
+        [plan.evaluate({"x": quabla.Tensor([2, 2], [0.0, 1.0, -1.0, 0.5])}).to_flat_list()],
         [[0.0, 2.0 * math.tanh(1.0), -2.0 * math.tanh(1.0), 2.0 * math.tanh(0.5)]],
     )
 
 
 def test_matrix_neg_and_scalar_div():
-    a = nabla.Matrix([[1.0, -2.0], [3.0, -4.0]])
+    a = quabla.Matrix([[1.0, -2.0], [3.0, -4.0]])
 
     negated = -a
     scaled = a / 2.0
@@ -5156,9 +5156,9 @@ def test_matrix_neg_and_scalar_div():
 
 
 def test_matrix_elementwise_division():
-    a = nabla.Matrix([[2.0, 6.0], [12.0, 20.0]])
-    b = nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
-    scalar = nabla.Matrix([[2.0]])
+    a = quabla.Matrix([[2.0, 6.0], [12.0, 20.0]])
+    b = quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
+    scalar = quabla.Matrix([[2.0]])
 
     divided = a / b
     scaled = a / scalar
@@ -5170,7 +5170,7 @@ def test_matrix_elementwise_division():
 
 
 def test_matrix_integer_power():
-    a = nabla.Matrix([[1.0, -2.0], [3.0, -4.0]])
+    a = quabla.Matrix([[1.0, -2.0], [3.0, -4.0]])
 
     squared = a**2
 
@@ -5179,7 +5179,7 @@ def test_matrix_integer_power():
 
 
 def test_matrix_float_power():
-    a = nabla.Matrix([[1.0, 4.0], [9.0, 16.0]])
+    a = quabla.Matrix([[1.0, 4.0], [9.0, 16.0]])
 
     rooted = a**0.5
 
@@ -5188,7 +5188,7 @@ def test_matrix_float_power():
 
 
 def test_matrix_sum():
-    a = nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
+    a = quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
 
     total = a.sum()
 
@@ -5197,7 +5197,7 @@ def test_matrix_sum():
 
 
 def test_matrix_sum_axis():
-    a = nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    a = quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
 
     column_totals = a.sum(axis=0)
     row_totals = a.sum(axis=1)
@@ -5209,7 +5209,7 @@ def test_matrix_sum_axis():
 
 
 def test_matrix_mean():
-    a = nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
+    a = quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])
 
     average = a.mean()
 
@@ -5218,7 +5218,7 @@ def test_matrix_mean():
 
 
 def test_matrix_mean_axis():
-    a = nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    a = quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
 
     column_means = a.mean(axis=0)
     row_means = a.mean(axis=1)
@@ -5230,7 +5230,7 @@ def test_matrix_mean_axis():
 
 
 def test_matrix_tanh():
-    a = nabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])
+    a = quabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])
 
     output = a.tanh()
 
@@ -5242,7 +5242,7 @@ def test_matrix_tanh():
 
 
 def test_matrix_exp():
-    a = nabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])
+    a = quabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])
 
     output = a.exp()
 
@@ -5254,7 +5254,7 @@ def test_matrix_exp():
 
 
 def test_matrix_log():
-    a = nabla.Matrix([[1.0, 2.0], [4.0, 8.0]])
+    a = quabla.Matrix([[1.0, 2.0], [4.0, 8.0]])
 
     output = a.log()
 
@@ -5266,7 +5266,7 @@ def test_matrix_log():
 
 
 def test_matrix_sqrt():
-    a = nabla.Matrix([[1.0, 4.0], [9.0, 16.0]])
+    a = quabla.Matrix([[1.0, 4.0], [9.0, 16.0]])
 
     output = a.sqrt()
 
@@ -5275,7 +5275,7 @@ def test_matrix_sqrt():
 
 
 def test_matrix_sin():
-    a = nabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])
+    a = quabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])
 
     output = a.sin()
 
@@ -5287,7 +5287,7 @@ def test_matrix_sin():
 
 
 def test_matrix_cos():
-    a = nabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])
+    a = quabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])
 
     output = a.cos()
 
@@ -5299,12 +5299,12 @@ def test_matrix_cos():
 
 
 def test_matrix_gt_and_where_support_masks():
-    a = nabla.Matrix([[-1.0, 0.5, 2.0], [3.0, -4.0, 5.0]])
+    a = quabla.Matrix([[-1.0, 0.5, 2.0], [3.0, -4.0, 5.0]])
     positive = a.gt(0.0)
-    selected = nabla.where(
+    selected = quabla.where(
         positive,
         a,
-        nabla.Matrix([[0.0]]),
+        quabla.Matrix([[0.0]]),
     )
 
     assert positive.shape == (2, 3)
@@ -5313,8 +5313,8 @@ def test_matrix_gt_and_where_support_masks():
 
 
 def test_matrix_rejects_incompatible_shapes():
-    a = nabla.Matrix([[1.0, 2.0]])
-    b = nabla.Matrix([[3.0, 4.0]])
+    a = quabla.Matrix([[1.0, 2.0]])
+    b = quabla.Matrix([[3.0, 4.0]])
 
     try:
         a @ b
@@ -5325,7 +5325,7 @@ def test_matrix_rejects_incompatible_shapes():
 
 
 def test_trace_graph_records_matmul():
-    graph = nabla.TraceGraph()
+    graph = quabla.TraceGraph()
     a = graph.input("a", (2, 3))
     b = graph.input("b", (3, 2))
 
@@ -5344,7 +5344,7 @@ def test_trace_function_records_python_matmul():
     def model(a, b):
         return a @ b
 
-    traced = nabla.trace(model, [("a", (2, 3)), ("b", (3, 2))])
+    traced = quabla.trace(model, [("a", (2, 3)), ("b", (3, 2))])
 
     assert traced.output.shape == (2, 2)
     assert traced.output.node_id == 2
@@ -5368,10 +5368,10 @@ def test_trace_function_records_python_matmul():
     gradients = traced.graph.evaluate_vjp(
         traced.output.node_id,
         {
-            "a": nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
-            "b": nabla.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]),
+            "a": quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            "b": quabla.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]),
         },
-        nabla.Matrix([[1.0, 0.5], [-1.0, 2.0]]),
+        quabla.Matrix([[1.0, 0.5], [-1.0, 2.0]]),
     )
     assert gradients["a"].to_list() == [[11.0, 14.0, 17.0], [9.0, 11.0, 13.0]]
     assert gradients["b"].to_list() == [[-3.0, 8.5], [-3.0, 11.0], [-3.0, 13.5]]
@@ -5381,9 +5381,9 @@ def test_trace_graph_ir_includes_backend_lowering_attrs():
     def model(a, b):
         powered = a**2.5
         reduced = powered.mean(axis=0)
-        return nabla.concat([reduced, b], axis=1)
+        return quabla.concat([reduced, b], axis=1)
 
-    traced = nabla.trace(model, [("a", (2, 2)), ("b", (1, 1))])
+    traced = quabla.trace(model, [("a", (2, 2)), ("b", (1, 1))])
     ir = traced.graph.ir()
 
     assert ir[2] == {
@@ -5413,9 +5413,9 @@ def test_trace_graph_lowers_to_deterministic_backend_text():
     def model(a, b):
         powered = a**2.5
         reduced = powered.mean(axis=0)
-        return nabla.concat([reduced, b], axis=1)
+        return quabla.concat([reduced, b], axis=1)
 
-    traced = nabla.trace(model, [("a", (2, 2)), ("b", (1, 1))])
+    traced = quabla.trace(model, [("a", (2, 2)), ("b", (1, 1))])
 
     assert traced.graph.lower_text() == "\n".join(
         [
@@ -5432,7 +5432,7 @@ def test_trace_graph_exports_verified_stablehlo_subset():
     def model(a, b):
         return (a + b).tanh()
 
-    traced = nabla.trace_tensor(model, [("a", [2, 1]), ("b", [2, 1])])
+    traced = quabla.trace_tensor(model, [("a", [2, 1]), ("b", [2, 1])])
 
     assert traced.graph.stablehlo_text(traced.output.node_id) == "\n".join(
         [
@@ -5451,16 +5451,16 @@ def test_trace_graph_evaluates_direct_jvp():
     def model(a, b):
         return (a @ b) + (a * b.T)
 
-    traced = nabla.trace(model, [("a", (2, 2)), ("b", (2, 2))])
+    traced = quabla.trace(model, [("a", (2, 2)), ("b", (2, 2))])
     primal, tangent = traced.graph.evaluate_jvp(
         traced.output.node_id,
         {
-            "a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
-            "b": nabla.Matrix([[5.0, 6.0], [7.0, 8.0]]),
+            "a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "b": quabla.Matrix([[5.0, 6.0], [7.0, 8.0]]),
         },
         {
-            "a": nabla.Matrix([[1.0, 0.5], [-1.0, 2.0]]),
-            "b": nabla.Matrix([[0.0, 1.0], [2.0, -1.0]]),
+            "a": quabla.Matrix([[1.0, 0.5], [-1.0, 2.0]]),
+            "b": quabla.Matrix([[0.0, 1.0], [2.0, -1.0]]),
         },
     )
 
@@ -5472,11 +5472,11 @@ def test_trace_graph_compiles_an_immutable_cpu_execution_plan():
     def model(a, b):
         return (a @ b).tanh()
 
-    traced = nabla.trace(model, [("a", (2, 2)), ("b", (2, 2))])
+    traced = quabla.trace(model, [("a", (2, 2)), ("b", (2, 2))])
     plan = traced.graph.compile_cpu(traced.output.node_id)
     values = {
-        "a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
-        "b": nabla.Matrix([[5.0, 6.0], [7.0, 8.0]]),
+        "a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+        "b": quabla.Matrix([[5.0, 6.0], [7.0, 8.0]]),
     }
 
     assert plan.output_node_id == traced.output.node_id
@@ -5490,13 +5490,13 @@ def test_cpu_execution_plan_evaluates_vjp():
     def model(a, b):
         return a @ b
 
-    traced = nabla.trace(model, [("a", (2, 2)), ("b", (2, 2))])
+    traced = quabla.trace(model, [("a", (2, 2)), ("b", (2, 2))])
     plan = traced.graph.compile_cpu(traced.output.node_id)
     values = {
-        "a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
-        "b": nabla.Matrix([[5.0, 6.0], [7.0, 8.0]]),
+        "a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+        "b": quabla.Matrix([[5.0, 6.0], [7.0, 8.0]]),
     }
-    cotangent = nabla.Matrix([[1.0, 0.5], [-1.0, 2.0]])
+    cotangent = quabla.Matrix([[1.0, 0.5], [-1.0, 2.0]])
 
     plan_gradients = plan.evaluate_vjp(values, cotangent)
     graph_gradients = traced.graph.evaluate_vjp(traced.output.node_id, values, cotangent)
@@ -5511,14 +5511,14 @@ def test_cpu_execution_plan_eliminates_unreachable_trace_nodes():
         _unreachable = a.exp()
         return a + 1.0
 
-    traced = nabla.trace(model, [("a", (2, 2))])
+    traced = quabla.trace(model, [("a", (2, 2))])
     plan = traced.graph.compile_cpu(traced.output.node_id)
 
     assert len(traced.graph.ir()) == 4
     assert plan.output_node_id == traced.output.node_id
     assert plan.node_count == 3
     assert plan.evaluate(
-        {"a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])}
+        {"a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])}
     ).to_list() == [[2.0, 3.0], [4.0, 5.0]]
 
 
@@ -5526,9 +5526,9 @@ def test_cpu_execution_plan_eliminates_repeated_unary_subexpressions():
     def model(a):
         return a.exp() + a.exp()
 
-    traced = nabla.trace(model, [("a", (2, 2))])
+    traced = quabla.trace(model, [("a", (2, 2))])
     plan = traced.graph.compile_cpu(traced.output.node_id)
-    values = {"a": nabla.Matrix([[0.0, 1.0], [2.0, 3.0]])}
+    values = {"a": quabla.Matrix([[0.0, 1.0], [2.0, 3.0]])}
 
     assert len(traced.graph.ir()) == 4
     assert plan.node_count == 3
@@ -5541,14 +5541,14 @@ def test_grad_traces_and_evaluates_vjp():
     def model(a, b):
         return a @ b
 
-    gradients = nabla.grad(
+    gradients = quabla.grad(
         model,
         [("a", (2, 3)), ("b", (3, 2))],
         {
-            "a": nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
-            "b": nabla.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]),
+            "a": quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            "b": quabla.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]),
         },
-        nabla.Matrix([[1.0, 0.5], [-1.0, 2.0]]),
+        quabla.Matrix([[1.0, 0.5], [-1.0, 2.0]]),
     )
 
     assert gradients["a"].to_list() == [[11.0, 14.0, 17.0], [9.0, 11.0, 13.0]]
@@ -5559,15 +5559,15 @@ def test_grad_fn_reuses_transform_callable():
     def model(a, b):
         return a @ b
 
-    grad_model = nabla.grad_fn(
+    grad_model = quabla.grad_fn(
         model,
         [("a", (2, 3)), ("b", (3, 2))],
-        nabla.Matrix([[1.0, 0.5], [-1.0, 2.0]]),
+        quabla.Matrix([[1.0, 0.5], [-1.0, 2.0]]),
     )
     gradients = grad_model(
         {
-            "a": nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
-            "b": nabla.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]),
+            "a": quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            "b": quabla.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]),
         }
     )
 
@@ -5579,16 +5579,16 @@ def test_grad_fn_evaluates_add_vjp():
     def model(a, b):
         return a + b
 
-    cotangent = nabla.Matrix([[0.5, 1.5], [2.5, 3.5]])
-    grad_model = nabla.grad_fn(
+    cotangent = quabla.Matrix([[0.5, 1.5], [2.5, 3.5]])
+    grad_model = quabla.grad_fn(
         model,
         [("a", (2, 2)), ("b", (2, 2))],
         cotangent,
     )
     gradients = grad_model(
         {
-            "a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
-            "b": nabla.Matrix([[5.0, 6.0], [7.0, 8.0]]),
+            "a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "b": quabla.Matrix([[5.0, 6.0], [7.0, 8.0]]),
         }
     )
 
@@ -5600,15 +5600,15 @@ def test_grad_fn_evaluates_mul_vjp():
     def model(a, b):
         return a * b
 
-    grad_model = nabla.grad_fn(
+    grad_model = quabla.grad_fn(
         model,
         [("a", (2, 2)), ("b", (2, 2))],
-        nabla.Matrix([[2.0, 3.0], [4.0, 5.0]]),
+        quabla.Matrix([[2.0, 3.0], [4.0, 5.0]]),
     )
     gradients = grad_model(
         {
-            "a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
-            "b": nabla.Matrix([[0.5, 1.5], [2.5, 3.5]]),
+            "a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "b": quabla.Matrix([[0.5, 1.5], [2.5, 3.5]]),
         }
     )
 
@@ -5620,14 +5620,14 @@ def test_grad_fn_evaluates_square_sum_vjp():
     def model(a):
         return (a * a).sum()
 
-    grad_model = nabla.grad_fn(
+    grad_model = quabla.grad_fn(
         model,
         [("a", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
     gradients = grad_model(
         {
-            "a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
         }
     )
 
@@ -5635,14 +5635,14 @@ def test_grad_fn_evaluates_square_sum_vjp():
 
 
 def test_grad_fn_evaluates_square_mean_vjp():
-    grad_model = nabla.grad_fn(
+    grad_model = quabla.grad_fn(
         lambda a: (a * a).mean(),
         [("a", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
 
     gradients = grad_model(
-        {"a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])}
+        {"a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])}
     )
 
     assert gradients["a"].to_list() == [[0.5, 1.0], [1.5, 2.0]]
@@ -5653,15 +5653,15 @@ def test_grad_fn_evaluates_squared_error_vjp():
         error = pred - target
         return (error * error).sum()
 
-    grad_model = nabla.grad_fn(
+    grad_model = quabla.grad_fn(
         model,
         [("pred", (2, 2)), ("target", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
     gradients = grad_model(
         {
-            "pred": nabla.Matrix([[1.0, 3.0], [2.0, 5.0]]),
-            "target": nabla.Matrix([[0.5, 1.0], [3.0, 1.5]]),
+            "pred": quabla.Matrix([[1.0, 3.0], [2.0, 5.0]]),
+            "target": quabla.Matrix([[0.5, 1.0], [3.0, 1.5]]),
         }
     )
 
@@ -5674,14 +5674,14 @@ def test_grad_scalar_fn_seeds_scalar_cotangent():
         error = pred - target
         return (error * error).sum()
 
-    grad_model = nabla.grad_scalar_fn(
+    grad_model = quabla.grad_scalar_fn(
         model,
         [("pred", (2, 2)), ("target", (2, 2))],
     )
     gradients = grad_model(
         {
-            "pred": nabla.Matrix([[1.0, 3.0], [2.0, 5.0]]),
-            "target": nabla.Matrix([[0.5, 1.0], [3.0, 1.5]]),
+            "pred": quabla.Matrix([[1.0, 3.0], [2.0, 5.0]]),
+            "target": quabla.Matrix([[0.5, 1.0], [3.0, 1.5]]),
         }
     )
 
@@ -5690,15 +5690,15 @@ def test_grad_scalar_fn_seeds_scalar_cotangent():
 
 
 def test_grad_scalar_decorator_factory():
-    @nabla.grad_scalar([("pred", (2, 2)), ("target", (2, 2))])
+    @quabla.grad_scalar([("pred", (2, 2)), ("target", (2, 2))])
     def model(pred, target):
         error = pred - target
         return (error * error).sum()
 
     gradients = model(
         {
-            "pred": nabla.Matrix([[1.0, 3.0], [2.0, 5.0]]),
-            "target": nabla.Matrix([[0.5, 1.0], [3.0, 1.5]]),
+            "pred": quabla.Matrix([[1.0, 3.0], [2.0, 5.0]]),
+            "target": quabla.Matrix([[0.5, 1.0], [3.0, 1.5]]),
         }
     )
 
@@ -5713,24 +5713,24 @@ def test_grad_fn_traces_once_at_transform_creation():
         calls["count"] += 1
         return a + b
 
-    grad_model = nabla.grad_fn(
+    grad_model = quabla.grad_fn(
         model,
         [("a", (2, 2)), ("b", (2, 2))],
-        nabla.Matrix([[1.0, 1.0], [1.0, 1.0]]),
+        quabla.Matrix([[1.0, 1.0], [1.0, 1.0]]),
     )
 
     assert calls["count"] == 1
 
     first = grad_model(
         {
-            "a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
-            "b": nabla.Matrix([[5.0, 6.0], [7.0, 8.0]]),
+            "a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "b": quabla.Matrix([[5.0, 6.0], [7.0, 8.0]]),
         }
     )
     second = grad_model(
         {
-            "a": nabla.Matrix([[10.0, 20.0], [30.0, 40.0]]),
-            "b": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "a": quabla.Matrix([[10.0, 20.0], [30.0, 40.0]]),
+            "b": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
         }
     )
 
@@ -5748,12 +5748,12 @@ def test_grad_scalar_fn_traces_once_at_transform_creation():
         calls["count"] += 1
         return (a * a).sum()
 
-    grad_model = nabla.grad_scalar_fn(model, [("a", (2, 2))])
+    grad_model = quabla.grad_scalar_fn(model, [("a", (2, 2))])
 
     assert calls["count"] == 1
 
-    first = grad_model({"a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])})
-    second = grad_model({"a": nabla.Matrix([[2.0, 4.0], [6.0, 8.0]])})
+    first = grad_model({"a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])})
+    second = grad_model({"a": quabla.Matrix([[2.0, 4.0], [6.0, 8.0]])})
 
     assert first["a"].to_list() == [[2.0, 4.0], [6.0, 8.0]]
     assert second["a"].to_list() == [[4.0, 8.0], [12.0, 16.0]]
@@ -5763,15 +5763,15 @@ def test_grad_scalar_fn_traces_once_at_transform_creation():
 def test_grad_scalar_decorator_traces_once_at_decoration_time():
     calls = {"count": 0}
 
-    @nabla.grad_scalar([("a", (2, 2))])
+    @quabla.grad_scalar([("a", (2, 2))])
     def model(a):
         calls["count"] += 1
         return (a * a).sum()
 
     assert calls["count"] == 1
 
-    first = model({"a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])})
-    second = model({"a": nabla.Matrix([[2.0, 4.0], [6.0, 8.0]])})
+    first = model({"a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])})
+    second = model({"a": quabla.Matrix([[2.0, 4.0], [6.0, 8.0]])})
 
     assert first["a"].to_list() == [[2.0, 4.0], [6.0, 8.0]]
     assert second["a"].to_list() == [[4.0, 8.0], [12.0, 16.0]]
@@ -5785,19 +5785,19 @@ def test_value_and_grad_fn_returns_value_and_traces_once():
         calls["count"] += 1
         return (a * a).sum()
 
-    value_and_grad = nabla.value_and_grad_fn(
+    value_and_grad = quabla.value_and_grad_fn(
         model,
         [("a", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
 
     assert calls["count"] == 1
 
     first_value, first_gradients = value_and_grad(
-        {"a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])}
+        {"a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])}
     )
     second_value, second_gradients = value_and_grad(
-        {"a": nabla.Matrix([[2.0, 4.0], [6.0, 8.0]])}
+        {"a": quabla.Matrix([[2.0, 4.0], [6.0, 8.0]])}
     )
 
     assert first_value.to_list() == [[30.0]]
@@ -5814,13 +5814,13 @@ def test_vjp_fn_traces_once_and_uses_runtime_cotangent():
         calls["count"] += 1
         return (a**2) + (a * 3.0)
 
-    vjp_model = nabla.vjp_fn(model, [("a", (2, 2))])
+    vjp_model = quabla.vjp_fn(model, [("a", (2, 2))])
 
     assert calls["count"] == 1
 
     primal, gradients = vjp_model(
-        {"a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])},
-        nabla.Matrix([[1.0, 0.5], [-1.0, 2.0]]),
+        {"a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])},
+        quabla.Matrix([[1.0, 0.5], [-1.0, 2.0]]),
     )
 
     assert primal.to_list() == [[4.0, 10.0], [18.0, 28.0]]
@@ -5835,12 +5835,12 @@ def test_jacobian_fn_traces_once_and_returns_dense_jacobian():
         calls["count"] += 1
         return (a**2) + (a * 3.0)
 
-    jacobian_model = nabla.jacobian_fn(model, [("a", (2, 2))])
+    jacobian_model = quabla.jacobian_fn(model, [("a", (2, 2))])
 
     assert calls["count"] == 1
 
     jacobian = jacobian_model(
-        {"a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])}
+        {"a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])}
     )
 
     assert jacobian.shape == (4, 4)
@@ -5860,7 +5860,7 @@ def test_jacobians_fn_traces_once_and_returns_dense_jacobians_for_each_input():
         calls["count"] += 1
         return a + b
 
-    jacobians_model = nabla.jacobians_fn(
+    jacobians_model = quabla.jacobians_fn(
         model,
         [("a", (2, 2)), ("b", (2, 2))],
     )
@@ -5869,8 +5869,8 @@ def test_jacobians_fn_traces_once_and_returns_dense_jacobians_for_each_input():
 
     jacobians = jacobians_model(
         {
-            "a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
-            "b": nabla.Matrix([[10.0, 20.0], [30.0, 40.0]]),
+            "a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "b": quabla.Matrix([[10.0, 20.0], [30.0, 40.0]]),
         }
     )
 
@@ -5895,13 +5895,13 @@ def test_jvp_fn_traces_once_and_returns_primal_and_tangent():
         calls["count"] += 1
         return (a**2) + (a * 3.0)
 
-    jvp_model = nabla.jvp_fn(model, [("a", (2, 2))])
+    jvp_model = quabla.jvp_fn(model, [("a", (2, 2))])
 
     assert calls["count"] == 1
 
     primal, tangent = jvp_model(
-        {"a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])},
-        {"a": nabla.Matrix([[1.0, 0.5], [-1.0, 2.0]])},
+        {"a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])},
+        {"a": quabla.Matrix([[1.0, 0.5], [-1.0, 2.0]])},
     )
 
     assert primal.to_list() == [[4.0, 10.0], [18.0, 28.0]]
@@ -5916,18 +5916,18 @@ def test_jvp_fn_supports_multiple_input_tangents():
         calls["count"] += 1
         return a * b
 
-    jvp_model = nabla.jvp_fn(model, [("a", (2, 2)), ("b", (2, 2))])
+    jvp_model = quabla.jvp_fn(model, [("a", (2, 2)), ("b", (2, 2))])
 
     assert calls["count"] == 1
 
     primal, tangent = jvp_model(
         {
-            "a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
-            "b": nabla.Matrix([[10.0, 20.0], [30.0, 40.0]]),
+            "a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "b": quabla.Matrix([[10.0, 20.0], [30.0, 40.0]]),
         },
         {
-            "a": nabla.Matrix([[0.5, 1.0], [1.5, 2.0]]),
-            "b": nabla.Matrix([[2.0, 3.0], [4.0, 5.0]]),
+            "a": quabla.Matrix([[0.5, 1.0], [1.5, 2.0]]),
+            "b": quabla.Matrix([[2.0, 3.0], [4.0, 5.0]]),
         },
     )
 
@@ -5937,21 +5937,21 @@ def test_jvp_fn_supports_multiple_input_tangents():
 
 
 def test_jit_and_vjp_support_transpose():
-    @nabla.jit([("a", (2, 3))])
+    @quabla.jit([("a", (2, 3))])
     def transpose_primal(a):
         return a.T
 
     output = transpose_primal(
-        {"a": nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])}
+        {"a": quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])}
     )
 
     assert output.shape == (3, 2)
     assert output.to_list() == [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]]
 
-    transpose_vjp = nabla.vjp_fn(lambda a: a.transpose(), [("a", (2, 3))])
+    transpose_vjp = quabla.vjp_fn(lambda a: a.transpose(), [("a", (2, 3))])
     primal, gradients = transpose_vjp(
-        {"a": nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
-        nabla.Matrix([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]]),
+        {"a": quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+        quabla.Matrix([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]]),
     )
 
     assert primal.to_list() == [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]]
@@ -5960,28 +5960,28 @@ def test_jit_and_vjp_support_transpose():
 
 
 def test_jit_and_vjp_support_scalar_matrix_broadcast():
-    @nabla.jit([("a", (2, 2)), ("s", (1, 1))])
+    @quabla.jit([("a", (2, 2)), ("s", (1, 1))])
     def shift(a, s):
         return a + s
 
     output = shift(
         {
-            "a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
-            "s": nabla.Matrix([[10.0]]),
+            "a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "s": quabla.Matrix([[10.0]]),
         }
     )
 
     assert output.to_list() == [[11.0, 12.0], [13.0, 14.0]]
 
-    scaled_sum_grad = nabla.grad_fn(
+    scaled_sum_grad = quabla.grad_fn(
         lambda a, s: (a * s).sum(),
         [("a", (2, 2)), ("s", (1, 1))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
     gradients = scaled_sum_grad(
         {
-            "a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
-            "s": nabla.Matrix([[3.0]]),
+            "a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "s": quabla.Matrix([[3.0]]),
         }
     )
 
@@ -5991,21 +5991,21 @@ def test_jit_and_vjp_support_scalar_matrix_broadcast():
 
 
 def test_jit_and_vjp_support_reshape():
-    @nabla.jit([("a", (2, 3))])
+    @quabla.jit([("a", (2, 3))])
     def reshape_primal(a):
         return a.reshape(3, 2)
 
     output = reshape_primal(
-        {"a": nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])}
+        {"a": quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])}
     )
 
     assert output.shape == (3, 2)
     assert output.to_list() == [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
 
-    reshape_vjp = nabla.vjp_fn(lambda a: a.reshape(3, 2), [("a", (2, 3))])
+    reshape_vjp = quabla.vjp_fn(lambda a: a.reshape(3, 2), [("a", (2, 3))])
     primal, gradients = reshape_vjp(
-        {"a": nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
-        nabla.Matrix([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]]),
+        {"a": quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])},
+        quabla.Matrix([[10.0, 20.0], [30.0, 40.0], [50.0, 60.0]]),
     )
 
     assert primal.to_list() == [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
@@ -6014,70 +6014,70 @@ def test_jit_and_vjp_support_reshape():
 
 
 def test_jit_and_grad_support_scalar_literals():
-    @nabla.jit([("a", (2, 2))])
+    @quabla.jit([("a", (2, 2))])
     def affine(a):
         return (a * 2.0) + 1.0
 
-    output = affine({"a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])})
+    output = affine({"a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])})
 
     assert output.to_list() == [[3.0, 5.0], [7.0, 9.0]]
 
-    grad_affine_sum = nabla.grad_fn(
+    grad_affine_sum = quabla.grad_fn(
         lambda a: ((a * 2.0) + 1.0).sum(),
         [("a", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
     gradients = grad_affine_sum(
-        {"a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])}
+        {"a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])}
     )
 
     assert gradients["a"].to_list() == [[2.0, 2.0], [2.0, 2.0]]
 
 
 def test_jit_and_grad_support_neg_and_scalar_division():
-    @nabla.jit([("a", (2, 2))])
+    @quabla.jit([("a", (2, 2))])
     def normalized(a):
         return -a / 2.0
 
-    output = normalized({"a": nabla.Matrix([[1.0, -2.0], [3.0, -4.0]])})
+    output = normalized({"a": quabla.Matrix([[1.0, -2.0], [3.0, -4.0]])})
 
     assert output.to_list() == [[-0.5, 1.0], [-1.5, 2.0]]
 
-    grad_normalized_sum = nabla.grad_fn(
+    grad_normalized_sum = quabla.grad_fn(
         lambda a: (-a / 2.0).sum(),
         [("a", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
     gradients = grad_normalized_sum(
-        {"a": nabla.Matrix([[1.0, -2.0], [3.0, -4.0]])}
+        {"a": quabla.Matrix([[1.0, -2.0], [3.0, -4.0]])}
     )
 
     assert gradients["a"].to_list() == [[-0.5, -0.5], [-0.5, -0.5]]
 
 
 def test_jit_and_grad_support_elementwise_division():
-    @nabla.jit([("a", (2, 2)), ("b", (2, 2))])
+    @quabla.jit([("a", (2, 2)), ("b", (2, 2))])
     def ratio(a, b):
         return a / b
 
     output = ratio(
         {
-            "a": nabla.Matrix([[2.0, 6.0], [12.0, 20.0]]),
-            "b": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "a": quabla.Matrix([[2.0, 6.0], [12.0, 20.0]]),
+            "b": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
         }
     )
 
     assert output.to_list() == [[2.0, 3.0], [4.0, 5.0]]
 
-    grad_ratio_sum = nabla.grad_fn(
+    grad_ratio_sum = quabla.grad_fn(
         lambda a, b: (a / b).sum(),
         [("a", (2, 2)), ("b", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
     gradients = grad_ratio_sum(
         {
-            "a": nabla.Matrix([[2.0, 6.0], [12.0, 20.0]]),
-            "b": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "a": quabla.Matrix([[2.0, 6.0], [12.0, 20.0]]),
+            "b": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
         }
     )
 
@@ -6092,24 +6092,24 @@ def test_jit_and_grad_support_elementwise_division():
 
 
 def test_jit_and_vjp_support_row_and_column_matrix_broadcast():
-    @nabla.jit([("a", (2, 3)), ("row", (1, 3)), ("column", (2, 1))])
+    @quabla.jit([("a", (2, 3)), ("row", (1, 3)), ("column", (2, 1))])
     def broadcasted(a, row, column):
         return (a + row) * column
 
     values = {
-        "a": nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
-        "row": nabla.Matrix([[10.0, 20.0, 30.0]]),
-        "column": nabla.Matrix([[2.0], [3.0]]),
+        "a": quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+        "row": quabla.Matrix([[10.0, 20.0, 30.0]]),
+        "column": quabla.Matrix([[2.0], [3.0]]),
     }
 
     output = broadcasted(values)
 
     assert output.to_list() == [[22.0, 44.0, 66.0], [42.0, 75.0, 108.0]]
 
-    grad_broadcasted_sum = nabla.grad_fn(
+    grad_broadcasted_sum = quabla.grad_fn(
         lambda a, row, column: (((a + row) * column).sum()),
         [("a", (2, 3)), ("row", (1, 3)), ("column", (2, 1))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
     gradients = grad_broadcasted_sum(values)
 
@@ -6119,22 +6119,22 @@ def test_jit_and_vjp_support_row_and_column_matrix_broadcast():
 
 
 def test_jit_and_vjp_support_where_masks():
-    @nabla.jit([("a", (2, 3))])
+    @quabla.jit([("a", (2, 3))])
     def relu_like(a):
-        return nabla.where(a.gt(0.0), a, a * 0.1)
+        return quabla.where(a.gt(0.0), a, a * 0.1)
 
     values = {
-        "a": nabla.Matrix([[-1.0, 0.5, 2.0], [3.0, -4.0, 5.0]]),
+        "a": quabla.Matrix([[-1.0, 0.5, 2.0], [3.0, -4.0, 5.0]]),
     }
 
     output = relu_like(values)
 
     assert output.to_list() == [[-0.1, 0.5, 2.0], [3.0, -0.4, 5.0]]
 
-    grad_relu_like_sum = nabla.grad_fn(
-        lambda a: nabla.where(a.gt(0.0), a, a * 0.1).sum(),
+    grad_relu_like_sum = quabla.grad_fn(
+        lambda a: quabla.where(a.gt(0.0), a, a * 0.1).sum(),
         [("a", (2, 3))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
     gradients = grad_relu_like_sum(values)
 
@@ -6142,70 +6142,70 @@ def test_jit_and_vjp_support_where_masks():
 
 
 def test_jit_and_grad_support_integer_power():
-    @nabla.jit([("a", (2, 2))])
+    @quabla.jit([("a", (2, 2))])
     def square(a):
         return a**2
 
-    output = square({"a": nabla.Matrix([[1.0, -2.0], [3.0, -4.0]])})
+    output = square({"a": quabla.Matrix([[1.0, -2.0], [3.0, -4.0]])})
 
     assert output.to_list() == [[1.0, 4.0], [9.0, 16.0]]
 
-    grad_square_sum = nabla.grad_fn(
+    grad_square_sum = quabla.grad_fn(
         lambda a: (a**2).sum(),
         [("a", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
     gradients = grad_square_sum(
-        {"a": nabla.Matrix([[1.0, -2.0], [3.0, -4.0]])}
+        {"a": quabla.Matrix([[1.0, -2.0], [3.0, -4.0]])}
     )
 
     assert gradients["a"].to_list() == [[2.0, -4.0], [6.0, -8.0]]
 
 
 def test_jit_and_grad_support_float_power():
-    @nabla.jit([("a", (2, 2))])
+    @quabla.jit([("a", (2, 2))])
     def cube(a):
         return a**3.0
 
-    output = cube({"a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])})
+    output = cube({"a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])})
 
     assert output.to_list() == [[1.0, 8.0], [27.0, 64.0]]
 
-    grad_cube_sum = nabla.grad_fn(
+    grad_cube_sum = quabla.grad_fn(
         lambda a: (a**3.0).sum(),
         [("a", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
     gradients = grad_cube_sum(
-        {"a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]])}
+        {"a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]])}
     )
 
     assert gradients["a"].to_list() == [[3.0, 12.0], [27.0, 48.0]]
 
 
 def test_jit_and_vjp_support_axis_reductions():
-    @nabla.jit([("a", (2, 3))])
+    @quabla.jit([("a", (2, 3))])
     def column_means(a):
         return a.mean(axis=0)
 
-    @nabla.jit([("a", (2, 3))])
+    @quabla.jit([("a", (2, 3))])
     def row_totals(a):
         return a.sum(axis=1)
 
-    values = {"a": nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])}
+    values = {"a": quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])}
 
     assert column_means(values).to_list() == [[2.5, 3.5, 4.5]]
     assert row_totals(values).to_list() == [[6.0], [15.0]]
 
-    grad_column_means = nabla.grad_fn(
+    grad_column_means = quabla.grad_fn(
         lambda a: a.mean(axis=0).sum(),
         [("a", (2, 3))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
-    grad_row_totals = nabla.grad_fn(
+    grad_row_totals = quabla.grad_fn(
         lambda a: a.sum(axis=1).sum(),
         [("a", (2, 3))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
 
     assert grad_column_means(values)["a"].to_list() == [
@@ -6219,21 +6219,21 @@ def test_jit_and_vjp_support_axis_reductions():
 
 
 def test_jit_and_vjp_support_concat():
-    @nabla.jit([("a", (1, 2)), ("b", (2, 2))])
+    @quabla.jit([("a", (1, 2)), ("b", (2, 2))])
     def vertical_concat(a, b):
-        return nabla.concat([a, b], axis=0)
+        return quabla.concat([a, b], axis=0)
 
-    @nabla.jit([("left", (2, 1)), ("right", (2, 2))])
+    @quabla.jit([("left", (2, 1)), ("right", (2, 2))])
     def horizontal_concat(left, right):
-        return nabla.concat([left, right], axis=1)
+        return quabla.concat([left, right], axis=1)
 
     vertical_values = {
-        "a": nabla.Matrix([[1.0, 2.0]]),
-        "b": nabla.Matrix([[3.0, 4.0], [5.0, 6.0]]),
+        "a": quabla.Matrix([[1.0, 2.0]]),
+        "b": quabla.Matrix([[3.0, 4.0], [5.0, 6.0]]),
     }
     horizontal_values = {
-        "left": nabla.Matrix([[1.0], [2.0]]),
-        "right": nabla.Matrix([[3.0, 4.0], [5.0, 6.0]]),
+        "left": quabla.Matrix([[1.0], [2.0]]),
+        "right": quabla.Matrix([[3.0, 4.0], [5.0, 6.0]]),
     }
 
     assert vertical_concat(vertical_values).to_list() == [
@@ -6246,15 +6246,15 @@ def test_jit_and_vjp_support_concat():
         [2.0, 5.0, 6.0],
     ]
 
-    grad_vertical = nabla.grad_fn(
-        lambda a, b: nabla.concat([a, b], axis=0).sum(),
+    grad_vertical = quabla.grad_fn(
+        lambda a, b: quabla.concat([a, b], axis=0).sum(),
         [("a", (1, 2)), ("b", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
-    grad_horizontal = nabla.grad_fn(
-        lambda left, right: nabla.concat([left, right], axis=1).sum(),
+    grad_horizontal = quabla.grad_fn(
+        lambda left, right: quabla.concat([left, right], axis=1).sum(),
         [("left", (2, 1)), ("right", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
 
     vertical_gradients = grad_vertical(vertical_values)
@@ -6267,14 +6267,14 @@ def test_jit_and_vjp_support_concat():
 
 
 def test_grad_fn_evaluates_tanh_vjp():
-    grad_model = nabla.grad_fn(
+    grad_model = quabla.grad_fn(
         lambda a: a.tanh().sum(),
         [("a", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
 
     gradients = grad_model(
-        {"a": nabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])}
+        {"a": quabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])}
     )
 
     assert_close_rows(
@@ -6287,14 +6287,14 @@ def test_grad_fn_evaluates_tanh_vjp():
 
 
 def test_grad_fn_evaluates_exp_vjp():
-    grad_model = nabla.grad_fn(
+    grad_model = quabla.grad_fn(
         lambda a: a.exp().sum(),
         [("a", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
 
     gradients = grad_model(
-        {"a": nabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])}
+        {"a": quabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])}
     )
 
     assert_close_rows(
@@ -6304,14 +6304,14 @@ def test_grad_fn_evaluates_exp_vjp():
 
 
 def test_grad_fn_evaluates_log_vjp():
-    grad_model = nabla.grad_fn(
+    grad_model = quabla.grad_fn(
         lambda a: a.log().sum(),
         [("a", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
 
     gradients = grad_model(
-        {"a": nabla.Matrix([[1.0, 2.0], [4.0, 8.0]])}
+        {"a": quabla.Matrix([[1.0, 2.0], [4.0, 8.0]])}
     )
 
     assert_close_rows(
@@ -6321,14 +6321,14 @@ def test_grad_fn_evaluates_log_vjp():
 
 
 def test_grad_fn_evaluates_sqrt_vjp():
-    grad_model = nabla.grad_fn(
+    grad_model = quabla.grad_fn(
         lambda a: a.sqrt().sum(),
         [("a", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
 
     gradients = grad_model(
-        {"a": nabla.Matrix([[1.0, 4.0], [9.0, 16.0]])}
+        {"a": quabla.Matrix([[1.0, 4.0], [9.0, 16.0]])}
     )
 
     assert_close_rows(
@@ -6338,14 +6338,14 @@ def test_grad_fn_evaluates_sqrt_vjp():
 
 
 def test_grad_fn_evaluates_sin_vjp():
-    grad_model = nabla.grad_fn(
+    grad_model = quabla.grad_fn(
         lambda a: a.sin().sum(),
         [("a", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
 
     gradients = grad_model(
-        {"a": nabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])}
+        {"a": quabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])}
     )
 
     assert_close_rows(
@@ -6355,14 +6355,14 @@ def test_grad_fn_evaluates_sin_vjp():
 
 
 def test_grad_fn_evaluates_cos_vjp():
-    grad_model = nabla.grad_fn(
+    grad_model = quabla.grad_fn(
         lambda a: a.cos().sum(),
         [("a", (2, 2))],
-        nabla.Matrix([[1.0]]),
+        quabla.Matrix([[1.0]]),
     )
 
     gradients = grad_model(
-        {"a": nabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])}
+        {"a": quabla.Matrix([[0.0, 1.0], [-1.0, 2.0]])}
     )
 
     assert_close_rows(
@@ -6372,15 +6372,15 @@ def test_grad_fn_evaluates_cos_vjp():
 
 
 def test_jit_decorator_factory_evaluates_primal():
-    @nabla.jit([("a", (2, 3)), ("b", (3, 2)), ("bias", (2, 2))])
+    @quabla.jit([("a", (2, 3)), ("b", (3, 2)), ("bias", (2, 2))])
     def model(a, b, bias):
         return (a @ b) + bias
 
     output = model(
         {
-            "a": nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
-            "b": nabla.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]),
-            "bias": nabla.Matrix([[0.1, 0.2], [0.3, 0.4]]),
+            "a": quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            "b": quabla.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]),
+            "bias": quabla.Matrix([[0.1, 0.2], [0.3, 0.4]]),
         }
     )
 
@@ -6391,7 +6391,7 @@ def test_jit_decorator_factory_evaluates_primal():
 def test_jit_traces_once_at_decoration_time():
     calls = {"count": 0}
 
-    @nabla.jit([("a", (2, 2)), ("b", (2, 2))])
+    @quabla.jit([("a", (2, 2)), ("b", (2, 2))])
     def model(a, b):
         calls["count"] += 1
         return a + b
@@ -6400,14 +6400,14 @@ def test_jit_traces_once_at_decoration_time():
 
     first = model(
         {
-            "a": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
-            "b": nabla.Matrix([[5.0, 6.0], [7.0, 8.0]]),
+            "a": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "b": quabla.Matrix([[5.0, 6.0], [7.0, 8.0]]),
         }
     )
     second = model(
         {
-            "a": nabla.Matrix([[10.0, 20.0], [30.0, 40.0]]),
-            "b": nabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
+            "a": quabla.Matrix([[10.0, 20.0], [30.0, 40.0]]),
+            "b": quabla.Matrix([[1.0, 2.0], [3.0, 4.0]]),
         }
     )
 
@@ -6420,16 +6420,16 @@ def test_grad_fn_evaluates_composed_add_matmul_vjp():
     def model(a, b, bias):
         return (a @ b) + bias
 
-    grad_model = nabla.grad_fn(
+    grad_model = quabla.grad_fn(
         model,
         [("a", (2, 3)), ("b", (3, 2)), ("bias", (2, 2))],
-        nabla.Matrix([[1.0, 0.5], [-1.0, 2.0]]),
+        quabla.Matrix([[1.0, 0.5], [-1.0, 2.0]]),
     )
     gradients = grad_model(
         {
-            "a": nabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
-            "b": nabla.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]),
-            "bias": nabla.Matrix([[0.1, 0.2], [0.3, 0.4]]),
+            "a": quabla.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            "b": quabla.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]),
+            "bias": quabla.Matrix([[0.1, 0.2], [0.3, 0.4]]),
         }
     )
 
@@ -6444,37 +6444,37 @@ def f32(values):
 
 
 def test_dtype_objects_compare_hash_and_print():
-    assert nabla.float32 == nabla.float32
-    assert nabla.float32 != nabla.float64
-    assert {nabla.float32: "single", nabla.float64: "double"}[nabla.float32] == "single"
-    assert repr(nabla.float32) == "nabla.float32"
-    assert str(nabla.float64) == "f64"
-    assert nabla.float32.name == "float32"
+    assert quabla.float32 == quabla.float32
+    assert quabla.float32 != quabla.float64
+    assert {quabla.float32: "single", quabla.float64: "double"}[quabla.float32] == "single"
+    assert repr(quabla.float32) == "quabla.float32"
+    assert str(quabla.float64) == "f64"
+    assert quabla.float32.name == "float32"
 
 
 def test_float32_tensor_rounds_values_and_converts_with_astype():
-    single = nabla.Tensor([2], [0.1, 0.2], dtype=nabla.float32)
+    single = quabla.Tensor([2], [0.1, 0.2], dtype=quabla.float32)
     assert single.to_flat_list() == f32([0.1, 0.2])
-    assert single.dtype == nabla.float32
-    assert nabla.Tensor([2], [0.1, 0.2]).dtype == nabla.float64
+    assert single.dtype == quabla.float32
+    assert quabla.Tensor([2], [0.1, 0.2]).dtype == quabla.float64
     assert "float32" in repr(single)
 
-    widened = single.astype(nabla.float64)
-    assert widened.dtype == nabla.float64
+    widened = single.astype(quabla.float64)
+    assert widened.dtype == quabla.float64
     assert widened.to_flat_list() == f32([0.1, 0.2])
-    narrowed = nabla.Tensor([1], [0.1]).astype(nabla.float32)
+    narrowed = quabla.Tensor([1], [0.1]).astype(quabla.float32)
     assert narrowed.to_flat_list() == f32([0.1])
 
     # 即時運算：f32 張量與弱純量維持 f32，結果逐元素捨入；不同 dtype 的張量需明確轉換。
-    other = nabla.Tensor([2], [0.3, 0.7], dtype=nabla.float32)
+    other = quabla.Tensor([2], [0.3, 0.7], dtype=quabla.float32)
     expected = [f32([f32([a * b])[0] + f32([0.1])[0]])[0] for a, b in zip(f32([0.1, 0.2]), f32([0.3, 0.7]))]
     result = single * other + 0.1
-    assert result.dtype == nabla.float32
+    assert result.dtype == quabla.float32
     assert result.to_flat_list() == expected
-    assert (single.reshape([1, 2]) @ other.reshape([2, 1])).dtype == nabla.float32
-    assert single.sum().dtype == nabla.float32
+    assert (single.reshape([1, 2]) @ other.reshape([2, 1])).dtype == quabla.float32
+    assert single.sum().dtype == quabla.float32
     try:
-        single + nabla.Tensor([2], [0.3, 0.7])
+        single + quabla.Tensor([2], [0.3, 0.7])
     except ValueError as error:
         assert "astype" in str(error)
     else:
@@ -6482,39 +6482,39 @@ def test_float32_tensor_rounds_values_and_converts_with_astype():
 
 
 def test_trace_tensor_accepts_typed_specs_and_keeps_two_tuple_specs_float64():
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, y: x * y + 0.1,
-        [("x", [2], nabla.float32), ("y", [2], nabla.float32)],
+        [("x", [2], quabla.float32), ("y", [2], quabla.float32)],
     )
-    assert traced.output.dtype == nabla.float32
+    assert traced.output.dtype == quabla.float32
     assert "tensor<2xf32>" in traced.graph.lower_text()
     plan = traced.output.compile_cpu()
     plan.validate_kernel_ir()
     assert {node["dtype"] for node in plan.kernel_ir()} == {"f32"}
     inputs = {
-        "x": nabla.Tensor([2], [0.1, 1.0 / 3.0]),
-        "y": nabla.Tensor([2], [0.3, 3.0]),
+        "x": quabla.Tensor([2], [0.1, 1.0 / 3.0]),
+        "y": quabla.Tensor([2], [0.3, 3.0]),
     }
     value = plan.evaluate(inputs)
-    assert value.dtype == nabla.float32
+    assert value.dtype == quabla.float32
     x, y = f32([0.1, 1.0 / 3.0]), f32([0.3, 3.0])
     assert value.to_flat_list() == [
         f32([f32([a * b])[0] + f32([0.1])[0]])[0] for a, b in zip(x, y)
     ]
 
-    legacy = nabla.trace_tensor(lambda x: x + 1.0, [("x", [2])])
-    assert legacy.output.dtype == nabla.float64
+    legacy = quabla.trace_tensor(lambda x: x + 1.0, [("x", [2])])
+    assert legacy.output.dtype == quabla.float64
     assert "f32" not in legacy.graph.lower_text()
     assert {node["dtype"] for node in legacy.output.compile_cpu().kernel_ir()} == {"f64"}
 
     try:
-        nabla.trace_tensor(lambda x, y: x + y, [("x", [2], nabla.float32), ("y", [2])])
+        quabla.trace_tensor(lambda x, y: x + y, [("x", [2], quabla.float32), ("y", [2])])
     except ValueError as error:
         assert "astype" in str(error)
     else:
         raise AssertionError("mixing float32 and float64 traced tensors must fail")
     try:
-        nabla.trace_tensor(lambda x: x, [("x", [2], "f32")])
+        quabla.trace_tensor(lambda x: x, [("x", [2], "f32")])
     except TypeError as error:
         assert "(name, shape, dtype)" in str(error)
     else:
@@ -6522,42 +6522,42 @@ def test_trace_tensor_accepts_typed_specs_and_keeps_two_tuple_specs_float64():
 
 
 def test_trace_tensor_astype_rounds_and_differentiates_through_casts():
-    traced = nabla.trace_tensor(
-        lambda x: x.astype(nabla.float32).powi(2).sum(), [("x", [3])]
+    traced = quabla.trace_tensor(
+        lambda x: x.astype(quabla.float32).powi(2).sum(), [("x", [3])]
     )
-    assert traced.output.dtype == nabla.float32
+    assert traced.output.dtype == quabla.float32
     point = [0.3, -1.7, 2.2]
-    inputs = {"x": nabla.Tensor([3], point), "seed": nabla.Tensor([], [1.0])}
+    inputs = {"x": quabla.Tensor([3], point), "seed": quabla.Tensor([], [1.0])}
     gradient = traced.symbolic_vjp("seed")["x"]
-    assert gradient.output.dtype == nabla.float64
+    assert gradient.output.dtype == quabla.float64
     values = gradient.output.compile_cpu().evaluate(inputs).to_flat_list()
     assert_close_rows([values], [[2.0 * value for value in f32(point)]], tol=1e-6)
 
-    round_trip = nabla.trace_tensor(
-        lambda x: x.astype(nabla.float32).astype(nabla.float64), [("x", [1])]
+    round_trip = quabla.trace_tensor(
+        lambda x: x.astype(quabla.float32).astype(quabla.float64), [("x", [1])]
     )
-    result = round_trip.output.compile_cpu().evaluate({"x": nabla.Tensor([1], [0.1])})
-    assert result.dtype == nabla.float64
+    result = round_trip.output.compile_cpu().evaluate({"x": quabla.Tensor([1], [0.1])})
+    assert result.dtype == quabla.float64
     assert result.to_flat_list() == [0.10000000149011612]
 
-    value_and_grad = nabla.tensor_value_and_grad_fn(
-        lambda w: (w * w).sum(), [("w", [2], nabla.float32)]
+    value_and_grad = quabla.tensor_value_and_grad_fn(
+        lambda w: (w * w).sum(), [("w", [2], quabla.float32)]
     )
-    value, gradients = value_and_grad({"w": nabla.Tensor([2], [0.1, 0.2])})
-    assert value.dtype == nabla.float32
-    assert gradients["w"].dtype == nabla.float32
+    value, gradients = value_and_grad({"w": quabla.Tensor([2], [0.1, 0.2])})
+    assert value.dtype == quabla.float32
+    assert gradients["w"].dtype == quabla.float32
     assert_close_rows([gradients["w"].to_flat_list()], [[0.2, 0.4]], tol=1e-7)
 
 
 def test_float32_fori_region_uses_a_float32_loop_index():
-    traced = nabla.trace_tensor(
-        lambda initial: nabla.tensor_fori_loop_region(
+    traced = quabla.trace_tensor(
+        lambda initial: quabla.tensor_fori_loop_region(
             0, 4, lambda index, carry: carry + index * 0.1, initial, []
         ),
-        [("initial", [], nabla.float32)],
+        [("initial", [], quabla.float32)],
     )
-    assert traced.output.dtype == nabla.float32
-    result = traced.output.compile_cpu().evaluate({"initial": nabla.Tensor([], [1.0])})
+    assert traced.output.dtype == quabla.float32
+    result = traced.output.compile_cpu().evaluate({"initial": quabla.Tensor([], [1.0])})
     expected = 1.0
     for index in range(4):
         expected = f32([expected + f32([f32([float(index)])[0] * f32([0.1])[0]])[0]])[0]
@@ -6572,7 +6572,7 @@ def f32_mlp_value_and_gradients(dtype):
         ("w2", [16, 1], dtype),
         ("b2", [1, 1], dtype),
     ]
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, w1, b1, w2, b2: (((x @ w1 + b1).tanh() @ w2 + b2) * 0.5).powi(2).mean(),
         specs,
     )
@@ -6583,12 +6583,12 @@ def f32_mlp_value_and_gradients(dtype):
         return [math.sin((index + 1.0) * seed) * 0.9 for index in range(count)]
 
     inputs = {
-        "x": nabla.Tensor([8, 3], values(24, 0.37)),
-        "w1": nabla.Tensor([3, 16], values(48, 1.13)),
-        "b1": nabla.Tensor([1, 16], values(16, 0.71)),
-        "w2": nabla.Tensor([16, 1], values(16, 2.03)),
-        "b2": nabla.Tensor([1, 1], [0.1]),
-        "seed": nabla.Tensor([], [1.0]),
+        "x": quabla.Tensor([8, 3], values(24, 0.37)),
+        "w1": quabla.Tensor([3, 16], values(48, 1.13)),
+        "b1": quabla.Tensor([1, 16], values(16, 0.71)),
+        "w2": quabla.Tensor([16, 1], values(16, 2.03)),
+        "b2": quabla.Tensor([1, 1], [0.1]),
+        "seed": quabla.Tensor([], [1.0]),
     }
     return outputs, inputs
 
@@ -6605,25 +6605,25 @@ def assert_float32_mlp_device_parity(compile_device):
     # 裝置與 CPU f32 參考共用同一組已捨入輸入，只差在逐運算捨入與歸約順序；
     # 每運算數個 f32 ulp（單位尺度約 6e-8）在約 10 層深的圖上仍低於 1e-6，
     # 比既有 f64 參考的 1e-5 容差緊十倍。
-    outputs, inputs = f32_mlp_value_and_gradients(nabla.float32)
-    reference_outputs, _ = f32_mlp_value_and_gradients(nabla.float64)
+    outputs, inputs = f32_mlp_value_and_gradients(quabla.float32)
+    reference_outputs, _ = f32_mlp_value_and_gradients(quabla.float64)
     cpu = [output.compile_cpu().evaluate(inputs) for output in outputs]
     device = [compile_device(output).evaluate(inputs) for output in outputs]
     reference = [output.compile_cpu().evaluate(inputs) for output in reference_outputs]
-    assert all(value.dtype == nabla.float32 for value in cpu + device)
+    assert all(value.dtype == quabla.float32 for value in cpu + device)
     device_rows = [value.to_flat_list() for value in device]
     assert max_scaled_error(device_rows, [value.to_flat_list() for value in cpu]) <= 1e-6
     assert max_scaled_error(device_rows, [value.to_flat_list() for value in reference]) <= 1e-5
 
 
 def test_mlx_float32_mlp_matches_the_cpu_float32_reference():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
     assert_float32_mlp_device_parity(lambda output: output.compile_mlx())
 
 
 def test_cuda_float32_mlp_matches_the_cpu_float32_reference():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
     assert_float32_mlp_device_parity(lambda output: output.compile_cuda())
 
@@ -6646,7 +6646,7 @@ COMPARISONS = [
 
 
 def bool_xy():
-    return nabla.Tensor([2, 3], BOOL_X), nabla.Tensor([2, 3], BOOL_Y)
+    return quabla.Tensor([2, 3], BOOL_X), quabla.Tensor([2, 3], BOOL_Y)
 
 
 def expect_error(action, *fragments, error=ValueError):
@@ -6660,32 +6660,32 @@ def expect_error(action, *fragments, error=ValueError):
 
 
 def test_bool_dtype_object_and_eager_comparisons_follow_ieee_semantics():
-    assert repr(nabla.bool_) == "nabla.bool_"
-    assert str(nabla.bool_) == "bool"
-    assert nabla.bool_.name == "bool"
-    assert {nabla.bool_: "mask"}[nabla.bool_] == "mask"
-    assert nabla.bool_ != nabla.float64
-    mask = nabla.Tensor([4], [0.0, 3.0, NAN, -INF], dtype=nabla.bool_)
-    assert mask.dtype == nabla.bool_
+    assert repr(quabla.bool_) == "quabla.bool_"
+    assert str(quabla.bool_) == "bool"
+    assert quabla.bool_.name == "bool"
+    assert {quabla.bool_: "mask"}[quabla.bool_] == "mask"
+    assert quabla.bool_ != quabla.float64
+    mask = quabla.Tensor([4], [0.0, 3.0, NAN, -INF], dtype=quabla.bool_)
+    assert mask.dtype == quabla.bool_
     assert mask.to_flat_list() == [0.0, 1.0, 1.0, 1.0]
-    assert "nabla.bool_" in repr(mask)
+    assert "quabla.bool_" in repr(mask)
 
     x, y = bool_xy()
     for name, operator, expected in COMPARISONS:
-        results = [getattr(x, name)(y), getattr(nabla, name)(x, y)]
+        results = [getattr(x, name)(y), getattr(quabla, name)(x, y)]
         if operator is not None:
             results.append(operator(x, y))
         for result in results:
-            assert result.dtype == nabla.bool_, name
+            assert result.dtype == quabla.bool_, name
             assert result.to_flat_list() == expected, name
     # Python 純量為弱型別；左側純量走反射運算子與反射函式。
     assert (x > 1.5).to_flat_list() == [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
     assert (1.5 < x).to_flat_list() == (x > 1.5).to_flat_list()
-    assert nabla.greater(1.5, x).to_flat_list() == (x < 1.5).to_flat_list()
-    single = nabla.Tensor([2], [0.1, 0.2], dtype=nabla.float32)
+    assert quabla.greater(1.5, x).to_flat_list() == (x < 1.5).to_flat_list()
+    single = quabla.Tensor([2], [0.1, 0.2], dtype=quabla.float32)
     assert single.equal(0.1).to_flat_list() == [1.0, 0.0]
-    assert x.astype(nabla.bool_).to_flat_list() == [1.0] * 6
-    assert (x > 1.5).astype(nabla.float32).dtype == nabla.float32
+    assert x.astype(quabla.bool_).to_flat_list() == [1.0] * 6
+    assert (x > 1.5).astype(quabla.float32).dtype == quabla.float32
 
 
 def test_bool_logical_ops_and_reductions_match_between_eager_and_traced():
@@ -6695,11 +6695,11 @@ def test_bool_logical_ops_and_reductions_match_between_eager_and_traced():
         greater = x > y
         return [
             x.isfinite(),
-            nabla.isnan(x),
+            quabla.isnan(x),
             greater & x.isfinite(),
-            nabla.logical_or(x < y, y.isnan()),
+            quabla.logical_or(x < y, y.isnan()),
             ~x.equal(y),
-            nabla.logical_not(greater),
+            quabla.logical_not(greater),
             x.isnan().any(),
             y.isfinite().all(),
             greater.any(axis=1),
@@ -6722,31 +6722,31 @@ def test_bool_logical_ops_and_reductions_match_between_eager_and_traced():
     ]
     eager = program(x, y)
     assert [value.to_flat_list() for value in eager] == expected
-    assert all(value.dtype == nabla.bool_ for value in eager)
+    assert all(value.dtype == quabla.bool_ for value in eager)
     assert eager[9].shape == [1, 3]
 
     inputs = {"x": x, "y": y}
     for index, row in enumerate(expected):
-        traced = nabla.trace_tensor(
+        traced = quabla.trace_tensor(
             lambda x, y, index=index: program(x, y)[index],
             [("x", [2, 3]), ("y", [2, 3])],
         )
-        assert traced.output.dtype == nabla.bool_
+        assert traced.output.dtype == quabla.bool_
         plan = traced.output.compile_cpu()
         plan.validate_kernel_ir()
         assert plan.kernel_ir()[-1]["dtype"] == "bool"
         value = plan.evaluate(inputs)
-        assert value.dtype == nabla.bool_
+        assert value.dtype == quabla.bool_
         assert value.to_flat_list() == row, index
     assert (
-        "xi1>" in nabla.trace_tensor(lambda x: x > 0.0, [("x", [2])]).graph.lower_text()
+        "xi1>" in quabla.trace_tensor(lambda x: x > 0.0, [("x", [2])]).graph.lower_text()
     )
 
     expect_error(lambda: x & y, "logical_and requires bool operands")
     expect_error(lambda: x.any(), "any requires bool operands")
     expect_error(lambda: x.isfinite().isnan(), "isnan is not defined for bool tensors")
     expect_error(
-        lambda: nabla.trace_tensor(lambda x: x.all(), [("x", [2])]),
+        lambda: quabla.trace_tensor(lambda x: x.all(), [("x", [2])]),
         "all requires bool operands",
     )
 
@@ -6761,19 +6761,19 @@ def test_tensor_ordering_operators_keep_identity_equality_and_hashing():
         seen.extend([a == a, a == b, {a: 1}[a]])
         return a > b
 
-    nabla.trace_tensor(record, [("a", [2]), ("b", [2])])
+    quabla.trace_tensor(record, [("a", [2]), ("b", [2])])
     assert seen == [True, False, 1]
 
 
 def test_legacy_gt_masks_and_extrema_tie_rules_are_unchanged():
-    x = nabla.Tensor([4], [-1.0, 0.0, 2.0, NAN])
+    x = quabla.Tensor([4], [-1.0, 0.0, 2.0, NAN])
     mask = x.gt(0.0)
-    assert mask.dtype == nabla.float64
+    assert mask.dtype == quabla.float64
     assert mask.to_flat_list() == [0.0, 0.0, 1.0, 0.0]
-    single = nabla.Tensor([2], [0.5, -0.5], dtype=nabla.float32)
-    assert single.gt(0.0).dtype == nabla.float32
-    traced = nabla.trace_tensor(lambda x: x.gt(0.0), [("x", [4])])
-    assert traced.output.dtype == nabla.float64
+    single = quabla.Tensor([2], [0.5, -0.5], dtype=quabla.float32)
+    assert single.gt(0.0).dtype == quabla.float32
+    traced = quabla.trace_tensor(lambda x: x.gt(0.0), [("x", [4])])
+    assert traced.output.dtype == quabla.float64
     assert traced.output.compile_cpu().evaluate({"x": x}).to_flat_list() == [
         0.0,
         0.0,
@@ -6781,19 +6781,19 @@ def test_legacy_gt_masks_and_extrema_tie_rules_are_unchanged():
         0.0,
     ]
 
-    ties = nabla.Tensor([3], [-1.0, 0.0, 1.0])
-    other = nabla.Tensor([3], [1.0, 0.0, -1.0])
+    ties = quabla.Tensor([3], [-1.0, 0.0, 1.0])
+    other = quabla.Tensor([3], [1.0, 0.0, -1.0])
     assert ties.abs().to_flat_list() == [1.0, -0.0, 1.0]
     for name, expected_gradient in [
         ("relu", [0.0, 0.0, 1.0]),
         ("abs", [-1.0, -1.0, 1.0]),
     ]:
-        _, gradients = nabla.tensor_value_and_grad_fn(
+        _, gradients = quabla.tensor_value_and_grad_fn(
             lambda x, name=name: getattr(x, name)().sum(), [("x", [3])]
         )({"x": ties})
         assert gradients["x"].to_flat_list() == expected_gradient
     # maximum/minimum 的相等次梯度仍路由到右運算元。
-    _, gradients = nabla.tensor_value_and_grad_fn(
+    _, gradients = quabla.tensor_value_and_grad_fn(
         lambda a, b: a.maximum(b).sum() + a.minimum(b).sum(), [("a", [3]), ("b", [3])]
     )({"a": ties, "b": other})
     assert gradients["a"].to_flat_list() == [1.0, 0.0, 1.0]
@@ -6801,33 +6801,33 @@ def test_legacy_gt_masks_and_extrema_tie_rules_are_unchanged():
 
 
 def test_bool_operands_promote_to_float_and_bool_arithmetic_is_rejected():
-    residual = nabla.Tensor([3], [0.1, -0.2, 0.3], dtype=nabla.float32)
-    x = nabla.Tensor([3], [1.0, -1.0, 2.0])
+    residual = quabla.Tensor([3], [0.1, -0.2, 0.3], dtype=quabla.float32)
+    x = quabla.Tensor([3], [1.0, -1.0, 2.0])
     mask = x > 0.0
     masked = residual * mask
-    assert masked.dtype == nabla.float32
+    assert masked.dtype == quabla.float32
     assert masked.to_flat_list() == f32([0.1, 0.0, 0.3])
     weak = mask * 2.0
-    assert weak.dtype == nabla.float64
+    assert weak.dtype == quabla.float64
     adopted = weak + residual
-    assert adopted.dtype == nabla.float32
+    assert adopted.dtype == quabla.float32
     assert adopted.to_flat_list() == f32(
         [f32([2.0])[0] + f32([0.1])[0], -0.2, f32([2.0])[0] + f32([0.3])[0]]
     )
-    expect_error(lambda: weak + weak.astype(nabla.float32) + x, "astype")
+    expect_error(lambda: weak + weak.astype(quabla.float32) + x, "astype")
 
-    specs = [("r", [3], nabla.float32), ("x", [3])]
-    traced = nabla.trace_tensor(lambda r, x: r * (x > 0.0), specs)
-    assert traced.output.dtype == nabla.float32
-    traced = nabla.trace_tensor(lambda r, x: (x > 0.0) * 2.0 + r, specs)
-    assert traced.output.dtype == nabla.float32
+    specs = [("r", [3], quabla.float32), ("x", [3])]
+    traced = quabla.trace_tensor(lambda r, x: r * (x > 0.0), specs)
+    assert traced.output.dtype == quabla.float32
+    traced = quabla.trace_tensor(lambda r, x: (x > 0.0) * 2.0 + r, specs)
+    assert traced.output.dtype == quabla.float32
     values = traced.output.compile_cpu().evaluate({"r": residual, "x": x})
     assert values.to_flat_list() == adopted.to_flat_list()
 
     for action in [lambda m: m + m, lambda m: m * m]:
         expect_error(lambda: action(mask), "not defined for bool tensors", "astype")
         expect_error(
-            lambda: nabla.trace_tensor(lambda x: action(x > 0.0), [("x", [3])]),
+            lambda: quabla.trace_tensor(lambda x: action(x > 0.0), [("x", [3])]),
             "not defined for bool tensors",
         )
     for name in [
@@ -6846,7 +6846,7 @@ def test_bool_operands_promote_to_float_and_bool_arithmetic_is_rejected():
             lambda: getattr(mask, name)(), f"{name} is not defined for bool tensors"
         )
         expect_error(
-            lambda: nabla.trace_tensor(
+            lambda: quabla.trace_tensor(
                 lambda x: getattr(x > 0.0, name)(), [("x", [3])]
             ),
             f"{name} is not defined for bool tensors",
@@ -6855,36 +6855,36 @@ def test_bool_operands_promote_to_float_and_bool_arithmetic_is_rejected():
 
 
 def test_eager_bool_truthiness_follows_numpy_and_traced_tensors_refuse():
-    x = nabla.Tensor([2], [1.0, -1.0])
+    x = quabla.Tensor([2], [1.0, -1.0])
     taken = "yes" if (x.sum() > 0.5) else "no"
     assert taken == "no"
     assert bool((x > 0.0).any())
     assert not bool((x > 0.0).all())
     expect_error(lambda: bool(x > 0.0), "ambiguous", ".any()")
     # 浮點張量維持原本的物件真值（永遠為真）。
-    assert bool(nabla.Tensor([1], [0.0]))
+    assert bool(quabla.Tensor([1], [0.0]))
     expect_error(
-        lambda: nabla.trace_tensor(lambda x: x if bool(x > 0.0) else x, [("x", [])]),
+        lambda: quabla.trace_tensor(lambda x: x if bool(x > 0.0) else x, [("x", [])]),
         "control flow",
         error=TypeError,
     )
 
 
 def test_nan_guards_keep_values_and_gradients_finite_while_float_masks_leak():
-    x = nabla.Tensor([2, 3], BOOL_X)
-    guarded = nabla.tensor_value_and_grad_fn(
-        lambda x: nabla.where(x.isfinite(), x, 0.0).powi(2).sum(), [("x", [2, 3])]
+    x = quabla.Tensor([2, 3], BOOL_X)
+    guarded = quabla.tensor_value_and_grad_fn(
+        lambda x: quabla.where(x.isfinite(), x, 0.0).powi(2).sum(), [("x", [2, 3])]
     )
     value, gradients = guarded({"x": x})
     assert value.to_flat_list() == [9.0]
     assert gradients["x"].to_flat_list() == [2.0, 4.0, 0.0, 0.0, 0.0, 4.0]
 
     # all(isfinite(x)) 作為 Cond 謂詞：非有限輸入走防護分支，值與梯度皆有限。
-    traced = nabla.trace_tensor(
-        lambda x: nabla.tensor_cond(
+    traced = quabla.trace_tensor(
+        lambda x: quabla.tensor_cond(
             x.isfinite().all(),
             lambda a: (a * a).sum(),
-            lambda a: nabla.where(a.isfinite(), a, 0.0).powi(2).sum() * 0.5,
+            lambda a: quabla.where(a.isfinite(), a, 0.0).powi(2).sum() * 0.5,
             [x],
         ),
         [("x", [2, 3])],
@@ -6894,7 +6894,7 @@ def test_nan_guards_keep_values_and_gradients_finite_while_float_masks_leak():
         (BOOL_X, 4.5, [1.0, 2.0, 0.0, 0.0, 0.0, 2.0]),
         ([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 91.0, [2.0, 4.0, 6.0, 8.0, 10.0, 12.0]),
     ]:
-        inputs = {"x": nabla.Tensor([2, 3], values), "seed": nabla.Tensor([], [1.0])}
+        inputs = {"x": quabla.Tensor([2, 3], values), "seed": quabla.Tensor([], [1.0])}
         assert traced.output.compile_cpu().evaluate(inputs).to_flat_list() == [
             expected_value
         ]
@@ -6908,12 +6908,12 @@ def test_nan_guards_keep_values_and_gradients_finite_while_float_masks_leak():
 
 
 def test_where_and_cond_accept_bool_and_legacy_float_predicates():
-    x = nabla.Tensor([3], [-2.0, 0.0, 3.0])
+    x = quabla.Tensor([3], [-2.0, 0.0, 3.0])
     for mask in [x >= 0.0, x.gt(0.0)]:
-        selected = nabla.where(mask, x, 0.0 - x)
+        selected = quabla.where(mask, x, 0.0 - x)
         assert selected.to_flat_list() == [2.0, 0.0, 3.0]
-        traced = nabla.trace_tensor(
-            lambda x, float_mask=(mask.dtype == nabla.float64): nabla.where(
+        traced = quabla.trace_tensor(
+            lambda x, float_mask=(mask.dtype == quabla.float64): quabla.where(
                 x.gt(0.0) if float_mask else x >= 0.0, x, 0.0 - x
             ),
             [("x", [3])],
@@ -6925,15 +6925,15 @@ def test_where_and_cond_accept_bool_and_legacy_float_predicates():
         ]
 
     for predicate in [lambda x: (x > 0.0).any(), lambda x: x.sum().gt(0.0)]:
-        traced = nabla.trace_tensor(
-            lambda x, predicate=predicate: nabla.tensor_cond(
+        traced = quabla.trace_tensor(
+            lambda x, predicate=predicate: quabla.tensor_cond(
                 predicate(x), lambda a: a.sum(), lambda a: (a * 2.0).sum(), [x]
             ),
             [("x", [3])],
         )
         for values, expected in [([-2.0, 0.0, 3.0], 1.0), ([-2.0, -1.0, 0.0], -6.0)]:
             result = traced.output.compile_cpu().evaluate(
-                {"x": nabla.Tensor([3], values)}
+                {"x": quabla.Tensor([3], values)}
             )
             assert result.to_flat_list() == [expected]
 
@@ -6941,24 +6941,24 @@ def test_where_and_cond_accept_bool_and_legacy_float_predicates():
 def masked_residual_loss(x, w, mask):
     # PINN 風格：遮罩選出殘差較大的點，Bool 遮罩輸入另外限制作用點。
     active = (x > 0.5) & mask
-    residual = nabla.where(active, x * w - 1.0, 0.0)
+    residual = quabla.where(active, x * w - 1.0, 0.0)
     return residual.powi(2).mean() + (x * w).powi(2).sum() * 0.1
 
 
-MASKED_SPECS = [("x", [2, 3]), ("w", [2, 3]), ("mask", [2, 3], nabla.bool_)]
+MASKED_SPECS = [("x", [2, 3]), ("w", [2, 3]), ("mask", [2, 3], quabla.bool_)]
 
 
 def masked_inputs():
     return {
-        "x": nabla.Tensor([2, 3], [1.0, 2.0, -0.3, 0.7, 0.2, 2.0]),
-        "w": nabla.Tensor([2, 3], [0.5, -1.5, 2.0, 0.25, 1.0, -0.75]),
-        "mask": nabla.Tensor([2, 3], [1.0, 1.0, 1.0, 0.0, 1.0, 1.0], dtype=nabla.bool_),
+        "x": quabla.Tensor([2, 3], [1.0, 2.0, -0.3, 0.7, 0.2, 2.0]),
+        "w": quabla.Tensor([2, 3], [0.5, -1.5, 2.0, 0.25, 1.0, -0.75]),
+        "mask": quabla.Tensor([2, 3], [1.0, 1.0, 1.0, 0.0, 1.0, 1.0], dtype=quabla.bool_),
     }
 
 
 def test_masked_loss_gradients_match_finite_differences_and_skip_bool_inputs():
     inputs = masked_inputs()
-    value, gradients = nabla.tensor_value_and_grad_fn(
+    value, gradients = quabla.tensor_value_and_grad_fn(
         masked_residual_loss, MASKED_SPECS
     )(inputs)
     assert sorted(gradients) == ["w", "x"]
@@ -6970,7 +6970,7 @@ def test_masked_loss_gradients_match_finite_differences_and_skip_bool_inputs():
             for delta in (step, -step):
                 point = list(base)
                 point[index] += delta
-                moved = dict(inputs, **{name: nabla.Tensor([2, 3], point)})
+                moved = dict(inputs, **{name: quabla.Tensor([2, 3], point)})
                 shifted.append(
                     masked_residual_loss(moved["x"], moved["w"], moved["mask"])
                 )
@@ -6979,22 +6979,22 @@ def test_masked_loss_gradients_match_finite_differences_and_skip_bool_inputs():
     assert value.to_flat_list() == masked_residual_loss(**inputs).to_flat_list()
 
     expect_error(
-        lambda: nabla.tensor_hessian_scalar_fn(
+        lambda: quabla.tensor_hessian_scalar_fn(
             masked_residual_loss, MASKED_SPECS, "mask"
         )(inputs),
         'bool input "mask"',
     )
-    traced = nabla.trace_tensor(masked_residual_loss, MASKED_SPECS)
+    traced = quabla.trace_tensor(masked_residual_loss, MASKED_SPECS)
     expect_error(lambda: traced.symbolic_jvp("mask"), 'bool input "mask"')
     expect_error(
-        lambda: nabla.trace_tensor(lambda x: x > 0.0, [("x", [2])]).symbolic_vjp(
+        lambda: quabla.trace_tensor(lambda x: x > 0.0, [("x", [2])]).symbolic_vjp(
             "seed"
         ),
         "bool output",
     )
-    if os.environ.get("NABLA_MLX_TEST") is not None:
+    if os.environ.get("QUABLA_MLX_TEST") is not None:
         expect_error(
-            lambda: nabla.tensor_value_and_grad_mlx_fn(
+            lambda: quabla.tensor_value_and_grad_mlx_fn(
                 masked_residual_loss, MASKED_SPECS, ["mask"]
             ),
             'bool input "mask"',
@@ -7016,21 +7016,21 @@ def assert_bool_device_parity(compile_device):
         lambda x, y: ~x.isfinite(),
         lambda x, y: (x > y).any(axis=1),
         lambda x, y: y.isfinite().all(axis=0, keepdims=True),
-        lambda x, y: nabla.where(x.isfinite(), x, 0.0) * (x > 0.5),
+        lambda x, y: quabla.where(x.isfinite(), x, 0.0) * (x > 0.5),
     ]
     for index, function in enumerate(outputs):
-        traced = nabla.trace_tensor(function, [("x", [2, 3]), ("y", [2, 3])])
+        traced = quabla.trace_tensor(function, [("x", [2, 3]), ("y", [2, 3])])
         cpu = traced.output.compile_cpu().evaluate(inputs)
         device = compile_device(traced.output).evaluate(inputs)
         assert device.dtype == cpu.dtype, index
         assert device.to_flat_list() == cpu.to_flat_list(), index
 
     # any/all 作為 Cond 謂詞，並比對 NaN 防護分支的值與梯度。
-    traced = nabla.trace_tensor(
-        lambda x: nabla.tensor_cond(
+    traced = quabla.trace_tensor(
+        lambda x: quabla.tensor_cond(
             x.isfinite().all(),
             lambda a: (a * a).sum(),
-            lambda a: nabla.where(a.isfinite(), a, 0.0).powi(2).sum() * 0.5,
+            lambda a: quabla.where(a.isfinite(), a, 0.0).powi(2).sum() * 0.5,
             [x],
         ),
         [("x", [2, 3])],
@@ -7038,8 +7038,8 @@ def assert_bool_device_parity(compile_device):
     gradient = traced.symbolic_vjp("seed")["x"].output
     for values in [BOOL_X, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]:
         cond_inputs = {
-            "x": nabla.Tensor([2, 3], values),
-            "seed": nabla.Tensor([], [1.0]),
+            "x": quabla.Tensor([2, 3], values),
+            "seed": quabla.Tensor([], [1.0]),
         }
         for output in [traced.output, gradient]:
             assert (
@@ -7047,9 +7047,9 @@ def assert_bool_device_parity(compile_device):
                 == output.compile_cpu().evaluate(cond_inputs).to_flat_list()
             )
 
-    traced = nabla.trace_tensor(masked_residual_loss, MASKED_SPECS)
+    traced = quabla.trace_tensor(masked_residual_loss, MASKED_SPECS)
     gradients = traced.symbolic_vjp("seed")
-    inputs = dict(masked_inputs(), seed=nabla.Tensor([], [1.0]))
+    inputs = dict(masked_inputs(), seed=quabla.Tensor([], [1.0]))
     for output in [traced.output, gradients["x"].output, gradients["w"].output]:
         cpu = output.compile_cpu().evaluate(inputs).to_flat_list()
         device = compile_device(output).evaluate(inputs).to_flat_list()
@@ -7057,13 +7057,13 @@ def assert_bool_device_parity(compile_device):
 
 
 def test_mlx_bool_masks_and_guarded_gradients_match_cpu():
-    if os.environ.get("NABLA_MLX_TEST") is None:
+    if os.environ.get("QUABLA_MLX_TEST") is None:
         return
     assert_bool_device_parity(lambda output: output.compile_mlx())
 
 
 def test_cuda_bool_masks_and_guarded_gradients_match_cpu():
-    if os.environ.get("NABLA_CUDA_TEST") is None:
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
     assert_bool_device_parity(lambda output: output.compile_cuda())
 

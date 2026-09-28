@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/nabla-core", "crates/nabla-macros", "crates/nabla-python"]
+members = ["crates/quabla-core", "crates/quabla-macros", "crates/quabla-python"]
 resolver = "2"
 
 [workspace.package]

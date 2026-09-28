@@ -9,7 +9,7 @@ or optimizer moments to Python until training is complete.
 
 import math
 
-import nabla
+import quabla
 
 
 def main() -> None:
@@ -23,7 +23,7 @@ def main() -> None:
         for coordinate in coordinates
     ]
 
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, forcing: (x @ weight).tanh(),
         [("x", [2, 1, 1]), ("weight", [1, 1, 1]), ("forcing", [2, 1, 1])],
     )
@@ -33,10 +33,10 @@ def main() -> None:
     loss_plan = loss.compile_cuda()
     weight_gradient_plan = loss.symbolic_vjp("loss_cotangent")["weight"].output.compile_cuda()
     inputs = {
-        "x": nabla.Tensor([2, 1, 1], coordinates),
-        "forcing": nabla.Tensor([2, 1, 1], forcing),
-        "loss_cotangent": nabla.Tensor([], [1.0]),
-        "weight": nabla.Tensor([1, 1, 1], [0.3]),
+        "x": quabla.Tensor([2, 1, 1], coordinates),
+        "forcing": quabla.Tensor([2, 1, 1], forcing),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
+        "weight": quabla.Tensor([1, 1, 1], [0.3]),
     }
 
     initial_loss = loss_plan.evaluate(inputs).to_flat_list()[0]

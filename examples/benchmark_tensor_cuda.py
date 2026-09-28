@@ -14,15 +14,15 @@ import json
 import platform
 import time
 
-import nabla
+import quabla
 
 
-def tensor(shape: list[int], offset: int) -> nabla.Tensor:
+def tensor(shape: list[int], offset: int) -> quabla.Tensor:
     count = 1
     for extent in shape:
         count *= extent
     data = [((index + offset) % 23 - 11) / 23.0 for index in range(count)]
-    return nabla.Tensor(shape, data)
+    return quabla.Tensor(shape, data)
 
 
 def benchmark(
@@ -41,11 +41,11 @@ def benchmark(
     if elementwise:
         def model(x):
             return ((x * 0.75 + 0.125).tanh().sin().exp())
-        traced = nabla.trace_tensor(model, [("x", lhs_shape)])
+        traced = quabla.trace_tensor(model, [("x", lhs_shape)])
         inputs = {"x": tensor(lhs_shape, 0)}
     else:
         model = (lambda lhs, rhs: (lhs @ rhs).tanh()) if activation else (lambda lhs, rhs: lhs @ rhs)
-        traced = nabla.trace_tensor(model, [("lhs", lhs_shape), ("rhs", rhs_shape)])
+        traced = quabla.trace_tensor(model, [("lhs", lhs_shape), ("rhs", rhs_shape)])
         inputs = {
             "lhs": tensor(lhs_shape, 0),
             "rhs": tensor(rhs_shape, 1),

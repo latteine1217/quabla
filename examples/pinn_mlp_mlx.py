@@ -12,7 +12,7 @@ same fixed number of optimization steps.
 
 import math
 
-import nabla
+import quabla
 
 
 def build_problem(width: int):
@@ -28,7 +28,7 @@ def build_problem(width: int):
         ("forcing", [4, 1]),
         ("target", [4, 1]),
     ]
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, x_boundary, w1, b1, w2, b2, forcing, target: (
             (x @ w1 + b1).tanh() @ w2
         )
@@ -48,36 +48,36 @@ def build_problem(width: int):
     loss = residual_loss + boundary_loss
 
     teacher = {
-        "w1": nabla.Tensor([1, width], [1.2, -0.7]),
-        "b1": nabla.Tensor([1, width], [0.1, -0.2]),
-        "w2": nabla.Tensor([width, 1], [0.8, 0.5]),
-        "b2": nabla.Tensor([1, 1], [0.05]),
+        "w1": quabla.Tensor([1, width], [1.2, -0.7]),
+        "b1": quabla.Tensor([1, width], [0.1, -0.2]),
+        "w2": quabla.Tensor([width, 1], [0.8, 0.5]),
+        "b2": quabla.Tensor([1, 1], [0.05]),
     }
     teacher_inputs = {
-        "x": nabla.Tensor([4, 1], coordinates),
-        "x_boundary": nabla.Tensor([4, 1], boundary_coordinates),
-        "forcing": nabla.Tensor([4, 1], [0.0] * 4),
-        "target": nabla.Tensor([4, 1], [0.0] * 4),
+        "x": quabla.Tensor([4, 1], coordinates),
+        "x_boundary": quabla.Tensor([4, 1], boundary_coordinates),
+        "forcing": quabla.Tensor([4, 1], [0.0] * 4),
+        "target": quabla.Tensor([4, 1], [0.0] * 4),
         **teacher,
     }
     second_value = graph.evaluate(second_derivative.output.node_id, teacher_inputs)
     boundary_target = graph.evaluate(boundary.node_id, teacher_inputs)
-    keys = nabla.Tensor.split_key(2026, 2)
+    keys = quabla.Tensor.split_key(2026, 2)
     inputs = {
-        "x": nabla.Tensor([4, 1], coordinates),
-        "x_boundary": nabla.Tensor([4, 1], boundary_coordinates),
-        "forcing": nabla.Tensor([4, 1], [-value for value in second_value.to_flat_list()]),
+        "x": quabla.Tensor([4, 1], coordinates),
+        "x_boundary": quabla.Tensor([4, 1], boundary_coordinates),
+        "forcing": quabla.Tensor([4, 1], [-value for value in second_value.to_flat_list()]),
         "target": boundary_target,
-        "w1": nabla.Tensor.glorot_normal([1, width], keys[0]),
-        "b1": nabla.Tensor([1, width], [0.0] * width),
-        "w2": nabla.Tensor.glorot_normal([width, 1], keys[1]),
-        "b2": nabla.Tensor([1, 1], [0.0]),
+        "w1": quabla.Tensor.glorot_normal([1, width], keys[0]),
+        "b1": quabla.Tensor([1, width], [0.0] * width),
+        "w2": quabla.Tensor.glorot_normal([width, 1], keys[1]),
+        "b2": quabla.Tensor([1, 1], [0.0]),
     }
     return graph, loss, residual_loss, boundary_loss, inputs
 
 
 def train_cpu(graph, loss, inputs, steps):
-    optimizer = nabla.Adam(learning_rate=0.02)
+    optimizer = quabla.Adam(learning_rate=0.02)
     parameter_names = ["w1", "b1", "w2", "b2"]
     parameters = {name: inputs[name] for name in parameter_names}
     initial_loss = graph.evaluate(loss.node_id, {**inputs, **parameters}).to_flat_list()[0]
@@ -85,7 +85,7 @@ def train_cpu(graph, loss, inputs, steps):
         _, gradients = graph.evaluate_value_and_vjp(
             loss.node_id,
             {**inputs, **parameters},
-            nabla.Tensor([], [1.0]),
+            quabla.Tensor([], [1.0]),
         )
         parameters = optimizer.step(parameters, {name: gradients[name] for name in parameter_names})
     final_loss = graph.evaluate(loss.node_id, {**inputs, **parameters}).to_flat_list()[0]
@@ -95,7 +95,7 @@ def train_cpu(graph, loss, inputs, steps):
 def run(width: int = 2, steps: int = 1500):
     graph, loss, residual_loss, boundary_loss, inputs = build_problem(width)
     cpu_initial, cpu_final, cpu_parameters = train_cpu(graph, loss, inputs, steps)
-    optimizer = nabla.mlx_adam_loss_optimizer(
+    optimizer = quabla.mlx_adam_loss_optimizer(
         loss,
         ["w1", "b1", "w2", "b2"],
         inputs,

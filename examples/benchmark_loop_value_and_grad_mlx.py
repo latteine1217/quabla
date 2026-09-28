@@ -17,12 +17,12 @@ import json
 import platform
 import time
 
-import nabla
+import quabla
 
 
 def build_optimizer(width: int, length: int):
-    loss = nabla.trace_tensor(
-        lambda initial, scale: nabla.tensor_fori_loop_region(
+    loss = quabla.trace_tensor(
+        lambda initial, scale: quabla.tensor_fori_loop_region(
             0,
             length,
             lambda index, carry, captured_scale: carry.tanh()
@@ -33,10 +33,10 @@ def build_optimizer(width: int, length: int):
         [("initial", [width]), ("scale", [width])],
     )
     inputs = {
-        "initial": nabla.Tensor([width], [0.05] * width),
-        "scale": nabla.Tensor([width], [0.01] * width),
+        "initial": quabla.Tensor([width], [0.05] * width),
+        "scale": quabla.Tensor([width], [0.01] * width),
     }
-    return nabla.mlx_adam_loss_optimizer(loss, ["scale"], inputs, 1e-3, ["initial"])
+    return quabla.mlx_adam_loss_optimizer(loss, ["scale"], inputs, 1e-3, ["initial"])
 
 
 def benchmark(steps: int, warmup_steps: int, width: int, length: int) -> None:

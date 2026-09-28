@@ -33,7 +33,7 @@ import subprocess
 import sys
 import time
 
-import nabla
+import quabla
 
 
 DEFAULT_GRID = 16  # grid * grid == batch input points on [-1, 1]^2.
@@ -114,12 +114,12 @@ def build_problem(grid, hidden):
     target = to_f32(
         [math.sin(math.pi * u) * math.cos(math.pi * v) for u, v in points]
     )
-    weight_keys = nabla.Tensor.split_key(PARAMETER_KEY, 3)
+    weight_keys = quabla.Tensor.split_key(PARAMETER_KEY, 3)
     parameters = {}
     for name, shape in parameter_shapes(hidden).items():
         if name.startswith("w"):
             key = weight_keys[int(name[1]) - 1]
-            values = nabla.Tensor.glorot_normal(shape, key).to_flat_list()
+            values = quabla.Tensor.glorot_normal(shape, key).to_flat_list()
         else:
             values = [0.0] * shape[0] * shape[1]
         parameters[name] = to_f32(values)
@@ -128,13 +128,13 @@ def build_problem(grid, hidden):
 
 def build_callable(mode, specs):
     if mode == "cpu":
-        return nabla.tensor_value_and_grad_fn(loss_fn, specs)
+        return quabla.tensor_value_and_grad_fn(loss_fn, specs)
     if mode == "single_gpu":
-        return nabla.tensor_value_and_grad_cuda_fn(
+        return quabla.tensor_value_and_grad_cuda_fn(
             loss_fn, specs, PARAMETER_NAMES, DEVICE_ORDINALS[0]
         )
     reduction = mode.removeprefix("two_gpu_")
-    return nabla.tensor_value_and_grad_data_parallel_cuda_fn(
+    return quabla.tensor_value_and_grad_data_parallel_cuda_fn(
         loss_fn,
         specs,
         PARAMETER_NAMES,
@@ -157,8 +157,8 @@ def train(mode, steps, lr, grid, hidden):
     construct_seconds = time.perf_counter() - construct_start
 
     fixed = {
-        "x": nabla.Tensor([batch, 2], x),
-        "target": nabla.Tensor([batch, 1], target),
+        "x": quabla.Tensor([batch, 2], x),
+        "target": quabla.Tensor([batch, 1], target),
     }
     losses = []
     timings = []
@@ -166,7 +166,7 @@ def train(mode, steps, lr, grid, hidden):
     for _ in range(steps):
         inputs = dict(fixed)
         for name, shape in shapes.items():
-            inputs[name] = nabla.Tensor(shape, parameters[name])
+            inputs[name] = quabla.Tensor(shape, parameters[name])
         call_start = time.perf_counter()
         value, gradients = value_and_grad(inputs)
         call_wall = time.perf_counter() - call_start

@@ -1,6 +1,6 @@
 import json
 
-import nabla
+import quabla
 
 
 INPUT_SPECS = [
@@ -27,7 +27,7 @@ def validate_reduction(cpu_plan, inputs, reduction):
     cpu_value, cpu_gradients = cpu_plan.value_and_grad_data_parallel(
         inputs, MAPPED_INPUTS, len(DEVICE_ORDINALS), reduction
     )
-    cuda_fn = nabla.tensor_value_and_grad_data_parallel_cuda_fn(
+    cuda_fn = quabla.tensor_value_and_grad_data_parallel_cuda_fn(
         loss_fn,
         INPUT_SPECS,
         ["weight"],
@@ -73,13 +73,13 @@ def validate_reduction(cpu_plan, inputs, reduction):
 
 def main():
     inputs = {
-        "x": nabla.Tensor([8, 1], [-4.0, -3.0, -2.0, -1.0, 1.0, 2.0, 3.0, 4.0]),
-        "target": nabla.Tensor(
+        "x": quabla.Tensor([8, 1], [-4.0, -3.0, -2.0, -1.0, 1.0, 2.0, 3.0, 4.0]),
+        "target": quabla.Tensor(
             [8, 1], [-7.0, -5.0, -3.0, -1.0, 3.0, 5.0, 7.0, 9.0]
         ),
-        "weight": nabla.Tensor([1, 1], [0.5]),
+        "weight": quabla.Tensor([1, 1], [0.5]),
     }
-    traced = nabla.trace_tensor(loss_fn, INPUT_SPECS)
+    traced = quabla.trace_tensor(loss_fn, INPUT_SPECS)
     cpu_plan = traced.output.compile_cpu()
     results = [
         validate_reduction(cpu_plan, inputs, reduction)

@@ -17,11 +17,11 @@ import math
 import platform
 import time
 
-import nabla
+import quabla
 
 
 def tensor(shape, values):
-    return nabla.Tensor(shape, values)
+    return quabla.Tensor(shape, values)
 
 
 def values(count, multiplier):
@@ -117,7 +117,7 @@ def benchmark(
         "x": tensor([batch, features], values(batch * features, 7)),
         "weight": tensor([features, outputs], values(features * outputs, 11)),
     }
-    matmul = nabla.trace_tensor(
+    matmul = quabla.trace_tensor(
         lambda x, weight: x.matmul(weight),
         [("x", [batch, features]), ("weight", [features, outputs])],
     ).output.compile_mlx()
@@ -139,7 +139,7 @@ def benchmark(
         "w2": tensor([width, outputs], values(width * outputs, 17)),
         "b2": tensor([1, outputs], values(outputs, 19)),
     }
-    mlp = nabla.trace_tensor(
+    mlp = quabla.trace_tensor(
         lambda x, w1, b1, w2, b2: (x.matmul(w1) + b1).tanh().matmul(w2) + b2,
         [
             ("x", [batch, features]),

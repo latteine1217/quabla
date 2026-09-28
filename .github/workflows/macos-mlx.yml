@@ -33,7 +33,7 @@ jobs:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy --workspace --all-targets --features nabla-core/mlx -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features quabla-core/mlx -- -D warnings
       - run: cargo test --workspace
       - name: Build extension
         run: |

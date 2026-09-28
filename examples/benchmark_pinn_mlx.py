@@ -21,7 +21,7 @@ import math
 import platform
 import time
 
-import nabla
+import quabla
 
 
 def mlp_parameter_specs(hidden_layers: int, hidden_width: int):
@@ -45,11 +45,11 @@ def mlp(x, parameters):
 
 
 def mlp_initial_parameters(specs):
-    keys = nabla.Tensor.split_key(2026, len(specs) // 2)
+    keys = quabla.Tensor.split_key(2026, len(specs) // 2)
     return {
-        name: nabla.Tensor.glorot_normal(shape, keys[index // 2])
+        name: quabla.Tensor.glorot_normal(shape, keys[index // 2])
         if name.startswith("w")
-        else nabla.Tensor(shape, [0.0] * shape[1])
+        else quabla.Tensor(shape, [0.0] * shape[1])
         for index, (name, shape) in enumerate(specs)
     }
 
@@ -63,7 +63,7 @@ def build_optimizer(collocation_count: int, hidden_layers: int = 0, hidden_width
         return build_mlp_optimizer(
             coordinates, forcing, collocation_count, hidden_layers, hidden_width
         )
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, weight, forcing, boundary_target, boundary_mask: (x * weight).sin(),
         [
             ("x", [sample_count, 1]),
@@ -79,17 +79,17 @@ def build_optimizer(collocation_count: int, hidden_layers: int = 0, hidden_width
     weight = graph.input("weight")
     residual = second_derivative.output + graph.input("forcing")
     boundary_error = (x * weight).sin() - graph.input("boundary_target")
-    error = nabla.where(graph.input("boundary_mask").gt(0.0), boundary_error, residual)
+    error = quabla.where(graph.input("boundary_mask").gt(0.0), boundary_error, residual)
     loss = (error * error).mean()
-    return nabla.mlx_adam_loss_optimizer(
+    return quabla.mlx_adam_loss_optimizer(
         loss,
         ["weight"],
         {
-            "x": nabla.Tensor([sample_count, 1], coordinates),
-            "forcing": nabla.Tensor([sample_count, 1], forcing),
-            "boundary_target": nabla.Tensor([sample_count, 1], [0.0] * sample_count),
-            "boundary_mask": nabla.Tensor([sample_count, 1], [0.0] * collocation_count + [1.0] * 2),
-            "weight": nabla.Tensor([1, 1], [2.5]),
+            "x": quabla.Tensor([sample_count, 1], coordinates),
+            "forcing": quabla.Tensor([sample_count, 1], forcing),
+            "boundary_target": quabla.Tensor([sample_count, 1], [0.0] * sample_count),
+            "boundary_mask": quabla.Tensor([sample_count, 1], [0.0] * collocation_count + [1.0] * 2),
+            "weight": quabla.Tensor([1, 1], [2.5]),
         },
         0.01,
         ["x", "forcing", "boundary_target", "boundary_mask"],
@@ -100,7 +100,7 @@ def build_mlp_optimizer(coordinates, forcing, collocation_count, hidden_layers, 
     sample_count = collocation_count + 2
     parameter_specs = mlp_parameter_specs(hidden_layers, hidden_width)
     parameter_names = [name for name, _ in parameter_specs]
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, forcing, boundary_target, boundary_mask, *parameters: mlp(x, parameters),
         [
             ("x", [sample_count, 1]),
@@ -115,16 +115,16 @@ def build_mlp_optimizer(coordinates, forcing, collocation_count, hidden_layers, 
     parameters = [graph.input(name) for name in parameter_names]
     residual = second_derivative.output + graph.input("forcing")
     boundary_error = mlp(graph.input("x"), parameters) - graph.input("boundary_target")
-    error = nabla.where(graph.input("boundary_mask").gt(0.0), boundary_error, residual)
+    error = quabla.where(graph.input("boundary_mask").gt(0.0), boundary_error, residual)
     loss = (error * error).mean()
-    return nabla.mlx_adam_loss_optimizer(
+    return quabla.mlx_adam_loss_optimizer(
         loss,
         parameter_names,
         {
-            "x": nabla.Tensor([sample_count, 1], coordinates),
-            "forcing": nabla.Tensor([sample_count, 1], forcing),
-            "boundary_target": nabla.Tensor([sample_count, 1], [0.0] * sample_count),
-            "boundary_mask": nabla.Tensor([sample_count, 1], [0.0] * collocation_count + [1.0] * 2),
+            "x": quabla.Tensor([sample_count, 1], coordinates),
+            "forcing": quabla.Tensor([sample_count, 1], forcing),
+            "boundary_target": quabla.Tensor([sample_count, 1], [0.0] * sample_count),
+            "boundary_mask": quabla.Tensor([sample_count, 1], [0.0] * collocation_count + [1.0] * 2),
             **mlp_initial_parameters(parameter_specs),
         },
         0.01,

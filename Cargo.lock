@@ -360,33 +360,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nabla-core"
-version = "0.1.0"
-dependencies = [
- "cudarc",
- "libloading 0.8.9",
- "mlx-rs",
- "nabla-macros",
-]
-
-[[package]]
-name = "nabla-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "nabla-python"
-version = "0.1.0"
-dependencies = [
- "nabla-core",
- "pyo3",
-]
-
-[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -560,6 +533,33 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "quabla-core"
+version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "libloading 0.8.9",
+ "mlx-rs",
+ "quabla-macros",
+]
+
+[[package]]
+name = "quabla-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "quabla-python"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "quabla-core",
 ]
 
 [[package]]

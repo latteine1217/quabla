@@ -16,7 +16,7 @@ import math
 import platform
 import time
 
-import nabla
+import quabla
 
 
 def build_optimizer(width: int, collocation: int, device_ordinal: int):
@@ -34,7 +34,7 @@ def build_optimizer(width: int, collocation: int, device_ordinal: int):
         ("forcing", [collocation, 1]),
         ("target", [collocation, 1]),
     ]
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, x_boundary, w1, b1, w2, b2, forcing, target: (
             (x @ w1 + b1).tanh() @ w2
         )
@@ -56,34 +56,34 @@ def build_optimizer(width: int, collocation: int, device_ordinal: int):
     loss = residual_loss + boundary_loss
 
     teacher = {
-        "w1": nabla.Tensor([1, width], [0.2 * (index + 1) for index in range(width)]),
-        "b1": nabla.Tensor([1, width], [0.05 * (index - width // 2) for index in range(width)]),
-        "w2": nabla.Tensor([width, 1], [0.1 * (index + 1) for index in range(width)]),
-        "b2": nabla.Tensor([1, 1], [0.05]),
+        "w1": quabla.Tensor([1, width], [0.2 * (index + 1) for index in range(width)]),
+        "b1": quabla.Tensor([1, width], [0.05 * (index - width // 2) for index in range(width)]),
+        "w2": quabla.Tensor([width, 1], [0.1 * (index + 1) for index in range(width)]),
+        "b2": quabla.Tensor([1, 1], [0.05]),
     }
     teacher_inputs = {
-        "x": nabla.Tensor([collocation, 1], coordinates),
-        "x_boundary": nabla.Tensor([collocation, 1], boundary_coordinates),
-        "forcing": nabla.Tensor([collocation, 1], [0.0] * collocation),
-        "target": nabla.Tensor([collocation, 1], [0.0] * collocation),
+        "x": quabla.Tensor([collocation, 1], coordinates),
+        "x_boundary": quabla.Tensor([collocation, 1], boundary_coordinates),
+        "forcing": quabla.Tensor([collocation, 1], [0.0] * collocation),
+        "target": quabla.Tensor([collocation, 1], [0.0] * collocation),
         **teacher,
     }
     second_value = graph.evaluate(second_derivative.output.node_id, teacher_inputs)
     boundary_target = graph.evaluate(boundary.node_id, teacher_inputs)
-    split = nabla.Tensor.split_key(2026, 2)
+    split = quabla.Tensor.split_key(2026, 2)
     inputs = {
-        "x": nabla.Tensor([collocation, 1], coordinates),
-        "x_boundary": nabla.Tensor([collocation, 1], boundary_coordinates),
-        "forcing": nabla.Tensor(
+        "x": quabla.Tensor([collocation, 1], coordinates),
+        "x_boundary": quabla.Tensor([collocation, 1], boundary_coordinates),
+        "forcing": quabla.Tensor(
             [collocation, 1], [-value for value in second_value.to_flat_list()]
         ),
         "target": boundary_target,
-        "w1": nabla.Tensor.glorot_normal([1, width], split[0]),
-        "b1": nabla.Tensor([1, width], [0.0] * width),
-        "w2": nabla.Tensor.glorot_normal([width, 1], split[1]),
-        "b2": nabla.Tensor([1, 1], [0.0]),
+        "w1": quabla.Tensor.glorot_normal([1, width], split[0]),
+        "b1": quabla.Tensor([1, width], [0.0] * width),
+        "w2": quabla.Tensor.glorot_normal([width, 1], split[1]),
+        "b2": quabla.Tensor([1, 1], [0.0]),
     }
-    optimizer = nabla.cuda_adam_loss_optimizer(
+    optimizer = quabla.cuda_adam_loss_optimizer(
         loss,
         ["w1", "b1", "w2", "b2"],
         inputs,

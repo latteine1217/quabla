@@ -16,11 +16,11 @@ import math
 import platform
 import time
 
-import nabla
+import quabla
 
 
 def tensor(shape, values):
-    return nabla.Tensor(shape, values)
+    return quabla.Tensor(shape, values)
 
 
 def build_inputs(batch: int, width: int):
@@ -41,7 +41,7 @@ def build_inputs(batch: int, width: int):
 
 
 def build_function(max_specializations: int):
-    return nabla.tensor_value_and_grad_batch_mlx_fn(
+    return quabla.tensor_value_and_grad_batch_mlx_fn(
         lambda x, target, w1, b1, w2, b2: (
             ((x.matmul(w1) + b1).tanh().matmul(w2) + b2 - target).powi(2)
         ).mean(),

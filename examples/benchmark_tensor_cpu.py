@@ -10,19 +10,19 @@ import json
 import platform
 import time
 
-import nabla
+import quabla
 
 
-def tensor(shape: list[int], offset: int) -> nabla.Tensor:
+def tensor(shape: list[int], offset: int) -> quabla.Tensor:
     count = 1
     for extent in shape:
         count *= extent
     data = [((index + offset) % 23 - 11) / 23.0 for index in range(count)]
-    return nabla.Tensor(shape, data)
+    return quabla.Tensor(shape, data)
 
 
 def benchmark(iterations: int, batch: int, width: int) -> None:
-    traced = nabla.trace_tensor(
+    traced = quabla.trace_tensor(
         lambda x, w1, b1, w2, b2: (((x @ w1 + b1).tanh() @ w2 + b2).sin()).mean(),
         [
             ("x", [batch, width]),
@@ -40,7 +40,7 @@ def benchmark(iterations: int, batch: int, width: int) -> None:
         "w2": tensor([width, width], 3),
         "b2": tensor([1, width], 4),
     }
-    cotangent = nabla.Tensor([], [1.0])
+    cotangent = quabla.Tensor([], [1.0])
 
     warmup_iterations = 10
     for _ in range(warmup_iterations):
