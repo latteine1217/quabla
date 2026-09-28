@@ -1,41 +1,91 @@
 # Quabla
 
-Quabla is a Rust-native scientific machine learning (SciML) compiler and
-runtime with a JAX-like programming model. Python functions are traced into a
-rank-N tensor IR, transformed with composable automatic differentiation
-(JVP, VJP, Jacobians, Hessians, Hessian-vector products, and `vmap`), and
-compiled to frozen execution plans. Structured control flow (`cond`,
-`fori_loop`, `scan`) is part of the IR rather than traced Python branches.
-Plans run on a CPU reference backend (`f64`), on CUDA (Linux; NVRTC kernels
-plus cuBLAS/cuSOLVER, with optional NCCL data parallelism), or on MLX (Apple
-silicon). The Python API is a PyO3 extension. "JAX-like" describes the API
-style only: Quabla does not depend on JAX and is not affiliated with JAX or
-with the `nabla-ml` project.
+**Differentiable scientific computing for physics-informed neural networks
+(PINNs): a Rust compiler and runtime with a JAX-style Python API that runs one
+traced program on CPU, CUDA, and Apple silicon.**
 
-The project was formerly named Nabla and was renamed to Quabla (after □, the
-d'Alembert operator) before the v0.1 release.
+[![CI](https://github.com/latteine1217/quabla/actions/workflows/ci.yml/badge.svg)](https://github.com/latteine1217/quabla/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation-from-source)
+[![Release v0.1.0](https://img.shields.io/badge/release-v0.1.0-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.1.0)
+
+![A tanh MLP trained with Quabla matches the exact solution of a 1D Poisson problem; its training loss falls from about 50 to 2.5e-4.](docs/assets/pinn_poisson.png)
+
+*A 16-unit tanh MLP trained as a PINN on the CPU backend (3,000 Adam steps)
+matches the exact solution `sin(πx)` to a max abs error of 2.4e-4.
+Reproduce with `python examples/plot_readme_figure.py`.*
+
+## Why Quabla
+
+- **One program, three backends.** Trace once, then compile for the `f64` CPU
+  reference, CUDA (Linux), or MLX (Apple silicon); device backends are
+  validated operation by operation against the CPU reference.
+- **Exact higher-order derivatives.** JVP, VJP, Jacobians, Hessians, and
+  Hessian-vector products compose with each other and with `vmap`, so a PINN
+  residual uses an exact `u_xx` that is itself differentiable in the weights.
+- **Differentiable control flow.** `cond`, `fori_loop`, and `scan` are IR
+  regions, not traced Python branches, with VJP and forward-over-reverse HVP
+  on CPU and MLX and, for elementwise loop bodies, on CUDA.
+- **Explicit rather than silent.** `float32`, `float64`, and `bool` convert
+  only through `astype`, and an operation a backend does not support raises an
+  error instead of falling back to the host.
+
+## At a Glance
+
+Two symbolic JVPs give an exact `u_xx`; the PDE-residual loss built from it is
+compiled once and trained with reverse-mode gradients and Adam:
+
+```python
+import math
+
+import quabla
+
+# Fit u(x) = sin(w x) to u'' = -pi^2 sin(pi x); the exact solution has w = pi.
+u = quabla.trace_tensor(lambda x, w: (x * w).sin(), [("x", [8, 1]), ("w", [1, 1])])
+u_xx = u.symbolic_jvp("x").symbolic_jvp("x")  # exact d2u/dx2, no finite differences
+x = u_xx.graph.input("x")
+loss = (u_xx.output + math.pi**2 * (math.pi * x).sin()).powi(2).mean()
+plan = loss.compile_cpu()  # frozen execution plan, reused every step
+
+points = {"x": quabla.Tensor.linspace(0.05, 0.95, 8).reshape([8, 1])}
+params, adam = {"w": quabla.Tensor([1, 1], [2.5])}, quabla.Adam(learning_rate=0.05)
+seed = quabla.Tensor([], [1.0])  # d loss / d loss
+for _ in range(300):
+    value, grads = plan.evaluate_value_and_vjp({**points, **params}, seed)
+    params = adam.step(params, {"w": grads["w"]})
+print(f"w = {params['w'].to_flat_list()[0]:.6f}, loss = {value.to_flat_list()[0]:.1e}")
+```
+
+```text
+w = 3.141593, loss = 1.5e-13
+```
+
+The [Quickstart](#quickstart) covers dtypes, masks, and the multi-backend
+compiler facade.
 
 ## Status
 
-Quabla v0.1 is a research-grade, source-only pre-release: it is released as a
-git tag and GitHub Release, with no prebuilt wheels. The 0.x API may change
-between releases. Backend support is validated operation by operation;
-unsupported operations fail explicitly instead of falling back to the host.
+Quabla v0.1 is a research-grade, source-only pre-release, published as a git
+tag and GitHub Release without prebuilt wheels; the 0.x API may change between
+releases. Python functions are traced into a rank-N tensor IR, transformed
+with composable automatic differentiation, and compiled to frozen execution
+plans by a Rust core exposed to Python through PyO3.
 
-The primary Python API is the rank-N path:
+The primary Python API is the rank-N path: the `quabla.Compiler` facade
+(`Compiler.trace(fn, input_specs) -> Program`, `Program.jvp(...)` /
+`Program.vjp(...)`, `Program.compile("cpu" | "cuda" | "mlx")`),
+`trace_tensor(...)`, the eager `Tensor` class, and the `tensor_*_fn` helpers
+(`tensor_value_and_grad_fn`, `tensor_jit_fn`, `tensor_vmap_fn`,
+`tensor_hvp_scalar_fn`, their `_cuda`/`_mlx` variants, and the control-flow
+builders `tensor_cond`, `tensor_fori_loop_region`, `tensor_scan_region`). The
+2D `Matrix`, `trace(...)`, `TraceGraph`, `grad*`, and `jit(...)` API is legacy:
+kept for compatibility, outside the compiler facade, without new backend
+features.
 
-- `quabla.Compiler` facade: `Compiler.trace(fn, input_specs) -> Program`,
-  `Program.jvp(...)` / `Program.vjp(...)`, `Program.compile(target) ->
-  Executable` for `"cpu"`, `"cuda"`, or `"mlx"`.
-- `trace_tensor(...)` with `TraceTensor` values, the eager `Tensor` class, and
-  the `tensor_*_fn` helpers (`tensor_value_and_grad_fn`, `tensor_jit_fn`,
-  `tensor_vmap_fn`, `tensor_hvp_scalar_fn`, their `_cuda`/`_mlx` variants, and
-  the structured control-flow builders `tensor_cond`,
-  `tensor_fori_loop_region`, and `tensor_scan_region`).
-
-The 2D `Matrix`, `trace(...)`, `TraceGraph`, `grad*`, and `jit(...)` API is
-legacy: it remains available for compatibility but is outside the compiler
-facade and does not receive new backend features.
+"JAX-style" describes the API only: Quabla does not depend on JAX and is not
+affiliated with JAX or with the `nabla-ml` project. It was formerly named
+Nabla and was renamed to Quabla (after □, the d'Alembert operator) before
+v0.1.
 
 ## Backend Support
 
