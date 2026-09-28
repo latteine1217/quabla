@@ -66,8 +66,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 - **Rust macros.** The `forward_diff!` and `forward_gradient!` procedural
   macros in `quabla-macros`, a restricted source-level forward-mode prototype.
 - **Examples and validation.** Poisson and MLP PINN examples for the CPU, CUDA,
-  and MLX backends, benchmarks, and a two-GPU data-parallel parity script with
-  slurm jobs.
+  and MLX backends, benchmarks, and two-GPU data-parallel parity and training
+  validation scripts.
 - **Project infrastructure.** Dual MIT/Apache-2.0 license files, a GitHub
   Actions workflow for the Linux development gates (fmt, ruff, clippy
   including a compile-only CUDA/NCCL check, `cargo test`, and the Python test

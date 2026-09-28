@@ -63,12 +63,10 @@ Prerequisites:
   time: `libnvrtc.so` is required, `libcublas` is used for rank-two `f32`
   GEMM when present (otherwise an NVRTC tiled kernel), and `libcusolver` is
   required for `solve`. Put their directory on `LD_LIBRARY_PATH`. The
-  two-GPU validation host used CUDA 12.6.
+  two-GPU validation used CUDA 12.6.
 - CUDA + NCCL builds: additionally NCCL loadable as `libnccl.so` (for example
-  through `LD_LIBRARY_PATH`) and at least two CUDA devices.
-  The Slurm scripts in `scripts/slurm/` set `LD_LIBRARY_PATH` from
-  `QUABLA_NCCL_LIB_DIR` (default `.deps/nccl/lib`). Ordinary `cuda` builds
-  neither link nor load NCCL.
+  through `LD_LIBRARY_PATH`) and at least two CUDA devices. Ordinary `cuda`
+  builds neither link nor load NCCL.
 
 Create a virtual environment and build the extension in place:
 
@@ -198,7 +196,7 @@ GPU hosts.
 
 ```sh
 cargo fmt --all --check
-ruff check tests examples scripts
+ruff check tests examples
 cargo clippy --workspace --all-targets -- -D warnings
 # macOS:
 cargo clippy --workspace --all-targets --features quabla-core/mlx -- -D warnings
@@ -297,8 +295,23 @@ CUDA + NCCL build (`--features cuda-nccl`, two GPUs):
 `examples/validate_data_parallel_cuda.py` checks single-call two-GPU parity
 against the CPU reference, and
 `examples/validate_data_parallel_training_cuda.py` checks 200-step training
-parity against one GPU and CPU. The Slurm scripts in
-`scripts/slurm/` run them on the two-GPU validation host.
+parity against one GPU and CPU. Both use CUDA ordinals 0 and 1 (select the
+devices with `CUDA_VISIBLE_DEVICES`) and need `libnccl.so` to be loadable.
+On any Linux machine with two GPUs and NCCL:
+
+```sh
+maturin develop --release --features cuda-nccl
+python examples/validate_data_parallel_cuda.py
+python examples/validate_data_parallel_training_cuda.py
+# Rust two-GPU tests: schedule parity, communicator recovery, lifecycle.
+QUABLA_CUDA_NCCL_TEST=1 cargo test -p quabla-core --features cuda-nccl \
+  --test tensor_ir on_two_gpus -- --nocapture
+```
+
+`--grid`, `--hidden`, `--steps`, and `--modes` scale or restrict the training
+check, and `--output` also writes its JSON report to a file (`--help` lists
+all flags); `--modes single_gpu,cpu` is a dry run for a host with one GPU and
+no NCCL.
 
 Rust-only examples of the core crate (no Python extension needed):
 
