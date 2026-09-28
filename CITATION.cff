@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using these metadata."
+title: Quabla
+abstract: >-
+  Quabla is a Rust-backed scientific machine learning runtime exposed to
+  Python, with CPU, MLX, CUDA, and single-node CUDA + NCCL backends.
+type: software
+authors:
+  - alias: latteine
+repository-code: "https://github.com/latteine1217/quabla"
+license:
+  - MIT
+  - Apache-2.0
+version: 0.1.0
