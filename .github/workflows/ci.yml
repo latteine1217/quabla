@@ -1,11 +1,17 @@
 # Development gates. Every step runs the same command a contributor runs
 # locally, so a red check reproduces with the command shown in its log.
 #
-# Deliberately NOT run here: CUDA, NCCL and MLX runtime tests. Hosted runners
-# have no NVIDIA GPU and no usable Metal device, so those backends are only
-# compiled and linted (clippy with the feature enabled). Their runtime suites
-# stay on the GPU hosts and are gated by NABLA_CUDA_TEST / NABLA_CUDA_NCCL_TEST
-# / NABLA_MLX_TEST, which must remain unset in CI.
+# One Linux job on purpose: the test suites finish in seconds, so the cost is
+# compilation. Sharing one job shares one build cache instead of recompiling
+# the workspace per job.
+#
+# Deliberately NOT run here:
+# - CUDA, NCCL and MLX runtime tests. Hosted runners have no NVIDIA GPU and no
+#   usable Metal device; those suites run on the GPU hosts, gated by
+#   NABLA_CUDA_TEST / NABLA_CUDA_NCCL_TEST / NABLA_MLX_TEST (unset here).
+# - macOS and the MLX build. macOS minutes are billed at 10x for this private
+#   repository and the mlx feature compiles MLX C++ from source; that check
+#   lives in macos-mlx.yml and runs on demand.
 name: CI
 
 on:
@@ -27,92 +33,36 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  lint:
-    name: fmt + ruff
+  gates:
+    name: gates (linux)
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
+      # Oldest supported interpreter (requires-python >= 3.10). PyO3 needs it
+      # at build time; setup-python also exports LD_LIBRARY_PATH so the test
+      # binaries find libpython.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       # pipx ships with the runner image. Ruff is pinned to a minor series so
       # a new release cannot turn the gate red without a code change.
       - run: pipx run --spec 'ruff>=0.15,<0.16' ruff check tests examples scripts
-
-  rust-linux:
-    name: rust (linux)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      # PyO3 (nabla-python) needs an interpreter at build time; setup-python
-      # also exports LD_LIBRARY_PATH so the test binaries find libpython.
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-      - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # Compile-only check of the CUDA/NCCL backend. cudarc is built with
-      # fallback-dynamic-loading, so no CUDA toolkit is needed to compile.
+      # Compile-only check of the CUDA/NCCL backend, which macOS development
+      # machines cannot compile at all. cudarc is built with
+      # fallback-dynamic-loading, so no CUDA toolkit is needed.
       - run: cargo clippy --workspace --all-targets --features nabla-core/cuda-nccl -- -D warnings
       - run: cargo test --workspace
-
-  python-linux:
-    name: python ${{ matrix.python }} (linux)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        # Oldest supported (requires-python >= 3.10) and newest.
-        python: ["3.10", "3.13"]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ matrix.python }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: py${{ matrix.python }}
       - name: Build extension
         run: |
           python -m venv .venv-ci
           .venv-ci/bin/python -m pip install 'maturin>=1.14,<2'
           VIRTUAL_ENV="$PWD/.venv-ci" .venv-ci/bin/maturin develop
       # The script's __main__ runner executes every test_*; exit 0 == pass.
-      - run: .venv-ci/bin/python tests/python/test_matrix.py
-
-  # macOS minutes are billed at 10x for this private repository, so all
-  # macOS gates share one job and one Python version.
-  macos:
-    name: macos (rust + mlx check + python 3.13)
-    runs-on: macos-15
-    # Cold runs build MLX C++ from source through mlx-rs (cmake); the build
-    # output lives in target/ and is reused through rust-cache afterwards.
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      # Compile-only: with the mlx feature, cargo test would execute MLX GPU
-      # tests that the runner cannot satisfy, so mlx is checked, never tested.
-      - run: cargo clippy --workspace --all-targets --features nabla-core/mlx -- -D warnings
-      - run: cargo test --workspace
-      - name: Build extension
-        run: |
-          python -m venv .venv-ci
-          .venv-ci/bin/python -m pip install 'maturin>=1.14,<2'
-          VIRTUAL_ENV="$PWD/.venv-ci" .venv-ci/bin/maturin develop
       - run: .venv-ci/bin/python tests/python/test_matrix.py

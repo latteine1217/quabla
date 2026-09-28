@@ -1,0 +1,43 @@
+# On-demand macOS check: the mlx feature build plus the default gates on the
+# newest supported Python. Not triggered by pushes because macOS minutes are
+# billed at 10x for this private repository and a cold mlx build compiles MLX
+# C++ from source. Run it before a release or after changing the MLX backend.
+#
+# MLX is compiled and linted only: hosted macOS runners have no usable Metal
+# device, and with the mlx feature cargo test would execute MLX GPU tests.
+name: macOS MLX check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  macos:
+    name: macos (mlx check + python 3.13)
+    runs-on: macos-15
+    # A cold run builds MLX C++ through mlx-rs (cmake).
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features nabla-core/mlx -- -D warnings
+      - run: cargo test --workspace
+      - name: Build extension
+        run: |
+          python -m venv .venv-ci
+          .venv-ci/bin/python -m pip install 'maturin>=1.14,<2'
+          VIRTUAL_ENV="$PWD/.venv-ci" .venv-ci/bin/maturin develop
+      - run: .venv-ci/bin/python tests/python/test_matrix.py

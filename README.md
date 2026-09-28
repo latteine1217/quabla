@@ -188,8 +188,10 @@ backend.
 
 ## Development Gates
 
-Run these before treating a change as verified. CI runs them on GitHub
-Actions; the GPU runtime suites run manually on GPU hosts.
+Run these before treating a change as verified. CI (`.github/workflows/ci.yml`)
+runs the Linux gates on every push and pull request; the macOS `mlx` check
+(`macos-mlx.yml`) runs on demand, and the GPU runtime suites run manually on
+GPU hosts.
 
 ```sh
 cargo fmt --all --check
