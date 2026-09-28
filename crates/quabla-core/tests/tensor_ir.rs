@@ -16,7 +16,7 @@ use quabla_core::tensor_ir::CudaBackend;
 use quabla_core::tensor_ir::CudaDataParallelExecutionPlan;
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
-use quabla_core::tensor_ir::MlxBackend;
+use quabla_core::tensor_ir::{MlxBackend, MlxRetainedInputs};
 
 macro_rules! must {
     ($result:expr) => {
@@ -6110,6 +6110,193 @@ fn mlx_backend_matches_cpu_for_concat_broadcast_and_tanh() {
             (actual - expected).abs() < 1e-5,
             "actual={actual}, expected={expected}"
         );
+    }
+}
+
+/// Executes `outputs` on the CPU and on MLX and requires identical values.
+///
+/// The readback tests below only move exactly representable values through layout views
+/// (transpose, broadcast, slice) or add exactly representable constants, so the f32 MLX result
+/// must equal the CPU reference bit for bit; any strided misread shows up as a wrong element.
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+fn assert_mlx_readback_matches_cpu(
+    graph: &TensorIr,
+    outputs: &[TensorNodeId],
+    inputs: &BTreeMap<String, DynamicTensor>,
+) {
+    let (plan, output_ids) = must!(graph.compile_cpu_many(outputs));
+    let cpu = must!(plan.evaluate_many(inputs));
+    let mlx = must!(MlxBackend.execute_many(&plan, &output_ids, inputs));
+    assert_eq!(mlx.len(), cpu.len());
+    for (index, (actual, expected)) in mlx.iter().zip(&cpu).enumerate() {
+        assert_eq!(actual.shape(), expected.shape(), "output {index} shape");
+        assert_eq!(actual.data(), expected.data(), "output {index} data");
+    }
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+fn iota_input(name: &str, shape: Vec<usize>) -> (String, DynamicTensor) {
+    let count = shape.iter().product::<usize>();
+    let data = (1..=count).map(|value| value as f64).collect();
+    (name.to_string(), must_tensor(shape, data))
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+fn must_tensor(shape: Vec<usize>, data: Vec<f64>) -> DynamicTensor {
+    DynamicTensor::new(shape, data).expect("valid test tensor")
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_readback_of_transposed_output_is_row_major() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 3]));
+    let output = must!(graph.transpose(x, Some(vec![1, 0])));
+    let inputs = BTreeMap::from([iota_input("x", vec![2, 3])]);
+    assert_mlx_readback_matches_cpu(&graph, &[output], &inputs);
+    let plan = must!(graph.compile_cpu(output));
+    assert_eq!(
+        must!(MlxBackend.execute(&plan, &inputs)).data(),
+        &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+    );
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_readback_of_broadcast_output_is_row_major() {
+    let mut graph = TensorIr::new();
+    let row = must!(graph.input("row", vec![1, 3]));
+    let column = must!(graph.input("column", vec![2, 1]));
+    let rows = must!(graph.broadcast_to(row, vec![2, 3]));
+    let columns = must!(graph.broadcast_to(column, vec![2, 3]));
+    let inputs = BTreeMap::from([
+        iota_input("row", vec![1, 3]),
+        iota_input("column", vec![2, 1]),
+    ]);
+    assert_mlx_readback_matches_cpu(&graph, &[rows], &inputs);
+    assert_mlx_readback_matches_cpu(&graph, &[columns], &inputs);
+    let plan = must!(graph.compile_cpu(rows));
+    assert_eq!(
+        must!(MlxBackend.execute(&plan, &inputs)).data(),
+        &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0]
+    );
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_readback_of_rank3_permutation_is_row_major() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 3, 4]));
+    let permuted = must!(graph.transpose(x, Some(vec![2, 0, 1])));
+    let swapped = must!(graph.transpose(x, Some(vec![0, 2, 1])));
+    let inputs = BTreeMap::from([iota_input("x", vec![2, 3, 4])]);
+    assert_mlx_readback_matches_cpu(&graph, &[permuted], &inputs);
+    assert_mlx_readback_matches_cpu(&graph, &[swapped], &inputs);
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_readback_of_sliced_transpose_is_row_major() {
+    // A slice of a transpose is strided and starts at a non-zero storage offset.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3, 4]));
+    let transposed = must!(graph.transpose(x, None));
+    let rows = must!(graph.slice_axis(transposed, 0, 1, 3));
+    let block = must!(graph.slice_axis(rows, 1, 1, 3));
+    let inputs = BTreeMap::from([iota_input("x", vec![3, 4])]);
+    assert_mlx_readback_matches_cpu(&graph, &[rows], &inputs);
+    assert_mlx_readback_matches_cpu(&graph, &[block], &inputs);
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_multi_output_readback_mixes_contiguous_and_strided_outputs() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 3]));
+    let bias = must!(graph.input("bias", vec![1, 3]));
+    let half = graph.scalar_constant(0.5);
+    let shifted = must!(graph.add(x, half));
+    let transposed = must!(graph.transpose(x, None));
+    let broadcast = must!(graph.broadcast_to(bias, vec![4, 3]));
+    let total = must!(graph.sum(shifted));
+    let inputs = BTreeMap::from([iota_input("x", vec![2, 3]), iota_input("bias", vec![1, 3])]);
+    assert_mlx_readback_matches_cpu(&graph, &[shifted, transposed, broadcast, total, x], &inputs);
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_retained_input_readback_of_transposed_weight_is_row_major() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 3]));
+    let weight = must!(graph.input("weight", vec![2, 3]));
+    let weight_t = must!(graph.transpose(weight, None));
+    let product = must!(graph.matmul(x, weight_t));
+    let inputs = BTreeMap::from([
+        iota_input("x", vec![2, 3]),
+        iota_input("weight", vec![2, 3]),
+    ]);
+    let (plan, output_ids) = must!(graph.compile_cpu_many(&[weight_t, product]));
+    let cpu = must!(plan.evaluate_many(&inputs));
+    let state = must!(MlxRetainedInputs::upload(&inputs, ["weight".to_string()]));
+    let dynamic_inputs = BTreeMap::from([iota_input("x", vec![2, 3])]);
+    let mlx =
+        must!(MlxBackend.execute_many_with_state(&plan, &output_ids, &dynamic_inputs, &state));
+    assert_eq!(mlx[0].data(), cpu[0].data());
+    for (actual, expected) in mlx[1].data().iter().zip(cpu[1].data()) {
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "actual={actual}, expected={expected}"
+        );
+    }
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_readback_of_elementwise_result_over_transpose_is_row_major() {
+    // MLX elementwise kernels keep a column-major input layout for their output, so ordinary
+    // arithmetic on a transpose also yields a non-row-major array.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 3]));
+    let transposed = must!(graph.transpose(x, None));
+    let half = graph.scalar_constant(0.5);
+    let shifted = must!(graph.add(transposed, half));
+    let doubled = must!(graph.add(transposed, transposed));
+    let inputs = BTreeMap::from([iota_input("x", vec![2, 3])]);
+    assert_mlx_readback_matches_cpu(&graph, &[shifted], &inputs);
+    assert_mlx_readback_matches_cpu(&graph, &[doubled], &inputs);
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_cond_reads_offset_predicates_and_returns_strided_branch_outputs() {
+    // The predicate is a scalar view at a non-zero storage offset of a transpose, and both
+    // branches return non-row-major arrays computed from their captured input.
+    let mut true_branch = TensorIr::new();
+    let true_value = must!(true_branch.input("value", vec![2, 3]));
+    let true_output = must!(true_branch.transpose(true_value, None));
+    let mut false_branch = TensorIr::new();
+    let false_value = must!(false_branch.input("value", vec![2, 3]));
+    let false_transposed = must!(false_branch.transpose(false_value, None));
+    let false_output = must!(false_branch.add(false_transposed, false_transposed));
+    let branches = must!(TensorCondExecutionPlan::new(
+        must!(true_branch.compile_cpu(true_output)),
+        must!(false_branch.compile_cpu(false_output)),
+    ));
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 3]));
+    let transposed = must!(graph.transpose(x, None));
+    let predicate_row = must!(graph.slice_axis(transposed, 0, 1, 2));
+    let predicate_cell = must!(graph.slice_axis(predicate_row, 1, 1, 2));
+    let predicate = must!(graph.reshape(predicate_cell, vec![]));
+    let output =
+        must!(graph.cond_with_captures(predicate, branches, vec![("value".to_string(), x)],));
+    // x[1][1] is the predicate; every other entry is non-zero so a misread flips the branch.
+    for x_values in [
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        vec![1.0, 2.0, 3.0, 4.0, 0.0, 6.0],
+    ] {
+        let inputs = BTreeMap::from([("x".to_string(), must_tensor(vec![2, 3], x_values))]);
+        assert_mlx_readback_matches_cpu(&graph, &[output], &inputs);
     }
 }
 

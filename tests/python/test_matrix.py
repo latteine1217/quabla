@@ -1589,6 +1589,22 @@ def test_mlx_trace_tensor_compiles_and_matches_cpu():
     assert plan.evaluate_device(inputs) is None
 
 
+def test_mlx_strided_outputs_read_back_in_row_major_order():
+    if os.environ.get("QUABLA_MLX_TEST") is None:
+        return
+
+    cases = [
+        (lambda x: x.transpose([1, 0]), [2, 3], [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]),
+        (lambda x: x.broadcast_to([2, 3]), [1, 3], [1.0, 2.0, 3.0, 1.0, 2.0, 3.0]),
+    ]
+    for function, shape, expected in cases:
+        traced = quabla.trace_tensor(function, [("x", shape)])
+        count = shape[0] * shape[1]
+        inputs = {"x": quabla.Tensor(shape, [float(value) for value in range(1, count + 1)])}
+        assert traced.output.compile_cpu().evaluate(inputs).to_flat_list() == expected
+        assert traced.output.compile_mlx().evaluate(inputs).to_flat_list() == expected
+
+
 def test_mlx_execution_plan_retains_static_inputs_across_calls():
     if os.environ.get("QUABLA_MLX_TEST") is None:
         return

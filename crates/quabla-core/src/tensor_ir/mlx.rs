@@ -356,14 +356,11 @@ impl MlxAdamPlan {
             .values
             .get(name)
             .ok_or_else(|| format!("MLX Adam parameter {name:?} is not retained"))?;
+        let parameter = mlx_row_major(parameter, &StreamOrDevice::gpu())?;
         DynamicTensor::with_dtype(
             node.shape.clone(),
-            parameter
-                .as_slice::<f32>()
-                .iter()
-                .copied()
-                .map(f64::from)
-                .collect(),
+            mlx_host_values(&parameter)
+                .map_err(|error| format!("MLX Adam parameter {name:?} {error}"))?,
             node.dtype,
         )
     }
@@ -423,11 +420,19 @@ impl MlxBackend {
         retained_inputs: &BTreeMap<String, Array>,
     ) -> Result<Vec<DynamicTensor>, String> {
         let _guard = mlx_execution_guard();
-        let outputs =
-            self.execute_arrays_with_retained(plan, output_node_ids, inputs, retained_inputs)?;
+        let stream = StreamOrDevice::gpu();
+        // Row-major copies are built before the single evaluation so that they run in the same
+        // GPU submission as the graph; an output that is already row-major shares its buffer.
+        let outputs = self
+            .lower_arrays_with_retained(plan, output_node_ids, inputs, retained_inputs)?
+            .iter()
+            .map(|output| mlx_row_major(output, &stream))
+            .collect::<Result<Vec<_>, _>>()?;
+        transforms::eval(&outputs)
+            .map_err(|error| format!("MLX output evaluation failed: {error}"))?;
         output_node_ids
             .iter()
-            .zip(outputs)
+            .zip(&outputs)
             .map(|(node_id, output)| {
                 let node = plan
                     .nodes
@@ -437,12 +442,8 @@ impl MlxBackend {
                 // result of f32-demoted execution).
                 DynamicTensor::with_dtype(
                     node.shape.clone(),
-                    output
-                        .as_slice::<f32>()
-                        .iter()
-                        .copied()
-                        .map(f64::from)
-                        .collect(),
+                    mlx_host_values(output)
+                        .map_err(|error| format!("MLX output node {node_id} {error}"))?,
                     node.dtype,
                 )
             })
@@ -451,6 +452,24 @@ impl MlxBackend {
 
     /// Executes a graph and returns evaluated MLX arrays without host readback.
     fn execute_arrays_with_retained(
+        &self,
+        plan: &TensorExecutionPlan,
+        output_node_ids: &[usize],
+        inputs: &BTreeMap<String, DynamicTensor>,
+        retained_inputs: &BTreeMap<String, Array>,
+    ) -> Result<Vec<Array>, String> {
+        let outputs =
+            self.lower_arrays_with_retained(plan, output_node_ids, inputs, retained_inputs)?;
+        transforms::eval(&outputs)
+            .map_err(|error| format!("MLX output evaluation failed: {error}"))?;
+        Ok(outputs)
+    }
+
+    /// Builds the MLX arrays of the requested outputs without evaluating them.
+    ///
+    /// Region nodes still synchronize internally (a `Cond` reads its predicate back and loops
+    /// evaluate their carries), but the returned arrays are lazy until the caller evaluates them.
+    fn lower_arrays_with_retained(
         &self,
         plan: &TensorExecutionPlan,
         output_node_ids: &[usize],
@@ -1055,13 +1074,10 @@ impl MlxBackend {
             values.push(value);
         }
 
-        let outputs = output_node_ids
+        output_node_ids
             .iter()
-            .map(|node_id| mlx_value(&values, *node_id))
-            .collect::<Result<Vec<_>, _>>()?;
-        transforms::eval(outputs.iter().copied())
-            .map_err(|error| format!("MLX output evaluation failed: {error}"))?;
-        Ok(outputs.into_iter().cloned().collect())
+            .map(|node_id| mlx_value(&values, *node_id).cloned())
+            .collect()
     }
 
     /// Executes a graph using the backend-owned retained input state.
@@ -1742,6 +1758,28 @@ fn mlx_array_from_dynamic(input: &DynamicTensor) -> Result<Array, String> {
     host_value
         .add_device(&zeros, &stream)
         .map_err(|error| error.to_string())
+}
+
+/// Returns `array` with a row-major layout, as host readback requires.
+///
+/// Transposes, broadcasts, and axis-moving gathers are strided views in MLX, and elementwise
+/// kernels keep a column-major input layout for their output, so a valid program can produce an
+/// array whose storage order differs from its logical row-major order. `contiguous` copies such
+/// an array and shares the buffer of one that is already row-major.
+fn mlx_row_major(array: &Array, stream: &StreamOrDevice) -> Result<Array, String> {
+    mlx_rs::with_stream(stream.as_ref(), || array.contiguous())
+        .map_err(|error| format!("MLX row-major copy failed: {error}"))
+}
+
+/// Copies an evaluated row-major f32 array to the host.
+///
+/// Callers pass the result of [`mlx_row_major`]; `try_as_slice` still rejects any other layout
+/// instead of returning elements in storage order.
+fn mlx_host_values(array: &Array) -> Result<Vec<f64>, String> {
+    array
+        .try_as_slice::<f32>()
+        .map(|values| values.iter().copied().map(f64::from).collect())
+        .map_err(|error| format!("readback failed: {error}"))
 }
 
 /// Reads back the scalar predicate of a `Cond` (evaluating and synchronizing the GPU stream).
