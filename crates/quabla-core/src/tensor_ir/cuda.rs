@@ -1802,16 +1802,15 @@ fn execute_cuda_device_program(
                         let member_count = element_count(&plan.nodes[*member_id].shape)?;
                         let mut output =
                             take_cuda_buffer(stream, free_buffers, member_count, *member_id)?;
-                        if matches!(member_target, TensorForiVjpTarget::External(_))
-                            && output.len() != carry_count
-                        {
-                            stream
-                                .memcpy_htod(&[0.0f32], &mut output)
-                                .map_err(|error| {
-                                    format!(
-                                        "failed to clear CUDA reduced Fori VJP output: {error:?}"
-                                    )
-                                })?;
+                        // A capture that broadcasts into the carry reduces into its output
+                        // with atomicAdd, and a pooled buffer still holds an earlier value, so
+                        // every lane of a capture gradient is cleared; carry-shaped captures are
+                        // overwritten anyway, which keeps this independent of the kernel's
+                        // shape test.
+                        if matches!(member_target, TensorForiVjpTarget::External(_)) {
+                            stream.memset_zeros(&mut output).map_err(|error| {
+                                format!("failed to clear CUDA reduced Fori VJP output: {error:?}")
+                            })?;
                         }
                         outputs.push(output);
                     }
@@ -2110,16 +2109,15 @@ fn execute_cuda_device_program(
                         let member_count = element_count(&plan.nodes[*member_id].shape)?;
                         let mut output =
                             take_cuda_buffer(stream, free_buffers, member_count, *member_id)?;
-                        if matches!(member_target, TensorScanVjpTarget::External(_))
-                            && output.len() != carry_count
-                        {
-                            stream
-                                .memcpy_htod(&[0.0f32], &mut output)
-                                .map_err(|error| {
-                                    format!(
-                                        "failed to clear CUDA reduced Scan VJP output: {error:?}"
-                                    )
-                                })?;
+                        // A capture that broadcasts into the carry reduces into its output
+                        // with atomicAdd, and a pooled buffer still holds an earlier value, so
+                        // every lane of a capture gradient is cleared; carry-shaped captures are
+                        // overwritten anyway, which keeps this independent of the kernel's
+                        // shape test.
+                        if matches!(member_target, TensorScanVjpTarget::External(_)) {
+                            stream.memset_zeros(&mut output).map_err(|error| {
+                                format!("failed to clear CUDA reduced Scan VJP output: {error:?}")
+                            })?;
                         }
                         outputs.push(output);
                     }
@@ -2242,11 +2240,16 @@ fn execute_cuda_device_program(
                         let member_count = element_count(&plan.nodes[*member_id].shape)?;
                         let mut output =
                             take_cuda_buffer(stream, free_buffers, member_count, *member_id)?;
-                        if matches!(member_target, TensorScanVjpTarget::External(_))
-                            && output.len() != carry_count
-                        {
-                            stream.memcpy_htod(&[0.0f32], &mut output).map_err(|error| {
-                                format!("failed to clear CUDA reduced Scan VJP JVP output: {error:?}")
+                        // A capture that broadcasts into the carry reduces into its output
+                        // with atomicAdd, and a pooled buffer still holds an earlier value, so
+                        // every lane of a capture gradient is cleared; carry-shaped captures are
+                        // overwritten anyway, which keeps this independent of the kernel's
+                        // shape test.
+                        if matches!(member_target, TensorScanVjpTarget::External(_)) {
+                            stream.memset_zeros(&mut output).map_err(|error| {
+                                format!(
+                                    "failed to clear CUDA reduced Scan VJP JVP output: {error:?}"
+                                )
                             })?;
                         }
                         outputs.push(output);

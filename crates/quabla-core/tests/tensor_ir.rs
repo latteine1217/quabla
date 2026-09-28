@@ -2801,6 +2801,55 @@ fn cuda_grouped_scan_vjp_jvp_matches_cpu_for_broadcast_and_equal_lane_outputs_wh
     }
 }
 
+/// Builds `sum(fori(initial) * fori(initial))` for a Fori loop with carry
+/// `[2, 3]` whose captures broadcast into the carry from `[1, 3]` (`scale`)
+/// and `[2, 1]` (`bias`), so the reverse kernel reduces both capture gradients
+/// into multi-element outputs with atomics.
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn cuda_group_fori_loss(
+) -> Result<(TensorIr, TensorNodeId, BTreeMap<String, DynamicTensor>), String> {
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![2, 3])?;
+    let index = body.input("index", vec![])?;
+    let scale = body.input("scale", vec![1, 3])?;
+    let bias = body.input("bias", vec![2, 1])?;
+    let scaled = body.mul(carry, scale)?;
+    let biased = body.add(scaled, bias)?;
+    let shifted = body.add(biased, index)?;
+    let next = body.tanh(shifted)?;
+    let loop_plan = TensorForiExecutionPlan::new(0, 3, body.compile_cpu(next)?, "carry", "index")?;
+    let mut graph = TensorIr::new();
+    let initial = graph.input("initial", vec![2, 3])?;
+    let scale = graph.input("scale", vec![1, 3])?;
+    let bias = graph.input("bias", vec![2, 1])?;
+    let output = graph.fori(
+        initial,
+        loop_plan,
+        vec![("scale".to_string(), scale), ("bias".to_string(), bias)],
+    )?;
+    let squared = graph.mul(output, output)?;
+    let loss = graph.sum(squared)?;
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            DynamicTensor::new(vec![2, 3], vec![0.2, -0.1, 0.3, -0.4, 0.5, 0.1])?,
+        ),
+        (
+            "scale".to_string(),
+            DynamicTensor::new(vec![1, 3], vec![0.8, 1.1, 0.6])?,
+        ),
+        (
+            "bias".to_string(),
+            DynamicTensor::new(vec![2, 1], vec![0.1, -0.2])?,
+        ),
+        (
+            "cotangent".to_string(),
+            DynamicTensor::new(vec![], vec![1.0])?,
+        ),
+    ]);
+    Ok((graph, loss, inputs))
+}
+
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_grouped_fori_vjp_matches_cpu_for_broadcast_captures_when_enabled() {
@@ -2808,33 +2857,7 @@ fn cuda_grouped_fori_vjp_matches_cpu_for_broadcast_captures_when_enabled() {
         return;
     }
 
-    let mut body = TensorIr::new();
-    let carry = must!(body.input("carry", vec![2, 3]));
-    let index = must!(body.input("index", vec![]));
-    let scale = must!(body.input("scale", vec![1, 3]));
-    let bias = must!(body.input("bias", vec![2, 1]));
-    let scaled = must!(body.mul(carry, scale));
-    let biased = must!(body.add(scaled, bias));
-    let shifted = must!(body.add(biased, index));
-    let next = must!(body.tanh(shifted));
-    let loop_plan = must!(TensorForiExecutionPlan::new(
-        0,
-        3,
-        must!(body.compile_cpu(next)),
-        "carry",
-        "index",
-    ));
-    let mut graph = TensorIr::new();
-    let initial = must!(graph.input("initial", vec![2, 3]));
-    let scale = must!(graph.input("scale", vec![1, 3]));
-    let bias = must!(graph.input("bias", vec![2, 1]));
-    let output = must!(graph.fori(
-        initial,
-        loop_plan,
-        vec![("scale".to_string(), scale), ("bias".to_string(), bias)],
-    ));
-    let squared = must!(graph.mul(output, output));
-    let loss = must!(graph.sum(squared));
+    let (graph, loss, inputs) = must!(cuda_group_fori_loss());
     let transformed = must!(graph.symbolic_vjp(loss, "cotangent"));
     assert_eq!(
         transformed
@@ -2849,30 +2872,169 @@ fn cuda_grouped_fori_vjp_matches_cpu_for_broadcast_captures_when_enabled() {
         transformed.gradients["scale"],
         transformed.gradients["bias"],
     ]));
-    let inputs = BTreeMap::from([
-        (
-            "initial".to_string(),
-            must!(DynamicTensor::new(
-                vec![2, 3],
-                vec![0.2, -0.1, 0.3, -0.4, 0.5, 0.1],
-            )),
-        ),
-        (
-            "scale".to_string(),
-            must!(DynamicTensor::new(vec![1, 3], vec![0.8, 1.1, 0.6])),
-        ),
-        (
-            "bias".to_string(),
-            must!(DynamicTensor::new(vec![2, 1], vec![0.1, -0.2])),
-        ),
-        (
-            "cotangent".to_string(),
-            must!(DynamicTensor::new(vec![], vec![1.0])),
-        ),
-    ]);
     let cpu = must!(plan.evaluate_many(&inputs));
     let cuda = must!(CudaBackend::new(0).execute_many(&plan, &output_ids, &inputs));
     assert_cuda_outputs_match_cpu("grouped Fori VJP", &cuda, &cpu, 2e-5);
+}
+
+/// Returns a second input set that changes every lane except the scalar
+/// `cotangent` seed, so a run that reads state left by the previous run cannot
+/// match the CPU reference by accident.
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn cuda_alternate_inputs(
+    inputs: &BTreeMap<String, DynamicTensor>,
+) -> Result<BTreeMap<String, DynamicTensor>, String> {
+    inputs
+        .iter()
+        .map(|(name, tensor)| {
+            let data = if name == "cotangent" {
+                tensor.data().to_vec()
+            } else {
+                tensor
+                    .data()
+                    .iter()
+                    .map(|value| 0.75 * value - 0.1)
+                    .collect()
+            };
+            Ok((
+                name.clone(),
+                DynamicTensor::new(tensor.shape().to_vec(), data)?,
+            ))
+        })
+        .collect()
+}
+
+/// Compiles `plan` once and executes it `runs` times, cycling through
+/// `input_sets`. Every run must match the CPU reference, and every repeat of an
+/// input set must reproduce that set's first CUDA result up to the summation
+/// order of device atomics.
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn assert_repeated_cuda_executions_match_cpu(
+    label: &str,
+    plan: &TensorExecutionPlan,
+    input_sets: &[BTreeMap<String, DynamicTensor>],
+    runs: usize,
+) -> Result<(), String> {
+    let compiled = CudaBackend::new(0).compile(plan.clone())?;
+    let mut first_results = vec![None::<Vec<DynamicTensor>>; input_sets.len()];
+    for run in 0..runs {
+        let set = run % input_sets.len();
+        let inputs = &input_sets[set];
+        let run_label = format!("{label}: run {run} (input set {set})");
+        let cuda = compiled
+            .execute_many(inputs)
+            .map_err(|error| format!("{run_label}: {error}"))?;
+        let cpu = plan.evaluate_many(inputs)?;
+        assert_cuda_outputs_match_cpu(&run_label, &cuda, &cpu, 2e-5);
+        match &first_results[set] {
+            Some(first) => assert_cuda_outputs_match_cpu(
+                &format!("{run_label} against its first run"),
+                &cuda,
+                first,
+                1e-6,
+            ),
+            None => first_results[set] = Some(cuda),
+        }
+    }
+    Ok(())
+}
+
+/// Adds the full sums of `gradients` into one scalar so a single-output plan
+/// consumes every member of a structural loop gradient group.
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn cuda_sum_of_gradients(
+    mut graph: TensorIr,
+    gradients: &[TensorNodeId],
+) -> Result<(TensorIr, TensorNodeId), String> {
+    let mut total = None;
+    for gradient in gradients {
+        let sum = graph.sum(*gradient)?;
+        total = Some(match total {
+            Some(previous) => graph.add(previous, sum)?,
+            None => sum,
+        });
+    }
+    let total = total.ok_or_else(|| "no gradients to sum".to_string())?;
+    Ok((graph, total))
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_grouped_loop_capture_reductions_repeat_exactly_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+
+    // Each plan returns one scalar that consumes every grouped gradient, so the gradient buffers
+    // return to the pool after each run and the next run receives them, still holding the previous
+    // gradients, for its atomically reduced capture outputs (Fori bias [2, 1] and scale [1, 3],
+    // Scan bias [1, 3], each into a [2, 3] carry).
+    let (graph, loss, inputs) = must!(cuda_group_fori_loss());
+    let vjp = must!(graph.symbolic_vjp(loss, "cotangent"));
+    let (graph, total) = must!(cuda_sum_of_gradients(
+        vjp.graph,
+        &[
+            vjp.gradients["initial"],
+            vjp.gradients["scale"],
+            vjp.gradients["bias"],
+        ],
+    ));
+    let plan = must!(graph.compile_cpu(total));
+    let alternate = must!(cuda_alternate_inputs(&inputs));
+    must!(assert_repeated_cuda_executions_match_cpu(
+        "summed grouped Fori VJP",
+        &plan,
+        &[inputs, alternate],
+        4,
+    ));
+
+    let (graph, loss, mut inputs) = must!(cuda_group_scan_loss(false, true));
+    let vjp = must!(graph.symbolic_vjp(loss, "cotangent"));
+    let gradients = [
+        vjp.gradients["initial"],
+        vjp.gradients["scale"],
+        vjp.gradients["bias"],
+    ];
+    let (summed_graph, total) = must!(cuda_sum_of_gradients(vjp.graph.clone(), &gradients));
+    let plan = must!(summed_graph.compile_cpu(total));
+    let alternate = must!(cuda_alternate_inputs(&inputs));
+    must!(assert_repeated_cuda_executions_match_cpu(
+        "summed grouped Scan VJP",
+        &plan,
+        &[inputs.clone(), alternate],
+        4,
+    ));
+
+    let (directional_graph, total) = must!(cuda_sum_of_gradients(vjp.graph, &gradients));
+    let directional = must!(directional_graph.symbolic_jvp_with_tangent_inputs(
+        total,
+        &BTreeMap::from([
+            ("initial".to_string(), "initial_tangent".to_string()),
+            ("scale".to_string(), "scale_tangent".to_string()),
+        ]),
+    ));
+    inputs.insert(
+        "initial_tangent".to_string(),
+        must!(DynamicTensor::new(
+            vec![2, 3],
+            vec![0.3, -0.5, 0.2, 0.7, -0.1, 0.4]
+        )),
+    );
+    inputs.insert(
+        "scale_tangent".to_string(),
+        must!(DynamicTensor::new(
+            vec![2, 3],
+            vec![-0.2, 0.6, 0.1, 0.3, -0.4, 0.5]
+        )),
+    );
+    let plan = must!(directional.graph.compile_cpu(directional.tangent));
+    let alternate = must!(cuda_alternate_inputs(&inputs));
+    must!(assert_repeated_cuda_executions_match_cpu(
+        "summed grouped Scan VJP JVP",
+        &plan,
+        &[inputs, alternate],
+        4,
+    ));
 }
 
 /// Builds `sum(cond(x > 0, y * log(x), y * y + x * 0))`.
