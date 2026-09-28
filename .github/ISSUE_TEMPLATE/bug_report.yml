@@ -1,0 +1,82 @@
+name: Bug report
+description: Report incorrect results, crashes, or build failures.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues first. Report security vulnerabilities
+        privately through the Security tab, not here.
+  - type: input
+    id: version
+    attributes:
+      label: Quabla version or commit
+      placeholder: 0.1.0 or a commit SHA
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15.5 (Apple M3) / Ubuntu 24.04 (x86_64)
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.4"
+    validations:
+      required: true
+  - type: dropdown
+    id: features
+    attributes:
+      label: Build features
+      description: The features passed to `maturin develop` or `cargo`.
+      options:
+        - cpu (no features)
+        - mlx
+        - cuda
+        - cuda-nccl
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend the failing code runs on
+      options:
+        - cpu
+        - mlx
+        - cuda
+        - cuda-nccl (data parallel)
+        - build or install failure
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU, driver, and CUDA/NCCL versions
+      description: For GPU backends only.
+      placeholder: RTX 4090, driver 560.35, CUDA 12.6, NCCL 2.23
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest self-contained script or command that shows the problem.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the full error message or traceback.
+      render: text
+    validations:
+      required: true
