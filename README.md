@@ -17,7 +17,7 @@ d'Alembert operator) before the v0.1 release.
 
 ## Status
 
-Quabla v0.1 is a research-grade, source-only pre-release: it is published as a
+Quabla v0.1 is a research-grade, source-only pre-release: it is released as a
 git tag and GitHub Release, with no prebuilt wheels. The 0.x API may change
 between releases. Backend support is validated operation by operation;
 unsupported operations fail explicitly instead of falling back to the host.
@@ -229,6 +229,11 @@ The Rust MLX tests run whenever `quabla-core/mlx` is enabled on macOS
 - [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md): execution roadmap,
   per-phase status (P0-P7, dtype phases D1-D6), and validation records.
 - [docs/design.md](docs/design.md): original core design notes.
+- [CHANGELOG.md](CHANGELOG.md): release notes.
+- [CONTRIBUTING.md](CONTRIBUTING.md): how to propose changes and which gates
+  to run.
+- [SECURITY.md](SECURITY.md): how to report a vulnerability.
+- [CITATION.cff](CITATION.cff): citation metadata for academic use.
 
 Quabla is licensed under either of [Apache License, Version 2.0](LICENSE-APACHE)
 or [MIT license](LICENSE-MIT), at your option.
