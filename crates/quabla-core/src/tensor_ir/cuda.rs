@@ -729,7 +729,13 @@ fn ensure_nvrtc_runtime_available() -> Result<(), String> {
                 drop(library);
                 return Ok(());
             }
-            Err(error) => errors.push(format!("{name}: {error}")),
+            // libloading 0.9 renders only "dlopen failed" through Display and exposes the
+            // dynamic linker's message through Error::source, so append the source to keep
+            // the reason (for example a missing file) in the diagnostic.
+            Err(error) => match std::error::Error::source(&error) {
+                Some(source) => errors.push(format!("{name}: {error}: {source}")),
+                None => errors.push(format!("{name}: {error}")),
+            },
         }
     }
 
