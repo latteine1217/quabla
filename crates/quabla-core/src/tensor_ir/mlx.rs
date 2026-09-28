@@ -1,3 +1,9 @@
+// mlx-rs 0.32 deprecates the `*_device(..., stream)` op variants in favour of scoping ops with
+// `mlx_rs::with_stream`. The deprecated variants are thin wrappers over that scope, so this
+// module keeps passing the GPU stream explicitly without a behaviour change.
+// TODO: build ops inside `with_stream` scopes and remove this allow.
+#![allow(deprecated)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -15,17 +21,18 @@ use super::{
 /// host-facing `DynamicTensor` result.
 ///
 /// Thread safety: all MLX graph construction, evaluation, and readback are serialized by a
-/// process-wide lock, so the backend can be called from multiple threads; GPU work already shares
-/// one default stream.
+/// process-wide lock, so the backend can be called from multiple threads.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MlxBackend;
 
 /// Serializes all access to MLX from this module.
 ///
-/// The MLX 0.25 dependency encodes GPU work into the default GPU stream on the calling thread, and
-/// that stream's Metal command buffer / encoder is process-wide and unguarded; two threads
-/// evaluating concurrently interleave encoding into the same command buffer, triggering a Metal
-/// assertion abort or a hang.
+/// The lock was introduced for MLX 0.25, which encoded GPU work into a process-wide, unguarded
+/// default GPU stream: two threads evaluating concurrently interleaved encoding into the same
+/// Metal command buffer, triggering a Metal assertion abort or a hang. MLX 0.32.2 (mlx-rs 0.32)
+/// gives each thread its own default stream and command encoder, but only supports multiple
+/// threads for independent computations; retained parameters and Adam state are shared across
+/// calls that may run on different threads, so evaluation stays serialized.
 static MLX_EXECUTION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Acquires the MLX process lock.
@@ -1743,7 +1750,7 @@ fn mlx_array_from_dynamic(input: &DynamicTensor) -> Result<Array, String> {
 /// is true.
 fn mlx_scalar_predicate(predicate: &Array) -> Result<bool, String> {
     let value = predicate
-        .try_item::<f32>()
+        .try_item_cast::<f32>()
         .map_err(|error| format!("MLX Cond predicate readback failed: {error}"))?;
     if !value.is_finite() {
         return Err("conditional predicate must be finite".to_string());

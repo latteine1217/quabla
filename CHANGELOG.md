@@ -90,7 +90,7 @@ package, import name, crates, types (`Quabla*`), and environment variables
 - CUDA loop bodies cannot contain matmul, reductions, or nested regions.
 - `float16`, `bfloat16`, and integer dtypes are not available, and host storage
   is `f64`.
-- MLX rejects `solve` because MLX 0.25.3 provides it only on a CPU stream.
+- MLX rejects `solve` because MLX 0.32.2 provides it only on a CPU stream.
 - Data parallelism is limited to a single node, and parameter updates happen on
   the host.
 

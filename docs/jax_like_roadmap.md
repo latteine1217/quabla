@@ -646,7 +646,7 @@ GTX 1660 SUPER on 2026-07-28.
 `cholesky()` is available as a rank-2 eager factorization with symmetry/SPD
 validation and as a static trace-time recurrence, so existing JVP/VJP machinery
 provides verified derivatives. Native CUDA/MLX factorization lowering and
-broader contractions remain pending. MLX 0.25.3
+broader contractions remain pending. MLX 0.32.2
 only exposes `linalg::solve` on a CPU stream, so Quabla rejects it on the MLX GPU
 backend rather than silently falling back. `relu`, `abs`, `sigmoid`, and a
 numerically stable `softplus` are available on eager and traced tensors; `relu`
