@@ -233,6 +233,8 @@ The Rust MLX tests run whenever `quabla-core/mlx` is enabled on macOS
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to propose changes and which gates
   to run.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): community standards and how to
+  report a conduct issue.
 - [CITATION.cff](CITATION.cff): citation metadata for academic use.
 
 Quabla is licensed under either of [Apache License, Version 2.0](LICENSE-APACHE)

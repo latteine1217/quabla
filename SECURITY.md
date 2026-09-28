@@ -15,7 +15,8 @@ receives fixes.
 Please report vulnerabilities privately through GitHub private vulnerability
 reporting: open the repository's **Security** tab and select
 **Report a vulnerability**
-(<https://github.com/latteine1217/quabla/security/advisories/new>).
+(<https://github.com/latteine1217/quabla/security/advisories/new>). If you
+cannot use GitHub, email felix.tc.tw@gmail.com instead.
 
 Do not open a public issue, pull request, or discussion for a suspected
 vulnerability.
