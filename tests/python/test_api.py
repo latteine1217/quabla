@@ -3,6 +3,7 @@ import ctypes
 import gc
 import importlib
 import importlib.machinery
+import inspect
 import math
 import os
 import pathlib
@@ -67,8 +68,10 @@ def test_quabla_alias_resolves():
 
 
 def test_v0_1_pickled_function_path_loads():
-    # A v0.1 pickle names module-level functions by `quabla.quabla.<name>`.
-    assert pickle.loads(b"cquabla.quabla\ngrad\n.") is quabla.grad
+    # A v0.1 pickle names module-level functions by `quabla.quabla.<name>`;
+    # `grad` there is the native v0.1 function, which `quabla.grad` wraps (D17).
+    assert pickle.loads(b"cquabla.quabla\ngrad\n.") is quabla._quabla.grad
+    assert pickle.loads(b"cquabla.quabla\ntensor_jit_fn\n.") is quabla.tensor_jit_fn
 
 
 def test_dtype_reprs_are_unchanged():
@@ -651,6 +654,374 @@ def test_error_classes_subclass_the_builtins_raised_before():
     assert isinstance(error, ValueError) and isinstance(error, NotImplementedError)
     assert (error.op, error.device, str(error)) == ("jit", "mlx", "no")
     assert qb.UnsupportedOperationError("no").op is None
+
+
+# -- S2: CPU transforms ---------------------------------------
+
+
+def masked_loss(x, w):
+    y = qb.tanh(x * w)
+    return qb.sum(qb.where(x > 0.0, y, 0.0) ** 2)
+
+
+QX = [-1.0, 0.5, 1.0, 2.0]
+QW = [0.3, -0.2, 0.1, 0.4]
+
+
+def test_value_and_grad_matches_tensor_value_and_grad_fn():
+    for dtype in [qb.float64, qb.float32]:
+        x, w = qb.array(QX, dtype=dtype), qb.array(QW, dtype=dtype)
+        specs = [("x", [4], dtype), ("w", [4], dtype)]
+        old_value, old_grads = qb.tensor_value_and_grad_fn(masked_loss, specs)({"x": x, "w": w})
+        value, (gx, gw) = qb.value_and_grad(masked_loss, argnums=(0, 1))(x, w)
+        tolerance = 1e-6 if dtype == qb.float32 else 1e-14
+        for tensor in [value, gx, gw]:
+            assert tensor.dtype == dtype, tensor.dtype
+        assert_close(value, old_value, tolerance)
+        assert_close(gx, old_grads["x"], tolerance)
+        assert_close(gw, old_grads["w"], tolerance)
+        assert_close(qb.grad(masked_loss, 1)(x, w), old_grads["w"], tolerance)
+        assert_close(qb.jit(qb.grad(masked_loss))(x, w), old_grads["x"], tolerance)
+        grad_scalar = qb.tensor_grad_scalar_fn(masked_loss, specs)({"x": x, "w": w})
+        assert_close(qb.grad(masked_loss, -1)(x, w), grad_scalar["w"], tolerance)
+
+
+def test_argnums_forms_select_and_structure_gradients():
+    x, w = qb.array(QX), qb.array(QW)
+    gx, gw = qb.grad(masked_loss, argnums=(0, 1))(x, w)
+    (only_w,) = qb.grad(masked_loss, argnums=(1,))(x, w)
+    assert_close(only_w, gw)
+    (w_first, x_second) = qb.grad(masked_loss, argnums=(1, 0))(x, w)
+    assert_close(w_first, gw)
+    assert_close(x_second, gx)
+    assert isinstance(qb.grad(masked_loss, argnums=1)(x, w), qb.Tensor)
+    assert_raises(ValueError, qb.grad(masked_loss, argnums=2), x, w, match="out of range")
+    assert_raises(ValueError, qb.grad(masked_loss, argnums=(0, -2)), x, w, match="duplicate")
+    assert_raises(TypeError, qb.grad(masked_loss, argnums=(0, "w")), x, w, match="tuple of ints")
+
+
+def init_mlp(dtype):
+    def values(count, seed):
+        return [math.sin((index + 1) * seed) * 0.9 for index in range(count)]
+
+    return {
+        "layers": [
+            {"w": qb.array(values(6, 0.37), dtype=dtype).reshape([2, 3]), "b": qb.zeros([3], dtype)},
+            {"w": qb.array(values(3, 0.71), dtype=dtype).reshape([3, 1]), "b": qb.ones([1], dtype)},
+        ]
+    }
+
+
+def mlp_loss(params, x, y):
+    hidden = x
+    for index, layer in enumerate(params["layers"]):
+        hidden = hidden @ layer["w"] + layer["b"]
+        if index + 1 < len(params["layers"]):
+            hidden = qb.tanh(hidden)
+    return qb.mean((hidden - y) ** 2)
+
+
+def test_dict_params_of_an_mlp_match_the_name_keyed_helper():
+    for dtype in [qb.float64, qb.float32]:
+        params = init_mlp(dtype)
+        x = qb.array([[0.5, -1.0], [0.25, 0.75], [-0.5, 1.5], [1.0, 0.0]], dtype=dtype)
+        y = qb.array([[0.1], [-0.2], [0.3], [0.0]], dtype=dtype)
+        value, grads = qb.jit(qb.value_and_grad(mlp_loss))(params, x, y)
+        assert qb.tree.flatten(grads)[1] == qb.tree.flatten(params)[1]
+
+        def named(w0, b0, w1, b1, x, y):
+            layers = [{"w": w0, "b": b0}, {"w": w1, "b": b1}]
+            return mlp_loss({"layers": layers}, x, y)
+
+        layers = params["layers"]
+        inputs = {
+            "w0": layers[0]["w"], "b0": layers[0]["b"],
+            "w1": layers[1]["w"], "b1": layers[1]["b"], "x": x, "y": y,
+        }
+        specs = [(name, tensor.shape, dtype) for name, tensor in inputs.items()]
+        old_value, old_grads = qb.tensor_value_and_grad_fn(named, specs)(inputs)
+        tolerance = 1e-6 if dtype == qb.float32 else 1e-13
+        assert value.dtype == dtype
+        assert_close(value, old_value, tolerance)
+        for index in range(2):
+            for leaf in ["w", "b"]:
+                gradient = grads["layers"][index][leaf]
+                assert gradient.dtype == dtype
+                assert_close(gradient, old_grads[f"{leaf}{index}"], tolerance)
+
+
+def test_has_aux_returns_auxiliary_pytrees_from_the_same_program():
+    calls = []
+
+    def loss(w, x):
+        calls.append(1)
+        prediction = x * w
+        return qb.sum(prediction**2), {"prediction": prediction, "scale": 2.0, "none": None}
+
+    w, x = qb.array([1.0, -2.0]), qb.array([3.0, 4.0])
+    (value, aux), grads = qb.value_and_grad(loss, has_aux=True)(w, x)
+    assert_close(value, 9.0 + 64.0)
+    assert_close(grads, [18.0, -64.0])
+    assert_close(aux["prediction"], [3.0, -8.0])
+    assert aux["scale"] == 2.0 and aux["none"] is None
+    grads, aux = qb.grad(loss, has_aux=True)(w, x)
+    assert_close(grads, [18.0, -64.0])
+    assert_close(aux["prediction"], [3.0, -8.0])
+    assert len(calls) == 2  # one trace per transform, reused by later calls
+    qb.grad(loss, has_aux=True)(w, x)
+    assert len(calls) == 2
+    assert_raises(
+        TypeError, qb.grad(lambda w: qb.sum(w), has_aux=True), w, match="(value, aux) pair"
+    )
+
+
+def test_grad_errors_and_python_scalar_arguments():
+    x = qb.array([1.0, 2.0])
+    assert_raises(ValueError, qb.grad(lambda x: x * 2.0), x, match="requires a scalar output")
+    assert_raises(ValueError, qb.grad(lambda x: qb.sum(x) > 1.0), x, match="bool output")
+    assert_raises(TypeError, qb.grad(lambda x: (x, x)), x, match="single scalar array")
+    assert_raises(ValueError, qb.grad(lambda x: 3.0), x, match="constant")
+    # A differentiated Python scalar becomes a float64 array ...
+    derivative = qb.grad(lambda x: x**3)(2.0)
+    assert_tensor(derivative, 12.0, qb.float64)
+    # ... while other Python scalars are static weak constants: float32 stays float32.
+    x32 = qb.array([1.0, 2.0], dtype=qb.float32)
+    gradient = qb.grad(lambda x, scale: qb.sum(x * x) * scale)(x32, 3.0)
+    assert_tensor(gradient, [6.0, 12.0], qb.float32)
+    # bool leaves get no gradient.
+    mask = qb.array([True, False])
+    gx, gmask = qb.grad(lambda x, m: qb.sum(qb.where(m, x, 0.0)), argnums=(0, 1))(x, mask)
+    assert_close(gx, [1.0, 0.0])
+    assert gmask is None
+    assert_raises(
+        TypeError, qb.grad(lambda x: qb.sum(x)), "abc", match="unsupported argument leaf"
+    )
+
+
+def test_second_order_by_direct_composition():
+    # Reverse over reverse (design Exp 3).
+    f = lambda x: qb.sin(x) * x**2  # noqa: E731
+    exact = -math.sin(1.3) * 1.3**2 + 4.0 * 1.3 * math.cos(1.3) + 2.0 * math.sin(1.3)
+    assert_close(qb.grad(qb.grad(f))(1.3), exact, 1e-14)
+    assert_close(qb.jit(qb.grad(qb.grad(f)))(qb.array(1.3)), exact, 1e-14)
+    # jit takes over the differentiated positions of the transforms inside it.
+    assert_close(qb.jit(qb.grad(qb.grad(f)))(1.3), exact, 1e-14)
+    # Forward over reverse is a Hessian-vector product.
+    def cubic(x):
+        return qb.sum(x**3) + qb.sum(x) * x[0]
+
+    x, v = qb.array([1.0, 2.0, -1.0]), qb.array([0.5, -1.0, 2.0])
+    _, hvp = qb.jvp(qb.grad(cubic), (x,), (v,))
+    old = qb.tensor_hvp_scalar_fn(cubic, [("x", [3])], "x")({"x": x}, v)
+    assert_close(hvp, old, 1e-14)
+
+
+def test_jvp_matches_tensor_jvp_fn_and_keeps_float32():
+    def model(x, w):
+        return qb.tanh(x @ w)
+
+    for dtype in [qb.float64, qb.float32]:
+        x = qb.array([[0.5, -1.0], [2.0, 0.25]], dtype=dtype)
+        w = qb.array([[0.3], [-0.7]], dtype=dtype)
+        dx = qb.array([[1.0, 0.0], [0.5, -0.5]], dtype=dtype)
+        dw = qb.array([[0.2], [0.1]], dtype=dtype)
+        specs = [("x", [2, 2], dtype), ("w", [2, 1], dtype)]
+        old_value, old_tangent = qb.tensor_jvp_fn(model, specs)({"x": x, "w": w}, {"x": dx, "w": dw})
+        value, tangent = qb.jvp(model, (x, w), (dx, dw))
+        tolerance = 1e-6 if dtype == qb.float32 else 1e-14
+        assert value.dtype == tangent.dtype == dtype
+        assert_close(value, old_value, tolerance)
+        assert_close(tangent, old_tangent, tolerance)
+    # Python number tangents adopt the primal dtype; pytrees of outputs work.
+    x32 = qb.array(2.0, dtype=qb.float32)
+    (square, pair), (dsquare, dpair) = qb.jvp(lambda x: (x * x, [x, 1.0]), (x32,), (1.0,))
+    assert_tensor(dsquare, 4.0, qb.float32)
+    assert_tensor(dpair[0], 1.0, qb.float32)
+    assert pair[1] == 1.0 and dpair[1] == 0.0
+    assert_raises(TypeError, qb.jvp, model, (x, w), (dx, qb.array([[0.2], [0.1]])),
+                  match="dtype quabla.float32")
+    assert_raises(ValueError, qb.jvp, model, (x, w), (dx,), match="must match")
+    assert_raises(ValueError, qb.jvp, model, (x, w), (dx, [dw]), match="pytree structure")
+
+
+def test_vjp_matches_tensor_vjp_fn_with_pytree_outputs():
+    def model(x, w):
+        return qb.tanh(x @ w)
+
+    x = qb.array([[0.5, -1.0], [2.0, 0.25]])
+    w = qb.array([[0.3], [-0.7]])
+    ct = qb.array([[1.0], [-2.0]])
+    old_value, old_grads = qb.tensor_vjp_fn(model, [("x", [2, 2]), ("w", [2, 1])])(
+        {"x": x, "w": w}, ct
+    )
+    value, pullback = qb.vjp(model, x, w)
+    assert_close(value, old_value)
+    gx, gw = pullback(ct)
+    assert_close(gx, old_grads["x"])
+    assert_close(gw, old_grads["w"])
+    # Several outputs: the pullback sums their VJPs.
+    out, pullback = qb.vjp(lambda x: {"a": x * 2.0, "b": qb.sum(x)}, qb.array([1.0, 2.0]))
+    assert_close(out["a"], [2.0, 4.0])
+    (gx,) = pullback({"a": qb.array([1.0, 3.0]), "b": 1.0})
+    assert_close(gx, [3.0, 7.0])
+    assert_raises(ValueError, pullback, [1.0, 1.0], match="pytree structure")
+    out, pullback, aux = qb.vjp(lambda x: (x * x, x + 1.0), qb.array([3.0]), has_aux=True)
+    assert_close(pullback(qb.array([1.0]))[0], [6.0])
+    assert_close(aux, [4.0])
+
+
+def test_jacobian_and_hessian_match_the_dense_helpers():
+    def model(x, w):
+        return qb.tanh(x @ w)
+
+    x = qb.array([[0.5, -1.0], [2.0, 0.25]])
+    w = qb.array([[0.3], [-0.7]])
+    specs = [("x", [2, 2]), ("w", [2, 1])]
+    old = qb.tensor_jacobian_fn(model, specs, "w")({"x": x, "w": w})
+    jac = qb.jacobian(model, argnums=1)(x, w)
+    assert jac.shape == [2, 1, 2, 1]
+    assert_close(jac.reshape([2, 2]), old)
+    jx, jw = qb.jacobian(model, argnums=(0, 1))(x, w)
+    assert jx.shape == [2, 1, 2, 2] and jw.shape == [2, 1, 2, 1]
+
+    def loss(x):
+        return qb.sum(qb.sin(x) * x**2) + qb.sum(x) ** 2
+
+    point = qb.array([0.5, -1.0, 2.0])
+    old_hessian = qb.tensor_hessian_scalar_fn(loss, [("x", [3])], "x")({"x": point})
+    hessian = qb.hessian(loss)(point)
+    assert hessian.shape == [3, 3]
+    assert_close(hessian, old_hessian, 1e-13)
+    assert_close(qb.jit(qb.hessian(loss))(point), old_hessian, 1e-13)
+    point32 = qb.array([0.5, -1.0, 2.0], dtype=qb.float32)
+    assert qb.hessian(loss)(point32).dtype == qb.float32
+    # A pytree argument gives pytree blocks.
+    blocks = qb.jacobian(lambda p: p["a"] * p["b"])({"a": qb.array([2.0]), "b": qb.array([3.0])})
+    assert_close(blocks["a"], [[3.0]])
+    assert_close(blocks["b"], [[2.0]])
+    assert_raises(
+        qb.UnsupportedOperationError, qb.grad(qb.hessian(loss)), point, match="cannot be transformed"
+    )
+
+
+def test_jit_matches_tensor_jit_fn_with_pytrees_and_static_argnums():
+    x, w = qb.array(QX), qb.array(QW)
+    old = qb.tensor_jit_fn(masked_loss, [("x", [4]), ("w", [4])])({"x": x, "w": w})
+    assert_close(qb.jit(masked_loss)(x, w), old)
+    assert_close(qb.jit(masked_loss, device="cpu")(x, w), old)
+    out = qb.jit(lambda p: {"sum": p[0] + p[1], "list": [p[0] * 2.0, None, 3]})((x, w))
+    assert_close(out["sum"], [a + b for a, b in zip(QX, QW)])
+    assert out["list"][1:] == [None, 3]
+
+    traces = []
+
+    def scaled(x, power):
+        traces.append(power)
+        return qb.sum(x**power)
+
+    jitted = qb.jit(scaled, static_argnums=1)
+    assert_close(jitted(x, 2), sum(v * v for v in QX))
+    assert_close(jitted(x, 3), sum(v**3 for v in QX))
+    jitted(x, 2)
+    assert traces == [2, 3]
+    assert_raises(TypeError, qb.jit(scaled, static_argnums=1), x, [2], match="hashable")
+    # NumPy data is accepted as an array leaf.
+    if np is not None:
+        assert_close(qb.jit(masked_loss)(np.array(QX), np.array(QW)), old)
+    # jit of a plain function inside another trace traces through it.
+    inner = qb.jit(lambda x: x * x)
+    assert_close(qb.grad(lambda x: qb.sum(inner(x)))(x), [2.0 * v for v in QX])
+
+
+def test_jit_devices_beyond_cpu_are_not_implemented_yet():
+    error = assert_raises(qb.UnsupportedOperationError, qb.jit, masked_loss, device="mlx")
+    assert (error.op, error.device) == ("jit", "mlx")
+    assert isinstance(error, ValueError)
+    assert_raises(qb.UnsupportedOperationError, qb.jit, masked_loss, device="cuda:1")
+    assert_raises(ValueError, qb.jit, masked_loss, device="tpu", match="device must be")
+    assert_raises(ValueError, qb.jit, masked_loss, max_traces=0, match="positive int")
+
+
+def test_trace_cache_keys_and_retrace_limit():
+    traces = []
+
+    def loss(x, scale):
+        traces.append((x.shape, x.dtype, scale))
+        return qb.sum(x * scale)
+
+    step = qb.jit(loss, max_traces=3)
+    step(qb.array([1.0, 2.0]), 2.0)
+    step(qb.array([3.0, 4.0]), 2.0)  # same shapes, dtypes, and static value: cached
+    assert len(traces) == 1
+    step(qb.array([1.0, 2.0, 3.0]), 2.0)  # new shape
+    step(qb.array([1.0, 2.0], dtype=qb.float32), 2.0)  # new dtype
+    assert len(traces) == 3
+    assert traces[2][1] == qb.float32
+    error = assert_raises(qb.RetraceLimitError, step, qb.array([1.0, 2.0]), 5.0)
+    message = str(error)
+    assert "max_traces=3" in message and "jit(" in message
+    assert "(float64[2], 2.0)" in message and "(float32[2], 2.0)" in message
+    assert "new signature:\n  (float64[2], 5.0)" in message
+    assert isinstance(error, ValueError)
+    # 1, 1.0, and True are different static values.
+    counter = []
+    typed = qb.jit(lambda x, s: counter.append(type(s)) or x * s)
+    for scale in [1, 1.0, True, 1.0, math.nan, math.nan]:
+        typed(qb.array(2.0), scale)
+    assert counter == [int, float, bool, float]  # a NaN static value is cached like any other
+
+
+def test_grad_recreated_per_call_reuses_the_trace():
+    traces = []
+
+    def loss(x):
+        traces.append(1)
+        return qb.sum(x * x)
+
+    x = qb.array([1.0, 2.0])
+    for _ in range(3):
+        assert_close(qb.grad(loss)(x), [2.0, 4.0])
+        assert_close(qb.jit(qb.grad(loss))(x), [2.0, 4.0])
+        qb.jvp(loss, (x,), (x,))
+    assert len(traces) == 3  # grad, jit(grad), and jvp each traced once
+
+
+def test_nested_transform_calls_need_graph_inlining():
+    inner = qb.grad(lambda x: x**3)
+    error = assert_raises(
+        qb.UnsupportedOperationError, qb.grad(lambda x: inner(x)), 2.0, match="graph inlining"
+    )
+    assert isinstance(error, NotImplementedError) and error.op == "nested transform"
+    assert_raises(qb.UnsupportedOperationError, qb.jit(lambda x: qb.jit(inner)(x)), qb.array(1.0))
+
+
+def test_legacy_grad_and_jit_call_forms_keep_v0_1_results():
+    def model(a, b):
+        return a @ b
+
+    specs = [("a", (2, 3)), ("b", (3, 2))]
+    values = {
+        "a": qb.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+        "b": qb.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]),
+    }
+    cotangent = qb.Matrix([[1.0, 0.5], [-1.0, 2.0]])
+    for gradients in [
+        qb.grad(model, specs, values, cotangent),
+        qb.grad(model, tuple(specs), values, output_cotangent=cotangent),
+        qb.grad(function=model, input_specs=specs, values=values, output_cotangent=cotangent),
+    ]:
+        assert gradients["a"].to_list() == [[11.0, 14.0, 17.0], [9.0, 11.0, 13.0]]
+        assert gradients["b"].to_list() == [[-3.0, 8.5], [-3.0, 11.0], [-3.0, 13.5]]
+
+    @qb.jit([("a", (2, 2))])
+    def double(a):
+        return a + a
+
+    assert type(double).__name__ == "JitFunction"
+    assert double({"a": qb.Matrix([[1.0, 2.0], [3.0, 4.0]])}).to_list() == [[2.0, 4.0], [6.0, 8.0]]
+    assert type(qb.jit(input_specs=[("a", (2, 2))])).__name__ == "JitTransform"
+    assert qb.grad is not qb._quabla.grad and qb.jit is not qb._quabla.jit
+    assert list(inspect.signature(qb.grad).parameters) == ["fun", "argnums", "has_aux"]
 
 
 if __name__ == "__main__":

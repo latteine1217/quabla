@@ -645,7 +645,7 @@ The gates are those under "Development Gates" (`CONTRIBUTING.md:18-35`), with
 | **S0 Packaging** | `python/quabla/__init__.py` re-exports all 132 names from `quabla._quabla`; `quabla.quabla` aliased (attribute and `sys.modules` entry); class `__module__` values unchanged without `#[pyclass(module = ...)]` edits, because PyO3 does not derive them from the extension's module name (`dtype` already reports `quabla`, the other classes `builtins`); module-level functions report `quabla._quabla` instead of `quabla.quabla` | bridge (module name only) | `pyproject.toml`, `py/lib.rs`, `python/quabla/__init__.py`, CI ruff path | a name-set test asserts the v0.1 names are a subset of `dir(quabla)`; old tests; `maturin build --sdist` then install; macOS MLX and Linux CI | maturin `python-source` with a `cdylib` named `quabla`; stale `.so` in dev venvs |
 | **S1 Arrays** | `array`, `asarray`, factories, `numpy()`, `tolist()`, `item()`, `__float__`, `__array__`, buffer import/export, `Array` ABC, module ops, tracer `__neg__`/`__pow__` | bridge | `py/tensor.rs`, `py/interop.rs`, `py/tensor_trace.rs`, `python/quabla/_array.py`, `python/quabla/_ops.py` | dtype-mapping table tests; NumPy round trip of 1e6 values under 5 ms; `unsafe` buffer export with `// SAFETY:` and a refcount test | buffer lifetime soundness; NumPy 1.x vs 2.x `__array__(copy=)` |
 | **S1b Pow op** | elementwise `Pow` IR op with JVP/VJP/HVP rules, CPU/CUDA/MLX lowering, fusion and CSE handling, `qb.power`, tracer `x ** y` for non-integer and tensor exponents | **core** | `core/tensor_ir.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/tensor_trace.rs` | finite-difference checks for both operands incl. negative base, zero base, and integer-valued float exponents; CPU/MLX/CUDA parity; `powi` path unchanged for integer exponents. Landed: the conventions of §3.2, eager `Tensor ** Tensor` and `c ** Tensor`, and `qb.power` | NaN/inf conventions at `x <= 0`; derivative at `x == 0`; the symbolic Hessian of a loss whose value is infinite was NaN because the reverse pass of `sum`/`mean` broadcast its cotangent with `powi(v - v, 0)` (predates `Pow`); resolved by broadcasting a constant ones tensor, so symbolic and runtime Hessians agree there |
-| **S2 CPU transforms** | `grad`, `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `jit(device="cpu")`, pytrees, `argnums`, `has_aux`, cache and `RetraceLimitError`, `quabla.tree` | bridge (tuple outputs from traces) | `py/tensor_trace.rs:4375-4399`, `python/quabla/_transforms.py` | parity against `tensor_*_fn` on shared fixtures; retrace-bound tests; float32 keeps float32 | Python overhead on tiny graphs (3 µs vs 17 µs, Exp 4) |
+| **S2 CPU transforms** | `grad`, `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `jit(device="cpu")`, pytrees, `argnums`, `has_aux`, cache and `RetraceLimitError`, `quabla.tree` | bridge (tuple outputs from traces) + core (`symbolic_vjp_many`) | `py/tensor_trace.rs:4375-4399`, `python/quabla/_transforms.py` | parity against `tensor_*_fn` on shared fixtures; retrace-bound tests; float32 keeps float32. Landed as described in "S2 as landed" below | Python overhead on tiny graphs (3 µs vs 17 µs, Exp 4) |
 | **S3 Composition** | `TensorIr::inline` + bridge binding; nested transforms; README PINN example | **core** | `core/tensor_ir.rs`, `py/tensor_trace.rs`, `python/quabla/_transforms.py` | Rust tests for inline, including `Cond`/`Fori`/`Scan` regions; `grad(grad)` vs exact; README example reproduces `w = 3.141593` | shared-subexpression duplication after inlining (freeze already commons pure nodes, `docs/api.md:352-353`) |
 | **S4 vmap** | `vmap(in_axes, out_axes)` over pytrees; `vmap(grad)`; rejection of unmapped per-example gradients and nested vmap | bridge | `py/tensor_trace.rs:4490-4594` | parity with `tensor_vmap_{,jvp_,vjp_,hvp_scalar_}fn` | `out_axes` pytrees vs the single `out_axis` today |
 | **S5 Devices and errors** | `jit(device=...)`, `"cuda:N"`, `devices()`, `lower()`/`ShapeDtype`, error hierarchy, typed lowering rejections, eager MLX validation, `float64`-on-device warning | **core** (errors, MLX validation) | `core/compiler.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/compiler.rs` | `QUABLA_MLX_TEST=1` suite on macOS; `QUABLA_CUDA_TEST=1` on the CUDA host; unbuilt-target error test in CI | MLX lock discipline for new entrypoints (`core/tensor_ir/mlx.rs:43`) |
@@ -655,10 +655,63 @@ The gates are those under "Development Gates" (`CONTRIBUTING.md:18-35`), with
 | **S9 Deprecation and docs** | `__getattr__` warnings, `quabla.legacy`, `grad`/`jit` dual dispatch, README/api.md/examples/CHANGELOG/CONTRIBUTING | none | `python/quabla/{__init__,legacy,_compat}.py`, docs | each deprecated name warns exactly once and returns the v0.1 object; the old suite passes with warnings ignored; README snippets run as tests | warnings in users' `-W error` CI (intended) |
 | S10 (optional) | identity-based input retention in device `jit` | bridge | `py/tensor_trace.rs:2634-2660, 2893-2941` | benchmark shows no re-upload for static inputs | cache invalidation if storage ever becomes mutable |
 
-Rust summary: S1b (`Pow`), S3 (inline), and S5 (typed errors, MLX
-validation) touch the core; S0, S1, S2, S4, and S7 touch only the bridge; S6, S8, and S9 are pure
-Python. The critical path is S0 → S2 → S3. S1 can run in parallel with S2,
+Rust summary: S1b (`Pow`), S2 (`symbolic_vjp_many`), S3 (inline), and S5
+(typed errors, MLX validation) touch the core; S0, S1, S4, and S7 touch only
+the bridge; S6, S8, and S9 are pure Python. The critical path is S0 → S2 → S3. S1 can run in parallel with S2,
 and S5 through S8 are independent after S3.
+
+**S2 as landed.** `python/quabla/_transforms.py` implements §3.3 on the
+CPU; deviations and refinements of this document:
+
+- **Core addition.** `TensorIr::symbolic_vjp_many` seeds several outputs,
+  each with a named cotangent input or a constant ones tensor, and returns
+  the rebuilt primal of every source node. `grad` seeds its loss with ones,
+  so a transformed graph keeps exactly the source inputs and can be
+  transformed again; `has_aux` retains the auxiliary outputs from the same
+  graph. The bridge stages transforms on `TensorTraceGraph` (`_symbolic_vjp`,
+  `_symbolic_jvp`, `_compile_cpu`) and compiles through
+  `QuablaCompiler::compile_many` into an unregistered, positional
+  `StagedExecutable`; `trace_tensor` keeps its single-output contract.
+- **Composition before S3.** A transform whose function is itself a
+  transform stages the inner graph directly, so `grad(grad(f))`,
+  `jvp(grad(f), ...)` (HVP), `value_and_grad(jit(f))`, `jit(grad(f))`, and
+  `hessian` (= `jacobian(grad(f))`, forward over reverse) work now. Calling a
+  transformed function on tracers inside a traced Python function raises
+  `UnsupportedOperationError` (`op="nested transform"`) until S3 inlines
+  graphs; `jit` of a plain Python function called on tracers traces through
+  it, which is exact. `jacobian`/`hessian` evaluate one column per input
+  element and cannot be transformed further (`grad(hessian(f))` raises);
+  `jit(hessian(f))` forwards the call. The scalar-leaf forward-mode `grad`
+  lowering of §3.4 is deferred to S3/S4, where it matters under `vmap`.
+- **Python scalars.** Static as in D7, except in differentiated positions
+  (`argnums`, the primals of `jvp`/`vjp`), where they become `float64` arrays,
+  so `grad(lambda x: x**3)(2.0)` works; inner transforms propagate these
+  positions to an outer `jit`. Static keys include the type (`1`, `1.0`, and
+  `True` differ), and floats compare by `float.hex`, so `NaN` hits the cache.
+- **Cache.** Programs are cached per root Python function (weakly) and
+  transform chain, so `grad(f)(x)` re-created in a loop reuses the trace of
+  `f`. The bound is `max_traces` of the outermost `jit`, 8 otherwise; the
+  error lists the cached and new signatures. Closure values are baked in, as
+  with `jax.jit`.
+- **Other choices.** `argnums=(0,)` returns a one-element tuple; `bool_`
+  leaves get `None` gradients; `vjp_fun` evaluates the forward pass again;
+  Python number tangents and cotangents adopt the dtype of their primal,
+  other values must match its shape and dtype. `jit(device=...)` accepts
+  only `None`/`"cpu"` and raises `UnsupportedOperationError` for
+  `"cuda"`, `"cuda:N"`, and `"mlx"` until S5. `quabla.grad` and `quabla.jit`
+  dispatch the v0.1 call forms (`grad(fn, specs, values, ct)`, including
+  keyword forms and tuple specs, and `jit(specs)`) to the native functions
+  without a warning; the warnings are S9 work. `quabla._quabla.grad` stays
+  the v0.1 function, so v0.1 pickles still load it.
+- **Overhead** (Apple silicon, `timeit` minimum, README "At a Glance" loss
+  with `u_xx` written analytically, since nesting is S3): `jit(loss)(x, w)`
+  3.1 µs against 1.5 µs for `tensor_jit_fn({...})`, of which the argument
+  signature (flatten plus key) is 0.8 µs and the executable 1.7 µs;
+  `jit(value_and_grad(loss, 1))(x, w)` 5.5 µs against 7.1 µs for
+  `tensor_value_and_grad_fn` and for the README's
+  `plan.evaluate_value_and_vjp`, since the gradient is compiled rather than
+  computed by the runtime VJP; a `value_and_grad` re-created per call costs
+  6.3 µs.
 
 ## 7. Resolved Questions
 

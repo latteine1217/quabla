@@ -11,6 +11,7 @@ repository root. Per-feature status and validation records are in
 
 - [Compiler Facade](#compiler-facade)
 - [Current Capabilities](#current-capabilities)
+  - [Function Transforms](#function-transforms)
   - [Rank-N Tensor API](#rank-n-tensor-api)
   - [Legacy 2D API](#legacy-2d-api)
   - [Rust Core Crate](#rust-core-crate)
@@ -100,6 +101,43 @@ Python frontend / PyO3 -> TensorTraceGraph -> TensorIr / AD transforms
 ```
 
 ## Current Capabilities
+
+### Function Transforms
+
+The v0.2 transforms (docs/api_v0_2_design.md, sections 3.3-3.5; CPU only so
+far) take positional pytree arguments (`dict` with string keys, `list`,
+`tuple`, `None`; `quabla.tree.flatten`/`unflatten`/`map`) of arrays and
+Python scalars, and need no input specs:
+
+```python
+qb.grad(fun, argnums=0, has_aux=False)            # -> grads, or (grads, aux)
+qb.value_and_grad(fun, argnums=0, has_aux=False)  # -> (value, grads)
+qb.jvp(fun, primals, tangents)                    # -> (out, tangent_out)
+qb.vjp(fun, *primals, has_aux=False)              # -> (out, vjp_fun[, aux])
+qb.jacobian(fun, argnums=0)                       # blocks [*out.shape, *in.shape]
+qb.hessian(fun, argnums=0)                        # blocks [*in.shape, *in.shape]
+qb.jit(fun, device=None, static_argnums=(), max_traces=8)
+```
+
+- Every transformed function traces and compiles one CPU program on its
+  first call per signature (pytree structure, array shapes and dtypes, and
+  static values) and reuses it afterwards; more than `max_traces` signatures
+  (8 by default) raise `quabla.RetraceLimitError`. Python scalars are static
+  weak constants, so they keep `float32` programs in `float32`, except in
+  differentiated positions, where they become `float64` arrays. Values read
+  from closures are fixed at trace time.
+- Gradients mirror the pytree of the selected arguments and keep their
+  dtypes; `bool_` leaves get `None`. Transforms compose when passed to each
+  other directly (`grad(grad(f))`, `jvp(grad(f), (x,), (v,))`,
+  `jit(value_and_grad(f))`). Calling a transformed function inside a
+  function that another transform traces raises
+  `quabla.UnsupportedOperationError`, except `jit` of a plain function.
+- `quabla.grad` and `quabla.jit` still accept the legacy 2D forms
+  `grad(fn, input_specs, values, output_cotangent)` and `jit(input_specs)`
+  and dispatch them to the v0.1 functions below.
+- Errors: `quabla.QuablaError` is the base of `TracerError` (a `TypeError`),
+  `RetraceLimitError` (a `ValueError`), and `UnsupportedOperationError` (a
+  `ValueError` and `NotImplementedError` with `.op` and `.device`).
 
 ### Rank-N Tensor API
 
@@ -504,7 +542,9 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
   add/sub/mul/div/where/concat/powf/tanh/exp/log/sqrt/sin/cos/transpose/reshape/matmul/sum/mean
   trace graphs. Greater-than mask nodes are treated as non-differentiable
   control values.
-- Python `grad(fn, input_specs, values, output_cotangent)` convenience API.
+- Python `grad(fn, input_specs, values, output_cotangent)` convenience API
+  (`quabla.grad` dispatches this form here; other calls are the v0.2
+  transform above).
 - Python `grad_fn(fn, input_specs, output_cotangent)` callable transform for
   reusing a cached trace across value dictionaries.
 - Python `grad_scalar_fn(fn, input_specs)` callable transform that seeds a
@@ -534,7 +574,8 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
   transforms and `jit(...)` evaluate this frozen plan. It is an execution-plan
   boundary, not machine-code JIT compilation.
 - Python `jit(input_specs)` decorator factory that traces a function once and
-  evaluates a frozen CPU execution plan for later value dictionaries.
+  evaluates a frozen CPU execution plan for later value dictionaries
+  (`quabla.jit` dispatches a non-callable first argument here).
 
 ### Rust Core Crate
 
@@ -586,3 +627,8 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - StableHLO export (`stablehlo_text`) covers only a small inspection subset
   and is not an execution path.
 - The legacy 2D `Matrix`/`TraceGraph` API is not migrated to the facade.
+- The v0.2 transforms run on the CPU only, cannot yet be nested through a
+  Python function (graph inlining), and do not capture eager `Tensor`
+  constants in a trace: arrays a traced function uses must be arguments.
+  `vmap` is not part of the v0.2 layer yet. `jacobian` and `hessian` are
+  dense and cannot be transformed further.
