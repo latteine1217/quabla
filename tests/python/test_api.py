@@ -2,6 +2,7 @@ import ctypes
 import gc
 import importlib
 import importlib.machinery
+import math
 import pathlib
 import pickle
 import subprocess
@@ -378,6 +379,129 @@ def test_numpy_round_trip_of_a_million_values_is_fast():
         timings.append(time.perf_counter() - start)
     assert np.array_equal(result, source)
     assert min(timings) < 0.005, timings
+
+
+def assert_close(actual, expected, tolerance=1e-12):
+    actual, expected = qb.asarray(actual), qb.asarray(expected)
+    assert actual.shape == expected.shape, (actual.shape, expected.shape)
+    for lhs, rhs in zip(actual.to_flat_list(), expected.to_flat_list()):
+        assert abs(lhs - rhs) <= tolerance * max(1.0, abs(rhs)), (actual.tolist(), expected.tolist())
+
+
+def traced(function, *arrays):
+    """Evaluates `function` on `arrays` through a CPU trace."""
+    specs = [(f"a{index}", array.shape, array.dtype) for index, array in enumerate(arrays)]
+    compiled = qb.tensor_jit_fn(function, specs)
+    return compiled({f"a{index}": array for index, array in enumerate(arrays)})
+
+
+def test_module_level_unary_and_reduction_ops_match_methods():
+    x = qb.array([[0.25, 0.5], [1.5, 2.0]])
+    unary = ["abs", "cos", "exp", "log", "relu", "sigmoid", "sin", "softplus", "sqrt", "tanh"]
+    for name in unary:
+        function = getattr(qb, name)
+        assert function.__name__ == name
+        expected = getattr(x, name)()
+        assert_close(function(x), expected)
+        assert_close(traced(function, x), expected)
+    for name in ["sum", "mean", "max", "min", "norm"]:
+        function = getattr(qb, name)
+        assert_close(function(x), getattr(x, name)())
+        assert_close(function(x, axis=0), getattr(x, name)(axis=0))
+        assert_close(function(x, 1, keepdims=True), getattr(x, name)(axis=1, keepdims=True))
+        assert function(x, axis=(0, 1), keepdims=True).shape == [1, 1]
+        assert_close(traced(lambda a, f=function: f(a, axis=1), x), getattr(x, name)(axis=1))
+    mask = qb.array([[True, False], [True, True]])
+    assert qb.any(mask).item() is True
+    assert qb.all(mask).item() is False
+    assert qb.all(mask, axis=1).tolist() == [False, True]
+
+
+def test_module_level_ops_accept_python_scalars_and_lists():
+    assert_tensor(qb.sin(0.0), 0.0, qb.float64)
+    assert_close(qb.exp([0.0, 1.0]), [1.0, math.e])
+    assert_close(qb.sum([[1.0, 2.0], [3.0, 4.0]], axis=0), [4.0, 6.0])
+    assert_close(qb.matmul([[1.0, 2.0]], [[3.0], [4.0]]), [[11.0]])
+    assert_close(qb.solve([[2.0, 0.0], [0.0, 4.0]], [[2.0], [8.0]]), [[1.0], [2.0]])
+    # A Python number stays weak in maximum/minimum on either side.
+    x = qb.array([-1.0, 2.0], dtype=qb.float32)
+    for result in [qb.maximum(x, 0.0), qb.maximum(0.0, x)]:
+        assert_tensor(result, [0.0, 2.0], qb.float32)
+    assert_tensor(qb.minimum(1.0, x), [-1.0, 1.0], qb.float32)
+    assert_tensor(qb.minimum(x, qb.array([0.0, 3.0], dtype=qb.float32)), [-1.0, 2.0], qb.float32)
+    assert_tensor(qb.maximum(1.0, 2.0), 2.0, qb.float64)
+    assert_raises(ValueError, qb.maximum, x, qb.array([0.0, 3.0]), match="mismatched dtypes")
+
+
+def test_module_level_shape_and_linear_algebra_ops():
+    x = qb.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    assert_tensor(qb.reshape(x, (3, 2)), [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], qb.float64)
+    assert qb.reshape(x, 6).shape == [6]
+    assert qb.transpose(x).shape == [3, 2]
+    assert qb.transpose(x, (1, 0)).tolist() == x.transpose([1, 0]).tolist()
+    assert qb.broadcast_to(qb.array([1.0, 2.0, 3.0]), (2, 3)).tolist() == [[1.0, 2.0, 3.0]] * 2
+    assert qb.astype(x, qb.float32).dtype == qb.float32
+    square = qb.array([[4.0, 2.0], [2.0, 3.0]])
+    assert_close(qb.cholesky(square), square.cholesky())
+    assert qb.tril(square).tolist() == [[4.0, 0.0], [2.0, 3.0]]
+    assert qb.triu(square).tolist() == [[4.0, 2.0], [0.0, 3.0]]
+    assert_close(qb.matmul(square, x[:, 0:2]), square @ x[:, 0:2])
+    assert_close(traced(lambda a, b: qb.matmul(a, b), square, x), square @ x)
+    assert_close(traced(lambda a: qb.reshape(qb.transpose(a), (6,)), x), x.transpose().reshape([6]))
+    assert_close(traced(lambda a: qb.tril(qb.cholesky(a)), square), square.cholesky())
+
+
+@requires_numpy
+def test_module_level_ops_accept_numpy_arrays():
+    source = np.array([[0.5, 1.0], [1.5, 2.0]], dtype=np.float32)
+    result = qb.sin(source)
+    assert result.dtype == qb.float32
+    assert np.allclose(result.numpy(), np.sin(source))
+    assert_close(qb.sum(source.astype(np.float64), axis=1), [1.5, 3.5])
+
+
+def test_traced_negation_and_integer_powers_with_gradients():
+    x = qb.array([0.5, -1.25, 2.0])
+    values = x.tolist()
+    assert_close(traced(lambda a: -a, x), [-value for value in values])
+    for exponent in [0, 1, 2, 3, np.int64(2) if np is not None else 2]:
+        assert_close(traced(lambda a, n=exponent: a**n, x), x ** int(exponent))
+        value, gradients = qb.tensor_value_and_grad_fn(
+            lambda a, n=exponent: (a**n).sum(), [("x", [3])]
+        )({"x": x})
+        n = int(exponent)
+        assert_close(value, sum(v**n for v in values))
+        assert_close(gradients["x"], [n * v ** (n - 1) if n else 0.0 for v in values])
+    value, gradients = qb.tensor_value_and_grad_fn(
+        lambda a: qb.sum(-(a**2) + qb.sin(a)), [("x", [3])]
+    )({"x": x})
+    assert_close(value, sum(-(v**2) + math.sin(v) for v in values))
+    assert_close(gradients["x"], [-2.0 * v + math.cos(v) for v in values])
+    # -0.0 keeps its sign, as for eager tensors.
+    assert math.copysign(1.0, traced(lambda a: -a, qb.array([0.0])).item()) == -1.0
+    # float32 stays float32.
+    x32 = qb.array([1.5, -2.0], dtype=qb.float32)
+    assert_tensor(traced(lambda a: -(a**2), x32), [-2.25, -4.0], qb.float32)
+
+
+def test_traced_power_rejects_other_exponents_until_the_pow_op():
+    for exponent in [0.5, 2.0, -1, qb.array(2.0)]:
+        error = assert_raises(
+            TypeError,
+            qb.tensor_jit_fn,
+            lambda a, p=exponent: a**p,
+            [("x", [2])],
+            match="arrive with quabla.power",
+        )
+        assert "TraceTensor ** " in str(error)
+    assert_raises(TypeError, qb.tensor_jit_fn, lambda a: pow(a, 2, 3), [("x", [2])], match="modulo")
+    assert_raises(
+        ValueError,
+        qb.tensor_jit_fn,
+        lambda a: -a,
+        [("x", [2], qb.bool_)],
+        match="negative is not defined for bool",
+    )
 
 
 if __name__ == "__main__":

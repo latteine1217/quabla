@@ -1992,6 +1992,40 @@ impl TraceTensor {
         trace_scalar_left_operand(self, lhs, "div")
     }
 
+    /// `-x` as `x * -1`, like the eager `Tensor` (so `-0.0` stays signed).
+    fn __neg__(&self) -> PyResult<Self> {
+        if self.dtype().map_err(PyValueError::new_err)? == TensorDType::Bool {
+            return Err(PyValueError::new_err(bool_operation_error("negative")));
+        }
+        self.scalar_binary(-1.0, "mul")
+            .map_err(PyValueError::new_err)
+    }
+
+    /// `x ** n` for a non-negative integer `n` lowers to `powi`, which is
+    /// exact and cheaper than a general power. Other exponents need the
+    /// `Pow` IR op of design slice S1b and are rejected until it lands.
+    fn __pow__(
+        &self,
+        exponent: &Bound<'_, PyAny>,
+        modulo: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        if modulo.is_some() {
+            return Err(PyTypeError::new_err(
+                "modulo argument is not supported for TraceTensor power",
+            ));
+        }
+        if let Ok(exponent) = exponent.extract::<u32>() {
+            return self.powi(exponent);
+        }
+        Err(PyTypeError::new_err(format!(
+            "TraceTensor ** {} is not supported yet: traced powers take a non-negative Python \
+             int exponent, which lowers to powi; float, negative, and tensor exponents arrive \
+             with quabla.power and the Pow op in the next slice (S1b in \
+             docs/api_v0_2_design.md)",
+            exponent.repr()?
+        )))
+    }
+
     #[pyo3(signature = (axis = None, keepdims = false))]
     fn sum(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
         self.reduce_axes_tensor(extract_reduction_axes(axis)?, keepdims, false)

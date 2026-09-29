@@ -243,12 +243,15 @@ Tensor.numpy() -> np.ndarray; Tensor.tolist(); Tensor.item(); float(t); np.asarr
   mean max min norm any all matmul reshape transpose broadcast_to astype
   solve cholesky tril triu`, plus the kept `where`, `concat`, `stack`,
   `einsum`, comparisons, and logical ops, plus `qb.power`. The only new IR op
-  is `Pow` (below); no `tan`.
+  is `Pow` (below); no `tan`. `abs`, `sum`, `max`, `min`, `any`, and `all`
+  are attributes of `quabla` but not in `__all__`, so `from quabla import *`
+  does not shadow the builtins.
 - **Operators:** add `__neg__`, `__pow__`, and `__rpow__` to `TraceTensor`
   (Exp 2). Traced `x ** p` keeps using `powi` (`core/tensor_ir.rs:4406`) for
   integer `p >= 0` (exact and cheaper) and lowers every other exponent,
   including a traced tensor exponent, to a new elementwise `Pow` IR op (slice
-  S1b). `Pow` follows the eager `f64::powf` semantics (`py/tensor.rs:1314`)
+  S1b). Until S1b lands, S1 rejects those exponents with a `TypeError` that
+  points to `qb.power`, and `__rpow__` is left out. `Pow` follows the eager `f64::powf` semantics (`py/tensor.rs:1314`)
   with NaN for a negative base and a non-integer exponent, and differentiates
   in both operands: `d/dx = y x^(y-1)`, `d/dy = x^y ln x`, where the exponent
   gradient is defined as zero at `x == 0` and the base gradient follows the
@@ -625,7 +628,7 @@ The gates are those under "Development Gates" (`CONTRIBUTING.md:18-35`), with
 | Slice | Scope | Rust? | Files | Verification | Risks |
 | --- | --- | --- | --- | --- | --- |
 | **S0 Packaging** | `python/quabla/__init__.py` re-exports all 132 names from `quabla._quabla`; `quabla.quabla` aliased (attribute and `sys.modules` entry); class `__module__` values unchanged without `#[pyclass(module = ...)]` edits, because PyO3 does not derive them from the extension's module name (`dtype` already reports `quabla`, the other classes `builtins`); module-level functions report `quabla._quabla` instead of `quabla.quabla` | bridge (module name only) | `pyproject.toml`, `py/lib.rs`, `python/quabla/__init__.py`, CI ruff path | a name-set test asserts the v0.1 names are a subset of `dir(quabla)`; old tests; `maturin build --sdist` then install; macOS MLX and Linux CI | maturin `python-source` with a `cdylib` named `quabla`; stale `.so` in dev venvs |
-| **S1 Arrays** | `array`, `asarray`, factories, `numpy()`, `tolist()`, `item()`, `__float__`, `__array__`, buffer import/export, `Array` ABC, module ops, tracer `__neg__`/`__pow__` | bridge | `py/tensor.rs`, `py/tensor_trace.rs`, `python/quabla/_array.py` | dtype-mapping table tests; NumPy round trip of 1e6 values under 5 ms; `unsafe` buffer export with `// SAFETY:` and a refcount test | buffer lifetime soundness; NumPy 1.x vs 2.x `__array__(copy=)` |
+| **S1 Arrays** | `array`, `asarray`, factories, `numpy()`, `tolist()`, `item()`, `__float__`, `__array__`, buffer import/export, `Array` ABC, module ops, tracer `__neg__`/`__pow__` | bridge | `py/tensor.rs`, `py/interop.rs`, `py/tensor_trace.rs`, `python/quabla/_array.py`, `python/quabla/_ops.py` | dtype-mapping table tests; NumPy round trip of 1e6 values under 5 ms; `unsafe` buffer export with `// SAFETY:` and a refcount test | buffer lifetime soundness; NumPy 1.x vs 2.x `__array__(copy=)` |
 | **S1b Pow op** | elementwise `Pow` IR op with JVP/VJP/HVP rules, CPU/CUDA/MLX lowering, fusion and CSE handling, `qb.power`, tracer `x ** y` for non-integer and tensor exponents | **core** | `core/tensor_ir.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/tensor_trace.rs` | finite-difference checks for both operands incl. negative base, zero base, and integer-valued float exponents; CPU/MLX/CUDA parity; `powi` path unchanged for integer exponents | NaN/inf conventions at `x <= 0`; derivative at `x == 0` |
 | **S2 CPU transforms** | `grad`, `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `jit(device="cpu")`, pytrees, `argnums`, `has_aux`, cache and `RetraceLimitError`, `quabla.tree` | bridge (tuple outputs from traces) | `py/tensor_trace.rs:4375-4399`, `python/quabla/_transforms.py` | parity against `tensor_*_fn` on shared fixtures; retrace-bound tests; float32 keeps float32 | Python overhead on tiny graphs (3 µs vs 17 µs, Exp 4) |
 | **S3 Composition** | `TensorIr::inline` + bridge binding; nested transforms; README PINN example | **core** | `core/tensor_ir.rs`, `py/tensor_trace.rs`, `python/quabla/_transforms.py` | Rust tests for inline, including `Cond`/`Fori`/`Scan` regions; `grad(grad)` vs exact; README example reproduces `w = 3.141593` | shared-subexpression duplication after inlining (freeze already commons pure nodes, `docs/api.md:352-353`) |
