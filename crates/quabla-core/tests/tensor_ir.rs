@@ -9714,3 +9714,364 @@ fn cuda_backend_uploads_array_constants_once_per_plan_when_enabled() {
         .expect_err("a device loop body with an array constant must be rejected");
     assert!(error.contains("array constant"), "{error}");
 }
+
+/// The leading-axis slice `index` of a mapped value, as one example.
+fn example_of(value: &DynamicTensor, index: usize) -> Result<DynamicTensor, String> {
+    let shape = value.shape()[1..].to_vec();
+    let count = shape.iter().product::<usize>();
+    DynamicTensor::with_dtype(
+        shape,
+        value.data()[index * count..(index + 1) * count].to_vec(),
+        value.dtype(),
+    )
+}
+
+/// One example per step: a callee over scalar `x`, vector `v`, and matrix
+/// `a` (mapped) and vector `w` and matrix `m` (unmapped) that reaches every
+/// batching rule, returning its outputs and the scalar total.
+fn batching_fixture() -> Result<(TensorIr, Vec<TensorNodeId>, TensorNodeId), String> {
+    use quabla_core::tensor_ir::TensorComparison;
+    let mut callee = TensorIr::new();
+    let x = callee.input("x", vec![])?;
+    let v = callee.input("v", vec![3])?;
+    let w = callee.input("w", vec![3])?;
+    let m = callee.input("m", vec![3, 2])?;
+    let a = callee.input("a", vec![2, 2])?;
+    // A mapped scalar against an unmapped vector: the padding case.
+    let scaled = callee.mul(x, w)?;
+    let powered = callee.pow(v, x)?;
+    let less = callee.compare(v, w, TensorComparison::Less)?;
+    let selected = callee.where_select(less, scaled, powered)?;
+    let activated = callee.tanh(selected)?;
+    let sin_v = callee.sin(v)?;
+    let cos_w = callee.cos(w)?;
+    let wave = callee.mul(sin_v, cos_w)?;
+    let exp_x = callee.exp(x)?;
+    let square = callee.powi(v, 2)?;
+    let one = callee.scalar_constant(1.0);
+    let shifted = callee.add(square, one)?;
+    let root = callee.sqrt(shifted)?;
+    let ratio = callee.div(exp_x, root)?;
+    let w_square = callee.powi(w, 2)?;
+    let w_shifted = callee.add(w_square, one)?;
+    let log_w = callee.log(w_shifted)?;
+    let mixed = callee.add(activated, wave)?;
+    let mixed = callee.sub(mixed, ratio)?;
+    let mixed = callee.add(mixed, log_w)?;
+    // Matmul with the mapped operand on either side and on both.
+    let row = callee.reshape(mixed, vec![1, 3])?;
+    let left = callee.matmul(row, m)?;
+    let m_t = callee.transpose(m, None)?;
+    let column = callee.reshape(mixed, vec![3, 1])?;
+    let right = callee.matmul(m_t, column)?;
+    let a_squared = callee.matmul(a, a)?;
+    let lower = callee.triangular(a_squared, true)?;
+    let a_t = callee.transpose(a, Some(vec![1, 0]))?;
+    let lower = callee.add(lower, a_t)?;
+    let left_flat = callee.reshape(left, vec![2])?;
+    let right_flat = callee.reshape(right, vec![2])?;
+    let w_head = callee.slice_axis(w, 0, 0, 2)?;
+    let joined = callee.concat(vec![left_flat, w_head, right_flat], 0)?;
+    let tail = callee.slice_axis(joined, 0, 2, 5)?;
+    let column_sums = callee.sum_axis(lower, 0)?;
+    let row_means = callee.mean_axis(lower, 1)?;
+    let reduced = callee.add(column_sums, row_means)?;
+    let spread = callee.broadcast_to(x, vec![2, 2])?;
+    let spread = callee.mul(spread, lower)?;
+    let half = callee.scalar_constant(0.5);
+    let mask = callee.greater(v, half)?;
+    let narrowed = callee.cast(mixed, TensorDType::F32)?;
+    let total = callee.sum(joined)?;
+    let average = callee.mean(spread)?;
+    let tail_total = callee.sum(tail)?;
+    let total = callee.add(total, average)?;
+    let total = callee.add(total, tail_total)?;
+    let reduced_total = callee.sum(reduced)?;
+    let total = callee.add(total, reduced_total)?;
+    // An output that depends on no mapped input stays unmapped.
+    let two = callee.scalar_constant(2.0);
+    let sin_w = callee.sin(w)?;
+    let unmapped = callee.mul(sin_w, two)?;
+    let outputs = vec![
+        selected, joined, reduced, spread, total, mask, narrowed, unmapped,
+    ];
+    Ok((callee, outputs, total))
+}
+
+fn batching_inputs(batch: usize) -> Result<BTreeMap<String, DynamicTensor>, String> {
+    let values = |count: usize, offset: f64| {
+        (0..count)
+            .map(|index| 0.35 + 0.17 * index as f64 + offset)
+            .collect::<Vec<_>>()
+    };
+    Ok(BTreeMap::from([
+        (
+            "x".to_string(),
+            DynamicTensor::new(vec![batch], values(batch, 0.1))?,
+        ),
+        (
+            "v".to_string(),
+            DynamicTensor::new(vec![batch, 3], values(batch * 3, 0.05))?,
+        ),
+        (
+            "w".to_string(),
+            DynamicTensor::new(vec![3], vec![0.9, 0.2, 1.4])?,
+        ),
+        (
+            "m".to_string(),
+            DynamicTensor::new(vec![3, 2], vec![0.5, -1.0, 0.25, 2.0, -0.75, 1.5])?,
+        ),
+        (
+            "a".to_string(),
+            DynamicTensor::new(vec![batch, 2, 2], values(batch * 4, -0.6))?,
+        ),
+    ]))
+}
+
+const BATCHING_MAPPED: [(&str, bool); 5] = [
+    ("x", true),
+    ("v", true),
+    ("w", false),
+    ("m", false),
+    ("a", true),
+];
+
+/// Batches `callee` over the inputs of [`batching_inputs`] and checks every
+/// output against a per-example evaluation of the callee.
+fn assert_batched_matches_examples(
+    callee: &TensorIr,
+    outputs: &[TensorNodeId],
+    expected_mapped: &[bool],
+) {
+    let batch = 4;
+    let inputs = must!(batching_inputs(batch));
+    let mut graph = TensorIr::new();
+    let mut bindings = BTreeMap::new();
+    for (name, is_mapped) in BATCHING_MAPPED {
+        let value = &inputs[name];
+        let node = must!(graph.input(name, value.shape().to_vec()));
+        bindings.insert(name.to_string(), (node, is_mapped));
+    }
+    let batched = must!(graph.inline_batched(callee, &bindings, batch, outputs));
+    assert_eq!(
+        batched
+            .iter()
+            .map(|(_, mapped)| *mapped)
+            .collect::<Vec<_>>(),
+        expected_mapped
+    );
+    for ((node, is_mapped), output) in batched.iter().zip(outputs) {
+        let value = must!(graph.evaluate(*node, &inputs));
+        for index in 0..batch {
+            let mut example_inputs = BTreeMap::new();
+            for (name, input_mapped) in BATCHING_MAPPED {
+                let input = &inputs[name];
+                example_inputs.insert(
+                    name.to_string(),
+                    if input_mapped {
+                        must!(example_of(input, index))
+                    } else {
+                        input.clone()
+                    },
+                );
+            }
+            let expected = must!(callee.evaluate(*output, &example_inputs));
+            let actual = if *is_mapped {
+                must!(example_of(&value, index))
+            } else {
+                value.clone()
+            };
+            assert_eq!(actual.shape(), expected.shape(), "output {output}");
+            assert_eq!(actual.dtype(), expected.dtype(), "output {output}");
+            assert_close(actual.data(), expected.data(), 1e-13);
+        }
+    }
+}
+
+#[test]
+fn inline_batched_matches_a_per_example_loop_for_every_batching_rule() {
+    let (callee, outputs, _) = must!(batching_fixture());
+    assert_batched_matches_examples(
+        &callee,
+        &outputs,
+        &[true, true, true, true, true, true, true, false],
+    );
+}
+
+#[test]
+fn inline_batched_reverse_mode_graphs_give_per_example_gradients() {
+    // Batching the VJP graph gives every example its own gradient, also for
+    // the unmapped inputs `w` and `m` (JAX semantics); the reverse pass adds
+    // broadcast, pad, and reduce-to-shape nodes to batch.
+    let (callee, _, total) = must!(batching_fixture());
+    let vjp = must!(callee.symbolic_vjp_many(&[(total, SymbolicCotangent::Ones)]));
+    let names = ["x", "v", "w", "m", "a"];
+    let outputs = names
+        .iter()
+        .map(|name| vjp.gradients[*name])
+        .collect::<Vec<_>>();
+    assert_batched_matches_examples(&vjp.graph, &outputs, &[true; 5]);
+}
+
+#[test]
+fn inline_batched_graphs_batch_again_for_nested_vmap() {
+    let mut callee = TensorIr::new();
+    let x = must!(callee.input("x", vec![]));
+    let w = must!(callee.input("w", vec![2]));
+    let product = must!(callee.mul(x, w));
+    let output = must!(callee.sin(product));
+
+    // Inner vmap over x ([3]), then an outer vmap over w ([2, 2]) and x.
+    let mut inner = TensorIr::new();
+    let xs = must!(inner.input("xs", vec![3]));
+    let w_inner = must!(inner.input("w", vec![2]));
+    let batched = must!(inner.inline_batched(
+        &callee,
+        &BTreeMap::from([
+            ("x".to_string(), (xs, true)),
+            ("w".to_string(), (w_inner, false)),
+        ]),
+        3,
+        &[output],
+    ));
+    let mut outer = TensorIr::new();
+    let xss = must!(outer.input("xss", vec![2, 3]));
+    let ws = must!(outer.input("ws", vec![2, 2]));
+    let nested = must!(outer.inline_batched(
+        &inner,
+        &BTreeMap::from([
+            ("xs".to_string(), (xss, true)),
+            ("w".to_string(), (ws, true)),
+        ]),
+        2,
+        &[batched[0].0],
+    ));
+    assert!(nested[0].1);
+    let x_values = [0.1, 0.2, 0.3, -0.4, 0.5, 0.6];
+    let w_values = [1.5, -2.0, 0.25, 3.0];
+    let value = must!(outer.evaluate(
+        nested[0].0,
+        &BTreeMap::from([
+            (
+                "xss".to_string(),
+                must!(DynamicTensor::new(vec![2, 3], x_values.to_vec()))
+            ),
+            (
+                "ws".to_string(),
+                must!(DynamicTensor::new(vec![2, 2], w_values.to_vec()))
+            ),
+        ])
+    ));
+    assert_eq!(value.shape(), &[2, 3, 2]);
+    let mut expected = Vec::new();
+    for outer_index in 0..2 {
+        for inner_index in 0..3 {
+            for element in 0..2 {
+                expected.push(
+                    (x_values[outer_index * 3 + inner_index] * w_values[outer_index * 2 + element])
+                        .sin(),
+                );
+            }
+        }
+    }
+    assert_close(value.data(), &expected, 1e-15);
+}
+
+#[test]
+fn inline_batched_rejects_unbatchable_ops_and_invalid_bindings() {
+    use quabla_core::tensor_ir::BatchingError;
+    let mut callee = TensorIr::new();
+    let matrix = must!(callee.input("matrix", vec![2, 2]));
+    let rhs = must!(callee.input("rhs", vec![2, 1]));
+    let solved = must!(callee.solve(matrix, rhs));
+
+    let mut graph = TensorIr::new();
+    let matrix_node = must!(graph.input("matrix", vec![2, 2]));
+    let rhs_node = must!(graph.input("rhs", vec![3, 2, 1]));
+    let error = graph
+        .inline_batched(
+            &callee,
+            &BTreeMap::from([
+                ("matrix".to_string(), (matrix_node, false)),
+                ("rhs".to_string(), (rhs_node, true)),
+            ]),
+            3,
+            &[solved],
+        )
+        .expect_err("a mapped solve has no batching rule");
+    assert_eq!(error, BatchingError::Unsupported { op: "solve" });
+    // An unmapped solve is copied as is.
+    let rhs_single = must!(graph.input("rhs_single", vec![2, 1]));
+    let copied = must!(graph.inline_batched(
+        &callee,
+        &BTreeMap::from([
+            ("matrix".to_string(), (matrix_node, false)),
+            ("rhs".to_string(), (rhs_single, false)),
+        ]),
+        3,
+        &[solved],
+    ));
+    assert!(!copied[0].1);
+
+    // Region nodes with a mapped operand are rejected, unmapped ones copied.
+    let (regions, loss) = must!(inline_region_fixture());
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![4]));
+    let s = must!(graph.input("s", vec![]));
+    let error = graph
+        .inline_batched(
+            &regions,
+            &BTreeMap::from([("x".to_string(), (x, true)), ("s".to_string(), (s, false))]),
+            4,
+            &[loss],
+        )
+        .expect_err("a mapped region has no batching rule");
+    assert!(
+        matches!(error, BatchingError::Unsupported { op } if ["scan", "fori", "cond"].contains(&op)),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("vmap cannot batch"), "{error}");
+    let x_single = must!(graph.input("x_single", vec![]));
+    let copied = must!(graph.inline_batched(
+        &regions,
+        &BTreeMap::from([
+            ("x".to_string(), (x_single, false)),
+            ("s".to_string(), (s, false)),
+        ]),
+        4,
+        &[loss],
+    ));
+    assert!(!copied[0].1);
+
+    // Bindings: a mapped binding needs the leading batch axis.
+    let wrong = [
+        ((x, false), "the input shape"),
+        (
+            (s, true),
+            "a mapped binding must have shape [4, *input shape]",
+        ),
+    ];
+    for (binding, message) in wrong {
+        let error = graph
+            .inline_batched(
+                &regions,
+                &BTreeMap::from([("x".to_string(), binding), ("s".to_string(), (s, false))]),
+                4,
+                &[loss],
+            )
+            .expect_err("a mismatched binding must be rejected");
+        assert!(
+            matches!(&error, BatchingError::Invalid(text) if text.contains(message)),
+            "{error:?}"
+        );
+    }
+    let error = graph
+        .inline_batched(
+            &regions,
+            &BTreeMap::from([("x".to_string(), (x, true)), ("s".to_string(), (s, false))]),
+            0,
+            &[loss],
+        )
+        .expect_err("a zero batch must be rejected");
+    assert!(error.to_string().contains("above zero"), "{error}");
+}

@@ -839,6 +839,40 @@ pub struct SymbolicVjpMany {
     pub gradients: BTreeMap<String, TensorNodeId>,
 }
 
+/// Why [`TensorIr::inline_batched`] could not splice a callee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchingError {
+    /// A node that depends on a mapped input has no batching rule; `op` is
+    /// its IR op name (`solve`, or a `cond`/`fori`/`scan` region node).
+    Unsupported { op: &'static str },
+    /// Invalid bindings, outputs, or batch size.
+    Invalid(String),
+}
+
+impl std::fmt::Display for BatchingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported { op: "solve" } => formatter.write_str(
+                "vmap cannot batch solve: it takes rank-2 operands only, so an operand that \
+                 depends on a mapped argument has no batching rule",
+            ),
+            Self::Unsupported { op } => write!(
+                formatter,
+                "vmap cannot batch a {op} region node: a cond, fori, or scan region whose \
+                 operands depend on a mapped argument has no batching rule yet (the \
+                 tensor_vmap_* helpers trace fori and scan bodies batched)"
+            ),
+            Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<String> for BatchingError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TensorExecutionPlan {
     nodes: Vec<TensorNode>,
@@ -2284,15 +2318,7 @@ impl TensorIr {
             }
         }
 
-        let mut reachable = vec![false; callee.nodes.len()];
-        let mut pending = outputs.to_vec();
-        while let Some(id) = pending.pop() {
-            let node = callee.node(id)?;
-            if !std::mem::replace(&mut reachable[id], true) {
-                pending.extend(tensor_op_inputs(&node.op));
-            }
-        }
-
+        let reachable = callee.reachable_from(outputs)?;
         let mut remap = HashMap::new();
         let mut groups = HashMap::new();
         for (id, node) in callee.nodes.iter().enumerate() {
@@ -2304,15 +2330,310 @@ impl TensorIr {
                     .get(name)
                     .ok_or_else(|| format!("inline leaves callee input {name:?} unbound"))?
             } else {
-                let mut op = remap_tensor_op(&node.op, &remap)?;
-                if let Some(group) = tensor_op_group_mut(&mut op) {
-                    *group = *groups.entry(*group).or_insert(self.nodes.len());
-                }
-                self.push_node(op, node.shape.clone(), node.dtype, node.weak)
+                self.push_spliced(node, &remap, &mut groups)?
             };
             remap.insert(id, spliced);
         }
         Ok(outputs.iter().map(|output| remap[output]).collect())
+    }
+
+    /// Splices the part of `callee` that `outputs` depend on into this graph
+    /// like [`Self::inline`], vectorized over `batch_size` examples: this is
+    /// the lowering of `vmap`.
+    ///
+    /// `callee` computes one example. Each binding is `(node, mapped)`: an
+    /// unmapped binding has the shape of its callee input and is shared by
+    /// every example, while a mapped binding has shape
+    /// `[batch_size, *input shape]` and holds one example per index of its
+    /// leading axis. A spliced node that depends on a mapped binding is
+    /// mapped, with the batch as its leading axis; the other nodes are copied
+    /// as `inline` copies them, so work that does not depend on the mapped
+    /// arguments is done once, not per example. Returns `(node, mapped)` per
+    /// output.
+    ///
+    /// Batching rules, with the batch axis always leading: elementwise ops,
+    /// `where`, `matmul`, and `broadcast` first insert unit axes after the
+    /// batch axis of a mapped operand whose example rank is below the node's,
+    /// because broadcasting aligns trailing axes and would otherwise align
+    /// the batch axis of a `[B]` operand with an example axis of the other
+    /// operand; ops with an axis shift it by one; full reductions reduce the
+    /// flattened example axes; `concat` broadcasts its unmapped operands over
+    /// the batch. The result is an ordinary graph, so it can be batched again
+    /// (nested `vmap`), differentiated, and inlined. A mapped `solve` or
+    /// region node (`cond`, `fori`, `scan`, and their derivative nodes) is
+    /// [`BatchingError::Unsupported`]; unmapped ones are copied unchanged.
+    pub fn inline_batched(
+        &mut self,
+        callee: &TensorIr,
+        bindings: &BTreeMap<String, (TensorNodeId, bool)>,
+        batch_size: usize,
+        outputs: &[TensorNodeId],
+    ) -> Result<Vec<(TensorNodeId, bool)>, BatchingError> {
+        if batch_size == 0 {
+            return Err(BatchingError::Invalid(
+                "vmap requires a batch size above zero".to_string(),
+            ));
+        }
+        let mut callee_inputs = HashMap::new();
+        for (id, node) in callee.nodes.iter().enumerate() {
+            if let TensorOp::Input { name } = &node.op {
+                callee_inputs.insert(name.as_str(), id);
+            }
+        }
+        for (name, (binding, mapped)) in bindings {
+            let input = callee_inputs
+                .get(name.as_str())
+                .map(|id| &callee.nodes[*id])
+                .ok_or_else(|| format!("inline binds {name:?}, which is not a callee input"))?;
+            let bound = self.node(*binding)?;
+            let expected = if *mapped {
+                batched_shape(batch_size, &input.shape)
+            } else {
+                input.shape.clone()
+            };
+            if bound.shape != expected || bound.dtype != input.dtype {
+                return Err(BatchingError::Invalid(format!(
+                    "vmap binds callee input {name:?} ({}{:?}, {}) to node {binding} ({}{:?}); \
+                     a mapped binding must have shape [{batch_size}, *input shape] and an \
+                     unmapped one the input shape, both with the input dtype",
+                    input.dtype,
+                    input.shape,
+                    if *mapped { "mapped" } else { "unmapped" },
+                    bound.dtype,
+                    bound.shape
+                )));
+            }
+        }
+
+        let reachable = callee.reachable_from(outputs)?;
+        let mut remap = HashMap::new();
+        let mut mapped = vec![false; callee.nodes.len()];
+        let mut groups = HashMap::new();
+        for (id, node) in callee.nodes.iter().enumerate() {
+            if !reachable[id] {
+                continue;
+            }
+            let spliced = if let TensorOp::Input { name } = &node.op {
+                let (binding, is_mapped) = *bindings
+                    .get(name)
+                    .ok_or_else(|| format!("inline leaves callee input {name:?} unbound"))?;
+                mapped[id] = is_mapped;
+                binding
+            } else if tensor_op_inputs(&node.op)
+                .iter()
+                .any(|input| mapped[*input])
+            {
+                mapped[id] = true;
+                self.push_batched(callee, node, &remap, &mapped, batch_size)?
+            } else {
+                self.push_spliced(node, &remap, &mut groups)?
+            };
+            remap.insert(id, spliced);
+        }
+        Ok(outputs
+            .iter()
+            .map(|output| (remap[output], mapped[*output]))
+            .collect())
+    }
+
+    /// The callee nodes that `outputs` depend on, by callee node id.
+    fn reachable_from(&self, outputs: &[TensorNodeId]) -> Result<Vec<bool>, String> {
+        let mut reachable = vec![false; self.nodes.len()];
+        let mut pending = outputs.to_vec();
+        while let Some(id) = pending.pop() {
+            let node = self.node(id)?;
+            if !std::mem::replace(&mut reachable[id], true) {
+                pending.extend(tensor_op_inputs(&node.op));
+            }
+        }
+        Ok(reachable)
+    }
+
+    /// Appends a copy of a callee node with its operands remapped; a group id
+    /// becomes the id of the group's first spliced node (see [`Self::inline`]).
+    fn push_spliced(
+        &mut self,
+        node: &TensorNode,
+        remap: &HashMap<TensorNodeId, TensorNodeId>,
+        groups: &mut HashMap<usize, usize>,
+    ) -> Result<TensorNodeId, String> {
+        let mut op = remap_tensor_op(&node.op, remap)?;
+        if let Some(group) = tensor_op_group_mut(&mut op) {
+            *group = *groups.entry(*group).or_insert(self.nodes.len());
+        }
+        Ok(self.push_node(op, node.shape.clone(), node.dtype, node.weak))
+    }
+
+    /// Appends the batched form of a callee node with at least one mapped
+    /// operand (see [`Self::inline_batched`]); the node's dtype and weak
+    /// flag are kept, and its shape gains the leading batch axis.
+    fn push_batched(
+        &mut self,
+        callee: &TensorIr,
+        node: &TensorNode,
+        remap: &HashMap<TensorNodeId, TensorNodeId>,
+        mapped: &[bool],
+        batch_size: usize,
+    ) -> Result<TensorNodeId, BatchingError> {
+        let target = |operand: TensorNodeId| {
+            remap
+                .get(&operand)
+                .copied()
+                .ok_or_else(|| format!("node {operand} is missing from the vmap remap"))
+        };
+        let rank = node.shape.len();
+        let op = match &node.op {
+            TensorOp::Cast { .. }
+            | TensorOp::Tanh { .. }
+            | TensorOp::Exp { .. }
+            | TensorOp::Sqrt { .. }
+            | TensorOp::SqrtDerivative { .. }
+            | TensorOp::Sin { .. }
+            | TensorOp::Cos { .. }
+            | TensorOp::Powi { .. }
+            | TensorOp::Log { .. }
+            | TensorOp::Triangular { .. }
+            | TensorOp::Reshape { .. } => remap_tensor_op(&node.op, remap)?,
+            TensorOp::Add { .. }
+            | TensorOp::Sub { .. }
+            | TensorOp::Div { .. }
+            | TensorOp::Mul { .. }
+            | TensorOp::Greater { .. }
+            | TensorOp::Compare { .. }
+            | TensorOp::Pow { .. }
+            | TensorOp::Where { .. }
+            | TensorOp::Matmul { .. }
+            | TensorOp::Broadcast { .. } => {
+                let mut local = HashMap::new();
+                for operand in tensor_op_inputs(&node.op) {
+                    let spliced = target(operand)?;
+                    let spliced = if mapped[operand] {
+                        self.pad_batched(spliced, rank)?
+                    } else {
+                        spliced
+                    };
+                    local.insert(operand, spliced);
+                }
+                remap_tensor_op(&node.op, &local)?
+            }
+            TensorOp::Sum { input } | TensorOp::Mean { input } => {
+                let count = element_count(&callee.node(*input)?.shape)?;
+                let spliced = target(*input)?;
+                let source = self.node(spliced)?;
+                let (dtype, weak) = (source.dtype, source.weak);
+                let flat = self.push_node(
+                    TensorOp::Reshape { input: spliced },
+                    vec![batch_size, count],
+                    dtype,
+                    weak,
+                );
+                match node.op {
+                    TensorOp::Sum { .. } => TensorOp::SumAxis {
+                        input: flat,
+                        axis: 1,
+                    },
+                    _ => TensorOp::MeanAxis {
+                        input: flat,
+                        axis: 1,
+                    },
+                }
+            }
+            TensorOp::SumAxis { input, axis } => TensorOp::SumAxis {
+                input: target(*input)?,
+                axis: axis + 1,
+            },
+            TensorOp::MeanAxis { input, axis } => TensorOp::MeanAxis {
+                input: target(*input)?,
+                axis: axis + 1,
+            },
+            TensorOp::Transpose { input, axes } => TensorOp::Transpose {
+                input: target(*input)?,
+                axes: std::iter::once(0)
+                    .chain(axes.iter().map(|axis| axis + 1))
+                    .collect(),
+            },
+            TensorOp::Concat { inputs, axis } => {
+                let mut spliced_inputs = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    let spliced = target(*input)?;
+                    spliced_inputs.push(if mapped[*input] {
+                        spliced
+                    } else {
+                        let source = self.node(spliced)?;
+                        let (shape, dtype, weak) = (
+                            batched_shape(batch_size, &source.shape),
+                            source.dtype,
+                            source.weak,
+                        );
+                        self.push_node(TensorOp::Broadcast { input: spliced }, shape, dtype, weak)
+                    });
+                }
+                TensorOp::Concat {
+                    inputs: spliced_inputs,
+                    axis: axis + 1,
+                }
+            }
+            TensorOp::Slice {
+                input,
+                axis,
+                start,
+                length,
+            } => TensorOp::Slice {
+                input: target(*input)?,
+                axis: axis + 1,
+                start: *start,
+                length: *length,
+            },
+            TensorOp::PadSlice { input, axis, start } => TensorOp::PadSlice {
+                input: target(*input)?,
+                axis: axis + 1,
+                start: *start,
+            },
+            TensorOp::Solve { .. }
+            | TensorOp::Cond { .. }
+            | TensorOp::Fori { .. }
+            | TensorOp::ForiJvp { .. }
+            | TensorOp::ForiVjp { .. }
+            | TensorOp::ForiVjpJvp { .. }
+            | TensorOp::Scan { .. }
+            | TensorOp::ScanVjp { .. }
+            | TensorOp::ScanVjpJvp { .. } => {
+                return Err(BatchingError::Unsupported {
+                    op: tensor_op_name(&node.op),
+                })
+            }
+            TensorOp::Input { .. }
+            | TensorOp::ScalarConstant { .. }
+            | TensorOp::Constant { .. } => {
+                return Err(BatchingError::Invalid(format!(
+                    "{} has no operand and cannot depend on a mapped input",
+                    tensor_op_name(&node.op)
+                )))
+            }
+        };
+        Ok(self.push_node(
+            op,
+            batched_shape(batch_size, &node.shape),
+            node.dtype,
+            node.weak,
+        ))
+    }
+
+    /// `node` (mapped, shape `[B, *example]`) with unit axes inserted after
+    /// the batch axis up to example rank `rank`, so that broadcasting against
+    /// an operand of that rank aligns example axes with example axes.
+    fn pad_batched(&mut self, node: TensorNodeId, rank: usize) -> Result<TensorNodeId, String> {
+        let source = self.node(node)?;
+        let example_rank = source.shape.len() - 1;
+        if example_rank >= rank {
+            return Ok(node);
+        }
+        let mut shape = Vec::with_capacity(rank + 1);
+        shape.push(source.shape[0]);
+        shape.extend(std::iter::repeat_n(1, rank - example_rank));
+        shape.extend_from_slice(&source.shape[1..]);
+        let (dtype, weak) = (source.dtype, source.weak);
+        Ok(self.push_node(TensorOp::Reshape { input: node }, shape, dtype, weak))
     }
 
     pub fn symbolic_jvp(
@@ -13276,6 +13597,13 @@ fn cuda_sqrt_derivative_expression(input: &str, order: u32) -> String {
 
 fn sqrt_derivative_coefficient(order: u32) -> f64 {
     (0..order).fold(1.0, |coefficient, index| coefficient * (0.5 - index as f64))
+}
+
+/// `[batch_size, *shape]`: the shape of a mapped node under `vmap`.
+fn batched_shape(batch_size: usize, shape: &[usize]) -> Vec<usize> {
+    std::iter::once(batch_size)
+        .chain(shape.iter().copied())
+        .collect()
 }
 
 fn element_count(shape: &[usize]) -> Result<usize, String> {
