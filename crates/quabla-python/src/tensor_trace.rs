@@ -787,10 +787,12 @@ impl TensorTraceGraph {
     }
 
     /// Splices `outputs` of this staged graph into the graph of the traced
-    /// bindings (see [`TensorIr::inline`]) and returns them as tracers there.
-    /// `bindings[i]` binds input `input_names[i]`; a scalar binding becomes
-    /// a constant of that input's dtype. The tracers of the `tensor_vmap_*`
-    /// helpers are rejected; `quabla.vmap` batches through
+    /// bindings (see [`TensorIr::inline`]) and returns them as tracers there;
+    /// when the bindings come from several traces in progress, that is the
+    /// innermost one, and tracers of the others are lifted into it as
+    /// capture inputs. `bindings[i]` binds input `input_names[i]`; a scalar
+    /// binding becomes a constant of that input's dtype. The tracers of the
+    /// `tensor_vmap_*` helpers are rejected; `quabla.vmap` batches through
     /// [`Self::inline_batched_into`] instead.
     pub fn inline_into(
         &self,
@@ -813,13 +815,19 @@ impl TensorTraceGraph {
                 InlineBinding::Scalar(_) | InlineBinding::Constant(_) => None,
             })
             .collect::<Vec<_>>();
-        let target = traced
-            .first()
-            .map(|tensor| tensor.graph.clone())
-            .ok_or_else(|| "inlining needs at least one traced binding".to_string())?;
-        target.ensure_owns(&traced).map_err(|_| {
-            "the traced arguments of a transformed function belong to different traces".to_string()
-        })?;
+        // Bindings from several traces in progress (explicit arguments of an
+        // inner trace and tracers captured from an outer one) splice into
+        // the innermost of them, where the outer ones become capture inputs;
+        // constant bindings alone splice into the innermost trace in progress.
+        let target = match traced.first() {
+            Some(first) => first.graph.clone(),
+            None => TRACE_FRAMES
+                .with(|frames| frames.borrow().last().map(|frame| frame.graph.clone()))
+                .ok_or_else(|| "inlining needs at least one traced binding".to_string())?,
+        };
+        let traced = TraceTensor::lifted_to_common_graph(&traced)?
+            .unwrap_or_else(|| traced.into_iter().cloned().collect());
+        let target = traced.first().map_or(target, |tensor| tensor.graph.clone());
         if traced.iter().any(|tensor| tensor.batch_axis.is_some()) {
             return Err("a batched (vmap) tracer cannot be bound to an inlined graph".to_string());
         }
@@ -834,10 +842,16 @@ impl TensorTraceGraph {
             .ir
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let mut traced = traced.iter();
         let mut bound = BTreeMap::new();
         for (name, binding) in input_names.iter().zip(bindings) {
             let node_id = match binding {
-                InlineBinding::Traced(tensor) => tensor.node_id,
+                InlineBinding::Traced(_) => {
+                    traced
+                        .next()
+                        .expect("one lifted tracer per traced binding")
+                        .node_id
+                }
                 InlineBinding::Scalar(value) => {
                     let constant = ir.scalar_constant(*value);
                     let dtype = callee.node_dtype(callee.input_node_id(name)?)?;
@@ -1022,6 +1036,195 @@ fn unexpected_executable(requested: QuablaTarget, executable: &QuablaExecutable)
     )
 }
 
+/// Name prefix of the inputs that stand for captured tracers (the
+/// `__quabla_` prefix is reserved, design 3.11).
+const CAPTURE_PREFIX: &str = "__quabla_capture/";
+
+/// The message of a tracer that meets a graph it cannot be lifted into.
+const UNLIFTABLE_TRACER: &str =
+    "a TraceTensor of another trace was combined with this trace, but that trace is not an \
+     enclosing quabla transform that is still tracing: the tracer escaped the function that \
+     created it (through a global, a container, or an attribute) and is used after its trace \
+     ended, or it meets a tensor_* helper or region trace, which cannot capture it; return the \
+     value from the transformed function, or pass it as an argument";
+
+/// A trace of a v0.2 transform in progress (`quabla._transforms._trace`).
+///
+/// A function staged by an inner transform may close over tracers of the
+/// traces that enclose it (`grad(lambda x: f(x, w))` with a traced `w`). Such
+/// a tracer is lifted into the inner graph as an input, recorded here with
+/// its source, so the inner transform treats it as a constant and the
+/// inlined graph binds the input back to the source; outer transforms then
+/// differentiate through it (slice S4b).
+struct TraceFrame {
+    graph: TensorTraceGraph,
+    captures: Vec<CapturedTracer>,
+}
+
+struct CapturedTracer {
+    name: String,
+    source: TraceTensor,
+    input: TraceTensor,
+}
+
+thread_local! {
+    /// The traces in progress on this thread, outermost first. Staging runs
+    /// the user function synchronously on the calling thread, so a trace and
+    /// the traces nested in it share one stack.
+    static TRACE_FRAMES: RefCell<Vec<TraceFrame>> = const { RefCell::new(Vec::new()) };
+}
+
+impl TraceFrame {
+    /// The input of this frame's graph standing for `tensor`, a tracer of an
+    /// enclosing frame; one input per source node.
+    fn capture(&mut self, tensor: &TraceTensor) -> Result<TraceTensor, String> {
+        if let Some(captured) = self.captures.iter().find(|captured| {
+            Arc::ptr_eq(&captured.source.graph.ir, &tensor.graph.ir)
+                && captured.source.node_id == tensor.node_id
+        }) {
+            return Ok(captured.input.clone());
+        }
+        if tensor.batch_axis.is_some() {
+            return Err(
+                "a batched tracer of a tensor_vmap_* helper cannot be captured by a nested \
+                 transform; batch with quabla.vmap instead"
+                    .to_string(),
+            );
+        }
+        let name = format!("{CAPTURE_PREFIX}{}", self.captures.len());
+        let input = self
+            .graph
+            .add_input(&name, tensor.shape.clone(), tensor.dtype()?)?;
+        self.captures.push(CapturedTracer {
+            name,
+            source: tensor.clone(),
+            input: input.clone(),
+        });
+        Ok(input)
+    }
+}
+
+fn frame_position(frames: &[TraceFrame], graph: &TensorTraceGraph) -> Option<usize> {
+    frames
+        .iter()
+        .position(|frame| Arc::ptr_eq(&frame.graph.ir, &graph.ir))
+}
+
+impl TraceTensor {
+    fn shares_graph(tensors: &[&Self]) -> bool {
+        tensors
+            .windows(2)
+            .all(|pair| Arc::ptr_eq(&pair[0].graph.ir, &pair[1].graph.ir))
+    }
+
+    /// Checks that tracers of several graphs can meet: each of their graphs
+    /// is a trace in progress, so the outer ones lift into the innermost.
+    /// Operand extraction calls this to raise `TracerError` for the others.
+    pub(crate) fn ensure_liftable(tensors: &[&Self]) -> Result<(), String> {
+        if Self::shares_graph(tensors) {
+            return Ok(());
+        }
+        TRACE_FRAMES.with(|frames| {
+            let frames = frames.borrow();
+            if tensors
+                .iter()
+                .all(|tensor| frame_position(&frames, &tensor.graph).is_some())
+            {
+                Ok(())
+            } else {
+                Err(UNLIFTABLE_TRACER.to_string())
+            }
+        })
+    }
+
+    /// `tensors` moved into one graph when they come from several traces in
+    /// progress: the innermost of their graphs keeps its tracers, and every
+    /// other tracer becomes a capture input of it (see [`TraceFrame`]).
+    /// `None` when they already share a graph.
+    fn lifted_to_common_graph(tensors: &[&Self]) -> Result<Option<Vec<Self>>, String> {
+        if Self::shares_graph(tensors) {
+            return Ok(None);
+        }
+        TRACE_FRAMES.with(|frames| {
+            let mut frames = frames.borrow_mut();
+            let positions = tensors
+                .iter()
+                .map(|tensor| {
+                    frame_position(&frames, &tensor.graph)
+                        .ok_or_else(|| UNLIFTABLE_TRACER.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let home = positions.iter().copied().max().unwrap_or_default();
+            tensors
+                .iter()
+                .zip(positions)
+                .map(|(tensor, position)| {
+                    if position == home {
+                        Ok((*tensor).clone())
+                    } else {
+                        frames[home].capture(tensor)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some)
+        })
+    }
+}
+
+impl TensorTraceGraph {
+    /// Marks this graph as a trace in progress (see [`TraceFrame`]).
+    pub fn begin_trace(&self) -> Result<(), String> {
+        TRACE_FRAMES.with(|frames| {
+            let mut frames = frames.borrow_mut();
+            if frame_position(&frames, self).is_some() {
+                return Err("this graph is already being traced".to_string());
+            }
+            frames.push(TraceFrame {
+                graph: self.clone(),
+                captures: Vec::new(),
+            });
+            Ok(())
+        })
+    }
+
+    /// Ends the trace of this graph, which must be the innermost one, and
+    /// returns its capture inputs as `(input name, captured tracer)` in
+    /// capture order.
+    pub fn end_trace(&self) -> Result<Vec<(String, TraceTensor)>, String> {
+        TRACE_FRAMES.with(|frames| {
+            let mut frames = frames.borrow_mut();
+            match frames.last() {
+                Some(frame) if Arc::ptr_eq(&frame.graph.ir, &self.ir) => {}
+                _ => return Err("this graph is not the innermost trace in progress".to_string()),
+            }
+            let frame = frames.pop().expect("the innermost frame was just checked");
+            Ok(frame
+                .captures
+                .into_iter()
+                .map(|captured| (captured.name, captured.source))
+                .collect())
+        })
+    }
+
+    /// `tensor` as a tracer of this graph, a trace in progress: itself, or a
+    /// capture input when it belongs to an enclosing trace.
+    pub fn lift(&self, tensor: &TraceTensor) -> Result<TraceTensor, String> {
+        if Arc::ptr_eq(&self.ir, &tensor.graph.ir) {
+            return Ok(tensor.clone());
+        }
+        TRACE_FRAMES.with(|frames| {
+            let mut frames = frames.borrow_mut();
+            match (
+                frame_position(&frames, self),
+                frame_position(&frames, &tensor.graph),
+            ) {
+                (Some(home), Some(source)) if source < home => frames[home].capture(tensor),
+                _ => Err(UNLIFTABLE_TRACER.to_string()),
+            }
+        })
+    }
+}
+
 impl TraceTensor {
     fn from_node(
         graph: TensorTraceGraph,
@@ -1109,8 +1312,8 @@ impl TraceTensor {
         let first = tensors
             .first()
             .ok_or_else(|| "concat requires at least one TraceTensor".to_string())?;
-        for tensor in &tensors[1..] {
-            first.same_graph(tensor)?;
+        if let Some(lifted) = Self::lifted_to_common_graph(&tensors.iter().collect::<Vec<_>>())? {
+            return Self::try_concat(&lifted, axis);
         }
         let batch_axis = Self::merged_batch_axis(&tensors.iter().collect::<Vec<_>>())?;
         let batch_extent = tensors
@@ -1170,7 +1373,9 @@ impl TraceTensor {
     }
 
     fn binary(&self, rhs: &Self, op: &str) -> Result<Self, String> {
-        self.same_graph(rhs)?;
+        if let Some(lifted) = Self::lifted_to_common_graph(&[self, rhs])? {
+            return lifted[0].binary(&lifted[1], op);
+        }
         let mut ir = self
             .graph
             .ir
@@ -1245,7 +1450,13 @@ impl TraceTensor {
     /// `None`, for the caller to try a Python number or raise its `TypeError`.
     pub(crate) fn traced_operand(&self, operand: &Bound<'_, PyAny>) -> Option<PyResult<Self>> {
         if let Ok(tracer) = operand.extract::<PyRef<'_, TraceTensor>>() {
-            return Some(Ok(tracer.clone()));
+            // A tracer of an enclosing trace is lifted when the op is built;
+            // any other tracer of another graph escaped its trace.
+            return Some(
+                Self::ensure_liftable(&[self, &tracer])
+                    .map(|()| tracer.clone())
+                    .map_err(|message| tracer_error(operand.py(), message)),
+            );
         }
         let captured = if let Ok(tensor) = operand.extract::<PyRef<'_, PyTensor>>() {
             self.capture(&tensor)
@@ -1329,7 +1540,9 @@ impl TraceTensor {
     }
 
     fn matmul_tensor(&self, rhs: &Self) -> Result<Self, String> {
-        self.same_graph(rhs)?;
+        if let Some(lifted) = Self::lifted_to_common_graph(&[self, rhs])? {
+            return lifted[0].matmul_tensor(&lifted[1]);
+        }
         let mut ir = self
             .graph
             .ir
@@ -1350,7 +1563,9 @@ impl TraceTensor {
     }
 
     fn solve_tensor(&self, rhs: &Self) -> Result<Self, String> {
-        self.same_graph(rhs)?;
+        if let Some(lifted) = Self::lifted_to_common_graph(&[self, rhs])? {
+            return lifted[0].solve_tensor(&lifted[1]);
+        }
         if self.batch_axis.is_some() || rhs.batch_axis.is_some() {
             return Err("solve does not yet support vmap-batched tensors".to_string());
         }
@@ -1434,8 +1649,9 @@ impl TraceTensor {
     }
 
     pub fn where_tensor(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
-        self.same_graph(on_true)?;
-        self.same_graph(on_false)?;
+        if let Some(lifted) = Self::lifted_to_common_graph(&[self, on_true, on_false])? {
+            return lifted[0].where_tensor(&lifted[1], &lifted[2]);
+        }
         let mut ir = self
             .graph
             .ir
@@ -1487,6 +1703,9 @@ impl TraceTensor {
     }
 
     fn compare_tensor(&self, rhs: &Self, kind: TensorComparison) -> Result<Self, String> {
+        if let Some(lifted) = Self::lifted_to_common_graph(&[self, rhs])? {
+            return lifted[0].compare_tensor(&lifted[1], kind);
+        }
         self.apply(&[rhs], |ir| ir.compare(self.node_id, rhs.node_id, kind))
     }
 
@@ -1498,6 +1717,9 @@ impl TraceTensor {
     }
 
     fn logical_tensor(&self, rhs: &Self, and: bool) -> Result<Self, String> {
+        if let Some(lifted) = Self::lifted_to_common_graph(&[self, rhs])? {
+            return lifted[0].logical_tensor(&lifted[1], and);
+        }
         self.apply(&[rhs], |ir| {
             if and {
                 ir.logical_and(self.node_id, rhs.node_id)
@@ -1745,7 +1967,9 @@ impl TraceTensor {
         updates: &Self,
         axis: isize,
     ) -> Result<Self, String> {
-        self.same_graph(updates)?;
+        if let Some(lifted) = Self::lifted_to_common_graph(&[self, updates])? {
+            return lifted[0].scatter_add_tensor(indices, &lifted[1], axis);
+        }
         let actual_axis = usize::try_from(self.example_axis(axis)?)
             .map_err(|_| "normalized tensor axis is negative".to_string())?;
         if indices.is_empty() {
@@ -2336,6 +2560,7 @@ impl TensorTraceGraph {
     #[pyo3(name = "_inline")]
     fn py_inline(
         &self,
+        py: Python<'_>,
         input_names: Vec<String>,
         bindings: Vec<Bound<'_, PyAny>>,
         outputs: Vec<TraceTensor>,
@@ -2362,8 +2587,47 @@ impl TensorTraceGraph {
                 }
             })
             .collect::<PyResult<Vec<_>>>()?;
+        let traced = bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                InlineBinding::Traced(tensor) => Some(tensor),
+                InlineBinding::Scalar(_) | InlineBinding::Constant(_) => None,
+            })
+            .collect::<Vec<_>>();
+        TraceTensor::ensure_liftable(&traced).map_err(|message| tracer_error(py, message))?;
         self.inline_into(&input_names, &bindings, &outputs)
             .map_err(PyValueError::new_err)
+    }
+
+    /// Marks this graph as a trace in progress of a v0.2 transform, so
+    /// tracers of the traces enclosing it are lifted into it as capture
+    /// inputs (slice S4b); `_end_trace` must follow.
+    #[pyo3(name = "_begin_trace")]
+    fn py_begin_trace(&self) -> PyResult<()> {
+        self.begin_trace().map_err(PyValueError::new_err)
+    }
+
+    /// Ends the innermost trace in progress, this graph, and returns its
+    /// capture inputs as `(input name, captured tracer)` in capture order.
+    #[pyo3(name = "_end_trace")]
+    fn py_end_trace(&self) -> PyResult<Vec<(String, TraceTensor)>> {
+        self.end_trace().map_err(PyValueError::new_err)
+    }
+
+    /// A result of the traced function as a tracer of this graph: a tracer
+    /// of an enclosing trace becomes a capture input, and a tracer of any
+    /// other graph raises `TracerError`.
+    #[pyo3(name = "_lift")]
+    fn py_lift(&self, py: Python<'_>, tensor: TraceTensor) -> PyResult<TraceTensor> {
+        self.lift(&tensor)
+            .map_err(|message| tracer_error(py, message))
+    }
+
+    /// Whether a trace of a v0.2 transform is in progress on this thread.
+    #[staticmethod]
+    #[pyo3(name = "_tracing")]
+    fn py_tracing() -> bool {
+        TRACE_FRAMES.with(|frames| !frames.borrow().is_empty())
     }
 
     /// `inline_batched_into` for `quabla._transforms` (`quabla.vmap`): a

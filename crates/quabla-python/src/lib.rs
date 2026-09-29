@@ -21,18 +21,18 @@ pub use matrix::PyMatrix;
 pub use optim::{sum_gradients, PyAdam};
 pub use tensor::{PyTensor, PyTensorView};
 pub use tensor_trace::{
-    StagedExecutable, TensorBatchCudaJitFunction, TensorBatchCudaValueAndGradFunction,
-    TensorBatchJitFunction, TensorBatchMlxValueAndGradFunction, TensorBatchValueAndGradFunction,
-    TensorCondFunction, TensorCondJvpFunction, TensorCondValueAndGradFunction,
-    TensorCpuExecutionPlan, TensorCudaAdamOptimizer, TensorCudaExecutionPlan,
-    TensorCudaValueAndGradFunction, TensorGradScalarFunction, TensorHessianScalarFunction,
-    TensorHvpScalarFunction, TensorJacobianFunction, TensorJitFunction, TensorJvpFunction,
-    TensorMlxAdamOptimizer, TensorMlxExecutionPlan, TensorMlxValueAndGradFunction,
-    TensorTraceGraph, TensorTraceResult, TensorValueAndGradFunction, TensorVjpFunction,
-    TensorVmapCudaFunction, TensorVmapCudaHvpScalarFunction, TensorVmapCudaJvpFunction,
-    TensorVmapCudaVjpFunction, TensorVmapFunction, TensorVmapHvpScalarFunction,
-    TensorVmapJvpFunction, TensorVmapMlxFunction, TensorVmapMlxJvpFunction,
-    TensorVmapMlxVjpFunction, TensorVmapVjpFunction, TraceTensor,
+    InlineBinding, StagedExecutable, TensorBatchCudaJitFunction,
+    TensorBatchCudaValueAndGradFunction, TensorBatchJitFunction,
+    TensorBatchMlxValueAndGradFunction, TensorBatchValueAndGradFunction, TensorCondFunction,
+    TensorCondJvpFunction, TensorCondValueAndGradFunction, TensorCpuExecutionPlan,
+    TensorCudaAdamOptimizer, TensorCudaExecutionPlan, TensorCudaValueAndGradFunction,
+    TensorGradScalarFunction, TensorHessianScalarFunction, TensorHvpScalarFunction,
+    TensorJacobianFunction, TensorJitFunction, TensorJvpFunction, TensorMlxAdamOptimizer,
+    TensorMlxExecutionPlan, TensorMlxValueAndGradFunction, TensorTraceGraph, TensorTraceResult,
+    TensorValueAndGradFunction, TensorVjpFunction, TensorVmapCudaFunction,
+    TensorVmapCudaHvpScalarFunction, TensorVmapCudaJvpFunction, TensorVmapCudaVjpFunction,
+    TensorVmapFunction, TensorVmapHvpScalarFunction, TensorVmapJvpFunction, TensorVmapMlxFunction,
+    TensorVmapMlxJvpFunction, TensorVmapMlxVjpFunction, TensorVmapVjpFunction, TraceTensor,
 };
 pub use trace::{
     CpuExecutionPlan, GradFunction, GradScalarFunction, GradScalarTransform, IrAttrValue,

@@ -125,8 +125,9 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8)
   static values) and reuses it afterwards; more than `max_traces` signatures
   (8 by default) raise `quabla.RetraceLimitError`. Python scalars are static
   weak constants, so they keep `float32` programs in `float32`, except in
-  differentiated positions, where they become `float64` arrays. Values read
-  from closures are fixed at trace time.
+  differentiated positions, where they become `float64` arrays. Arrays and
+  Python values read from closures are fixed at trace time; tracers of an
+  enclosing trace read from closures are not (see "Closures over tracers").
 - Gradients mirror the pytree of the selected arguments and keep their
   dtypes; `bool_` leaves get `None`. Transforms compose when passed to each
   other directly (`grad(grad(f))`, `jvp(grad(f), (x,), (v,))`,
@@ -199,6 +200,34 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8)
   and fold elementwise ops on them. CUDA uploads each constant once per
   compiled plan, MLX once per constant, and CUDA `fori`/`scan` loop bodies
   reject captured arrays.
+- Closures over tracers: a function passed to a transform inside a traced
+  function may close over tracers of that trace, or of any trace enclosing
+  it, as in JAX:
+
+  ```python
+  def loss(params, x):                                  # x: [n] points
+      u_xx = qb.vmap(qb.grad(qb.grad(lambda t: net(params, t))))
+      return qb.mean((u_xx(x) - forcing(x)) ** 2)
+
+  qb.jit(qb.value_and_grad(loss))(params, x)
+  ```
+
+  The inner transform treats a closed-over tracer as a constant: it
+  differentiates only its explicit arguments, and `vmap` leaves the value
+  unmapped. The enclosing transform differentiates through it, so the
+  gradient above includes the dependence of `u_xx` on `params`; the result
+  equals passing `params` as an unmapped argument
+  (`vmap(grad(grad(net_x)), in_axes=(0, None))(x, params)`). This works for
+  `grad`, `value_and_grad`, `jvp`, `vjp`, `vmap`, `jacobian`, `hessian`,
+  and `jit`, with `has_aux`, with eager arguments of the inner call, next to
+  captured arrays, and across several levels of nesting. A transformed
+  function that captured tracers when it was staged is traced again on
+  each call to find the tracers it captures this time, and reuses its
+  transformed graph while their shapes and dtypes match, so a closure that
+  refers to a different tracer on each call binds the right one. A tracer
+  used after its trace ended (stored in a global or a container and used in
+  a later trace), or inside a `tensor_*` helper or region trace, raises
+  `quabla.TracerError`.
 - `quabla.grad` and `quabla.jit` still accept the legacy 2D forms
   `grad(fn, input_specs, values, output_cotangent)` and `jit(input_specs)`
   and dispatch them to the v0.1 functions below.

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use quabla::{TensorTraceGraph, TraceTensor};
+use quabla::{InlineBinding, TensorTraceGraph, TraceTensor};
 use quabla_core::tensor_ir::{DynamicTensor, SymbolicCotangent, TensorDType};
 
 fn matrix(rows: usize, columns: usize, data: &[f64]) -> Result<DynamicTensor, String> {
@@ -198,5 +198,72 @@ fn inline_batched_reports_unbatchable_ops_as_unsupported() -> Result<(), String>
         .map(|_| ())
         .expect_err("bindings of two traces must be rejected");
     assert!(error.to_string().contains("different traces"), "{error}");
+    Ok(())
+}
+
+/// Closed-over tracers (slice S4b): while an inner trace is in progress, a
+/// tracer of the enclosing trace that meets it becomes one capture input of
+/// the inner graph, and inlining binds that input back to the tracer.
+#[test]
+fn tracers_of_an_enclosing_trace_lift_into_the_inner_trace() -> Result<(), String> {
+    let outer = TensorTraceGraph::new();
+    let w = outer.add_input("w", vec![1, 1], TensorDType::F64)?;
+    outer.begin_trace()?;
+    let inner = TensorTraceGraph::new();
+    let x = inner.add_input("x", vec![1, 1], TensorDType::F64)?;
+    inner.begin_trace()?;
+    // Either operand order lifts `w` into the inner graph, once.
+    let product = x.try_matmul(&w)?.try_matmul(&w.try_matmul(&x)?)?;
+    let returned = inner.lift(&w)?;
+    let error = outer
+        .end_trace()
+        .expect_err("only the innermost trace can end");
+    assert!(error.contains("innermost"), "{error}");
+    let captures = inner.end_trace()?;
+    assert_eq!(captures.len(), 1);
+    assert_eq!(captures[0].0, "__quabla_capture/0");
+
+    // x * w * (w * x) with x = 2 bound as a constant and w from the outer
+    // trace, plus the lifted w returned as is.
+    let spliced = inner.inline_into(
+        &["x".to_string(), captures[0].0.clone()],
+        &[
+            InlineBinding::Constant(matrix(1, 1, &[2.0])?),
+            InlineBinding::Traced(captures[0].1.clone()),
+        ],
+        &[product, returned],
+    )?;
+    outer.end_trace()?;
+    let executable = outer.compile_cpu_many(&spliced, vec!["w".into()])?;
+    let values = executable.execute(vec![matrix(1, 1, &[3.0])?])?;
+    assert_eq!(values[0].data(), &[36.0]);
+    assert_eq!(values[1].data(), &[3.0]);
+    Ok(())
+}
+
+/// A tracer whose trace ended, or one of a graph that is not a trace in
+/// progress, cannot be lifted: the error names the escape.
+#[test]
+fn tracers_of_finished_traces_are_not_lifted() -> Result<(), String> {
+    let finished = TensorTraceGraph::new();
+    let stale = finished.add_input("a", vec![2], TensorDType::F64)?;
+    finished.begin_trace()?;
+    finished.end_trace()?;
+    let current = TensorTraceGraph::new();
+    let x = current.add_input("x", vec![2], TensorDType::F64)?;
+    current.begin_trace()?;
+    let errors = [
+        TraceTensor::try_concat(&[x.clone(), stale.clone()], 0)
+            .map(|_| ())
+            .expect_err("a finished trace's tracer must not be lifted"),
+        current
+            .lift(&stale)
+            .map(|_| ())
+            .expect_err("a finished trace's result must not be lifted"),
+    ];
+    current.end_trace()?;
+    for error in errors {
+        assert!(error.contains("escaped"), "{error}");
+    }
     Ok(())
 }

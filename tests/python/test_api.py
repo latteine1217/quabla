@@ -1819,6 +1819,253 @@ def test_jacobian_and_hessian_are_staged_through_vmap():
     assert_close(qb.jacobian(lambda t: qb.sin(t) * 2.0)(qb.array(0.3)), 2.0 * math.cos(0.3), 1e-15)
 
 
+# -- closures over tracers (slice S4b) --------------------------------------------------
+
+
+def test_closures_over_tracers_of_an_enclosing_trace_are_lifted():
+    # The issue repro: d/dw of (d/dx sin(x w))^2 at x = 0.3.
+    def u(x, w):
+        return qb.sin(x * w)
+
+    def loss(w):
+        u_x = qb.grad(lambda x: u(x, w))  # w is a tracer of the enclosing trace
+        return u_x(0.3) ** 2
+
+    def exact_loss(w):
+        return (w * math.cos(0.3 * w)) ** 2
+
+    def exact_grad(w):
+        c, s = math.cos(0.3 * w), math.sin(0.3 * w)
+        return 2.0 * w * c * (c - 0.3 * w * s)
+
+    def central(function, w, h=1e-6):
+        return (function(w + h) - function(w - h)) / (2.0 * h)
+
+    value, gradient = qb.value_and_grad(loss)(qb.array(1.2))
+    assert_close(value, exact_loss(1.2), 1e-15)
+    assert_close(gradient, exact_grad(1.2), 1e-15)
+    assert_close(gradient, central(exact_loss, 1.2), 1e-8)
+    assert_close(qb.jit(qb.grad(loss))(qb.array(0.7)), exact_grad(0.7), 1e-15)
+
+    # The inner transform differentiates only its explicit argument: jvp,
+    # vjp, jit(grad), jit of a plain function, vmap (the capture is
+    # unmapped), vmap(grad), and hessian closures, each differentiated in w.
+    x0, w0 = 0.3, qb.array(1.2)
+    d_x = math.cos(0.36) - 0.36 * math.sin(0.36)  # d/dw of w cos(x w)
+    assert_close(qb.grad(lambda w: qb.jvp(lambda t: u(t, w), (x0,), (1.0,))[1])(w0), d_x, 1e-15)
+    assert_close(qb.grad(lambda w: qb.vjp(lambda t: u(t, w), x0)[1](1.0)[0])(w0), d_x, 1e-15)
+    assert_close(qb.grad(lambda w: qb.jit(qb.grad(lambda t: u(t, w)))(x0))(w0), d_x, 1e-15)
+    assert_close(qb.grad(lambda w: qb.jit(lambda t: u(t, w))(x0))(w0), 0.3 * math.cos(0.36), 1e-15)
+    points = [0.1, 0.2, 0.3]
+    xs = qb.array(points)
+    assert_close(
+        qb.grad(lambda w: qb.sum(qb.vmap(lambda t: u(t, w))(xs)))(w0),
+        sum(p * math.cos(1.2 * p) for p in points),
+        1e-14,
+    )
+    assert_close(
+        qb.grad(lambda w: qb.sum(qb.vmap(qb.grad(lambda t: u(t, w)))(xs)))(w0),
+        sum(math.cos(1.2 * p) - 1.2 * p * math.sin(1.2 * p) for p in points),
+        1e-14,
+    )
+    vs = [0.4, -0.2]
+    assert_close(
+        qb.grad(lambda w: qb.sum(qb.hessian(lambda v: qb.sum(qb.sin(v * w)))(qb.array(vs))))(w0),
+        sum(-2.4 * math.sin(1.2 * v) - 1.44 * v * math.cos(1.2 * v) for v in vs),
+        1e-14,
+    )
+    # has_aux returning the captured tracer itself, and a captured tracer
+    # next to a captured eager constant (S3b).
+    def aux_loss(w):
+        derivative, aux = qb.grad(lambda t: (u(t, w), w * 2.0), has_aux=True)(x0)
+        return derivative + aux
+
+    assert_close(qb.grad(aux_loss)(w0), d_x + 2.0, 1e-15)
+    c = qb.array(0.7)
+    assert_close(
+        qb.grad(lambda w: qb.grad(lambda t: qb.sin(t * w * c))(x0))(w0),
+        0.7 * math.cos(0.252) - 0.3 * 1.2 * 0.49 * math.sin(0.252),
+        1e-15,
+    )
+
+
+def test_closures_capture_several_tracers_from_several_levels():
+    # The innermost function captures y from the enclosing trace and w from
+    # two levels up; both are constants for d/dx and differentiated outside.
+    def outer(w):
+        def middle(y):
+            return qb.grad(lambda x: qb.sin(x * y * w))(0.3) * y
+
+        return qb.grad(middle)(0.5)
+
+    def exact(w, y=0.5):
+        a = 0.3 * y * w
+        return 2.0 * y * w * math.cos(a) - 0.3 * y**2 * w**2 * math.sin(a)
+
+    h = 1e-6
+    assert_close(outer(qb.array(1.2)), exact(1.2), 1e-15)
+    value, gradient = qb.value_and_grad(outer)(qb.array(1.2))
+    assert_close(value, exact(1.2), 1e-15)
+    assert_close(gradient, (exact(1.2 + h) - exact(1.2 - h)) / (2.0 * h), 1e-8)
+
+
+def test_captured_tracers_rebind_on_every_call_of_a_cached_closure():
+    from quabla import _transforms
+
+    # A function whose closure refers to a different tracer on each call:
+    # the staged graph is reused, but its capture input binds to the tracer
+    # of this call, never to the one it was staged with.
+    box = {}
+
+    def inner(x):
+        return qb.sum(qb.sin(x * box["w"]))
+
+    g = qb.grad(inner)
+
+    def loss(w):
+        box["w"] = w
+        first = g(0.3)
+        box["w"] = w * 2.0
+        return first + 3.0 * g(0.3)
+
+    def exact(w):
+        return w * math.cos(0.3 * w) + 6.0 * w * math.cos(0.6 * w)
+
+    h = 1e-6
+    for w in [1.2, 0.7]:  # two outer traces through two outer transforms
+        value, gradient = qb.value_and_grad(loss)(qb.array(w))
+        assert_close(value, exact(w), 1e-14)
+        assert_close(gradient, (exact(w + h) - exact(w - h)) / (2.0 * h), 1e-8)
+        assert_close(qb.jit(loss)(qb.array(w)), exact(w), 1e-14)
+    # One staged graph serves all six calls in the four outer traces.
+    inline_cache = _transforms._CACHES[inner][(("grad", 0, False), _transforms._INLINED)]
+    assert len(inline_cache.entries) == 1
+    # A capture of another shape is another entry; its signature says so.
+    vector = qb.jit(lambda w: (box.__setitem__("w", w), g(0.3))[1])(qb.array([0.5, 1.0]))
+    assert_close(vector, 0.5 * math.cos(0.15) + math.cos(0.3), 1e-15)
+    assert len(inline_cache.entries) == 2
+    rendered = [_transforms._describe_signature(key) for key in inline_cache.entries]
+    assert rendered == [
+        "(float64[],) capturing [float64[]]",
+        "(float64[],) capturing [float64[2]]",
+    ]
+
+    # A call that captures nothing this time (the closure now holds an eager
+    # array, a constant) is inlined with constants only, and stays exact.
+    def mixed_loss(w):
+        box["w"] = w
+        first = g(0.3)
+        box["w"] = qb.array(2.0)
+        return first + g(0.3)
+
+    value, gradient = qb.value_and_grad(mixed_loss)(qb.array(1.2))
+    assert_close(value, 1.2 * math.cos(0.36) + 2.0 * math.cos(0.6), 1e-14)
+    assert_close(gradient, math.cos(0.36) - 0.36 * math.sin(0.36), 1e-14)
+    assert len(inline_cache.entries) == 3
+
+    # A closure applied in a loop inside one trace is staged once.
+    traces = []
+
+    def u(x, w):
+        traces.append(1)
+        return qb.sin(x * w)
+
+    def loop_loss(w, x):
+        u_x = qb.grad(lambda t: u(t, w))
+        return u_x(x[0]) + u_x(x[1]) + u_x(x[2])
+
+    xs = qb.array([0.1, 0.2, 0.3])
+    assert_close(
+        qb.jit(loop_loss)(qb.array(1.5), xs),
+        sum(1.5 * math.cos(1.5 * p) for p in [0.1, 0.2, 0.3]),
+        1e-14,
+    )
+    # The first call stages the closure; each later call only traces it
+    # again to find the tracers it captures, and reuses the staged graph.
+    assert len(traces) == 3
+
+
+def jax_style_net(params, x):  # scalar x
+    hidden = qb.tanh(params["w1"] * x + params["b1"])
+    return qb.sum(params["w2"] * hidden) + params["b2"]
+
+
+def test_jax_style_pinn_closing_over_params_matches_explicit_arguments():
+    xs = qb.linspace(0.05, 0.95, PINN_POINTS)
+    forcing = math.pi**2 * qb.sin(math.pi * xs)  # an eager constant, captured
+
+    def closure_loss(params):
+        # The common JAX form: params closed over, per-point vmap(grad(grad)).
+        u_xx = qb.vmap(qb.grad(qb.grad(lambda x: jax_style_net(params, x))))
+        boundary = jax_style_net(params, 0.0) ** 2 + jax_style_net(params, 1.0) ** 2
+        return qb.mean((u_xx(xs) + forcing) ** 2) + boundary
+
+    explicit_u_xx = qb.vmap(
+        qb.grad(qb.grad(lambda x, p: jax_style_net(p, x))), in_axes=(0, None)
+    )
+
+    def explicit_loss(params):  # the S4 form: params as an unmapped argument
+        boundary = jax_style_net(params, 0.0) ** 2 + jax_style_net(params, 1.0) ** 2
+        return qb.mean((explicit_u_xx(xs, params) + forcing) ** 2) + boundary
+
+    width = 6
+    params = {
+        "w1": qb.array([0.9 * math.sin(i + 1.0) for i in range(width)]),
+        "b1": qb.array([0.3 * math.cos(i + 2.0) for i in range(width)]),
+        "w2": qb.array([0.7 * math.sin(2.0 * i + 0.5) for i in range(width)]),
+        "b2": qb.array(0.1),
+    }
+    closure_step = qb.jit(qb.value_and_grad(closure_loss))
+    explicit_step = qb.jit(qb.value_and_grad(explicit_loss))
+    # Finite differences of one parameter element at the initial point.
+    h = 1e-6
+    w1 = params["w1"].tolist()
+    plus = dict(params, w1=qb.array([w1[0] + h] + w1[1:]))
+    minus = dict(params, w1=qb.array([w1[0] - h] + w1[1:]))
+    fd = (qb.jit(closure_loss)(plus).item() - qb.jit(closure_loss)(minus).item()) / (2.0 * h)
+    assert_close(closure_step(params)[1]["w1"][0], fd, 1e-6)
+
+    closure_params, explicit_params = params, params
+    closure_adam, explicit_adam = qb.Adam(learning_rate=0.01), qb.Adam(learning_rate=0.01)
+    losses = []
+    for _ in range(5):
+        value, grads = closure_step(closure_params)
+        explicit_value, explicit_grads = explicit_step(explicit_params)
+        assert_close(value, explicit_value, 1e-12)
+        for name in params:
+            assert_close(grads[name], explicit_grads[name], 1e-12)
+        losses.append(value.item())
+        closure_params = closure_adam.step(closure_params, grads)
+        explicit_params = explicit_adam.step(explicit_params, explicit_grads)
+    assert losses[-1] < losses[0], losses
+
+
+def test_escaped_tracers_raise_tracer_error_instead_of_mixing_graphs():
+    leaked = []
+    x = qb.array([1.0, 2.0])
+    qb.jit(lambda t: leaked.append(t) or t)(x)
+    # A tracer used after its trace ended, in either operand position, in a
+    # module function, or returned from a later trace.
+    for function in [
+        lambda t: t * leaked[0],
+        lambda t: leaked[0] + t,
+        lambda t: qb.where(t > 0.0, leaked[0], t),
+        lambda t: leaked[0] * 2.0,
+    ]:
+        error = assert_raises(qb.TracerError, qb.jit(function), x, match="escaped")
+        assert isinstance(error, TypeError)
+    assert_raises(qb.TracerError, qb.grad(lambda t: qb.sum(qb.sin(t) + leaked[0])), x)
+    # The trace of a v0.1 helper is not an enclosing transform: its tracers
+    # cannot be captured by a v0.2 transform inside it.
+    assert_raises(
+        qb.TracerError,
+        qb.tensor_jit_fn,
+        lambda a: qb.grad(lambda y: y * a)(1.0),
+        [("a", [])],
+        match="tensor_* helper",
+    )
+
+
 if __name__ == "__main__":
     # Run every test_* function in definition order so new tests cannot be left out of a manual list
     for name, test in list(globals().items()):

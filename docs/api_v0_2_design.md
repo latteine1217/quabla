@@ -650,6 +650,7 @@ The gates are those under "Development Gates" (`CONTRIBUTING.md:18-35`), with
 | **S3 Composition** | `TensorIr::inline` + bridge binding; nested transforms; README PINN example | **core** | `core/tensor_ir.rs`, `py/tensor_trace.rs`, `python/quabla/_transforms.py` | Rust tests for inline, including `Cond`/`Fori`/`Scan` regions; `grad(grad)` vs exact; README example reproduces `w = 3.141593`. Landed as described in "S3 as landed" below | shared-subexpression duplication after inlining (freeze already commons pure nodes, `docs/api.md:352-353`) |
 | **S3b Constant capture** | eager arrays that meet a tracer become `TensorOp::Constant` graph nodes: closures over arrays, eager operands of traced ops and module functions, and eager arguments, tangents, and cotangents of inlined calls | **core** + bridge | `core/tensor_ir.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/tensor.rs`, `py/tensor_trace.rs`, `py/lib.rs`, `python/quabla/_transforms.py` | Rust tests for evaluation, dtype, folding, CSE, AD, inline, and lowering text; MLX parity; CUDA parity with an upload count; the issue repros, including the PINN with eager forcing terms reproducing `w = 3.141593`. Landed as described in "S3b as landed" below | graph and plan size grow with captured data; CUDA device loops reject captured arrays in their bodies |
 | **S4 vmap** | `vmap(in_axes, out_axes)` over pytrees; `vmap(grad)`; rejection of unmapped per-example gradients and nested vmap | **core** (`inline_batched`) + bridge | `core/tensor_ir.rs`, `py/tensor_trace.rs`, `py/errors.rs`, `python/quabla/_transforms.py` | parity with `tensor_vmap_{,jvp_,vjp_,hvp_scalar_}fn`. Landed as described in "S4 as landed" below | `out_axes` pytrees vs the single `out_axis` today |
+| **S4b Closed-over tracers** | a function staged by an inner transform may close over tracers of enclosing traces: they are lifted into its graph as capture inputs, constant for the inner transform and bound back when it is inlined; unliftable foreign tracers raise `TracerError` | bridge | `py/tensor_trace.rs`, `py/lib.rs`, `python/quabla/_transforms.py` | the issue repro against the analytic derivative and central differences; jvp/vjp/vmap/jit/jacobian/hessian closures; two-level capture; rebinding of a cached closure; a JAX-style MLP PINN equal to the explicit-argument S4 form; Rust tests for lifting and escapes. Landed as described in "S4b as landed" below | a closure that captured tracers is traced again on every call to find its captures |
 | **S5 Devices and errors** | `jit(device=...)`, `"cuda:N"`, `devices()`, `lower()`/`ShapeDtype`, error hierarchy, typed lowering rejections, eager MLX validation, `float64`-on-device warning | **core** (errors, MLX validation) | `core/compiler.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/compiler.rs` | `QUABLA_MLX_TEST=1` suite on macOS; `QUABLA_CUDA_TEST=1` on the CUDA host; unbuilt-target error test in CI | MLX lock discipline for new entrypoints (`core/tensor_ir/mlx.rs:43`) |
 | **S6 Optim and Trainer** | `optim.Adam`/`SGD` (pure), `Trainer` on CPU/MLX/CUDA; `quabla.Adam` alias | none | `python/quabla/optim.py` | `benchmark_pinn_mlx.py` and `benchmark_pinn_cuda.py` with old and new APIs on the same host: step time within 2%; convergence parity with `examples/pinn_poisson_mlx.py` | parameter naming mismatches between pytree paths and the factories' name lists |
 | **S7 Control flow** | `cond`, `fori_loop`, `scan` wrappers and the capture error | bridge (error text) | `python/quabla/_control.py`, `py/tensor_trace.rs:4407-4960` | parity with the region tests; CUDA elementwise loop VJP/HVP on the CUDA host | JAX argument order (`scan` body gets `(carry, i)`) |
@@ -943,7 +944,84 @@ with batched tracers:
   has not been exercised. A function passed to a transform that closes over
   a tracer of the enclosing trace (for example `jvp(lambda t: f(t, w), ...)`
   inside a traced function with a traced `w`) still fails with "different
-  graphs": pass such values as arguments.
+  graphs": pass such values as arguments (superseded by S4b below).
+
+**S4b as landed.** Closures over tracers of enclosing traces, the common
+JAX idiom (`grad(lambda x: net(params, x))`, `jvp(lambda t: f(t, w), ...)`,
+`vmap(lambda x: f(x, params))`), added as its own slice after S4. Only the
+bridge and the Python layer change; the core is untouched.
+
+- **Mechanism.** `_trace` registers its graph as a trace in progress with
+  the bridge (`_begin_trace`/`_end_trace`, a thread-local stack of frames,
+  outermost first) while the user function runs. When an op meets tracers
+  of several graphs that are all traces in progress, the bridge keeps the
+  innermost of those graphs and lifts each other tracer into it as a new
+  strong input `__quabla_capture/N` of the tracer's shape and dtype, one
+  per source node, recording the source in the frame. Results of the
+  function that are tracers of an enclosing trace are lifted the same way
+  (`_lift`), and so are the traced bindings of an inline splice that come
+  from several traces. Ending the trace returns the captures, which follow
+  the argument inputs of the staged graph (`_Staged.captures`), and every
+  transform carries them along: `grad`/`value_and_grad` and `vjp`
+  differentiate only the argument inputs, `jvp` gives the capture inputs no
+  tangent, and `vmap` and `jacobian`/`hessian` add them to their own graphs
+  as unmapped inputs. Inlining binds each capture input back to its source
+  tracer, so the enclosing transform differentiates through it, as JAX
+  treats a closed-over value as a constant of the inner transform.
+- **Levels.** A tracer captured from two levels up is lifted directly into
+  the innermost graph. When that graph is inlined into the middle trace,
+  the binding is a tracer of the outer trace, which the splice lifts into
+  the middle graph in turn, so each level binds its own capture inputs.
+  A value computed only from outer tracers inside an inner function stays
+  in the outer graph and is lifted when it meets an inner tracer; both are
+  exact, since it is constant for the inner arguments.
+- **Eager arguments.** A transformed function called with eager arguments
+  inside a trace (`u_x(0.3)` in the issue repro) still compiles a program
+  when it captures nothing. If its staging captured tracers, it is not
+  compiled: the staged graphs move to the inline cache and the call is
+  inlined into the enclosing trace instead (`jit` of a plain function
+  traces through it); later calls with that signature inside a trace go
+  there directly.
+- **Caching.** A staged graph that captured nothing is cached per argument
+  signature as before, with no extra work per call. One that captured
+  tracers is keyed by the signature plus the shapes and dtypes of the
+  captures, and the cache records a probe: every later call traces the
+  root function again, with the same argument avals, only to find the
+  tracers this call captures (a closure can refer to a different tracer
+  each time, for example a rebound name or a mutated container), then
+  reuses the transformed graph when their avals match, or stages a new one
+  when they do not; the splice binds the capture inputs to this call's
+  tracers. Cached graphs keep no tracers, and the probe holds the root
+  function weakly, so the cache keeps no finished trace alive. A closure
+  applied in a loop inside one trace is transformed once; a call that now
+  captures nothing (the closure holds an eager array instead) is inlined
+  with constant bindings only, into the innermost trace in progress. The
+  assumption is the one every trace cache makes: the function builds the
+  same graph for the same signature.
+- **Errors.** A tracer whose graph is not a trace in progress, one that
+  escaped its trace through a global or a container and is used in a later
+  trace or returned from it, now raises `TracerError` naming the escape
+  instead of the `ValueError` "cannot combine TraceTensor values from
+  different graphs"; this includes a v0.2 transform inside a `tensor_*`
+  helper trace, or a region body, closing over that trace's tracers, whose
+  graphs are not registered frames. The operand extraction of the tracer
+  methods and module functions and the inline splice check this before
+  building the op. Batched tracers of the `tensor_vmap_*` helpers are not
+  captured.
+- **Correctness.** The issue repro, `grad` in `w` of
+  `(d/dx sin(x w))^2` at `x = 0.3`, `w = 1.2`, gives `1.8173126966773974`
+  against the analytic `1.8173126966773971` (central differences
+  `1.81731269655`). `jvp`, `vjp`, `jit(grad)`, `jit` of a plain function,
+  `vmap`, `vmap(grad)`, `hessian`, and `has_aux` closures, a capture next to
+  a captured eager constant, and a two-level capture (`w` from two levels
+  up and `y` from one) match their analytic derivatives within `1e-14` and
+  central differences within `1e-8`. A JAX-style MLP PINN with the
+  parameter dict closed over and `vmap(grad(grad(lambda x: net(params,
+  x))))` trained 5 Adam steps with `jit(value_and_grad)` gives losses and
+  gradients bitwise equal to the explicit-argument S4 form
+  `vmap(grad(grad(...)), in_axes=(0, None))`. For the README problem both
+  forms stage the same graph and plan (92 / 42 nodes) and take the same
+  step time (5.3 µs against 5.4 µs, `timeit` minimum, Apple silicon).
 
 ## 7. Resolved Questions
 

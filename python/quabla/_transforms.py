@@ -1,5 +1,5 @@
 """Composable function transforms on the CPU (docs/api_v0_2_design.md,
-sections 3.3-3.5 and 3.11, decisions D5-D8 and D16-D17; slices S2-S4).
+sections 3.3-3.5 and 3.11, decisions D5-D8 and D16-D17; slices S2-S4b).
 
 Every transform is staged, as `jit` is: the first call with a new argument
 signature traces the function into a Tensor IR graph, applies the symbolic
@@ -33,6 +33,18 @@ instead, which is exact. `vmap` stages its function for one example and
 splices that graph batched into its own (`TensorIr::inline_batched`, slice
 S4), so it composes the same way; `jacobian` and `hessian` are forward mode
 vectorized with it over the input elements, so they compose as well.
+
+A function staged inside another trace may close over that trace's tracers
+(`grad(lambda x: net(params, x))` with traced `params`, slice S4b). Each
+trace in progress is registered with the bridge, which lifts such a tracer
+into the inner graph as an implicit input (`__quabla_capture/N`) when an op
+first meets it. The inner transform treats the input as a constant, as JAX
+treats closed-over values, and inlining binds it back to the captured
+tracer, so outer transforms differentiate through it. Since a closure can
+refer to a different tracer on every call, a staged graph that captured
+tracers is reused only after tracing its function again to find the
+tracers of this call, which must have the shapes and dtypes it was staged
+with.
 """
 
 import inspect
@@ -228,18 +240,25 @@ def _traced_signature(args, static_argnums, converted_argnums):
 
 
 def _describe_signature(key):
+    if type(key) is _CaptureKey:
+        key, avals = key
+        captured = ", ".join(_describe_aval(shape, dtype) for shape, dtype in avals)
+        return f"{_describe_signature(key)} capturing [{captured}]"
     in_node, parts = key
     rendered = []
     for part in parts:
         if part[0] is _Static:
             rendered.append(_Text(f"static {part[1]!r}"))
         elif isinstance(part[0], tuple):
-            shape = ",".join(str(extent) for extent in part[0])
-            rendered.append(_Text(f"{part[1].name}[{shape}]"))
+            rendered.append(_Text(_describe_aval(part[0], part[1])))
         else:
             value = float.fromhex(part[1]) if part[0] is float else part[1]
             rendered.append(_Text(repr(value)))
     return repr(_unflatten(in_node, iter(rendered)))
+
+
+def _describe_aval(shape, dtype):
+    return f"{dtype.name}[{','.join(str(extent) for extent in shape)}]"
 
 
 def _argument_ranges(in_node):
@@ -291,15 +310,55 @@ def _leaf_names(fun, in_node):
 class _Staged:
     """A traced and possibly transformed program: `graph` takes the array
     leaves of the arguments as inputs named `input_names`, and `outputs` are
-    the flat result leaves, each a tracer of `graph` or a constant."""
+    the flat result leaves, each a tracer of `graph` or a constant.
 
-    __slots__ = ("graph", "input_names", "outputs", "out_node")
+    `captures` holds the tracers of enclosing traces that the function
+    closed over, one per capture input; those inputs follow the argument
+    inputs in `input_names` (the tangent and cotangent inputs of `jvp` and
+    `vjp` graphs come after them). `probe` finds the captures of a later
+    call (see `_Transform._inline_staged`), or is `None` without captures.
+    A staged graph kept in an inline cache has `captures` set to `None`.
+    """
 
-    def __init__(self, graph, input_names, outputs, out_node):
+    __slots__ = ("graph", "input_names", "outputs", "out_node", "captures", "probe")
+
+    def __init__(self, graph, input_names, outputs, out_node, captures=(), probe=None):
         self.graph = graph
         self.input_names = input_names
         self.outputs = outputs
         self.out_node = out_node
+        self.captures = captures
+        self.probe = probe
+
+
+def _capture_names(staged):
+    """The capture input names of a staged function (not of a `jvp`/`vjp`
+    graph, whose tangent or cotangent inputs follow them)."""
+    return staged.input_names[len(staged.input_names) - len(staged.captures) :]
+
+
+class _Probe:
+    """Traces the root function of a staged graph that captured tracers
+    again, with the same argument avals, to find the tracers that a new call
+    captures. The function is held weakly where possible, since the caches
+    holding the probe are keyed weakly on it."""
+
+    __slots__ = ("fun", "in_node", "leaves", "names")
+
+    def __init__(self, fun, in_node, leaves, names):
+        try:
+            self.fun = weakref.ref(fun)
+        except TypeError:
+            self.fun = lambda: fun
+        self.in_node = in_node
+        self.leaves = [
+            _Aval(leaf.shape, leaf.dtype) if type(leaf) in _ARRAY_LEAVES else leaf
+            for leaf in leaves
+        ]
+        self.names = names
+
+    def captures(self):
+        return _trace(self.fun(), self.in_node, self.leaves, self.names).captures
 
 
 def _trace(fun, in_node, leaves, names):
@@ -315,10 +374,26 @@ def _trace(fun, in_node, leaves, names):
             values.append(leaf.value)
         else:
             values.append(leaf)
-    result = fun(*_unflatten(in_node, iter(values)))
-    outputs = []
-    out_node = _flatten(result, outputs)
-    return _Staged(graph, input_names, outputs, out_node)
+    # While `fun` runs, tracers of enclosing traces that meet this graph are
+    # lifted into it as capture inputs (see the module notes).
+    graph._begin_trace()
+    try:
+        result = fun(*_unflatten(in_node, iter(values)))
+        outputs = []
+        out_node = _flatten(result, outputs)
+        outputs = [graph._lift(output) if _is_traced(output) else output for output in outputs]
+    finally:
+        captured = graph._end_trace()
+    if not captured:
+        return _Staged(graph, input_names, outputs, out_node)
+    return _Staged(
+        graph,
+        input_names + [name for name, _ in captured],
+        outputs,
+        out_node,
+        [source for _, source in captured],
+        _Probe(fun, in_node, leaves, names),
+    )
 
 
 def _stage(fun, in_node, leaves, names):
@@ -395,33 +470,79 @@ class _Const:
         self.value = value
 
 
+class _CapturedTracers(Exception):
+    """Raised instead of compiling a staged function that captured tracers
+    of an enclosing trace: a call with eager arguments inside a trace, which
+    is inlined into that trace instead. `value` holds the staged graphs."""
+
+    def __init__(self, value):
+        super().__init__("the staged function captured tracers of an enclosing trace")
+        self.value = value
+
+
+def _compilable(value):
+    """Staged graphs for compilation (a tuple led by the `_Staged` that
+    holds the captures), which needs a graph without captures."""
+    if value[0].captures:
+        raise _CapturedTracers(value)
+    return value
+
+
 # -- trace caches ----------------------------------------------------------------
 
 
-class _TraceCache:
-    """Compiled programs of one transformed function keyed by signature."""
+class _CaptureKey(tuple):
+    """`(signature key, capture avals)`: the key of a staged graph that
+    captured tracers of shapes and dtypes `capture avals`."""
 
-    __slots__ = ("entries", "max_traces")
+
+class _TraceCache:
+    """Compiled programs (or staged graphs) of one transformed function
+    keyed by signature. `probes` maps the signature of a staged function
+    that captured tracers to its `_Probe`; such graphs are keyed by
+    `_CaptureKey`."""
+
+    __slots__ = ("entries", "max_traces", "probes")
 
     def __init__(self, max_traces):
         self.entries = {}
         self.max_traces = max_traces
+        self.probes = {}
 
     def lookup(self, key, build, transform):
         entry = self.entries.get(key)
         if entry is None:
-            if len(self.entries) >= self.max_traces:
-                cached = "\n".join(f"  {_describe_signature(k)}" for k in self.entries)
-                raise RetraceLimitError(
-                    f"{transform!r} exceeded max_traces={self.max_traces}; cached signatures:\n"
-                    f"{cached}\nnew signature:\n  {_describe_signature(key)}\n"
-                    "Python scalar arguments are static and part of the signature: pass "
-                    "quabla.array(value, dtype=...) to vary one without retracing, or raise "
-                    "max_traces with quabla.jit"
-                )
+            self.ensure_room(key, transform)
             entry = build()
             self.entries[key] = entry
         return entry
+
+    def store_staged(self, key, value, transform):
+        """Caches the staged graphs `value` of a call with signature `key`
+        for inlining (see `_Transform._inline_staged`) and returns the
+        tracers they captured."""
+        captures = value[0].captures
+        if captures:
+            self.probes[key] = value[0].probe
+        if key in self.probes:
+            key = _CaptureKey((key, _avals(captures)))
+        self.ensure_room(key, transform)
+        for staged in value:
+            if type(staged) is _Staged:
+                staged.captures = None  # the cache must not keep old traces alive
+        self.entries[key] = value
+        return list(captures)
+
+    def ensure_room(self, key, transform):
+        if len(self.entries) >= self.max_traces:
+            cached = "\n".join(f"  {_describe_signature(k)}" for k in self.entries)
+            raise RetraceLimitError(
+                f"{transform!r} exceeded max_traces={self.max_traces}; cached signatures:\n"
+                f"{cached}\nnew signature:\n  {_describe_signature(key)}\n"
+                "Python scalar arguments are static and part of the signature: pass "
+                "quabla.array(value, dtype=...) to vary one without retracing, or raise "
+                "max_traces with quabla.jit"
+            )
 
 
 # Trace caches by root Python function, then by transform chain, so that
@@ -501,16 +622,33 @@ class _Transform:
     def _names(self, in_node):
         return _leaf_names(self._root, in_node)
 
+    def _inlines(self, key):
+        """Whether a call with eager arguments and signature `key` must be
+        inlined into the enclosing trace instead of compiled: it runs inside
+        a trace and its function captured tracers when it was staged."""
+        return key in self._inline_cache().probes and TensorTraceGraph._tracing()
+
+    def _compiled(self, key, compile):
+        """The compiled program for `key`, or `None` when the function
+        captured tracers of an enclosing trace, which requires inlining."""
+        try:
+            return self._trace_cache().lookup(key, compile, self)
+        except _CapturedTracers as captured:
+            self._inline_cache().store_staged(key, captured.value, self)
+            return None
+
     def __call__(self, *args):
         converted = self._converted_positions(len(args))
         in_node, leaves, arrays, key, traced = _signature(args, (), converted)
-        if traced:
+        if traced or self._inlines(key):
             return self._call_traced(args, (), converted)
-        program = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
+        program = self._compiled(key, lambda: self._compile(in_node, leaves))
+        if program is None:
+            return self._call_traced(args, (), converted)
         return program.run(arrays)
 
     def _compile(self, in_node, leaves):
-        staged = self._stage(in_node, leaves, self._names(in_node))
+        (staged,) = _compilable((self._stage(in_node, leaves, self._names(in_node)),))
         return _Program(staged.graph, staged.input_names, staged.outputs, staged.out_node)
 
     def _call_traced(self, args, static_argnums, converted_argnums):
@@ -519,10 +657,36 @@ class _Transform:
         in_node, leaves, key, bindings = _traced_signature(
             args, static_argnums, converted_argnums
         )
-        staged = self._inline_cache().lookup(
-            key, lambda: self._stage(in_node, leaves, self._names(in_node)), self
+        (staged,), captures = self._inline_staged(
+            key, lambda: (self._stage(in_node, leaves, self._names(in_node)),)
         )
-        return _splice(staged, bindings)
+        return _splice(staged, bindings + captures)
+
+    def _inline_staged(self, key, stage):
+        """The staged graphs of a call on tracers with signature `key`, from
+        the inline cache or `stage()`, which returns a tuple of them led by
+        the `_Staged` that holds the captures; and the tracers of enclosing
+        traces that this call captures, to bind after its argument inputs.
+
+        A function that captured nothing is staged once per signature. One
+        that captured tracers is traced again on every call to find the
+        tracers it captures now (a closure may refer to a different tracer
+        each time); the transformed graph is reused when their shapes and
+        dtypes match those it was staged with, and inlining binds it to them.
+        """
+        cache = self._inline_cache()
+        probe = cache.probes.get(key)
+        if probe is None:
+            value = cache.entries.get(key)
+            if value is not None:
+                return value, []
+        else:
+            captures = probe.captures()
+            value = cache.entries.get(_CaptureKey((key, _avals(captures))))
+            if value is not None:
+                return value, captures
+        value = stage()
+        return value, cache.store_staged(key, value, self)
 
     def __repr__(self):
         name = getattr(self._root, "__qualname__", None) or repr(self._root)
@@ -579,6 +743,10 @@ def _stage_value_and_grad(staged, in_node, leaves, names, argnums, has_aux, what
     return graph, value, value_node, aux, aux_node, grad_leaves, grads_node
 
 
+def _avals(tracers):
+    return tuple((tuple(tracer.shape), tracer.dtype) for tracer in tracers)
+
+
 class _Tuple(tuple):
     """`argnums` given as a tuple, so a one-element tuple keeps its tuple
     structure in the result (`argnums=(0,)` gives `(grad,)`)."""
@@ -622,7 +790,7 @@ class _ValueAndGrad(_Transform):
         else:
             outputs = grad_leaves
             out_node = grads_node
-        return _Staged(graph, staged.input_names, outputs, out_node)
+        return _Staged(graph, staged.input_names, outputs, out_node, staged.captures, staged.probe)
 
 
 class _Jit(_Transform):
@@ -654,13 +822,14 @@ class _Jit(_Transform):
         statics = self._statics(count) if self._static_argnums else ()
         converted = self._converted_positions(count)
         in_node, leaves, arrays, key, traced = _signature(args, statics, converted)
-        if traced:
-            if isinstance(self._fun, _Transform):
-                return self._call_traced(args, statics, converted)
-            # Inside another trace, tracing through a plain function inlines it.
-            return self._fun(*args)
-        program = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
-        return program.run(arrays)
+        if not (traced or self._inlines(key)):
+            program = self._compiled(key, lambda: self._compile(in_node, leaves))
+            if program is not None:
+                return program.run(arrays)
+        if isinstance(self._fun, _Transform):
+            return self._call_traced(args, statics, converted)
+        # Inside another trace, tracing through a plain function inlines it.
+        return self._fun(*args)
 
 
 def _check_device(device):
@@ -727,9 +896,11 @@ class _Jvp(_Transform):
         in_node, leaves, arrays, key, traced = _signature(primals, (), converted)
         tangent_leaves = []
         tangent_node = _flatten(tuple(tangents), tangent_leaves)
-        if traced or any(_is_traced(tangent) for tangent in tangent_leaves):
+        if traced or self._inlines(key) or any(_is_traced(tangent) for tangent in tangent_leaves):
             return self._jvp_traced(primals, converted, tangent_node, tangent_leaves)
-        entry = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
+        entry = self._compiled(key, lambda: self._compile(in_node, leaves))
+        if entry is None:
+            return self._jvp_traced(primals, converted, tangent_node, tangent_leaves)
         if tangent_node != in_node:
             raise ValueError("jvp tangents must have the pytree structure of the primals")
         inputs = list(arrays)
@@ -744,11 +915,12 @@ class _Jvp(_Transform):
         """`jvp` on tracers of an enclosing trace: the staged JVP graph is
         inlined with its tangent inputs bound to the traced tangents."""
         in_node, leaves, key, bindings = _traced_signature(primals, (), converted)
-        staged, tangent_positions = self._inline_cache().lookup(
-            key, lambda: self._stage_jvp(in_node, leaves), self
+        (staged, tangent_positions), captures = self._inline_staged(
+            key, lambda: self._stage_jvp(in_node, leaves)
         )
         if tangent_node != in_node:
             raise ValueError("jvp tangents must have the pytree structure of the primals")
+        bindings += captures
         for position in tangent_positions:
             primal = leaves[position]
             bindings.append(
@@ -757,13 +929,14 @@ class _Jvp(_Transform):
         return _splice(staged, bindings)
 
     def _compile(self, in_node, leaves):
-        staged, tangent_positions = self._stage_jvp(in_node, leaves)
+        staged, tangent_positions = _compilable(self._stage_jvp(in_node, leaves))
         program = _Program(staged.graph, staged.input_names, staged.outputs, staged.out_node)
         return _JvpProgram(program, tangent_positions)
 
     def _stage_jvp(self, in_node, leaves):
-        """The forward-mode graph, taking the primal inputs followed by one
-        tangent input per leaf in the returned `tangent_positions`."""
+        """The forward-mode graph, taking the primal inputs and the capture
+        inputs followed by one tangent input per leaf in the returned
+        `tangent_positions`; captured tracers get no tangent."""
         names = self._names(in_node)
         staged = _stage(self._fun, in_node, leaves, names)
         tangent_positions = [
@@ -796,6 +969,8 @@ class _Jvp(_Transform):
             staged.input_names + [tangent_names[names[p]] for p in tangent_positions],
             primal_out + tangent_out,
             (tuple, (staged.out_node, staged.out_node)),
+            staged.captures,
+            staged.probe,
         )
         return staged, tangent_positions
 
@@ -885,15 +1060,18 @@ class _Vjp(_Transform):
     def __call__(self, *primals):
         converted = frozenset(range(len(primals)))
         in_node, leaves, arrays, key, traced = _signature(primals, (), converted)
-        if traced:
+        entry = None
+        if not (traced or self._inlines(key)):
+            entry = self._compiled(key, lambda: self._compile(in_node, leaves))
+        if entry is None:
             in_node, leaves, key, bindings = _traced_signature(primals, (), converted)
-            forward, reverse, cotangent_specs, out_node = self._inline_cache().lookup(
-                key, lambda: self._stage_vjp(in_node, leaves), self
+            (forward, reverse, cotangent_specs, out_node), captures = self._inline_staged(
+                key, lambda: self._stage_vjp(in_node, leaves)
             )
+            bindings += captures
             result = _splice(forward, bindings)
             pullback = _TracedVjpFunction(reverse, cotangent_specs, out_node, bindings)
         else:
-            entry = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
             result = entry.forward.run(arrays)
             pullback = VjpFunction(entry, arrays, self, primals)
         if self._has_aux:
@@ -906,13 +1084,13 @@ class _Vjp(_Transform):
         reverse graph, inlined with the primals bound as constants."""
         converted = frozenset(range(len(primals)))
         in_node, leaves, key, bindings = _traced_signature(primals, (), converted)
-        _, reverse, cotangent_specs, out_node = self._inline_cache().lookup(
-            key, lambda: self._stage_vjp(in_node, leaves), self
+        (_, reverse, cotangent_specs, out_node), captures = self._inline_staged(
+            key, lambda: self._stage_vjp(in_node, leaves)
         )
-        return _TracedVjpFunction(reverse, cotangent_specs, out_node, bindings)
+        return _TracedVjpFunction(reverse, cotangent_specs, out_node, bindings + captures)
 
     def _compile(self, in_node, leaves):
-        forward, reverse, cotangent_specs, out_node = self._stage_vjp(in_node, leaves)
+        forward, reverse, cotangent_specs, out_node = _compilable(self._stage_vjp(in_node, leaves))
         return _VjpProgram(
             _Program(forward.graph, forward.input_names, forward.outputs, forward.out_node),
             _Program(reverse.graph, reverse.input_names, reverse.outputs, reverse.out_node),
@@ -922,8 +1100,8 @@ class _Vjp(_Transform):
         )
 
     def _stage_vjp(self, in_node, leaves):
-        """The forward graph, the reverse graph (the primal inputs followed by
-        one cotangent input per entry of `cotangent_specs`), the cotangent
+        """The forward graph, the reverse graph (the primal and capture inputs
+        followed by one cotangent input per entry of `cotangent_specs`), the cotangent
         specs `(output leaf position, shape, dtype)`, and the structure of
         the differentiated output."""
         names = self._names(in_node)
@@ -948,7 +1126,14 @@ class _Vjp(_Transform):
             gradients[name] if type(leaf) in _ARRAY_LEAVES and leaf.dtype != bool_ else None
             for leaf, name in zip(leaves, names)
         ]
-        reverse = _Staged(graph, staged.input_names + cotangent_names, grad_outputs, in_node)
+        reverse = _Staged(
+            graph,
+            staged.input_names + cotangent_names,
+            grad_outputs,
+            in_node,
+            staged.captures,
+            staged.probe,
+        )
         return staged, reverse, cotangent_specs, out_node
 
 
@@ -1074,6 +1259,10 @@ class _Vmap(_Transform):
                 "vmap needs at least one mapped array argument, but in_axes maps none"
             )
         inner = _stage(self._fun, in_node, example_leaves, names)
+        # Captured tracers of enclosing traces are unmapped inputs here too.
+        capture_names = _capture_names(inner)
+        for name, source in zip(capture_names, inner.captures):
+            bound[name] = (graph.input(name, source.shape, source.dtype), False)
         traced = [output for output in inner.outputs if _is_traced(output)]
         if traced:
             bindings = [bound[name] for name in inner.input_names]
@@ -1094,8 +1283,8 @@ class _Vmap(_Transform):
             if _is_traced(output):
                 output, mapped = next(spliced)
             outputs.append(_place_output(graph, output, mapped, out_axis, batch))
-        input_names = [name for name in names if name in bound]
-        return _Staged(graph, input_names, outputs, inner.out_node)
+        input_names = [name for name in names if name in bound] + capture_names
+        return _Staged(graph, input_names, outputs, inner.out_node, inner.captures, inner.probe)
 
 
 def _place_output(graph, value, mapped, out_axis, batch):
@@ -1183,6 +1372,8 @@ class _Jacobian(_Transform):
         for leaf, name in zip(leaves, names):
             if type(leaf) in _ARRAY_LEAVES:
                 primals[name] = graph.input(name, leaf.shape, leaf.dtype)
+        for name, source in zip(_capture_names(staged), staged.captures):
+            primals[name] = graph.input(name, source.shape, source.dtype)
         # The basis: row r of the identity over all selected elements, split
         # into one mapped tangent per selected leaf.
         sizes = [_size(leaves[position].shape) for position in selected]
@@ -1232,7 +1423,14 @@ class _Jacobian(_Transform):
             block_node = in_node[1][argnums[0]]
         else:
             block_node = (tuple, tuple(in_node[1][argnum] for argnum in argnums))
-        return _Staged(graph, list(primals), blocks, _graft(staged.out_node, block_node))
+        return _Staged(
+            graph,
+            list(primals),
+            blocks,
+            _graft(staged.out_node, block_node),
+            staged.captures,
+            staged.probe,
+        )
 
 
 # -- public API ----------------------------------------------------------------------
