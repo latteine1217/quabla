@@ -731,6 +731,33 @@ pub struct SymbolicVjp {
     pub gradients: BTreeMap<String, TensorNodeId>,
 }
 
+/// The cotangent seed of one differentiated output of
+/// [`TensorIr::symbolic_vjp_many`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SymbolicCotangent {
+    /// A new graph input with this name, shaped and typed like the output,
+    /// bound by the caller at execution time (`vjp`).
+    Input(String),
+    /// A constant tensor of ones shaped and typed like the output, so the
+    /// transformed graph has no extra inputs (`grad` of a scalar loss).
+    Ones,
+}
+
+/// A reverse-mode transform of several seeded outputs that shares one
+/// transformed graph with the rebuilt primal of every source node.
+#[derive(Clone, Debug)]
+pub struct SymbolicVjpMany {
+    pub graph: TensorIr,
+    /// The rebuilt primal of each source node, indexed by source node id, so
+    /// a caller can retain values that are not differentiated (auxiliary
+    /// outputs) without evaluating the source graph a second time.
+    pub primals: Vec<TensorNodeId>,
+    /// The seed node of each differentiated output, in request order.
+    pub cotangents: Vec<TensorNodeId>,
+    /// The summed VJP of every non-`bool` source input, keyed by input name.
+    pub gradients: BTreeMap<String, TensorNodeId>,
+}
+
 #[derive(Clone, Debug)]
 pub struct TensorExecutionPlan {
     nodes: Vec<TensorNode>,
@@ -2702,15 +2729,49 @@ impl TensorIr {
         output: TensorNodeId,
         cotangent_name: &str,
     ) -> Result<SymbolicVjp, String> {
-        ensure_differentiable_output(self.node(output)?)?;
-        if self
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.op, TensorOp::Input { name } if name == cotangent_name))
-        {
-            return Err(format!(
-                "cotangent input name {cotangent_name:?} conflicts with an existing input"
-            ));
+        let transformed = self
+            .symbolic_vjp_many(&[(output, SymbolicCotangent::Input(cotangent_name.to_string()))])?;
+        Ok(SymbolicVjp {
+            value: transformed.primals[output],
+            cotangent: transformed.cotangents[0],
+            graph: transformed.graph,
+            gradients: transformed.gradients,
+        })
+    }
+
+    /// Emits one reverse-mode graph for several seeded outputs.
+    ///
+    /// The gradients are the sum of the VJPs of every output with its seed,
+    /// which is the VJP of the tuple of outputs; an output listed twice
+    /// accumulates both seeds. Every source node is replayed, so
+    /// [`SymbolicVjpMany::primals`] also maps nodes the outputs do not depend
+    /// on. With [`SymbolicCotangent::Input`] seeds and a single output this is
+    /// exactly [`Self::symbolic_vjp`].
+    pub fn symbolic_vjp_many(
+        &self,
+        outputs: &[(TensorNodeId, SymbolicCotangent)],
+    ) -> Result<SymbolicVjpMany, String> {
+        if outputs.is_empty() {
+            return Err("symbolic VJP requires at least one output".to_string());
+        }
+        let mut seed_names = BTreeSet::new();
+        for (output, seed) in outputs {
+            ensure_differentiable_output(self.node(*output)?)?;
+            let SymbolicCotangent::Input(cotangent_name) = seed else {
+                continue;
+            };
+            if self
+                .nodes
+                .iter()
+                .any(|node| matches!(&node.op, TensorOp::Input { name } if name == cotangent_name))
+            {
+                return Err(format!(
+                    "cotangent input name {cotangent_name:?} conflicts with an existing input"
+                ));
+            }
+            if !seed_names.insert(cotangent_name) {
+                return Err(format!("duplicate cotangent input name {cotangent_name:?}"));
+            }
         }
 
         let mut transformed = TensorIr::new();
@@ -2885,14 +2946,29 @@ impl TensorIr {
             values.push(value);
         }
 
-        let output_node = self.node(output)?;
-        let cotangent = transformed.input_typed(
-            cotangent_name,
-            output_node.shape.clone(),
-            output_node.dtype,
-        )?;
         let mut cotangents = vec![None; self.nodes.len()];
-        cotangents[output] = Some(cotangent);
+        let mut seeds = Vec::with_capacity(outputs.len());
+        for (output, seed) in outputs {
+            let output_node = self.node(*output)?;
+            let seed = match seed {
+                SymbolicCotangent::Input(cotangent_name) => transformed.input_typed(
+                    cotangent_name.clone(),
+                    output_node.shape.clone(),
+                    output_node.dtype,
+                )?,
+                // A strong constant, typed like the output as the input seed is.
+                SymbolicCotangent::Ones => {
+                    let one = transformed.constant_like(1.0, output_node.dtype, false);
+                    if output_node.shape.is_empty() {
+                        one
+                    } else {
+                        transformed.broadcast_to(one, output_node.shape.clone())?
+                    }
+                }
+            };
+            symbolic_accumulate(&mut transformed, &mut cotangents, *output, seed)?;
+            seeds.push(seed);
+        }
         let mut processed_scan_groups = HashSet::new();
 
         for node_id in (0..self.nodes.len()).rev() {
@@ -3457,10 +3533,10 @@ impl TensorIr {
                 gradients.insert(name.clone(), gradient);
             }
         }
-        Ok(SymbolicVjp {
+        Ok(SymbolicVjpMany {
             graph: transformed,
-            value: values[output],
-            cotangent,
+            primals: values,
+            cotangents: seeds,
             gradients,
         })
     }

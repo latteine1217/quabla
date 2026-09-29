@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use quabla_core::tensor_ir::{
-    CpuBackend, DynamicTensor, TensorBackend, TensorBufferSlot, TensorCondExecutionPlan,
-    TensorDType, TensorDeviceBackend, TensorDeviceId, TensorDeviceMesh, TensorExecutionPlan,
-    TensorForiExecutionPlan, TensorForiMultiExecutionPlan, TensorForiVjpJvpExecutionPlan,
-    TensorFusionRegion, TensorIr, TensorNodeId, TensorPartitionSpec, TensorPlacement,
-    TensorReplicaReduction, TensorScanExecutionPlan, TensorShardingPlan,
+    CpuBackend, DynamicTensor, SymbolicCotangent, TensorBackend, TensorBufferSlot,
+    TensorCondExecutionPlan, TensorDType, TensorDeviceBackend, TensorDeviceId, TensorDeviceMesh,
+    TensorExecutionPlan, TensorForiExecutionPlan, TensorForiMultiExecutionPlan,
+    TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr, TensorNodeId, TensorPartitionSpec,
+    TensorPlacement, TensorReplicaReduction, TensorScanExecutionPlan, TensorShardingPlan,
 };
 use quabla_core::{QuablaCompiler, QuablaMultiOutputProgram, QuablaTarget};
 
@@ -8778,4 +8778,186 @@ fn scan_vjp_gives_an_exact_zero_cotangent_to_an_unused_non_finite_output() {
             );
         }
     }
+}
+
+/// `f(x, w) = sum(tanh(x * w))` with an auxiliary `mean(x)` that the loss
+/// does not use, for the multi-output symbolic VJP tests.
+fn symbolic_vjp_many_fixture(
+    graph: &mut TensorIr,
+) -> Result<(TensorNodeId, TensorNodeId, BTreeMap<String, DynamicTensor>), String> {
+    let x = graph.input("x", vec![3])?;
+    let w = graph.input("w", vec![3])?;
+    let product = graph.mul(x, w)?;
+    let activated = graph.tanh(product)?;
+    let loss = graph.sum(activated)?;
+    let aux = graph.mean(x)?;
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            DynamicTensor::new(vec![3], vec![0.5, -1.0, 2.0])?,
+        ),
+        (
+            "w".to_string(),
+            DynamicTensor::new(vec![3], vec![0.3, -0.7, 1.1])?,
+        ),
+    ]);
+    Ok((loss, aux, inputs))
+}
+
+#[test]
+fn symbolic_vjp_many_ones_seed_matches_an_input_seed_and_retains_primals() {
+    let mut graph = TensorIr::new();
+    let (loss, aux, inputs) = must!(symbolic_vjp_many_fixture(&mut graph));
+    let seeded = must!(graph.symbolic_vjp(loss, "seed"));
+    let ones = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    assert_eq!(ones.cotangents.len(), 1);
+    // The ones seed adds no graph input.
+    assert!(ones.graph.input_node_id("seed").is_err());
+
+    let mut seeded_inputs = inputs.clone();
+    seeded_inputs.insert(
+        "seed".to_string(),
+        must!(DynamicTensor::filled(vec![], 1.0)),
+    );
+    for name in ["x", "w"] {
+        assert_eq!(
+            must!(ones.graph.evaluate(ones.gradients[name], &inputs)).data(),
+            must!(seeded
+                .graph
+                .evaluate(seeded.gradients[name], &seeded_inputs))
+            .data(),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        must!(ones.graph.evaluate(ones.primals[loss], &inputs)).data(),
+        must!(graph.evaluate(loss, &inputs)).data()
+    );
+    // The auxiliary node is rebuilt although the loss does not depend on it.
+    assert_close(
+        must!(ones.graph.evaluate(ones.primals[aux], &inputs)).data(),
+        &[0.5],
+        1e-15,
+    );
+
+    // One frozen program returns the value, the auxiliary output, and both gradients.
+    let outputs = vec![
+        ones.primals[loss],
+        ones.primals[aux],
+        ones.gradients["x"],
+        ones.gradients["w"],
+    ];
+    let program = must!(QuablaMultiOutputProgram::new(ones.graph.clone(), outputs));
+    let executable = must!(QuablaCompiler.compile_many(&program, QuablaTarget::Cpu));
+    let values = must!(executable.execute(&inputs));
+    assert_eq!(values.len(), 4);
+    assert_eq!(
+        values[0].data(),
+        must!(graph.evaluate(loss, &inputs)).data()
+    );
+    assert_eq!(
+        values[3].data(),
+        must!(seeded.graph.evaluate(seeded.gradients["w"], &seeded_inputs)).data()
+    );
+}
+
+#[test]
+fn symbolic_vjp_many_sums_the_vjps_of_several_outputs() {
+    let mut graph = TensorIr::new();
+    let (loss, aux, inputs) = must!(symbolic_vjp_many_fixture(&mut graph));
+    let both = must!(graph.symbolic_vjp_many(&[
+        (loss, SymbolicCotangent::Input("loss_bar".to_string())),
+        (aux, SymbolicCotangent::Input("aux_bar".to_string())),
+    ]));
+    let mut seeded = inputs.clone();
+    seeded.insert(
+        "loss_bar".to_string(),
+        must!(DynamicTensor::filled(vec![], 2.0)),
+    );
+    seeded.insert(
+        "aux_bar".to_string(),
+        must!(DynamicTensor::filled(vec![], 3.0)),
+    );
+    let (_, loss_gradients) =
+        must!(graph.value_and_vjp(loss, &inputs, must!(DynamicTensor::filled(vec![], 2.0))));
+    let (_, aux_gradients) =
+        must!(graph.value_and_vjp(aux, &inputs, must!(DynamicTensor::filled(vec![], 3.0))));
+    for name in ["x", "w"] {
+        let expected = loss_gradients[name]
+            .data()
+            .iter()
+            .zip(aux_gradients[name].data())
+            .map(|(lhs, rhs)| lhs + rhs)
+            .collect::<Vec<_>>();
+        assert_close(
+            must!(both.graph.evaluate(both.gradients[name], &seeded)).data(),
+            &expected,
+            1e-14,
+        );
+    }
+
+    // An output listed twice accumulates both seeds.
+    let twice = must!(graph.symbolic_vjp_many(&[
+        (loss, SymbolicCotangent::Ones),
+        (loss, SymbolicCotangent::Ones),
+    ]));
+    let (_, doubled) =
+        must!(graph.value_and_vjp(loss, &inputs, must!(DynamicTensor::filled(vec![], 2.0))));
+    assert_close(
+        must!(twice.graph.evaluate(twice.gradients["w"], &inputs)).data(),
+        doubled["w"].data(),
+        1e-15,
+    );
+}
+
+#[test]
+fn symbolic_vjp_many_rejects_invalid_seeds() {
+    let mut graph = TensorIr::new();
+    let (loss, aux, _) = must!(symbolic_vjp_many_fixture(&mut graph));
+    let error = graph
+        .symbolic_vjp_many(&[])
+        .expect_err("no outputs must be rejected");
+    assert!(error.contains("at least one output"), "{error}");
+    let error = graph
+        .symbolic_vjp_many(&[
+            (loss, SymbolicCotangent::Input("bar".to_string())),
+            (aux, SymbolicCotangent::Input("bar".to_string())),
+        ])
+        .expect_err("duplicate seed names must be rejected");
+    assert!(error.contains("duplicate cotangent input name"), "{error}");
+    let error = graph
+        .symbolic_vjp_many(&[(loss, SymbolicCotangent::Input("x".to_string()))])
+        .expect_err("a seed name that shadows an input must be rejected");
+    assert!(
+        error.contains("conflicts with an existing input"),
+        "{error}"
+    );
+    let mask = must!(graph.input_typed("mask", vec![], TensorDType::Bool));
+    let error = graph
+        .symbolic_vjp_many(&[(mask, SymbolicCotangent::Ones)])
+        .expect_err("a bool output must be rejected");
+    assert!(
+        error.contains("cannot differentiate a bool output"),
+        "{error}"
+    );
+}
+
+#[test]
+fn symbolic_jvp_over_a_ones_seeded_vjp_is_the_hessian_vector_product() {
+    let mut graph = TensorIr::new();
+    let (loss, _, inputs) = must!(symbolic_vjp_many_fixture(&mut graph));
+    let reverse = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    let forward = must!(reverse.graph.symbolic_jvp_many_with_tangent_inputs(
+        &[reverse.gradients["w"]],
+        &BTreeMap::from([("w".to_string(), "w_dot".to_string())]),
+    ));
+    let direction = must!(DynamicTensor::new(vec![3], vec![1.0, -2.0, 0.5]));
+    let mut tangent_inputs = inputs.clone();
+    tangent_inputs.insert("w_dot".to_string(), direction.clone());
+    let expected = must!(graph.hvp_scalar(loss, "w", &inputs, direction));
+    assert_close(
+        must!(forward.graph.evaluate(forward.tangents[0], &tangent_inputs)).data(),
+        expected.data(),
+        1e-14,
+    );
 }

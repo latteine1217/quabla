@@ -8,9 +8,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyString, PyTuple};
 use quabla_core::tensor_ir::{
     CudaBackend, CudaDataParallelExecutionPlan, CudaDataParallelTiming, CudaExecutionPlan,
-    DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs, TensorBackend, TensorComparison,
-    TensorCondExecutionPlan, TensorDType, TensorExecutionPlan, TensorForiExecutionPlan, TensorIr,
-    TensorNodeId, TensorReplicaReduction, TensorScanExecutionPlan,
+    DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs, SymbolicCotangent, TensorBackend,
+    TensorComparison, TensorCondExecutionPlan, TensorDType, TensorExecutionPlan,
+    TensorForiExecutionPlan, TensorIr, TensorNodeId, TensorReplicaReduction,
+    TensorScanExecutionPlan,
 };
 use quabla_core::{
     QuablaCompiler, QuablaExecutable, QuablaMultiOutputExecutable, QuablaMultiOutputProgram,
@@ -649,6 +650,166 @@ impl TensorTraceGraph {
                 .clone(),
         };
         QuablaMultiOutputProgram::new(ir, output_node_ids)
+    }
+}
+
+/// A reverse-mode transform staged by [`TensorTraceGraph::symbolic_vjp_many`]:
+/// the transformed graph, the retained tracers in request order, and one
+/// gradient tracer per non-`bool` input, keyed by input name.
+pub type StagedVjp = (
+    TensorTraceGraph,
+    Vec<TraceTensor>,
+    BTreeMap<String, TraceTensor>,
+);
+
+/// A forward-mode transform staged by [`TensorTraceGraph::symbolic_jvp_many`]:
+/// the transformed graph and the primal and tangent tracer of each output.
+pub type StagedJvp = (TensorTraceGraph, Vec<TraceTensor>, Vec<TraceTensor>);
+
+/// Multi-output staging for the v0.2 Python transforms (`quabla.grad`,
+/// `quabla.jit`, ...). The Python layer traces a function into a graph,
+/// flattens its pytree result into tracers, and composes these transforms on
+/// the graph; every result is a fresh graph, so tracers of the source graph
+/// stay valid for further transforms of the same trace.
+impl TensorTraceGraph {
+    fn ensure_owns(&self, tensors: &[&TraceTensor]) -> Result<(), String> {
+        if tensors
+            .iter()
+            .all(|tensor| Arc::ptr_eq(&self.ir, &tensor.graph.ir))
+        {
+            Ok(())
+        } else {
+            Err(
+                "a traced output belongs to a different graph; a tracer escaped from \
+                 another trace"
+                    .to_string(),
+            )
+        }
+    }
+
+    /// Wraps nodes of a freshly transformed graph as unbatched tracers.
+    fn tracers(&self, node_ids: &[TensorNodeId]) -> Result<Vec<TraceTensor>, String> {
+        let ir = self
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        node_ids
+            .iter()
+            .map(|&node_id| {
+                Ok(TraceTensor::from_node(
+                    self.clone(),
+                    node_id,
+                    ir.node_shape(node_id)?,
+                    None,
+                ))
+            })
+            .collect()
+    }
+
+    /// Reverse mode over several seeded outputs, retaining `retained`
+    /// (for example the value and auxiliary outputs) from the same graph.
+    pub fn symbolic_vjp_many(
+        &self,
+        outputs: &[(TraceTensor, SymbolicCotangent)],
+        retained: &[TraceTensor],
+    ) -> Result<StagedVjp, String> {
+        self.ensure_owns(
+            &outputs
+                .iter()
+                .map(|(output, _)| output)
+                .chain(retained)
+                .collect::<Vec<_>>(),
+        )?;
+        let seeds = outputs
+            .iter()
+            .map(|(output, seed)| (output.node_id, seed.clone()))
+            .collect::<Vec<_>>();
+        let transformed = self
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+            .symbolic_vjp_many(&seeds)?;
+        let retained = retained
+            .iter()
+            .map(|tensor| transformed.primals[tensor.node_id])
+            .collect::<Vec<_>>();
+        let (names, gradients): (Vec<_>, Vec<_>) = transformed.gradients.into_iter().unzip();
+        let graph = TensorTraceGraph {
+            ir: Arc::new(Mutex::new(transformed.graph)),
+        };
+        let retained = graph.tracers(&retained)?;
+        let gradients = names.into_iter().zip(graph.tracers(&gradients)?).collect();
+        Ok((graph, retained, gradients))
+    }
+
+    /// Forward mode over several outputs with runtime tangent inputs:
+    /// `tangent_inputs` maps input names to new tangent input names, and
+    /// omitted inputs get a zero tangent.
+    pub fn symbolic_jvp_many(
+        &self,
+        outputs: &[TraceTensor],
+        tangent_inputs: &BTreeMap<String, String>,
+    ) -> Result<StagedJvp, String> {
+        self.ensure_owns(&outputs.iter().collect::<Vec<_>>())?;
+        let output_ids = outputs
+            .iter()
+            .map(|output| output.node_id)
+            .collect::<Vec<_>>();
+        let transformed = self
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+            .symbolic_jvp_many_with_tangent_inputs(&output_ids, tangent_inputs)?;
+        let graph = TensorTraceGraph {
+            ir: Arc::new(Mutex::new(transformed.graph)),
+        };
+        let values = graph.tracers(&transformed.values)?;
+        let tangents = graph.tracers(&transformed.tangents)?;
+        Ok((graph, values, tangents))
+    }
+
+    /// Freezes `outputs` into one CPU program whose inputs are bound by
+    /// position in `input_names` order.
+    pub fn compile_cpu_many(
+        &self,
+        outputs: &[TraceTensor],
+        input_names: Vec<String>,
+    ) -> Result<StagedExecutable, String> {
+        self.ensure_owns(&outputs.iter().collect::<Vec<_>>())?;
+        let program = self
+            .clone()
+            .into_multi_output_program(outputs.iter().map(|output| output.node_id).collect())?;
+        Ok(StagedExecutable {
+            executable: QuablaCompiler.compile_many(&program, QuablaTarget::Cpu)?,
+            input_names,
+        })
+    }
+}
+
+/// A multi-output program compiled for the v0.2 transforms. Inputs are
+/// positional, in the order of [`Self::input_names`], so a call does not
+/// build a name-keyed dict in Python; outputs follow program order.
+///
+/// The class is deliberately not registered in the extension module: it is
+/// an implementation detail of `quabla._transforms`.
+#[pyclass(name = "StagedExecutable", skip_from_py_object)]
+#[derive(Clone, Debug)]
+pub struct StagedExecutable {
+    executable: QuablaMultiOutputExecutable,
+    input_names: Vec<String>,
+}
+
+impl StagedExecutable {
+    pub fn execute(&self, inputs: Vec<DynamicTensor>) -> Result<Vec<DynamicTensor>, String> {
+        if inputs.len() != self.input_names.len() {
+            return Err(format!(
+                "staged program expects {} inputs, got {}",
+                self.input_names.len(),
+                inputs.len()
+            ));
+        }
+        self.executable
+            .execute(&self.input_names.iter().cloned().zip(inputs).collect())
     }
 }
 
@@ -1896,6 +2057,58 @@ impl TensorTraceGraph {
             .map_err(PyValueError::new_err)
     }
 
+    /// `symbolic_vjp_many` for `quabla._transforms`: a `None` cotangent name
+    /// seeds that output with ones.
+    #[pyo3(name = "_symbolic_vjp")]
+    fn py_symbolic_vjp(
+        &self,
+        outputs: Vec<TraceTensor>,
+        cotangent_names: Vec<Option<String>>,
+        retained: Vec<TraceTensor>,
+    ) -> PyResult<StagedVjp> {
+        if outputs.len() != cotangent_names.len() {
+            return Err(PyValueError::new_err(format!(
+                "{} differentiated outputs with {} cotangent names",
+                outputs.len(),
+                cotangent_names.len()
+            )));
+        }
+        let outputs = outputs
+            .into_iter()
+            .zip(cotangent_names)
+            .map(|(output, name)| {
+                (
+                    output,
+                    name.map_or(SymbolicCotangent::Ones, SymbolicCotangent::Input),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.symbolic_vjp_many(&outputs, &retained)
+            .map_err(PyValueError::new_err)
+    }
+
+    /// `symbolic_jvp_many` for `quabla._transforms`.
+    #[pyo3(name = "_symbolic_jvp")]
+    fn py_symbolic_jvp(
+        &self,
+        outputs: Vec<TraceTensor>,
+        tangent_inputs: BTreeMap<String, String>,
+    ) -> PyResult<StagedJvp> {
+        self.symbolic_jvp_many(&outputs, &tangent_inputs)
+            .map_err(PyValueError::new_err)
+    }
+
+    /// `compile_cpu_many` for `quabla._transforms`.
+    #[pyo3(name = "_compile_cpu")]
+    fn py_compile_cpu(
+        &self,
+        outputs: Vec<TraceTensor>,
+        input_names: Vec<String>,
+    ) -> PyResult<StagedExecutable> {
+        self.compile_cpu_many(&outputs, input_names)
+            .map_err(PyValueError::new_err)
+    }
+
     fn evaluate_value_and_vjp(
         &self,
         output_node_id: TensorNodeId,
@@ -1913,6 +2126,36 @@ impl TensorTraceGraph {
             .evaluate_vjp_tensor(output_node_id, inputs, output_cotangent)
             .map_err(PyValueError::new_err)?;
         Ok((value, gradients))
+    }
+}
+
+#[pymethods]
+impl StagedExecutable {
+    #[getter]
+    fn input_names(&self) -> Vec<String> {
+        self.input_names.clone()
+    }
+
+    fn __call__(&self, inputs: Vec<PyRef<'_, PyTensor>>) -> PyResult<Vec<PyTensor>> {
+        let inputs = inputs
+            .iter()
+            .map(|tensor| tensor.to_dynamic_tensor())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PyValueError::new_err)?;
+        self.execute(inputs)
+            .map_err(PyValueError::new_err)?
+            .into_iter()
+            .map(PyTensor::from_dynamic_tensor)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PyValueError::new_err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "StagedExecutable(inputs={}, outputs={})",
+            self.input_names.len(),
+            self.executable.output_node_ids().len()
+        )
     }
 }
 
