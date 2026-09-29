@@ -7,8 +7,44 @@ use std::ffi::c_int;
 use std::sync::Arc;
 
 use crate::dtype::PyDType;
-use crate::errors::eager_operand_error;
 use crate::interop;
+use crate::tensor_trace::{eager_traced_binary, TraceTensor, TracedBinary};
+
+/// The result of an eager `Tensor` operation. It is traced when the other
+/// operand is a tracer: the tensor is then captured as a constant of the
+/// tracer's graph, as a `jax.jit` closure constant is.
+#[derive(IntoPyObject)]
+pub enum EagerOrTraced {
+    Eager(PyTensor),
+    Traced(TraceTensor),
+    /// `NotImplemented` from a binary operator, so that Python tries the
+    /// reflected method of an operand this type does not know.
+    NotImplemented(Py<PyAny>),
+}
+
+/// Whether a binary operator can handle `operand` itself: a `Tensor`, or a
+/// tracer that captures this tensor.
+fn is_array_operand(operand: &Bound<'_, PyAny>) -> bool {
+    operand.is_instance_of::<PyTensor>() || operand.is_instance_of::<TraceTensor>()
+}
+
+/// Wraps an eager result, mapping its error to `ValueError`.
+fn eager(result: Result<PyTensor, String>) -> PyResult<EagerOrTraced> {
+    result
+        .map(EagerOrTraced::Eager)
+        .map_err(PyValueError::new_err)
+}
+
+/// Runs `op` with a traced `operand` (see [`eager_traced_binary`]).
+fn traced(
+    tensor: &PyTensor,
+    operand: &Bound<'_, PyAny>,
+    op: TracedBinary,
+    tensor_first: bool,
+) -> Option<PyResult<EagerOrTraced>> {
+    eager_traced_binary(tensor, operand, op, tensor_first)
+        .map(|result| result.map(EagerOrTraced::Traced))
+}
 
 /// Eager host tensor. Storage is `f64`; a `float32` tensor holds only values
 /// rounded to `f32`, and every eager op on it rounds its `f64` result the way
@@ -416,6 +452,11 @@ impl PyTensor {
 
     pub fn dtype(&self) -> TensorDType {
         self.dtype
+    }
+
+    /// Whether this tensor is weakly typed (see the `weak` field).
+    pub fn is_weak(&self) -> bool {
+        self.weak
     }
 
     pub fn shape_data(&self) -> (&[usize], &[f64]) {
@@ -1951,104 +1992,126 @@ impl PyTensor {
         self.try_index(&indices).map_err(PyValueError::new_err)
     }
 
-    fn __add__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    // With a tracer operand, arithmetic, comparisons, `maximum`/`minimum`,
+    // `**`, `@`, `solve`, and the logical ops are traced, with this tensor
+    // captured as a constant; the tracer check comes first because a tracer
+    // refuses the `float()` conversion that the scalar branch attempts.
+    fn __add__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, rhs, TracedBinary::Arithmetic("add"), true) {
+            return result;
+        }
         if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
-            return self.try_add(&rhs).map_err(PyValueError::new_err);
+            return eager(self.try_add(&rhs));
         }
         if let Ok(rhs) = rhs.extract::<f64>() {
-            return self.try_add_scalar(rhs).map_err(PyValueError::new_err);
+            return eager(self.try_add_scalar(rhs));
         }
-        Err(eager_operand_error(
-            rhs,
+        Err(PyTypeError::new_err(
             "expected Tensor or numeric scalar operand",
         ))
     }
 
-    fn add(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn add(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.__add__(rhs)
     }
 
-    fn __radd__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn __radd__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, lhs, TracedBinary::Arithmetic("add"), false) {
+            return result;
+        }
         self.__add__(lhs)
     }
 
-    fn __sub__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn __sub__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, rhs, TracedBinary::Arithmetic("sub"), true) {
+            return result;
+        }
         if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
-            return self.try_sub(&rhs).map_err(PyValueError::new_err);
+            return eager(self.try_sub(&rhs));
         }
         if let Ok(rhs) = rhs.extract::<f64>() {
-            return self.try_sub_scalar(rhs).map_err(PyValueError::new_err);
+            return eager(self.try_sub_scalar(rhs));
         }
-        Err(eager_operand_error(
-            rhs,
+        Err(PyTypeError::new_err(
             "expected Tensor or numeric scalar operand",
         ))
     }
 
-    fn sub(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn sub(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.__sub__(rhs)
     }
 
-    fn __rsub__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn __rsub__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, lhs, TracedBinary::Arithmetic("sub"), false) {
+            return result;
+        }
         if let Ok(lhs) = lhs.extract::<PyRef<'_, PyTensor>>() {
-            return lhs.try_sub(self).map_err(PyValueError::new_err);
+            return eager(lhs.try_sub(self));
         }
         if let Ok(lhs) = lhs.extract::<f64>() {
-            return self.try_scalar_sub(lhs).map_err(PyValueError::new_err);
+            return eager(self.try_scalar_sub(lhs));
         }
-        Err(eager_operand_error(
-            lhs,
+        Err(PyTypeError::new_err(
             "expected Tensor or numeric scalar operand",
         ))
     }
 
-    fn __mul__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn __mul__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, rhs, TracedBinary::Arithmetic("mul"), true) {
+            return result;
+        }
         if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
-            return self.try_mul(&rhs).map_err(PyValueError::new_err);
+            return eager(self.try_mul(&rhs));
         }
         if let Ok(rhs) = rhs.extract::<f64>() {
-            return self.try_mul_scalar(rhs).map_err(PyValueError::new_err);
+            return eager(self.try_mul_scalar(rhs));
         }
-        Err(eager_operand_error(
-            rhs,
+        Err(PyTypeError::new_err(
             "expected Tensor or numeric scalar operand",
         ))
     }
 
-    fn mul(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn mul(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.__mul__(rhs)
     }
 
-    fn __rmul__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn __rmul__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, lhs, TracedBinary::Arithmetic("mul"), false) {
+            return result;
+        }
         self.__mul__(lhs)
     }
 
-    fn __truediv__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn __truediv__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, rhs, TracedBinary::Arithmetic("div"), true) {
+            return result;
+        }
         if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
-            return self.try_div(&rhs).map_err(PyValueError::new_err);
+            return eager(self.try_div(&rhs));
         }
         if let Ok(rhs) = rhs.extract::<f64>() {
-            return self.try_div_scalar(rhs).map_err(PyValueError::new_err);
+            return eager(self.try_div_scalar(rhs));
         }
-        Err(eager_operand_error(
-            rhs,
+        Err(PyTypeError::new_err(
             "expected Tensor or numeric scalar divisor",
         ))
     }
 
-    fn div(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn div(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.__truediv__(rhs)
     }
 
-    fn __rtruediv__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn __rtruediv__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, lhs, TracedBinary::Arithmetic("div"), false) {
+            return result;
+        }
         if let Ok(lhs) = lhs.extract::<PyRef<'_, PyTensor>>() {
-            return lhs.try_div(self).map_err(PyValueError::new_err);
+            return eager(lhs.try_div(self));
         }
         if let Ok(lhs) = lhs.extract::<f64>() {
-            return self.try_scalar_div(lhs).map_err(PyValueError::new_err);
+            return eager(self.try_scalar_div(lhs));
         }
-        Err(eager_operand_error(
-            lhs,
+        Err(PyTypeError::new_err(
             "expected Tensor or numeric scalar dividend",
         ))
     }
@@ -2063,25 +2126,27 @@ impl PyTensor {
         &self,
         exponent: &Bound<'_, PyAny>,
         modulo: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Self> {
+    ) -> PyResult<EagerOrTraced> {
         if modulo.is_some() {
             return Err(PyTypeError::new_err(
                 "modulo argument is not supported for Tensor power",
             ));
         }
+        if let Some(result) = traced(self, exponent, TracedBinary::Arithmetic("pow"), true) {
+            return result;
+        }
         if let Ok(exponent) = exponent.extract::<u32>() {
-            return self.try_powi(exponent).map_err(PyValueError::new_err);
+            return eager(self.try_powi(exponent));
         }
         // A tensor exponent, including a single-element one, is an elementwise
         // operand that broadcasts, as in NumPy and in traced code; it is never
         // unwrapped into a scalar.
         if let Ok(exponent) = exponent.extract::<PyRef<'_, PyTensor>>() {
-            return self.try_pow(&exponent).map_err(PyValueError::new_err);
+            return eager(self.try_pow(&exponent));
         }
-        let exponent = extract_scalar(exponent).ok_or_else(|| {
-            eager_operand_error(exponent, "expected a Tensor or numeric scalar exponent")
-        })?;
-        self.try_powf(exponent).map_err(PyValueError::new_err)
+        let exponent = extract_scalar(exponent)
+            .ok_or_else(|| PyTypeError::new_err("expected a Tensor or numeric scalar exponent"))?;
+        eager(self.try_powf(exponent))
     }
 
     /// `c ** x` for a Python number `c`.
@@ -2100,60 +2165,62 @@ impl PyTensor {
         self.try_scalar_pow(base).map_err(PyValueError::new_err)
     }
 
-    fn gt(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn gt(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, rhs, TracedBinary::Arithmetic("greater"), true) {
+            return result;
+        }
         if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
-            return self.try_gt(&rhs).map_err(PyValueError::new_err);
+            return eager(self.try_gt(&rhs));
         }
         if let Ok(rhs) = rhs.extract::<f64>() {
-            return self.try_gt_scalar(rhs).map_err(PyValueError::new_err);
+            return eager(self.try_gt_scalar(rhs));
         }
-        Err(eager_operand_error(
-            rhs,
+        Err(PyTypeError::new_err(
             "expected Tensor or numeric scalar operand",
         ))
     }
 
     /// Elementwise `self > rhs` as a `bool` tensor (unlike `gt`, which keeps
     /// returning a 0/1 float mask).
-    fn greater(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn greater(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.compare_operand(rhs, TensorComparison::Greater)
     }
 
-    fn greater_equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn greater_equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.compare_operand(rhs, TensorComparison::GreaterEqual)
     }
 
-    fn less(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn less(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.compare_operand(rhs, TensorComparison::Less)
     }
 
-    fn less_equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn less_equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.compare_operand(rhs, TensorComparison::LessEqual)
     }
 
-    fn equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.compare_operand(rhs, TensorComparison::Equal)
     }
 
-    fn not_equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn not_equal(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.compare_operand(rhs, TensorComparison::NotEqual)
     }
 
     // `==`/`!=` are deliberately not overloaded: tensors keep identity
     // equality and stay hashable; use `equal`/`not_equal` for elementwise.
-    fn __gt__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn __gt__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.greater(rhs)
     }
 
-    fn __ge__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn __ge__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.greater_equal(rhs)
     }
 
-    fn __lt__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn __lt__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.less(rhs)
     }
 
-    fn __le__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn __le__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
         self.less_equal(rhs)
     }
 
@@ -2164,23 +2231,29 @@ impl PyTensor {
         slf.as_ptr() as isize
     }
 
-    fn logical_and(&self, rhs: &Self) -> PyResult<Self> {
-        self.try_logical(rhs, true).map_err(PyValueError::new_err)
+    fn logical_and(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        self.logical_operand(rhs, true)
     }
 
-    fn logical_or(&self, rhs: &Self) -> PyResult<Self> {
-        self.try_logical(rhs, false).map_err(PyValueError::new_err)
+    fn logical_or(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        self.logical_operand(rhs, false)
     }
 
     fn logical_not(&self) -> PyResult<Self> {
         self.try_logical_not().map_err(PyValueError::new_err)
     }
 
-    fn __and__(&self, rhs: &Self) -> PyResult<Self> {
+    fn __and__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if !is_array_operand(rhs) {
+            return Ok(EagerOrTraced::NotImplemented(rhs.py().NotImplemented()));
+        }
         self.logical_and(rhs)
     }
 
-    fn __or__(&self, rhs: &Self) -> PyResult<Self> {
+    fn __or__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if !is_array_operand(rhs) {
+            return Ok(EagerOrTraced::NotImplemented(rhs.py().NotImplemented()));
+        }
         self.logical_or(rhs)
     }
 
@@ -2214,48 +2287,73 @@ impl PyTensor {
         self.truthiness().map_err(PyValueError::new_err)
     }
 
-    fn maximum(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn maximum(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, rhs, TracedBinary::Maximum, true) {
+            return result;
+        }
         if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
-            return self.try_maximum(&rhs).map_err(PyValueError::new_err);
+            return eager(self.try_maximum(&rhs));
         }
         if let Ok(rhs) = rhs.extract::<f64>() {
-            return self.try_maximum_scalar(rhs).map_err(PyValueError::new_err);
+            return eager(self.try_maximum_scalar(rhs));
         }
-        Err(eager_operand_error(
-            rhs,
+        Err(PyTypeError::new_err(
             "expected Tensor or numeric scalar operand",
         ))
     }
 
-    fn minimum(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn minimum(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, rhs, TracedBinary::Minimum, true) {
+            return result;
+        }
         if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
-            return self.try_minimum(&rhs).map_err(PyValueError::new_err);
+            return eager(self.try_minimum(&rhs));
         }
         if let Ok(rhs) = rhs.extract::<f64>() {
-            return self.try_minimum_scalar(rhs).map_err(PyValueError::new_err);
+            return eager(self.try_minimum_scalar(rhs));
         }
-        Err(eager_operand_error(
-            rhs,
+        Err(PyTypeError::new_err(
             "expected Tensor or numeric scalar operand",
         ))
     }
 
-    fn __matmul__(&self, rhs: &Self) -> PyResult<Self> {
-        self.try_matmul(rhs).map_err(PyValueError::new_err)
+    fn __matmul__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if !is_array_operand(rhs) {
+            return Ok(EagerOrTraced::NotImplemented(rhs.py().NotImplemented()));
+        }
+        self.matmul(rhs)
     }
 
-    fn matmul(&self, rhs: &Self) -> PyResult<Self> {
-        self.__matmul__(rhs)
+    fn matmul(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, rhs, TracedBinary::Matmul, true) {
+            return result;
+        }
+        eager(self.try_matmul(&self.tensor_operand(rhs, "matmul")?))
     }
 
-    fn solve(&self, rhs: &Self) -> PyResult<Self> {
-        self.try_solve(rhs).map_err(PyValueError::new_err)
+    fn solve(&self, rhs: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, rhs, TracedBinary::Solve, true) {
+            return result;
+        }
+        eager(self.try_solve(&self.tensor_operand(rhs, "solve")?))
     }
 
     #[pyo3(signature = (rhs, lower = true, transpose = false))]
-    fn solve_triangular(&self, rhs: &Self, lower: bool, transpose: bool) -> PyResult<Self> {
-        self.try_solve_triangular(rhs, lower, transpose)
-            .map_err(PyValueError::new_err)
+    fn solve_triangular(
+        &self,
+        rhs: &Bound<'_, PyAny>,
+        lower: bool,
+        transpose: bool,
+    ) -> PyResult<EagerOrTraced> {
+        let op = TracedBinary::SolveTriangular { lower, transpose };
+        if let Some(result) = traced(self, rhs, op, true) {
+            return result;
+        }
+        eager(self.try_solve_triangular(
+            &self.tensor_operand(rhs, "solve_triangular")?,
+            lower,
+            transpose,
+        ))
     }
 
     fn cholesky(&self) -> PyResult<Self> {
@@ -2275,19 +2373,48 @@ impl PyTensor {
 }
 
 impl PyTensor {
-    fn compare_operand(&self, rhs: &Bound<'_, PyAny>, kind: TensorComparison) -> PyResult<Self> {
+    fn compare_operand(
+        &self,
+        rhs: &Bound<'_, PyAny>,
+        kind: TensorComparison,
+    ) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, rhs, TracedBinary::Compare(kind), true) {
+            return result;
+        }
         if let Ok(rhs) = rhs.extract::<PyRef<'_, PyTensor>>() {
-            return self.try_compare(&rhs, kind).map_err(PyValueError::new_err);
+            return eager(self.try_compare(&rhs, kind));
         }
         if let Ok(rhs) = rhs.extract::<f64>() {
-            return self
-                .try_compare_scalar(rhs, kind)
-                .map_err(PyValueError::new_err);
+            return eager(self.try_compare_scalar(rhs, kind));
         }
-        Err(eager_operand_error(
-            rhs,
+        Err(PyTypeError::new_err(
             "expected Tensor or numeric scalar operand",
         ))
+    }
+
+    fn logical_operand(&self, rhs: &Bound<'_, PyAny>, and: bool) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, rhs, TracedBinary::Logical { and }, true) {
+            return result;
+        }
+        let name = if and { "logical_and" } else { "logical_or" };
+        eager(self.try_logical(&self.tensor_operand(rhs, name)?, and))
+    }
+
+    /// The eager `Tensor` operand of a method without a scalar form; the
+    /// `TypeError` matches the one argument extraction used to raise.
+    fn tensor_operand(&self, operand: &Bound<'_, PyAny>, op: &str) -> PyResult<PyTensor> {
+        operand
+            .extract::<PyRef<'_, PyTensor>>()
+            .map(|tensor| tensor.clone())
+            .map_err(|_| {
+                PyTypeError::new_err(format!(
+                    "{op} expects a Tensor operand, got {}",
+                    operand
+                        .get_type()
+                        .name()
+                        .map_or_else(|_| "an unknown type".to_string(), |name| name.to_string())
+                ))
+            })
     }
 }
 
@@ -2325,7 +2452,7 @@ impl PyTensorView {
             .collect())
     }
 
-    fn materialize(&self) -> Result<PyTensor, String> {
+    pub(crate) fn materialize(&self) -> Result<PyTensor, String> {
         PyTensor::from_shape_data_typed(self.shape.clone(), self.to_flat_vec()?, self.dtype)
     }
 }

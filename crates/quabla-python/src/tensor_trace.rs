@@ -19,10 +19,10 @@ use quabla_core::{
 };
 
 use crate::dtype::PyDType;
-use crate::errors::{concrete_value_error, traced_operand_error, tracer_error};
+use crate::errors::{concrete_value_error, tracer_error};
 use crate::tensor::bool_operation_error;
 use crate::tensor::{
-    extract_scalar, parse_axis_indices, parse_tensor_indices, PyTensor, TensorIndex,
+    extract_scalar, parse_axis_indices, parse_tensor_indices, PyTensor, PyTensorView, TensorIndex,
 };
 
 /// One traced input declaration: `(name, shape)` for `float64`, or
@@ -809,7 +809,7 @@ impl TensorTraceGraph {
             .iter()
             .filter_map(|binding| match binding {
                 InlineBinding::Traced(tensor) => Some(tensor),
-                InlineBinding::Scalar(_) => None,
+                InlineBinding::Scalar(_) | InlineBinding::Constant(_) => None,
             })
             .collect::<Vec<_>>();
         let target = traced
@@ -846,6 +846,7 @@ impl TensorTraceGraph {
                         ir.cast(constant, dtype)?
                     }
                 }
+                InlineBinding::Constant(value) => ir.constant(value.clone(), false),
             };
             if bound.insert(name.clone(), node_id).is_some() {
                 return Err(format!("callee input {name:?} is bound twice"));
@@ -876,6 +877,9 @@ impl TensorTraceGraph {
 pub enum InlineBinding {
     Traced(TraceTensor),
     Scalar(f64),
+    /// An eager array, bound as a strong constant of the enclosing trace like
+    /// the graph input it replaces.
+    Constant(DynamicTensor),
 }
 
 /// A multi-output program compiled for the v0.2 transforms. Inputs are
@@ -1134,6 +1138,53 @@ impl TraceTensor {
             shape,
             self.batch_axis,
         ))
+    }
+
+    /// Embeds `value` as an array constant of this tracer's graph. Like a
+    /// `jax.jit` closure constant, its data is fixed when the function is
+    /// traced; it carries no vmap batch axis, so it broadcasts against the
+    /// examples of a batched operand like an unmapped value.
+    fn constant_tensor(&self, value: DynamicTensor, weak: bool) -> Result<Self, String> {
+        let mut ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let node_id = ir.constant(value, weak);
+        let shape = ir.node_shape(node_id)?;
+        Ok(Self::from_node(self.graph.clone(), node_id, shape, None))
+    }
+
+    /// Captures an eager tensor as a constant of this tracer's graph, keeping
+    /// its dtype and (rare) weak type, so eager and traced code promote alike.
+    pub(crate) fn capture(&self, eager: &PyTensor) -> Result<Self, String> {
+        self.constant_tensor(eager.to_dynamic_tensor()?, eager.is_weak())
+    }
+
+    /// `operand` as a value of this tracer's graph: a tracer as is, and an
+    /// eager `Tensor` or `TensorView` captured as a constant. Anything else is
+    /// `None`, for the caller to try a Python number or raise its `TypeError`.
+    pub(crate) fn traced_operand(&self, operand: &Bound<'_, PyAny>) -> Option<PyResult<Self>> {
+        if let Ok(tracer) = operand.extract::<PyRef<'_, TraceTensor>>() {
+            return Some(Ok(tracer.clone()));
+        }
+        let captured = if let Ok(tensor) = operand.extract::<PyRef<'_, PyTensor>>() {
+            self.capture(&tensor)
+        } else if let Ok(view) = operand.extract::<PyRef<'_, PyTensorView>>() {
+            view.materialize().and_then(|tensor| self.capture(&tensor))
+        } else {
+            return None;
+        };
+        Some(captured.map_err(PyValueError::new_err))
+    }
+
+    /// [`Self::traced_operand`] for an operand that must be an array.
+    fn array_operand(&self, operand: &Bound<'_, PyAny>, op: &str) -> PyResult<Self> {
+        self.traced_operand(operand).unwrap_or_else(|| {
+            Err(PyTypeError::new_err(format!(
+                "{op} expects a TraceTensor or Tensor operand"
+            )))
+        })
     }
 
     pub(crate) fn scalar_tensor(&self, value: f64) -> Result<Self, String> {
@@ -2202,7 +2253,7 @@ impl TensorTraceGraph {
     }
 
     /// `inline_into` for `quabla._transforms`: each binding is a tracer of
-    /// the enclosing trace or a Python number.
+    /// the enclosing trace, a Python number, or an eager array.
     #[pyo3(name = "_inline")]
     fn py_inline(
         &self,
@@ -2215,13 +2266,18 @@ impl TensorTraceGraph {
             .map(|binding| {
                 if let Ok(tensor) = binding.extract::<TraceTensor>() {
                     Ok(InlineBinding::Traced(tensor))
+                } else if let Ok(tensor) = binding.extract::<PyRef<'_, PyTensor>>() {
+                    // Checked before numbers: a single-element Tensor also
+                    // converts to f64, which would drop its dtype.
+                    Ok(InlineBinding::Constant(
+                        tensor.to_dynamic_tensor().map_err(PyValueError::new_err)?,
+                    ))
                 } else if binding.is_instance_of::<PyFloat>() || binding.is_instance_of::<PyInt>() {
-                    // Python numbers only: an eager Tensor also converts to
-                    // f64, but arrays are not captured as constants.
                     Ok(InlineBinding::Scalar(binding.extract::<f64>()?))
                 } else {
                     Err(PyTypeError::new_err(format!(
-                        "an inline binding must be a TraceTensor or a Python number, got {}",
+                        "an inline binding must be a TraceTensor, a Tensor, or a Python number, \
+                         got {}",
                         binding.get_type().name()?
                     )))
                 }
@@ -2473,9 +2529,9 @@ impl TraceTensor {
     }
 
     fn __matmul__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let rhs = rhs
-            .extract::<PyRef<'_, TraceTensor>>()
-            .map_err(|_| traced_operand_error(rhs, "expected a TraceTensor matmul operand"))?;
+        let rhs = self.traced_operand(rhs).ok_or_else(|| {
+            PyTypeError::new_err("expected a TraceTensor or Tensor matmul operand")
+        })??;
         self.matmul_tensor(&rhs).map_err(PyValueError::new_err)
     }
 
@@ -2483,22 +2539,29 @@ impl TraceTensor {
         self.__matmul__(rhs)
     }
 
-    /// `a @ x` with an eager `a` reaches here after `Tensor.__matmul__`
-    /// declines the tracer; it can only be a mix of the two kinds.
+    /// `a @ x` for an operand `a` whose `__matmul__` declined the tracer,
+    /// such as a `TensorView`, which is captured as a constant.
     fn __rmatmul__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<Self> {
-        Err(traced_operand_error(
-            lhs,
-            "expected a TraceTensor matmul operand",
-        ))
+        let lhs = self.traced_operand(lhs).ok_or_else(|| {
+            PyTypeError::new_err("expected a TraceTensor or Tensor matmul operand")
+        })??;
+        lhs.matmul_tensor(self).map_err(PyValueError::new_err)
     }
 
-    fn solve(&self, rhs: &Self) -> PyResult<Self> {
-        self.solve_tensor(rhs).map_err(PyValueError::new_err)
+    fn solve(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let rhs = self.array_operand(rhs, "solve")?;
+        self.solve_tensor(&rhs).map_err(PyValueError::new_err)
     }
 
     #[pyo3(signature = (rhs, lower = true, transpose = false))]
-    fn solve_triangular(&self, rhs: &Self, lower: bool, transpose: bool) -> PyResult<Self> {
-        self.solve_triangular_tensor(rhs, lower, transpose)
+    fn solve_triangular(
+        &self,
+        rhs: &Bound<'_, PyAny>,
+        lower: bool,
+        transpose: bool,
+    ) -> PyResult<Self> {
+        let rhs = self.array_operand(rhs, "solve_triangular")?;
+        self.solve_triangular_tensor(&rhs, lower, transpose)
             .map_err(PyValueError::new_err)
     }
 
@@ -2560,13 +2623,15 @@ impl TraceTensor {
         slf.as_ptr() as isize
     }
 
-    fn logical_and(&self, rhs: &Self) -> PyResult<Self> {
-        self.logical_tensor(rhs, true)
+    fn logical_and(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let rhs = self.array_operand(rhs, "logical_and")?;
+        self.logical_tensor(&rhs, true)
             .map_err(PyValueError::new_err)
     }
 
-    fn logical_or(&self, rhs: &Self) -> PyResult<Self> {
-        self.logical_tensor(rhs, false)
+    fn logical_or(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let rhs = self.array_operand(rhs, "logical_or")?;
+        self.logical_tensor(&rhs, false)
             .map_err(PyValueError::new_err)
     }
 
@@ -2574,12 +2639,24 @@ impl TraceTensor {
         self.logical_not_tensor().map_err(PyValueError::new_err)
     }
 
-    fn __and__(&self, rhs: &Self) -> PyResult<Self> {
+    fn __and__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
         self.logical_and(rhs)
     }
 
-    fn __or__(&self, rhs: &Self) -> PyResult<Self> {
+    fn __or__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
         self.logical_or(rhs)
+    }
+
+    fn __rand__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let lhs = self.array_operand(lhs, "logical_and")?;
+        lhs.logical_tensor(self, true)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn __ror__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let lhs = self.array_operand(lhs, "logical_or")?;
+        lhs.logical_tensor(self, false)
+            .map_err(PyValueError::new_err)
     }
 
     fn __invert__(&self) -> PyResult<Self> {
@@ -2607,33 +2684,37 @@ impl TraceTensor {
     }
 
     fn maximum(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
-        if let Ok(rhs) = rhs.extract::<PyRef<'_, TraceTensor>>() {
-            return self.maximum_tensor(&rhs).map_err(PyValueError::new_err);
+        if let Some(rhs) = self.traced_operand(rhs) {
+            return self.maximum_tensor(&rhs?).map_err(PyValueError::new_err);
         }
         if let Some(rhs) = extract_scalar(rhs) {
             return self.maximum_scalar(rhs).map_err(PyValueError::new_err);
         }
-        Err(traced_operand_error(
-            rhs,
-            "expected TraceTensor or numeric scalar operand",
+        Err(PyTypeError::new_err(
+            "expected a TraceTensor, Tensor, or numeric scalar operand",
         ))
     }
 
     fn minimum(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
-        if let Ok(rhs) = rhs.extract::<PyRef<'_, TraceTensor>>() {
-            return self.minimum_tensor(&rhs).map_err(PyValueError::new_err);
+        if let Some(rhs) = self.traced_operand(rhs) {
+            return self.minimum_tensor(&rhs?).map_err(PyValueError::new_err);
         }
         if let Some(rhs) = extract_scalar(rhs) {
             return self.minimum_scalar(rhs).map_err(PyValueError::new_err);
         }
-        Err(traced_operand_error(
-            rhs,
-            "expected TraceTensor or numeric scalar operand",
+        Err(PyTypeError::new_err(
+            "expected a TraceTensor, Tensor, or numeric scalar operand",
         ))
     }
 
-    fn where_select(&self, on_true: &Self, on_false: &Self) -> PyResult<Self> {
-        self.where_tensor(on_true, on_false)
+    fn where_select(
+        &self,
+        on_true: &Bound<'_, PyAny>,
+        on_false: &Bound<'_, PyAny>,
+    ) -> PyResult<Self> {
+        let on_true = self.array_operand(on_true, "where")?;
+        let on_false = self.array_operand(on_false, "where")?;
+        self.where_tensor(&on_true, &on_false)
             .map_err(PyValueError::new_err)
     }
 
@@ -2727,13 +2808,14 @@ impl TraceTensor {
     fn scatter_add(
         &self,
         indices: &Bound<'_, PyAny>,
-        updates: &Self,
+        updates: &Bound<'_, PyAny>,
         axis: isize,
     ) -> PyResult<Self> {
         let actual_axis = usize::try_from(self.example_axis(axis).map_err(PyValueError::new_err)?)
             .map_err(|_| PyValueError::new_err("normalized tensor axis is negative"))?;
         let indices = parse_axis_indices(indices, self.shape[actual_axis])?;
-        self.scatter_add_tensor(&indices, updates, axis)
+        let updates = self.array_operand(updates, "scatter_add")?;
+        self.scatter_add_tensor(&indices, &updates, axis)
             .map_err(PyValueError::new_err)
     }
 
@@ -2801,20 +2883,76 @@ impl TraceTensor {
     }
 }
 
+/// A binary operation of two traced values, which an eager `Tensor` method
+/// forwards to its traced operand after capturing itself as a constant.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TracedBinary {
+    /// An op name of [`TraceTensor::binary`].
+    Arithmetic(&'static str),
+    Compare(TensorComparison),
+    Maximum,
+    Minimum,
+    Matmul,
+    Solve,
+    SolveTriangular {
+        lower: bool,
+        transpose: bool,
+    },
+    Logical {
+        and: bool,
+    },
+}
+
+impl TracedBinary {
+    fn apply(self, lhs: &TraceTensor, rhs: &TraceTensor) -> Result<TraceTensor, String> {
+        match self {
+            Self::Arithmetic(op) => lhs.binary(rhs, op),
+            Self::Compare(kind) => lhs.compare_tensor(rhs, kind),
+            Self::Maximum => lhs.maximum_tensor(rhs),
+            Self::Minimum => lhs.minimum_tensor(rhs),
+            Self::Matmul => lhs.matmul_tensor(rhs),
+            Self::Solve => lhs.solve_tensor(rhs),
+            Self::SolveTriangular { lower, transpose } => {
+                lhs.solve_triangular_tensor(rhs, lower, transpose)
+            }
+            Self::Logical { and } => lhs.logical_tensor(rhs, and),
+        }
+    }
+}
+
+/// `eager op tracer` (or `tracer op eager` when `eager_first` is false) for
+/// an eager `Tensor` method whose `operand` is a tracer: the tensor becomes a
+/// constant of the tracer's graph. `None` when `operand` is not a tracer.
+pub(crate) fn eager_traced_binary(
+    eager: &PyTensor,
+    operand: &Bound<'_, PyAny>,
+    op: TracedBinary,
+    eager_first: bool,
+) -> Option<PyResult<TraceTensor>> {
+    let tracer = operand.extract::<PyRef<'_, TraceTensor>>().ok()?;
+    let result = tracer.capture(eager).and_then(|constant| {
+        if eager_first {
+            op.apply(&constant, &tracer)
+        } else {
+            op.apply(&tracer, &constant)
+        }
+    });
+    Some(result.map_err(PyValueError::new_err))
+}
+
 fn trace_tensor_or_scalar_operand(
     lhs: &TraceTensor,
     rhs: &Bound<'_, PyAny>,
     op: &str,
 ) -> PyResult<TraceTensor> {
-    if let Ok(rhs) = rhs.extract::<PyRef<'_, TraceTensor>>() {
-        return lhs.binary(&rhs, op).map_err(PyValueError::new_err);
+    if let Some(rhs) = lhs.traced_operand(rhs) {
+        return lhs.binary(&rhs?, op).map_err(PyValueError::new_err);
     }
     if let Some(value) = extract_scalar(rhs) {
         return lhs.scalar_binary(value, op).map_err(PyValueError::new_err);
     }
-    Err(traced_operand_error(
-        rhs,
-        "expected a TraceTensor or numeric scalar operand",
+    Err(PyTypeError::new_err(
+        "expected a TraceTensor, Tensor, or numeric scalar operand",
     ))
 }
 
@@ -2845,9 +2983,9 @@ fn trace_compare_operand(
     rhs: &Bound<'_, PyAny>,
     kind: TensorComparison,
 ) -> PyResult<TraceTensor> {
-    if let Ok(rhs) = rhs.extract::<PyRef<'_, TraceTensor>>() {
+    if let Some(rhs) = lhs.traced_operand(rhs) {
         return lhs
-            .compare_tensor(&rhs, kind)
+            .compare_tensor(&rhs?, kind)
             .map_err(PyValueError::new_err);
     }
     if let Some(value) = extract_scalar(rhs) {
@@ -2855,22 +2993,23 @@ fn trace_compare_operand(
             .compare_scalar(value, kind)
             .map_err(PyValueError::new_err);
     }
-    Err(traced_operand_error(
-        rhs,
-        "expected a TraceTensor or numeric scalar operand",
+    Err(PyTypeError::new_err(
+        "expected a TraceTensor, Tensor, or numeric scalar operand",
     ))
 }
 
+/// A reflected op (`lhs op rhs` with a traced `rhs`), reached when `lhs`
+/// declined it: a Python number, or an eager array captured as a constant.
 fn trace_scalar_left_operand(
     rhs: &TraceTensor,
     lhs: &Bound<'_, PyAny>,
     op: &str,
 ) -> PyResult<TraceTensor> {
+    if let Some(lhs) = rhs.traced_operand(lhs) {
+        return lhs?.binary(rhs, op).map_err(PyValueError::new_err);
+    }
     let value = extract_scalar(lhs).ok_or_else(|| {
-        traced_operand_error(
-            lhs,
-            "expected a numeric scalar as the left TraceTensor operand",
-        )
+        PyTypeError::new_err("expected a Tensor or numeric scalar as the left TraceTensor operand")
     })?;
     rhs.scalar_left_binary(value, op)
         .map_err(PyValueError::new_err)

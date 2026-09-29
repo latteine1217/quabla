@@ -85,28 +85,36 @@ fn py_where(
         return Ok(output.into_pyobject(py)?.into_any().unbind());
     }
 
-    if let Ok(mask) = mask.extract::<PyRef<'_, TraceTensor>>() {
+    // A traced operand anywhere traces the selection: eager arrays become constants of its
+    // graph and scalar branches stay weak.
+    let tracer = [mask, on_true, on_false]
+        .into_iter()
+        .find_map(|value| value.extract::<TraceTensor>().ok());
+    if let Some(tracer) = tracer {
         let traced_branch = |value: &Bound<'_, PyAny>| -> Option<PyResult<TraceTensor>> {
-            if let Ok(tensor) = value.extract::<PyRef<'_, TraceTensor>>() {
-                return Some(Ok(tensor.clone()));
-            }
-            tensor::extract_scalar(value).map(|value| {
-                mask.scalar_tensor(value)
-                    .map_err(pyo3::exceptions::PyValueError::new_err)
+            tracer.traced_operand(value).or_else(|| {
+                tensor::extract_scalar(value).map(|value| {
+                    tracer
+                        .scalar_tensor(value)
+                        .map_err(pyo3::exceptions::PyValueError::new_err)
+                })
             })
         };
-        if let (Some(on_true), Some(on_false)) = (traced_branch(on_true), traced_branch(on_false)) {
-            let output = mask
+        if let (Some(mask), Some(on_true), Some(on_false)) = (
+            tracer.traced_operand(mask),
+            traced_branch(on_true),
+            traced_branch(on_false),
+        ) {
+            let output = mask?
                 .where_tensor(&on_true?, &on_false?)
                 .map_err(pyo3::exceptions::PyValueError::new_err)?;
             return Ok(output.into_pyobject(py)?.into_any().unbind());
         }
     }
 
-    Err(errors::operands_error(
-        &[mask, on_true, on_false],
+    Err(pyo3::exceptions::PyTypeError::new_err(
         "where expects three Matrix or TraceMatrix operands, or a Tensor or TraceTensor mask \
-         with same-kind or numeric scalar branches",
+         with Tensor, TraceTensor, or numeric scalar branches",
     ))
 }
 
@@ -244,20 +252,7 @@ fn py_concat(py: Python<'_>, matrices: &Bound<'_, PySequence>, axis: usize) -> P
         return Ok(output.into_pyobject(py)?.into_any().unbind());
     }
 
-    let mut trace_tensors = Vec::with_capacity(len);
-    let mut all_trace_tensors = true;
-    for index in 0..len {
-        let item = matrices.get_item(index)?;
-        match item.extract::<PyRef<'_, TraceTensor>>() {
-            Ok(tensor) => trace_tensors.push(tensor.clone()),
-            Err(_) => {
-                all_trace_tensors = false;
-                break;
-            }
-        }
-    }
-
-    if all_trace_tensors {
+    if let Some(trace_tensors) = traced_sequence(matrices)? {
         let output = TraceTensor::try_concat(&trace_tensors, axis)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
         return Ok(output.into_pyobject(py)?.into_any().unbind());
@@ -300,21 +295,32 @@ fn py_stack(py: Python<'_>, tensors: &Bound<'_, PySequence>, axis: isize) -> PyR
         return Ok(output.into_pyobject(py)?.into_any().unbind());
     }
 
-    let mut traced = Vec::with_capacity(len);
-    for index in 0..len {
-        let tensor = tensors
-            .get_item(index)?
-            .extract::<PyRef<'_, TraceTensor>>()
-            .map_err(|_| {
-                pyo3::exceptions::PyTypeError::new_err(
-                    "stack expects only Tensor or TraceTensor operands",
-                )
-            })?;
-        traced.push(tensor.clone());
-    }
+    let traced = traced_sequence(tensors)?.ok_or_else(|| {
+        pyo3::exceptions::PyTypeError::new_err("stack expects only Tensor or TraceTensor operands")
+    })?;
     let output =
         TraceTensor::try_stack(&traced, axis).map_err(pyo3::exceptions::PyValueError::new_err)?;
     Ok(output.into_pyobject(py)?.into_any().unbind())
+}
+
+/// The items of a sequence holding at least one tracer as values of that
+/// tracer's graph, with eager `Tensor` and `TensorView` items captured as
+/// constants. `None` when there is no tracer or another kind of item.
+fn traced_sequence(items: &Bound<'_, PySequence>) -> PyResult<Option<Vec<TraceTensor>>> {
+    let items = (0..items.len()?)
+        .map(|index| items.get_item(index))
+        .collect::<PyResult<Vec<_>>>()?;
+    let Some(tracer) = items
+        .iter()
+        .find_map(|item| item.extract::<TraceTensor>().ok())
+    else {
+        return Ok(None);
+    };
+    items
+        .iter()
+        .map(|item| tracer.traced_operand(item))
+        .collect::<Option<PyResult<Vec<_>>>>()
+        .transpose()
 }
 
 #[pyfunction(name = "einsum")]
@@ -349,18 +355,20 @@ fn py_einsum(
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
         return Ok(output.into_pyobject(py)?.into_any().unbind());
     }
-    if let (Ok(lhs), Ok(rhs)) = (
-        lhs.extract::<PyRef<'_, TraceTensor>>(),
-        rhs.extract::<PyRef<'_, TraceTensor>>(),
-    ) {
-        let output = lhs
-            .try_matmul(&rhs)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        return Ok(output.into_pyobject(py)?.into_any().unbind());
+    let tracer = [&lhs, &rhs]
+        .into_iter()
+        .find_map(|value| value.extract::<TraceTensor>().ok());
+    if let Some(tracer) = tracer {
+        if let (Some(lhs), Some(rhs)) = (tracer.traced_operand(&lhs), tracer.traced_operand(&rhs)) {
+            let output = lhs?
+                .try_matmul(&rhs?)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            return Ok(output.into_pyobject(py)?.into_any().unbind());
+        }
     }
 
     Err(pyo3::exceptions::PyTypeError::new_err(
-        "einsum expects two Tensor or two TraceTensor operands",
+        "einsum expects two Tensor or TraceTensor operands",
     ))
 }
 

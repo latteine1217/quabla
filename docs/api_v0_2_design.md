@@ -647,6 +647,7 @@ The gates are those under "Development Gates" (`CONTRIBUTING.md:18-35`), with
 | **S1b Pow op** | elementwise `Pow` IR op with JVP/VJP/HVP rules, CPU/CUDA/MLX lowering, fusion and CSE handling, `qb.power`, tracer `x ** y` for non-integer and tensor exponents | **core** | `core/tensor_ir.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/tensor_trace.rs` | finite-difference checks for both operands incl. negative base, zero base, and integer-valued float exponents; CPU/MLX/CUDA parity; `powi` path unchanged for integer exponents. Landed: the conventions of §3.2, eager `Tensor ** Tensor` and `c ** Tensor`, and `qb.power` | NaN/inf conventions at `x <= 0`; derivative at `x == 0`; the symbolic Hessian of a loss whose value is infinite was NaN because the reverse pass of `sum`/`mean` broadcast its cotangent with `powi(v - v, 0)` (predates `Pow`); resolved by broadcasting a constant ones tensor, so symbolic and runtime Hessians agree there |
 | **S2 CPU transforms** | `grad`, `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `jit(device="cpu")`, pytrees, `argnums`, `has_aux`, cache and `RetraceLimitError`, `quabla.tree` | bridge (tuple outputs from traces) + core (`symbolic_vjp_many`) | `py/tensor_trace.rs:4375-4399`, `python/quabla/_transforms.py` | parity against `tensor_*_fn` on shared fixtures; retrace-bound tests; float32 keeps float32. Landed as described in "S2 as landed" below | Python overhead on tiny graphs (3 µs vs 17 µs, Exp 4) |
 | **S3 Composition** | `TensorIr::inline` + bridge binding; nested transforms; README PINN example | **core** | `core/tensor_ir.rs`, `py/tensor_trace.rs`, `python/quabla/_transforms.py` | Rust tests for inline, including `Cond`/`Fori`/`Scan` regions; `grad(grad)` vs exact; README example reproduces `w = 3.141593`. Landed as described in "S3 as landed" below | shared-subexpression duplication after inlining (freeze already commons pure nodes, `docs/api.md:352-353`) |
+| **S3b Constant capture** | eager arrays that meet a tracer become `TensorOp::Constant` graph nodes: closures over arrays, eager operands of traced ops and module functions, and eager arguments, tangents, and cotangents of inlined calls | **core** + bridge | `core/tensor_ir.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/tensor.rs`, `py/tensor_trace.rs`, `py/lib.rs`, `python/quabla/_transforms.py` | Rust tests for evaluation, dtype, folding, CSE, AD, inline, and lowering text; MLX parity; CUDA parity with an upload count; the issue repros, including the PINN with eager forcing terms reproducing `w = 3.141593`. Landed as described in "S3b as landed" below | graph and plan size grow with captured data; CUDA device loops reject captured arrays in their bodies |
 | **S4 vmap** | `vmap(in_axes, out_axes)` over pytrees; `vmap(grad)`; rejection of unmapped per-example gradients and nested vmap | bridge | `py/tensor_trace.rs:4490-4594` | parity with `tensor_vmap_{,jvp_,vjp_,hvp_scalar_}fn` | `out_axes` pytrees vs the single `out_axis` today |
 | **S5 Devices and errors** | `jit(device=...)`, `"cuda:N"`, `devices()`, `lower()`/`ShapeDtype`, error hierarchy, typed lowering rejections, eager MLX validation, `float64`-on-device warning | **core** (errors, MLX validation) | `core/compiler.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/compiler.rs` | `QUABLA_MLX_TEST=1` suite on macOS; `QUABLA_CUDA_TEST=1` on the CUDA host; unbuilt-target error test in CI | MLX lock discipline for new entrypoints (`core/tensor_ir/mlx.rs:43`) |
 | **S6 Optim and Trainer** | `optim.Adam`/`SGD` (pure), `Trainer` on CPU/MLX/CUDA; `quabla.Adam` alias | none | `python/quabla/optim.py` | `benchmark_pinn_mlx.py` and `benchmark_pinn_cuda.py` with old and new APIs on the same host: step time within 2%; convergence parity with `examples/pinn_poisson_mlx.py` | parameter naming mismatches between pytree paths and the factories' name lists |
@@ -655,10 +656,12 @@ The gates are those under "Development Gates" (`CONTRIBUTING.md:18-35`), with
 | **S9 Deprecation and docs** | `__getattr__` warnings, `quabla.legacy`, `grad`/`jit` dual dispatch, README/api.md/examples/CHANGELOG/CONTRIBUTING | none | `python/quabla/{__init__,legacy,_compat}.py`, docs | each deprecated name warns exactly once and returns the v0.1 object; the old suite passes with warnings ignored; README snippets run as tests | warnings in users' `-W error` CI (intended) |
 | S10 (optional) | identity-based input retention in device `jit` | bridge | `py/tensor_trace.rs:2634-2660, 2893-2941` | benchmark shows no re-upload for static inputs | cache invalidation if storage ever becomes mutable |
 
-Rust summary: S1b (`Pow`), S2 (`symbolic_vjp_many`), S3 (inline), and S5
-(typed errors, MLX validation) touch the core; S0, S1, S4, and S7 touch only
-the bridge; S6, S8, and S9 are pure Python. The critical path is S0 → S2 → S3. S1 can run in parallel with S2,
-and S5 through S8 are independent after S3.
+Rust summary: S1b (`Pow`), S2 (`symbolic_vjp_many`), S3 (inline), S3b
+(`Constant`), and S5 (typed errors, MLX validation) touch the core; S0, S1,
+S4, and S7 touch only the bridge; S6, S8, and S9 are pure Python. The
+critical path is S0 → S2 → S3 → S3b. S1 can run in parallel with S2, and S4
+through S8 are independent after S3b. S3b was added after S3 landed: the
+accepted design assigned constant capture to no slice.
 
 **S2 as landed.** `python/quabla/_transforms.py` implements §3.3 on the
 CPU; deviations and refinements of this document:
@@ -706,12 +709,10 @@ CPU; deviations and refinements of this document:
 - **Tracer errors.** `TraceTensor` raises `TracerError` for Python control
   flow, `float()`, `int()`, use as an index, `item()`, `tolist()`,
   `numpy()`, and `__array__`, so `np.asarray(tracer)` and NumPy ufuncs no
-  longer build object arrays. Constant capture of eager arrays is in no
-  slice of this design, so an eager `Tensor` or `TensorView` meeting a tracer
-  in arithmetic, comparisons, `maximum`/`minimum`, `**`, `@`/`matmul`, or
-  `where` raises `TracerError` asking to pass the array as an argument;
-  other invalid operands keep their `TypeError`. The extension imports the
-  class from `quabla._errors`.
+  longer build object arrays. An eager `Tensor` or `TensorView` meeting a
+  tracer raised `TracerError` asking to pass the array as an argument until
+  S3b captured it as a constant; other invalid operands keep their
+  `TypeError`. The extension imports the class from `quabla._errors`.
 - **Overhead** (Apple silicon, `timeit` minimum, README "At a Glance" loss
   with `u_xx` written analytically, since nesting is S3): `jit(loss)(x, w)`
   3.1 µs against 1.5 µs for `tensor_jit_fn({...})`, of which the argument
@@ -742,8 +743,8 @@ CPU; deviations and refinements of this document:
   signature in a separate cache bounded by the same `max_traces`, and
   `TensorTraceGraph._inline` splices it into the enclosing trace. Python
   scalars in differentiated positions and Python number tangents and
-  cotangents bind as constants of the input dtype; eager arrays raise
-  `TracerError`, since constants are not captured. `grad`,
+  cotangents bind as constants of the input dtype; eager arrays raised
+  `TracerError` until S3b bound them as constants too. `grad`,
   `value_and_grad` (with `has_aux`), `jvp` (traced or number tangents),
   `vjp` (its pullback inlines the reverse graph on each call), and
   `jit(transform)` compose this way; `jit` of a plain function still
@@ -776,6 +777,70 @@ CPU; deviations and refinements of this document:
   the per-point README loss takes 10.4 µs (vectorized form 5.3 µs) against
   15.1 µs for the README's `plan.evaluate_value_and_vjp`; the first call,
   which stages `u_xx` once, inlines it 8 times, and compiles, takes 0.35 ms.
+
+**S3b as landed.** Constant capture, added as its own slice before `vmap`:
+
+- **Core.** `TensorOp::Constant` holds an `Arc`-shared `DynamicTensor`
+  whose shape and dtype are the node's; `TensorIr::constant(value, weak)`
+  adds one. An eager array is strong (D1), so a `float64` constant meeting a
+  `float32` tracer is the usual dtype error asking for `astype`; only an
+  eager value that is itself weak (a `bool` mask times a Python scalar)
+  stays weak. The tangent is a zero of the constant's dtype and no
+  cotangent flows into it. Transforms, `inline`, plan freezing, and region
+  plans share the data instead of copying it. `lower_text` prints
+  `constant[dense] : tensor<...>` without the elements; `stablehlo_text`
+  rejects array constants as it rejects scalar constants, since a StableHLO
+  constant must embed its data. The buffer plan treats a constant like an
+  input: resident, without a recycled slot.
+- **Folding and CSE.** Plan compilation folds the ops that scalar folding
+  covers (`add`, `sub`, `mul`, `div`, `greater`, comparisons, `cast`, `tanh`,
+  `exp`, `sin`, `cos`, `powi`, `pow`, `log`) when every operand is a
+  constant and one is an array, with the CPU evaluator's own kernels, then
+  rounds to the node dtype, so the folded value equals per-node execution.
+  An op the evaluator rejects (a zero divisor, a non-positive logarithm) is
+  left to fail at execution. Constants are deduplicated by value: a hash of
+  shape, dtype, and element bits selects candidates that are compared
+  bitwise, so `-0.0` and `0.0` and NaNs with different payloads stay apart,
+  weakness is part of the identity, and no key is formatted from the
+  elements. Identity-based CSE was rejected because an array captured by
+  two operations is copied twice and would stay duplicated.
+- **Backends.** The whole-plan fused elementwise kernel binds only inputs,
+  so a plan with an array constant runs the per-node program on CPU and
+  CUDA, where fusion regions read the constant as a leaf. CUDA uploads each
+  constant on the plan's first execution into a device buffer that no
+  execution writes, recycles, or releases (`CudaExecutionPlan::
+  constant_upload_count` stays at the number of constants); a `Cond` region
+  plan keeps its own copy and copies it into the parent buffer when the
+  region returns it. CUDA `fori`/`scan` device loops compile their body into
+  one expression over parent captures, so a constant in a loop body is
+  rejected with an explicit error (pass the array as an operand). MLX
+  creates and evaluates each constant's array once, on first use under the
+  MLX execution lock, and every plan holding that constant reuses it.
+- **Bridge and Python.** `TraceTensor` operands accept eager arrays in
+  arithmetic (both orders), comparisons, `**`, `@`, `maximum`/`minimum`,
+  `where_select`, `solve`, `solve_triangular`, `logical_and`/`logical_or`
+  (`&`, `|`), and `scatter_add` updates. Eager `Tensor` methods with a
+  tracer operand capture themselves and return a tracer (the tracer check
+  precedes the `float()` conversion of the scalar branch); `@`, `&`, and
+  `|` still return `NotImplemented` for foreign operands. `where`,
+  `concat`, `stack`, and `einsum` capture eager items next to a tracer, and
+  `_ops.py` reaches the methods. Eager arguments of an inlined transformed
+  call, eager `jvp` tangents and `vjp` cotangents, and an eager `vjp`
+  pullback called on a traced cotangent (the reverse graph is inlined with
+  the primals as constants) bind as constants. Python scalars are
+  unchanged. `TracerError` remains for tracer escapes only.
+- **Caching.** As with `jax.jit`, captured values are baked in at trace
+  time. Tensors are immutable, so only rebinding a closed-over name could
+  change them, and a cached trace does not retrace for it. Each capture
+  copies the data into the graph; equal constants merge in the compiled
+  plan, but large captured arrays grow graph memory and compile time, so
+  large or changing data belongs in the arguments.
+- **Notes for S4.** Constants carry no batch axis and broadcast against a
+  batched tracer like unmapped values. A NumPy array is not captured
+  directly (`np_array * tracer` lets NumPy convert the tracer, which raises
+  `TracerError`); convert it with `quabla.asarray` first. The same eager
+  array captured several times in one trace is copied each time and merged
+  only at plan compilation.
 
 ## 7. Resolved Questions
 

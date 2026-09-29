@@ -16,7 +16,9 @@ derivative. A function may be traced at most `max_traces` times (8 unless
 `jit` sets it) before `RetraceLimitError`; the cache never evicts.
 
 Values that the function reads from its closure or from globals are baked
-into the trace, as with `jax.jit`: pass values that change as arguments.
+into the trace, as with `jax.jit`: an eager array that meets a traced value
+becomes a constant of the graph (slice S3b), so rebinding the name after the
+first call does not retrace. Pass values that change as arguments.
 
 Composition works by staging (slice S3, design 3.4 and D8). A transform
 whose function is itself a transform (`grad(grad(f))`, `jvp(grad(f), ...)`,
@@ -36,7 +38,7 @@ import weakref
 
 from . import _quabla
 from ._array import asarray, eye, zeros
-from ._errors import RetraceLimitError, TracerError, UnsupportedOperationError
+from ._errors import RetraceLimitError, UnsupportedOperationError
 from ._quabla import Tensor, TensorTraceGraph, TraceTensor, bool_, stack
 from .tree import _LEAF, _flatten, _leaf_count, _leaf_paths, _unflatten
 
@@ -160,13 +162,6 @@ def _signature(args, static_argnums, converted_argnums):
     return in_node, leaves, arrays, (in_node, tuple(key)), traced
 
 
-_EAGER_IN_TRACE = (
-    "cannot pass an eager array to a transformed function called on traced values: traced "
-    "functions do not capture arrays as constants yet; pass the array as an argument of the "
-    "outer transformed function (it becomes a graph input), or use a Python scalar"
-)
-
-
 def _traced_signature(args, static_argnums, converted_argnums):
     """Flattens a call whose arguments hold tracers of an enclosing trace.
 
@@ -175,8 +170,8 @@ def _traced_signature(args, static_argnums, converted_argnums):
     Python scalar in a differentiated position becomes a `float64` array
     leaf as in `_signature`; `bindings` holds, per array leaf in order, the
     value its callee input is bound to when the callee is inlined: the
-    tracer, or the Python scalar as a constant. Eager arrays cannot be bound,
-    since constants are not captured.
+    tracer, or the Python scalar or eager array as a constant of the
+    enclosing trace.
     """
     leaves = []
     nodes = []
@@ -208,8 +203,8 @@ def _traced_signature(args, static_argnums, converted_argnums):
                 bindings.append(leaf)
                 leaf = leaves[position] = asarray(leaf)
             else:
-                _as_array_leaf(leaf)
-                raise TracerError(_EAGER_IN_TRACE)
+                leaf = leaves[position] = _as_array_leaf(leaf)
+                bindings.append(leaf)
             key.append((tuple(leaf.shape), leaf.dtype))
     in_node = (tuple, tuple(nodes))
     return in_node, leaves, (in_node, tuple(key)), bindings
@@ -331,16 +326,16 @@ def _splice(staged, bindings):
 
 def _traced_like(value, shape, dtype, what):
     """`value` as an inline binding for a callee input of `shape` and `dtype`:
-    a tracer of the enclosing trace, or a Python number for a scalar input,
+    a tracer of the enclosing trace, a Python number for a scalar input,
     which the bridge binds as a constant of `dtype` (as `_as_like` adopts the
-    primal dtype for a number)."""
+    primal dtype for a number), or an eager array, bound as a constant."""
     if type(value) is TraceTensor:
         actual_shape, actual_dtype = value.shape, value.dtype
     elif type(value) in _STATIC_TYPES:
         actual_shape, actual_dtype = [], dtype
     else:
-        _as_array_leaf(value)
-        raise TracerError(_EAGER_IN_TRACE)
+        value = _as_array_leaf(value)
+        actual_shape, actual_dtype = value.shape, value.dtype
     if actual_shape != shape or actual_dtype != dtype:
         raise TypeError(
             f"{what} must have shape {shape} and dtype {dtype!r} to match its primal, got "
@@ -682,12 +677,6 @@ def _as_like(value, shape, dtype, what):
     scalar that adopts `dtype`, every other value must match it exactly."""
     if type(value) in _STATIC_TYPES:
         value = asarray(value, dtype)
-    elif _is_traced(value):
-        raise TracerError(
-            f"{what} is traced but its primals are eager arrays: traced functions do not "
-            "capture arrays as constants yet; pass the primals as arguments of the outer "
-            "transformed function"
-        )
     else:
         value = _as_array_leaf(value)
     if value.shape != shape or value.dtype != dtype:
@@ -824,19 +813,24 @@ class VjpFunction:
     """The pullback returned by `quabla.vjp`: `vjp_fun(cotangent)` maps a
     cotangent shaped like the primal output to one cotangent pytree per
     primal. Each call evaluates the forward pass again (no residuals are
-    stored)."""
+    stored). Called on a traced cotangent inside another transform, it
+    inlines the reverse-mode graph with the eager primals as constants."""
 
-    __slots__ = ("_program", "_arrays")
+    __slots__ = ("_program", "_arrays", "_transform", "_primals")
 
-    def __init__(self, program, arrays):
+    def __init__(self, program, arrays, transform, primals):
         self._program = program
         self._arrays = arrays
+        self._transform = transform
+        self._primals = primals
 
     def __call__(self, cotangent):
         program = self._program
         cotangent_leaves = []
         if _flatten(cotangent, cotangent_leaves) != program.out_node:
             raise ValueError("the cotangent must have the pytree structure of the primal output")
+        if any(_is_traced(leaf) for leaf in cotangent_leaves):
+            return self._transform._traced_pullback(self._primals)(cotangent)
         inputs = list(self._arrays)
         for position, shape, dtype in program.cotangent_specs:
             inputs.append(_as_like(cotangent_leaves[position], shape, dtype, "a vjp cotangent"))
@@ -893,11 +887,21 @@ class _Vjp(_Transform):
         else:
             entry = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
             result = entry.forward.run(arrays)
-            pullback = VjpFunction(entry, arrays)
+            pullback = VjpFunction(entry, arrays, self, primals)
         if self._has_aux:
             out, aux = result
             return out, pullback, aux
         return result, pullback
+
+    def _traced_pullback(self, primals):
+        """The pullback at eager `primals` for a traced cotangent: the staged
+        reverse graph, inlined with the primals bound as constants."""
+        converted = frozenset(range(len(primals)))
+        in_node, leaves, key, bindings = _traced_signature(primals, (), converted)
+        _, reverse, cotangent_specs, out_node = self._inline_cache().lookup(
+            key, lambda: self._stage_vjp(in_node, leaves), self
+        )
+        return _TracedVjpFunction(reverse, cotangent_specs, out_node, bindings)
 
     def _compile(self, in_node, leaves):
         forward, reverse, cotangent_specs, out_node = self._stage_vjp(in_node, leaves)

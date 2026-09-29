@@ -146,20 +146,45 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8)
   value, grad_w = qb.jit(qb.value_and_grad(loss))(qb.array(2.5), x)
   ```
 
-  Arguments of such an inner call must be traced values, Python scalars,
-  or static values; an eager array raises `quabla.TracerError`. The graph
+  Eager array arguments of such an inner call bind as constants. The graph
   grows linearly with the number of inner calls (per-point loops become a
   `vmap` once it lands). `jacobian`/`hessian` cannot be called on traced
   values or transformed further, calls on `vmap` tracers are not
   supported yet, and second-order reverse mode through `fori`/`scan`
   regions is rejected; these raise `quabla.UnsupportedOperationError`
   (the region case a `ValueError`).
+- Closures and constants: an eager array (`Tensor` or `TensorView`,
+  including a result such as `qb.sin(math.pi * 0.3)`) that meets a traced
+  value becomes a constant of the graph. This covers arithmetic in either
+  order, comparisons, `**`, `@`, `maximum`/`minimum`, `where`, `concat`,
+  `stack`, `solve`, the logical ops, and eager arguments, tangents, and
+  cotangents of an inner transformed call, so closures over module-level
+  arrays work:
+
+  ```python
+  points = qb.linspace(0.0, 1.0, 8)
+  f = lambda w: qb.sum(qb.sin(points * w))
+  qb.grad(f)(qb.array(1.0))
+  ```
+
+  As with `jax.jit`, the value is fixed at trace time: rebinding `points`
+  after the first call does not retrace (tensors are immutable, so
+  rebinding is the only change possible); pass data that changes as an
+  argument. A constant keeps its dtype (strong): a `float64` array with a
+  `float32` traced value is a dtype error asking for `astype`, while Python
+  scalars stay weak. Every captured array is stored in the graph, so large
+  ones grow memory and compile time; compiled plans merge equal constants
+  and fold elementwise ops on them. CUDA uploads each constant once per
+  compiled plan, MLX once per constant, and CUDA `fori`/`scan` loop bodies
+  reject captured arrays.
 - `quabla.grad` and `quabla.jit` still accept the legacy 2D forms
   `grad(fn, input_specs, values, output_cotangent)` and `jit(input_specs)`
   and dispatch them to the v0.1 functions below.
 - A `TraceTensor` has no value while it is traced: Python control flow,
   `float()`, `int()`, `item()`, `tolist()`, `numpy()`, and `np.asarray` on
-  it raise `quabla.TracerError`.
+  it raise `quabla.TracerError`. A NumPy array is not captured: as the
+  left operand it converts the tracer and raises `TracerError`, as the
+  right one it is a `TypeError`; convert it with `qb.asarray` first.
 - Errors: `quabla.QuablaError` is the base of `TracerError` (a `TypeError`),
   `RetraceLimitError` (a `ValueError`), and `UnsupportedOperationError` (a
   `ValueError` and `NotImplementedError` with `.op` and `.device`).
@@ -652,9 +677,6 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - StableHLO export (`stablehlo_text`) covers only a small inspection subset
   and is not an execution path.
 - The legacy 2D `Matrix`/`TraceGraph` API is not migrated to the facade.
-- The v0.2 transforms run on the CPU only, cannot yet be nested through a
-  Python function (graph inlining), and do not capture eager `Tensor`
-  constants in a trace: arrays a traced function uses must be arguments
-  (mixing them with tracers raises `quabla.TracerError`).
-  `vmap` is not part of the v0.2 layer yet. `jacobian` and `hessian` are
+- The v0.2 transforms run on the CPU only. `vmap` is not part of the v0.2
+  layer yet. `jacobian` and `hessian` are
   dense and cannot be transformed further.

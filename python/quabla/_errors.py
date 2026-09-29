@@ -31,8 +31,8 @@ class UnsupportedOperationError(QuablaError, ValueError, NotImplementedError):
 
 class TracerError(QuablaError, TypeError):
     """A traced value was used where a concrete value is required: Python
-    control flow, conversion to a Python number or a NumPy array, or mixing
-    with an eager `Tensor` inside a transformed function."""
+    control flow, or conversion to a Python number or a NumPy array. (An
+    eager `Tensor` that meets a traced value is captured as a constant.)"""
 
 
 class RetraceLimitError(QuablaError, ValueError):

@@ -205,14 +205,18 @@ def test_single_element_tensors_stay_tensor_operands():
     def mixed(x):
         return (x * scalar).sum()
 
-    assert_raises(TypeError, qb.tensor_jit_fn, mixed, [("x", [2])])
-    assert_raises(TypeError, qb.tensor_jit_fn, lambda x: (scalar - x).sum(), [("x", [2])])
-    assert_raises(
-        TypeError,
-        qb.tensor_jit_fn,
+    # Traced, the tensor is a strong float32 constant (slice S3b): a float64
+    # tracer rejects it, a float32 tracer keeps float32.
+    for function in [
+        mixed,
+        lambda x: (scalar - x).sum(),
         lambda x: qb.where(x > 0.0, x, scalar).sum(),
-        [("x", [2])],
-    )
+    ]:
+        assert_raises(
+            ValueError, qb.tensor_jit_fn, function, [("x", [2])], match="mismatched dtypes"
+        )
+        compiled = qb.tensor_jit_fn(function, [("x", [2], qb.float32)])
+        assert compiled({"x": qb.array([1.0, 2.0], dtype=qb.float32)}).dtype == qb.float32
 
 
 def test_factories():
@@ -1020,13 +1024,10 @@ def test_transforms_called_on_tracers_inline_their_graphs():
     # A traced cotangent of a nested vjp.
     pullback_grad = qb.grad(lambda c, x: qb.sum(qb.vjp(qb.sin, x)[1](c)[0]))(v, x)
     assert_close(pullback_grad, [math.cos(value) for value in x.tolist()], 1e-14)
-    # With eager primals, a traced cotangent cannot be bound.
-    assert_raises(
-        qb.TracerError,
-        qb.grad(lambda c: qb.sum(qb.vjp(qb.sin, x)[1](c)[0])),
-        v,
-        match="primals are eager arrays",
-    )
+    # With eager primals, a traced cotangent inlines the pullback with the
+    # primals as constants (slice S3b).
+    eager_pullback_grad = qb.grad(lambda c: qb.sum(qb.vjp(qb.sin, x)[1](c)[0]))(v)
+    assert_close(eager_pullback_grad, [math.cos(value) for value in x.tolist()], 1e-14)
 
     # Coordinate derivatives inside a loss, then gradients in the weights,
     # with pytree parameters, has_aux, and a static Python scalar.
@@ -1086,13 +1087,14 @@ def test_inlined_transforms_cache_their_staged_graph_and_reject_unsupported_call
     assert_raises(
         qb.UnsupportedOperationError, qb.grad(lambda x: qb.sum(qb.jacobian(qb.sin)(x))), x
     )
-    # Eager arrays are not captured; vmap composition is slice S4.
-    assert_raises(
-        qb.TracerError, qb.jit(lambda x: qb.grad(u)(x[0], w)), x, match="eager array"
-    )
+    # Eager arguments and tangents of an inner call bind as constants (S3b);
+    # vmap composition is slice S4.
+    assert_close(qb.jit(lambda x: qb.grad(u)(x[0], w))(x), 1.5 * math.cos(0.15), 1e-14)
     v_eager = qb.array([1.0, 1.0, 1.0])
-    assert_raises(
-        qb.TracerError, qb.jit(lambda t: qb.jvp(qb.sin, (t,), (v_eager,))[1]), x, match="eager"
+    assert_close(
+        qb.jit(lambda t: qb.jvp(qb.sin, (t,), (v_eager,))[1])(x),
+        [math.cos(value) for value in x.tolist()],
+        1e-14,
     )
     error = assert_raises(
         qb.UnsupportedOperationError,
@@ -1173,6 +1175,127 @@ def test_pinn_loss_with_a_nested_second_derivative_reproduces_the_readme():
     assert value.item() < 1e-10
 
 
+def test_pinn_loss_with_eager_forcing_terms_reproduces_the_readme():
+    # The first S3b repro: the points are Python floats, so `qb.sin(pi * x)`
+    # is an eager Tensor that meets a tracer and is captured as a constant.
+    def loss(w, xs):
+        residuals = [(pinn_u_xx(x, w) + math.pi**2 * qb.sin(math.pi * x)) ** 2 for x in xs]
+        return qb.mean(qb.stack(residuals, 0))
+
+    xs = qb.linspace(0.05, 0.95, PINN_POINTS).tolist()
+    step = qb.jit(qb.value_and_grad(loss))
+    value, grad_w = step(qb.array(2.5), xs)
+    traced_value, traced_grad_w = qb.jit(qb.value_and_grad(pinn_loss))(qb.array(2.5), qb.array(xs))
+    assert_close(value, traced_value, 1e-12)
+    assert_close(grad_w, traced_grad_w, 1e-12)
+    w, adam = {"w": qb.array(2.5)}, qb.Adam(learning_rate=0.05)
+    for _ in range(300):
+        value, grad_w = step(w["w"], xs)
+        w = adam.step(w, {"w": grad_w})
+    assert f"{w['w'].item():.6f}" == "3.141593", w["w"].item()
+    assert value.item() < 1e-10
+    # The single-point form of the issue report.
+    value, grad_w = qb.jit(
+        qb.value_and_grad(
+            lambda w, xs: (
+                qb.grad(qb.grad(lambda x, w: qb.sin(x * w)))(xs[0], w)
+                + math.pi**2 * qb.sin(math.pi * xs[0])
+            )
+            ** 2
+        )
+    )(qb.array(2.5), [0.3])
+    residual = -(2.5**2) * math.sin(0.75) + math.pi**2 * math.sin(0.3 * math.pi)
+    assert_close(value, residual**2, 1e-12)
+
+
+def test_closures_over_arrays_are_captured_in_transforms():
+    points = qb.linspace(0.0, 1.0, 8)
+    xs = points.tolist()
+
+    def f(w):
+        return (qb.sin(points * w)).sum()
+
+    w = qb.array(1.3)
+    expected_value = sum(math.sin(x * 1.3) for x in xs)
+    expected_grad = sum(x * math.cos(x * 1.3) for x in xs)
+    assert_close(qb.jit(f)(w), expected_value, 1e-14)
+    assert_close(qb.grad(f)(w), expected_grad, 1e-14)
+    value, gradient = qb.value_and_grad(f)(w)
+    assert_close(value, expected_value, 1e-14)
+    assert_close(gradient, expected_grad, 1e-14)
+    assert_close(qb.jit(qb.grad(f))(w), expected_grad, 1e-14)
+    # Nested: grad(grad), a jvp of the gradient, and a closure inside an
+    # inner transform that an outer one differentiates again.
+    expected_second = -sum(x * x * math.sin(x * 1.3) for x in xs)
+    assert_close(qb.grad(qb.grad(f))(w), expected_second, 1e-13)
+    assert_close(qb.jvp(qb.grad(f), (w,), (1.0,))[1], expected_second, 1e-13)
+    assert_close(qb.grad(lambda w: qb.grad(f)(w) * 2.0)(w), 2.0 * expected_second, 1e-13)
+    assert_close(qb.hessian(f)(w), expected_second, 1e-13)
+
+    # Like jax.jit, the array is baked in when the function is traced:
+    # rebinding the closed-over name does not retrace.
+    scale = qb.array([1.0, 2.0])
+    scaled = qb.jit(lambda t: t * scale)
+    x = qb.array([3.0, 4.0])
+    assert scaled(x).tolist() == [3.0, 8.0]
+    scale = qb.array([10.0, 20.0])  # noqa: F841 (read by the lambda on a retrace)
+    assert scaled(x).tolist() == [3.0, 8.0]
+    assert scaled(qb.array([1.0, 1.0, 1.0]).slice(0, 0, 2).to_tensor()).tolist() == [1.0, 2.0]
+
+
+def test_captured_constants_keep_their_dtype():
+    c32 = qb.array([0.5, -2.0], dtype=qb.float32)
+    x32 = qb.array([1.5, 0.25], dtype=qb.float32)
+    result = qb.jit(lambda t: t * c32 + 1.0)(x32)
+    assert_tensor(result, (x32 * c32 + 1.0).tolist(), qb.float32)
+    gradient = qb.grad(lambda t: qb.sum(qb.sin(t * c32)))(x32)
+    assert gradient.dtype == qb.float32
+    assert_close(gradient, [c * math.cos(x * c) for x, c in zip(x32.tolist(), c32.tolist())], 1e-6)
+    # A float64 constant is strong: with a float32 tracer it is a dtype error
+    # that asks for astype, as the same eager operation is.
+    c64 = qb.array([0.5, -2.0])
+    for function in [lambda t: t * c64, lambda t: c64 * t, lambda t: qb.maximum(t, c64)]:
+        assert_raises(ValueError, qb.jit(function), x32, match="astype")
+    assert_raises(ValueError, lambda: x32 * c64, match="astype")
+    assert qb.jit(lambda t: t * c64.astype(qb.float32))(x32).dtype == qb.float32
+    # Python scalars stay weak; bool masks select in either role.
+    assert qb.jit(lambda t: t * 3.0)(x32).dtype == qb.float32
+    mask = qb.array([True, False])
+    assert_tensor(qb.jit(lambda t: qb.where(mask, t, 0.0))(x32), [1.5, 0.0], qb.float32)
+    assert_tensor(qb.jit(lambda t: (t > 1.0) & mask)(x32), [True, False], qb.bool_)
+    assert_tensor(qb.jit(lambda t: mask | (t > 1.0))(x32), [True, False], qb.bool_)
+
+
+def assert_constant_device_parity(value_and_grad_fn):
+    c = qb.array([0.5, -1.25, 2.0, 0.75])
+    x = qb.array([0.1, 0.2, -0.3, 0.4])
+    specs = [("x", [4])]
+
+    def loss(t):
+        return (qb.sin(t * c) + c * t).sum()
+
+    cpu_value, cpu_gradients = qb.tensor_value_and_grad_fn(loss, specs)({"x": x})
+    device = value_and_grad_fn(loss, specs, ["x"])
+    for _ in range(2):  # the second call reuses the uploaded constant
+        value, gradients = device({"x": x})
+        assert_close(value, cpu_value, 1e-5)
+        assert_close(gradients["x"], cpu_gradients["x"], 1e-5)
+
+
+def test_mlx_captured_constants_match_cpu():
+    if os.environ.get("QUABLA_MLX_TEST") is None:
+        return
+    assert_constant_device_parity(qb.tensor_value_and_grad_mlx_fn)
+
+
+def test_cuda_captured_constants_match_cpu():
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
+        return
+    assert_constant_device_parity(
+        lambda loss, specs, names: qb.tensor_value_and_grad_cuda_fn(loss, specs, names, 0)
+    )
+
+
 def test_nested_second_derivatives_grow_the_graph_linearly_in_the_points():
     from quabla import _transforms
 
@@ -1247,33 +1370,49 @@ def test_tracer_escapes_raise_tracer_error():
     )
 
 
-def test_eager_tensors_in_a_trace_raise_an_actionable_tracer_error():
+def test_eager_arrays_meeting_tracers_are_captured_as_constants():
     x = qb.array([1.0, 2.0])
     data = qb.array([3.0, 4.0])
-    for function in [
-        lambda t: t * data,
-        lambda t: data * t,
-        lambda t: data - t,
-        lambda t: data / t,
-        lambda t: t > data,
-        lambda t: data ** t,
-        lambda t: qb.maximum(t, data),
-        lambda t: qb.where(t > 0.0, t, data),
-        lambda t: t.reshape([1, 2]) @ data.reshape([2, 1]),
-        lambda t: data.reshape([1, 2]) @ t.reshape([2, 1]),
-        lambda t: t * data.slice(0, 0, 2),
-    ]:
-        error = assert_raises(
-            qb.TracerError, qb.jit(function), x, match="pass the array as an argument"
-        )
-        assert "do not capture arrays as constants" in str(error)
-    # Passing the array in works.
-    assert_close(qb.jit(lambda t, d: t * d)(x, data), [3.0, 8.0])
+    matrix = qb.array([[2.0, 1.0], [1.0, 3.0]])
+    cases = [
+        (lambda t: t * data, [3.0, 8.0]),
+        (lambda t: data * t, [3.0, 8.0]),
+        (lambda t: data - t, [2.0, 2.0]),
+        (lambda t: data / t, [3.0, 2.0]),
+        (lambda t: data**t, [3.0, 16.0]),
+        (lambda t: t**data, [1.0, 16.0]),
+        (lambda t: qb.power(data, t), [3.0, 16.0]),
+        (lambda t: (t > data).astype(qb.float64), [0.0, 0.0]),
+        (lambda t: data.less(t).astype(qb.float64), [0.0, 0.0]),
+        (lambda t: qb.maximum(t, data), [3.0, 4.0]),
+        (lambda t: qb.minimum(data, t), [1.0, 2.0]),
+        (lambda t: qb.where(t > 1.0, t, data), [3.0, 2.0]),
+        (lambda t: qb.where(data > 3.5, t, 0.0), [0.0, 2.0]),
+        (lambda t: (t.reshape([1, 2]) @ data.reshape([2, 1])).reshape([1]), [11.0]),
+        (lambda t: (data.reshape([1, 2]) @ t.reshape([2, 1])).reshape([1]), [11.0]),
+        (lambda t: qb.matmul(matrix, t.reshape([2, 1])).reshape([2]), [4.0, 7.0]),
+        (lambda t: qb.solve(matrix, t.reshape([2, 1])).reshape([2]), [0.2, 0.6]),
+        (lambda t: matrix.solve(t.reshape([2, 1])).reshape([2]), [0.2, 0.6]),
+        (lambda t: qb.concat([t, data], 0), [1.0, 2.0, 3.0, 4.0]),
+        (lambda t: qb.stack([data, t], 0).reshape([4]), [3.0, 4.0, 1.0, 2.0]),
+        (lambda t: qb.einsum("ij,jk->ik", [matrix, t.reshape([2, 1])]).reshape([2]), [4.0, 7.0]),
+        (lambda t: t * data.slice(0, 0, 2), [3.0, 8.0]),
+        (lambda t: t + qb.sin(0.5), [1.0 + math.sin(0.5), 2.0 + math.sin(0.5)]),
+    ]
+    for function, expected in cases:
+        assert_close(qb.jit(function)(x), expected, 1e-14)
+    # The same operations differentiate through the constants.
+    assert_close(qb.grad(lambda t: qb.sum(data * t * t))(x), [6.0, 16.0], 1e-14)
+    assert_close(
+        qb.grad(lambda t: qb.sum(qb.solve(matrix, t.reshape([2, 1]))))(x), [0.4, 0.2], 1e-14
+    )
     # Other operand types keep their TypeError.
     error = assert_raises(TypeError, qb.jit(lambda t: t + "a"), x, match="numeric scalar operand")
     assert not isinstance(error, qb.TracerError)
     error = assert_raises(TypeError, lambda: data + "a", match="numeric scalar operand")
     assert not isinstance(error, qb.TracerError)
+    assert_raises(TypeError, lambda: data @ "a")
+    assert_raises(TypeError, lambda: data.matmul("a"), match="matmul expects a Tensor")
 
 
 if __name__ == "__main__":
