@@ -248,16 +248,31 @@ Tensor.numpy() -> np.ndarray; Tensor.tolist(); Tensor.item(); float(t); np.asarr
   does not shadow the builtins.
 - **Operators:** add `__neg__`, `__pow__`, and `__rpow__` to `TraceTensor`
   (Exp 2). Traced `x ** p` keeps using `powi` (`core/tensor_ir.rs:4406`) for
-  integer `p >= 0` (exact and cheaper) and lowers every other exponent,
-  including a traced tensor exponent, to a new elementwise `Pow` IR op (slice
-  S1b). Until S1b lands, S1 rejects those exponents with a `TypeError` that
-  points to `qb.power`, and `__rpow__` is left out. `Pow` follows the eager `f64::powf` semantics (`py/tensor.rs:1314`)
-  with NaN for a negative base and a non-integer exponent, and differentiates
-  in both operands: `d/dx = y x^(y-1)`, `d/dy = x^y ln x`, where the exponent
-  gradient is defined as zero at `x == 0` and the base gradient follows the
-  same zero-subgradient convention as `sqrt` at the origin. It lowers on CPU,
-  CUDA (NVRTC `powf`), and MLX (`power`). `==` keeps identity semantics
-  (`docs/api.md:156-157`).
+  a non-negative Python int `p` (exact and cheaper, like JAX's
+  `integer_pow`) and lowers every other exponent, including an
+  integer-valued float, a negative int, and a traced tensor exponent, to the
+  elementwise `Pow` IR op (slice S1b); `c ** x` lowers through `__rpow__`.
+  A Python number is a weak scalar that adopts the other operand's dtype, and
+  `bool` operands are rejected as by the unary math ops. `Pow` follows the
+  eager `f64::powf` semantics (`py/tensor.rs:1314`) with NaN for a negative
+  base and a non-integer exponent, `0 ** 0 == 1`, and IEEE results for
+  infinities and NaN, and differentiates in both operands: `d/dx = y
+  x^(y-1)`, `d/dy = x^y ln x`. The base gradient is zero where `x == 0` and
+  `y < 1` (the zero subgradient of `sqrt` at the origin, so `pow(x, 0.5)`
+  and `sqrt(x)` agree there) and keeps the finite limit for `y >= 1`, so
+  `x ** 2.0` still has second derivative 2 at zero. The exponent gradient is
+  zero for every `x <= 0`: at `x == 0` the power is piecewise constant in
+  `y`, and for `x < 0` no real derivative in `y` exists; unlike JAX, which
+  returns NaN for `x < 0`, the zero keeps the backward pass finite for a
+  learnable exponent at an integer value. The symbolic rules mask the
+  singular points out of the inner power as well, so Hessians and HVPs stay
+  finite there wherever the value is finite; at `x <= 0` the two mixed second
+  partials follow these conventions and need not be equal. It lowers on CPU, CUDA (NVRTC `powf`, fused elementwise kernels and
+  elementwise loop bodies), and MLX (`power`), and to `stablehlo.power` in the
+  StableHLO export. Eager `Tensor ** Tensor`, including a single-element
+  tensor exponent, is a broadcast elementwise power with the strict dtype
+  promotion of the other binary ops; a tensor is never unwrapped into a
+  scalar. `==` keeps identity semantics (`docs/api.md:156-157`).
 
 ### 3.3 Transforms
 
@@ -629,7 +644,7 @@ The gates are those under "Development Gates" (`CONTRIBUTING.md:18-35`), with
 | --- | --- | --- | --- | --- | --- |
 | **S0 Packaging** | `python/quabla/__init__.py` re-exports all 132 names from `quabla._quabla`; `quabla.quabla` aliased (attribute and `sys.modules` entry); class `__module__` values unchanged without `#[pyclass(module = ...)]` edits, because PyO3 does not derive them from the extension's module name (`dtype` already reports `quabla`, the other classes `builtins`); module-level functions report `quabla._quabla` instead of `quabla.quabla` | bridge (module name only) | `pyproject.toml`, `py/lib.rs`, `python/quabla/__init__.py`, CI ruff path | a name-set test asserts the v0.1 names are a subset of `dir(quabla)`; old tests; `maturin build --sdist` then install; macOS MLX and Linux CI | maturin `python-source` with a `cdylib` named `quabla`; stale `.so` in dev venvs |
 | **S1 Arrays** | `array`, `asarray`, factories, `numpy()`, `tolist()`, `item()`, `__float__`, `__array__`, buffer import/export, `Array` ABC, module ops, tracer `__neg__`/`__pow__` | bridge | `py/tensor.rs`, `py/interop.rs`, `py/tensor_trace.rs`, `python/quabla/_array.py`, `python/quabla/_ops.py` | dtype-mapping table tests; NumPy round trip of 1e6 values under 5 ms; `unsafe` buffer export with `// SAFETY:` and a refcount test | buffer lifetime soundness; NumPy 1.x vs 2.x `__array__(copy=)` |
-| **S1b Pow op** | elementwise `Pow` IR op with JVP/VJP/HVP rules, CPU/CUDA/MLX lowering, fusion and CSE handling, `qb.power`, tracer `x ** y` for non-integer and tensor exponents | **core** | `core/tensor_ir.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/tensor_trace.rs` | finite-difference checks for both operands incl. negative base, zero base, and integer-valued float exponents; CPU/MLX/CUDA parity; `powi` path unchanged for integer exponents | NaN/inf conventions at `x <= 0`; derivative at `x == 0` |
+| **S1b Pow op** | elementwise `Pow` IR op with JVP/VJP/HVP rules, CPU/CUDA/MLX lowering, fusion and CSE handling, `qb.power`, tracer `x ** y` for non-integer and tensor exponents | **core** | `core/tensor_ir.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/tensor_trace.rs` | finite-difference checks for both operands incl. negative base, zero base, and integer-valued float exponents; CPU/MLX/CUDA parity; `powi` path unchanged for integer exponents. Landed: the conventions of §3.2, eager `Tensor ** Tensor` and `c ** Tensor`, and `qb.power` | NaN/inf conventions at `x <= 0`; derivative at `x == 0`; the symbolic Hessian of a loss whose value is infinite is NaN, because the reverse pass of `sum` broadcasts with `powi(v - v, 0)` (predates `Pow`) |
 | **S2 CPU transforms** | `grad`, `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `jit(device="cpu")`, pytrees, `argnums`, `has_aux`, cache and `RetraceLimitError`, `quabla.tree` | bridge (tuple outputs from traces) | `py/tensor_trace.rs:4375-4399`, `python/quabla/_transforms.py` | parity against `tensor_*_fn` on shared fixtures; retrace-bound tests; float32 keeps float32 | Python overhead on tiny graphs (3 µs vs 17 µs, Exp 4) |
 | **S3 Composition** | `TensorIr::inline` + bridge binding; nested transforms; README PINN example | **core** | `core/tensor_ir.rs`, `py/tensor_trace.rs`, `python/quabla/_transforms.py` | Rust tests for inline, including `Cond`/`Fori`/`Scan` regions; `grad(grad)` vs exact; README example reproduces `w = 3.141593` | shared-subexpression duplication after inlining (freeze already commons pure nodes, `docs/api.md:352-353`) |
 | **S4 vmap** | `vmap(in_axes, out_axes)` over pytrees; `vmap(grad)`; rejection of unmapped per-example gradients and nested vmap | bridge | `py/tensor_trace.rs:4490-4594` | parity with `tensor_vmap_{,jvp_,vjp_,hvp_scalar_}fn` | `out_axes` pytrees vs the single `out_axis` today |

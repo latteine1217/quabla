@@ -1329,6 +1329,23 @@ impl PyTensor {
         self.try_unary("pow", |value| value.powf(exponent))
     }
 
+    /// Elementwise `self ** exponent` of two tensors with broadcasting and
+    /// the dtype promotion of the other binary ops (strict between tensors).
+    /// `bool` operands are rejected, as by the scalar-exponent form.
+    pub fn try_pow(&self, exponent: &Self) -> Result<Self, String> {
+        self.ensure_not_bool("pow")?;
+        exponent.ensure_not_bool("pow")?;
+        self.try_elementwise(exponent, "**", |base, exponent| Ok(base.powf(exponent)))
+    }
+
+    /// `base ** self` for a Python number `base`, which is a weak scalar
+    /// rounded to the tensor dtype like the other scalar operands.
+    pub fn try_scalar_pow(&self, base: f64) -> Result<Self, String> {
+        self.ensure_not_bool("pow")?;
+        let base = self.dtype.round(base);
+        self.try_map(|exponent| base.powf(exponent))
+    }
+
     pub fn try_concat(tensors: &[PyTensor], axis: usize) -> Result<Self, String> {
         let first = tensors
             .first()
@@ -2048,9 +2065,31 @@ impl PyTensor {
         if let Ok(exponent) = exponent.extract::<u32>() {
             return self.try_powi(exponent).map_err(PyValueError::new_err);
         }
+        // A tensor exponent, including a single-element one, is an elementwise
+        // operand that broadcasts, as in NumPy and in traced code; it is never
+        // unwrapped into a scalar.
+        if let Ok(exponent) = exponent.extract::<PyRef<'_, PyTensor>>() {
+            return self.try_pow(&exponent).map_err(PyValueError::new_err);
+        }
         let exponent = extract_scalar(exponent)
-            .ok_or_else(|| PyTypeError::new_err("expected numeric scalar exponent"))?;
+            .ok_or_else(|| PyTypeError::new_err("expected a Tensor or numeric scalar exponent"))?;
         self.try_powf(exponent).map_err(PyValueError::new_err)
+    }
+
+    /// `c ** x` for a Python number `c`.
+    fn __rpow__(
+        &self,
+        base: &Bound<'_, PyAny>,
+        modulo: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        if modulo.is_some() {
+            return Err(PyTypeError::new_err(
+                "modulo argument is not supported for Tensor power",
+            ));
+        }
+        let base = extract_scalar(base)
+            .ok_or_else(|| PyTypeError::new_err("expected a numeric scalar base"))?;
+        self.try_scalar_pow(base).map_err(PyValueError::new_err)
     }
 
     fn gt(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {

@@ -846,6 +846,7 @@ impl TraceTensor {
             "div" => ir.div(self.node_id, rhs.node_id)?,
             "mul" => ir.mul(self.node_id, rhs.node_id)?,
             "greater" => ir.greater(self.node_id, rhs.node_id)?,
+            "pow" => ir.pow(self.node_id, rhs.node_id)?,
             _ => return Err(format!("unsupported trace tensor binary op {op}")),
         };
         let shape = ir.node_shape(node_id)?;
@@ -870,6 +871,7 @@ impl TraceTensor {
             "div" => ir.div(self.node_id, scalar)?,
             "mul" => ir.mul(self.node_id, scalar)?,
             "greater" => ir.greater(self.node_id, scalar)?,
+            "pow" => ir.pow(self.node_id, scalar)?,
             _ => return Err(format!("unsupported trace tensor scalar op {op}")),
         };
         let shape = ir.node_shape(node_id)?;
@@ -905,6 +907,7 @@ impl TraceTensor {
             "div" => ir.div(scalar, self.node_id)?,
             "mul" => ir.mul(scalar, self.node_id)?,
             "greater" => ir.greater(scalar, self.node_id)?,
+            "pow" => ir.pow(scalar, self.node_id)?,
             _ => return Err(format!("unsupported left scalar trace op {op}")),
         };
         let shape = ir.node_shape(node_id)?;
@@ -2001,9 +2004,12 @@ impl TraceTensor {
             .map_err(PyValueError::new_err)
     }
 
-    /// `x ** n` for a non-negative integer `n` lowers to `powi`, which is
-    /// exact and cheaper than a general power. Other exponents need the
-    /// `Pow` IR op of design slice S1b and are rejected until it lands.
+    /// `x ** n` for a non-negative Python int `n` lowers to `powi`, which
+    /// is exact and cheaper than a general power (like JAX's
+    /// `integer_pow`). Every other exponent, including an integer-valued
+    /// float, a negative int, and a `TraceTensor`, lowers to the
+    /// differentiable elementwise `pow` op; a Python number is a weak scalar
+    /// that adopts the dtype of `x`.
     fn __pow__(
         &self,
         exponent: &Bound<'_, PyAny>,
@@ -2017,13 +2023,21 @@ impl TraceTensor {
         if let Ok(exponent) = exponent.extract::<u32>() {
             return self.powi(exponent);
         }
-        Err(PyTypeError::new_err(format!(
-            "TraceTensor ** {} is not supported yet: traced powers take a non-negative Python \
-             int exponent, which lowers to powi; float, negative, and tensor exponents arrive \
-             with quabla.power and the Pow op in the next slice (S1b in \
-             docs/api_v0_2_design.md)",
-            exponent.repr()?
-        )))
+        trace_tensor_or_scalar_operand(self, exponent, "pow")
+    }
+
+    /// `c ** x` for a Python number `c`, through the `pow` op.
+    fn __rpow__(
+        &self,
+        base: &Bound<'_, PyAny>,
+        modulo: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        if modulo.is_some() {
+            return Err(PyTypeError::new_err(
+                "modulo argument is not supported for TraceTensor power",
+            ));
+        }
+        trace_scalar_left_operand(self, base, "pow")
     }
 
     #[pyo3(signature = (axis = None, keepdims = false))]

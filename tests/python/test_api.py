@@ -3,6 +3,7 @@ import gc
 import importlib
 import importlib.machinery
 import math
+import os
 import pathlib
 import pickle
 import subprocess
@@ -194,7 +195,8 @@ def test_single_element_tensors_stay_tensor_operands():
     # `float(t)` must not let a Tensor slip into scalar-operand parsing,
     # which would turn it into a weak scalar and drop its dtype.
     scalar = qb.array(2.0, dtype=qb.float32)
-    assert_raises(TypeError, lambda: qb.array([1.0, 2.0]) ** scalar)
+    # A tensor exponent keeps its float32 dtype, so the strict promotion rejects the float64 base.
+    assert_raises(ValueError, lambda: qb.array([1.0, 2.0]) ** scalar, match="mismatched dtypes")
 
     def mixed(x):
         return (x * scalar).sum()
@@ -484,17 +486,60 @@ def test_traced_negation_and_integer_powers_with_gradients():
     assert_tensor(traced(lambda a: -(a**2), x32), [-2.25, -4.0], qb.float32)
 
 
-def test_traced_power_rejects_other_exponents_until_the_pow_op():
-    for exponent in [0.5, 2.0, -1, qb.array(2.0)]:
-        error = assert_raises(
-            TypeError,
+def test_power_values_follow_powf_eagerly_and_traced():
+    base = qb.array([0.0, 0.0, -2.0, -2.0, 4.0, 2.0, math.inf])
+    exponent = qb.array([0.0, -1.0, 3.0, 0.5, 0.5, -1.0, -0.5])
+    expected = [1.0, math.inf, -8.0, math.nan, 2.0, 0.5, 0.0]
+
+    def same(actual, expected):
+        assert len(actual) == len(expected)
+        for lhs, rhs in zip(actual, expected):
+            assert (math.isnan(lhs) and math.isnan(rhs)) or lhs == rhs, (actual, expected)
+
+    for result in [
+        base**exponent,
+        qb.power(base, exponent),
+        traced(lambda a, b: a**b, base, exponent),
+        traced(lambda a, b: qb.power(a, b), base, exponent),
+    ]:
+        same(result.tolist(), expected)
+    x = qb.array([0.25, 1.0, 2.25])
+    values = x.tolist()
+    for function, reference in [
+        (lambda a: a**0.5, [v**0.5 for v in values]),
+        (lambda a: a**-1, [1.0 / v for v in values]),
+        (lambda a: a**2.0, [v * v for v in values]),
+        (lambda a: 2.0**a, [2.0**v for v in values]),
+        (lambda a: qb.power(3, a), [3.0**v for v in values]),
+        (lambda a: qb.power(a, 1.5), [v**1.5 for v in values]),
+    ]:
+        assert_close(function(x), reference)
+        assert_close(traced(function, x), reference)
+    # A single-element tensor exponent is an elementwise operand that broadcasts, never a scalar.
+    assert_close(x ** qb.array(2.0), [v * v for v in values])
+    assert_close(x ** qb.array([2.0]), [v * v for v in values])
+    assert_close(qb.power([1.0, 2.0], [[2.0], [3.0]]), [[1.0, 4.0], [1.0, 8.0]])
+    assert_close(qb.power(2.0, 3.0), 8.0)
+    # Python numbers are weak scalars: float32 stays float32 on both sides.
+    x32 = qb.array([0.25, 4.0], dtype=qb.float32)
+    for function in [lambda a: a**0.5, lambda a: 2.0**a, lambda a: qb.power(a, -1)]:
+        assert function(x32).dtype == qb.float32
+        assert traced(function, x32).dtype == qb.float32
+    assert_tensor(traced(lambda a: a**0.5, x32), [0.5, 2.0], qb.float32)
+    # Strong dtypes stay strict, and bool operands are rejected, eagerly and traced.
+    assert_raises(ValueError, lambda: x ** qb.array([2.0, 2.0, 2.0], dtype=qb.float32))
+    mask = qb.array([True, False])
+    for function in [lambda m: m**0.5, lambda m: 2.0**m, lambda m: qb.power(m, 1.5)]:
+        assert_raises(ValueError, function, mask, match="pow is not defined for bool")
+        assert_raises(
+            ValueError,
             qb.tensor_jit_fn,
-            lambda a, p=exponent: a**p,
-            [("x", [2])],
-            match="arrive with quabla.power",
+            function,
+            [("m", [2], qb.bool_)],
+            match="pow is not defined for bool",
         )
-        assert "TraceTensor ** " in str(error)
     assert_raises(TypeError, qb.tensor_jit_fn, lambda a: pow(a, 2, 3), [("x", [2])], match="modulo")
+    assert_raises(TypeError, lambda: pow(x, 2, 3), match="modulo")
     assert_raises(
         ValueError,
         qb.tensor_jit_fn,
@@ -503,6 +548,74 @@ def test_traced_power_rejects_other_exponents_until_the_pow_op():
         match="negative is not defined for bool",
     )
 
+
+def test_traced_power_gradients_in_both_operands():
+    x = qb.array([0.5, 1.5, 2.25])
+    y = qb.array([0.5, -1.0, 2.5])
+    xs, ys = x.tolist(), y.tolist()
+    for function, base_gradient in [
+        (lambda a: (a**0.5).sum(), [0.5 * v**-0.5 for v in xs]),
+        (lambda a: (a**-1).sum(), [-(v**-2) for v in xs]),
+        (lambda a: (2.0**a).sum(), [2.0**v * math.log(2.0) for v in xs]),
+    ]:
+        value, gradients = qb.tensor_value_and_grad_fn(function, [("x", [3])])({"x": x})
+        assert_close(value, function(x))
+        assert_close(gradients["x"], base_gradient)
+    value, gradients = qb.tensor_value_and_grad_fn(
+        lambda a, b: qb.power(a, b).sum(), [("x", [3]), ("y", [3])]
+    )({"x": x, "y": y})
+    assert_close(value, sum(a**b for a, b in zip(xs, ys)))
+    assert_close(gradients["x"], [b * a ** (b - 1.0) for a, b in zip(xs, ys)])
+    assert_close(gradients["y"], [a**b * math.log(a) for a, b in zip(xs, ys)])
+    # Conventions at x <= 0: d/dx is the zero subgradient where x == 0 and y < 1 (like sqrt at
+    # the origin) and the finite limit for y >= 1; d/dy is 0 for every x <= 0.
+    base = qb.array([0.0, 0.0, 0.0, -2.0])
+    exponent = qb.array([0.5, 1.0, 2.0, 3.0])
+    _, gradients = qb.tensor_value_and_grad_fn(
+        lambda a, b: (a**b).sum(), [("x", [4]), ("y", [4])]
+    )({"x": base, "y": exponent})
+    assert gradients["x"].tolist() == [0.0, 1.0, 0.0, 12.0]
+    assert gradients["y"].tolist() == [0.0, 0.0, 0.0, 0.0]
+    # Second derivatives compose through the traced graph: d^2/dx^2 x^2.0 is 2, also at 0.
+    inputs = {"x": qb.array([0.0, 1.5])}
+    traced_power = qb.trace_tensor(lambda a: (a**2.0).sum(), [("x", [2])])
+    hessian = traced_power.graph.hessian_scalar(traced_power.output.node_id, "x", inputs)
+    assert hessian == [[2.0, 0.0], [0.0, 2.0]]
+    hvp = qb.tensor_hvp_scalar_fn(lambda a: (a**2.0).sum(), [("x", [2])], "x")
+    assert hvp(inputs, qb.array([1.0, -1.0])).tolist() == [2.0, -2.0]
+
+
+def assert_power_device_parity(value_and_grad_fn):
+    x = qb.array([0.0, 0.5, 1.5, 2.25, -2.0])
+    y = qb.array([0.5, 0.5, -1.0, 2.5, 3.0])
+    specs = [("x", [5]), ("y", [5])]
+
+    def loss(a, b):
+        return (a**b + 2.0**b * a**0.5 + a**2).sum()
+
+    cpu_value, cpu_gradients = qb.tensor_value_and_grad_fn(loss, specs)({"x": x, "y": y})
+    value, gradients = value_and_grad_fn(loss, specs, ["x", "y"])({"x": x, "y": y})
+    assert math.isnan(cpu_value.item()) and math.isnan(value.item())
+    for name in ["x", "y"]:
+        for actual, expected in zip(gradients[name].tolist(), cpu_gradients[name].tolist()):
+            if math.isnan(expected):
+                assert math.isnan(actual), (name, actual)
+            else:
+                assert abs(actual - expected) <= 1e-5 * max(1.0, abs(expected)), (name, actual, expected)
+
+
+def test_mlx_power_matches_cpu():
+    if os.environ.get("QUABLA_MLX_TEST") is None:
+        return
+    assert_power_device_parity(qb.tensor_value_and_grad_mlx_fn)
+
+
+def test_cuda_power_matches_cpu():
+    if os.environ.get("QUABLA_CUDA_TEST") is None:
+        return
+    assert_power_device_parity(
+        lambda loss, specs, names: qb.tensor_value_and_grad_cuda_fn(loss, specs, names, 0)
+    )
 
 if __name__ == "__main__":
     # Run every test_* function in definition order so new tests cannot be left out of a manual list

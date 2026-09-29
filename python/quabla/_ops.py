@@ -6,7 +6,8 @@ Each function calls the method of the same name on `Tensor` or
 numbers, nested lists, NumPy arrays) go through `asarray` first, except that
 the second operand of `maximum`/`minimum` stays a Python number when it is
 one, keeping the weak scalar typing of the method form:
-`qb.maximum(x, 0.0)` keeps the dtype of `x`.
+`qb.maximum(x, 0.0)` keeps the dtype of `x`. `power` keeps a Python number
+in either position the same way.
 
 `abs`, `sum`, `max`, `min`, `any`, and `all` shadow Python builtins, so they
 are attributes of `quabla` but not listed in `__all__`: `from quabla import *`
@@ -30,6 +31,7 @@ __all__ = [
     "mean",
     "minimum",
     "norm",
+    "power",
     "relu",
     "reshape",
     "sigmoid",
@@ -106,6 +108,23 @@ all = _reduction("all")
 
 maximum = _symmetric_binary("maximum")
 minimum = _symmetric_binary("minimum")
+
+
+def power(x1, x2):
+    """Elementwise `x1 ** x2`; `quabla.power(x, y)` is `x ** y`.
+
+    Either operand may be a Python number, which stays a weak scalar adopting
+    the dtype of the array operand. Values follow `f64::powf`: NaN for a
+    negative base with a non-integer exponent, `0 ** 0 == 1`, IEEE results
+    for infinities and NaN. Traced code lowers a non-negative Python int
+    exponent to the exact `powi` and every other exponent, including a traced
+    array, to the differentiable `pow` op, whose derivative conventions at
+    `x1 <= 0` are listed in `docs/api.md`.
+    """
+    if isinstance(x1, numbers.Number) and not isinstance(x2, numbers.Number):
+        # Called directly: `x1 ** x2` would let a NumPy scalar base take over.
+        return _array(x2).__rpow__(x1)
+    return _array(x1) ** (x2 if isinstance(x2, numbers.Number) else _array(x2))
 
 
 def matmul(x1, x2):
