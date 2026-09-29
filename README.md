@@ -26,61 +26,64 @@ Reproduce with `python examples/plot_readme_figure.py`.*
 - **Differentiable control flow.** `cond`, `fori_loop`, and `scan` are IR
   regions, not traced Python branches, with VJP and forward-over-reverse HVP
   on CPU and MLX and, for elementwise loop bodies, on CUDA.
-- **Explicit rather than silent.** `float32`, `float64`, and `bool` convert
-  only through `astype`, and an operation a backend does not support raises an
-  error instead of falling back to the host.
+- **Explicit rather than silent.** Mixing `float32` and `float64` arrays
+  requires an explicit `astype`, and an operation a backend does not support
+  raises an error instead of falling back to the host.
 
 ## At a Glance
 
-Two symbolic JVPs give an exact `u_xx`; the PDE-residual loss built from it is
-compiled once and trained with reverse-mode gradients and Adam:
+`grad(grad(u))` gives an exact `u_xx` at one point, `vmap` maps it over the
+collocation points, and the PDE-residual loss built from it is compiled once
+and trained with reverse-mode gradients and Adam:
 
 ```python
 import math
+import quabla as qb
 
-import quabla
+def u(x, w):  # the model at one collocation point x
+    return qb.sin(w * x)
 
-# Fit u(x) = sin(w x) to u'' = -pi^2 sin(pi x); the exact solution has w = pi.
-u = quabla.trace_tensor(lambda x, w: (x * w).sin(), [("x", [8, 1]), ("w", [1, 1])])
-u_xx = u.symbolic_jvp("x").symbolic_jvp("x")  # exact d2u/dx2, no finite differences
-x = u_xx.graph.input("x")
-loss = (u_xx.output + math.pi**2 * (math.pi * x).sin()).powi(2).mean()
-plan = loss.compile_cpu()  # frozen execution plan, reused every step
+u_xx = qb.vmap(qb.grad(qb.grad(u)), in_axes=(0, None))  # exact d2u/dx2 per point
 
-points = {"x": quabla.Tensor.linspace(0.05, 0.95, 8).reshape([8, 1])}
-params, adam = {"w": quabla.Tensor([1, 1], [2.5])}, quabla.Adam(learning_rate=0.05)
-seed = quabla.Tensor([], [1.0])  # d loss / d loss
+def loss(params, x):  # residual of u'' = -pi^2 sin(pi x), solved by w = pi
+    return qb.mean((u_xx(x, params["w"]) + math.pi**2 * qb.sin(math.pi * x)) ** 2)
+
+x = qb.linspace(0.05, 0.95, 8)
+params, adam = {"w": qb.array(2.5)}, qb.Adam(learning_rate=0.05)
+step = qb.jit(qb.value_and_grad(loss))  # traced and compiled on the first call
 for _ in range(300):
-    value, grads = plan.evaluate_value_and_vjp({**points, **params}, seed)
-    params = adam.step(params, {"w": grads["w"]})
-print(f"w = {params['w'].to_flat_list()[0]:.6f}, loss = {value.to_flat_list()[0]:.1e}")
+    value, grads = step(params, x)
+    params = adam.step(params, grads)
+print(f"w = {params['w'].item():.6f}, loss = {value.item():.1e}")
 ```
 
 ```text
 w = 3.141593, loss = 1.5e-13
 ```
 
-The [Quickstart](#quickstart) covers dtypes, masks, and the multi-backend
-compiler facade.
+The [Quickstart](#quickstart) covers arrays, dtypes, masks, `vmap`, and
+running on CUDA or MLX.
 
 ## Status
 
-Quabla v0.1 is a research-grade, source-only pre-release, published as a git
-tag and GitHub Release without prebuilt wheels; the 0.x API may change between
-releases. Python functions are traced into a rank-N tensor IR, transformed
-with composable automatic differentiation, and compiled to frozen execution
-plans by a Rust core exposed to Python through PyO3.
+The latest release is **v0.1.0**, a research-grade, source-only pre-release
+(a git tag and GitHub Release without prebuilt wheels). `main` adds the
+unreleased v0.2 JAX-style API ([CHANGELOG](CHANGELOG.md#unreleased),
+[design](docs/api_v0_2_design.md)): the transforms `grad`, `value_and_grad`,
+`jvp`, `vjp`, `jacobian`, `hessian`, `vmap`, and `jit` over arrays and
+pytrees, and module-level math such as `quabla.sin`. They compile for the CPU
+so far; `jit(device="cuda" | "mlx")` is coming in v0.2. Until then, CUDA and
+MLX run through the v0.1 layer: the `quabla.Compiler` facade, the
+`tensor_*_fn` helpers with their `_cuda`/`_mlx` variants and device Adam
+optimizers, and the control-flow builders `tensor_cond`,
+`tensor_fori_loop_region`, and `tensor_scan_region`. The optimizer is
+`quabla.Adam` until `quabla.optim` lands.
 
-The primary Python API is the rank-N path: the `quabla.Compiler` facade
-(`Compiler.trace(fn, input_specs) -> Program`, `Program.jvp(...)` /
-`Program.vjp(...)`, `Program.compile("cpu" | "cuda" | "mlx")`),
-`trace_tensor(...)`, the eager `Tensor` class, and the `tensor_*_fn` helpers
-(`tensor_value_and_grad_fn`, `tensor_jit_fn`, `tensor_vmap_fn`,
-`tensor_hvp_scalar_fn`, their `_cuda`/`_mlx` variants, and the control-flow
-builders `tensor_cond`, `tensor_fori_loop_region`, `tensor_scan_region`). The
-2D `Matrix`, `trace(...)`, `TraceGraph`, `grad*`, and `jit(...)` API is legacy:
-kept for compatibility, outside the compiler facade, without new backend
-features.
+All v0.1 names keep working unchanged and emit no deprecation warnings yet.
+The 0.x API may still change between releases through additions and
+deprecations (see the [compatibility policy](CONTRIBUTING.md#scope-and-status)). The 2D `Matrix`,
+`trace(...)`, and `TraceGraph` API is legacy, kept for compatibility without
+new backend features.
 
 "JAX-style" describes the API only: Quabla does not depend on JAX and is not
 affiliated with JAX or with the `nabla-ml` project. It was formerly named
@@ -90,8 +93,10 @@ v0.1.
 ## Backend Support
 
 `float64` programs execute as `f32` on CUDA and MLX; `bool` values are held as
-`f32` `0`/`1` on both devices. The authoritative per-feature status and its
-validation records are in [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md).
+`f32` `0`/`1` on both devices. The function transforms of the v0.2 API run on
+the CPU so far; the CUDA and MLX rows describe the compiler facade and the
+device helpers. The authoritative per-feature status and its validation
+records are in [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md).
 
 | Backend | Platform | Build feature | Execution dtype | Autodiff | Control flow | Notable limitations |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -139,78 +144,98 @@ maturin develop --release --features cuda-nccl   # Linux, CUDA + NCCL
 python -c "import quabla; print(quabla.Compiler().capabilities())"
 ```
 
-`Compiler.capabilities()` reports which targets this build contains, for
-example `{'cpu': True, 'cuda': False, 'mlx': True}` for an MLX build. It is
-not a hardware probe.
-
 ## Quickstart
 
-Trace a scalar loss in `float32`, mask it with a comparison, and evaluate its
-value and gradients on the CPU:
+The snippets below run in sequence in one session. Arrays come from Python
+lists, scalars, or NumPy arrays (NumPy is optional), with dtype `float32`,
+`float64`, or `bool`. `grad` and `value_and_grad` differentiate with respect
+to the first argument (or `argnums`), and gradients mirror its pytree, here a
+dict of `float32` parameters:
 
 ```python
-import quabla
+import numpy as np
+import quabla as qb
 
+x = qb.array([-1.0, 0.5, 1.0, 2.0], dtype=qb.float32)  # from a list
+w = qb.asarray(np.array([0.3, -0.2, 0.1, 0.4], dtype=np.float32))  # dtype from NumPy
+mask = x > 0.0  # comparisons return bool masks
+print(x.dtype, w.dtype, mask.dtype, mask.tolist())
+print(qb.sin(x).numpy())
 
-def loss(x, w):
-    y = (x * w).tanh()
-    mask = x > 0.0  # comparison operators return quabla.bool_ masks
-    return quabla.where(mask, y, 0.0).powi(2).sum()
+def loss(params, x):
+    y = qb.tanh(x * params["w"] + params["b"])
+    return qb.sum(qb.where(x > 0.0, y, 0.0) ** 2)  # masked entries contribute 0
 
-
-specs = [("x", [4], quabla.float32), ("w", [4], quabla.float32)]
-inputs = {
-    "x": quabla.Tensor([4], [-1.0, 0.5, 1.0, 2.0], dtype=quabla.float32),
-    "w": quabla.Tensor([4], [0.3, -0.2, 0.1, 0.4], dtype=quabla.float32),
-}
-
-mask = inputs["x"] > 0.0
-print(mask.dtype, mask.to_flat_list())
-
-value_and_grad = quabla.tensor_value_and_grad_fn(loss, specs)
-value, grads = value_and_grad(inputs)
-print(value.dtype, value.to_flat_list())
-print(grads["w"].to_flat_list())
+params = {"w": w, "b": qb.array(0.2, dtype=qb.float32)}
+value, grads = qb.value_and_grad(loss)(params, x)  # gradients mirror the dict
+print(value.dtype, value.item())
+print(grads["w"].tolist(), grads["b"].item())
+print(qb.grad(loss, argnums=1)(params, x).tolist())  # d loss / d x
 ```
 
 ```text
-bool [0.0, 1.0, 1.0, 1.0]
-f32 [0.4608122408390045]
-[0.0, -0.09867792576551437, 0.19735585153102875, 1.484932780265808]
-```
-
-Continuing in the same session, the same function goes through the compiler
-facade, which compiles one traced program for every target in the build:
-
-```python
-compiler = quabla.Compiler()
-print(compiler.capabilities())
-
-program = compiler.trace(loss, specs)
-for target in ("cpu", "mlx", "cuda"):
-    if compiler.capability(target):
-        print(target, program.compile(target)(inputs).to_flat_list())
-
-# Symbolic VJP: one gradient Program per input, compiled like any other.
-grad_w = program.vjp("loss_bar")["w"].compile("cpu")
-seed = quabla.Tensor([], [1.0], dtype=quabla.float32)
-print(grad_w({**inputs, "loss_bar": seed}).to_flat_list())
-```
-
-Output of an MLX build on Apple silicon (a CUDA build prints a `cuda` line
-instead of the `mlx` line):
-
-```text
-{'cpu': True, 'cuda': False, 'mlx': True}
-cpu [0.4608122408390045]
-mlx [0.4608122408390045]
-[-0.0, -0.09867792576551437, 0.19735585153102875, 1.484932780265808]
+f32 f32 bool [False, True, True, True]
+[-0.84147096  0.47942555  0.84147096  0.9092974 ]
+f32 0.6748224496841431
+[-0.0, 0.09867792576551437, 0.53318190574646, 1.2793999910354614] 1.3702377080917358
+[0.0, -0.03947117179632187, 0.053318191319704056, 0.2558799982070923]
 ```
 
 The masked coordinate has a zero gradient: `where` routes no derivative
-through the unselected branch or its predicate. See
-[examples/README.md](examples/README.md) for PINN training on each
-backend.
+through the unselected branch or its predicate. `vmap` vectorizes a function
+written for one example, and `jit` compiles once per argument signature
+(shapes, dtypes, pytree structure) and reuses the frozen plan:
+
+```python
+xs = qb.array([[0.5, 1.0, 2.0, -1.0], [1.0, 1.0, 1.0, 1.0]], dtype=qb.float32)
+per_example = qb.vmap(loss, in_axes=(None, 0))  # params shared, rows of xs mapped
+print(per_example(params, xs).tolist())
+
+step = qb.jit(qb.value_and_grad(loss))  # traced and compiled on the first call
+value, grads = step(params, x)  # later calls with the same shapes reuse the plan
+print(value.item(), grads["b"].item())
+```
+
+```text
+[0.2575097382068634, 0.5868375897407532]
+0.6748224496841431 1.3702377080917358
+```
+
+The transforms compile for the CPU so far; `jit(device="cuda" | "mlx")` is
+coming in v0.2. Until then, run on CUDA or MLX through the compiler facade,
+which traces one program from named input specs and compiles it for any
+target in the build. `capabilities()` reports the targets this build
+contains; it is not a hardware probe.
+
+```python
+compiler = qb.Compiler()
+print(compiler.capabilities())
+specs = [("x", [4], qb.float32), ("w", [4], qb.float32), ("b", [], qb.float32)]
+program = compiler.trace(lambda x, w, b: loss({"w": w, "b": b}, x), specs)
+grad_w = program.vjp("loss_bar")["w"]  # symbolic reverse mode, also a Program
+inputs = {"x": x, **params}
+seed = {"loss_bar": qb.array(1.0, dtype=qb.float32)}  # d loss / d loss
+for target in ("cpu", "mlx", "cuda"):
+    if compiler.capability(target):
+        value = program.compile(target)(inputs).item()
+        print(target, value, grad_w.compile(target)({**inputs, **seed}).tolist())
+```
+
+Output of an MLX build on Apple silicon (a CUDA build prints a `cuda` line
+instead of the `mlx` line). The device executes in `f32` and agrees with the
+CPU `float32` reference up to rounding:
+
+```text
+{'cpu': True, 'cuda': False, 'mlx': True}
+cpu 0.6748224496841431 [-0.0, 0.09867792576551437, 0.53318190574646, 1.2793999910354614]
+mlx 0.6748223900794983 [-0.0, 0.09867792576551437, 0.53318190574646, 1.279400110244751]
+```
+
+For device training, `tensor_value_and_grad_{mlx,cuda}_fn` compute a loss
+and its gradients in one device plan, and `mlx_adam_loss_optimizer` and
+`cuda_adam_vjp_optimizer` keep parameters and Adam moments on the device; see
+[docs/api.md](docs/api.md#device-execution) and the PINN examples in
+[examples/README.md](examples/README.md), which use the v0.1 helpers.
 
 ## Known Limitations
 
@@ -222,13 +247,19 @@ backend.
 - CUDA loop bodies must be pure elementwise. MLX rejects `solve` and has no
   `vmap` HVP lowering.
 - Data parallelism is single-node CUDA + NCCL only.
+- The v0.2 function transforms compile for the CPU only; `quabla.vmap`
+  cannot batch `solve` or `cond`/`fori`/`scan` regions over a mapped
+  argument, and `jacobian`/`hessian` are dense.
 
 The full list is in [docs/api.md](docs/api.md#known-limitations).
 
 ## Documentation
 
-- [docs/api.md](docs/api.md): compiler facade, API reference, and the full
-  list of known limitations.
+- [docs/api.md](docs/api.md): function transforms, device execution, the
+  compiler facade, the v0.1 API reference, and the full list of known
+  limitations.
+- [docs/api_v0_2_design.md](docs/api_v0_2_design.md): the accepted v0.2 API
+  design and its implementation status.
 - [examples/README.md](examples/README.md): PINN examples and benchmarks.
 - [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md): roadmap, per-phase
   status (P0-P7, dtype phases D1-D6), validation records, and open items.

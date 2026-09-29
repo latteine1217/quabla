@@ -1,29 +1,264 @@
 # Quabla API Reference
 
 This document is the reference companion to the [README](../README.md). It
-describes the rank-N compiler facade, lists what each Python and Rust API
-currently supports, and collects the full set of known limitations. Paths in
-code spans (for example `examples/pinn_poisson.py`) are relative to the
-repository root. Per-feature status and validation records are in
-[jax_like_roadmap.md](jax_like_roadmap.md).
+describes the Python API on `main` in two layers:
+
+- The **core API** of the upcoming v0.2 release (unreleased; slices S0-S4b of
+  [api_v0_2_design.md](api_v0_2_design.md)): arrays with NumPy interop,
+  module-level math, and the JAX-style function transforms `grad`,
+  `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `vmap`, and `jit`.
+  New code should start here. These transforms compile for the CPU only so
+  far.
+- The **v0.1 layer**, released in v0.1.0 and kept unchanged: the rank-N
+  compiler facade (`Compiler`, `Program`, `Executable`), which is the
+  advanced layer for explicit compilation and, until `jit(device=...)` lands,
+  the way to run on CUDA and MLX; the `trace_tensor` and `tensor_*_fn`
+  helpers with their device variants and device optimizers; the control-flow
+  builders; and the legacy 2D `Matrix` API. The design deprecates most
+  `tensor_*_fn` helpers in favour of the core API in v0.2, but none of them
+  emits a warning yet, and all of them keep working through 0.x.
+
+Paths in code spans (for example `examples/pinn_poisson.py`) are relative to
+the repository root. Per-feature status and validation records are in
+[jax_like_roadmap.md](jax_like_roadmap.md). The examples below use
+`import quabla as qb`.
 
 ## Contents
 
-- [Compiler Facade](#compiler-facade)
-- [Current Capabilities](#current-capabilities)
+- [Core API](#core-api)
+  - [Arrays and NumPy](#arrays-and-numpy)
   - [Function Transforms](#function-transforms)
+- [Device Execution](#device-execution)
+- [Compiler Facade](#compiler-facade)
+- [v0.1 API Reference](#v01-api-reference)
   - [Rank-N Tensor API](#rank-n-tensor-api)
   - [Legacy 2D API](#legacy-2d-api)
   - [Rust Core Crate](#rust-core-crate)
 - [Known Limitations](#known-limitations)
 
+## Core API
+
+### Arrays and NumPy
+
+```python
+qb.array(obj, dtype=None)       # always a new object
+qb.asarray(obj, dtype=None)     # returns obj unchanged if already a Tensor of dtype
+qb.zeros(shape, dtype=None), qb.ones(...), qb.full(shape, fill_value, ...)
+qb.arange(start, stop=None, step=1.0, dtype=None), qb.linspace(start, stop, num, ...)
+qb.eye(n, m=None, dtype=None)
+```
+
+- `array`/`asarray` accept Python scalars, rectangular nested lists and
+  tuples, NumPy arrays and scalars, objects with the buffer protocol or
+  `__array__`, and Quabla arrays. The result is an eager `Tensor`; imported
+  data is always copied, so a tensor never aliases a NumPy array.
+- dtype inference: NumPy `float64`, `float32`, and `bool_` keep their dtype;
+  NumPy integers become `float64` (there is no integer dtype) and `float16`
+  raises `TypeError`. Python numbers and lists become `float64`, or `bool_`
+  when every element is a Python `bool`. Pass `dtype=qb.float32` to convert.
+- Export: `Tensor.numpy()`, `tolist()`, `item()`, `float(t)`, `np.asarray(t)`
+  (through `__array__`), and the buffer protocol. `to_flat_list()` keeps
+  working. `qb.Array` is an abstract base class that `Tensor`, `TensorView`,
+  and `TraceTensor` are registered with.
+- NumPy is optional: importing `quabla` never imports it.
+- Module-level functions call the method of the same name on a `Tensor` or
+  `TraceTensor`, so eager and traced code share one spelling (`qb.sin(x)` is
+  `x.sin()`): `sin`, `cos`, `tanh`, `exp`, `log`, `sqrt`, `relu`, `sigmoid`,
+  `softplus`, `sum`, `mean`, `max`, `min`, `any`, `all`, `norm`, `matmul`,
+  `transpose`, `reshape`, `broadcast_to`, `astype`, `maximum`, `minimum`,
+  `power`, `solve`, `cholesky`, `tril`, and `triu`, next to the v0.1
+  functions `where`, `concat`, `stack`, `einsum`, and the comparison and
+  logical functions. Other operands (numbers, lists, NumPy arrays) go
+  through `asarray`; a Python number stays a weak scalar. `abs`, `sum`,
+  `max`, `min`, `any`, and `all` are attributes of `quabla` but not in
+  `__all__`, so `from quabla import *` leaves the builtins alone.
+- Operators: `-x` and `x ** y` work on traced values as on eager ones;
+  `x ** y` with a non-integer or tensor exponent is the differentiable
+  elementwise `pow` op (`qb.power`), described under
+  [Rank-N Tensor API](#rank-n-tensor-api).
+- The dtype rules, bool masks, and the operation set are the v0.1 rules of
+  the [Rank-N Tensor API](#rank-n-tensor-api).
+
+### Function Transforms
+
+The v0.2 transforms ([api_v0_2_design.md](api_v0_2_design.md), sections
+3.3-3.5; CPU only so far, see [Device Execution](#device-execution)) take
+positional pytree arguments (`dict` with string keys, `list`,
+`tuple`, `None`; `quabla.tree.flatten`/`unflatten`/`map`) of arrays and
+Python scalars, and need no input specs:
+
+```python
+qb.grad(fun, argnums=0, has_aux=False)            # -> grads, or (grads, aux)
+qb.value_and_grad(fun, argnums=0, has_aux=False)  # -> (value, grads)
+qb.jvp(fun, primals, tangents)                    # -> (out, tangent_out)
+qb.vjp(fun, *primals, has_aux=False)              # -> (out, vjp_fun[, aux])
+qb.jacobian(fun, argnums=0)                       # blocks [*out.shape, *in.shape]
+qb.hessian(fun, argnums=0)                        # blocks [*in.shape, *in.shape]
+qb.vmap(fun, in_axes=0, out_axes=0)               # -> batched fun
+qb.jit(fun, device=None, static_argnums=(), max_traces=8)
+```
+
+- Every transformed function traces and compiles one CPU program on its
+  first call per signature (pytree structure, array shapes and dtypes, and
+  static values) and reuses it afterwards; more than `max_traces` signatures
+  (8 by default) raise `quabla.RetraceLimitError`. Python scalars are static
+  weak constants, so they keep `float32` programs in `float32`, except in
+  differentiated positions, where they become `float64` arrays. Arrays and
+  Python values read from closures are fixed at trace time; tracers of an
+  enclosing trace read from closures are not (see "Closures over tracers").
+- Gradients mirror the pytree of the selected arguments and keep their
+  dtypes; `bool_` leaves get `None`. Transforms compose when passed to each
+  other directly (`grad(grad(f))`, `jvp(grad(f), (x,), (v,))`,
+  `jit(value_and_grad(f))`) and when a transformed function is called
+  inside a function that another transform traces: `grad`,
+  `value_and_grad`, `jvp`, `vjp`, `vmap`, and `jit` stage their graph once
+  per signature and inline it into the enclosing trace, so a derivative can
+  be used inside a loss that is differentiated again:
+
+  ```python
+  def u(x, w):                                          # one point, scalar x
+      return qb.sin(x * w)
+
+  u_xx = qb.vmap(qb.grad(qb.grad(u)), in_axes=(0, None))  # d2u/dx2 per point
+
+  def loss(w, x):                                       # x: [n] points
+      return qb.mean((u_xx(x, w) + math.pi**2 * qb.sin(math.pi * x)) ** 2)
+
+  x = qb.linspace(0.05, 0.95, 8)
+  value, grad_w = qb.jit(qb.value_and_grad(loss))(qb.array(2.5), x)
+  ```
+
+  Eager array arguments of such an inner call bind as constants. Each
+  inner call adds its graph once, so per-point Python loops grow the graph
+  linearly; `vmap` keeps it independent of the number of points.
+  `jacobian` and `hessian` are forward mode vectorized with `vmap` over the
+  input elements (as `jax.jacfwd`), so they compose too, for example
+  `grad(lambda x: qb.sum(qb.hessian(f)(x)))` or `vmap(hessian(f))`.
+  Second-order reverse mode through `fori`/`scan` regions is rejected with
+  a `ValueError`.
+- `vmap(fun, in_axes=0, out_axes=0)` vectorizes `fun`, which sees one
+  example, with JAX semantics. `in_axes` is an int (the mapped axis,
+  negative counts from the end), `None` (an argument shared by every
+  example), or a tuple, list, or dict of them matching the arguments as a
+  pytree prefix; all mapped axes must have one size, and Python scalars can
+  only be unmapped. `out_axes` places the batch axis of each result leaf
+  the same way: results that do not depend on a mapped argument are
+  broadcast over the batch, and `None` returns them unbatched (a mapped
+  result with `out_axes=None` is an error). `fun` is staged for one example
+  and the graph is batched node by node, so `vmap` composes with every
+  transform in both directions and with itself: `vmap(grad(f))`,
+  `jit(vmap(f))`, `grad` of a loss over `vmap`, `jvp`/`vjp` of `vmap`, and
+  `vmap(vmap(f))`. `vmap(grad(f, argnums=1), in_axes=(0, None))` returns
+  one gradient per example, `[B, *w.shape]`, as in JAX, while
+  `vjp(vmap(f, in_axes=(0, None)), x, w)` sums the unmapped gradient over
+  the batch, as reverse mode must. A mapped `solve`, `cond`, `fori`, or
+  `scan` raises `quabla.UnsupportedOperationError` (the v0.1
+  `tensor_vmap_*` helpers batch `fori`/`scan` bodies).
+- Closures and constants: an eager array (`Tensor` or `TensorView`,
+  including a result such as `qb.sin(math.pi * 0.3)`) that meets a traced
+  value becomes a constant of the graph. This covers arithmetic in either
+  order, comparisons, `**`, `@`, `maximum`/`minimum`, `where`, `concat`,
+  `stack`, `solve`, the logical ops, and eager arguments, tangents, and
+  cotangents of an inner transformed call, so closures over module-level
+  arrays work:
+
+  ```python
+  points = qb.linspace(0.0, 1.0, 8)
+  f = lambda w: qb.sum(qb.sin(points * w))
+  qb.grad(f)(qb.array(1.0))
+  ```
+
+  As with `jax.jit`, the value is fixed at trace time: rebinding `points`
+  after the first call does not retrace (tensors are immutable, so
+  rebinding is the only change possible); pass data that changes as an
+  argument. A constant keeps its dtype (strong): a `float64` array with a
+  `float32` traced value is a dtype error asking for `astype`, while Python
+  scalars stay weak. Every captured array is stored in the graph, so large
+  ones grow memory and compile time; compiled plans merge equal constants
+  and fold elementwise ops on them. CUDA uploads each constant once per
+  compiled plan, MLX once per constant, and CUDA `fori`/`scan` loop bodies
+  reject captured arrays.
+- Closures over tracers: a function passed to a transform inside a traced
+  function may close over tracers of that trace, or of any trace enclosing
+  it, as in JAX:
+
+  ```python
+  def loss(params, x):                                  # x: [n] points
+      u_xx = qb.vmap(qb.grad(qb.grad(lambda t: net(params, t))))
+      return qb.mean((u_xx(x) - forcing(x)) ** 2)
+
+  qb.jit(qb.value_and_grad(loss))(params, x)
+  ```
+
+  The inner transform treats a closed-over tracer as a constant: it
+  differentiates only its explicit arguments, and `vmap` leaves the value
+  unmapped. The enclosing transform differentiates through it, so the
+  gradient above includes the dependence of `u_xx` on `params`; the result
+  equals passing `params` as an unmapped argument
+  (`vmap(grad(grad(net_x)), in_axes=(0, None))(x, params)`). This works for
+  `grad`, `value_and_grad`, `jvp`, `vjp`, `vmap`, `jacobian`, `hessian`,
+  and `jit`, with `has_aux`, with eager arguments of the inner call, next to
+  captured arrays, and across several levels of nesting. A transformed
+  function that captured tracers when it was staged is traced again on
+  each call to find the tracers it captures this time, and reuses its
+  transformed graph while their shapes and dtypes match, so a closure that
+  refers to a different tracer on each call binds the right one. A tracer
+  used after its trace ended (stored in a global or a container and used in
+  a later trace), or inside a `tensor_*` helper or region trace, raises
+  `quabla.TracerError`.
+- `quabla.grad` and `quabla.jit` still accept the legacy 2D forms
+  `grad(fn, input_specs, values, output_cotangent)` and `jit(input_specs)`
+  and dispatch them to the v0.1 functions below.
+- A `TraceTensor` has no value while it is traced: Python control flow,
+  `float()`, `int()`, `item()`, `tolist()`, `numpy()`, and `np.asarray` on
+  it raise `quabla.TracerError`. A NumPy array is not captured: as the
+  left operand it converts the tracer and raises `TracerError`, as the
+  right one it is a `TypeError`; convert it with `qb.asarray` first.
+- Errors: `quabla.QuablaError` is the base of `TracerError` (a `TypeError`),
+  `RetraceLimitError` (a `ValueError`), and `UnsupportedOperationError` (a
+  `ValueError` and `NotImplementedError` with `.op` and `.device`).
+
+## Device Execution
+
+`qb.jit(fun, device=...)` accepts only `None` and `"cpu"` so far; `"cuda"`,
+`"cuda:N"`, and `"mlx"` raise `quabla.UnsupportedOperationError` until slice
+S5 of the v0.2 design lands, and any other value is a `ValueError`. Until
+then, the v0.1 entrypoints below run on CUDA and MLX. They take name-keyed
+input specs (`[(name, shape, dtype), ...]`) and dictionaries of eager
+tensors, and they are unchanged since v0.1.0. The README
+[Quickstart](../README.md#quickstart) shows the facade on every built
+target.
+
+| Task | CUDA (Linux, `cuda` feature) | MLX (Apple silicon, `mlx` feature) |
+| --- | --- | --- |
+| Primal function, any target | `Compiler().trace(fn, specs).compile("cuda")` | `Compiler().trace(fn, specs).compile("mlx")` |
+| Symbolic JVP/VJP programs | `Program.jvp(name)`, `Program.vjp(cotangent_name)`, then `compile(target)` | same |
+| Scalar loss with named gradients | `tensor_value_and_grad_cuda_fn` | `tensor_value_and_grad_mlx_fn` |
+| Bounded batch-size specialization | `tensor_jit_batch_cuda_fn`, `tensor_value_and_grad_batch_cuda_fn` | `tensor_value_and_grad_batch_mlx_fn` |
+| `vmap` and its JVP/VJP/HVP | `tensor_vmap_cuda_fn`, `tensor_vmap_{jvp,vjp}_cuda_fn`, `tensor_vmap_hvp_scalar_cuda_fn` | `tensor_vmap_mlx_fn`, `tensor_vmap_{jvp,vjp}_mlx_fn` |
+| Device-resident Adam training | `cuda_adam_vjp_optimizer`, `cuda_adam_loss_optimizer` | `mlx_adam_loss_optimizer` |
+| Data parallelism (`cuda-nccl`) | `tensor_value_and_grad_data_parallel_cuda_fn` | not available |
+
+Control flow on every backend uses the region builders `tensor_cond`,
+`tensor_fori_loop_region`, and `tensor_scan_region` inside a traced
+function, under the v0.2 transforms (CPU) and the v0.1 helpers alike; the
+core `qb.cond`, `qb.fori_loop`, and `qb.scan` wrappers are planned for v0.2. `Compiler.capabilities()` reports which targets the build
+contains; it is not a hardware probe. The PINN examples in
+`examples/pinn_poisson_{mlx,cuda}.py` and `examples/pinn_mlp_{mlx,cuda}.py`
+train on each device with these helpers. Their behaviour and limits are
+described under [Compiler Facade](#compiler-facade) and
+[Rank-N Tensor API](#rank-n-tensor-api).
+
 ## Compiler Facade
 
-The rank-N compiler path has one explicit lifecycle. New Python integrations
-should use this facade instead of coupling to a backend-specific execution
-plan class. It is the canonical entrypoint for new rank-N compiler features;
-the legacy 2D `Matrix` tracer is intentionally outside this migration boundary.
-The [Quickstart](../README.md#quickstart) shows the lifecycle end to end.
+The rank-N compiler path has one explicit lifecycle. It is the advanced
+layer of the v0.2 design, for explicit compilation and inspection from
+name-keyed input specs, and until `jit(device=...)` lands it is the
+target-independent way to run on CUDA and MLX. Integrations that need a
+compiled program should use this facade instead of coupling to a
+backend-specific execution plan class; the legacy 2D `Matrix` tracer is
+intentionally outside it. The [Quickstart](../README.md#quickstart) shows the
+lifecycle end to end.
 
 `Program.jvp(input_name)` and `Program.vjp(cotangent_name)` produce new
 programs that can be compiled through the same interface. `compile("cuda")`
@@ -100,145 +335,13 @@ Python frontend / PyO3 -> TensorTraceGraph -> TensorIr / AD transforms
                        -> frozen TensorExecutionPlan -> CPU | CUDA | MLX
 ```
 
-## Current Capabilities
+## v0.1 API Reference
 
-### Function Transforms
-
-The v0.2 transforms (docs/api_v0_2_design.md, sections 3.3-3.5; CPU only so
-far) take positional pytree arguments (`dict` with string keys, `list`,
-`tuple`, `None`; `quabla.tree.flatten`/`unflatten`/`map`) of arrays and
-Python scalars, and need no input specs:
-
-```python
-qb.grad(fun, argnums=0, has_aux=False)            # -> grads, or (grads, aux)
-qb.value_and_grad(fun, argnums=0, has_aux=False)  # -> (value, grads)
-qb.jvp(fun, primals, tangents)                    # -> (out, tangent_out)
-qb.vjp(fun, *primals, has_aux=False)              # -> (out, vjp_fun[, aux])
-qb.jacobian(fun, argnums=0)                       # blocks [*out.shape, *in.shape]
-qb.hessian(fun, argnums=0)                        # blocks [*in.shape, *in.shape]
-qb.vmap(fun, in_axes=0, out_axes=0)               # -> batched fun
-qb.jit(fun, device=None, static_argnums=(), max_traces=8)
-```
-
-- Every transformed function traces and compiles one CPU program on its
-  first call per signature (pytree structure, array shapes and dtypes, and
-  static values) and reuses it afterwards; more than `max_traces` signatures
-  (8 by default) raise `quabla.RetraceLimitError`. Python scalars are static
-  weak constants, so they keep `float32` programs in `float32`, except in
-  differentiated positions, where they become `float64` arrays. Arrays and
-  Python values read from closures are fixed at trace time; tracers of an
-  enclosing trace read from closures are not (see "Closures over tracers").
-- Gradients mirror the pytree of the selected arguments and keep their
-  dtypes; `bool_` leaves get `None`. Transforms compose when passed to each
-  other directly (`grad(grad(f))`, `jvp(grad(f), (x,), (v,))`,
-  `jit(value_and_grad(f))`) and when a transformed function is called
-  inside a function that another transform traces: `grad`,
-  `value_and_grad`, `jvp`, `vjp`, `vmap`, and `jit` stage their graph once
-  per signature and inline it into the enclosing trace, so a derivative can
-  be used inside a loss that is differentiated again:
-
-  ```python
-  def u(x, w):                                          # one point, scalar x
-      return qb.sin(x * w)
-
-  u_xx = qb.vmap(qb.grad(qb.grad(u)), in_axes=(0, None))  # d2u/dx2 per point
-
-  def loss(w, x):                                       # x: [n] points
-      return qb.mean((u_xx(x, w) + math.pi**2 * qb.sin(math.pi * x)) ** 2)
-
-  x = qb.linspace(0.05, 0.95, 8)
-  value, grad_w = qb.jit(qb.value_and_grad(loss))(qb.array(2.5), x)
-  ```
-
-  Eager array arguments of such an inner call bind as constants. Each
-  inner call adds its graph once, so per-point Python loops grow the graph
-  linearly; `vmap` keeps it independent of the number of points.
-  `jacobian` and `hessian` are forward mode vectorized with `vmap` over the
-  input elements (as `jax.jacfwd`), so they compose too, for example
-  `grad(lambda x: qb.sum(qb.hessian(f)(x)))` or `vmap(hessian(f))`.
-  Second-order reverse mode through `fori`/`scan` regions is rejected with
-  a `ValueError`.
-- `vmap(fun, in_axes=0, out_axes=0)` vectorizes `fun`, which sees one
-  example, with JAX semantics. `in_axes` is an int (the mapped axis,
-  negative counts from the end), `None` (an argument shared by every
-  example), or a tuple, list, or dict of them matching the arguments as a
-  pytree prefix; all mapped axes must have one size, and Python scalars can
-  only be unmapped. `out_axes` places the batch axis of each result leaf
-  the same way: results that do not depend on a mapped argument are
-  broadcast over the batch, and `None` returns them unbatched (a mapped
-  result with `out_axes=None` is an error). `fun` is staged for one example
-  and the graph is batched node by node, so `vmap` composes with every
-  transform in both directions and with itself: `vmap(grad(f))`,
-  `jit(vmap(f))`, `grad` of a loss over `vmap`, `jvp`/`vjp` of `vmap`, and
-  `vmap(vmap(f))`. `vmap(grad(f, argnums=1), in_axes=(0, None))` returns
-  one gradient per example, `[B, *w.shape]`, as in JAX, while
-  `vjp(vmap(f, in_axes=(0, None)), x, w)` sums the unmapped gradient over
-  the batch, as reverse mode must. A mapped `solve`, `cond`, `fori`, or
-  `scan` raises `quabla.UnsupportedOperationError` (the deprecated
-  `tensor_vmap_*` helpers batch `fori`/`scan` bodies).
-- Closures and constants: an eager array (`Tensor` or `TensorView`,
-  including a result such as `qb.sin(math.pi * 0.3)`) that meets a traced
-  value becomes a constant of the graph. This covers arithmetic in either
-  order, comparisons, `**`, `@`, `maximum`/`minimum`, `where`, `concat`,
-  `stack`, `solve`, the logical ops, and eager arguments, tangents, and
-  cotangents of an inner transformed call, so closures over module-level
-  arrays work:
-
-  ```python
-  points = qb.linspace(0.0, 1.0, 8)
-  f = lambda w: qb.sum(qb.sin(points * w))
-  qb.grad(f)(qb.array(1.0))
-  ```
-
-  As with `jax.jit`, the value is fixed at trace time: rebinding `points`
-  after the first call does not retrace (tensors are immutable, so
-  rebinding is the only change possible); pass data that changes as an
-  argument. A constant keeps its dtype (strong): a `float64` array with a
-  `float32` traced value is a dtype error asking for `astype`, while Python
-  scalars stay weak. Every captured array is stored in the graph, so large
-  ones grow memory and compile time; compiled plans merge equal constants
-  and fold elementwise ops on them. CUDA uploads each constant once per
-  compiled plan, MLX once per constant, and CUDA `fori`/`scan` loop bodies
-  reject captured arrays.
-- Closures over tracers: a function passed to a transform inside a traced
-  function may close over tracers of that trace, or of any trace enclosing
-  it, as in JAX:
-
-  ```python
-  def loss(params, x):                                  # x: [n] points
-      u_xx = qb.vmap(qb.grad(qb.grad(lambda t: net(params, t))))
-      return qb.mean((u_xx(x) - forcing(x)) ** 2)
-
-  qb.jit(qb.value_and_grad(loss))(params, x)
-  ```
-
-  The inner transform treats a closed-over tracer as a constant: it
-  differentiates only its explicit arguments, and `vmap` leaves the value
-  unmapped. The enclosing transform differentiates through it, so the
-  gradient above includes the dependence of `u_xx` on `params`; the result
-  equals passing `params` as an unmapped argument
-  (`vmap(grad(grad(net_x)), in_axes=(0, None))(x, params)`). This works for
-  `grad`, `value_and_grad`, `jvp`, `vjp`, `vmap`, `jacobian`, `hessian`,
-  and `jit`, with `has_aux`, with eager arguments of the inner call, next to
-  captured arrays, and across several levels of nesting. A transformed
-  function that captured tracers when it was staged is traced again on
-  each call to find the tracers it captures this time, and reuses its
-  transformed graph while their shapes and dtypes match, so a closure that
-  refers to a different tracer on each call binds the right one. A tracer
-  used after its trace ended (stored in a global or a container and used in
-  a later trace), or inside a `tensor_*` helper or region trace, raises
-  `quabla.TracerError`.
-- `quabla.grad` and `quabla.jit` still accept the legacy 2D forms
-  `grad(fn, input_specs, values, output_cotangent)` and `jit(input_specs)`
-  and dispatch them to the v0.1 functions below.
-- A `TraceTensor` has no value while it is traced: Python control flow,
-  `float()`, `int()`, `item()`, `tolist()`, `numpy()`, and `np.asarray` on
-  it raise `quabla.TracerError`. A NumPy array is not captured: as the
-  left operand it converts the tracer and raises `TracerError`, as the
-  right one it is a `TypeError`; convert it with `qb.asarray` first.
-- Errors: `quabla.QuablaError` is the base of `TracerError` (a `TypeError`),
-  `RetraceLimitError` (a `ValueError`), and `UnsupportedOperationError` (a
-  `ValueError` and `NotImplementedError` with `.op` and `.device`).
+These entrypoints shipped in v0.1.0 and work unchanged on `main`. The v0.2
+design ([Appendix A](api_v0_2_design.md#appendix-a-name-mapping)) maps each
+of them to its core-API equivalent and deprecates most `tensor_*_fn` helpers
+from v0.2 on; the deprecation warnings are not implemented yet, and every
+name keeps working through 0.x.
 
 ### Rank-N Tensor API
 
@@ -590,7 +693,9 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8)
   back to the host. Build requirements are listed under
   [Installation From Source](../README.md#installation-from-source).
 - Python `Adam` updates immutable dictionaries of named rank-N `Tensor`
-  parameters from VJP gradients. The test suite includes a manufactured 1D
+  parameters from VJP gradients, including the gradient dictionaries that
+  `qb.grad` and `qb.value_and_grad` return for a flat dict of parameters
+  (README "At a Glance"); `quabla.optim` is planned for v0.2. The test suite includes a manufactured 1D
   Poisson residual in which two symbolic coordinate JVP transforms form
   `u_xx`, then VJP and Adam recover one scalar MLP weight. This is a
   vertical-slice correctness proof. It includes batched collocation points and
@@ -728,7 +833,10 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - StableHLO export (`stablehlo_text`) covers only a small inspection subset
   and is not an execution path.
 - The legacy 2D `Matrix`/`TraceGraph` API is not migrated to the facade.
-- The v0.2 transforms run on the CPU only. `quabla.vmap` cannot batch
-  `solve` or `cond`/`fori`/`scan` regions over a mapped argument.
+- The v0.2 transforms run on the CPU only; `jit(device=...)` for CUDA and
+  MLX, `quabla.optim`, and the `cond`/`fori_loop`/`scan` wrappers are not
+  implemented yet (see [Device Execution](#device-execution)).
+  `quabla.vmap` cannot batch `solve` or `cond`/`fori`/`scan` regions over a
+  mapped argument.
   `jacobian` and `hessian` are dense: their basis constant and result grow
   quadratically with the number of input elements.
