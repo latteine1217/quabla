@@ -1331,23 +1331,23 @@ returns early there.
 
 Two-GPU verification (2026-09-27): the two-GPU parity run on a single
 Linux node (2x RTX 3090, driver 560.35.05, CUDA 12.6) tested commit
-`b38b987`. The Python caller-reduction callable matches the deterministic
+`6ea5e7d`. The Python caller-reduction callable matches the deterministic
 CPU oracle exactly for both reductions (`Sum`: loss 35.75, weight gradient
 -45.0; `Mean`: loss 17.875, gradient -22.5; absolute error 0.0). The
 mixed-schedule Rust test matches the global CPU plan within `1.7e-7`
 (`Sum` output) and `5.0e-9` (`Mean` output). Each is a single call, so the
 reported collective durations (0.63-1.08 s) are not steady-state collective
-costs. An earlier run of the same Python parity against the pre-`b38b987`
+costs. An earlier run of the same Python parity against the pre-`6ea5e7d`
 extension, whose per-rank NCCL calls were not grouped, hit its 20-minute
-time limit; with grouping, the parity run finished in 7 s. Commit `920ee7d`
+time limit; with grouping, the parity run finished in 7 s. Commit `07aa493`
 later changed how the data-parallel path freezes its program; a rerun of
-both checks at `535ef84` on the same node reproduced the same values and
+both checks at `17cbc02` on the same node reproduced the same values and
 errors.
 
 Two-GPU training verification (2026-09-27): the data-parallel plan created its
 NCCL communicators (`ncclCommInitAll`) on every call and dropped them, issuing
 `ncclCommAbort`, before synchronizing the replicas; the single-call collective
-durations above were mostly that initialization. Commit `b9131a2` creates the
+durations above were mostly that initialization. Commit `424bf82` creates the
 communicators once in `compile_data_parallel` and keeps them for the plan's
 lifetime behind a mutex that serializes invocations.
 `examples/validate_data_parallel_training_cuda.py` trains a 2-32-32-1 tanh MLP
@@ -1362,7 +1362,7 @@ max|b|` over all parameters. `1e-4` is about 6.5 times the f32 worst-case
 rounding bound for the 256-row batch mean (`256 * 2^-24`), while reduction
 bugs such as a `Sum`/`Mean` mix-up give O(1) differences. The two-GPU training
 run on the same node (2x RTX 3090, driver 560.35.05, CUDA 12.6, NCCL 2.24.3)
-tested the tree of `66ef989` and passed; an earlier run produced identical
+tested the tree of `1fadc03` and passed; an earlier run produced identical
 differences but exited non-zero because its 50-step baseline run did not meet
 the loss-halving check. Loss fell from 0.3024 to 0.1335 in every mode.
 
@@ -1374,7 +1374,7 @@ the loss-halving check. Loss fell from 0.3024 to 0.1335 in every mode.
 | two-GPU sum vs two-GPU mean | 0 | 0 | 0 |
 
 Timing is host-observed per call; steady state is steps 10-199 (median,
-min-max). The baseline row is the pre-fix extension (`4d99716`) run in the
+min-max). The baseline row is the pre-fix extension (`9251fee`) run in the
 same run with the same 200 steps; it reproduced the final loss exactly.
 
 | Two-GPU `mean` | First step | Steady median | Steady min-max |
@@ -1394,7 +1394,7 @@ with two GPUs was measured.
 Failure handling and communicator lifecycle (2026-09-27): a failed
 data-parallel call kept its communicators, although a failure while
 enqueuing one rank's all-reduce inside the NCCL group can leave the
-collective launched on the other ranks only. Commit `a132f2a` defines the
+collective launched on the other ranks only. Commit `32baba1` defines the
 contract: any error after the communicator lock is taken is returned with
 the note that the communicators were aborted, the failed call drops them
 (`ncclCommAbort`), and the next call on the plan or any clone creates new
@@ -1404,7 +1404,7 @@ lacks its shard: it fails input validation after replica 0 has enqueued
 its work. No fault-injection seam was added, so an error returned by NCCL
 itself takes the same path but is not exercised. The two-GPU robustness run
 on the same node (2x RTX 3090, driver 560.35.05, NCCL 2.24.3) tested the
-tree of `ff0735e`:
+tree of `f1122c7`:
 
 - Recovery: after a successful call, two consecutive failed calls each
   returned `missing input "x"` with the reset note (the second first
