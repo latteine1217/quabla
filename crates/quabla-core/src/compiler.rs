@@ -270,6 +270,11 @@ impl QuablaMultiOutputExecutable {
         self.executable.plan().output_node_ids()
     }
 
+    /// The frozen plan, after dead-code elimination and structural CSE.
+    pub fn plan(&self) -> &TensorExecutionPlan {
+        self.executable.plan()
+    }
+
     /// Executes the plan once and returns every output in program order.
     pub fn execute(
         &self,

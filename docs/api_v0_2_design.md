@@ -646,7 +646,7 @@ The gates are those under "Development Gates" (`CONTRIBUTING.md:18-35`), with
 | **S1 Arrays** | `array`, `asarray`, factories, `numpy()`, `tolist()`, `item()`, `__float__`, `__array__`, buffer import/export, `Array` ABC, module ops, tracer `__neg__`/`__pow__` | bridge | `py/tensor.rs`, `py/interop.rs`, `py/tensor_trace.rs`, `python/quabla/_array.py`, `python/quabla/_ops.py` | dtype-mapping table tests; NumPy round trip of 1e6 values under 5 ms; `unsafe` buffer export with `// SAFETY:` and a refcount test | buffer lifetime soundness; NumPy 1.x vs 2.x `__array__(copy=)` |
 | **S1b Pow op** | elementwise `Pow` IR op with JVP/VJP/HVP rules, CPU/CUDA/MLX lowering, fusion and CSE handling, `qb.power`, tracer `x ** y` for non-integer and tensor exponents | **core** | `core/tensor_ir.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/tensor_trace.rs` | finite-difference checks for both operands incl. negative base, zero base, and integer-valued float exponents; CPU/MLX/CUDA parity; `powi` path unchanged for integer exponents. Landed: the conventions of §3.2, eager `Tensor ** Tensor` and `c ** Tensor`, and `qb.power` | NaN/inf conventions at `x <= 0`; derivative at `x == 0`; the symbolic Hessian of a loss whose value is infinite was NaN because the reverse pass of `sum`/`mean` broadcast its cotangent with `powi(v - v, 0)` (predates `Pow`); resolved by broadcasting a constant ones tensor, so symbolic and runtime Hessians agree there |
 | **S2 CPU transforms** | `grad`, `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `jit(device="cpu")`, pytrees, `argnums`, `has_aux`, cache and `RetraceLimitError`, `quabla.tree` | bridge (tuple outputs from traces) + core (`symbolic_vjp_many`) | `py/tensor_trace.rs:4375-4399`, `python/quabla/_transforms.py` | parity against `tensor_*_fn` on shared fixtures; retrace-bound tests; float32 keeps float32. Landed as described in "S2 as landed" below | Python overhead on tiny graphs (3 µs vs 17 µs, Exp 4) |
-| **S3 Composition** | `TensorIr::inline` + bridge binding; nested transforms; README PINN example | **core** | `core/tensor_ir.rs`, `py/tensor_trace.rs`, `python/quabla/_transforms.py` | Rust tests for inline, including `Cond`/`Fori`/`Scan` regions; `grad(grad)` vs exact; README example reproduces `w = 3.141593` | shared-subexpression duplication after inlining (freeze already commons pure nodes, `docs/api.md:352-353`) |
+| **S3 Composition** | `TensorIr::inline` + bridge binding; nested transforms; README PINN example | **core** | `core/tensor_ir.rs`, `py/tensor_trace.rs`, `python/quabla/_transforms.py` | Rust tests for inline, including `Cond`/`Fori`/`Scan` regions; `grad(grad)` vs exact; README example reproduces `w = 3.141593`. Landed as described in "S3 as landed" below | shared-subexpression duplication after inlining (freeze already commons pure nodes, `docs/api.md:352-353`) |
 | **S4 vmap** | `vmap(in_axes, out_axes)` over pytrees; `vmap(grad)`; rejection of unmapped per-example gradients and nested vmap | bridge | `py/tensor_trace.rs:4490-4594` | parity with `tensor_vmap_{,jvp_,vjp_,hvp_scalar_}fn` | `out_axes` pytrees vs the single `out_axis` today |
 | **S5 Devices and errors** | `jit(device=...)`, `"cuda:N"`, `devices()`, `lower()`/`ShapeDtype`, error hierarchy, typed lowering rejections, eager MLX validation, `float64`-on-device warning | **core** (errors, MLX validation) | `core/compiler.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/compiler.rs` | `QUABLA_MLX_TEST=1` suite on macOS; `QUABLA_CUDA_TEST=1` on the CUDA host; unbuilt-target error test in CI | MLX lock discipline for new entrypoints (`core/tensor_ir/mlx.rs:43`) |
 | **S6 Optim and Trainer** | `optim.Adam`/`SGD` (pure), `Trainer` on CPU/MLX/CUDA; `quabla.Adam` alias | none | `python/quabla/optim.py` | `benchmark_pinn_mlx.py` and `benchmark_pinn_cuda.py` with old and new APIs on the same host: step time within 2%; convergence parity with `examples/pinn_poisson_mlx.py` | parameter naming mismatches between pytree paths and the factories' name lists |
@@ -678,7 +678,7 @@ CPU; deviations and refinements of this document:
   `hessian` (= `jacobian(grad(f))`, forward over reverse) work now. Calling a
   transformed function on tracers inside a traced Python function raises
   `UnsupportedOperationError` (`op="nested transform"`) until S3 inlines
-  graphs; `jit` of a plain Python function called on tracers traces through
+  graphs (superseded by S3 below); `jit` of a plain Python function called on tracers traces through
   it, which is exact. `jacobian`/`hessian` evaluate one column per input
   element and cannot be transformed further (`grad(hessian(f))` raises);
   `jit(hessian(f))` forwards the call. The scalar-leaf forward-mode `grad`
@@ -721,6 +721,61 @@ CPU; deviations and refinements of this document:
   `plan.evaluate_value_and_vjp`, since the gradient is compiled rather than
   computed by the runtime VJP; a `value_and_grad` re-created per call costs
   6.3 µs.
+
+**S3 as landed.** Deviations and refinements of sections 3.4 and 6:
+
+- **Core.** `TensorIr::inline(callee, bindings, outputs)` copies the part of
+  a staged graph that `outputs` depend on, binding each callee `Input` by
+  name to an existing node of the same shape and dtype and copying every
+  other node with its shape, dtype, and weak flag through
+  `remap_tensor_op`/`push_node`; region nodes clone their plans and rebind
+  their captures. Nodes that share one region execution through a `group`
+  id (`Scan`, `ScanVjp`, `ForiVjp`, and their forward-over-reverse nodes)
+  get the id of their first spliced node, so two splices of one callee
+  never share a cached execution. No subexpression is merged while
+  splicing: plan compilation commons pure nodes as before, and a Rust test
+  checks that a spliced `sin(x)` compiles to the same plan as one traced
+  in place. `TensorIr::node_count` and `QuablaMultiOutputExecutable::plan`
+  were added for inspection.
+- **Bridge and Python.** A transformed function called on tracers stages
+  itself for their shapes and dtypes in a graph of its own, cached per
+  signature in a separate cache bounded by the same `max_traces`, and
+  `TensorTraceGraph._inline` splices it into the enclosing trace. Python
+  scalars in differentiated positions and Python number tangents and
+  cotangents bind as constants of the input dtype; eager arrays raise
+  `TracerError`, since constants are not captured. `grad`,
+  `value_and_grad` (with `has_aux`), `jvp` (traced or number tangents),
+  `vjp` (its pullback inlines the reverse graph on each call), and
+  `jit(transform)` compose this way; `jit` of a plain function still
+  traces through it. Batched `vmap` tracers raise
+  `UnsupportedOperationError` (`op="nested transform"`) until S4.
+- **Not staged.** `jacobian` and `hessian` still evaluate one forward-mode
+  column per input element, so `grad(hessian(f))` and calls on tracers
+  raise `UnsupportedOperationError` (`op="jacobian"`/`"hessian"`). Staging
+  them by inlining one JVP per basis vector would grow the graph with the
+  input size; they become stageable as `vmap` of a JVP over the basis in
+  S4. Second-order reverse mode through `Fori`/`Scan` regions stays the
+  core's explicit error (a `ValueError`), as section 3.4 records.
+- **PINN before `vmap`.** The README problem is expressed per point:
+  `u_xx = grad(grad(u))` on a scalar `u(x, w)`, called on `x[i]` for each
+  collocation point and stacked inside the loss, then
+  `jit(value_and_grad(loss))` with `quabla.Adam` for 300 steps reproduces
+  `w = 3.141593` (loss `1.5e-13`); the initial loss and gradient equal the
+  README's `symbolic_jvp("x").symbolic_jvp("x")` path within `1e-12`. The
+  README itself changes in S9, with `vmap` from S4.
+- **Graph size** (Apple silicon, graph nodes / compiled plan nodes).
+  Scalar `u_xx`: `grad(grad(u))` 33 / 11 against 34 / 21 for
+  `symbolic_jvp` twice. README loss with 8 points: the per-point
+  `value_and_grad` program is 516 / 206, growing by exactly 60 / 23 per
+  point (tested for 1, 2, 4, and 8 points), against 189 / 66 for a
+  symbolic VJP of the README graph; the vectorized form
+  `grad(lambda x, w: sum(grad(lambda x, w: sum(u(x, w)))(x, w)))`, exact
+  here because the points are independent, is 112 / 42. Per-point inlining
+  is linear in the points; batching them is the job of `vmap`.
+- **Overhead** (`timeit` minimum): one `jit(value_and_grad(loss))` step of
+  the per-point README loss takes 10.4 µs (vectorized form 5.3 µs) against
+  15.1 µs for the README's `plan.evaluate_value_and_vjp`; the first call,
+  which stages `u_xx` once, inlines it 8 times, and compiles, takes 0.35 ms.
 
 ## 7. Resolved Questions
 

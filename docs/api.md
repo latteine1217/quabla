@@ -129,9 +129,31 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8)
 - Gradients mirror the pytree of the selected arguments and keep their
   dtypes; `bool_` leaves get `None`. Transforms compose when passed to each
   other directly (`grad(grad(f))`, `jvp(grad(f), (x,), (v,))`,
-  `jit(value_and_grad(f))`). Calling a transformed function inside a
-  function that another transform traces raises
-  `quabla.UnsupportedOperationError`, except `jit` of a plain function.
+  `jit(value_and_grad(f))`) and when a transformed function is called
+  inside a function that another transform traces: `grad`,
+  `value_and_grad`, `jvp`, `vjp`, and `jit` stage their graph once per
+  signature and inline it into the enclosing trace, so a derivative can be
+  used inside a loss that is differentiated again:
+
+  ```python
+  u_xx = qb.grad(qb.grad(lambda x, w: qb.sin(x * w)))  # scalar x
+
+  def loss(w, x):                                       # x: [n] points
+      residual = qb.stack([u_xx(x[i], w) for i in range(x.shape[0])], 0)
+      return qb.mean((residual + math.pi**2 * qb.sin(math.pi * x)) ** 2)
+
+  x = qb.linspace(0.05, 0.95, 8)
+  value, grad_w = qb.jit(qb.value_and_grad(loss))(qb.array(2.5), x)
+  ```
+
+  Arguments of such an inner call must be traced values, Python scalars,
+  or static values; an eager array raises `quabla.TracerError`. The graph
+  grows linearly with the number of inner calls (per-point loops become a
+  `vmap` once it lands). `jacobian`/`hessian` cannot be called on traced
+  values or transformed further, calls on `vmap` tracers are not
+  supported yet, and second-order reverse mode through `fori`/`scan`
+  regions is rejected; these raise `quabla.UnsupportedOperationError`
+  (the region case a `ValueError`).
 - `quabla.grad` and `quabla.jit` still accept the legacy 2D forms
   `grad(fn, input_specs, values, output_cotangent)` and `jit(input_specs)`
   and dispatch them to the v0.1 functions below.

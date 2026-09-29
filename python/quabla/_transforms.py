@@ -18,13 +18,17 @@ derivative. A function may be traced at most `max_traces` times (8 unless
 Values that the function reads from its closure or from globals are baked
 into the trace, as with `jax.jit`: pass values that change as arguments.
 
-Composition works by staging: a transform whose function is itself a
-transform (`grad(grad(f))`, `jvp(grad(f), ...)`, `jit(value_and_grad(f))`,
-`hessian`) transforms the inner transform's graph directly. Calling a
-transformed function on traced values, inside a function that another
-transform is tracing, needs graph inlining (slice S3) and raises
-`UnsupportedOperationError`; `jit` of a plain Python function is the
-exception, because tracing through it is exact.
+Composition works by staging (slice S3, design 3.4 and D8). A transform
+whose function is itself a transform (`grad(grad(f))`, `jvp(grad(f), ...)`,
+`jit(value_and_grad(f))`, `hessian`) transforms the inner transform's graph
+directly. A transformed function called on traced values, inside a function
+that another transform is tracing, stages itself for the tracers' shapes and
+dtypes in a graph of its own, cached per signature like a compiled program,
+and inlines that graph into the enclosing trace (`TensorIr::inline`): its
+inputs bind to the tracers, so a derivative can be used inside a loss that
+is differentiated again. `jit` of a plain Python function traces through it
+instead, which is exact. `jacobian` and `hessian` evaluate column by column
+and cannot be staged or inlined until `vmap` exists.
 """
 
 import inspect
@@ -32,13 +36,16 @@ import weakref
 
 from . import _quabla
 from ._array import asarray, eye, zeros
-from ._errors import RetraceLimitError, UnsupportedOperationError
+from ._errors import RetraceLimitError, TracerError, UnsupportedOperationError
 from ._quabla import Tensor, TensorTraceGraph, TraceTensor, bool_, stack
 from .tree import _LEAF, _flatten, _leaf_count, _leaf_paths, _unflatten
 
 __all__ = ["grad", "hessian", "jacobian", "jit", "jvp", "value_and_grad", "vjp"]
 
 _STATIC_TYPES = (bool, int, float)
+# Leaves that become graph inputs when a function is staged: arrays, and the
+# tracers of an enclosing trace when a transformed function is inlined.
+_ARRAY_LEAVES = (Tensor, TraceTensor)
 _DEFAULT_MAX_TRACES = 8
 # Graph input names starting with `__quabla_` are reserved (design 3.11).
 _TANGENT_PREFIX = "__quabla_tangent/"
@@ -153,6 +160,61 @@ def _signature(args, static_argnums, converted_argnums):
     return in_node, leaves, arrays, (in_node, tuple(key)), traced
 
 
+_EAGER_IN_TRACE = (
+    "cannot pass an eager array to a transformed function called on traced values: traced "
+    "functions do not capture arrays as constants yet; pass the array as an argument of the "
+    "outer transformed function (it becomes a graph input), or use a Python scalar"
+)
+
+
+def _traced_signature(args, static_argnums, converted_argnums):
+    """Flattens a call whose arguments hold tracers of an enclosing trace.
+
+    Returns `(in_node, leaves, key, bindings)`. Each tracer leaf stands for
+    an input of the staged callee with the tracer's shape and dtype, and a
+    Python scalar in a differentiated position becomes a `float64` array
+    leaf as in `_signature`; `bindings` holds, per array leaf in order, the
+    value its callee input is bound to when the callee is inlined: the
+    tracer, or the Python scalar as a constant. Eager arrays cannot be bound,
+    since constants are not captured.
+    """
+    leaves = []
+    nodes = []
+    key = []
+    bindings = []
+    for index, arg in enumerate(args):
+        if index in static_argnums:
+            nodes.append(_LEAF)
+            leaves.append(_Static(arg))
+            key.append((_Static, arg))
+            continue
+        start = len(leaves)
+        nodes.append(_flatten(arg, leaves))
+        for position in range(start, len(leaves)):
+            leaf = leaves[position]
+            kind = type(leaf)
+            if kind is TraceTensor:
+                if leaf._batched:
+                    raise UnsupportedOperationError(
+                        "a transformed function was called on a batched tracer inside vmap; "
+                        "composing transforms with vmap is not implemented yet",
+                        op="nested transform",
+                    )
+                bindings.append(leaf)
+            elif kind in _STATIC_TYPES:
+                if index not in converted_argnums:
+                    key.append(_static_key(leaf))
+                    continue
+                bindings.append(leaf)
+                leaf = leaves[position] = asarray(leaf)
+            else:
+                _as_array_leaf(leaf)
+                raise TracerError(_EAGER_IN_TRACE)
+            key.append((tuple(leaf.shape), leaf.dtype))
+    in_node = (tuple, tuple(nodes))
+    return in_node, leaves, (in_node, tuple(key)), bindings
+
+
 def _describe_signature(key):
     in_node, parts = key
     rendered = []
@@ -234,7 +296,7 @@ def _trace(fun, in_node, leaves, names):
     input_names = []
     for leaf, name in zip(leaves, names):
         kind = type(leaf)
-        if kind is Tensor:
+        if kind is Tensor or kind is TraceTensor:
             values.append(graph.input(name, leaf.shape, leaf.dtype))
             input_names.append(name)
         elif kind is _Static:
@@ -255,6 +317,36 @@ def _stage(fun, in_node, leaves, names):
 
 def _is_traced(value):
     return type(value) is TraceTensor
+
+
+def _splice(staged, bindings):
+    """Inlines `staged` into the enclosing trace, binding its inputs in order
+    to `bindings`, and returns its result pytree; constant results (Python
+    scalars, `None`) are returned unchanged."""
+    traced = [output for output in staged.outputs if _is_traced(output)]
+    spliced = iter(staged.graph._inline(staged.input_names, bindings, traced) if traced else ())
+    flat = [next(spliced) if _is_traced(output) else output for output in staged.outputs]
+    return _unflatten(staged.out_node, iter(flat))
+
+
+def _traced_like(value, shape, dtype, what):
+    """`value` as an inline binding for a callee input of `shape` and `dtype`:
+    a tracer of the enclosing trace, or a Python number for a scalar input,
+    which the bridge binds as a constant of `dtype` (as `_as_like` adopts the
+    primal dtype for a number)."""
+    if type(value) is TraceTensor:
+        actual_shape, actual_dtype = value.shape, value.dtype
+    elif type(value) in _STATIC_TYPES:
+        actual_shape, actual_dtype = [], dtype
+    else:
+        _as_array_leaf(value)
+        raise TracerError(_EAGER_IN_TRACE)
+    if actual_shape != shape or actual_dtype != dtype:
+        raise TypeError(
+            f"{what} must have shape {shape} and dtype {dtype!r} to match its primal, got "
+            f"shape {actual_shape} and dtype {actual_dtype!r}"
+        )
+    return value
 
 
 class _Program:
@@ -324,6 +416,9 @@ class _TraceCache:
 # `quabla.grad(f)(x)` re-created in a loop reuses the trace of `f`, as a jit
 # cache keyed on the function does. Weak keys drop the programs with `f`.
 _CACHES = weakref.WeakKeyDictionary()
+# Chain suffix of the caches of staged graphs for calls on tracers; no
+# transform has this config, so these never share a cache with a program.
+_INLINED = ("inlined",)
 
 
 class _Transform:
@@ -346,6 +441,7 @@ class _Transform:
             self._root = fun
             self._chain = (config,)
         self._cache = None
+        self._inlined_cache = None
         self._converted_by_count = {}
 
     def _own_differentiated(self, count):
@@ -364,33 +460,46 @@ class _Transform:
         return converted
 
     def _trace_cache(self):
+        """Compiled programs, keyed by argument signature."""
         cache = self._cache
         if cache is None:
-            try:
-                by_chain = _CACHES.get(self._root)
-                if by_chain is None:
-                    by_chain = _CACHES[self._root] = {}
-            except TypeError:
-                # The root cannot be weakly referenced or hashed: cache on
-                # this object only.
-                by_chain = {}
-            cache = by_chain.get(self._chain)
-            if cache is None:
-                cache = by_chain[self._chain] = _TraceCache(self._max_traces)
-            self._cache = cache
+            cache = self._cache = self._cache_for(self._chain)
+        return cache
+
+    def _inline_cache(self):
+        """Staged graphs for calls on tracers, keyed like `_trace_cache`."""
+        cache = self._inlined_cache
+        if cache is None:
+            cache = self._inlined_cache = self._cache_for(self._chain + (_INLINED,))
+        return cache
+
+    def _cache_for(self, chain):
+        try:
+            by_chain = _CACHES.get(self._root)
+            if by_chain is None:
+                by_chain = _CACHES[self._root] = {}
+        except TypeError:
+            # The root cannot be weakly referenced or hashed: cache on this
+            # object only.
+            by_chain = {}
+        cache = by_chain.get(chain)
+        if cache is None:
+            cache = by_chain[chain] = _TraceCache(self._max_traces)
         return cache
 
     def _names(self, in_node):
         return _leaf_names(self._root, in_node)
 
-    def _nested_error(self):
-        return UnsupportedOperationError(
-            f"{self!r} was called on traced values inside another transform; transforms "
-            "nested through a Python function need graph inlining, which is not implemented "
-            "yet. Compose the transforms directly instead, e.g. quabla.grad(quabla.grad(f)) "
-            "or quabla.jvp(quabla.grad(f), primals, tangents)",
-            op="nested transform",
+    def _call_traced(self, args, static_argnums, converted_argnums):
+        """A call on tracers of an enclosing trace: stages this transform for
+        their shapes and dtypes and inlines it into that trace."""
+        in_node, leaves, key, bindings = _traced_signature(
+            args, static_argnums, converted_argnums
         )
+        staged = self._inline_cache().lookup(
+            key, lambda: self._stage(in_node, leaves, self._names(in_node)), self
+        )
+        return _splice(staged, bindings)
 
     def __repr__(self):
         name = getattr(self._root, "__qualname__", None) or repr(self._root)
@@ -435,7 +544,7 @@ def _stage_value_and_grad(staged, in_node, leaves, names, argnums, has_aux, what
     for argnum in argnums:
         for position in ranges[argnum]:
             leaf = leaves[position]
-            if type(leaf) is not Tensor:
+            if type(leaf) not in _ARRAY_LEAVES:
                 raise TypeError(
                     f"{what} cannot differentiate with respect to static argument {argnum}"
                 )
@@ -496,7 +605,7 @@ class _ValueAndGrad(_Transform):
         converted = self._converted_positions(len(args))
         in_node, leaves, arrays, key, traced = _signature(args, (), converted)
         if traced:
-            raise self._nested_error()
+            return self._call_traced(args, (), converted)
         program = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
         return program.run(arrays)
 
@@ -536,12 +645,11 @@ class _Jit(_Transform):
             return self._fun(*args)
         count = len(args)
         statics = self._statics(count) if self._static_argnums else ()
-        in_node, leaves, arrays, key, traced = _signature(
-            args, statics, self._converted_positions(count)
-        )
+        converted = self._converted_positions(count)
+        in_node, leaves, arrays, key, traced = _signature(args, statics, converted)
         if traced:
             if isinstance(self._fun, _Transform):
-                raise self._nested_error()
+                return self._call_traced(args, statics, converted)
             # Inside another trace, tracing through a plain function inlines it.
             return self._fun(*args)
         program = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
@@ -574,6 +682,12 @@ def _as_like(value, shape, dtype, what):
     scalar that adopts `dtype`, every other value must match it exactly."""
     if type(value) in _STATIC_TYPES:
         value = asarray(value, dtype)
+    elif _is_traced(value):
+        raise TracerError(
+            f"{what} is traced but its primals are eager arrays: traced functions do not "
+            "capture arrays as constants yet; pass the primals as arguments of the outer "
+            "transformed function"
+        )
     else:
         value = _as_array_leaf(value)
     if value.shape != shape or value.dtype != dtype:
@@ -612,14 +726,13 @@ class _Jvp(_Transform):
                 f"jvp got {len(primals)} primals and {len(tangents)} tangents; they must match"
             )
         primals = tuple(primals)
-        in_node, leaves, arrays, key, traced = _signature(
-            primals, (), frozenset(range(len(primals)))
-        )
-        if traced:
-            raise self._nested_error()
-        entry = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
+        converted = frozenset(range(len(primals)))
+        in_node, leaves, arrays, key, traced = _signature(primals, (), converted)
         tangent_leaves = []
         tangent_node = _flatten(tuple(tangents), tangent_leaves)
+        if traced or any(_is_traced(tangent) for tangent in tangent_leaves):
+            return self._jvp_traced(primals, converted, tangent_node, tangent_leaves)
+        entry = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
         if tangent_node != in_node:
             raise ValueError("jvp tangents must have the pytree structure of the primals")
         inputs = list(arrays)
@@ -630,13 +743,36 @@ class _Jvp(_Transform):
             )
         return entry.program.run(inputs)
 
+    def _jvp_traced(self, primals, converted, tangent_node, tangent_leaves):
+        """`jvp` on tracers of an enclosing trace: the staged JVP graph is
+        inlined with its tangent inputs bound to the traced tangents."""
+        in_node, leaves, key, bindings = _traced_signature(primals, (), converted)
+        staged, tangent_positions = self._inline_cache().lookup(
+            key, lambda: self._stage_jvp(in_node, leaves), self
+        )
+        if tangent_node != in_node:
+            raise ValueError("jvp tangents must have the pytree structure of the primals")
+        for position in tangent_positions:
+            primal = leaves[position]
+            bindings.append(
+                _traced_like(tangent_leaves[position], primal.shape, primal.dtype, "a jvp tangent")
+            )
+        return _splice(staged, bindings)
+
     def _compile(self, in_node, leaves):
+        staged, tangent_positions = self._stage_jvp(in_node, leaves)
+        program = _Program(staged.graph, staged.input_names, staged.outputs, staged.out_node)
+        return _JvpProgram(program, tangent_positions)
+
+    def _stage_jvp(self, in_node, leaves):
+        """The forward-mode graph, taking the primal inputs followed by one
+        tangent input per leaf in the returned `tangent_positions`."""
         names = self._names(in_node)
         staged = _stage(self._fun, in_node, leaves, names)
         tangent_positions = [
             position
             for position, leaf in enumerate(leaves)
-            if type(leaf) is Tensor and leaf.dtype != bool_
+            if type(leaf) in _ARRAY_LEAVES and leaf.dtype != bool_
         ]
         if not tangent_positions:
             raise ValueError("jvp requires at least one floating-point primal")
@@ -658,13 +794,13 @@ class _Jvp(_Transform):
             else:
                 primal_out.append(output)
                 tangent_out.append(_zeros_like_constant(output))
-        program = _Program(
+        staged = _Staged(
             graph,
             staged.input_names + [tangent_names[names[p]] for p in tangent_positions],
             primal_out + tangent_out,
             (tuple, (staged.out_node, staged.out_node)),
         )
-        return _JvpProgram(program, tangent_positions)
+        return staged, tangent_positions
 
 
 # -- reverse mode with a runtime cotangent ------------------------------------------
@@ -710,26 +846,74 @@ class VjpFunction:
         return f"VjpFunction(primals={self._program.primal_count})"
 
 
+class _TracedVjpFunction:
+    """The pullback returned by `quabla.vjp` called on tracers inside
+    another transform: each call inlines the staged reverse-mode graph into
+    the enclosing trace, with the cotangents bound to tracers or Python
+    numbers."""
+
+    __slots__ = ("_reverse", "_cotangent_specs", "_out_node", "_bindings")
+
+    def __init__(self, reverse, cotangent_specs, out_node, bindings):
+        self._reverse = reverse
+        self._cotangent_specs = cotangent_specs
+        self._out_node = out_node
+        self._bindings = bindings
+
+    def __call__(self, cotangent):
+        cotangent_leaves = []
+        if _flatten(cotangent, cotangent_leaves) != self._out_node:
+            raise ValueError("the cotangent must have the pytree structure of the primal output")
+        bindings = list(self._bindings)
+        for position, shape, dtype in self._cotangent_specs:
+            bindings.append(
+                _traced_like(cotangent_leaves[position], shape, dtype, "a vjp cotangent")
+            )
+        return _splice(self._reverse, bindings)
+
+    def __repr__(self):
+        return f"VjpFunction(primals={len(self._reverse.out_node[1])}, traced)"
+
+
 class _Vjp(_Transform):
     def __init__(self, fun, has_aux):
         super().__init__(fun, ("vjp", bool(has_aux)))
         self._has_aux = bool(has_aux)
 
     def __call__(self, *primals):
-        in_node, leaves, arrays, key, traced = _signature(
-            primals, (), frozenset(range(len(primals)))
-        )
+        converted = frozenset(range(len(primals)))
+        in_node, leaves, arrays, key, traced = _signature(primals, (), converted)
         if traced:
-            raise self._nested_error()
-        entry = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
-        result = entry.forward.run(arrays)
-        pullback = VjpFunction(entry, arrays)
+            in_node, leaves, key, bindings = _traced_signature(primals, (), converted)
+            forward, reverse, cotangent_specs, out_node = self._inline_cache().lookup(
+                key, lambda: self._stage_vjp(in_node, leaves), self
+            )
+            result = _splice(forward, bindings)
+            pullback = _TracedVjpFunction(reverse, cotangent_specs, out_node, bindings)
+        else:
+            entry = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
+            result = entry.forward.run(arrays)
+            pullback = VjpFunction(entry, arrays)
         if self._has_aux:
             out, aux = result
             return out, pullback, aux
         return result, pullback
 
     def _compile(self, in_node, leaves):
+        forward, reverse, cotangent_specs, out_node = self._stage_vjp(in_node, leaves)
+        return _VjpProgram(
+            _Program(forward.graph, forward.input_names, forward.outputs, forward.out_node),
+            _Program(reverse.graph, reverse.input_names, reverse.outputs, reverse.out_node),
+            cotangent_specs,
+            out_node,
+            len(in_node[1]),
+        )
+
+    def _stage_vjp(self, in_node, leaves):
+        """The forward graph, the reverse graph (the primal inputs followed by
+        one cotangent input per entry of `cotangent_specs`), the cotangent
+        specs `(output leaf position, shape, dtype)`, and the structure of
+        the differentiated output."""
         names = self._names(in_node)
         staged = _stage(self._fun, in_node, leaves, names)
         out_node, outputs = staged.out_node, staged.outputs
@@ -738,7 +922,6 @@ class _Vjp(_Transform):
                 raise TypeError("vjp with has_aux=True requires fun to return an (out, aux) pair")
             out_node = out_node[1][0]
             outputs = outputs[: _leaf_count(out_node)]
-        forward = _Program(staged.graph, staged.input_names, staged.outputs, staged.out_node)
         seeded = []
         cotangent_specs = []
         for position, output in enumerate(outputs):
@@ -750,11 +933,11 @@ class _Vjp(_Transform):
         cotangent_names = [f"{_COTANGENT_PREFIX}{index}" for index in range(len(seeded))]
         graph, _, gradients = staged.graph._symbolic_vjp(seeded, cotangent_names, [])
         grad_outputs = [
-            gradients[name] if type(leaf) is Tensor and leaf.dtype != bool_ else None
+            gradients[name] if type(leaf) in _ARRAY_LEAVES and leaf.dtype != bool_ else None
             for leaf, name in zip(leaves, names)
         ]
-        reverse = _Program(graph, staged.input_names + cotangent_names, grad_outputs, in_node)
-        return _VjpProgram(forward, reverse, cotangent_specs, out_node, len(in_node[1]))
+        reverse = _Staged(graph, staged.input_names + cotangent_names, grad_outputs, in_node)
+        return staged, reverse, cotangent_specs, out_node
 
 
 # -- dense Jacobians ------------------------------------------------------------------
@@ -789,10 +972,17 @@ class _Jacobian(_Transform):
         return _normalize_argnums(self._argnums, count, "argnums")
 
     def _stage(self, in_node, leaves, names):
-        raise UnsupportedOperationError(
-            f"{self!r} cannot be transformed further: jacobian and hessian evaluate one "
-            "column at a time instead of staging a single program",
-            op=self._config[0],
+        raise self._unstaged_error()
+
+    def _unstaged_error(self):
+        kind = self._config[0]
+        return UnsupportedOperationError(
+            f"{self!r} cannot be transformed further or called on traced values: {kind} "
+            "evaluates one forward-mode column per input element instead of staging a single "
+            "program, and staging it needs vmap, which is not implemented yet. Inside a traced "
+            "function, use grad(grad(f)) for the second derivative of a scalar function, or "
+            "jvp(grad(f), (x,), (v,)) for a Hessian-vector product",
+            op=kind,
         )
 
     def __call__(self, *args):
@@ -801,7 +991,7 @@ class _Jacobian(_Transform):
             args, (), self._converted_positions(count)
         )
         if traced:
-            raise self._nested_error()
+            raise self._unstaged_error()
         entry = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
         argnums = self._positions(count)
         ranges = _argument_ranges(in_node)

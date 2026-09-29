@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList, PyString, PyTuple};
+use pyo3::types::{PyAny, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use quabla_core::tensor_ir::{
     CudaBackend, CudaDataParallelExecutionPlan, CudaDataParallelTiming, CudaExecutionPlan,
     DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs, SymbolicCotangent, TensorBackend,
@@ -785,6 +785,97 @@ impl TensorTraceGraph {
             input_names,
         })
     }
+
+    /// Splices `outputs` of this staged graph into the graph of the traced
+    /// bindings (see [`TensorIr::inline`]) and returns them as tracers there.
+    /// `bindings[i]` binds input `input_names[i]`; a scalar binding becomes
+    /// a constant of that input's dtype. Unbatched tracers only: `vmap`
+    /// composition is slice S4 of docs/api_v0_2_design.md.
+    pub fn inline_into(
+        &self,
+        input_names: &[String],
+        bindings: &[InlineBinding],
+        outputs: &[TraceTensor],
+    ) -> Result<Vec<TraceTensor>, String> {
+        self.ensure_owns(&outputs.iter().collect::<Vec<_>>())?;
+        if input_names.len() != bindings.len() {
+            return Err(format!(
+                "{} callee inputs with {} bindings",
+                input_names.len(),
+                bindings.len()
+            ));
+        }
+        let traced = bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                InlineBinding::Traced(tensor) => Some(tensor),
+                InlineBinding::Scalar(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let target = traced
+            .first()
+            .map(|tensor| tensor.graph.clone())
+            .ok_or_else(|| "inlining needs at least one traced binding".to_string())?;
+        target.ensure_owns(&traced).map_err(|_| {
+            "the traced arguments of a transformed function belong to different traces".to_string()
+        })?;
+        if traced.iter().any(|tensor| tensor.batch_axis.is_some()) {
+            return Err("a batched (vmap) tracer cannot be bound to an inlined graph".to_string());
+        }
+        if Arc::ptr_eq(&self.ir, &target.ir) {
+            return Err("a staged graph cannot be inlined into itself".to_string());
+        }
+        let callee = self
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let mut ir = target
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let mut bound = BTreeMap::new();
+        for (name, binding) in input_names.iter().zip(bindings) {
+            let node_id = match binding {
+                InlineBinding::Traced(tensor) => tensor.node_id,
+                InlineBinding::Scalar(value) => {
+                    let constant = ir.scalar_constant(*value);
+                    let dtype = callee.node_dtype(callee.input_node_id(name)?)?;
+                    if dtype == TensorDType::F64 {
+                        constant
+                    } else {
+                        ir.cast(constant, dtype)?
+                    }
+                }
+            };
+            if bound.insert(name.clone(), node_id).is_some() {
+                return Err(format!("callee input {name:?} is bound twice"));
+            }
+        }
+        let output_ids = outputs
+            .iter()
+            .map(|output| output.node_id)
+            .collect::<Vec<_>>();
+        let spliced = ir.inline(&callee, &bound, &output_ids)?;
+        spliced
+            .into_iter()
+            .map(|node_id| {
+                Ok(TraceTensor::from_node(
+                    target.clone(),
+                    node_id,
+                    ir.node_shape(node_id)?,
+                    None,
+                ))
+            })
+            .collect()
+    }
+}
+
+/// A value bound to a callee input by [`TensorTraceGraph::inline_into`]: a
+/// tracer of the enclosing trace or a Python number.
+#[derive(Clone, Debug)]
+pub enum InlineBinding {
+    Traced(TraceTensor),
+    Scalar(f64),
 }
 
 /// A multi-output program compiled for the v0.2 transforms. Inputs are
@@ -2110,6 +2201,46 @@ impl TensorTraceGraph {
             .map_err(PyValueError::new_err)
     }
 
+    /// `inline_into` for `quabla._transforms`: each binding is a tracer of
+    /// the enclosing trace or a Python number.
+    #[pyo3(name = "_inline")]
+    fn py_inline(
+        &self,
+        input_names: Vec<String>,
+        bindings: Vec<Bound<'_, PyAny>>,
+        outputs: Vec<TraceTensor>,
+    ) -> PyResult<Vec<TraceTensor>> {
+        let bindings = bindings
+            .iter()
+            .map(|binding| {
+                if let Ok(tensor) = binding.extract::<TraceTensor>() {
+                    Ok(InlineBinding::Traced(tensor))
+                } else if binding.is_instance_of::<PyFloat>() || binding.is_instance_of::<PyInt>() {
+                    // Python numbers only: an eager Tensor also converts to
+                    // f64, but arrays are not captured as constants.
+                    Ok(InlineBinding::Scalar(binding.extract::<f64>()?))
+                } else {
+                    Err(PyTypeError::new_err(format!(
+                        "an inline binding must be a TraceTensor or a Python number, got {}",
+                        binding.get_type().name()?
+                    )))
+                }
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        self.inline_into(&input_names, &bindings, &outputs)
+            .map_err(PyValueError::new_err)
+    }
+
+    /// Number of nodes in the graph, including nodes no output depends on.
+    #[getter(_node_count)]
+    fn py_node_count(&self) -> PyResult<usize> {
+        Ok(self
+            .ir
+            .lock()
+            .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
+            .node_count())
+    }
+
     fn evaluate_value_and_vjp(
         &self,
         output_node_id: TensorNodeId,
@@ -2135,6 +2266,12 @@ impl StagedExecutable {
     #[getter]
     fn input_names(&self) -> Vec<String> {
         self.input_names.clone()
+    }
+
+    /// Number of nodes in the frozen plan (after DCE and structural CSE).
+    #[getter]
+    fn node_count(&self) -> usize {
+        self.executable.plan().node_count()
     }
 
     fn __call__(&self, inputs: Vec<PyRef<'_, PyTensor>>) -> PyResult<Vec<PyTensor>> {
@@ -2210,6 +2347,12 @@ impl TraceTensor {
     #[getter]
     fn node_id(&self) -> TensorNodeId {
         self.node_id
+    }
+
+    /// Whether the tracer carries a `vmap` batch axis.
+    #[getter(_batched)]
+    fn py_batched(&self) -> bool {
+        self.batch_axis.is_some()
     }
 
     #[getter]

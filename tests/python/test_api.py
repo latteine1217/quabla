@@ -986,13 +986,211 @@ def test_grad_recreated_per_call_reuses_the_trace():
     assert len(traces) == 3  # grad, jit(grad), and jvp each traced once
 
 
-def test_nested_transform_calls_need_graph_inlining():
-    inner = qb.grad(lambda x: x**3)
-    error = assert_raises(
-        qb.UnsupportedOperationError, qb.grad(lambda x: inner(x)), 2.0, match="graph inlining"
+def test_transforms_called_on_tracers_inline_their_graphs():
+    f = lambda x: qb.sin(x) * x**2  # noqa: E731
+    first = 2.0 * 1.3 * math.sin(1.3) + 1.3**2 * math.cos(1.3)
+    second = -math.sin(1.3) * 1.3**2 + 4.0 * 1.3 * math.cos(1.3) + 2.0 * math.sin(1.3)
+    df = qb.grad(f)
+    # grad inside value_and_grad: the inner VJP graph is inlined and
+    # differentiated again.
+    value, derivative = qb.value_and_grad(lambda x: df(x))(qb.array(1.3))
+    assert_close(value, first, 1e-14)
+    assert_close(derivative, second, 1e-14)
+    value32, derivative32 = qb.value_and_grad(lambda x: df(x))(qb.array(1.3, dtype=qb.float32))
+    assert value32.dtype == derivative32.dtype == qb.float32
+    assert_close(derivative32, second, 1e-5)
+    # jvp, vjp, and jit(grad) inside grad; Python number tangents and
+    # cotangents become constants of the primal dtype.
+    assert_close(qb.grad(lambda x: qb.jvp(f, (x,), (1.0,))[1])(1.3), second, 1e-14)
+    assert_close(qb.grad(lambda x: qb.vjp(f, x)[1](1.0)[0])(1.3), second, 1e-14)
+    assert_close(qb.grad(lambda x: qb.jit(qb.grad(f))(x))(1.3), second, 1e-14)
+    assert_close(qb.jit(lambda x: df(x) * 2.0)(qb.array(1.3)), 2.0 * first, 1e-14)
+
+    # A traced tangent: d/dv of J(x) v is the gradient of the scalar output.
+    def cubic(x):
+        return qb.sum(x**3) + qb.sum(x) * x[0]
+
+    x, v = qb.array([1.0, 2.0, -1.0]), qb.array([0.5, -1.0, 2.0])
+    by_tangent = qb.grad(lambda x, v: qb.jvp(cubic, (x,), (v,))[1], argnums=1)(x, v)
+    assert_close(by_tangent, qb.grad(cubic)(x), 1e-14)
+    # HVP through a Python function equals the direct composition.
+    _, hvp = qb.jvp(lambda x: qb.grad(cubic)(x) * 3.0, (x,), (v,))
+    _, direct = qb.jvp(qb.grad(cubic), (x,), (v,))
+    assert_close(hvp, [3.0 * value for value in direct.tolist()], 1e-14)
+    # A traced cotangent of a nested vjp.
+    pullback_grad = qb.grad(lambda c, x: qb.sum(qb.vjp(qb.sin, x)[1](c)[0]))(v, x)
+    assert_close(pullback_grad, [math.cos(value) for value in x.tolist()], 1e-14)
+    # With eager primals, a traced cotangent cannot be bound.
+    assert_raises(
+        qb.TracerError,
+        qb.grad(lambda c: qb.sum(qb.vjp(qb.sin, x)[1](c)[0])),
+        v,
+        match="primals are eager arrays",
     )
-    assert isinstance(error, NotImplementedError) and error.op == "nested transform"
-    assert_raises(qb.UnsupportedOperationError, qb.jit(lambda x: qb.jit(inner)(x)), qb.array(1.0))
+
+    # Coordinate derivatives inside a loss, then gradients in the weights,
+    # with pytree parameters, has_aux, and a static Python scalar.
+    def model(x, p, scale):
+        y = qb.tanh(x * p["a"]) * p["b"] * scale
+        return qb.sum(y), qb.mean(y)
+
+    def loss(p, x):
+        du, aux = qb.grad(model, has_aux=True)(x, p, 2.0)
+        return qb.sum(du**2) + aux
+
+    params = {"a": qb.array(0.7), "b": qb.array(-1.3)}
+    points = qb.array([0.1, -0.4, 0.9])
+    value, grads = qb.value_and_grad(loss)(params, points)
+
+    def reference(a, b):
+        xs = points.tolist()
+        du = [2.0 * a * b / math.cosh(a * x) ** 2 for x in xs]
+        return sum(d * d for d in du) + sum(2.0 * b * math.tanh(a * x) for x in xs) / len(xs)
+
+    assert_close(value, reference(0.7, -1.3), 1e-13)
+    h = 1e-6
+    fd_a = (reference(0.7 + h, -1.3) - reference(0.7 - h, -1.3)) / (2.0 * h)
+    fd_b = (reference(0.7, -1.3 + h) - reference(0.7, -1.3 - h)) / (2.0 * h)
+    assert_close(grads["a"], fd_a, 1e-8)
+    assert_close(grads["b"], fd_b, 1e-8)
+
+
+def test_inlined_transforms_cache_their_staged_graph_and_reject_unsupported_calls():
+    traces = []
+
+    def u(x, w):
+        traces.append(1)
+        return qb.sin(x * w)
+
+    u_xx = qb.grad(qb.grad(u))
+    x, w = qb.array([0.1, 0.2, 0.3]), qb.array(1.5)
+    total = qb.jit(lambda x, w: u_xx(x[0], w) + u_xx(x[1], w) + u_xx(x[2], w))(x, w)
+    assert_close(total, sum(-(1.5**2) * math.sin(1.5 * p) for p in [0.1, 0.2, 0.3]), 1e-14)
+    assert len(traces) == 1  # three calls with one signature stage u once
+
+    # jacobian and hessian cannot be staged until vmap exists.
+    def loss(x):
+        return qb.sum(x**3)
+
+    error = assert_raises(
+        qb.UnsupportedOperationError, qb.grad(qb.hessian(loss)), x, match="cannot be transformed"
+    )
+    assert error.op == "hessian" and isinstance(error, NotImplementedError)
+    error = assert_raises(
+        qb.UnsupportedOperationError,
+        qb.jit(lambda x: qb.sum(qb.hessian(loss)(x))),
+        x,
+        match="called on traced values",
+    )
+    assert error.op == "hessian"
+    assert_raises(
+        qb.UnsupportedOperationError, qb.grad(lambda x: qb.sum(qb.jacobian(qb.sin)(x))), x
+    )
+    # Eager arrays are not captured; vmap composition is slice S4.
+    assert_raises(
+        qb.TracerError, qb.jit(lambda x: qb.grad(u)(x[0], w)), x, match="eager array"
+    )
+    v_eager = qb.array([1.0, 1.0, 1.0])
+    assert_raises(
+        qb.TracerError, qb.jit(lambda t: qb.jvp(qb.sin, (t,), (v_eager,))[1]), x, match="eager"
+    )
+    error = assert_raises(
+        qb.UnsupportedOperationError,
+        qb.tensor_vmap_fn,
+        lambda row: qb.grad(lambda y: qb.sum(y * y))(row),
+        [("row", [2])],
+        3,
+        match="batched tracer",
+    )
+    assert error.op == "nested transform"
+    # Second-order reverse mode through a region stays an explicit error.
+
+    def scan_loss(initial, scale):
+        carry, outputs = qb.tensor_scan_region(
+            0,
+            3,
+            lambda index, current, s: (current * current * s + index, current * s),
+            initial,
+            [scale],
+        )
+        return carry + outputs.sum()
+
+    g = qb.grad(scan_loss, argnums=1)
+    assert_raises(
+        ValueError, qb.grad(lambda i, s: g(i, s), argnums=1), qb.array(0.4), qb.array(0.8),
+        match="not implemented",
+    )
+    # Forward over reverse through the inlined region matches the direct
+    # composition, and two splices in one trace stay separate executions.
+    i0, s0 = qb.array(0.4), qb.array(0.8)
+    _, direct = qb.jvp(g, (i0, s0), (0.0, 1.0))
+    _, nested = qb.jvp(lambda i, s: g(i, s) * 2.0, (i0, s0), (0.0, 1.0))
+    assert_close(nested, 2.0 * direct.item(), 1e-13)
+    both = qb.jit(lambda i, s: g(i, s) + g(s, i))(i0, s0)
+    assert_close(both, g(i0, s0).item() + g(s0, i0).item(), 1e-13)
+
+
+PINN_POINTS = 8
+
+
+def pinn_u(x, w):  # one collocation point, scalar x
+    return qb.sin(x * w)
+
+
+pinn_u_xx = qb.grad(qb.grad(pinn_u))  # exact d2u/dx2 at one point
+
+
+def pinn_loss(w, x):
+    # The per-point form of design 2.4 until vmap (slice S4) batches it.
+    u_xx = qb.stack([pinn_u_xx(x[i], w) for i in range(x.shape[0])], 0)
+    return qb.mean((u_xx + math.pi**2 * qb.sin(math.pi * x)) ** 2)
+
+
+def readme_symbolic_jvp_loss():
+    """The v0.1 README "At a Glance" loss: two symbolic coordinate JVPs."""
+    u = qb.trace_tensor(lambda x, w: (x * w).sin(), [("x", [PINN_POINTS, 1]), ("w", [1, 1])])
+    u_xx = u.symbolic_jvp("x").symbolic_jvp("x")
+    x = u_xx.graph.input("x")
+    return (u_xx.output + math.pi**2 * (math.pi * x).sin()).powi(2).mean()
+
+
+def test_pinn_loss_with_a_nested_second_derivative_reproduces_the_readme():
+    x, w = qb.linspace(0.05, 0.95, PINN_POINTS), qb.array(2.5)
+    step = qb.jit(qb.value_and_grad(pinn_loss))
+    value, grad_w = step(w, x)
+    # Same loss and gradient as the README's symbolic_jvp().symbolic_jvp() path.
+    plan = readme_symbolic_jvp_loss().compile_cpu()
+    readme_inputs = {"x": x.reshape([PINN_POINTS, 1]), "w": w.reshape([1, 1])}
+    old_value, old_grads = plan.evaluate_value_and_vjp(readme_inputs, qb.Tensor([], [1.0]))
+    assert_close(value, old_value.item(), 1e-12)
+    assert_close(grad_w, old_grads["w"].item(), 1e-12)
+    params, adam = {"w": w}, qb.Adam(learning_rate=0.05)
+    for _ in range(300):
+        value, grad_w = step(params["w"], x)
+        params = adam.step(params, {"w": grad_w})
+    assert abs(params["w"].item() - math.pi) < 1e-5, params["w"].item()
+    assert f"{params['w'].item():.6f}" == "3.141593"
+    assert value.item() < 1e-10
+
+
+def test_nested_second_derivatives_grow_the_graph_linearly_in_the_points():
+    from quabla import _transforms
+
+    def sizes(points):
+        x, w = qb.linspace(0.05, 0.95, points), qb.array(2.5)
+        staged = qb.value_and_grad(pinn_loss)._stage(
+            (tuple, (_transforms._LEAF, _transforms._LEAF)), [w, x], ["w", "x"]
+        )
+        executable = staged.graph._compile_cpu(
+            [output for output in staged.outputs], staged.input_names
+        )
+        return staged.graph._node_count, executable.node_count
+
+    counts = {points: sizes(points) for points in [1, 2, 4, 8]}
+    for index in range(2):
+        per_point = counts[2][index] - counts[1][index]
+        assert counts[4][index] - counts[2][index] == 2 * per_point, counts
+        assert counts[8][index] - counts[4][index] == 4 * per_point, counts
 
 
 def test_legacy_grad_and_jit_call_forms_keep_v0_1_results():
