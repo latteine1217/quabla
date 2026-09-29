@@ -19,6 +19,7 @@ use quabla_core::{
 };
 
 use crate::dtype::PyDType;
+use crate::errors::{concrete_value_error, traced_operand_error, tracer_error};
 use crate::tensor::bool_operation_error;
 use crate::tensor::{
     extract_scalar, parse_axis_indices, parse_tensor_indices, PyTensor, TensorIndex,
@@ -2161,10 +2162,49 @@ impl StagedExecutable {
 
 #[pymethods]
 impl TraceTensor {
-    fn __bool__(&self) -> PyResult<bool> {
-        Err(PyTypeError::new_err(
+    fn __bool__(&self, py: Python<'_>) -> PyResult<bool> {
+        Err(tracer_error(
+            py,
             "TraceTensor cannot drive Python control flow; use quabla.where for elementwise selection or an explicit control-flow primitive",
         ))
+    }
+
+    // A tracer has no value while its function is traced. Without these
+    // methods `np.asarray(x)` would silently wrap the tracer in an object
+    // array, so every conversion to concrete data raises `TracerError`.
+    fn __float__(&self, py: Python<'_>) -> PyResult<f64> {
+        Err(concrete_value_error(py, "float()"))
+    }
+
+    fn __int__(&self, py: Python<'_>) -> PyResult<i64> {
+        Err(concrete_value_error(py, "int()"))
+    }
+
+    fn __index__(&self, py: Python<'_>) -> PyResult<isize> {
+        Err(concrete_value_error(py, "an integer index"))
+    }
+
+    #[pyo3(signature = (dtype = None, copy = None))]
+    fn __array__(
+        &self,
+        py: Python<'_>,
+        dtype: Option<&Bound<'_, PyAny>>,
+        copy: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        let _ = (dtype, copy);
+        Err(concrete_value_error(py, "conversion to a NumPy array"))
+    }
+
+    fn numpy(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        Err(concrete_value_error(py, "numpy()"))
+    }
+
+    fn tolist(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        Err(concrete_value_error(py, "tolist()"))
+    }
+
+    fn item(&self, py: Python<'_>) -> PyResult<f64> {
+        Err(concrete_value_error(py, "item()"))
     }
 
     #[getter]
@@ -2289,12 +2329,24 @@ impl TraceTensor {
             .map_err(PyValueError::new_err)
     }
 
-    fn __matmul__(&self, rhs: &Self) -> PyResult<Self> {
-        self.matmul_tensor(rhs).map_err(PyValueError::new_err)
+    fn __matmul__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let rhs = rhs
+            .extract::<PyRef<'_, TraceTensor>>()
+            .map_err(|_| traced_operand_error(rhs, "expected a TraceTensor matmul operand"))?;
+        self.matmul_tensor(&rhs).map_err(PyValueError::new_err)
     }
 
-    fn matmul(&self, rhs: &Self) -> PyResult<Self> {
+    fn matmul(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
         self.__matmul__(rhs)
+    }
+
+    /// `a @ x` with an eager `a` reaches here after `Tensor.__matmul__`
+    /// declines the tracer; it can only be a mix of the two kinds.
+    fn __rmatmul__(&self, lhs: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Err(traced_operand_error(
+            lhs,
+            "expected a TraceTensor matmul operand",
+        ))
     }
 
     fn solve(&self, rhs: &Self) -> PyResult<Self> {
@@ -2418,7 +2470,8 @@ impl TraceTensor {
         if let Some(rhs) = extract_scalar(rhs) {
             return self.maximum_scalar(rhs).map_err(PyValueError::new_err);
         }
-        Err(PyTypeError::new_err(
+        Err(traced_operand_error(
+            rhs,
             "expected TraceTensor or numeric scalar operand",
         ))
     }
@@ -2430,7 +2483,8 @@ impl TraceTensor {
         if let Some(rhs) = extract_scalar(rhs) {
             return self.minimum_scalar(rhs).map_err(PyValueError::new_err);
         }
-        Err(PyTypeError::new_err(
+        Err(traced_operand_error(
+            rhs,
             "expected TraceTensor or numeric scalar operand",
         ))
     }
@@ -2615,7 +2669,8 @@ fn trace_tensor_or_scalar_operand(
     if let Some(value) = extract_scalar(rhs) {
         return lhs.scalar_binary(value, op).map_err(PyValueError::new_err);
     }
-    Err(PyTypeError::new_err(
+    Err(traced_operand_error(
+        rhs,
         "expected a TraceTensor or numeric scalar operand",
     ))
 }
@@ -2657,7 +2712,8 @@ fn trace_compare_operand(
             .compare_scalar(value, kind)
             .map_err(PyValueError::new_err);
     }
-    Err(PyTypeError::new_err(
+    Err(traced_operand_error(
+        rhs,
         "expected a TraceTensor or numeric scalar operand",
     ))
 }
@@ -2668,7 +2724,10 @@ fn trace_scalar_left_operand(
     op: &str,
 ) -> PyResult<TraceTensor> {
     let value = extract_scalar(lhs).ok_or_else(|| {
-        PyTypeError::new_err("expected a numeric scalar as the left TraceTensor operand")
+        traced_operand_error(
+            lhs,
+            "expected a numeric scalar as the left TraceTensor operand",
+        )
     })?;
     rhs.scalar_left_binary(value, op)
         .map_err(PyValueError::new_err)

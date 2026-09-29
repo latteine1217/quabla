@@ -2,7 +2,8 @@
 
 Each class also subclasses the builtin exception that the same failure raised
 before v0.2, so existing `except ValueError` and `except TypeError` handlers
-keep catching it.
+keep catching it. The extension raises `TracerError` by importing it from
+this module, so the class is the same object in Python and Rust.
 """
 
 __all__ = [

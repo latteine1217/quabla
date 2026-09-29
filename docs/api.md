@@ -135,6 +135,9 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8)
 - `quabla.grad` and `quabla.jit` still accept the legacy 2D forms
   `grad(fn, input_specs, values, output_cotangent)` and `jit(input_specs)`
   and dispatch them to the v0.1 functions below.
+- A `TraceTensor` has no value while it is traced: Python control flow,
+  `float()`, `int()`, `item()`, `tolist()`, `numpy()`, and `np.asarray` on
+  it raise `quabla.TracerError`.
 - Errors: `quabla.QuablaError` is the base of `TracerError` (a `TypeError`),
   `RetraceLimitError` (a `ValueError`), and `UnsupportedOperationError` (a
   `ValueError` and `NotImplementedError` with `.op` and `.device`).
@@ -629,6 +632,7 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - The legacy 2D `Matrix`/`TraceGraph` API is not migrated to the facade.
 - The v0.2 transforms run on the CPU only, cannot yet be nested through a
   Python function (graph inlining), and do not capture eager `Tensor`
-  constants in a trace: arrays a traced function uses must be arguments.
+  constants in a trace: arrays a traced function uses must be arguments
+  (mixing them with tracers raises `quabla.TracerError`).
   `vmap` is not part of the v0.2 layer yet. `jacobian` and `hessian` are
   dense and cannot be transformed further.

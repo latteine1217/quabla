@@ -1024,6 +1024,60 @@ def test_legacy_grad_and_jit_call_forms_keep_v0_1_results():
     assert list(inspect.signature(qb.grad).parameters) == ["fun", "argnums", "has_aux"]
 
 
+def test_tracer_escapes_raise_tracer_error():
+    x = qb.array([1.0, 2.0])
+    escapes = [
+        (lambda t: t if t else t, "cannot drive Python control flow"),
+        (lambda t: float(t), "float() needs a concrete value"),
+        (lambda t: int(t), "int() needs a concrete value"),
+        (lambda t: [0.0, 1.0][t], "an integer index needs a concrete value"),
+        (lambda t: t.item(), "item() needs a concrete value"),
+        (lambda t: t.tolist(), "tolist() needs a concrete value"),
+        (lambda t: t.numpy(), "numpy() needs a concrete value"),
+    ]
+    if np is not None:
+        escapes += [
+            (lambda t: np.asarray(t), "conversion to a NumPy array needs a concrete value"),
+            (lambda t: np.sin(t), "conversion to a NumPy array needs a concrete value"),
+        ]
+    for function, message in escapes:
+        error = assert_raises(qb.TracerError, qb.jit(function), x, match=message)
+        assert isinstance(error, TypeError)
+    # The v0.1 helpers raise the same class, which is still a TypeError.
+    assert_raises(
+        TypeError, qb.tensor_jit_fn, lambda t: t if t else t, [("x", [])], match="control flow"
+    )
+
+
+def test_eager_tensors_in_a_trace_raise_an_actionable_tracer_error():
+    x = qb.array([1.0, 2.0])
+    data = qb.array([3.0, 4.0])
+    for function in [
+        lambda t: t * data,
+        lambda t: data * t,
+        lambda t: data - t,
+        lambda t: data / t,
+        lambda t: t > data,
+        lambda t: data ** t,
+        lambda t: qb.maximum(t, data),
+        lambda t: qb.where(t > 0.0, t, data),
+        lambda t: t.reshape([1, 2]) @ data.reshape([2, 1]),
+        lambda t: data.reshape([1, 2]) @ t.reshape([2, 1]),
+        lambda t: t * data.slice(0, 0, 2),
+    ]:
+        error = assert_raises(
+            qb.TracerError, qb.jit(function), x, match="pass the array as an argument"
+        )
+        assert "do not capture arrays as constants" in str(error)
+    # Passing the array in works.
+    assert_close(qb.jit(lambda t, d: t * d)(x, data), [3.0, 8.0])
+    # Other operand types keep their TypeError.
+    error = assert_raises(TypeError, qb.jit(lambda t: t + "a"), x, match="numeric scalar operand")
+    assert not isinstance(error, qb.TracerError)
+    error = assert_raises(TypeError, lambda: data + "a", match="numeric scalar operand")
+    assert not isinstance(error, qb.TracerError)
+
+
 if __name__ == "__main__":
     # Run every test_* function in definition order so new tests cannot be left out of a manual list
     for name, test in list(globals().items()):

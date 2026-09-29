@@ -7,6 +7,7 @@ use std::ffi::c_int;
 use std::sync::Arc;
 
 use crate::dtype::PyDType;
+use crate::errors::eager_operand_error;
 use crate::interop;
 
 /// Eager host tensor. Storage is `f64`; a `float32` tensor holds only values
@@ -1957,7 +1958,8 @@ impl PyTensor {
         if let Ok(rhs) = rhs.extract::<f64>() {
             return self.try_add_scalar(rhs).map_err(PyValueError::new_err);
         }
-        Err(PyTypeError::new_err(
+        Err(eager_operand_error(
+            rhs,
             "expected Tensor or numeric scalar operand",
         ))
     }
@@ -1977,7 +1979,8 @@ impl PyTensor {
         if let Ok(rhs) = rhs.extract::<f64>() {
             return self.try_sub_scalar(rhs).map_err(PyValueError::new_err);
         }
-        Err(PyTypeError::new_err(
+        Err(eager_operand_error(
+            rhs,
             "expected Tensor or numeric scalar operand",
         ))
     }
@@ -1993,7 +1996,8 @@ impl PyTensor {
         if let Ok(lhs) = lhs.extract::<f64>() {
             return self.try_scalar_sub(lhs).map_err(PyValueError::new_err);
         }
-        Err(PyTypeError::new_err(
+        Err(eager_operand_error(
+            lhs,
             "expected Tensor or numeric scalar operand",
         ))
     }
@@ -2005,7 +2009,8 @@ impl PyTensor {
         if let Ok(rhs) = rhs.extract::<f64>() {
             return self.try_mul_scalar(rhs).map_err(PyValueError::new_err);
         }
-        Err(PyTypeError::new_err(
+        Err(eager_operand_error(
+            rhs,
             "expected Tensor or numeric scalar operand",
         ))
     }
@@ -2025,7 +2030,8 @@ impl PyTensor {
         if let Ok(rhs) = rhs.extract::<f64>() {
             return self.try_div_scalar(rhs).map_err(PyValueError::new_err);
         }
-        Err(PyTypeError::new_err(
+        Err(eager_operand_error(
+            rhs,
             "expected Tensor or numeric scalar divisor",
         ))
     }
@@ -2041,7 +2047,8 @@ impl PyTensor {
         if let Ok(lhs) = lhs.extract::<f64>() {
             return self.try_scalar_div(lhs).map_err(PyValueError::new_err);
         }
-        Err(PyTypeError::new_err(
+        Err(eager_operand_error(
+            lhs,
             "expected Tensor or numeric scalar dividend",
         ))
     }
@@ -2071,8 +2078,9 @@ impl PyTensor {
         if let Ok(exponent) = exponent.extract::<PyRef<'_, PyTensor>>() {
             return self.try_pow(&exponent).map_err(PyValueError::new_err);
         }
-        let exponent = extract_scalar(exponent)
-            .ok_or_else(|| PyTypeError::new_err("expected a Tensor or numeric scalar exponent"))?;
+        let exponent = extract_scalar(exponent).ok_or_else(|| {
+            eager_operand_error(exponent, "expected a Tensor or numeric scalar exponent")
+        })?;
         self.try_powf(exponent).map_err(PyValueError::new_err)
     }
 
@@ -2099,7 +2107,8 @@ impl PyTensor {
         if let Ok(rhs) = rhs.extract::<f64>() {
             return self.try_gt_scalar(rhs).map_err(PyValueError::new_err);
         }
-        Err(PyTypeError::new_err(
+        Err(eager_operand_error(
+            rhs,
             "expected Tensor or numeric scalar operand",
         ))
     }
@@ -2212,7 +2221,8 @@ impl PyTensor {
         if let Ok(rhs) = rhs.extract::<f64>() {
             return self.try_maximum_scalar(rhs).map_err(PyValueError::new_err);
         }
-        Err(PyTypeError::new_err(
+        Err(eager_operand_error(
+            rhs,
             "expected Tensor or numeric scalar operand",
         ))
     }
@@ -2224,7 +2234,8 @@ impl PyTensor {
         if let Ok(rhs) = rhs.extract::<f64>() {
             return self.try_minimum_scalar(rhs).map_err(PyValueError::new_err);
         }
-        Err(PyTypeError::new_err(
+        Err(eager_operand_error(
+            rhs,
             "expected Tensor or numeric scalar operand",
         ))
     }
@@ -2273,7 +2284,8 @@ impl PyTensor {
                 .try_compare_scalar(rhs, kind)
                 .map_err(PyValueError::new_err);
         }
-        Err(PyTypeError::new_err(
+        Err(eager_operand_error(
+            rhs,
             "expected Tensor or numeric scalar operand",
         ))
     }

@@ -703,6 +703,15 @@ CPU; deviations and refinements of this document:
   keyword forms and tuple specs, and `jit(specs)`) to the native functions
   without a warning; the warnings are S9 work. `quabla._quabla.grad` stays
   the v0.1 function, so v0.1 pickles still load it.
+- **Tracer errors.** `TraceTensor` raises `TracerError` for Python control
+  flow, `float()`, `int()`, use as an index, `item()`, `tolist()`,
+  `numpy()`, and `__array__`, so `np.asarray(tracer)` and NumPy ufuncs no
+  longer build object arrays. Constant capture of eager arrays is in no
+  slice of this design, so an eager `Tensor` or `TensorView` meeting a tracer
+  in arithmetic, comparisons, `maximum`/`minimum`, `**`, `@`/`matmul`, or
+  `where` raises `TracerError` asking to pass the array as an argument;
+  other invalid operands keep their `TypeError`. The extension imports the
+  class from `quabla._errors`.
 - **Overhead** (Apple silicon, `timeit` minimum, README "At a Glance" loss
   with `u_xx` written analytically, since nesting is S3): `jit(loss)(x, w)`
   3.1 µs against 1.5 µs for `tensor_jit_fn({...})`, of which the argument

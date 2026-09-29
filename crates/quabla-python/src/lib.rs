@@ -7,6 +7,7 @@ use quabla_core::tensor_ir::TensorDType;
 
 mod compiler;
 mod dtype;
+mod errors;
 mod interop;
 mod matrix;
 mod optim;
@@ -102,7 +103,8 @@ fn py_where(
         }
     }
 
-    Err(pyo3::exceptions::PyTypeError::new_err(
+    Err(errors::operands_error(
+        &[mask, on_true, on_false],
         "where expects three Matrix or TraceMatrix operands, or a Tensor or TraceTensor mask \
          with same-kind or numeric scalar branches",
     ))
