@@ -9,8 +9,10 @@
 
 import sys as _sys
 
-from . import _array, _ops, _quabla
+from . import _array, _errors, _ops, _quabla
+from . import tree as tree
 from ._array import *  # noqa: F403
+from ._errors import *  # noqa: F403
 from ._ops import *  # noqa: F403
 
 # Re-exported as attributes but kept out of `__all__`, so a star import
@@ -26,7 +28,7 @@ from ._quabla import *  # noqa: F403
 __doc__ = _quabla.__doc__
 # The extension's names followed by the pure-Python v0.2 layers; a new list,
 # so these additions do not mutate the extension's own `__all__`.
-__all__ = list(_quabla.__all__) + _array.__all__ + _ops.__all__
+__all__ = list(_quabla.__all__) + _array.__all__ + _errors.__all__ + _ops.__all__
 
 # v0.1 compatibility alias for the native module. Registering it in
 # sys.modules keeps `import quabla.quabla` and `from quabla.quabla import X`

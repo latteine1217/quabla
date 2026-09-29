@@ -1,3 +1,4 @@
+import collections
 import ctypes
 import gc
 import importlib
@@ -616,6 +617,41 @@ def test_cuda_power_matches_cpu():
     assert_power_device_parity(
         lambda loss, specs, names: qb.tensor_value_and_grad_cuda_fn(loss, specs, names, 0)
     )
+
+
+# -- S2: pytrees and errors ---------------------------------------
+
+
+def test_tree_flatten_unflatten_and_map():
+    tree = {"b": [1.0, (2.0, None)], "a": qb.array(3.0), "c": None}
+    leaves, treedef = qb.tree.flatten(tree)
+    # dict keys are traversed in sorted order; None is an empty container
+    assert leaves[1:] == [1.0, 2.0] and isinstance(leaves[0], qb.Tensor)
+    assert treedef.num_leaves == 3
+    assert repr(treedef) == "TreeDef({'a': *, 'b': [*, (*, None)], 'c': None})"
+    rebuilt = qb.tree.unflatten(treedef, leaves)
+    assert rebuilt["b"] == [1.0, (2.0, None)] and rebuilt["c"] is None
+    assert qb.tree.flatten({"c": None, "b": [0, (0, None)], "a": 0})[1] == treedef
+    assert hash(qb.tree.flatten((1.0,))[1]) == hash(qb.tree.flatten((2.0,))[1])
+    assert qb.tree.flatten((1.0,))[1] != qb.tree.flatten([1.0])[1]
+    doubled = qb.tree.map(lambda x, y: x + y, {"a": 1.0, "b": [2.0]}, {"a": 10.0, "b": [20.0]})
+    assert doubled == {"a": 11.0, "b": [22.0]}
+    assert_raises(ValueError, qb.tree.map, lambda x, y: x, [1.0], (1.0,), match="structures differ")
+    assert_raises(ValueError, qb.tree.unflatten, treedef, [1.0], match="has 3 leaves, got 1")
+    assert_raises(TypeError, qb.tree.flatten, {1: 2.0}, match="keys must be strings")
+    # Container subclasses are leaves (D6: no NamedTuple support in v0.2).
+    point = collections.namedtuple("Point", "x y")(1.0, 2.0)
+    assert qb.tree.flatten([point])[0] == [point]
+
+
+def test_error_classes_subclass_the_builtins_raised_before():
+    assert issubclass(qb.TracerError, qb.QuablaError) and issubclass(qb.TracerError, TypeError)
+    assert issubclass(qb.RetraceLimitError, ValueError)
+    error = qb.UnsupportedOperationError("no", op="jit", device="mlx")
+    assert isinstance(error, ValueError) and isinstance(error, NotImplementedError)
+    assert (error.op, error.device, str(error)) == ("jit", "mlx", "no")
+    assert qb.UnsupportedOperationError("no").op is None
+
 
 if __name__ == "__main__":
     # Run every test_* function in definition order so new tests cannot be left out of a manual list
