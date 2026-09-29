@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 mod cuda;
@@ -401,13 +402,93 @@ pub struct DynamicTensor {
     dtype: TensorDType,
 }
 
+/// The value of a [`TensorOp::Constant`]: an array baked into a graph, such
+/// as an eager array that a traced function captured.
+///
+/// The data is shared, so cloning a graph, a plan, or a region never copies
+/// the elements, and `Debug` prints only the shape and dtype because captured
+/// arrays can be large. Plan compilation deduplicates constants by value
+/// (bitwise, see [`Self::same_bits`]), not by identity.
+#[derive(Clone)]
+struct TensorConstant(Arc<TensorConstantData>);
+
+struct TensorConstantData {
+    value: DynamicTensor,
+    /// The MLX copy of `value`, created by the first MLX execution of any plan
+    /// holding this constant and reused by every later one. It is only
+    /// accessed while the MLX execution lock is held.
+    #[cfg(all(feature = "mlx", target_os = "macos"))]
+    mlx_array: std::sync::Mutex<Option<mlx_rs::Array>>,
+}
+
+impl TensorConstant {
+    fn new(value: DynamicTensor) -> Self {
+        Self(Arc::new(TensorConstantData {
+            value,
+            #[cfg(all(feature = "mlx", target_os = "macos"))]
+            mlx_array: std::sync::Mutex::new(None),
+        }))
+    }
+
+    fn value(&self) -> &DynamicTensor {
+        &self.0.value
+    }
+
+    /// Whether both constants hold the same shape, dtype, and element bit
+    /// patterns. Bitwise equality keeps `-0.0` apart from `0.0` and never
+    /// merges values that some consumer could tell apart; two NaNs merge only
+    /// when their payloads match.
+    fn same_bits(&self, other: &Self) -> bool {
+        let (lhs, rhs) = (self.value(), other.value());
+        Arc::ptr_eq(&self.0, &other.0)
+            || (lhs.dtype == rhs.dtype
+                && lhs.shape == rhs.shape
+                && lhs
+                    .data
+                    .iter()
+                    .zip(&rhs.data)
+                    .all(|(lhs, rhs)| lhs.to_bits() == rhs.to_bits()))
+    }
+
+    /// A hash consistent with [`Self::same_bits`].
+    fn bits_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let value = self.value();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        value.dtype.hash(&mut hasher);
+        value.shape.hash(&mut hasher);
+        for element in &value.data {
+            element.to_bits().hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+}
+
+impl std::fmt::Debug for TensorConstant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "TensorConstant({})",
+            format_tensor_type(&self.value().shape, self.value().dtype)
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 enum TensorOp {
     Input {
         name: String,
     },
+    /// A weak or strong scalar known at graph-construction time (Python
+    /// scalars and AD-internal constants).
     ScalarConstant {
         value: f64,
+    },
+    /// An array known at graph-construction time; the node's shape and dtype
+    /// are those of the value. It has no inputs, a zero tangent, and receives
+    /// no cotangent.
+    Constant {
+        value: TensorConstant,
     },
     /// Element type conversion; the target dtype is the node's dtype.
     Cast {
@@ -1312,7 +1393,8 @@ pub struct TensorBufferSlot {
 
 /// Static liveness-based allocation contract for a frozen tensor plan.
 ///
-/// Inputs are externally bound and therefore have no slot. `reshape` nodes
+/// Inputs are externally bound and array constants are resident for the
+/// plan's lifetime, so neither has a slot. `reshape` nodes
 /// carry an alias instead of allocating storage. All other values use an
 /// exact-size temporary slot that may be reused after its final consumer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2426,6 +2508,22 @@ impl TensorIr {
                     transformed.constant_like(*value, node.dtype, node.weak),
                     transformed.scalar_constant(0.0),
                 ),
+                TensorOp::Constant { value } => {
+                    let primal = transformed.push_node(
+                        TensorOp::Constant {
+                            value: value.clone(),
+                        },
+                        node.shape.clone(),
+                        node.dtype,
+                        node.weak,
+                    );
+                    let tangent = if node.dtype == TensorDType::Bool {
+                        symbolic_zero_tangent(&mut transformed, &node.shape)?
+                    } else {
+                        symbolic_zero_like(&mut transformed, primal)?
+                    };
+                    (primal, tangent)
+                }
                 // d cast(x) = cast(dx): the tangent has the same dtype as the primal.
                 TensorOp::Cast { input } => {
                     let (value, tangent) = pairs[*input];
@@ -2870,6 +2968,12 @@ impl TensorIr {
                 TensorOp::ScalarConstant { value } => {
                     transformed.constant_like(*value, node.dtype, node.weak)
                 }
+                TensorOp::Constant { .. } => transformed.push_node(
+                    node.op.clone(),
+                    node.shape.clone(),
+                    node.dtype,
+                    node.weak,
+                ),
                 TensorOp::Cast { input } => transformed.cast(values[*input], node.dtype)?,
                 TensorOp::Add { lhs, rhs } => transformed.add(values[*lhs], values[*rhs])?,
                 TensorOp::Sub { lhs, rhs } => transformed.sub(values[*lhs], values[*rhs])?,
@@ -3064,6 +3168,7 @@ impl TensorIr {
             match &node.op {
                 TensorOp::Input { .. }
                 | TensorOp::ScalarConstant { .. }
+                | TensorOp::Constant { .. }
                 | TensorOp::Greater { .. }
                 | TensorOp::Compare { .. } => {}
                 // The cast VJP converts the cotangent back to the source dtype; Bool sources are
@@ -3662,6 +3767,27 @@ impl TensorIr {
             vec![],
             TensorDType::F64,
             true,
+        )
+    }
+
+    /// Adds an array constant with the shape and dtype of `value`.
+    ///
+    /// A constant is strong unless `weak` is set: an eager array keeps its
+    /// dtype when it meets a traced value, so a strong `f64` constant combined
+    /// with an `f32` operand is a dtype error that asks for `astype`. `weak`
+    /// preserves the weak type of a value that already has one (an eager
+    /// `bool` mask combined with a Python scalar). The data is shared, never
+    /// copied, by later transforms and compiled plans; it has a zero tangent
+    /// and receives no cotangent.
+    pub fn constant(&mut self, value: DynamicTensor, weak: bool) -> TensorNodeId {
+        let (shape, dtype) = (value.shape.clone(), value.dtype);
+        self.push_node(
+            TensorOp::Constant {
+                value: TensorConstant::new(value),
+            },
+            shape,
+            dtype,
+            weak,
         )
     }
 
@@ -4964,6 +5090,9 @@ impl TensorIr {
 
         let mut remap = HashMap::new();
         let mut cse_nodes = HashMap::new();
+        // Array constants by `TensorConstant::bits_hash`; candidates in one bucket are compared
+        // bitwise, so a hash collision never merges different values.
+        let mut constant_nodes = HashMap::<u64, Vec<TensorNodeId>>::new();
         let mut nodes = Vec::with_capacity(reachable.len());
         for (old_id, node) in self.nodes.iter().enumerate() {
             if !reachable.contains(&old_id) {
@@ -4980,6 +5109,23 @@ impl TensorIr {
                 op = TensorOp::ScalarConstant {
                     value: node.dtype.round(value),
                 };
+            } else if let Some(value) = fold_tensor_constant_op(&op, &nodes) {
+                op = TensorOp::Constant {
+                    value: TensorConstant::new(value.into_dtype(node.dtype)),
+                };
+            }
+            if let TensorOp::Constant { value } = &op {
+                let bucket = constant_nodes.entry(value.bits_hash()).or_default();
+                let existing = bucket.iter().copied().find(|id| {
+                    let existing: &TensorNode = &nodes[*id];
+                    existing.weak == node.weak
+                        && matches!(&existing.op, TensorOp::Constant { value: other } if other.same_bits(value))
+                });
+                if let Some(existing_id) = existing {
+                    remap.insert(old_id, existing_id);
+                    continue;
+                }
+                bucket.push(nodes.len());
             }
             if let Some(key) = pure_tensor_op_cse_key(&op, &node.shape) {
                 // dtype and weakness are part of a value's identity: cast(x, f32) must not be
@@ -5094,7 +5240,9 @@ impl TensorIr {
                 None => continue,
             };
             match &self.nodes[node_id].op {
-                TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } => {}
+                TensorOp::Input { .. }
+                | TensorOp::ScalarConstant { .. }
+                | TensorOp::Constant { .. } => {}
                 TensorOp::Cast { input } => {
                     // Bool sources are not differentiable: a mask converted to float returns no
                     // gradient.
@@ -5574,6 +5722,7 @@ impl TensorIr {
                     input_tangent.astype(node.dtype)
                 }
                 TensorOp::ScalarConstant { .. } => DynamicTensor::filled(vec![], 0.0)?,
+                TensorOp::Constant { .. } => DynamicTensor::filled(node.shape.clone(), 0.0)?,
                 TensorOp::Cast { input } => tangents
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
@@ -6128,6 +6277,12 @@ impl TensorIr {
                         format_tensor_type(&node.shape, node.dtype)
                     )
                 }
+                // The elements are not printed: a captured array can be large, and the text is
+                // for reading the graph structure.
+                TensorOp::Constant { .. } => format!(
+                    "%{id} = constant[dense] : {}",
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
                 TensorOp::Cast { input } => format!(
                     "%{id} = cast(%{input}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
@@ -6591,6 +6746,7 @@ impl TensorIr {
                     input.clone()
                 }
                 TensorOp::ScalarConstant { value } => DynamicTensor::filled(vec![], *value)?,
+                TensorOp::Constant { value } => value.value().clone(),
                 TensorOp::Cast { input } => values
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
@@ -7281,6 +7437,12 @@ impl TensorIr {
                     first: DynamicTensor::filled(vec![], 0.0)?,
                     second: DynamicTensor::filled(vec![], 0.0)?,
                     mixed: DynamicTensor::filled(vec![], 0.0)?,
+                },
+                TensorOp::Constant { value } => MixedTangent {
+                    value: value.value().clone(),
+                    first: DynamicTensor::filled(node.shape.clone(), 0.0)?,
+                    second: DynamicTensor::filled(node.shape.clone(), 0.0)?,
+                    mixed: DynamicTensor::filled(node.shape.clone(), 0.0)?,
                 },
                 TensorOp::Cast { input } => {
                     let input = values
@@ -10950,6 +11112,13 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                 TensorOp::ScalarConstant { value } => {
                     specialized.constant_like(*value, node.dtype, node.weak)
                 }
+                // Constants are replicated: only mapped inputs are sharded.
+                TensorOp::Constant { .. } => specialized.push_node(
+                    node.op.clone(),
+                    node.shape.clone(),
+                    node.dtype,
+                    node.weak,
+                ),
                 TensorOp::Cast { input } => specialized.cast(mapped(*input)?, node.dtype)?,
                 TensorOp::Add { lhs, rhs } => specialized.add(mapped(*lhs)?, mapped(*rhs)?)?,
                 TensorOp::Sub { lhs, rhs } => specialized.sub(mapped(*lhs)?, mapped(*rhs)?)?,
@@ -11095,6 +11264,11 @@ fn cuda_expression(nodes: &[TensorNode], node_id: TensorNodeId) -> Result<String
         TensorOp::ScalarConstant { .. } => Err(
             "CUDA lowering does not support non-finite scalar constants".to_string(),
         ),
+        // `is_fusable_elementwise_subgraph` keeps array constants out of whole-plan kernels; the
+        // per-node program binds them as device buffers.
+        TensorOp::Constant { .. } => {
+            Err("the fused CUDA kernel does not bind array constants".to_string())
+        }
         // f32 and f64 both execute as float on CUDA (TensorDeviceBackend::execution_dtype), so cast
         // is the identity.
         TensorOp::Cast { input } => child(*input),
@@ -11309,6 +11483,9 @@ fn is_fusable_elementwise_subgraph(nodes: &[TensorNode], node_id: TensorNodeId) 
     };
     match &node.op {
         TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } => true,
+        // A whole-plan kernel binds only plan inputs; a plan with an array constant runs the
+        // per-node program, where fusion regions read the constant's buffer.
+        TensorOp::Constant { .. } => false,
         TensorOp::Add { lhs, rhs }
         | TensorOp::Sub { lhs, rhs }
         | TensorOp::Mul { lhs, rhs }
@@ -11442,6 +11619,9 @@ fn evaluate_fused_element(
             Ok(input.data[broadcast_offset(output_index, output_shape, &node.shape, &strides)])
         }
         TensorOp::ScalarConstant { value } => Ok(*value),
+        TensorOp::Constant { .. } => {
+            Err("the fused elementwise evaluator does not read array constants".to_string())
+        }
         TensorOp::Cast { input } => child(*input),
         TensorOp::Add { lhs, rhs } => Ok(child(*lhs)? + child(*rhs)?),
         TensorOp::Sub { lhs, rhs } => Ok(child(*lhs)? - child(*rhs)?),
@@ -11522,7 +11702,9 @@ fn evaluate_fused_element(
 
 fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
     match op {
-        TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } => Vec::new(),
+        TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } | TensorOp::Constant { .. } => {
+            Vec::new()
+        }
         TensorOp::Add { lhs, rhs }
         | TensorOp::Sub { lhs, rhs }
         | TensorOp::Div { lhs, rhs }
@@ -11771,7 +11953,9 @@ fn infer_tensor_placement(
         |input_ids: &[TensorNodeId]| merge_tensor_placements(node_id, input_ids, kernel_nodes);
 
     match &node.op {
-        TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } => Ok(TensorPlacement::Unplaced),
+        TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } | TensorOp::Constant { .. } => {
+            Ok(TensorPlacement::Unplaced)
+        }
         TensorOp::Add { lhs, rhs }
         | TensorOp::Sub { lhs, rhs }
         | TensorOp::Div { lhs, rhs }
@@ -12185,6 +12369,7 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
     match op {
         TensorOp::Input { .. } => "input",
         TensorOp::ScalarConstant { .. } => "constant",
+        TensorOp::Constant { .. } => "tensor_constant",
         TensorOp::Cast { .. } => "cast",
         TensorOp::Add { .. } => "add",
         TensorOp::Sub { .. } => "sub",
@@ -12269,6 +12454,59 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
             let value = scalar(*input)?;
             (value > 0.0).then(|| value.ln())
         }
+        _ => None,
+    }
+}
+
+/// Folds an elementwise op whose operands are all constants, at least one of
+/// them an array constant: the array counterpart of `fold_scalar_constant_op`,
+/// covering the same ops. It evaluates with the CPU evaluator's own kernels on
+/// operands rounded to their dtypes, so the caller only rounds the result to
+/// the node dtype to get what per-node execution computes. An op that the
+/// evaluator rejects (a zero divisor, a non-positive logarithm) stays unfolded
+/// and still fails at execution.
+fn fold_tensor_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<DynamicTensor> {
+    let operands = tensor_op_inputs(op);
+    let is_array = |id: &TensorNodeId| {
+        matches!(
+            nodes.get(*id).map(|node| &node.op),
+            Some(TensorOp::Constant { .. })
+        )
+    };
+    if !operands.iter().any(is_array) {
+        return None;
+    }
+    let constant = |id: TensorNodeId| -> Option<std::borrow::Cow<'_, DynamicTensor>> {
+        let node = nodes.get(id)?;
+        match &node.op {
+            TensorOp::ScalarConstant { value } if node.shape.is_empty() => {
+                Some(std::borrow::Cow::Owned(
+                    DynamicTensor::filled(vec![], *value)
+                        .ok()?
+                        .into_dtype(node.dtype),
+                ))
+            }
+            TensorOp::Constant { value } => Some(std::borrow::Cow::Borrowed(value.value())),
+            _ => None,
+        }
+    };
+    match op {
+        TensorOp::Add { lhs, rhs } => constant(*lhs)?.add(&*constant(*rhs)?).ok(),
+        TensorOp::Sub { lhs, rhs } => constant(*lhs)?.sub(&*constant(*rhs)?).ok(),
+        TensorOp::Mul { lhs, rhs } => constant(*lhs)?.mul(&*constant(*rhs)?).ok(),
+        TensorOp::Div { lhs, rhs } => constant(*lhs)?.div(&*constant(*rhs)?).ok(),
+        TensorOp::Greater { lhs, rhs } => constant(*lhs)?.greater(&*constant(*rhs)?).ok(),
+        TensorOp::Compare { lhs, rhs, kind } => {
+            constant(*lhs)?.compare(&*constant(*rhs)?, *kind).ok()
+        }
+        TensorOp::Cast { input } => Some(constant(*input)?.into_owned()),
+        TensorOp::Tanh { input } => constant(*input)?.tanh().ok(),
+        TensorOp::Exp { input } => constant(*input)?.exp().ok(),
+        TensorOp::Sin { input } => constant(*input)?.sin().ok(),
+        TensorOp::Cos { input } => constant(*input)?.cos().ok(),
+        TensorOp::Powi { input, exponent } => constant(*input)?.powi(*exponent).ok(),
+        TensorOp::Pow { base, exponent } => constant(*base)?.pow(&*constant(*exponent)?).ok(),
+        TensorOp::Log { input } => constant(*input)?.log().ok(),
         _ => None,
     }
 }
@@ -12449,7 +12687,9 @@ fn build_tensor_buffer_plan(
             let root = tensor_storage_root(nodes, *input)?;
             node_slots[node_id] = node_slots[root];
             node_aliases[node_id] = Some(*input);
-        } else if !matches!(node.op, TensorOp::Input { .. }) {
+        } else if !matches!(node.op, TensorOp::Input { .. } | TensorOp::Constant { .. }) {
+            // Inputs and array constants are bound storage, not planned slots: a constant is
+            // read-only for the plan's lifetime, so its storage is never recycled.
             let count = element_count(&node.shape)?;
             let slot = free_slots
                 .get_mut(&count)
@@ -12513,6 +12753,9 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<String> {
     let key = match op {
         TensorOp::Input { .. } => return None,
         TensorOp::ScalarConstant { value } => format!("constant:{value}:{shape:?}"),
+        // Array constants are deduplicated by value in `compile_cpu_many`, without formatting
+        // their elements into a key.
+        TensorOp::Constant { .. } => return None,
         TensorOp::Cast { input } => format!("cast:{input}:{shape:?}"),
         TensorOp::Add { lhs, rhs } => format!("add:{lhs}:{rhs}:{shape:?}"),
         TensorOp::Sub { lhs, rhs } => format!("sub:{lhs}:{rhs}:{shape:?}"),
@@ -12600,6 +12843,9 @@ fn remap_tensor_op(
     match op {
         TensorOp::Input { name } => Ok(TensorOp::Input { name: name.clone() }),
         TensorOp::ScalarConstant { value } => Ok(TensorOp::ScalarConstant { value: *value }),
+        TensorOp::Constant { value } => Ok(TensorOp::Constant {
+            value: value.clone(),
+        }),
         TensorOp::Cast { input } => Ok(TensorOp::Cast {
             input: remap_node(*input)?,
         }),

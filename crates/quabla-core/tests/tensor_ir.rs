@@ -9301,3 +9301,416 @@ fn inline_splices_region_graphs_and_keeps_two_splices_separate() {
         1e-12,
     );
 }
+
+fn vector(data: &[f64]) -> Result<DynamicTensor, String> {
+    DynamicTensor::new(vec![data.len()], data.to_vec())
+}
+
+#[test]
+fn array_constants_evaluate_with_a_strong_dtype() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3]));
+    let c = graph.constant(must!(vector(&[1.0, -2.0, 0.5])), false);
+    assert_eq!(must!(graph.node_shape(c)), vec![3]);
+    assert_eq!(must!(graph.node_dtype(c)), TensorDType::F64);
+    let product = must!(graph.mul(x, c));
+    let output = must!(graph.add(product, c));
+    let inputs = BTreeMap::from([("x".to_string(), must!(vector(&[3.0, 4.0, -1.0])))]);
+    assert_eq!(
+        must!(graph.evaluate(output, &inputs)).data(),
+        &[4.0, -10.0, 0.0]
+    );
+    // The elements are not printed.
+    assert!(graph
+        .lower_text()
+        .contains(&format!("%{c} = constant[dense] : tensor<3xf64>")));
+
+    // A strong f32 constant meets an f32 operand; a strong f64 constant is a
+    // dtype error that asks for astype, like an f64 input.
+    let x32 = must!(graph.input_typed("x32", vec![3], TensorDType::F32));
+    let c32 = graph.constant(
+        must!(DynamicTensor::with_dtype(
+            vec![3],
+            vec![0.1, 0.2, 0.3],
+            TensorDType::F32
+        )),
+        false,
+    );
+    let sum32 = must!(graph.add(x32, c32));
+    assert_eq!(must!(graph.node_dtype(sum32)), TensorDType::F32);
+    let before = graph.node_count();
+    let error = graph
+        .add(x32, c)
+        .expect_err("strong f64 + f32 must be rejected");
+    assert!(error.contains("mismatched dtypes f32 and f64"), "{error}");
+    assert!(error.contains("astype"), "{error}");
+    assert_eq!(graph.node_count(), before);
+    // A weak constant adopts the strong operand's dtype.
+    let weak = graph.constant(must!(vector(&[1.0, 2.0, 3.0])), true);
+    let adopted = must!(graph.add(x32, weak));
+    assert_eq!(must!(graph.node_dtype(adopted)), TensorDType::F32);
+
+    // A bool constant selects like a traced mask.
+    let mask = graph.constant(
+        must!(DynamicTensor::with_dtype(
+            vec![3],
+            vec![1.0, 0.0, 1.0],
+            TensorDType::Bool
+        )),
+        false,
+    );
+    let zero = graph.scalar_constant(0.0);
+    let selected = must!(graph.where_select(mask, x, zero));
+    let mut inputs = inputs;
+    inputs.insert(
+        "x32".to_string(),
+        must!(DynamicTensor::with_dtype(
+            vec![3],
+            vec![0.0; 3],
+            TensorDType::F32
+        )),
+    );
+    assert_eq!(
+        must!(graph.evaluate(selected, &inputs)).data(),
+        &[3.0, 0.0, -1.0]
+    );
+}
+
+#[test]
+fn array_constants_fold_like_per_node_execution() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input_typed("x", vec![3], TensorDType::F32));
+    let c = graph.constant(
+        must!(DynamicTensor::with_dtype(
+            vec![3],
+            vec![0.1, 1.7, -2.3],
+            TensorDType::F32
+        )),
+        false,
+    );
+    let two = graph.scalar_constant(2.0);
+    let sine = must!(graph.sin(c));
+    let scaled = must!(graph.mul(sine, two));
+    let output = must!(graph.add(x, scaled));
+    let plan = must!(graph.compile_cpu(output));
+    // sin(c) * 2 folds into one f32 constant: x, the constant, and the add.
+    assert_eq!(plan.node_count(), 3);
+    assert!(!plan.lower_text().contains("sin("), "{}", plan.lower_text());
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::with_dtype(
+            vec![3],
+            vec![0.25, -1.5, 3.0],
+            TensorDType::F32
+        )),
+    )]);
+    let folded = must!(plan.evaluate(&inputs));
+    let unfolded = must!(graph.evaluate(output, &inputs));
+    assert_eq!(folded.dtype(), TensorDType::F32);
+    assert_eq!(folded.data(), unfolded.data());
+
+    // A zero divisor is left to fail at execution, as without folding.
+    let z = graph.constant(must!(vector(&[1.0, 0.0, 2.0])), false);
+    let ones = graph.constant(must!(vector(&[1.0, 1.0, 1.0])), false);
+    let quotient = must!(graph.div(ones, z));
+    let plan = must!(graph.compile_cpu(quotient));
+    assert!(plan.lower_text().contains("div("), "{}", plan.lower_text());
+    let error = plan
+        .evaluate(&BTreeMap::new())
+        .expect_err("division by zero must fail");
+    assert!(error.contains("division by zero"), "{error}");
+}
+
+#[test]
+fn array_constants_deduplicate_by_bits_in_compiled_plans() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let nan = f64::from_bits(0x7ff8_0000_0000_0001);
+    let mut outputs = Vec::new();
+    for data in [
+        [1.5, nan],
+        [1.5, nan],
+        [0.0, 2.0],
+        [-0.0, 2.0],
+        [1.5, f64::from_bits(0x7ff8_0000_0000_0002)],
+    ] {
+        let c = graph.constant(must!(vector(&data)), false);
+        outputs.push(must!(graph.mul(x, c)));
+    }
+    // The first two constants are separate allocations with equal bits and
+    // merge, and so do their products; -0.0 and 0.0, and NaNs with different
+    // payloads, stay apart.
+    let (plan, plan_outputs) = must!(graph.compile_cpu_many(&outputs));
+    assert_eq!(plan_outputs[0], plan_outputs[1]);
+    assert_eq!(plan.node_count(), 1 + 4 + 4);
+    let inputs = BTreeMap::from([("x".to_string(), must!(vector(&[2.0, 1.0])))]);
+    let values = must!(plan.evaluate_many(&inputs));
+    assert_eq!(values[2].data()[0].to_bits(), 0.0f64.to_bits());
+    assert_eq!(values[3].data()[0].to_bits(), (-0.0f64).to_bits());
+
+    // dtype and weakness are part of the identity.
+    let mut graph = TensorIr::new();
+    let strong = graph.constant(must!(vector(&[1.0, 2.0])), false);
+    let weak = graph.constant(must!(vector(&[1.0, 2.0])), true);
+    let narrow = graph.constant(
+        must!(DynamicTensor::with_dtype(
+            vec![2],
+            vec![1.0, 2.0],
+            TensorDType::F32
+        )),
+        false,
+    );
+    let (plan, _) = must!(graph.compile_cpu_many(&[strong, weak, narrow]));
+    assert_eq!(plan.node_count(), 3);
+}
+
+#[test]
+fn array_constants_have_zero_tangents_and_receive_no_cotangent() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3]));
+    let c_data = [0.5, -1.0, 2.0];
+    let c = graph.constant(must!(vector(&c_data)), false);
+    let product = must!(graph.mul(x, c));
+    let sine = must!(graph.sin(product));
+    let shifted = must!(graph.add(sine, c));
+    let loss = must!(graph.sum(shifted));
+    let x_data = [0.3, 0.1, -0.2];
+    let inputs = BTreeMap::from([("x".to_string(), must!(vector(&x_data)))]);
+    let expected_gradient = x_data
+        .iter()
+        .zip(c_data)
+        .map(|(x, c)| c * (x * c).cos())
+        .collect::<Vec<_>>();
+
+    let (_, gradients) = must!(graph.value_and_vjp(loss, &inputs, must!(scalar(1.0))));
+    assert_eq!(gradients.keys().collect::<Vec<_>>(), vec!["x"]);
+    assert_close(gradients["x"].data(), &expected_gradient, 1e-15);
+
+    let symbolic = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    assert_eq!(symbolic.gradients.keys().collect::<Vec<_>>(), vec!["x"]);
+    assert_close(
+        must!(symbolic.graph.evaluate(symbolic.gradients["x"], &inputs)).data(),
+        &expected_gradient,
+        1e-15,
+    );
+
+    let direction = [1.0, -2.0, 0.5];
+    let expected_tangent = expected_gradient
+        .iter()
+        .zip(direction)
+        .map(|(gradient, direction)| gradient * direction)
+        .sum::<f64>();
+    let tangents = BTreeMap::from([("x".to_string(), must!(vector(&direction)))]);
+    let (_, tangent) = must!(graph.jvp(loss, &inputs, &tangents));
+    assert_close(tangent.data(), &[expected_tangent], 1e-15);
+    let forward = must!(graph.symbolic_jvp_with_tangent_inputs(
+        loss,
+        &BTreeMap::from([("x".to_string(), "x_dot".to_string())]),
+    ));
+    let mut forward_inputs = inputs.clone();
+    forward_inputs.insert("x_dot".to_string(), must!(vector(&direction)));
+    assert_close(
+        must!(forward.graph.evaluate(forward.tangent, &forward_inputs)).data(),
+        &[expected_tangent],
+        1e-15,
+    );
+
+    // Second order: d^2/dx^2 sum(sin(x * c)) = -c^2 sin(x * c) on the diagonal.
+    let hvp = must!(graph.hvp_scalar(loss, "x", &inputs, must!(vector(&direction))));
+    let expected_hvp = x_data
+        .iter()
+        .zip(c_data)
+        .zip(direction)
+        .map(|((x, c), direction)| -c * c * (x * c).sin() * direction)
+        .collect::<Vec<_>>();
+    assert_close(hvp.data(), &expected_hvp, 1e-14);
+
+    // The forward tangent of a constant output is a zero of its dtype.
+    let (_, constant_tangent) = must!(graph.jvp(c, &inputs, &tangents));
+    assert_eq!(constant_tangent.data(), &[0.0, 0.0, 0.0]);
+}
+
+#[test]
+fn inline_shares_array_constants_between_splices() {
+    let mut callee = TensorIr::new();
+    let a = must!(callee.input("a", vec![2]));
+    let c = callee.constant(must!(vector(&[3.0, -4.0])), false);
+    let product = must!(callee.mul(a, c));
+    let output = must!(callee.sum(product));
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let y = must!(graph.input("y", vec![2]));
+    let first = must!(graph.inline(&callee, &BTreeMap::from([("a".to_string(), x)]), &[output]));
+    let second = must!(graph.inline(&callee, &BTreeMap::from([("a".to_string(), y)]), &[output]));
+    let inputs = BTreeMap::from([
+        ("x".to_string(), must!(vector(&[1.0, 2.0]))),
+        ("y".to_string(), must!(vector(&[-1.0, 0.5]))),
+    ]);
+    assert_eq!(must!(graph.evaluate(first[0], &inputs)).data(), &[-5.0]);
+    assert_eq!(must!(graph.evaluate(second[0], &inputs)).data(), &[-5.0]);
+    // Each splice copies the constant node; the plan holds it once.
+    let (plan, _) = must!(graph.compile_cpu_many(&[first[0], second[0]]));
+    assert_eq!(plan.lower_text().matches("constant[dense]").count(), 1);
+    // A resident constant takes no temporary buffer slot.
+    let buffers = must!(must!(graph.compile_cpu(first[0])).buffer_plan());
+    let plan = must!(graph.compile_cpu(first[0]));
+    let constant_id = plan
+        .lower_text()
+        .lines()
+        .position(|line| line.contains("constant[dense]"))
+        .expect("the plan keeps the constant");
+    assert_eq!(buffers.node_slots[constant_id], None);
+}
+
+/// A graph whose elementwise chain reads an array constant, plus a gradient
+/// that reads it too, so device plans run a fusion region with a constant
+/// leaf and a multi-output program.
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn constant_chain_fixture() -> Result<(TensorIr, Vec<TensorNodeId>), String> {
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![4])?;
+    let c = graph.constant(
+        DynamicTensor::new(vec![4], vec![0.5, -1.25, 2.0, 0.75])?,
+        false,
+    );
+    let product = graph.mul(x, c)?;
+    let sine = graph.sin(product)?;
+    let shifted = graph.add(sine, c)?;
+    let loss = graph.sum(shifted)?;
+    let reverse = graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)])?;
+    let outputs = vec![
+        reverse.primals[shifted],
+        reverse.primals[loss],
+        reverse.gradients["x"],
+    ];
+    Ok((reverse.graph, outputs))
+}
+
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn assert_constant_chain_parity(target: QuablaTarget) {
+    let (graph, outputs) = must!(constant_chain_fixture());
+    let program = must!(QuablaMultiOutputProgram::new(graph, outputs));
+    let compiler = QuablaCompiler;
+    let cpu = must!(compiler.compile_many(&program, QuablaTarget::Cpu));
+    let device = must!(compiler.compile_many(&program, target));
+    for x in [[0.1, 0.2, -0.3, 0.4], [1.0, -2.0, 0.5, 0.0]] {
+        let inputs = BTreeMap::from([("x".to_string(), must!(vector(&x)))]);
+        let expected = must!(cpu.execute(&inputs));
+        // Repeated executions read the same resident constant.
+        for _ in 0..2 {
+            let actual = must!(device.execute(&inputs));
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_close(actual.data(), expected.data(), 1e-5);
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_backend_executes_array_constants_like_cpu() {
+    assert_constant_chain_parity(QuablaTarget::Mlx);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_array_constants_like_cpu_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    assert_constant_chain_parity(QuablaTarget::Cuda { device_ordinal: 0 });
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_uploads_array_constants_once_per_plan_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![4]));
+    let c = graph.constant(must!(vector(&[0.5, -1.25, 2.0, 0.75])), false);
+    let product = must!(graph.mul(x, c));
+    let sine = must!(graph.sin(product));
+    let output = must!(graph.add(sine, c));
+    let cpu_plan = must!(graph.compile_cpu(output));
+    let plan = must!(CudaBackend::new(0).compile(cpu_plan.clone()));
+    // The chain runs as one fusion region whose leaves are `x` and the
+    // constant's device buffer.
+    assert!(plan.fused_region_count() >= 1);
+    assert_eq!(plan.constant_upload_count(), 0);
+    for x in [[0.1, 0.2, -0.3, 0.4], [1.0, -2.0, 0.5, 0.0], [0.0; 4]] {
+        let inputs = BTreeMap::from([("x".to_string(), must!(vector(&x)))]);
+        assert_close(
+            must!(plan.execute(&inputs)).data(),
+            must!(cpu_plan.evaluate(&inputs)).data(),
+            1e-5,
+        );
+        assert_eq!(plan.constant_upload_count(), 1);
+    }
+
+    // A Cond region that returns a constant copies it into the parent's
+    // buffer and keeps its own resident copy.
+    let on_true = {
+        let mut region = TensorIr::new();
+        let captured = must!(region.input("captured", vec![4]));
+        let two = region.scalar_constant(2.0);
+        let output = must!(region.mul(captured, two));
+        must!(region.compile_cpu(output))
+    };
+    let on_false = {
+        let mut region = TensorIr::new();
+        let captured = must!(region.input("captured", vec![4]));
+        let output = region.constant(must!(vector(&[9.0, 8.0, 7.0, 6.0])), false);
+        // Both branches must capture the same inputs, so the plan also keeps
+        // the unused capture as a second output; the constant is the result.
+        let (plan, _) = must!(region.compile_cpu_many(&[output, captured]));
+        plan
+    };
+    let branches = must!(TensorCondExecutionPlan::new(on_true, on_false));
+    let mut graph = TensorIr::new();
+    let predicate = must!(graph.input("predicate", vec![]));
+    let x = must!(graph.input("x", vec![4]));
+    let conditional =
+        must!(graph.cond_with_captures(predicate, branches, vec![("captured".to_string(), x)],));
+    let cpu_plan = must!(graph.compile_cpu(conditional));
+    let plan = must!(CudaBackend::new(0).compile(cpu_plan.clone()));
+    for predicate in [0.0, 1.0, 0.0, 0.0] {
+        let inputs = BTreeMap::from([
+            ("predicate".to_string(), must!(scalar(predicate))),
+            ("x".to_string(), must!(vector(&[1.0, 2.0, 3.0, 4.0]))),
+        ]);
+        assert_eq!(
+            must!(plan.execute(&inputs)).data(),
+            must!(cpu_plan.evaluate(&inputs)).data()
+        );
+    }
+
+    // Device loops bind arrays only through captures.
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![2]));
+    let _index = must!(body.input("index", vec![]));
+    let step = body.constant(must!(vector(&[1.0, 2.0])), false);
+    let next = must!(body.add(carry, step));
+    let loop_plan = must!(TensorForiExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu(next)),
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![2]));
+    let output = must!(graph.fori(initial, loop_plan, vec![]));
+    let error = CudaBackend::new(0)
+        .compile(must!(graph.compile_cpu(output)))
+        .expect_err("a device loop body with an array constant must be rejected");
+    assert!(error.contains("array constant"), "{error}");
+}

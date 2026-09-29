@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -58,6 +59,9 @@ pub struct CudaExecutionPlan {
     solver: Option<Arc<Mutex<DnHandle>>>,
     state: Arc<Mutex<CudaExecutionState>>,
     cond_branches: BTreeMap<TensorNodeId, CudaCondBranches>,
+    /// Host-to-device copies of array constants made by this plan's
+    /// executions; see [`CudaExecutionPlan::constant_upload_count`].
+    constant_uploads: Arc<AtomicUsize>,
 }
 
 /// Device plans for the two regions of one `Cond` node.
@@ -428,6 +432,7 @@ impl CudaBackend {
             solver,
             state: Arc::new(Mutex::new(CudaExecutionState::default())),
             cond_branches,
+            constant_uploads: Arc::new(AtomicUsize::new(0)),
         })
     }
 }
@@ -781,6 +786,16 @@ impl CudaExecutionPlan {
             + state.free_buffers.values().map(Vec::len).sum::<usize>())
     }
 
+    /// Number of array constants this plan has copied to the device.
+    ///
+    /// The first execution uploads each constant of the plan into a device
+    /// buffer that stays read-only and is never recycled, and every later
+    /// execution reads that buffer, so the count stops growing after the first
+    /// call. `Cond` region plans keep their own counts.
+    pub fn constant_upload_count(&self) -> usize {
+        self.constant_uploads.load(Ordering::Relaxed)
+    }
+
     pub fn synchronize(&self) -> Result<(), String> {
         self.context
             .default_stream()
@@ -874,7 +889,16 @@ impl CudaExecutionPlan {
                 .collect();
         }
         recycle_cuda_computed_values(&self.plan, values, free_buffers);
-        values[self.plan.output_node_id] = Some(output);
+        // A region that returns an array constant keeps the constant's resident buffer and copies
+        // it into `output`; every other region writes its result into `output` directly.
+        let output_is_constant = matches!(
+            self.plan.nodes[self.plan.output_node_id].op,
+            TensorOp::Constant { .. }
+        );
+        let mut output = Some(output);
+        if !output_is_constant {
+            values[self.plan.output_node_id] = output.take();
+        }
         execute_cuda_device_program(
             &self.plan,
             &BTreeMap::new(),
@@ -885,16 +909,26 @@ impl CudaExecutionPlan {
                 solver: self.solver.as_ref(),
                 cond_branches: &self.cond_branches,
                 region_captures: captures,
+                constant_uploads: &self.constant_uploads,
             },
             values,
             free_buffers,
             &BTreeSet::new(),
             false,
         )?;
-        values
-            .get_mut(self.plan.output_node_id)
-            .and_then(Option::take)
-            .ok_or_else(|| "CUDA Cond region did not produce its output".to_string())
+        match output {
+            Some(mut output) => {
+                let constant = cuda_value(values, self.plan.output_node_id)?;
+                stream.memcpy_dtod(constant, &mut output).map_err(|error| {
+                    format!("failed to copy the CUDA Cond region constant output: {error:?}")
+                })?;
+                Ok(output)
+            }
+            None => values
+                .get_mut(self.plan.output_node_id)
+                .and_then(Option::take)
+                .ok_or_else(|| "CUDA Cond region did not produce its output".to_string()),
+        }
     }
 
     fn execute_retaining_inner(
@@ -948,6 +982,7 @@ impl CudaExecutionPlan {
                     solver: self.solver.as_ref(),
                     cond_branches: &self.cond_branches,
                     region_captures: &BTreeMap::new(),
+                    constant_uploads: &self.constant_uploads,
                 },
                 values,
                 free_buffers,
@@ -1368,6 +1403,8 @@ struct CudaProgramRuntime<'a> {
     /// When non-empty, this program is a `Cond` region: every input is bound to a parent-plan
     /// device buffer.
     region_captures: &'a BTreeMap<String, &'a CudaSlice<f32>>,
+    /// Counts the array-constant uploads of the plan that owns `values`.
+    constant_uploads: &'a AtomicUsize,
 }
 
 fn cuda_remaining_use_counts(plan: &TensorExecutionPlan) -> Vec<usize> {
@@ -1490,14 +1527,15 @@ fn release_cuda_value(
 /// result computed by a sibling node into an empty slot, so a slot still
 /// holding the previous run's output would otherwise be rejected. Input slots
 /// stay: retained inputs hold device-resident parameters, and the upload
-/// overwrites every other input.
+/// overwrites every other input. Array-constant slots stay too: they hold the
+/// read-only copy that the first execution uploaded.
 fn recycle_cuda_computed_values(
     plan: &TensorExecutionPlan,
     values: &mut [Option<CudaSlice<f32>>],
     free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
 ) {
     for (slot, node) in values.iter_mut().zip(&plan.nodes) {
-        if matches!(node.op, TensorOp::Input { .. }) {
+        if matches!(node.op, TensorOp::Input { .. } | TensorOp::Constant { .. }) {
             continue;
         }
         if let Some(buffer) = slot.take() {
@@ -1524,11 +1562,11 @@ fn release_dead_cuda_values(
         if *remaining != 0 || plan.output_node_ids().contains(&input_id) {
             continue;
         }
-        if matches!(
-            &plan.nodes[input_id].op,
-            TensorOp::Input { name } if retained_inputs.contains(name)
-        ) {
-            continue;
+        match &plan.nodes[input_id].op {
+            TensorOp::Input { name } if retained_inputs.contains(name) => continue,
+            // An array constant's buffer is read-only and reused by every execution.
+            TensorOp::Constant { .. } => continue,
+            _ => {}
         }
         release_cuda_value(values, free_buffers, input_id)?;
     }
@@ -1551,6 +1589,7 @@ fn execute_cuda_device_program(
         solver,
         cond_branches,
         region_captures,
+        constant_uploads,
     } = runtime;
     if region_captures.is_empty() {
         validate_cuda_program_inputs(plan, inputs)?;
@@ -1629,6 +1668,26 @@ fn execute_cuda_device_program(
                     continue;
                 }
                 upload_cuda_input(stream, slot, free_buffers, &host, name)?;
+                continue;
+            }
+            TensorOp::Constant { value } => {
+                // Uploaded by the first execution only: the slot survives recycling and dead-value
+                // release, and no kernel writes to it.
+                let slot = values
+                    .get_mut(node_id)
+                    .ok_or_else(|| format!("CUDA constant node {node_id} is missing its buffer"))?;
+                if slot.is_none() {
+                    let host = value
+                        .value()
+                        .data()
+                        .iter()
+                        .map(|value| *value as f32)
+                        .collect::<Vec<_>>();
+                    *slot = Some(stream.clone_htod(&host).map_err(|error| {
+                        format!("failed to copy CUDA constant node {node_id}: {error:?}")
+                    })?);
+                    constant_uploads.fetch_add(1, Ordering::Relaxed);
+                }
                 continue;
             }
             TensorOp::Solve { matrix, rhs } => {
@@ -3923,6 +3982,7 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
                 }
             }
             TensorOp::ScalarConstant { value } if value.is_finite() => {}
+            TensorOp::Constant { .. } => return Err(cuda_loop_constant_error(node_id)),
             TensorOp::Add { .. }
             | TensorOp::Sub { .. }
             | TensorOp::Div { .. }
@@ -3951,6 +4011,17 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Device loops compile their body into one elementwise expression whose
+/// arrays are all captures of the parent plan; an array constant in the body
+/// has no binding there, so it is rejected instead of being re-uploaded per
+/// iteration.
+fn cuda_loop_constant_error(node_id: usize) -> String {
+    format!(
+        "body node {node_id} is an array constant; CUDA device loops read arrays only through \
+         captures, so pass the array into the loop as an explicit operand"
+    )
 }
 
 fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<(), String> {
@@ -4003,6 +4074,7 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
                 }
             }
             TensorOp::ScalarConstant { value } if value.is_finite() => {}
+            TensorOp::Constant { .. } => return Err(cuda_loop_constant_error(node_id)),
             TensorOp::Add { .. }
             | TensorOp::Sub { .. }
             | TensorOp::Div { .. }
@@ -6548,7 +6620,10 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
         let function = cuda_node_function_name(node_id);
         let count = element_count(&node.shape)?;
         let kernel = match &node.op {
-            TensorOp::Input { .. } | TensorOp::Reshape { .. } | TensorOp::Cast { .. } => continue,
+            TensorOp::Input { .. }
+            | TensorOp::Constant { .. }
+            | TensorOp::Reshape { .. }
+            | TensorOp::Cast { .. } => continue,
             TensorOp::ScalarConstant { value } if value.is_finite() => format!(
                 "extern \"C\" __global__ void {function}(float* out, unsigned long long count) {{\n\
                     unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
@@ -7023,6 +7098,7 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
     match op {
         TensorOp::Input { .. } => "input",
         TensorOp::ScalarConstant { .. } => "constant",
+        TensorOp::Constant { .. } => "tensor_constant",
         TensorOp::Cast { .. } => "cast",
         TensorOp::Add { .. } => "add",
         TensorOp::Sub { .. } => "sub",

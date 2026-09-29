@@ -10,8 +10,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
-    sqrt_derivative_coefficient, DynamicTensor, TensorBackend, TensorComparison, TensorDType,
-    TensorDeviceBackend, TensorExecutionPlan, TensorForiExecutionPlan, TensorOp,
+    sqrt_derivative_coefficient, DynamicTensor, TensorBackend, TensorComparison, TensorConstant,
+    TensorDType, TensorDeviceBackend, TensorExecutionPlan, TensorForiExecutionPlan, TensorOp,
 };
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
@@ -526,6 +526,7 @@ impl MlxBackend {
                 TensorOp::ScalarConstant { .. } => {
                     return Err("MLX backend does not support non-finite constants".to_string())
                 }
+                TensorOp::Constant { value } => value.mlx_array(),
                 // Source and target both execute as f32 (see the check above), so cast is the
                 // identity.
                 TensorOp::Cast { input } => Ok(mlx_value(&values, *input)?.clone()),
@@ -1757,6 +1758,28 @@ fn mlx_shape(shape: &[usize]) -> Result<Vec<i32>, String> {
         .collect()
 }
 
+impl TensorConstant {
+    /// The MLX array of this constant: created and evaluated by the first MLX
+    /// execution that needs it, then shared by every later execution of any
+    /// plan holding the constant, so its data crosses to MLX once. The caller
+    /// holds the MLX execution lock, which also serializes this cache.
+    fn mlx_array(&self) -> Result<Array, String> {
+        let mut cached = self
+            .0
+            .mlx_array
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(array) = cached.as_ref() {
+            return Ok(array.clone());
+        }
+        let array = mlx_array_from_dynamic(self.value())?;
+        transforms::eval([&array])
+            .map_err(|error| format!("MLX constant upload failed: {error}"))?;
+        *cached = Some(array.clone());
+        Ok(array)
+    }
+}
+
 fn mlx_array_from_dynamic(input: &DynamicTensor) -> Result<Array, String> {
     let shape = mlx_shape(input.shape())?;
     let data = input
@@ -1818,6 +1841,7 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
     match op {
         TensorOp::Input { .. } => "input",
         TensorOp::ScalarConstant { .. } => "constant",
+        TensorOp::Constant { .. } => "tensor_constant",
         TensorOp::Cast { .. } => "cast",
         TensorOp::Add { .. } => "add",
         TensorOp::Sub { .. } => "sub",
