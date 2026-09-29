@@ -903,9 +903,16 @@ def test_jacobian_and_hessian_match_the_dense_helpers():
     blocks = qb.jacobian(lambda p: p["a"] * p["b"])({"a": qb.array([2.0]), "b": qb.array([3.0])})
     assert_close(blocks["a"], [[3.0]])
     assert_close(blocks["b"], [[2.0]])
-    assert_raises(
-        qb.UnsupportedOperationError, qb.grad(qb.hessian(loss)), point, match="cannot be transformed"
-    )
+    # Staged through vmap (slice S4), the Hessian differentiates again:
+    # d/dx sum(H(x)) of this loss, by central differences of the Hessian.
+    third = qb.grad(lambda t: qb.sum(qb.hessian(loss)(t)))(point)
+    step = 1e-5
+    for index in range(3):
+        shift = [step if k == index else 0.0 for k in range(3)]
+        plus = qb.hessian(loss)(qb.array([p + d for p, d in zip(point.tolist(), shift)]))
+        minus = qb.hessian(loss)(qb.array([p - d for p, d in zip(point.tolist(), shift)]))
+        expected = (qb.sum(plus).item() - qb.sum(minus).item()) / (2.0 * step)
+        assert_close(third[index], expected, 1e-7)
 
 
 def test_jit_matches_tensor_jit_fn_with_pytrees_and_static_argnums():
@@ -1069,24 +1076,6 @@ def test_inlined_transforms_cache_their_staged_graph_and_reject_unsupported_call
     assert_close(total, sum(-(1.5**2) * math.sin(1.5 * p) for p in [0.1, 0.2, 0.3]), 1e-14)
     assert len(traces) == 1  # three calls with one signature stage u once
 
-    # jacobian and hessian cannot be staged until they go through vmap.
-    def loss(x):
-        return qb.sum(x**3)
-
-    error = assert_raises(
-        qb.UnsupportedOperationError, qb.grad(qb.hessian(loss)), x, match="cannot be transformed"
-    )
-    assert error.op == "hessian" and isinstance(error, NotImplementedError)
-    error = assert_raises(
-        qb.UnsupportedOperationError,
-        qb.jit(lambda x: qb.sum(qb.hessian(loss)(x))),
-        x,
-        match="called on traced values",
-    )
-    assert error.op == "hessian"
-    assert_raises(
-        qb.UnsupportedOperationError, qb.grad(lambda x: qb.sum(qb.jacobian(qb.sin)(x))), x
-    )
     # Eager arguments and tangents of an inner call bind as constants (S3b).
     assert_close(qb.jit(lambda x: qb.grad(u)(x[0], w))(x), 1.5 * math.cos(0.15), 1e-14)
     v_eager = qb.array([1.0, 1.0, 1.0])
@@ -1765,6 +1754,70 @@ def test_pinn_gradients_in_vector_parameters_through_vmap_match_the_loop_form():
         minus = dict(params, **{name: params[name] - h})
         fd = (qb.jit(loss)(plus, x).item() - qb.jit(loss)(minus, x).item()) / (2.0 * h)
         assert_close(grads[name], fd, 1e-6)
+
+
+def central_jacobian(function, value, step=1e-6):
+    """The `[*out, *in]` Jacobian of an array function of one array by
+    central differences."""
+    base = value.to_flat_list()
+    out_shape = qb.asarray(function(value)).shape
+    columns = []
+    for element in range(len(base)):
+        plus, minus = list(base), list(base)
+        plus[element] += step
+        minus[element] -= step
+        upper = qb.asarray(function(qb.array(plus).reshape(value.shape))).to_flat_list()
+        lower = qb.asarray(function(qb.array(minus).reshape(value.shape))).to_flat_list()
+        columns.append([(a - b) / (2.0 * step) for a, b in zip(upper, lower)])
+    rows = [[column[row] for column in columns] for row in range(len(columns[0]))]
+    return qb.array(rows).reshape(list(out_shape) + list(value.shape))
+
+
+def test_jacobian_and_hessian_are_staged_through_vmap():
+    def model(x, p):
+        return {"y": qb.tanh(x @ p["w"]) * p["s"], "z": qb.sum(x**2) * p["s"]}
+
+    x = qb.array([[0.5, -1.0], [2.0, 0.25]])
+    p = {"w": qb.array([[0.3], [-0.7]]), "s": qb.array(1.5)}
+    jac = qb.jacobian(model, argnums=(0, 1))(x, p)
+    assert jac["y"][0].shape == [2, 1, 2, 2] and jac["y"][1]["w"].shape == [2, 1, 2, 1]
+    assert jac["z"][1]["s"].shape == []
+
+    # Every block against central differences in the elements of its leaf.
+    blocks = [
+        (lambda t: model(t, p)["y"], x, jac["y"][0]),
+        (lambda t: model(t, p)["z"], x, jac["z"][0]),
+        (lambda t: model(x, dict(p, w=t))["y"], p["w"], jac["y"][1]["w"]),
+        (lambda t: model(x, dict(p, s=t))["y"], p["s"], jac["y"][1]["s"]),
+        (lambda t: model(x, dict(p, w=t))["z"], p["w"], jac["z"][1]["w"]),
+    ]
+    for function, value, block in blocks:
+        assert_close(block, central_jacobian(function, value), 1e-8)
+
+    # Staged: jit compiles it, a trace can call it, and grad differentiates it.
+    def cubic(v):
+        return qb.sum(v**3) + v[0] * v[1]
+
+    v = qb.array([0.5, -1.0, 2.0])
+    expected = [[3.0, 1.0, 0.0], [1.0, -6.0, 0.0], [0.0, 0.0, 12.0]]
+    assert_close(qb.hessian(cubic)(v), expected, 1e-14)
+    assert_close(qb.jit(qb.hessian(cubic))(v), expected, 1e-14)
+    doubled = [[2.0 * entry for entry in row] for row in expected]
+    assert_close(qb.jit(lambda t: qb.hessian(cubic)(t) * 2.0)(v), doubled, 1e-14)
+    assert_close(qb.grad(lambda t: qb.sum(qb.hessian(cubic)(t)))(v), [6.0, 6.0, 6.0], 1e-14)
+    # Per-example Hessians under vmap, and a Jacobian of vmap.
+    vs = qb.array([[0.5, -1.0, 2.0], [1.0, 0.0, -0.5]])
+    per_example_hessians = qb.vmap(qb.hessian(cubic))(vs)
+    assert per_example_hessians.shape == [2, 3, 3]
+    assert_close(qb.asarray(per_example_hessians[1]), qb.hessian(cubic)(qb.asarray(vs[1])), 1e-14)
+    batch_jacobian = qb.jacobian(qb.vmap(qb.sin))(vs)
+    assert batch_jacobian.shape == [2, 3, 2, 3]
+    assert_close(batch_jacobian[1, 2, 1, 2], math.cos(-0.5), 1e-14)
+    assert_close(batch_jacobian[0, 2, 1, 2], 0.0)
+    # float32 stays float32; a scalar argument gives a scalar block.
+    assert qb.hessian(cubic)(v.astype(qb.float32)).dtype == qb.float32
+    assert_close(qb.jacobian(lambda t: qb.sin(t) * 2.0)(qb.array(0.3)), 2.0 * math.cos(0.3), 1e-15)
+
 
 if __name__ == "__main__":
     # Run every test_* function in definition order so new tests cannot be left out of a manual list

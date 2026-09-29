@@ -152,10 +152,11 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8)
   Eager array arguments of such an inner call bind as constants. Each
   inner call adds its graph once, so per-point Python loops grow the graph
   linearly; `vmap` keeps it independent of the number of points.
-  `jacobian`/`hessian` cannot be called on traced values or transformed
-  further, and second-order reverse mode through `fori`/`scan` regions is
-  rejected; these raise `quabla.UnsupportedOperationError` (the region case
-  a `ValueError`).
+  `jacobian` and `hessian` are forward mode vectorized with `vmap` over the
+  input elements (as `jax.jacfwd`), so they compose too, for example
+  `grad(lambda x: qb.sum(qb.hessian(f)(x)))` or `vmap(hessian(f))`.
+  Second-order reverse mode through `fori`/`scan` regions is rejected with
+  a `ValueError`.
 - `vmap(fun, in_axes=0, out_axes=0)` vectorizes `fun`, which sees one
   example, with JAX semantics. `in_axes` is an int (the mapped axis,
   negative counts from the end), `None` (an argument shared by every
@@ -700,4 +701,5 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - The legacy 2D `Matrix`/`TraceGraph` API is not migrated to the facade.
 - The v0.2 transforms run on the CPU only. `quabla.vmap` cannot batch
   `solve` or `cond`/`fori`/`scan` regions over a mapped argument.
-  `jacobian` and `hessian` are dense and cannot be transformed further.
+  `jacobian` and `hessian` are dense: their basis constant and result grow
+  quadratically with the number of input elements.

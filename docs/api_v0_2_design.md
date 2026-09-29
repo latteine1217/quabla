@@ -299,7 +299,8 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8) -> compiled fun (+ .lo
 - **`jacobian`/`hessian`** are dense and CPU-only in v0.2: per-column JVP as
   in `TensorJacobianFunction` (`py/tensor_trace.rs:4324-4370`) and the core
   `hessian_scalar` (`core/tensor_ir.rs:5536`). Inside `jit(device="cuda"|"mlx")`
-  they raise `UnsupportedOperationError`.
+  they raise `UnsupportedOperationError`. (S4 stages them as `vmap` of a
+  JVP over the basis instead; see "S4 as landed".)
 - Every transformed function is staged: calling `qb.grad(f)(x)` without `jit`
   traces and compiles on the CPU, cached like `jit`. Eager op-by-op
   differentiation does not exist today and is not added.
@@ -755,7 +756,7 @@ CPU; deviations and refinements of this document:
   raise `UnsupportedOperationError` (`op="jacobian"`/`"hessian"`). Staging
   them by inlining one JVP per basis vector would grow the graph with the
   input size; they become stageable as `vmap` of a JVP over the basis in
-  S4. Second-order reverse mode through `Fori`/`Scan` regions stays the
+  S4 (superseded by S4 below). Second-order reverse mode through `Fori`/`Scan` regions stays the
   core's explicit error (a `ValueError`), as section 3.4 records.
 - **PINN before `vmap`.** The README problem is expressed per point:
   `u_xx = grad(grad(u))` on a scalar `u(x, w)`, called on `x[i]` for each
@@ -888,6 +889,18 @@ with batched tracers:
   only because the helpers' VJP sums over the batch; `quabla.vmap` does not
   use that path, and a rejection could only catch the direct spelling, not
   the same computation written through a lambda.
+- **`jacobian` and `hessian`** are staged like `jax.jacfwd`: one JVP graph
+  with a tangent input per selected non-`bool` leaf is spliced with
+  `inline_batched` over the rows of the identity of all `N` selected
+  elements together (each tangent is a mapped constant slice of it), and
+  each output's `[N, *out]` tangents are split per leaf and reshaped to
+  `[*out, *in]`. `hessian` stays `jacobian(grad(f))`, forward over reverse.
+  Both are single staged programs, so `jit` compiles them, they inline
+  when called on tracers, and `grad(hessian(f))`, `vmap(hessian(f))`, and
+  `jacobian(vmap(f))` work; results equal the column-by-column S2 path
+  (`tensor_hessian_scalar_fn` within `1e-13`) and central differences. The
+  basis is an `N x N` constant, so memory grows quadratically with the
+  number of input elements, as the dense result does.
 - **Rejected.** A mapped `solve` (rank-2 only) and mapped `cond`, `fori`,
   and `scan` regions (their bodies are compiled plans, which have no batching
   rule yet; the helpers trace `fori`/`scan` bodies batched). The control-flow

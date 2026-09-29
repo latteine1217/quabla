@@ -31,8 +31,8 @@ inputs bind to the tracers, so a derivative can be used inside a loss that
 is differentiated again. `jit` of a plain Python function traces through it
 instead, which is exact. `vmap` stages its function for one example and
 splices that graph batched into its own (`TensorIr::inline_batched`, slice
-S4), so it composes the same way. `jacobian` and `hessian` evaluate column
-by column and cannot be staged or inlined yet.
+S4), so it composes the same way; `jacobian` and `hessian` are forward mode
+vectorized with it over the input elements, so they compose as well.
 """
 
 import inspect
@@ -41,7 +41,7 @@ import weakref
 from . import _quabla
 from ._array import asarray, eye, zeros
 from ._errors import RetraceLimitError, UnsupportedOperationError
-from ._quabla import Tensor, TensorTraceGraph, TraceTensor, bool_, stack
+from ._quabla import Tensor, TensorTraceGraph, TraceTensor, bool_
 from .tree import _LEAF, _describe, _flatten, _leaf_count, _leaf_paths, _unflatten
 
 __all__ = ["grad", "hessian", "jacobian", "jit", "jvp", "value_and_grad", "vjp", "vmap"]
@@ -438,7 +438,6 @@ class _Transform:
     of this transform; `_chain` lists the configs from the innermost
     transform out, which with the root function identifies the program."""
 
-    _stageable = True
     _max_traces = _DEFAULT_MAX_TRACES
 
     def __init__(self, fun, config):
@@ -651,10 +650,6 @@ class _Jit(_Transform):
         return statics
 
     def __call__(self, *args):
-        if not getattr(self._fun, "_stageable", True):
-            # jacobian and hessian evaluate column by column on the CPU; they
-            # are already compiled, so jit only forwards the call.
-            return self._fun(*args)
         count = len(args)
         statics = self._statics(count) if self._static_argnums else ()
         converted = self._converted_positions(count)
@@ -1130,22 +1125,30 @@ def _place_output(graph, value, mapped, out_axis, batch):
 # -- dense Jacobians ------------------------------------------------------------------
 
 
-class _JacobianProgram:
-    __slots__ = ("executable", "selected", "out_node", "outputs", "tangent_index")
+def _size(shape):
+    size = 1
+    for extent in shape:
+        size *= extent
+    return size
 
-    def __init__(self, executable, selected, out_node, outputs, tangent_index):
-        self.executable = executable
-        self.selected = selected
-        self.out_node = out_node
-        self.outputs = outputs
-        self.tangent_index = tangent_index
+
+def _graft(node, block_node):
+    """The structure `node` with each leaf replaced by `block_node`."""
+    if node is _LEAF:
+        return block_node
+    if node is None:
+        return None
+    if node[0] is dict:
+        return (dict, node[1], tuple(_graft(child, block_node) for child in node[2]))
+    return (node[0], tuple(_graft(child, block_node) for child in node[1]))
 
 
 class _Jacobian(_Transform):
-    """Dense Jacobian by one forward-mode evaluation per input element, as
-    `TensorJacobianFunction` does (design 3.3: dense and CPU-only in v0.2)."""
-
-    _stageable = False
+    """Dense Jacobian by forward mode vectorized over the basis (design 3.3,
+    as `jax.jacfwd`): one JVP graph, with one tangent input per selected
+    leaf, is spliced with `vmap` batching over the rows of the identity of
+    all selected elements together, so the result is a single staged graph
+    that composes, inlines, and differentiates like every other transform."""
 
     def __init__(self, fun, argnums, kind="jacobian"):
         argnums = _argnums_config(argnums)
@@ -1159,128 +1162,77 @@ class _Jacobian(_Transform):
         return _normalize_argnums(self._argnums, count, "argnums")
 
     def _stage(self, in_node, leaves, names):
-        raise self._unstaged_error()
-
-    def _unstaged_error(self):
         kind = self._config[0]
-        return UnsupportedOperationError(
-            f"{self!r} cannot be transformed further or called on traced values: {kind} "
-            "evaluates one forward-mode column per input element instead of staging a single "
-            "program, and it is not staged through vmap yet. Inside a traced "
-            "function, use grad(grad(f)) for the second derivative of a scalar function, or "
-            "jvp(grad(f), (x,), (v,)) for a Hessian-vector product",
-            op=kind,
-        )
-
-    def __call__(self, *args):
-        count = len(args)
-        in_node, leaves, arrays, key, traced = _signature(
-            args, (), self._converted_positions(count)
-        )
-        if traced:
-            raise self._unstaged_error()
-        entry = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
-        argnums = self._positions(count)
-        ranges = _argument_ranges(in_node)
-        # blocks[output][position]: the Jacobian block of one output leaf with
-        # respect to one selected input leaf.
-        blocks = [{} for _ in entry.outputs]
-        zero_tangents = [
-            zeros(leaves[position].shape, leaves[position].dtype) for position in entry.selected
-        ]
-        for slot, position in enumerate(entry.selected):
-            leaf = leaves[position]
-            size = 1
-            for extent in leaf.shape:
-                size *= extent
-            basis = eye(size, dtype=leaf.dtype)
-            columns = [[] for _ in entry.outputs]
-            for element in range(size):
-                tangents = list(zero_tangents)
-                tangents[slot] = basis[element].reshape(leaf.shape)
-                results = entry.executable(arrays + tangents) if entry.executable else ()
-                for index, output in enumerate(entry.outputs):
-                    if _is_traced_spec(output):
-                        columns[index].append(results[entry.tangent_index[index]])
-            for index, output in enumerate(entry.outputs):
-                blocks[index][position] = _jacobian_block(output, columns[index], leaf)
-        rendered = []
-        for index in range(len(entry.outputs)):
-            parts = []
-            for argnum in argnums:
-                parts.append(
-                    _unflatten(
-                        in_node[1][argnum],
-                        iter([blocks[index].get(position) for position in ranges[argnum]]),
-                    )
-                )
-            if len(argnums) == 1 and not isinstance(self._argnums, _Tuple):
-                rendered.append(parts[0])
-            else:
-                rendered.append(tuple(parts))
-        if entry.out_node is _LEAF:
-            return rendered[0]
-        return _unflatten(entry.out_node, iter(rendered))
-
-    def _compile(self, in_node, leaves):
-        names = self._names(in_node)
-        staged = _stage(self._fun, in_node, leaves, names)
         argnums = self._positions(len(in_node[1]))
         ranges = _argument_ranges(in_node)
         selected = []
         for argnum in argnums:
             for position in ranges[argnum]:
                 leaf = leaves[position]
-                if type(leaf) is not Tensor:
+                if type(leaf) not in _ARRAY_LEAVES:
                     raise TypeError(
-                        f"{self._config[0]} cannot differentiate with respect to static "
-                        f"argument {argnum}"
+                        f"{kind} cannot differentiate with respect to static argument {argnum}"
                     )
                 if leaf.dtype != bool_:
                     selected.append(position)
         if not selected:
-            raise ValueError(f"{self._config[0]} requires a floating-point argument in argnums")
-        tangent_names = {names[p]: _TANGENT_PREFIX + names[p] for p in selected}
+            raise ValueError(f"{kind} requires a floating-point argument in argnums")
+        staged = _stage(self._fun, in_node, leaves, names)
+        graph = TensorTraceGraph()
+        primals = {}
+        for leaf, name in zip(leaves, names):
+            if type(leaf) in _ARRAY_LEAVES:
+                primals[name] = graph.input(name, leaf.shape, leaf.dtype)
+        # The basis: row r of the identity over all selected elements, split
+        # into one mapped tangent per selected leaf.
+        sizes = [_size(leaves[position].shape) for position in selected]
+        total = sum(sizes)
+        offsets = []
+        tangents = []
+        offset = 0
+        for position, size in zip(selected, sizes):
+            leaf = leaves[position]
+            basis = eye(total, dtype=leaf.dtype).slice(1, offset, size).to_tensor()
+            tangents.append(graph._constant(basis.reshape([total] + list(leaf.shape))))
+            offsets.append(offset)
+            offset += size
         traced = [output for output in staged.outputs if _is_traced(output)]
-        outputs = []
-        tangent_index = {}
-        executable = None
         if traced:
-            graph, _, tangents = staged.graph._symbolic_jvp(traced, tangent_names)
-            executable = graph._compile_cpu(
-                tangents, staged.input_names + [tangent_names[names[p]] for p in selected]
+            tangent_names = {names[p]: _TANGENT_PREFIX + names[p] for p in selected}
+            jvp_graph, _, jvp_tangents = staged.graph._symbolic_jvp(traced, tangent_names)
+            spliced = iter(
+                jvp_graph._inline_batched(
+                    staged.input_names + [tangent_names[names[p]] for p in selected],
+                    [primals[name] for name in staged.input_names] + tangents,
+                    [False] * len(staged.input_names) + [True] * len(selected),
+                    total,
+                    jvp_tangents,
+                )
             )
-        traced_index = 0
-        for index, output in enumerate(staged.outputs):
+        blocks = []
+        for output in staged.outputs:
             if _is_traced(output):
-                outputs.append(_TracedSpec(output.shape, output.dtype))
-                tangent_index[index] = traced_index
-                traced_index += 1
-            else:
-                outputs.append(output)
-        return _JacobianProgram(executable, selected, staged.out_node, outputs, tangent_index)
-
-
-class _TracedSpec:
-    __slots__ = ("shape", "dtype")
-
-    def __init__(self, shape, dtype):
-        self.shape = shape
-        self.dtype = dtype
-
-
-def _is_traced_spec(output):
-    return type(output) is _TracedSpec
-
-
-def _jacobian_block(output, columns, leaf):
-    """The block `[*output.shape, *leaf.shape]` from the per-element columns."""
-    if not _is_traced_spec(output):
-        shape = list(output.shape) if isinstance(output, Tensor) else []
-        dtype = output.dtype if isinstance(output, Tensor) else leaf.dtype
-        return zeros(shape + leaf.shape, dtype)
-    stacked = stack(columns, len(output.shape))
-    return stacked.reshape(output.shape + leaf.shape)
+                columns, mapped = next(spliced)
+                if not mapped:
+                    columns = columns.broadcast_to([total] + list(output.shape))
+            by_position = {}
+            for position, offset, size in zip(selected, offsets, sizes):
+                leaf = leaves[position]
+                if not _is_traced(output):
+                    shape = list(output.shape) if isinstance(output, Tensor) else []
+                    dtype = output.dtype if isinstance(output, Tensor) else leaf.dtype
+                    by_position[position] = zeros(shape + list(leaf.shape), dtype)
+                    continue
+                block = columns.slice(0, offset, offset + size)
+                block = _move_batch_axis(block, len(output.shape))
+                by_position[position] = block.reshape(list(output.shape) + list(leaf.shape))
+            for argnum in argnums:
+                blocks.extend(by_position.get(position) for position in ranges[argnum])
+        if len(argnums) == 1 and not isinstance(self._argnums, _Tuple):
+            block_node = in_node[1][argnums[0]]
+        else:
+            block_node = (tuple, tuple(in_node[1][argnum] for argnum in argnums))
+        return _Staged(graph, list(primals), blocks, _graft(staged.out_node, block_node))
 
 
 # -- public API ----------------------------------------------------------------------
@@ -1378,15 +1330,16 @@ def vjp(fun, *primals, has_aux=False):
 def jacobian(fun, argnums=0):
     """`fun` transformed to return its dense Jacobian: for each output leaf,
     blocks of shape `[*out.shape, *in.shape]` with the pytree structure of
-    the arguments selected by `argnums`. Evaluated on the CPU with one
-    forward-mode pass per input element."""
+    the arguments selected by `argnums`. Forward mode, vectorized over the
+    input elements with `vmap` (as `jax.jacfwd`), so it is staged like the
+    other transforms and composes with them."""
     return _Jacobian(fun, argnums)
 
 
 def hessian(fun, argnums=0):
     """`fun` transformed to return the dense Hessian of its scalar output,
     `jacobian(grad(fun, argnums), argnums)`: blocks of shape
-    `[*in.shape, *in.shape]`, evaluated forward-over-reverse on the CPU."""
+    `[*in.shape, *in.shape]`, forward over reverse."""
     return _Jacobian(_ValueAndGrad(fun, argnums, False, "grad"), argnums, "hessian")
 
 
