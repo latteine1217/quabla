@@ -357,7 +357,11 @@ fn py_einsum(
     ))
 }
 
-#[pymodule]
+// The extension is the private submodule `quabla._quabla`; the pure-Python
+// package in `python/quabla/` re-exports its names as the public `quabla`.
+// The Rust library keeps the crate name `quabla` so the crate's own tests
+// and `use quabla::...` paths are unaffected.
+#[pymodule(name = "_quabla")]
 fn quabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyQuablaCompiler>()?;
     m.add_class::<PyQuablaProgram>()?;

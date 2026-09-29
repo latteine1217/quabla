@@ -52,4 +52,8 @@ Changelog = "https://github.com/latteine1217/quabla/blob/main/CHANGELOG.md"
 [tool.maturin]
 manifest-path = "crates/quabla-python/Cargo.toml"
 features = ["extension-module"]
-module-name = "quabla"
+# Mixed Rust/Python layout: the pure-Python package in python/quabla/ is the
+# public `quabla` package, and the compiled extension is its private
+# submodule `quabla._quabla`.
+python-source = "python"
+module-name = "quabla._quabla"

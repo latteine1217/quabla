@@ -57,3 +57,4 @@ jobs:
           .venv-ci/bin/python -m pip install 'maturin>=1.14,<2'
           VIRTUAL_ENV="$PWD/.venv-ci" .venv-ci/bin/maturin develop
       - run: .venv-ci/bin/python tests/python/test_matrix.py
+      - run: .venv-ci/bin/python tests/python/test_api.py

@@ -57,7 +57,7 @@ jobs:
       - run: cargo fmt --all --check
       # pipx ships with the runner image. Ruff is pinned to a minor series so
       # a new release cannot turn the gate red without a code change.
-      - run: pipx run --spec 'ruff>=0.15,<0.16' ruff check tests examples
+      - run: pipx run --spec 'ruff>=0.15,<0.16' ruff check tests examples python
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Compile-only check of the CUDA/NCCL backend, which macOS development
       # machines cannot compile at all. cudarc is built with
@@ -71,3 +71,4 @@ jobs:
           VIRTUAL_ENV="$PWD/.venv-ci" .venv-ci/bin/maturin develop
       # The script's __main__ runner executes every test_*; exit 0 == pass.
       - run: .venv-ci/bin/python tests/python/test_matrix.py
+      - run: .venv-ci/bin/python tests/python/test_api.py

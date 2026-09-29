@@ -21,7 +21,7 @@ Run these before opening a pull request:
 
 ```sh
 cargo fmt --all --check
-ruff check tests examples
+ruff check tests examples python
 cargo clippy --workspace --all-targets -- -D warnings
 # macOS:
 cargo clippy --workspace --all-targets --features quabla-core/mlx -- -D warnings
@@ -32,7 +32,18 @@ cargo test --workspace
 
 maturin develop --release              # add --features mlx or --features cuda
 python tests/python/test_matrix.py
+python tests/python/test_api.py
 ```
+
+The `quabla` package is a mixed Rust/Python project: the pure-Python
+package lives in `python/quabla/`, and the compiled extension is its
+private submodule `quabla._quabla`. `maturin develop` installs the package
+in editable mode and writes the extension next to it as
+`python/quabla/_quabla.*.so` (ignored by git), so edits to the Python files
+take effect without a rebuild while Rust changes still need one. The first
+`maturin develop` in an environment that holds a pre-0.2 build replaces
+that build; if `quabla.__file__` does not point into `python/quabla/`
+afterwards, run `python -m pip uninstall quabla` and build again.
 
 CI (`.github/workflows/ci.yml`) runs the Linux gates on every push to `main`
 and every pull request. The macOS MLX check
