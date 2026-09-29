@@ -8961,3 +8961,343 @@ fn symbolic_jvp_over_a_ones_seeded_vjp_is_the_hessian_vector_product() {
         1e-14,
     );
 }
+
+fn scalar(value: f64) -> Result<DynamicTensor, String> {
+    DynamicTensor::new(vec![], vec![value])
+}
+
+#[test]
+fn inline_splices_the_reachable_callee_with_bound_inputs() {
+    let mut callee = TensorIr::new();
+    let a = must!(callee.input("a", vec![3]));
+    let b = must!(callee.input("b", vec![3]));
+    let product = must!(callee.mul(a, b));
+    let activated = must!(callee.tanh(product));
+    let total = must!(callee.sum(activated));
+    let one = callee.scalar_constant(1.0);
+    let shifted = must!(callee.add(a, one));
+    let _unused = must!(callee.exp(b));
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3]));
+    let y = must!(graph.input("y", vec![3]));
+    let two = graph.scalar_constant(2.0);
+    let doubled = must!(graph.mul(x, two));
+    let before = graph.node_count();
+    let outputs = must!(graph.inline(
+        &callee,
+        &BTreeMap::from([("a".to_string(), doubled), ("b".to_string(), y)]),
+        &[total, shifted, a],
+    ));
+    // product, tanh, sum, the constant, and add; the unused exp is not copied
+    // and the input `a` resolves to its binding.
+    assert_eq!(graph.node_count(), before + 5);
+    assert_eq!(outputs[2], doubled);
+
+    let x_value = must!(DynamicTensor::new(vec![3], vec![0.5, -1.0, 2.0]));
+    let y_value = must!(DynamicTensor::new(vec![3], vec![0.3, -0.7, 1.1]));
+    let graph_inputs = BTreeMap::from([
+        ("x".to_string(), x_value.clone()),
+        ("y".to_string(), y_value.clone()),
+    ]);
+    let callee_inputs = BTreeMap::from([
+        (
+            "a".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![1.0, -2.0, 4.0])),
+        ),
+        ("b".to_string(), y_value),
+    ]);
+    for (inlined, source) in outputs.iter().zip([total, shifted, a]) {
+        assert_eq!(
+            must!(graph.evaluate(*inlined, &graph_inputs)).data(),
+            must!(callee.evaluate(source, &callee_inputs)).data()
+        );
+    }
+    // The spliced nodes differentiate like nodes traced in place.
+    let gradients = must!(graph.symbolic_vjp_many(&[(outputs[0], SymbolicCotangent::Ones)]));
+    let (_, expected) = must!(callee.value_and_vjp(total, &callee_inputs, must!(scalar(1.0))));
+    let expected_x = expected["a"]
+        .data()
+        .iter()
+        .map(|value| 2.0 * value)
+        .collect::<Vec<_>>();
+    assert_close(
+        must!(gradients
+            .graph
+            .evaluate(gradients.gradients["x"], &graph_inputs))
+        .data(),
+        &expected_x,
+        1e-15,
+    );
+    assert_close(
+        must!(gradients
+            .graph
+            .evaluate(gradients.gradients["y"], &graph_inputs))
+        .data(),
+        expected["b"].data(),
+        1e-15,
+    );
+}
+
+#[test]
+fn inline_rejects_mismatched_unknown_and_missing_bindings() {
+    let mut callee = TensorIr::new();
+    let a = must!(callee.input("a", vec![2]));
+    let b = must!(callee.input_typed("b", vec![2], TensorDType::F32));
+    let a32 = must!(callee.cast(a, TensorDType::F32));
+    let output = must!(callee.mul(a32, b));
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let x32 = must!(graph.input_typed("x32", vec![2], TensorDType::F32));
+    let wide = must!(graph.input("wide", vec![3]));
+    let cases = [
+        (vec![("a", x), ("b", x)], "the shape and dtype must match"),
+        (
+            vec![("a", wide), ("b", x32)],
+            "the shape and dtype must match",
+        ),
+        (vec![("a", x), ("c", x32)], "not a callee input"),
+        (vec![("a", x)], "leaves callee input \"b\" unbound"),
+    ];
+    for (bindings, message) in cases {
+        let bindings = bindings
+            .into_iter()
+            .map(|(name, node)| (name.to_string(), node))
+            .collect::<BTreeMap<_, _>>();
+        let before = graph.node_count();
+        let error = graph
+            .inline(&callee, &bindings, &[output])
+            .expect_err("invalid bindings must be rejected");
+        assert!(error.contains(message), "{error}");
+        // Validation precedes every append except the unbound-input check,
+        // which is reached only while splicing.
+        if message != "leaves callee input \"b\" unbound" {
+            assert_eq!(graph.node_count(), before);
+        }
+    }
+    let error = graph
+        .inline(
+            &callee,
+            &BTreeMap::from([("a".to_string(), x), ("b".to_string(), x32)]),
+            &[output + 100],
+        )
+        .expect_err("an unknown output must be rejected");
+    assert!(error.contains("does not exist"), "{error}");
+}
+
+#[test]
+fn inline_preserves_dtypes_and_weak_constants() {
+    let mut callee = TensorIr::new();
+    let a = must!(callee.input_typed("a", vec![2], TensorDType::F32));
+    let two = callee.scalar_constant(2.0);
+    let four = must!(callee.mul(two, two));
+    let scaled = must!(callee.mul(a, two));
+    let mask = must!(callee.greater(a, two));
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input_typed("x", vec![2], TensorDType::F32));
+    let outputs = must!(graph.inline(
+        &callee,
+        &BTreeMap::from([("a".to_string(), x)]),
+        &[four, scaled, mask],
+    ));
+    assert_eq!(must!(graph.node_dtype(outputs[0])), TensorDType::F64);
+    assert_eq!(must!(graph.node_dtype(outputs[1])), TensorDType::F32);
+    assert_eq!(
+        must!(graph.node_dtype(outputs[2])),
+        must!(callee.node_dtype(mask))
+    );
+    // The weak constant still adopts the dtype of a strong f32 operand; a
+    // strong f64 node would be rejected as a mixed-dtype operand.
+    let sum = must!(graph.add(x, outputs[0]));
+    assert_eq!(must!(graph.node_dtype(sum)), TensorDType::F32);
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::with_dtype(
+            vec![2],
+            vec![0.1, 3.0],
+            TensorDType::F32
+        )),
+    )]);
+    assert_eq!(
+        must!(graph.evaluate(sum, &inputs)).dtype(),
+        TensorDType::F32
+    );
+    assert_eq!(
+        must!(graph.evaluate(outputs[1], &inputs)).data(),
+        must!(callee.evaluate(
+            scaled,
+            &BTreeMap::from([("a".to_string(), inputs["x"].clone())])
+        ))
+        .data()
+    );
+    let strong = must!(graph.input("strong", vec![]));
+    assert!(graph.add(x, strong).is_err());
+}
+
+#[test]
+fn compiled_plans_common_subexpressions_after_inline() {
+    let mut callee = TensorIr::new();
+    let a = must!(callee.input("a", vec![4]));
+    let sine = must!(callee.sin(a));
+    let two = callee.scalar_constant(2.0);
+    let scaled = must!(callee.mul(sine, two));
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![4]));
+    let own_sine = must!(graph.sin(x));
+    let outputs = must!(graph.inline(&callee, &BTreeMap::from([("a".to_string(), x)]), &[scaled]));
+    // The graph holds sin(x) twice; the compiled plan holds it once.
+    let (plan, _) = must!(graph.compile_cpu_many(&[own_sine, outputs[0]]));
+
+    let mut direct = TensorIr::new();
+    let x_direct = must!(direct.input("x", vec![4]));
+    let sine_direct = must!(direct.sin(x_direct));
+    let two_direct = direct.scalar_constant(2.0);
+    let scaled_direct = must!(direct.mul(sine_direct, two_direct));
+    let (direct_plan, _) = must!(direct.compile_cpu_many(&[sine_direct, scaled_direct]));
+    assert_eq!(plan.node_count(), direct_plan.node_count());
+
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![4], vec![0.1, 0.2, 0.3, 0.4])),
+    )]);
+    assert_eq!(
+        must!(plan.evaluate_many(&inputs)),
+        must!(direct_plan.evaluate_many(&inputs))
+    );
+}
+
+/// A scalar loss over `x` and `s` through a Scan, a Fori, and a Cond region,
+/// each with an explicit capture of `s`.
+fn inline_region_fixture() -> Result<(TensorIr, TensorNodeId), String> {
+    let mut scan_body = TensorIr::new();
+    let carry = scan_body.input("carry", vec![])?;
+    let index = scan_body.input("index", vec![])?;
+    let scale = scan_body.input("scale", vec![])?;
+    let scaled = scan_body.mul(carry, scale)?;
+    let next = scan_body.add(scaled, index)?;
+    let output = scan_body.sin(next)?;
+    let scan_plan = TensorScanExecutionPlan::new(
+        0,
+        3,
+        scan_body.compile_cpu_many(&[next, output])?.0,
+        "carry",
+        "index",
+    )?;
+
+    let mut fori_body = TensorIr::new();
+    let carry = fori_body.input("carry", vec![])?;
+    let shift = fori_body.input("shift", vec![])?;
+    let product = fori_body.mul(carry, shift)?;
+    let next = fori_body.tanh(product)?;
+    let fori_plan =
+        TensorForiExecutionPlan::new(0, 2, fori_body.compile_cpu(next)?, "carry", "index")?;
+
+    let mut on_true = TensorIr::new();
+    let captured = on_true.input("captured", vec![])?;
+    let true_output = on_true.mul(captured, captured)?;
+    let mut on_false = TensorIr::new();
+    let captured = on_false.input("captured", vec![])?;
+    let three = on_false.scalar_constant(3.0);
+    let false_output = on_false.mul(captured, three)?;
+    let branches = TensorCondExecutionPlan::new(
+        on_true.compile_cpu(true_output)?,
+        on_false.compile_cpu(false_output)?,
+    )?;
+
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![])?;
+    let s = graph.input("s", vec![])?;
+    let (final_carry, outputs) = graph.scan(x, scan_plan, vec![("scale".to_string(), s)])?;
+    let looped = graph.fori(x, fori_plan, vec![("shift".to_string(), s)])?;
+    let zero = graph.scalar_constant(0.0);
+    let predicate = graph.greater(x, zero)?;
+    let branched =
+        graph.cond_with_captures(predicate, branches, vec![("captured".to_string(), s)])?;
+    let output_sum = graph.sum(outputs)?;
+    let partial = graph.add(final_carry, output_sum)?;
+    let partial = graph.add(partial, looped)?;
+    let loss = graph.add(partial, branched)?;
+    Ok((graph, loss))
+}
+
+#[test]
+fn inline_splices_region_graphs_and_keeps_two_splices_separate() {
+    let (source, loss) = must!(inline_region_fixture());
+    // The reverse-mode graph adds ScanVjp and ForiVjp groups to the forward
+    // Scan group; the callee returns the loss and both gradients.
+    let reverse = must!(source.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    let callee_outputs = [
+        reverse.primals[loss],
+        reverse.gradients["x"],
+        reverse.gradients["s"],
+    ];
+
+    let mut graph = TensorIr::new();
+    let p = must!(graph.input("p", vec![]));
+    let q = must!(graph.input("q", vec![]));
+    let minus_one = graph.scalar_constant(-1.0);
+    let negated = must!(graph.mul(p, minus_one));
+    let first = must!(graph.inline(
+        &reverse.graph,
+        &BTreeMap::from([("x".to_string(), p), ("s".to_string(), q)]),
+        &callee_outputs,
+    ));
+    let second = must!(graph.inline(
+        &reverse.graph,
+        &BTreeMap::from([("x".to_string(), negated), ("s".to_string(), p)]),
+        &callee_outputs,
+    ));
+    assert!(graph.lower_text().contains("scan_vjp(group="));
+
+    let (p_value, q_value) = (0.7, -0.4);
+    let graph_inputs = BTreeMap::from([
+        ("p".to_string(), must!(scalar(p_value))),
+        ("q".to_string(), must!(scalar(q_value))),
+    ]);
+    let (plan, plan_outputs) =
+        must!(graph.compile_cpu_many(&[first.clone(), second.clone()].concat()));
+    let plan_values = must!(plan.evaluate_many(&graph_inputs));
+    assert_eq!(plan_outputs.len(), 6);
+    for (splice, (x_value, s_value)) in [(0, (p_value, q_value)), (1, (-p_value, p_value))] {
+        let callee_inputs = BTreeMap::from([
+            ("x".to_string(), must!(scalar(x_value))),
+            ("s".to_string(), must!(scalar(s_value))),
+        ]);
+        let outputs = if splice == 0 { &first } else { &second };
+        for (index, (inlined, source_output)) in outputs.iter().zip(callee_outputs).enumerate() {
+            let expected = must!(reverse.graph.evaluate(source_output, &callee_inputs));
+            assert_eq!(
+                must!(graph.evaluate(*inlined, &graph_inputs)).data(),
+                expected.data(),
+                "splice {splice} output {index}"
+            );
+            assert_eq!(
+                plan_values[3 * splice + index].data(),
+                expected.data(),
+                "compiled splice {splice} output {index}"
+            );
+        }
+    }
+
+    // Forward mode through the spliced reverse-mode regions is the HVP of
+    // the source loss, as in hessian = jacobian(grad(f)).
+    let forward = must!(graph.symbolic_jvp_many_with_tangent_inputs(
+        &[first[2]],
+        &BTreeMap::from([("q".to_string(), "q_dot".to_string())]),
+    ));
+    let mut tangent_inputs = graph_inputs.clone();
+    tangent_inputs.insert("q_dot".to_string(), must!(scalar(1.0)));
+    let callee_inputs = BTreeMap::from([
+        ("x".to_string(), must!(scalar(p_value))),
+        ("s".to_string(), must!(scalar(q_value))),
+    ]);
+    let expected = must!(source.hessian_scalar(loss, "s", &callee_inputs));
+    assert_close(
+        must!(forward.graph.evaluate(forward.tangents[0], &tangent_inputs)).data(),
+        &[expected[0][0]],
+        1e-12,
+    );
+}

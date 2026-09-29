@@ -2148,6 +2148,91 @@ impl TensorIr {
         Self::default()
     }
 
+    /// Number of nodes in the graph, including nodes no output depends on;
+    /// compiled plans drop those and common pure subexpressions.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Splices the part of `callee` that `outputs` depend on into this graph
+    /// and returns the ids of the spliced outputs, in order.
+    ///
+    /// This is how a transformed function is called inside another traced
+    /// function: the callee is staged in its own graph, then every callee
+    /// `Input` reached from `outputs` is replaced by the node that `bindings`
+    /// names for it, and the other reached nodes are appended with their
+    /// shape, dtype, and weak flag unchanged. A binding must have the shape
+    /// and dtype of its input; a weak binding keeps its weakness, while the
+    /// spliced nodes keep the flags the callee derived from a strong input.
+    /// Callee nodes that no output depends on are not copied, and nodes equal
+    /// to existing ones are not merged here: plan compilation removes common
+    /// pure subexpressions, as for any traced graph.
+    ///
+    /// Region nodes (`Cond`, `Fori`, `Scan`, and their derivative nodes)
+    /// clone their compiled region plans and rebind their captures like any
+    /// other operand. Nodes that share one execution through a `group` id
+    /// receive a new id, the id of the first spliced node of the group, as
+    /// [`Self::scan`] assigns them. Every group id of a graph is below its
+    /// node count, so the spliced groups never merge with existing or later
+    /// groups, and two splices of one callee stay separate executions.
+    pub fn inline(
+        &mut self,
+        callee: &TensorIr,
+        bindings: &BTreeMap<String, TensorNodeId>,
+        outputs: &[TensorNodeId],
+    ) -> Result<Vec<TensorNodeId>, String> {
+        let mut callee_inputs = HashMap::new();
+        for (id, node) in callee.nodes.iter().enumerate() {
+            if let TensorOp::Input { name } = &node.op {
+                callee_inputs.insert(name.as_str(), id);
+            }
+        }
+        for (name, binding) in bindings {
+            let input = callee_inputs
+                .get(name.as_str())
+                .map(|id| &callee.nodes[*id])
+                .ok_or_else(|| format!("inline binds {name:?}, which is not a callee input"))?;
+            let bound = self.node(*binding)?;
+            if bound.shape != input.shape || bound.dtype != input.dtype {
+                return Err(format!(
+                    "inline binds callee input {name:?} ({}{:?}) to node {binding} ({}{:?}); \
+                     the shape and dtype must match",
+                    input.dtype, input.shape, bound.dtype, bound.shape
+                ));
+            }
+        }
+
+        let mut reachable = vec![false; callee.nodes.len()];
+        let mut pending = outputs.to_vec();
+        while let Some(id) = pending.pop() {
+            let node = callee.node(id)?;
+            if !std::mem::replace(&mut reachable[id], true) {
+                pending.extend(tensor_op_inputs(&node.op));
+            }
+        }
+
+        let mut remap = HashMap::new();
+        let mut groups = HashMap::new();
+        for (id, node) in callee.nodes.iter().enumerate() {
+            if !reachable[id] {
+                continue;
+            }
+            let spliced = if let TensorOp::Input { name } = &node.op {
+                *bindings
+                    .get(name)
+                    .ok_or_else(|| format!("inline leaves callee input {name:?} unbound"))?
+            } else {
+                let mut op = remap_tensor_op(&node.op, &remap)?;
+                if let Some(group) = tensor_op_group_mut(&mut op) {
+                    *group = *groups.entry(*group).or_insert(self.nodes.len());
+                }
+                self.push_node(op, node.shape.clone(), node.dtype, node.weak)
+            };
+            remap.insert(id, spliced);
+        }
+        Ok(outputs.iter().map(|output| remap[output]).collect())
+    }
+
     pub fn symbolic_jvp(
         &self,
         output: TensorNodeId,
@@ -12487,6 +12572,19 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<String> {
         TensorOp::Broadcast { input } => format!("broadcast:{input}:{shape:?}"),
     };
     Some(key)
+}
+
+/// The execution-group id of a node that shares one region execution with
+/// its sibling results, if the op has one.
+fn tensor_op_group_mut(op: &mut TensorOp) -> Option<&mut usize> {
+    match op {
+        TensorOp::ForiVjp { group, .. }
+        | TensorOp::ForiVjpJvp { group, .. }
+        | TensorOp::Scan { group, .. }
+        | TensorOp::ScanVjp { group, .. }
+        | TensorOp::ScanVjpJvp { group, .. } => Some(group),
+        _ => None,
+    }
 }
 
 fn remap_tensor_op(
