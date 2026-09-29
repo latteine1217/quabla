@@ -947,6 +947,9 @@ impl MlxBackend {
                         .power_device(&exponent, &stream)
                         .map_err(|error| error.to_string())
                 }
+                TensorOp::Pow { base, exponent } => mlx_value(&values, *base)?
+                    .power_device(mlx_value(&values, *exponent)?, &stream)
+                    .map_err(|error| error.to_string()),
                 TensorOp::Matmul { lhs, rhs } => mlx_value(&values, *lhs)?
                     .matmul_device(mlx_value(&values, *rhs)?, &stream)
                     .map_err(|error| error.to_string()),
@@ -1837,6 +1840,7 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Sin { .. } => "sin",
         TensorOp::Cos { .. } => "cos",
         TensorOp::Powi { .. } => "powi",
+        TensorOp::Pow { .. } => "pow",
         TensorOp::Transpose { .. } => "transpose",
         TensorOp::Log { .. } => "log",
         TensorOp::Concat { .. } => "concat",

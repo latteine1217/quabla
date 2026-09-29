@@ -575,6 +575,13 @@ enum TensorOp {
         input: TensorNodeId,
         exponent: u32,
     },
+    /// Elementwise `base ** exponent` with `f64::powf` semantics and
+    /// broadcasting. Its derivative conventions at `base <= 0` are documented
+    /// on `DynamicTensor::pow_base_derivative`.
+    Pow {
+        base: TensorNodeId,
+        exponent: TensorNodeId,
+    },
     Transpose {
         input: TensorNodeId,
         axes: Vec<usize>,
@@ -1818,6 +1825,21 @@ impl DynamicTensor {
         )
     }
 
+    /// Elementwise `self ** exponent` with `f64::powf` semantics.
+    fn pow(&self, exponent: &Self) -> Result<Self, String> {
+        self.elementwise(exponent, f64::powf)
+    }
+
+    /// `d pow(x, y) / dx` under the conventions of `pow_base_derivative`.
+    fn pow_base_derivative(&self, exponent: &Self) -> Result<Self, String> {
+        self.elementwise(exponent, pow_base_derivative)
+    }
+
+    /// `d pow(x, y) / dy` under the conventions of `pow_exponent_derivative`.
+    fn pow_exponent_derivative(&self, exponent: &Self) -> Result<Self, String> {
+        self.elementwise(exponent, pow_exponent_derivative)
+    }
+
     fn log(&self) -> Result<Self, String> {
         if self.data.iter().any(|value| *value <= 0.0) {
             return Err("log requires strictly positive tensor values".to_string());
@@ -2610,6 +2632,19 @@ impl TensorIr {
                     };
                     (value, tangent)
                 }
+                TensorOp::Pow { base, exponent } => {
+                    let (base_value, base_tangent) = pairs[*base];
+                    let (exponent_value, exponent_tangent) = pairs[*exponent];
+                    (
+                        transformed.pow(base_value, exponent_value)?,
+                        transformed.pow_tangent(
+                            base_value,
+                            base_tangent,
+                            exponent_value,
+                            exponent_tangent,
+                        )?,
+                    )
+                }
                 TensorOp::Concat { inputs, axis } => {
                     let values = inputs.iter().map(|input| pairs[*input].0).collect();
                     let tangents = inputs.iter().map(|input| pairs[*input].1).collect();
@@ -2820,6 +2855,9 @@ impl TensorIr {
                 TensorOp::Cos { input } => transformed.cos(values[*input])?,
                 TensorOp::Powi { input, exponent } => {
                     transformed.powi(values[*input], *exponent)?
+                }
+                TensorOp::Pow { base, exponent } => {
+                    transformed.pow(values[*base], values[*exponent])?
                 }
                 TensorOp::Transpose { input, axes } => transformed.transpose(
                     values[*input],
@@ -3317,6 +3355,43 @@ impl TensorIr {
                             &mut transformed,
                             &mut cotangents,
                             *input,
+                            contribution,
+                        )?;
+                    }
+                }
+                // A constant operand receives no cotangent, so its derivative expression is not
+                // emitted at all.
+                TensorOp::Pow { base, exponent } => {
+                    let base_value = values[*base];
+                    let exponent_value = values[*exponent];
+                    let operands = [
+                        (*base, self.scalar_constant_value(*base).is_none(), true),
+                        (
+                            *exponent,
+                            self.scalar_constant_value(*exponent).is_none(),
+                            false,
+                        ),
+                    ];
+                    for (operand, differentiable, is_base) in operands {
+                        if !differentiable {
+                            continue;
+                        }
+                        let derivative = if is_base {
+                            transformed.pow_base_derivative(base_value, exponent_value)?
+                        } else {
+                            transformed.pow_exponent_derivative(base_value, exponent_value)?
+                        };
+                        let contribution = transformed.mul(upstream, derivative)?;
+                        let contribution = symbolic_reduce_to_shape(
+                            &mut transformed,
+                            contribution,
+                            &node.shape,
+                            &self.node(operand)?.shape,
+                        )?;
+                        symbolic_accumulate(
+                            &mut transformed,
+                            &mut cotangents,
+                            operand,
                             contribution,
                         )?;
                     }
@@ -4411,6 +4486,152 @@ impl TensorIr {
         self.push_derived(TensorOp::Powi { input, exponent }, shape)
     }
 
+    /// Elementwise `base ** exponent` with `f64::powf` semantics: NaN for a
+    /// negative base with a non-integer exponent, `0 ** 0 == 1`, and IEEE
+    /// results for infinities and NaN. Operands broadcast and promote like
+    /// arithmetic operands, so a weak scalar exponent adopts the base dtype.
+    /// `Bool` operands are rejected, as by the unary math ops, instead of
+    /// being promoted to 0/1.
+    pub fn pow(
+        &mut self,
+        base: TensorNodeId,
+        exponent: TensorNodeId,
+    ) -> Result<TensorNodeId, String> {
+        for operand in [base, exponent] {
+            if self.node(operand)?.dtype == TensorDType::Bool {
+                return Err(
+                    "pow is not defined for bool tensors; use logical_and/logical_or/logical_not \
+                     (& | ~) or convert explicitly with astype"
+                        .to_string(),
+                );
+            }
+        }
+        self.binary("pow", base, exponent, |base, exponent| TensorOp::Pow {
+            base,
+            exponent,
+        })
+    }
+
+    /// The value of `id` when it is a scalar constant, possibly behind the
+    /// casts that promotion inserts for weak scalars, rounded like the cast
+    /// chain. The `pow` rules use it to skip the derivative of a constant
+    /// operand and to fold the constants of the derivative expressions.
+    fn scalar_constant_value(&self, id: TensorNodeId) -> Option<f64> {
+        let node = self.nodes.get(id)?;
+        match node.op {
+            TensorOp::ScalarConstant { value } if node.shape.is_empty() => Some(value),
+            TensorOp::Cast { input } => Some(node.dtype.round(self.scalar_constant_value(input)?)),
+            _ => None,
+        }
+    }
+
+    /// `exponent - 1`, folded to a constant of the same dtype and weakness
+    /// when the exponent is a constant, so nested derivatives of a constant
+    /// exponent keep recognizing it.
+    fn pow_lowered_exponent(&mut self, exponent: TensorNodeId) -> Result<TensorNodeId, String> {
+        if let Some(value) = self.scalar_constant_value(exponent) {
+            let node = self.node(exponent)?;
+            let (dtype, weak) = (node.dtype, node.weak);
+            return Ok(self.constant_like(dtype.round(value - 1.0), dtype, weak));
+        }
+        let one = self.scalar_constant(1.0);
+        self.sub(exponent, one)
+    }
+
+    /// Symbolic `d pow(x, y) / dx` with the conventions of the free function
+    /// `pow_base_derivative`: `where(m, 0, y * pow(where(m, 1, x), y - 1))`
+    /// with `m = (x == 0) & (y < 1)`. Masking the inner base keeps `0 * inf`
+    /// out of the reverse pass through this expression, so Hessians stay
+    /// finite at the origin. A constant exponent decides `y < 1` statically.
+    fn pow_base_derivative(
+        &mut self,
+        base: TensorNodeId,
+        exponent: TensorNodeId,
+    ) -> Result<TensorNodeId, String> {
+        let zero = self.scalar_constant(0.0);
+        let one = self.scalar_constant(1.0);
+        let singular = match self.scalar_constant_value(exponent) {
+            // No point is singular unless `y < 1` (a NaN exponent is never singular).
+            Some(value) if !pow_base_is_singular(0.0, value) => None,
+            Some(_) => Some(self.compare(base, zero, TensorComparison::Equal)?),
+            None => {
+                let at_origin = self.compare(base, zero, TensorComparison::Equal)?;
+                let below_one = self.compare(exponent, one, TensorComparison::Less)?;
+                Some(self.logical_and(at_origin, below_one)?)
+            }
+        };
+        let safe_base = match singular {
+            Some(mask) => self.where_select(mask, one, base)?,
+            None => base,
+        };
+        let lowered = self.pow_lowered_exponent(exponent)?;
+        let power = self.pow(safe_base, lowered)?;
+        let derivative = self.mul(exponent, power)?;
+        match singular {
+            Some(mask) => self.where_select(mask, zero, derivative),
+            None => Ok(derivative),
+        }
+    }
+
+    /// Symbolic `d pow(x, y) / dy` with the conventions of the free function
+    /// `pow_exponent_derivative`: `pow(s, y) * log(s)` with
+    /// `s = where(x <= 0, 1, x)`, which is exactly `0` for `x <= 0` and keeps
+    /// the checked-domain `log` away from non-positive values.
+    fn pow_exponent_derivative(
+        &mut self,
+        base: TensorNodeId,
+        exponent: TensorNodeId,
+    ) -> Result<TensorNodeId, String> {
+        if let Some(value) = self.scalar_constant_value(base) {
+            if value <= 0.0 {
+                return Ok(self.scalar_constant(0.0));
+            }
+            // A positive constant base reuses the primal `pow(base, y)` (CSE)
+            // and folds its logarithm.
+            let node = self.node(base)?;
+            let (dtype, weak) = (node.dtype, node.weak);
+            let log = self.constant_like(dtype.round(value.ln()), dtype, weak);
+            let power = self.pow(base, exponent)?;
+            return self.mul(power, log);
+        }
+        let zero = self.scalar_constant(0.0);
+        let one = self.scalar_constant(1.0);
+        let non_positive = self.compare(base, zero, TensorComparison::LessEqual)?;
+        let safe_base = self.where_select(non_positive, one, base)?;
+        let power = self.pow(safe_base, exponent)?;
+        let log = self.log(safe_base)?;
+        self.mul(power, log)
+    }
+
+    /// Tangent of `pow(x, y)`; the term of an operand whose tangent is the
+    /// constant zero (a constant operand) is left out rather than multiplied
+    /// by a derivative that may be non-finite.
+    fn pow_tangent(
+        &mut self,
+        base: TensorNodeId,
+        base_tangent: TensorNodeId,
+        exponent: TensorNodeId,
+        exponent_tangent: TensorNodeId,
+    ) -> Result<TensorNodeId, String> {
+        let mut tangent = None;
+        if self.scalar_constant_value(base_tangent) != Some(0.0) {
+            let derivative = self.pow_base_derivative(base, exponent)?;
+            tangent = Some(self.mul(base_tangent, derivative)?);
+        }
+        if self.scalar_constant_value(exponent_tangent) != Some(0.0) {
+            let derivative = self.pow_exponent_derivative(base, exponent)?;
+            let term = self.mul(exponent_tangent, derivative)?;
+            tangent = Some(match tangent {
+                Some(tangent) => self.add(tangent, term)?,
+                None => term,
+            });
+        }
+        Ok(match tangent {
+            Some(tangent) => tangent,
+            None => self.scalar_constant(0.0),
+        })
+    }
+
     pub fn transpose(
         &mut self,
         input: TensorNodeId,
@@ -5079,6 +5300,27 @@ impl TensorIr {
                         .reduce_to_shape(&self.node(*input)?.shape)?;
                     accumulate(&mut cotangents[*input], contribution)?;
                 }
+                TensorOp::Pow { base, exponent } => {
+                    let base_value = values
+                        .get(*base)
+                        .ok_or_else(|| format!("node {base} has no evaluated value"))?;
+                    let exponent_value = values
+                        .get(*exponent)
+                        .ok_or_else(|| format!("node {exponent} has no evaluated value"))?;
+                    // Constant operands are skipped, as in the symbolic rule.
+                    if self.scalar_constant_value(*base).is_none() {
+                        let contribution = cotangent
+                            .mul(&base_value.pow_base_derivative(exponent_value)?)?
+                            .reduce_to_shape(&base_value.shape)?;
+                        accumulate(&mut cotangents[*base], contribution)?;
+                    }
+                    if self.scalar_constant_value(*exponent).is_none() {
+                        let contribution = cotangent
+                            .mul(&base_value.pow_exponent_derivative(exponent_value)?)?
+                            .reduce_to_shape(&exponent_value.shape)?;
+                        accumulate(&mut cotangents[*exponent], contribution)?;
+                    }
+                }
                 TensorOp::Transpose { input, axes } => {
                     let contribution = cotangent.transpose(&inverse_permutation(axes)?)?;
                     accumulate(&mut cotangents[*input], contribution)?;
@@ -5469,6 +5711,34 @@ impl TensorIr {
                             .scale(*exponent as f64)?
                     }
                 }
+                TensorOp::Pow { base, exponent } => {
+                    let base_value = values
+                        .get(*base)
+                        .ok_or_else(|| format!("node {base} has no evaluated value"))?;
+                    let exponent_value = values
+                        .get(*exponent)
+                        .ok_or_else(|| format!("node {exponent} has no evaluated value"))?;
+                    // Constant operands are skipped, as in the symbolic rule.
+                    let mut tangent = DynamicTensor::filled(node.shape.clone(), 0.0)?;
+                    if self.scalar_constant_value(*base).is_none() {
+                        let base_tangent = tangents
+                            .get(*base)
+                            .ok_or_else(|| format!("node {base} has no evaluated tangent"))?;
+                        tangent = tangent.add(
+                            &base_tangent.mul(&base_value.pow_base_derivative(exponent_value)?)?,
+                        )?;
+                    }
+                    if self.scalar_constant_value(*exponent).is_none() {
+                        let exponent_tangent = tangents
+                            .get(*exponent)
+                            .ok_or_else(|| format!("node {exponent} has no evaluated tangent"))?;
+                        tangent = tangent.add(
+                            &exponent_tangent
+                                .mul(&base_value.pow_exponent_derivative(exponent_value)?)?,
+                        )?;
+                    }
+                    tangent
+                }
                 TensorOp::Transpose { input, axes } => tangents
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
@@ -5857,6 +6127,10 @@ impl TensorIr {
                     "%{id} = powi(%{input}, {exponent}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
+                TensorOp::Pow { base, exponent } => format!(
+                    "%{id} = pow(%{base}, %{exponent}) : {}",
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
                 TensorOp::Transpose { input, axes } => format!(
                     "%{id} = transpose(%{input}, axes={axes:?}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
@@ -5938,6 +6212,12 @@ impl TensorIr {
                     "%v{id} = stablehlo.multiply {}, {} : {}",
                     values[lhs],
                     values[rhs],
+                    tensor_type(node)
+                ),
+                TensorOp::Pow { base, exponent } => format!(
+                    "%v{id} = stablehlo.power {}, {} : {}",
+                    values[base],
+                    values[exponent],
                     tensor_type(node)
                 ),
                 TensorOp::Tanh { input } => format!(
@@ -6570,6 +6850,14 @@ impl TensorIr {
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .powi(*exponent)?,
+                TensorOp::Pow { base, exponent } => values
+                    .get(*base)
+                    .ok_or_else(|| format!("node {base} has no evaluated value"))?
+                    .pow(
+                        values
+                            .get(*exponent)
+                            .ok_or_else(|| format!("node {exponent} has no evaluated value"))?,
+                    )?,
                 TensorOp::Transpose { input, axes } => values
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
@@ -6937,6 +7225,50 @@ impl TensorIr {
                             .add(&lhs.first.mul(&rhs.second)?)?
                             .add(&lhs.second.mul(&rhs.first)?)?
                             .add(&lhs.value.mul(&rhs.mixed)?)?,
+                    }
+                }
+                // Second-order forward rule matching the composed symbolic rules: `first` and
+                // `second` use the first partials, and `mixed` adds `sum_ij d_i d_j pow` over the
+                // non-constant operands, with the mixed partials in composition order.
+                TensorOp::Pow { base, exponent } => {
+                    let base_tangent = values
+                        .get(*base)
+                        .ok_or_else(|| format!("node {base} has no evaluated value"))?;
+                    let exponent_tangent = values
+                        .get(*exponent)
+                        .ok_or_else(|| format!("node {exponent} has no evaluated value"))?;
+                    let (x, y) = (&base_tangent.value, &exponent_tangent.value);
+                    let operands = [
+                        (base_tangent, self.scalar_constant_value(*base).is_none()),
+                        (exponent_tangent, self.scalar_constant_value(*exponent).is_none()),
+                    ];
+                    let derivatives = [x.pow_base_derivative(y)?, x.pow_exponent_derivative(y)?];
+                    let mut first = DynamicTensor::filled(node.shape.clone(), 0.0)?;
+                    let mut second = first.clone();
+                    let mut mixed = first.clone();
+                    for (index, (operand, varies)) in operands.iter().enumerate() {
+                        if !varies {
+                            continue;
+                        }
+                        let derivative = &derivatives[index];
+                        first = first.add(&operand.first.mul(derivative)?)?;
+                        second = second.add(&operand.second.mul(derivative)?)?;
+                        mixed = mixed.add(&operand.mixed.mul(derivative)?)?;
+                        for (other_index, (other, other_varies)) in operands.iter().enumerate() {
+                            if !other_varies {
+                                continue;
+                            }
+                            let partial = x.elementwise(y, |base, exponent| {
+                                pow_second_derivatives(base, exponent)[2 * index + other_index]
+                            })?;
+                            mixed = mixed.add(&operand.first.mul(&other.second)?.mul(&partial)?)?;
+                        }
+                    }
+                    MixedTangent {
+                        value: x.pow(y)?,
+                        first,
+                        second,
+                        mixed,
                     }
                 }
                 TensorOp::Greater { lhs, rhs } => {
@@ -10482,6 +10814,9 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                 TensorOp::Powi { input, exponent } => {
                     specialized.powi(mapped(*input)?, *exponent)?
                 }
+                TensorOp::Pow { base, exponent } => {
+                    specialized.pow(mapped(*base)?, mapped(*exponent)?)?
+                }
                 TensorOp::Transpose { input, axes } => specialized.transpose(
                     mapped(*input)?,
                     Some(axes.iter().map(|axis| *axis as isize).collect()),
@@ -10618,6 +10953,9 @@ fn cuda_expression(nodes: &[TensorNode], node_id: TensorNodeId) -> Result<String
             child(*input)?,
             exponent
         )),
+        TensorOp::Pow { base, exponent } => {
+            Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
+        }
         TensorOp::Div { .. } | TensorOp::Log { .. } => Err(
             "CUDA lowering does not yet support div or log because their CPU execution has checked domain semantics"
                 .to_string(),
@@ -10712,6 +11050,9 @@ fn cuda_region_expression(
         TensorOp::Powi { input, exponent } => {
             Ok(format!("quabla_powi({}, {}U)", child(*input)?, exponent))
         }
+        TensorOp::Pow { base, exponent } => {
+            Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
+        }
         _ => Err(format!(
             "CUDA fusion region cannot inline {} node {node_id}",
             tensor_op_name(&node.op)
@@ -10795,7 +11136,11 @@ fn is_fusable_elementwise_subgraph(nodes: &[TensorNode], node_id: TensorNodeId) 
         | TensorOp::Sub { lhs, rhs }
         | TensorOp::Mul { lhs, rhs }
         | TensorOp::Greater { lhs, rhs }
-        | TensorOp::Compare { lhs, rhs, .. } => {
+        | TensorOp::Compare { lhs, rhs, .. }
+        | TensorOp::Pow {
+            base: lhs,
+            exponent: rhs,
+        } => {
             is_fusable_elementwise_subgraph(nodes, *lhs)
                 && is_fusable_elementwise_subgraph(nodes, *rhs)
         }
@@ -10858,6 +11203,7 @@ fn is_fusable_elementwise_compute_op(op: &TensorOp) -> bool {
             | TensorOp::Sin { .. }
             | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
+            | TensorOp::Pow { .. }
             | TensorOp::Cast { .. }
     )
 }
@@ -10966,6 +11312,7 @@ fn evaluate_fused_element(
                 .map_err(|_| "powi exponent must fit in a signed 32-bit integer".to_string())?;
             Ok(child(*input)?.powi(exponent))
         }
+        TensorOp::Pow { base, exponent } => Ok(child(*base)?.powf(child(*exponent)?)),
         TensorOp::Log { input } => {
             let value = child(*input)?;
             if value <= 0.0 {
@@ -11013,6 +11360,7 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         | TensorOp::Matmul { lhs, rhs } => {
             vec![*lhs, *rhs]
         }
+        TensorOp::Pow { base, exponent } => vec![*base, *exponent],
         TensorOp::Solve { matrix, rhs } => vec![*matrix, *rhs],
         TensorOp::Triangular { input, .. } => vec![*input],
         TensorOp::Where {
@@ -11258,6 +11606,7 @@ fn infer_tensor_placement(
         | TensorOp::Mul { lhs, rhs }
         | TensorOp::Greater { lhs, rhs }
         | TensorOp::Compare { lhs, rhs, .. } => merge(&[*lhs, *rhs]),
+        TensorOp::Pow { base, exponent } => merge(&[*base, *exponent]),
         TensorOp::Where {
             condition,
             on_true,
@@ -11695,6 +12044,7 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Sin { .. } => "sin",
         TensorOp::Cos { .. } => "cos",
         TensorOp::Powi { .. } => "powi",
+        TensorOp::Pow { .. } => "pow",
         TensorOp::Transpose { .. } => "transpose",
         TensorOp::Log { .. } => "log",
         TensorOp::Concat { .. } => "concat",
@@ -11742,6 +12092,7 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
             let exponent = i32::try_from(*exponent).ok()?;
             Some(scalar(*input)?.powi(exponent))
         }
+        TensorOp::Pow { base, exponent } => Some(scalar(*base)?.powf(scalar(*exponent)?)),
         TensorOp::Log { input } => {
             let value = scalar(*input)?;
             (value > 0.0).then(|| value.ln())
@@ -12031,6 +12382,7 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<String> {
         TensorOp::Sin { input } => format!("sin:{input}:{shape:?}"),
         TensorOp::Cos { input } => format!("cos:{input}:{shape:?}"),
         TensorOp::Powi { input, exponent } => format!("powi:{input}:{exponent}:{shape:?}"),
+        TensorOp::Pow { base, exponent } => format!("pow:{base}:{exponent}:{shape:?}"),
         TensorOp::Transpose { input, axes } => format!("transpose:{input}:{axes:?}:{shape:?}"),
         TensorOp::Log { input } => format!("log:{input}:{shape:?}"),
         TensorOp::Concat { inputs, axis } => format!("concat:{inputs:?}:{axis}:{shape:?}"),
@@ -12307,6 +12659,10 @@ fn remap_tensor_op(
             input: remap_node(*input)?,
             exponent: *exponent,
         }),
+        TensorOp::Pow { base, exponent } => Ok(TensorOp::Pow {
+            base: remap_node(*base)?,
+            exponent: remap_node(*exponent)?,
+        }),
         TensorOp::Transpose { input, axes } => Ok(TensorOp::Transpose {
             input: remap_node(*input)?,
             axes: axes.clone(),
@@ -12387,6 +12743,74 @@ fn input_tangent_or_zero(
         }
         None => DynamicTensor::filled(shape.to_vec(), 0.0),
     }
+}
+
+/// `d pow(x, y) / dx = y * x^(y-1)`, defined as `0` where `x == 0` and `y < 1`.
+///
+/// Those are the points where the derivative is infinite (`0 < y < 1`) or the
+/// value itself is (`y < 0`), or where the formula is `0 * inf` (`y == 0`).
+/// The zero subgradient matches `sqrt` at the origin (`SqrtDerivative`), so
+/// `pow(x, 0.5)` and `sqrt(x)` agree there. For `y >= 1` the finite limit is
+/// kept (`1` for `y == 1`, `0` above), so `x ** 2.0` keeps the derivative
+/// `2x` and the second derivative `2` at the origin. A negative base with an
+/// integer-valued exponent follows `powf` and stays finite; with a
+/// non-integer exponent the value and this derivative are NaN.
+///
+/// The symbolic rule (`TensorIr::pow_base_derivative`) evaluates the same
+/// expression with the singular points masked out of the inner power, so its
+/// own derivatives stay finite there instead of producing `0 * inf`.
+fn pow_base_derivative(base: f64, exponent: f64) -> f64 {
+    if pow_base_is_singular(base, exponent) {
+        0.0
+    } else {
+        exponent * base.powf(exponent - 1.0)
+    }
+}
+
+fn pow_base_is_singular(base: f64, exponent: f64) -> bool {
+    base == 0.0 && exponent < 1.0
+}
+
+/// `d pow(x, y) / dy = x^y * ln(x)` for `x > 0`, defined as `0` for `x <= 0`.
+///
+/// At `x == 0` the formula is `0 * -inf` or `inf * -inf`; the power is
+/// piecewise constant along `y` there (`inf`, `1` at `y == 0`, then `0`), so
+/// zero is its derivative everywhere except at the jump. For `x < 0` the real power exists only at
+/// integer exponents, so no derivative in `y` exists; unlike JAX, which
+/// returns NaN there, the gradient is `0`, keeping the backward pass finite
+/// for a learnable exponent at an integer value with negative bases (the
+/// value itself is NaN at every non-integer exponent). A NaN base propagates.
+fn pow_exponent_derivative(base: f64, exponent: f64) -> f64 {
+    if base <= 0.0 {
+        0.0
+    } else {
+        base.powf(exponent) * base.ln()
+    }
+}
+
+/// Second partial derivatives of `pow` as the symbolic rules compose them:
+/// `(d/dx d/dx, d/dy d/dx, d/dx d/dy, d/dy d/dy)`. Each zero region of a
+/// first derivative is also a zero region of its derivatives, so the two
+/// mixed partials may differ at `x <= 0`, where the conventions apply.
+fn pow_second_derivatives(base: f64, exponent: f64) -> [f64; 4] {
+    let (base_base, base_exponent) = if pow_base_is_singular(base, exponent) {
+        (0.0, 0.0)
+    } else {
+        (
+            exponent * pow_base_derivative(base, exponent - 1.0),
+            base.powf(exponent - 1.0) + exponent * pow_exponent_derivative(base, exponent - 1.0),
+        )
+    };
+    let (exponent_base, exponent_exponent) = if base <= 0.0 {
+        (0.0, 0.0)
+    } else {
+        let log = base.ln();
+        (
+            pow_base_derivative(base, exponent) * log + base.powf(exponent) / base,
+            base.powf(exponent) * log * log,
+        )
+    };
+    [base_base, base_exponent, exponent_base, exponent_exponent]
 }
 
 fn sqrt_derivative_coefficient(order: u32) -> f64 {

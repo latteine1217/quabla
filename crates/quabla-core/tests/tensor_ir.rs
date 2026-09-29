@@ -7482,3 +7482,779 @@ fn cuda_bool_masks_comparisons_and_guarded_gradients_match_cpu_when_enabled() {
     }
     assert_bool_parity(QuablaTarget::Cuda { device_ordinal: 0 });
 }
+
+// --- Pow (design slice S1b) ---
+
+/// Bases and exponents covering the `powf` edge cases: `0^0`, `0^-1`,
+/// `-0^-1`, a negative base with integer and non-integer exponents,
+/// infinities, and NaN in either operand.
+const POW_EDGE_BASES: [f64; 10] = [
+    0.0,
+    0.0,
+    -0.0,
+    -2.0,
+    -2.0,
+    f64::INFINITY,
+    f64::NEG_INFINITY,
+    f64::NAN,
+    2.0,
+    1.0,
+];
+const POW_EDGE_EXPONENTS: [f64; 10] = [
+    0.0,
+    -1.0,
+    -1.0,
+    3.0,
+    0.5,
+    -0.5,
+    3.0,
+    0.0,
+    f64::NAN,
+    f64::NAN,
+];
+
+/// Equal as IEEE values, with NaN equal to NaN and signed zeros distinct.
+fn same_float(actual: f64, expected: f64) -> bool {
+    (actual.is_nan() && expected.is_nan())
+        || (actual == expected && actual.is_sign_negative() == expected.is_sign_negative())
+}
+
+fn pow_inputs(base: &[f64], exponent: &[f64]) -> Result<BTreeMap<String, DynamicTensor>, String> {
+    Ok(BTreeMap::from([
+        (
+            "x".to_string(),
+            DynamicTensor::new(vec![base.len()], base.to_vec())?,
+        ),
+        (
+            "y".to_string(),
+            DynamicTensor::new(vec![exponent.len()], exponent.to_vec())?,
+        ),
+    ]))
+}
+
+#[test]
+fn pow_follows_powf_for_edge_cases_broadcasting_and_f32() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![POW_EDGE_BASES.len()]));
+    let y = must!(graph.input("y", vec![POW_EDGE_EXPONENTS.len()]));
+    let output = must!(graph.pow(x, y));
+    let inputs = must!(pow_inputs(&POW_EDGE_BASES, &POW_EDGE_EXPONENTS));
+    let expected = [
+        1.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        -8.0,
+        f64::NAN,
+        0.0,
+        f64::NEG_INFINITY,
+        1.0,
+        f64::NAN,
+        1.0,
+    ];
+    let plan = must!(graph.compile_cpu(output));
+    for value in [
+        must!(graph.evaluate(output, &inputs)),
+        must!(plan.evaluate(&inputs)),
+    ] {
+        for (index, (actual, expected)) in value.data().iter().zip(expected).enumerate() {
+            assert!(
+                same_float(*actual, expected),
+                "pow({}, {}) = {actual}, expected {expected}",
+                POW_EDGE_BASES[index],
+                POW_EDGE_EXPONENTS[index]
+            );
+            let reference = POW_EDGE_BASES[index].powf(POW_EDGE_EXPONENTS[index]);
+            assert!(same_float(*actual, reference));
+        }
+    }
+
+    // [2, 1] ** [3] broadcasts like the other binary ops.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 1]));
+    let y = must!(graph.input("y", vec![3]));
+    let output = must!(graph.pow(x, y));
+    assert_eq!(must!(graph.node_shape(output)), vec![2, 3]);
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2, 1], vec![2.0, 9.0])),
+        ),
+        (
+            "y".to_string(),
+            must!(DynamicTensor::new(vec![3], vec![0.5, 2.0, -1.0])),
+        ),
+    ]);
+    let value = must!(graph.evaluate(output, &inputs));
+    assert_eq!(
+        value.data(),
+        &[2.0_f64.sqrt(), 4.0, 0.5, 3.0, 81.0, 1.0 / 9.0]
+    );
+
+    // A weak scalar exponent adopts the f32 base dtype; each f32 node is the correctly rounded
+    // f64 result of its f32-rounded operands.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input_typed("x", vec![3], TensorDType::F32));
+    let third = graph.scalar_constant(1.0 / 3.0);
+    let output = must!(graph.pow(x, third));
+    assert_eq!(must!(graph.node_dtype(output)), TensorDType::F32);
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![3], vec![0.1, 2.7, 1234.5])),
+    )]);
+    let value = must!(graph.evaluate(output, &inputs));
+    assert_eq!(value.dtype(), TensorDType::F32);
+    for (actual, base) in value.data().iter().zip([0.1_f64, 2.7, 1234.5]) {
+        let expected = ((base as f32 as f64).powf((1.0_f64 / 3.0) as f32 as f64)) as f32 as f64;
+        assert_eq!(*actual, expected);
+    }
+
+    // Bool operands are rejected instead of promoted to 0/1, and strong dtypes must match.
+    let mut graph = TensorIr::new();
+    let mask = must!(graph.input_typed("mask", vec![2], TensorDType::Bool));
+    let x = must!(graph.input("x", vec![2]));
+    let x32 = must!(graph.input_typed("x32", vec![2], TensorDType::F32));
+    let two = graph.scalar_constant(2.0);
+    for (base, exponent) in [(mask, two), (two, mask), (x, mask)] {
+        let error = graph.pow(base, exponent).err().unwrap_or_default();
+        assert!(error.contains("pow is not defined for bool"), "{error}");
+    }
+    let error = graph.pow(x, x32).err().unwrap_or_default();
+    assert!(error.contains("mismatched dtypes"), "{error}");
+}
+
+/// Gradients of one route with respect to the base and the exponent.
+type PowGradients = (Vec<f64>, Vec<f64>);
+
+/// `sum(pow(x, y))` with every derivative route, for comparison with central
+/// finite differences: runtime VJP and JVP, symbolic VJP, and symbolic JVP
+/// with runtime tangent inputs.
+fn pow_loss_derivatives(
+    base: &[f64],
+    exponent: &[f64],
+    exponent_shape: Vec<usize>,
+) -> Result<Vec<PowGradients>, String> {
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![base.len()])?;
+    let y = graph.input("y", exponent_shape.clone())?;
+    let power = graph.pow(x, y)?;
+    let loss = graph.sum(power)?;
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            DynamicTensor::new(vec![base.len()], base.to_vec())?,
+        ),
+        (
+            "y".to_string(),
+            DynamicTensor::new(exponent_shape.clone(), exponent.to_vec())?,
+        ),
+    ]);
+    let mut routes = Vec::new();
+
+    let gradients = graph.vjp(loss, &inputs, DynamicTensor::filled(vec![], 1.0)?)?;
+    routes.push((
+        gradients["x"].data().to_vec(),
+        gradients["y"].data().to_vec(),
+    ));
+
+    let symbolic = graph.symbolic_vjp(loss, "cotangent")?;
+    let mut symbolic_inputs = inputs.clone();
+    symbolic_inputs.insert("cotangent".to_string(), DynamicTensor::filled(vec![], 1.0)?);
+    routes.push((
+        symbolic
+            .graph
+            .evaluate(symbolic.gradients["x"], &symbolic_inputs)?
+            .data()
+            .to_vec(),
+        symbolic
+            .graph
+            .evaluate(symbolic.gradients["y"], &symbolic_inputs)?
+            .data()
+            .to_vec(),
+    ));
+
+    // Directional derivatives along one-hot directions recover each gradient entry.
+    let tangent_names = BTreeMap::from([
+        ("x".to_string(), "dx".to_string()),
+        ("y".to_string(), "dy".to_string()),
+    ]);
+    let forward = graph.symbolic_jvp_with_tangent_inputs(loss, &tangent_names)?;
+    let mut runtime_forward = (Vec::new(), Vec::new());
+    let mut symbolic_forward = (Vec::new(), Vec::new());
+    for (name, count) in [("x", base.len()), ("y", exponent.len())] {
+        for index in 0..count {
+            let mut directions = BTreeMap::from([
+                (
+                    "x".to_string(),
+                    DynamicTensor::filled(vec![base.len()], 0.0)?,
+                ),
+                (
+                    "y".to_string(),
+                    DynamicTensor::filled(exponent_shape.clone(), 0.0)?,
+                ),
+            ]);
+            let shape = directions[name].shape().to_vec();
+            let mut data = vec![0.0; count];
+            data[index] = 1.0;
+            directions.insert(name.to_string(), DynamicTensor::new(shape, data)?);
+            let (_, runtime) = graph.jvp(loss, &inputs, &directions)?;
+            let mut forward_inputs = inputs.clone();
+            forward_inputs.insert("dx".to_string(), directions["x"].clone());
+            forward_inputs.insert("dy".to_string(), directions["y"].clone());
+            let symbolic = forward.graph.evaluate(forward.tangent, &forward_inputs)?;
+            let (runtime_slot, symbolic_slot) = if name == "x" {
+                (&mut runtime_forward.0, &mut symbolic_forward.0)
+            } else {
+                (&mut runtime_forward.1, &mut symbolic_forward.1)
+            };
+            runtime_slot.push(runtime.data()[0]);
+            symbolic_slot.push(symbolic.data()[0]);
+        }
+    }
+    routes.push(runtime_forward);
+    routes.push(symbolic_forward);
+    Ok(routes)
+}
+
+fn assert_pow_gradients_match_finite_differences(
+    base: &[f64],
+    exponent: &[f64],
+    exponent_shape: Vec<usize>,
+) {
+    let routes = must!(pow_loss_derivatives(base, exponent, exponent_shape.clone()));
+    let loss = |base: &[f64], exponent: &[f64]| -> f64 {
+        base.iter()
+            .enumerate()
+            .map(|(index, value)| value.powf(exponent[index % exponent.len()]))
+            .sum()
+    };
+    let step = 1e-6;
+    let difference = |perturb_base: bool, index: usize| {
+        let (mut base_plus, mut exponent_plus) = (base.to_vec(), exponent.to_vec());
+        let (mut base_minus, mut exponent_minus) = (base.to_vec(), exponent.to_vec());
+        if perturb_base {
+            base_plus[index] += step;
+            base_minus[index] -= step;
+        } else {
+            exponent_plus[index] += step;
+            exponent_minus[index] -= step;
+        }
+        (loss(&base_plus, &exponent_plus) - loss(&base_minus, &exponent_minus)) / (2.0 * step)
+    };
+    for (route, (base_gradient, exponent_gradient)) in routes.iter().enumerate() {
+        for (index, actual) in base_gradient.iter().enumerate() {
+            let expected = difference(true, index);
+            assert!(
+                (actual - expected).abs() <= 1e-6 * expected.abs().max(1.0),
+                "route {route} d/dx[{index}]: {actual} vs finite difference {expected}"
+            );
+        }
+        for (index, actual) in exponent_gradient.iter().enumerate() {
+            let expected = difference(false, index);
+            assert!(
+                (actual - expected).abs() <= 1e-6 * expected.abs().max(1.0),
+                "route {route} d/dy[{index}]: {actual} vs finite difference {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn pow_gradients_in_both_operands_match_finite_differences() {
+    assert_pow_gradients_match_finite_differences(
+        &[0.7, 1.9, 3.2, 1.3, 0.25],
+        &[-1.3, 0.4, 2.5, 1.0, 3.0],
+        vec![5],
+    );
+    // A broadcast scalar exponent accumulates its gradient over every element.
+    assert_pow_gradients_match_finite_differences(&[0.7, 1.9, 3.2], &[1.7], vec![]);
+}
+
+#[test]
+fn pow_derivative_conventions_at_zero_and_negative_bases() {
+    // Columns: 0^0.5 (sqrt-like, singular), 0^2, 0^1, 0^-1 (inf value), 0^0, (-2)^3, (-2)^2,
+    // and (-2)^0.5 (NaN value).
+    let base = [0.0, 0.0, 0.0, 0.0, 0.0, -2.0, -2.0, -2.0];
+    let exponent = [0.5, 2.0, 1.0, -1.0, 0.0, 3.0, 2.0, 0.5];
+    let expected_base = [0.0, 0.0, 1.0, 0.0, 0.0, 12.0, -4.0, f64::NAN];
+    // The exponent gradient is defined as 0 for every base <= 0 (JAX returns NaN for x < 0).
+    let expected_exponent = [0.0; 8];
+    // A forward pass with a zero base direction still multiplies it by the NaN base partial of
+    // (-2)^0.5, whose value is NaN anyway.
+    let mut expected_forward_exponent = expected_exponent;
+    expected_forward_exponent[7] = f64::NAN;
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![8]));
+    let y = must!(graph.input("y", vec![8]));
+    let output = must!(graph.pow(x, y));
+    let inputs = must!(pow_inputs(&base, &exponent));
+    let ones = must!(DynamicTensor::filled(vec![8], 1.0));
+    let zeros = must!(DynamicTensor::filled(vec![8], 0.0));
+
+    let runtime = must!(graph.vjp(output, &inputs, ones.clone()));
+    let symbolic = must!(graph.symbolic_vjp(output, "cotangent"));
+    let mut symbolic_inputs = inputs.clone();
+    symbolic_inputs.insert("cotangent".to_string(), ones.clone());
+    let symbolic_base = must!(symbolic
+        .graph
+        .evaluate(symbolic.gradients["x"], &symbolic_inputs));
+    let symbolic_exponent = must!(symbolic
+        .graph
+        .evaluate(symbolic.gradients["y"], &symbolic_inputs));
+    let forward_base = must!(graph.jvp(
+        output,
+        &inputs,
+        &BTreeMap::from([
+            ("x".to_string(), ones.clone()),
+            ("y".to_string(), zeros.clone())
+        ])
+    ))
+    .1;
+    let forward_exponent = must!(graph.jvp(
+        output,
+        &inputs,
+        &BTreeMap::from([("x".to_string(), zeros), ("y".to_string(), ones)])
+    ))
+    .1;
+    for (label, actual, expected) in [
+        ("runtime VJP d/dx", runtime["x"].data(), &expected_base),
+        ("runtime VJP d/dy", runtime["y"].data(), &expected_exponent),
+        ("symbolic VJP d/dx", symbolic_base.data(), &expected_base),
+        (
+            "symbolic VJP d/dy",
+            symbolic_exponent.data(),
+            &expected_exponent,
+        ),
+        ("runtime JVP d/dx", forward_base.data(), &expected_base),
+        (
+            "runtime JVP d/dy",
+            forward_exponent.data(),
+            &expected_forward_exponent,
+        ),
+    ] {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                same_float(*actual, *expected) || (*actual == 0.0 && *expected == 0.0),
+                "{label}[{index}] at pow({}, {}): {actual}, expected {expected}",
+                base[index],
+                exponent[index]
+            );
+        }
+    }
+
+    // At the origin, pow(x, 0.5) and sqrt(x) share the zero subgradient.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![1]));
+    let half = graph.scalar_constant(0.5);
+    let power = must!(graph.pow(x, half));
+    let root = must!(graph.sqrt(x));
+    let origin = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![1], vec![0.0])),
+    )]);
+    let seed = must!(DynamicTensor::filled(vec![1], 1.0));
+    assert_eq!(
+        must!(graph.vjp(power, &origin, seed.clone()))["x"].data(),
+        must!(graph.vjp(root, &origin, seed))["x"].data()
+    );
+}
+
+/// Hessian of `pow(v[0], v[1])` with respect to the packed operands, by
+/// symbolic forward-over-reverse (the compiled HVP route).
+fn pow_symbolic_hessian(point: [f64; 2]) -> Result<Vec<Vec<f64>>, String> {
+    let mut graph = TensorIr::new();
+    let v = graph.input("v", vec![2])?;
+    let x = graph.slice_axis(v, 0, 0, 1)?;
+    let y = graph.slice_axis(v, 0, 1, 2)?;
+    let power = graph.pow(x, y)?;
+    let loss = graph.sum(power)?;
+    let reverse = graph.symbolic_vjp(loss, "cotangent")?;
+    let forward = reverse.graph.symbolic_jvp_with_tangent_inputs(
+        reverse.gradients["v"],
+        &BTreeMap::from([("v".to_string(), "dv".to_string())]),
+    )?;
+    let mut hessian = Vec::new();
+    for column in 0..2 {
+        let mut direction = vec![0.0; 2];
+        direction[column] = 1.0;
+        let inputs = BTreeMap::from([
+            (
+                "v".to_string(),
+                DynamicTensor::new(vec![2], point.to_vec())?,
+            ),
+            ("cotangent".to_string(), DynamicTensor::filled(vec![], 1.0)?),
+            ("dv".to_string(), DynamicTensor::new(vec![2], direction)?),
+        ]);
+        hessian.push(
+            forward
+                .graph
+                .evaluate(forward.tangent, &inputs)?
+                .data()
+                .to_vec(),
+        );
+    }
+    Ok(hessian)
+}
+
+/// The same Hessian by the runtime second-order forward evaluator.
+fn pow_runtime_hessian(point: [f64; 2]) -> Result<Vec<Vec<f64>>, String> {
+    let mut graph = TensorIr::new();
+    let v = graph.input("v", vec![2])?;
+    let x = graph.slice_axis(v, 0, 0, 1)?;
+    let y = graph.slice_axis(v, 0, 1, 2)?;
+    let power = graph.pow(x, y)?;
+    let loss = graph.sum(power)?;
+    graph.hessian_scalar(
+        loss,
+        "v",
+        &BTreeMap::from([(
+            "v".to_string(),
+            DynamicTensor::new(vec![2], point.to_vec())?,
+        )]),
+    )
+}
+
+#[test]
+fn pow_hessians_agree_across_routes_and_with_the_closed_form() {
+    let (x, y) = (1.7_f64, 0.6_f64);
+    let log = x.ln();
+    let mixed = x.powf(y - 1.0) * (1.0 + y * log);
+    let expected = [
+        [y * (y - 1.0) * x.powf(y - 2.0), mixed],
+        [mixed, x.powf(y) * log * log],
+    ];
+    for hessian in [
+        must!(pow_symbolic_hessian([x, y])),
+        must!(pow_runtime_hessian([x, y])),
+    ] {
+        for (row, expected_row) in hessian.iter().zip(expected) {
+            for (actual, expected) in row.iter().zip(expected_row) {
+                assert!(
+                    (actual - expected).abs() <= 1e-12 * expected.abs().max(1.0),
+                    "{actual} vs {expected}"
+                );
+            }
+        }
+    }
+
+    // x ** 2.0 keeps the second derivative 2 at the origin (the finite limit for y >= 1), on the
+    // symbolic and the runtime routes.
+    for (point, expected_base_base) in [
+        ([0.0, 2.0], 2.0),
+        ([0.0, 1.0], 0.0),
+        ([0.0, 0.5], 0.0),
+        ([-2.0, 3.0], -12.0),
+    ] {
+        let symbolic = must!(pow_symbolic_hessian(point));
+        let runtime = must!(pow_runtime_hessian(point));
+        // Every entry is finite: the singular points are masked out of the reverse pass too.
+        for (symbolic_row, runtime_row) in symbolic.iter().zip(&runtime) {
+            for (symbolic, runtime) in symbolic_row.iter().zip(runtime_row) {
+                assert!(symbolic.is_finite(), "{point:?}: {symbolic_row:?}");
+                assert!(runtime.is_finite(), "{point:?}: {runtime_row:?}");
+            }
+        }
+        assert_eq!(symbolic[0][0], expected_base_base, "{point:?}");
+        assert_eq!(runtime[0][0], expected_base_base, "{point:?}");
+        // The exponent-exponent entry is 0 for every base <= 0.
+        assert_eq!(symbolic[1][1], 0.0, "{point:?}");
+        assert_eq!(runtime[1][1], 0.0, "{point:?}");
+        // symbolic[c][r] differentiates the r-th gradient entry along e_c, as runtime[r][c]
+        // differentiates along e_r and then e_c, so the mixed partials pair up transposed.
+        assert_eq!(symbolic[0][1], runtime[1][0], "{point:?}");
+        assert_eq!(symbolic[1][0], runtime[0][1], "{point:?}");
+    }
+    // Where the value itself is infinite (0^-1) the runtime Hessian is the zero convention. The
+    // symbolic route is NaN there because the reverse pass of `sum` broadcasts its cotangent with
+    // `powi(v - v, 0)`, whose tangent `v - v` is NaN for an infinite `v`; that predates `pow`.
+    assert_eq!(
+        must!(pow_runtime_hessian([0.0, -1.0])),
+        vec![vec![0.0, 0.0], vec![0.0, 0.0]]
+    );
+}
+
+#[test]
+fn pow_folds_constants_shares_cse_and_skips_constant_operand_derivatives() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let two = graph.scalar_constant(2.0);
+    let three = graph.scalar_constant(3.0);
+    let eight = must!(graph.pow(two, three));
+    let scaled = must!(graph.mul(x, eight));
+    let cube = must!(graph.pow(x, three));
+    let same_cube = must!(graph.pow(x, three));
+    let sum = must!(graph.add(scaled, cube));
+    let output = must!(graph.add(sum, same_cube));
+    let plan = must!(graph.compile_cpu(output));
+    let text = plan.lower_text();
+    assert!(text.contains("constant[value=8]"), "{text}");
+    assert_eq!(text.matches("pow(").count(), 1, "{text}");
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![2], vec![1.5, -2.0])),
+    )]);
+    assert_eq!(
+        must!(plan.evaluate(&inputs)).data(),
+        &[8.0 * 1.5 + 2.0 * 1.5_f64.powf(3.0), -16.0 - 16.0]
+    );
+
+    // A constant exponent emits no exponent derivative (no log), and a positive constant base
+    // folds its logarithm.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let half = graph.scalar_constant(0.5);
+    let root = must!(graph.pow(x, half));
+    let two = graph.scalar_constant(2.0);
+    let exponential = must!(graph.pow(two, x));
+    let sum = must!(graph.add(root, exponential));
+    let loss = must!(graph.sum(sum));
+    let reverse = must!(graph.symbolic_vjp(loss, "cotangent"));
+    let reverse_text = must!(reverse.graph.compile_cpu(reverse.gradients["x"])).lower_text();
+    let forward = must!(graph.symbolic_jvp(loss, "x"));
+    let forward_text = must!(forward.graph.compile_cpu(forward.tangent)).lower_text();
+    for text in [&reverse_text, &forward_text] {
+        assert!(!text.contains("log("), "{text}");
+    }
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![0.0, 2.25])),
+        ),
+        (
+            "cotangent".to_string(),
+            must!(DynamicTensor::filled(vec![], 1.0)),
+        ),
+    ]);
+    let gradient = must!(reverse.graph.evaluate(reverse.gradients["x"], &inputs));
+    let ln2 = 2.0_f64.ln();
+    // d/dx sqrt-like is 0 at the origin; d/dx 2^x = 2^x ln 2.
+    let expected = [ln2, 1.0 / 3.0 + 2.0_f64.powf(2.25) * ln2];
+    for (actual, expected) in gradient.data().iter().zip(expected) {
+        assert!((actual - expected).abs() < 1e-12, "{actual} vs {expected}");
+    }
+    let tangent = must!(forward.graph.evaluate(forward.tangent, &inputs));
+    assert!((tangent.data()[0] - expected.iter().sum::<f64>()).abs() < 1e-12);
+}
+
+#[test]
+fn pow_fuses_into_elementwise_kernels_and_exports_stablehlo() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 1]));
+    let bias = must!(graph.input("bias", vec![1, 3]));
+    let shifted = must!(graph.add(x, bias));
+    let activated = must!(graph.tanh(shifted));
+    let exponent = graph.scalar_constant(1.5);
+    let one = graph.scalar_constant(1.0);
+    let positive = must!(graph.add(activated, one));
+    let output = must!(graph.pow(positive, exponent));
+    let plan = must!(graph.compile_cpu(output));
+    assert!(plan.uses_fused_elementwise_kernel());
+    assert_eq!(plan.fusion_regions().len(), 1);
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2, 1], vec![-1.0, 2.0])),
+        ),
+        (
+            "bias".to_string(),
+            must!(DynamicTensor::new(vec![1, 3], vec![0.0, 1.0, -1.0])),
+        ),
+    ]);
+    assert_eq!(
+        must!(plan.evaluate(&inputs)),
+        must!(graph.evaluate(output, &inputs))
+    );
+    let source = must!(plan.cuda_source());
+    assert!(source.contains("powf("), "{source}");
+
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3]));
+    let y = must!(graph.input("y", vec![3]));
+    let output = must!(graph.pow(x, y));
+    let text = must!(graph.stablehlo_text(output));
+    assert!(
+        text.contains("%v2 = stablehlo.power %arg0, %arg1 : tensor<3xf64>"),
+        "{text}"
+    );
+}
+
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+type PowDeviceCase = (QuablaMultiOutputProgram, BTreeMap<String, DynamicTensor>);
+
+/// f32 device programs: pow values at the edge cases; gradients in both
+/// operands with a forward-over-reverse directional derivative of each; and a
+/// fixed `Fori` whose loop body applies `pow` with a captured exponent, with
+/// gradients through the loop.
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn pow_device_programs() -> Result<Vec<PowDeviceCase>, String> {
+    let base = [
+        0.0,
+        0.0,
+        0.0,
+        -2.0,
+        -2.0,
+        -1.5,
+        1.5,
+        0.3,
+        f64::INFINITY,
+        f64::NAN,
+        2.0,
+    ];
+    let exponent = [
+        0.0,
+        -1.0,
+        0.5,
+        3.0,
+        0.5,
+        2.0,
+        2.5,
+        -0.7,
+        -0.5,
+        0.0,
+        f64::NAN,
+    ];
+    let count = base.len();
+    let mut graph = TensorIr::new();
+    let x = graph.input_typed("x", vec![count], TensorDType::F32)?;
+    let y = graph.input_typed("y", vec![count], TensorDType::F32)?;
+    let power = graph.pow(x, y)?;
+    let values = QuablaMultiOutputProgram::new(graph.clone(), vec![power])?;
+    let loss = graph.sum(power)?;
+    let reverse = graph.symbolic_vjp(loss, "cotangent")?;
+    let forward = reverse.graph.symbolic_jvp_many_with_tangent_inputs(
+        &[reverse.gradients["x"], reverse.gradients["y"]],
+        &BTreeMap::from([
+            ("x".to_string(), "dx".to_string()),
+            ("y".to_string(), "dy".to_string()),
+        ]),
+    )?;
+    let mut outputs = forward.values.clone();
+    outputs.extend(&forward.tangents);
+    let derivatives = QuablaMultiOutputProgram::new(forward.graph, outputs)?;
+    let mut inputs = pow_inputs(&base, &exponent)?;
+    inputs.insert("cotangent".to_string(), DynamicTensor::filled(vec![], 1.0)?);
+    inputs.insert("dx".to_string(), DynamicTensor::filled(vec![count], 0.5)?);
+    inputs.insert("dy".to_string(), DynamicTensor::filled(vec![count], -0.25)?);
+
+    let mut body = TensorIr::new();
+    let carry = body.input_typed("carry", vec![3], TensorDType::F32)?;
+    let p = body.input_typed("p", vec![], TensorDType::F32)?;
+    let step = body.pow(carry, p)?;
+    let quarter = body.scalar_constant(0.25);
+    let step = body.mul(step, quarter)?;
+    let next = body.add(carry, step)?;
+    let loop_plan = TensorForiExecutionPlan::new(0, 3, body.compile_cpu(next)?, "carry", "index")?;
+    let mut graph = TensorIr::new();
+    let initial = graph.input_typed("initial", vec![3], TensorDType::F32)?;
+    let p = graph.input_typed("p", vec![], TensorDType::F32)?;
+    let result = graph.fori(initial, loop_plan, vec![("p".to_string(), p)])?;
+    let loss = graph.sum(result)?;
+    let reverse = graph.symbolic_vjp(loss, "cotangent")?;
+    let looped = QuablaMultiOutputProgram::new(
+        reverse.graph,
+        vec![
+            reverse.value,
+            reverse.gradients["initial"],
+            reverse.gradients["p"],
+        ],
+    )?;
+    let loop_inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            DynamicTensor::new(vec![3], vec![0.4, 1.1, 2.3])?,
+        ),
+        ("p".to_string(), DynamicTensor::new(vec![], vec![0.75])?),
+        ("cotangent".to_string(), DynamicTensor::filled(vec![], 1.0)?),
+    ]);
+    Ok(vec![
+        (values, inputs.clone()),
+        (derivatives, inputs),
+        (looped, loop_inputs),
+    ])
+}
+
+/// Device results match the CPU f32 reference within a few f32 ulps per op,
+/// with NaN and infinity at the same positions.
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn assert_pow_device_parity(target: QuablaTarget) {
+    let compiler = QuablaCompiler;
+    for (index, (program, inputs)) in must!(pow_device_programs()).into_iter().enumerate() {
+        let cpu = must!(must!(compiler.compile_many(&program, QuablaTarget::Cpu)).execute(&inputs));
+        let device = must!(must!(compiler.compile_many(&program, target)).execute(&inputs));
+        assert_eq!(device.len(), cpu.len());
+        for (output, (actual, expected)) in device.iter().zip(&cpu).enumerate() {
+            assert_eq!(actual.shape(), expected.shape());
+            for (element, (actual, expected)) in
+                actual.data().iter().zip(expected.data()).enumerate()
+            {
+                let close = if expected.is_finite() {
+                    (actual - expected).abs() <= 1e-5 * expected.abs().max(1.0)
+                } else {
+                    same_float(*actual, *expected)
+                };
+                assert!(
+                    close,
+                    "{target:?} program {index} output {output}[{element}]: {actual} vs CPU {expected}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_pow_values_derivatives_and_loop_bodies_match_cpu() {
+    assert_pow_device_parity(QuablaTarget::Mlx);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_pow_values_derivatives_and_loop_bodies_match_cpu_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    assert_pow_device_parity(QuablaTarget::Cuda { device_ordinal: 0 });
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_fuses_pow_chains_into_one_region_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 1]));
+    let y = must!(graph.input("y", vec![1, 3]));
+    let shifted = must!(graph.tanh(x));
+    let one = graph.scalar_constant(1.0);
+    let positive = must!(graph.add(shifted, one));
+    let power = must!(graph.pow(positive, y));
+    let output = must!(graph.sin(power));
+    let plan = must!(graph.compile_cpu(output));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2, 1], vec![-1.0, 2.0])),
+        ),
+        (
+            "y".to_string(),
+            must!(DynamicTensor::new(vec![1, 3], vec![0.5, -1.5, 2.25])),
+        ),
+    ]);
+    let cpu = must!(plan.evaluate(&inputs));
+    let compiled = must!(CudaBackend::new(0).compile(plan));
+    assert!(compiled.fused_region_count() >= 1);
+    let cuda = must!(compiled.execute(&inputs));
+    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+        assert!((actual - expected).abs() < 1e-5, "{actual} vs {expected}");
+    }
+}

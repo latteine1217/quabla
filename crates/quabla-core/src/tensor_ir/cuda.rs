@@ -2357,6 +2357,7 @@ fn execute_cuda_device_program(
             | TensorOp::Sin { .. }
             | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
+            | TensorOp::Pow { .. }
             | TensorOp::Log { .. }
             | TensorOp::Triangular { .. }
             | TensorOp::Matmul { .. }
@@ -2976,7 +2977,11 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
         | TensorOp::Div { lhs, rhs }
         | TensorOp::Mul { lhs, rhs }
         | TensorOp::Greater { lhs, rhs }
-        | TensorOp::Compare { lhs, rhs, .. } => {
+        | TensorOp::Compare { lhs, rhs, .. }
+        | TensorOp::Pow {
+            base: lhs,
+            exponent: rhs,
+        } => {
             launch.arg(cuda_value(values, *lhs)?);
             launch.arg(cuda_value(values, *rhs)?);
             launch.arg(output);
@@ -3932,6 +3937,7 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
             | TensorOp::Sin { .. }
             | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
+            | TensorOp::Pow { .. }
             | TensorOp::Log { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
@@ -4011,6 +4017,7 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
             | TensorOp::Sin { .. }
             | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
+            | TensorOp::Pow { .. }
             | TensorOp::Log { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
@@ -4180,6 +4187,9 @@ fn cuda_fori_body_expression(
         TensorOp::Powi { input, exponent } => {
             Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
         }
+        TensorOp::Pow { base, exponent } => {
+            Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
+        }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
         // Cast source and target both execute as float, so the cast is the identity.
         TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
@@ -4315,6 +4325,9 @@ fn cuda_scan_body_expression_in_half(
         TensorOp::Powi { input, exponent } => {
             Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
         }
+        TensorOp::Pow { base, exponent } => {
+            Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
+        }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
         // Cast source and target both execute as float, so the cast is the identity.
         TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
@@ -4441,6 +4454,9 @@ fn cuda_elementwise_plan_expression_with_index(
         TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
         TensorOp::Powi { input, exponent } => {
             Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
+        }
+        TensorOp::Pow { base, exponent } => {
+            Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
         // Cast source and target both execute as float, so the cast is the identity.
@@ -6573,7 +6589,11 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
             | TensorOp::Div { lhs, rhs }
             | TensorOp::Mul { lhs, rhs }
             | TensorOp::Greater { lhs, rhs }
-            | TensorOp::Compare { lhs, rhs, .. } => {
+            | TensorOp::Compare { lhs, rhs, .. }
+            | TensorOp::Pow {
+                base: lhs,
+                exponent: rhs,
+            } => {
                 let lhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*lhs].shape);
                 let rhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*rhs].shape);
                 let expression = match &node.op {
@@ -6588,6 +6608,7 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                         "lhs[{lhs_offset}] {} rhs[{rhs_offset}] ? 1.0f : 0.0f",
                         kind.operator()
                     ),
+                    TensorOp::Pow { .. } => format!("powf(lhs[{lhs_offset}], rhs[{rhs_offset}])"),
                     _ => unreachable!(),
                 };
                 format!(
@@ -7052,6 +7073,7 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Sin { .. } => "sin",
         TensorOp::Cos { .. } => "cos",
         TensorOp::Powi { .. } => "powi",
+        TensorOp::Pow { .. } => "pow",
         TensorOp::Transpose { .. } => "transpose",
         TensorOp::Log { .. } => "log",
         TensorOp::Concat { .. } => "concat",
