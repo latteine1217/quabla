@@ -7964,11 +7964,14 @@ fn pow_hessians_agree_across_routes_and_with_the_closed_form() {
         assert_eq!(symbolic[0][1], runtime[1][0], "{point:?}");
         assert_eq!(symbolic[1][0], runtime[0][1], "{point:?}");
     }
-    // Where the value itself is infinite (0^-1) the runtime Hessian is the zero convention. The
-    // symbolic route is NaN there because the reverse pass of `sum` broadcasts its cotangent with
-    // `powi(v - v, 0)`, whose tangent `v - v` is NaN for an infinite `v`; that predates `pow`.
+    // Where the value itself is infinite (0^-1) both routes give the zero convention: the reverse
+    // pass of `sum` broadcasts its cotangent without reading the infinite value.
     assert_eq!(
         must!(pow_runtime_hessian([0.0, -1.0])),
+        vec![vec![0.0, 0.0], vec![0.0, 0.0]]
+    );
+    assert_eq!(
+        must!(pow_symbolic_hessian([0.0, -1.0])),
         vec![vec![0.0, 0.0], vec![0.0, 0.0]]
     );
 }
@@ -8411,4 +8414,134 @@ fn cuda_sqrt_values_derivatives_and_loop_bodies_match_cpu_when_enabled() {
         QuablaTarget::Cuda { device_ordinal: 0 },
         sqrt_device_programs(),
     );
+}
+
+/// Symbolic forward-over-reverse HVP of `reduce(pow(v, -1))` along `direction`,
+/// with `reduce` a global `sum` or `mean`.
+fn reciprocal_symbolic_hvp(
+    mean: bool,
+    point: &[f64],
+    direction: &[f64],
+) -> Result<Vec<f64>, String> {
+    let mut graph = TensorIr::new();
+    let v = graph.input("v", vec![point.len()])?;
+    let minus_one = graph.scalar_constant(-1.0);
+    let reciprocal = graph.pow(v, minus_one)?;
+    let loss = if mean {
+        graph.mean(reciprocal)?
+    } else {
+        graph.sum(reciprocal)?
+    };
+    let reverse = graph.symbolic_vjp(loss, "cotangent")?;
+    let forward = reverse.graph.symbolic_jvp_with_tangent_inputs(
+        reverse.gradients["v"],
+        &BTreeMap::from([("v".to_string(), "dv".to_string())]),
+    )?;
+    let inputs = BTreeMap::from([
+        (
+            "v".to_string(),
+            DynamicTensor::new(vec![point.len()], point.to_vec())?,
+        ),
+        ("cotangent".to_string(), DynamicTensor::filled(vec![], 1.0)?),
+        (
+            "dv".to_string(),
+            DynamicTensor::new(vec![direction.len()], direction.to_vec())?,
+        ),
+    ]);
+    Ok(forward
+        .graph
+        .evaluate(forward.tangent, &inputs)?
+        .data()
+        .to_vec())
+}
+
+#[test]
+fn symbolic_hessians_stay_finite_where_the_loss_is_infinite() {
+    // sum(1 / v) is infinite at v = [0, 2, -4]. The gradient -v^-2 and the Hessian diagonal
+    // 2 v^-3 follow the pow zero convention at the origin and are finite elsewhere.
+    let point = [0.0, 2.0, -4.0];
+    let direction = [1.0, 1.0, 1.0];
+    let expected = [0.0, 0.25, -0.03125];
+    for mean in [false, true] {
+        let scale = if mean { 1.0 / 3.0 } else { 1.0 };
+        let mut graph = TensorIr::new();
+        let v = must!(graph.input("v", vec![3]));
+        let minus_one = graph.scalar_constant(-1.0);
+        let reciprocal = must!(graph.pow(v, minus_one));
+        let loss = if mean {
+            must!(graph.mean(reciprocal))
+        } else {
+            must!(graph.sum(reciprocal))
+        };
+        let inputs = BTreeMap::from([(
+            "v".to_string(),
+            must!(DynamicTensor::new(vec![3], point.to_vec())),
+        )]);
+        assert_eq!(
+            must!(graph.evaluate(loss, &inputs)).data()[0],
+            f64::INFINITY
+        );
+
+        let symbolic = must!(reciprocal_symbolic_hvp(mean, &point, &direction));
+        let runtime = must!(graph.hvp_scalar(
+            loss,
+            "v",
+            &inputs,
+            must!(DynamicTensor::new(vec![3], direction.to_vec())),
+        ));
+        let hessian = must!(graph.hessian_scalar(loss, "v", &inputs));
+        for index in 0..3 {
+            let expected = scale * expected[index];
+            let row_sum = hessian[index].iter().sum::<f64>();
+            for (route, actual) in [
+                ("symbolic", symbolic[index]),
+                ("runtime", runtime.data()[index]),
+                ("hessian_scalar", row_sum),
+            ] {
+                assert!(
+                    (actual - expected).abs() <= 1e-15,
+                    "mean={mean} {route}[{index}]: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn reduction_cotangent_broadcast_ignores_nan_and_infinite_values() {
+    // The reverse pass of sum and mean broadcasts the cotangent to the input shape. Its value and
+    // its tangent must not read the input, so NaN and infinities leave the gradient of a linear
+    // loss and its (zero) second derivative untouched, and the f32 dtype is kept.
+    let point = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.5];
+    for (mean, gradient) in [(false, 1.0), (true, 0.25)] {
+        let mut graph = TensorIr::new();
+        let x = must!(graph.input_typed("x", vec![4], TensorDType::F32));
+        let loss = if mean {
+            must!(graph.mean(x))
+        } else {
+            must!(graph.sum(x))
+        };
+        let reverse = must!(graph.symbolic_vjp(loss, "cotangent"));
+        let forward = must!(reverse.graph.symbolic_jvp_with_tangent_inputs(
+            reverse.gradients["x"],
+            &BTreeMap::from([("x".to_string(), "dx".to_string())]),
+        ));
+        let inputs = BTreeMap::from([
+            (
+                "x".to_string(),
+                must!(DynamicTensor::new(vec![4], point.to_vec())),
+            ),
+            (
+                "cotangent".to_string(),
+                must!(DynamicTensor::filled(vec![], 1.0)),
+            ),
+            ("dx".to_string(), must!(DynamicTensor::filled(vec![4], 1.0))),
+        ]);
+        let value = must!(forward.graph.evaluate(forward.value, &inputs));
+        let tangent = must!(forward.graph.evaluate(forward.tangent, &inputs));
+        assert_eq!(value.dtype(), TensorDType::F32, "mean={mean}");
+        assert_eq!(tangent.dtype(), TensorDType::F32, "mean={mean}");
+        assert_eq!(value.data(), [gradient; 4], "mean={mean}");
+        assert_eq!(tangent.data(), [0.0; 4], "mean={mean}");
+    }
 }

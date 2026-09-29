@@ -8444,13 +8444,32 @@ fn symbolic_zero_tangent(graph: &mut TensorIr, shape: &[usize]) -> Result<Tensor
     }
 }
 
+/// Broadcasts `value` to the shape of `target`, promoted with the dtype of
+/// `target` as `value * ones_like(target)`.
+///
+/// The ones are a constant of `target`'s dtype and weakness broadcast to its
+/// shape, so neither the result nor any of its derivatives reads the values
+/// of `target`. Deriving them from `target` (`powi(target - target, 0)`)
+/// would give the tangent `target - target`, which is NaN wherever `target`
+/// is infinite or NaN and turns forward-over-reverse Hessians of such a loss
+/// into NaN.
 fn symbolic_broadcast_like(
     graph: &mut TensorIr,
     value: TensorNodeId,
     target: TensorNodeId,
 ) -> Result<TensorNodeId, String> {
-    let zero = symbolic_zero_like(graph, target)?;
-    let ones = graph.powi(zero, 0)?;
+    let target_node = graph.node(target)?;
+    let (shape, dtype, weak) = (
+        target_node.shape.clone(),
+        target_node.dtype,
+        target_node.weak,
+    );
+    let one = graph.constant_like(1.0, dtype, weak);
+    let ones = if shape.is_empty() {
+        one
+    } else {
+        graph.broadcast_to(one, shape)?
+    };
     graph.mul(value, ones)
 }
 
