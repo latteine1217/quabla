@@ -210,6 +210,7 @@ qb.array(obj, dtype=None) -> Tensor      # always copies
 qb.asarray(obj, dtype=None) -> Tensor    # returns obj unchanged if already a Tensor of dtype
 qb.zeros(shape, dtype=None); qb.ones(...); qb.full(shape, value, dtype=None)
 qb.arange(start, stop=None, step=1.0, dtype=None); qb.linspace(start, stop, num, dtype=None)
+qb.eye(n, m=None, dtype=None)
 Tensor.numpy() -> np.ndarray; Tensor.tolist(); Tensor.item(); float(t); np.asarray(t)
 ```
 
@@ -217,15 +218,23 @@ Tensor.numpy() -> np.ndarray; Tensor.tolist(); Tensor.item(); float(t); np.asarr
   and scalars, objects with `__array__` or the buffer protocol, `Tensor`.
 - **dtype inference:** NumPy `float64`/`float32`/`bool_` map to the same
   Quabla dtype; integers → `float64` (no integer dtype, `docs/api.md:568-570`);
-  `float16` → `TypeError`; Python floats and lists → `float64` (D3). Today a
-  `float32` ndarray becomes `float64` (Exp 6).
+  `float16` → `TypeError`; Python floats and lists → `float64` (D3), except
+  that a Python `bool` or a list whose elements are all `bool` gives `bool_`,
+  as in NumPy. Before S1 a `float32` ndarray became `float64` (Exp 6).
+  Zero-extent shapes stay unsupported, so empty inputs raise `ValueError`.
 - **Fast path:** input through PyO3 `PyBuffer<f64>`/`PyBuffer<f32>` (safe
-  contiguous copy); output through `__array__(dtype=None, copy=None)` backed
-  by a read-only buffer export of the immutable `Arc<Vec<f64>>` storage
-  (`py/tensor.rs:14-24`). A `float64` export can be zero-copy while the
-  exporter holds an `Arc` clone (an `unsafe` `__getbuffer__` with a
-  `// SAFETY:` comment); `float32` exports copy, because host storage is
-  `f64` (`docs/api.md:570`). NumPy stays optional (D2).
+  C-order copy of any layout; `bool` data goes through
+  `memoryview.tobytes()`, since PyO3 has no `bool` buffer element);
+  non-native byte order is rejected explicitly, because PyO3 0.29 accepts
+  `>` as native on little-endian hosts. Import always copies, so a tensor
+  never aliases foreign memory. Output through `__array__(dtype=None,
+  copy=None)` backed by a read-only buffer export of the immutable
+  `Arc<Vec<f64>>` storage (`py/tensor.rs:14-24`). A `float64` export can be
+  zero-copy while the exporter holds an `Arc` clone (an `unsafe`
+  `__getbuffer__` with a `// SAFETY:` comment); `float32` exports copy,
+  because host storage is `f64` (`docs/api.md:570`). NumPy stays optional
+  (D2). `qb.array` of a `Tensor` returns a new object that shares the
+  immutable storage.
 - **`Tensor` stays the class name;** `qb.Array` is an ABC with `Tensor`,
   `TensorView`, and `TraceTensor` registered (D1).
 - **Module-level ops** dispatch to the existing methods of `Tensor` and

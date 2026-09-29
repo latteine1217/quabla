@@ -19,7 +19,9 @@ use quabla_core::{
 
 use crate::dtype::PyDType;
 use crate::tensor::bool_operation_error;
-use crate::tensor::{parse_axis_indices, parse_tensor_indices, PyTensor, TensorIndex};
+use crate::tensor::{
+    extract_scalar, parse_axis_indices, parse_tensor_indices, PyTensor, TensorIndex,
+};
 
 /// One traced input declaration: `(name, shape)` for `float64`, or
 /// `(name, shape, dtype)` with a `quabla.float32`/`quabla.float64` object.
@@ -2122,7 +2124,7 @@ impl TraceTensor {
         if let Ok(rhs) = rhs.extract::<PyRef<'_, TraceTensor>>() {
             return self.maximum_tensor(&rhs).map_err(PyValueError::new_err);
         }
-        if let Ok(rhs) = rhs.extract::<f64>() {
+        if let Some(rhs) = extract_scalar(rhs) {
             return self.maximum_scalar(rhs).map_err(PyValueError::new_err);
         }
         Err(PyTypeError::new_err(
@@ -2134,7 +2136,7 @@ impl TraceTensor {
         if let Ok(rhs) = rhs.extract::<PyRef<'_, TraceTensor>>() {
             return self.minimum_tensor(&rhs).map_err(PyValueError::new_err);
         }
-        if let Ok(rhs) = rhs.extract::<f64>() {
+        if let Some(rhs) = extract_scalar(rhs) {
             return self.minimum_scalar(rhs).map_err(PyValueError::new_err);
         }
         Err(PyTypeError::new_err(
@@ -2319,7 +2321,7 @@ fn trace_tensor_or_scalar_operand(
     if let Ok(rhs) = rhs.extract::<PyRef<'_, TraceTensor>>() {
         return lhs.binary(&rhs, op).map_err(PyValueError::new_err);
     }
-    if let Ok(value) = rhs.extract::<f64>() {
+    if let Some(value) = extract_scalar(rhs) {
         return lhs.scalar_binary(value, op).map_err(PyValueError::new_err);
     }
     Err(PyTypeError::new_err(
@@ -2359,7 +2361,7 @@ fn trace_compare_operand(
             .compare_tensor(&rhs, kind)
             .map_err(PyValueError::new_err);
     }
-    if let Ok(value) = rhs.extract::<f64>() {
+    if let Some(value) = extract_scalar(rhs) {
         return lhs
             .compare_scalar(value, kind)
             .map_err(PyValueError::new_err);
@@ -2374,7 +2376,7 @@ fn trace_scalar_left_operand(
     lhs: &Bound<'_, PyAny>,
     op: &str,
 ) -> PyResult<TraceTensor> {
-    let value = lhs.extract::<f64>().map_err(|_| {
+    let value = extract_scalar(lhs).ok_or_else(|| {
         PyTypeError::new_err("expected a numeric scalar as the left TraceTensor operand")
     })?;
     rhs.scalar_left_binary(value, op)

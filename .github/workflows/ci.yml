@@ -64,10 +64,14 @@ jobs:
       # fallback-dynamic-loading, so no CUDA toolkit is needed.
       - run: cargo clippy --workspace --all-targets --features quabla-core/cuda-nccl -- -D warnings
       - run: cargo test --workspace
+      # NumPy is optional for quabla, but installed here so the NumPy
+      # interop tests (buffer import and export) run instead of skipping.
+      # Pinned to a major series so a new release cannot turn the gate red
+      # without a code change.
       - name: Build extension
         run: |
           python -m venv .venv-ci
-          .venv-ci/bin/python -m pip install 'maturin>=1.14,<2'
+          .venv-ci/bin/python -m pip install 'maturin>=1.14,<2' 'numpy>=2,<3'
           VIRTUAL_ENV="$PWD/.venv-ci" .venv-ci/bin/maturin develop
       # The script's __main__ runner executes every test_*; exit 0 == pass.
       - run: .venv-ci/bin/python tests/python/test_matrix.py

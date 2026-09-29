@@ -1,9 +1,13 @@
+// Every unsafe block and impl must document its soundness invariant.
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PySequence};
 use quabla_core::tensor_ir::TensorDType;
 
 mod compiler;
 mod dtype;
+mod interop;
 mod matrix;
 mod optim;
 mod tensor;
@@ -57,7 +61,7 @@ fn py_where(
         if let Ok(tensor) = value.extract::<PyRef<'_, PyTensor>>() {
             return Some(tensor.clone());
         }
-        value.extract::<f64>().ok().map(PyTensor::weak_scalar)
+        tensor::extract_scalar(value).map(PyTensor::weak_scalar)
     };
     if let (Ok(mask), Some(on_true), Some(on_false)) = (
         mask.extract::<PyRef<'_, PyTensor>>(),
@@ -84,7 +88,7 @@ fn py_where(
             if let Ok(tensor) = value.extract::<PyRef<'_, TraceTensor>>() {
                 return Some(Ok(tensor.clone()));
             }
-            value.extract::<f64>().ok().map(|value| {
+            tensor::extract_scalar(value).map(|value| {
                 mask.scalar_tensor(value)
                     .map_err(pyo3::exceptions::PyValueError::new_err)
             })

@@ -1,10 +1,13 @@
 use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
+use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PySlice, PySliceMethods, PyTuple};
+use pyo3::types::{PyAny, PyMemoryView, PySlice, PySliceMethods, PyTuple};
 use quabla_core::tensor_ir::{TensorComparison, TensorDType};
+use std::ffi::c_int;
 use std::sync::Arc;
 
 use crate::dtype::PyDType;
+use crate::interop;
 
 /// Eager host tensor. Storage is `f64`; a `float32` tensor holds only values
 /// rounded to `f32`, and every eager op on it rounds its `f64` result the way
@@ -140,6 +143,17 @@ pub(crate) fn bool_operation_error(op: &str) -> String {
         "{op} is not defined for bool tensors; use logical_and/logical_or/logical_not \
          (& | ~) or convert explicitly with astype"
     )
+}
+
+/// A Python number operand of a tensor op. `Tensor` defines `__float__`
+/// (for `float(t)`), so a bare `extract::<f64>()` would also accept a
+/// single-element `Tensor` and turn it into a weak scalar, dropping its
+/// dtype; operand parsing keeps rejecting tensors there as before.
+pub(crate) fn extract_scalar(value: &Bound<'_, PyAny>) -> Option<f64> {
+    if value.is_instance_of::<PyTensor>() {
+        return None;
+    }
+    value.extract::<f64>().ok()
 }
 
 fn element_count(shape: &[usize]) -> Result<usize, String> {
@@ -1684,6 +1698,108 @@ impl PyTensor {
         self.data.as_ref().clone()
     }
 
+    /// Backend of `quabla.array` for Python scalars and nested lists/tuples
+    /// (see `interop::tensor_from_nested`).
+    #[staticmethod]
+    #[pyo3(name = "_from_nested", signature = (value, dtype = None))]
+    fn from_nested(value: &Bound<'_, PyAny>, dtype: Option<PyDType>) -> PyResult<Self> {
+        interop::tensor_from_nested(value, dtype.map(|dtype| dtype.dtype))
+    }
+
+    /// Backend of `quabla.array` for buffer-protocol objects; `None` when
+    /// `value` has no buffer (see `interop::tensor_from_buffer`).
+    #[staticmethod]
+    #[pyo3(name = "_from_buffer", signature = (value, dtype = None))]
+    fn from_buffer(value: &Bound<'_, PyAny>, dtype: Option<PyDType>) -> PyResult<Option<Self>> {
+        interop::tensor_from_buffer(value, dtype.map(|dtype| dtype.dtype))
+    }
+
+    /// Nested Python lists (a bare scalar for rank 0); `bool` tensors give
+    /// Python `bool`s.
+    fn tolist<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        interop::nested_list(py, &self.shape, &self.data, self.dtype)
+    }
+
+    /// The single element as a Python `float` (or `bool` for `bool`
+    /// tensors); any shape with exactly one element is accepted.
+    fn item<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        interop::single_item(py, &self.shape, &self.data, self.dtype)
+    }
+
+    fn __float__(&self) -> PyResult<f64> {
+        match self.data.as_slice() {
+            [value] => Ok(*value),
+            _ => Err(PyTypeError::new_err(format!(
+                "only single-element tensors can be converted to a Python float, got shape {:?}",
+                self.shape
+            ))),
+        }
+    }
+
+    /// A read-only NumPy array over the buffer export: zero-copy for
+    /// `float64`, a converted copy for `float32` and `bool`. Imports NumPy
+    /// on first use; `numpy.array(tensor)` gives a writable copy.
+    fn numpy<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        let numpy = slf.py().import("numpy")?;
+        numpy.call_method1("asarray", (PyMemoryView::from(slf.as_any())?,))
+    }
+
+    /// NumPy's array protocol, for NumPy 1.x (`dtype` only) and 2.x
+    /// (`copy`). Without a dtype change the result is the read-only export
+    /// (`copy=True` copies it into a writable array); a dtype change gives
+    /// a fresh writable array, and with `copy=False` raises `ValueError` as
+    /// NumPy does. Implemented with `asarray` and `astype` only, because
+    /// NumPy 1.x's `asarray` has no `copy` keyword.
+    #[pyo3(signature = (dtype = None, copy = None))]
+    fn __array__<'py>(
+        slf: &Bound<'py, Self>,
+        dtype: Option<&Bound<'py, PyAny>>,
+        copy: Option<bool>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let numpy = slf.py().import("numpy")?;
+        let export = numpy.call_method1("asarray", (PyMemoryView::from(slf.as_any())?,))?;
+        if let Some(dtype) = dtype {
+            let dtype = numpy.call_method1("dtype", (dtype,))?;
+            if !export.getattr("dtype")?.eq(&dtype)? {
+                if copy == Some(false) {
+                    return Err(PyValueError::new_err(format!(
+                        "cannot convert a {} tensor to {dtype} without a copy (copy=False)",
+                        PyDType::from(slf.borrow().dtype).__repr__()
+                    )));
+                }
+                return export.call_method1("astype", (dtype,));
+            }
+        }
+        if copy == Some(true) {
+            export.call_method0("copy")
+        } else {
+            Ok(export)
+        }
+    }
+
+    /// Read-only buffer export (see `interop::fill_buffer`).
+    unsafe fn __getbuffer__(
+        slf: Bound<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        flags: c_int,
+    ) -> PyResult<()> {
+        let export = {
+            let tensor = slf.borrow();
+            interop::BufferExport::new(&tensor.shape, &tensor.data, tensor.dtype)
+        };
+        // SAFETY: CPython calls `bf_getbuffer` with a `Py_buffer` it owns
+        // for the duration of the export, and `slf` is the exporter, which
+        // is what `fill_buffer` requires.
+        unsafe { interop::fill_buffer(view, flags, export, slf.into_any()) }
+    }
+
+    unsafe fn __releasebuffer__(&self, view: *mut ffi::Py_buffer) {
+        // SAFETY: CPython calls `bf_releasebuffer` once for each view that
+        // `__getbuffer__` filled successfully, which is what
+        // `release_buffer` requires.
+        unsafe { interop::release_buffer(view) }
+    }
+
     fn reshape(&self, shape: Vec<usize>) -> PyResult<Self> {
         self.try_reshape(shape).map_err(PyValueError::new_err)
     }
@@ -1932,9 +2048,8 @@ impl PyTensor {
         if let Ok(exponent) = exponent.extract::<u32>() {
             return self.try_powi(exponent).map_err(PyValueError::new_err);
         }
-        let exponent = exponent
-            .extract::<f64>()
-            .map_err(|_| PyTypeError::new_err("expected numeric scalar exponent"))?;
+        let exponent = extract_scalar(exponent)
+            .ok_or_else(|| PyTypeError::new_err("expected numeric scalar exponent"))?;
         self.try_powf(exponent).map_err(PyValueError::new_err)
     }
 

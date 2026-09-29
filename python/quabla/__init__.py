@@ -9,12 +9,14 @@
 
 import sys as _sys
 
-from . import _quabla
+from . import _array, _quabla
+from ._array import *  # noqa: F403
 from ._quabla import *  # noqa: F403
 
 __doc__ = _quabla.__doc__
-# A copy, so later additions to this package do not mutate the extension's list.
-__all__ = list(_quabla.__all__)
+# The extension's names followed by the pure-Python v0.2 layers; a new list,
+# so these additions do not mutate the extension's own `__all__`.
+__all__ = list(_quabla.__all__) + _array.__all__
 
 # v0.1 compatibility alias for the native module. Registering it in
 # sys.modules keeps `import quabla.quabla` and `from quabla.quabla import X`

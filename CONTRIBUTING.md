@@ -45,6 +45,11 @@ take effect without a rebuild while Rust changes still need one. The first
 that build; if `quabla.__file__` does not point into `python/quabla/`
 afterwards, run `python -m pip uninstall quabla` and build again.
 
+NumPy is an optional runtime dependency: importing `quabla` never imports
+it, and the NumPy interop tests in `tests/python/test_api.py` print
+`skipped` without it. Install it (`python -m pip install numpy`) to run
+them; CI does.
+
 CI (`.github/workflows/ci.yml`) runs the Linux gates on every push to `main`
 and every pull request. The macOS MLX check
 (`.github/workflows/macos-mlx.yml`) runs on pull requests that touch the MLX
