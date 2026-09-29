@@ -338,9 +338,9 @@ plans. Estimate: 200-300 lines of Rust plus tests (D8).
 | `jvp(grad(f))` (HVP) | forward-over-reverse (Exp 3) | yes; MLX `vmap` HVP not lowered (`docs/api.md:579-580`) |
 | `grad` of a loss that calls `vmap(grad(grad(u)), in_axes=(0, None))` (PINN) | JVP, JVP, then VJP: the README graph | yes |
 | `vmap(grad(f))` w.r.t. a mapped argument | VJP with a ones cotangent over the batch; exact because mapped examples are independent (Exp 5: per-example `x` gradients) | yes |
-| `vmap(grad(f), in_axes=(0, None))` w.r.t. the unmapped argument | JAX returns per-example gradients `[B, *w.shape]`; the vmap VJP sums them (Exp 5) | rejected with a pointer to `grad(lambda w: vmap(f)(x, w).sum())`; see Q2 |
+| `vmap(grad(f), in_axes=(0, None))` w.r.t. the unmapped argument | JAX returns per-example gradients `[B, *w.shape]`; the vmap VJP sums them (Exp 5) | rejected with a pointer to `grad(lambda w: vmap(f)(x, w).sum())`; see Q2 (superseded: exact per-example gradients, see "S4 as landed") |
 | `grad(vmap(f))`-style aggregated losses | existing vmap VJP | yes |
-| `vmap(vmap(f))` | `batch_axis` is one `Option<usize>` (`py/tensor_trace.rs:104`) | rejected; nested batching is Rust work |
+| `vmap(vmap(f))` | `batch_axis` is one `Option<usize>` (`py/tensor_trace.rs:104`) | rejected; nested batching is Rust work (superseded: supported, see "S4 as landed") |
 | `vmap` over `cond` | rejected at trace time (`py/tensor_trace.rs:4421-4426`) | rejected |
 | `grad`/HVP through `fori_loop`/`scan` | region VJP and forward-over-reverse | yes (CUDA: elementwise bodies only) |
 | second-order reverse through regions | explicit error (`docs/api.md:577-578`) | rejected |
@@ -648,7 +648,7 @@ The gates are those under "Development Gates" (`CONTRIBUTING.md:18-35`), with
 | **S2 CPU transforms** | `grad`, `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `jit(device="cpu")`, pytrees, `argnums`, `has_aux`, cache and `RetraceLimitError`, `quabla.tree` | bridge (tuple outputs from traces) + core (`symbolic_vjp_many`) | `py/tensor_trace.rs:4375-4399`, `python/quabla/_transforms.py` | parity against `tensor_*_fn` on shared fixtures; retrace-bound tests; float32 keeps float32. Landed as described in "S2 as landed" below | Python overhead on tiny graphs (3 µs vs 17 µs, Exp 4) |
 | **S3 Composition** | `TensorIr::inline` + bridge binding; nested transforms; README PINN example | **core** | `core/tensor_ir.rs`, `py/tensor_trace.rs`, `python/quabla/_transforms.py` | Rust tests for inline, including `Cond`/`Fori`/`Scan` regions; `grad(grad)` vs exact; README example reproduces `w = 3.141593`. Landed as described in "S3 as landed" below | shared-subexpression duplication after inlining (freeze already commons pure nodes, `docs/api.md:352-353`) |
 | **S3b Constant capture** | eager arrays that meet a tracer become `TensorOp::Constant` graph nodes: closures over arrays, eager operands of traced ops and module functions, and eager arguments, tangents, and cotangents of inlined calls | **core** + bridge | `core/tensor_ir.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/tensor.rs`, `py/tensor_trace.rs`, `py/lib.rs`, `python/quabla/_transforms.py` | Rust tests for evaluation, dtype, folding, CSE, AD, inline, and lowering text; MLX parity; CUDA parity with an upload count; the issue repros, including the PINN with eager forcing terms reproducing `w = 3.141593`. Landed as described in "S3b as landed" below | graph and plan size grow with captured data; CUDA device loops reject captured arrays in their bodies |
-| **S4 vmap** | `vmap(in_axes, out_axes)` over pytrees; `vmap(grad)`; rejection of unmapped per-example gradients and nested vmap | bridge | `py/tensor_trace.rs:4490-4594` | parity with `tensor_vmap_{,jvp_,vjp_,hvp_scalar_}fn` | `out_axes` pytrees vs the single `out_axis` today |
+| **S4 vmap** | `vmap(in_axes, out_axes)` over pytrees; `vmap(grad)`; rejection of unmapped per-example gradients and nested vmap | **core** (`inline_batched`) + bridge | `core/tensor_ir.rs`, `py/tensor_trace.rs`, `py/errors.rs`, `python/quabla/_transforms.py` | parity with `tensor_vmap_{,jvp_,vjp_,hvp_scalar_}fn`. Landed as described in "S4 as landed" below | `out_axes` pytrees vs the single `out_axis` today |
 | **S5 Devices and errors** | `jit(device=...)`, `"cuda:N"`, `devices()`, `lower()`/`ShapeDtype`, error hierarchy, typed lowering rejections, eager MLX validation, `float64`-on-device warning | **core** (errors, MLX validation) | `core/compiler.rs`, `core/tensor_ir/{cuda,mlx}.rs`, `py/compiler.rs` | `QUABLA_MLX_TEST=1` suite on macOS; `QUABLA_CUDA_TEST=1` on the CUDA host; unbuilt-target error test in CI | MLX lock discipline for new entrypoints (`core/tensor_ir/mlx.rs:43`) |
 | **S6 Optim and Trainer** | `optim.Adam`/`SGD` (pure), `Trainer` on CPU/MLX/CUDA; `quabla.Adam` alias | none | `python/quabla/optim.py` | `benchmark_pinn_mlx.py` and `benchmark_pinn_cuda.py` with old and new APIs on the same host: step time within 2%; convergence parity with `examples/pinn_poisson_mlx.py` | parameter naming mismatches between pytree paths and the factories' name lists |
 | **S7 Control flow** | `cond`, `fori_loop`, `scan` wrappers and the capture error | bridge (error text) | `python/quabla/_control.py`, `py/tensor_trace.rs:4407-4960` | parity with the region tests; CUDA elementwise loop VJP/HVP on the CUDA host | JAX argument order (`scan` body gets `(carry, i)`) |
@@ -657,8 +657,8 @@ The gates are those under "Development Gates" (`CONTRIBUTING.md:18-35`), with
 | S10 (optional) | identity-based input retention in device `jit` | bridge | `py/tensor_trace.rs:2634-2660, 2893-2941` | benchmark shows no re-upload for static inputs | cache invalidation if storage ever becomes mutable |
 
 Rust summary: S1b (`Pow`), S2 (`symbolic_vjp_many`), S3 (inline), S3b
-(`Constant`), and S5 (typed errors, MLX validation) touch the core; S0, S1,
-S4, and S7 touch only the bridge; S6, S8, and S9 are pure Python. The
+(`Constant`), S4 (`inline_batched`), and S5 (typed errors, MLX validation)
+touch the core; S0, S1, and S7 touch only the bridge; S6, S8, and S9 are pure Python. The
 critical path is S0 → S2 → S3 → S3b. S1 can run in parallel with S2, and S4
 through S8 are independent after S3b. S3b was added after S3 landed: the
 accepted design assigned constant capture to no slice.
@@ -842,6 +842,96 @@ CPU; deviations and refinements of this document:
   array captured several times in one trace is copied each time and merged
   only at plan compilation.
 
+**S4 as landed.** `quabla.vmap` batches staged graphs instead of tracing
+with batched tracers:
+
+- **Core.** `TensorIr::inline_batched(callee, bindings, batch_size,
+  outputs)` splices a per-example graph like `inline`, each binding marked
+  mapped (shape `[B, *input]`) or unmapped. A node that depends on a mapped
+  binding is batched with the batch axis leading: elementwise ops, `where`,
+  `matmul`, and `broadcast` insert unit axes after the batch axis of a
+  lower-rank mapped operand (broadcasting aligns trailing axes, so an
+  unpadded `[B]` operand would meet an example axis); axis-carrying ops
+  shift their axis; `sum`/`mean` reduce the flattened example axes;
+  `concat` broadcasts its unmapped operands. Unmapped nodes are copied once.
+  A mapped `solve` or `cond`/`fori`/`scan` region node returns
+  `BatchingError::Unsupported`, which the bridge raises as
+  `UnsupportedOperationError` with the IR op name as `.op`.
+- **Python.** `vmap(fun, in_axes=0, out_axes=0)` stages `fun` for one
+  example, with shape-only leaves for the arguments and the mapped axes
+  removed, then splices that graph into its own graph over the full
+  arguments (a mapped axis other than 0 is transposed to the front first)
+  and moves each result's batch axis to its `out_axes`. `vmap` is an
+  ordinary staged transform: it caches per signature (the batch size is
+  part of it), inlines when called on tracers, and is transformed by every
+  other transform. The single-level `batch_axis` tracers of the
+  `tensor_vmap_*` helpers are unchanged and unused; a v0.2 transform called
+  on one of them still raises `UnsupportedOperationError`.
+- **Semantics** (JAX). `in_axes`/`out_axes` are an int, `None`, or a
+  tuple, list, or dict of them forming a pytree prefix (a list matches a
+  tuple); `None` is a leaf there. Negative axes count from the end. All
+  mapped axes must have one size, and at least one argument must be mapped.
+  Python scalars are static and can only be unmapped; eager arrays captured
+  inside `fun` are unmapped constants. A result that does not depend on a
+  mapped argument (including a constant) is broadcast over the batch, or
+  returned as is for `out_axes=None`, which a mapped result rejects.
+- **Compositions.** `vmap(grad(f))`, the PINN form
+  `vmap(grad(grad(u)), in_axes=(0, None))`, `jit(vmap(...))`,
+  `grad`/`value_and_grad` of a loss over `vmap(...)` with respect to an
+  unmapped parameter (an ordinary gradient of a scalar), `jvp`/`vjp` of
+  `vmap`, `vmap` of `jvp(grad(f))` (per-example HVPs), `vmap` called inside
+  a traced function, and nested `vmap(vmap(f))` all work. Per-example
+  gradients with respect to an unmapped argument,
+  `vmap(grad(f, argnums=1), in_axes=(0, None))`, return `[B, *w.shape]`
+  exactly as in JAX: the gradient node depends on the mapped argument, so it
+  is batched like any other node. Q2 and section 3.4 rejected this form
+  only because the helpers' VJP sums over the batch; `quabla.vmap` does not
+  use that path, and a rejection could only catch the direct spelling, not
+  the same computation written through a lambda.
+- **Rejected.** A mapped `solve` (rank-2 only) and mapped `cond`, `fori`,
+  and `scan` regions (their bodies are compiled plans, which have no batching
+  rule yet; the helpers trace `fori`/`scan` bodies batched). The control-flow
+  wrappers of S7 need a batching rule for regions.
+- **Parity with the helpers.** On shared fixtures `vmap` equals
+  `tensor_vmap_fn` (mapped matmul, `in_axes=[-1, None]` with
+  `out_axis=-1`, transpose and `mean` with `in_axes=[2]`), `jvp(vmap(f))`
+  equals `tensor_vmap_jvp_fn`, `vjp(vmap(f))` equals `tensor_vmap_vjp_fn`
+  including the summed gradient of an unmapped argument (reverse mode of a
+  batched function), and `jvp(grad(lambda x: sum(vmap(f)(x))))` equals
+  `tensor_vmap_hvp_scalar_fn`. They differ where `vmap(grad(f))` takes an
+  unmapped argument (per-example gradients here, a sum there), where a
+  mapped operand of lower example rank meets a higher-rank mapped operand
+  (`[B]` times `[B, 3]` fails to broadcast in the helpers), and for mapped
+  `fori`/`scan` regions (helpers only).
+- **Scalar leaves.** The forward-mode lowering of `grad` for scalar leaves
+  proposed in section 3.4 was measured and not adopted: reverse mode gives
+  smaller plans. Graph / compiled plan nodes for the README problem (the
+  plan does not depend on the number of points, measured for 1, 8, and 64):
+
+  | Second derivative inside `vmap(..., in_axes=(0, None))` | `u_xx` alone | `value_and_grad` of the loss |
+  | --- | ---: | ---: |
+  | `grad(grad(u))` (VJP over VJP) | 18 / 11 | 92 / 42 |
+  | ones-seeded JVP over JVP | 30 / 21 | 157 / 60 |
+  | ones-seeded JVP over VJP | 25 / 21 | 133 / 58 |
+  | VJP over ones-seeded JVP | 25 / 19 | 128 / 54 |
+
+  For comparison, the per-point S3 form is 516 / 206 for 8 points and the
+  README's symbolic-JVP graph 189 / 66.
+- **PINN.** The canonical form `u_xx = vmap(grad(grad(u)), in_axes=(0,
+  None))` with `jit(value_and_grad(loss))` and `quabla.Adam` for 300 steps
+  reproduces `w = 3.141593` (loss `1.5e-13`); the initial loss and gradient
+  equal the per-point S3 form within `1e-13` and the README's
+  `symbolic_jvp` path within `1e-12`. A step takes 5.1 µs (`timeit`
+  minimum, Apple silicon) against 10.4 µs for the per-point form and
+  15.4 µs for the README's `plan.evaluate_value_and_vjp`; the first call
+  takes 0.37 ms.
+- **Notes for S5.** Batched graphs contain rank-3+ `matmul` with broadcast
+  batch dimensions and unit-axis reshapes; device lowering of these shapes
+  has not been exercised. A function passed to a transform that closes over
+  a tracer of the enclosing trace (for example `jvp(lambda t: f(t, w), ...)`
+  inside a traced function with a traced `w`) still fails with "different
+  graphs": pass such values as arguments.
+
 ## 7. Resolved Questions
 
 Resolved by the owner on 2026-09-29. Items marked "as recommended" follow
@@ -852,7 +942,8 @@ this document's proposal without a separate owner discussion.
    `elementwise_grad` shortcut ships, because it is silently wrong when points
    are coupled.
 2. **Per-example gradients w.r.t. unmapped arguments** under `vmap`:
-   rejected with an explicit error in v0.2 (as recommended).
+   rejected with an explicit error in v0.2 (as recommended). Superseded in
+   S4: `quabla.vmap` computes them exactly, as JAX does; see "S4 as landed".
 3. **Python scalars:** static (as recommended).
 4. **Device selection:** explicit `device=` only in v0.2; no global default
    device (as recommended by D9).

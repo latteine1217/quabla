@@ -4,9 +4,9 @@
 //! class objects; each subclasses the builtin exception that the same failure
 //! raised before v0.2, so existing `except TypeError` handlers still match.
 
-use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyType;
+use pyo3::types::{PyDict, PyType};
 
 /// A `quabla.TracerError` carrying `message`.
 ///
@@ -37,4 +37,28 @@ pub(crate) fn concrete_value_error(py: Python<'_>, what: &str) -> PyErr {
              with quabla operations"
         ),
     )
+}
+
+/// A `quabla.UnsupportedOperationError` carrying `message` and `op`.
+///
+/// The class is a `ValueError`, which is also the fallback when the
+/// pure-Python package cannot be imported (see [`tracer_error`]).
+pub(crate) fn unsupported_operation_error(
+    py: Python<'_>,
+    message: impl Into<String>,
+    op: &str,
+) -> PyErr {
+    let message = message.into();
+    let error = py
+        .import("quabla._errors")
+        .and_then(|module| module.getattr("UnsupportedOperationError"))
+        .and_then(|class| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("op", op)?;
+            class.call((message.as_str(),), Some(&kwargs))
+        });
+    match error {
+        Ok(error) => PyErr::from_value(error),
+        Err(_) => PyValueError::new_err(message),
+    }
 }

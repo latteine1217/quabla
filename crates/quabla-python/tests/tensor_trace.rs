@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use quabla::TensorTraceGraph;
+use quabla::{TensorTraceGraph, TraceTensor};
 use quabla_core::tensor_ir::{DynamicTensor, SymbolicCotangent, TensorDType};
 
 fn matrix(rows: usize, columns: usize, data: &[f64]) -> Result<DynamicTensor, String> {
@@ -113,5 +113,90 @@ fn staging_rejects_tracers_of_another_graph() -> Result<(), String> {
     ] {
         assert!(error.contains("different graph"), "{error}");
     }
+    Ok(())
+}
+
+/// The splice behind `quabla.vmap`: a per-example graph batched into the
+/// caller's graph, with mapped and unmapped bindings and flags per output.
+#[test]
+fn inline_batched_splices_a_per_example_graph_over_the_batch() -> Result<(), String> {
+    let callee = TensorTraceGraph::new();
+    let row = callee.add_input("row", vec![1, 2], TensorDType::F64)?;
+    let weight = callee.add_input("weight", vec![2, 1], TensorDType::F64)?;
+    let product = row.try_matmul(&weight)?;
+    let shared = weight.try_matmul(&row)?.try_matmul(&weight)?;
+    let unmapped = TraceTensor::try_concat(&[weight.clone(), weight.clone()], 0)?;
+
+    let graph = TensorTraceGraph::new();
+    let rows = graph.add_input("rows", vec![3, 1, 2], TensorDType::F64)?;
+    let weight_node = graph.add_input("weight", vec![2, 1], TensorDType::F64)?;
+    let spliced = callee
+        .inline_batched_into(
+            &["row".to_string(), "weight".to_string()],
+            &[rows, weight_node],
+            &[true, false],
+            3,
+            &[product, shared, unmapped],
+        )
+        .map_err(|error| error.to_string())?;
+    assert_eq!(
+        spliced
+            .iter()
+            .map(|(_, mapped)| *mapped)
+            .collect::<Vec<_>>(),
+        vec![true, true, false]
+    );
+    let outputs = spliced
+        .into_iter()
+        .map(|(tensor, _)| tensor)
+        .collect::<Vec<_>>();
+    let executable = graph.compile_cpu_many(&outputs, vec!["rows".into(), "weight".into()])?;
+    let values = executable.execute(vec![
+        DynamicTensor::new(vec![3, 1, 2], vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.5])?,
+        matrix(2, 1, &[0.5, -2.0])?,
+    ])?;
+    assert_eq!(values[0].shape(), &[3, 1, 1]);
+    assert_eq!(values[0].data(), &[-3.5, -6.5, -1.5]);
+    assert_eq!(values[1].shape(), &[3, 2, 1]);
+    // weight @ (row @ weight) per example: the row products scale weight.
+    assert_eq!(values[1].data(), &[-1.75, 7.0, -3.25, 13.0, -0.75, 3.0]);
+    assert_eq!(values[2].shape(), &[4, 1]);
+    Ok(())
+}
+
+#[test]
+fn inline_batched_reports_unbatchable_ops_as_unsupported() -> Result<(), String> {
+    use quabla_core::tensor_ir::BatchingError;
+    let callee = TensorTraceGraph::new();
+    let matrix_input = callee.add_input("matrix", vec![2, 2], TensorDType::F64)?;
+    let rhs = callee.add_input("rhs", vec![2, 1], TensorDType::F64)?;
+    let solved = matrix_input.try_solve(&rhs)?;
+    let graph = TensorTraceGraph::new();
+    let matrices = graph.add_input("matrices", vec![4, 2, 2], TensorDType::F64)?;
+    let rhs_node = graph.add_input("rhs", vec![2, 1], TensorDType::F64)?;
+    let error = callee
+        .inline_batched_into(
+            &["matrix".to_string(), "rhs".to_string()],
+            &[matrices, rhs_node.clone()],
+            &[true, false],
+            4,
+            std::slice::from_ref(&solved),
+        )
+        .map(|_| ())
+        .expect_err("a mapped solve must be rejected");
+    assert_eq!(error, BatchingError::Unsupported { op: "solve" });
+    let other = TensorTraceGraph::new();
+    let stray = other.add_input("matrix", vec![2, 2], TensorDType::F64)?;
+    let error = callee
+        .inline_batched_into(
+            &["matrix".to_string(), "rhs".to_string()],
+            &[stray, rhs_node],
+            &[false, false],
+            4,
+            &[solved],
+        )
+        .map(|_| ())
+        .expect_err("bindings of two traces must be rejected");
+    assert!(error.to_string().contains("different traces"), "{error}");
     Ok(())
 }

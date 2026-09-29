@@ -1069,7 +1069,7 @@ def test_inlined_transforms_cache_their_staged_graph_and_reject_unsupported_call
     assert_close(total, sum(-(1.5**2) * math.sin(1.5 * p) for p in [0.1, 0.2, 0.3]), 1e-14)
     assert len(traces) == 1  # three calls with one signature stage u once
 
-    # jacobian and hessian cannot be staged until vmap exists.
+    # jacobian and hessian cannot be staged until they go through vmap.
     def loss(x):
         return qb.sum(x**3)
 
@@ -1087,8 +1087,7 @@ def test_inlined_transforms_cache_their_staged_graph_and_reject_unsupported_call
     assert_raises(
         qb.UnsupportedOperationError, qb.grad(lambda x: qb.sum(qb.jacobian(qb.sin)(x))), x
     )
-    # Eager arguments and tangents of an inner call bind as constants (S3b);
-    # vmap composition is slice S4.
+    # Eager arguments and tangents of an inner call bind as constants (S3b).
     assert_close(qb.jit(lambda x: qb.grad(u)(x[0], w))(x), 1.5 * math.cos(0.15), 1e-14)
     v_eager = qb.array([1.0, 1.0, 1.0])
     assert_close(
@@ -1414,6 +1413,358 @@ def test_eager_arrays_meeting_tracers_are_captured_as_constants():
     assert_raises(TypeError, lambda: data @ "a")
     assert_raises(TypeError, lambda: data.matmul("a"), match="matmul expects a Tensor")
 
+
+# -- vmap (slice S4) -------------------------------------------------------------------
+
+
+def per_example(function, mapped, *args):
+    """`function` applied example by example along axis 0 of the arguments
+    whose `mapped` flag is set, with the results stacked along axis 0."""
+    size = next(arg.shape[0] for arg, flag in zip(args, mapped) if flag)
+    rows = [
+        function(*[qb.asarray(arg[i]) if flag else arg for arg, flag in zip(args, mapped)])
+        for i in range(size)
+    ]
+    return qb.stack([qb.asarray(row) for row in rows], 0)
+
+
+def test_vmap_in_axes_and_out_axes_select_the_batch_axis():
+    x = qb.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    w = qb.array([0.5, -1.0, 2.0])
+    assert_close(qb.vmap(lambda a, b: a * b, in_axes=(0, None))(x, w), x * w)
+    assert_close(qb.vmap(qb.sum)(x), [6.0, 15.0])
+    assert_close(qb.vmap(qb.sum, in_axes=1)(x), [5.0, 7.0, 9.0])
+    assert_close(qb.vmap(qb.sum, in_axes=-1)(x), [5.0, 7.0, 9.0])
+    assert_close(qb.vmap(lambda a: a * 2.0, in_axes=1, out_axes=1)(x), x * 2.0)
+    assert_close(qb.vmap(lambda a: a * 2.0, out_axes=-1)(x), (x * 2.0).transpose())
+    # A mapped scalar meets an unmapped vector: each example is a vector.
+    s = qb.array([1.0, 2.0])
+    assert_close(
+        qb.vmap(lambda a, b: a * b, in_axes=(0, None))(s, w), [w.tolist(), (w * 2.0).tolist()]
+    )
+    # A list works like a tuple, and in_axes is a pytree prefix per argument.
+    params = {"scale": qb.array([2.0, 3.0]), "shift": qb.array(1.0)}
+
+    def affine(p, v):
+        return p["scale"] * v + p["shift"]
+
+    points = qb.array([[1.0, 2.0], [3.0, 4.0]])
+    batched = qb.vmap(affine, in_axes=[{"scale": 0, "shift": None}, 0])(params, points)
+    assert_close(batched, [[3.0, 5.0], [10.0, 13.0]])
+    # Pytree results with per-leaf out_axes; out_axes=None for an output that
+    # does not depend on the mapped arguments, which is not broadcast.
+    both = qb.vmap(
+        lambda a, b: {"prod": a * b, "w": b + 0.0},
+        in_axes=(1, None),
+        out_axes={"prod": 1, "w": None},
+    )
+    result = both(x, qb.array(3.0))
+    assert_close(result["prod"], x * 3.0)
+    assert_close(result["w"], 3.0)
+    # Unmapped and constant results are broadcast over the batch.
+    const = qb.vmap(lambda a, b: (b * 2.0, 7.0, qb.array([1.0, 2.0])), in_axes=(0, None))(
+        s, qb.array(0.5)
+    )
+    assert_close(const[0], [1.0, 1.0])
+    assert_close(const[1], [7.0, 7.0])
+    assert_close(const[2], [[1.0, 2.0], [1.0, 2.0]])
+    # A static Python scalar with in_axes None stays static.
+    assert_close(qb.vmap(lambda a, k: a * k, in_axes=(0, None))(s, 3.0), [3.0, 6.0])
+    # The batch size is part of the signature: a new size retraces.
+    assert_close(qb.vmap(qb.sum)(qb.array([[1.0], [2.0], [3.0]])), [1.0, 2.0, 3.0])
+
+
+def test_vmap_rejects_invalid_axes_and_unbatchable_ops():
+    x = qb.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    add = qb.vmap(lambda a, b: a + b)
+    assert_raises(ValueError, add, x, qb.array([1.0, 2.0, 3.0]), match="inconsistent sizes")
+    assert_raises(ValueError, qb.vmap(qb.sum, in_axes=None), x, match="at least one mapped")
+    assert_raises(ValueError, qb.vmap(lambda a, k: a * k), x, 2.0, match="static argument")
+    assert_raises(ValueError, qb.vmap(qb.sum, in_axes=2), x, match="out of range")
+    assert_raises(ValueError, qb.vmap(add, in_axes=(0, 0, 0)), x, x, match="does not match")
+    assert_raises(ValueError, qb.vmap(lambda a: a, out_axes=None), x, match="out_axes=None")
+    assert_raises(ValueError, qb.vmap(lambda a: a, out_axes=3), x, match="out of range")
+    assert_raises(TypeError, qb.vmap, qb.sum, in_axes="0")
+    # Ops without a batching rule raise UnsupportedOperationError (D16).
+    matrix = qb.array([[2.0, 0.0], [1.0, 3.0]])
+    rhs = qb.array([[[1.0], [2.0]], [[3.0], [4.0]]])
+    error = assert_raises(
+        qb.UnsupportedOperationError,
+        qb.vmap(lambda m, b: qb.solve(m, b), in_axes=(None, 0)),
+        matrix,
+        rhs,
+        match="vmap cannot batch solve",
+    )
+    assert error.op == "solve"
+    # An unmapped solve is fine.
+    unmapped_solve = qb.vmap(lambda m, b, k: qb.solve(m, b) * k, in_axes=(None, None, 0))
+    assert_close(
+        unmapped_solve(matrix, qb.asarray(rhs[0]), qb.array([1.0, 2.0])),
+        [[[0.5], [0.5]], [[1.0], [1.0]]],
+    )
+
+    def looped(initial, scale):
+        return qb.tensor_fori_loop_region(0, 3, lambda i, c, s: c + i * s, initial, [scale])
+
+    error = assert_raises(
+        qb.UnsupportedOperationError,
+        qb.vmap(looped),
+        qb.array([1.0, 2.0]),
+        qb.array([2.0, 3.0]),
+        match="region",
+    )
+    assert error.op == "fori"
+    # The deprecated helper batches the region body.
+    old = qb.tensor_vmap_fn(looped, [("initial", []), ("scale", [])], 2)
+    assert_close(old({"initial": qb.array([1.0, 2.0]), "scale": qb.array([2.0, 3.0])}), [7.0, 11.0])
+
+
+def test_vmap_matches_the_tensor_vmap_helpers():
+    def model(x, weight):
+        return x.matmul(weight).tanh()
+
+    x = qb.array([[[1.0, 0.0], [0.0, 1.0]], [[2.0, 1.0], [1.0, 2.0]], [[3.0, 0.0], [0.0, 3.0]]])
+    weight = qb.array([[[1.0], [-1.0]], [[1.0], [0.5]], [[2.0], [1.0]]])
+    old = qb.tensor_vmap_fn(model, [("x", [2, 2]), ("weight", [2, 1])], 3)
+    assert_close(qb.vmap(model)(x, weight), old({"x": x, "weight": weight}), 1e-15)
+    # The helpers align a mapped [B] operand with a mapped [B, 3] one by
+    # trailing axes, so a per-example scalar times a vector fails there;
+    # quabla.vmap batches the per-example graph and handles it.
+    rows = qb.array([[0.1, 0.2, 0.3], [-0.4, 0.5, 0.6]])
+    scales = qb.array([0.8, 1.1])
+    assert_raises(
+        ValueError,
+        qb.tensor_vmap_fn,
+        lambda r, c: r * c,
+        [("r", [3]), ("c", [])],
+        2,
+        match="cannot broadcast",
+    )
+    assert_close(qb.vmap(lambda r, c: r * c)(rows, scales), [[0.08, 0.16, 0.24], [-0.44, 0.55, 0.66]])
+
+    def dot(a, b):
+        return (a * b).sum()
+
+    xt = qb.array([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
+    b = qb.array([2.0, -1.0])
+    old = qb.tensor_vmap_fn(
+        dot, [("x", [2]), ("weight", [2])], 3, in_axes=[-1, None], out_axis=-1
+    )
+    assert_close(qb.vmap(dot, in_axes=(-1, None), out_axes=-1)(xt, b), old({"x": xt, "weight": b}))
+    cube = qb.array(
+        [[[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]], [[4.0, 40.0], [5.0, 50.0], [6.0, 60.0]]]
+    )
+    old = qb.tensor_vmap_fn(
+        lambda t: t.transpose().mean(axis=1), [("x", [2, 3])], 2, in_axes=[2], out_axis=1
+    )
+    new = qb.vmap(lambda t: t.transpose().mean(axis=1), in_axes=2, out_axes=1)(cube)
+    assert_close(new, old({"x": cube}))
+
+    # jvp of vmap: forward mode over the batched function.
+    def f(x, s):
+        return qb.sin(x * s) * s + x**2
+
+    # `s` has one element per example: the helpers cannot batch a scalar
+    # against a vector (above).
+    specs = [("x", [3]), ("s", [1])]
+    values = {"x": qb.array([[0.1, 0.2, 0.3], [-0.4, 0.5, 0.6]]), "s": qb.array([[0.8], [1.1]])}
+    tangents = {"x": qb.array([[1.0, -1.0, 0.5], [0.0, 2.0, 1.0]]), "s": qb.array([[0.3], [-0.2]])}
+    old_out, old_tangent = qb.tensor_vmap_jvp_fn(f, specs, 2)(values, tangents)
+    out, tangent = qb.jvp(qb.vmap(f), (values["x"], values["s"]), (tangents["x"], tangents["s"]))
+    assert_close(out, old_out, 1e-15)
+    assert_close(tangent, old_tangent, 1e-14)
+    # vjp of vmap: mapped cotangents give per-example gradients, and the
+    # gradient of an unmapped argument sums over the batch, as the helper's.
+    cotangent = qb.array([[1.0, -0.5, 0.25], [-0.75, 0.5, 1.0]])
+    old_out, old_grads = qb.tensor_vmap_vjp_fn(f, specs, 2)(values, cotangent)
+    out, pullback = qb.vjp(qb.vmap(f), values["x"], values["s"])
+    gx, gs = pullback(cotangent)
+    assert_close(out, old_out, 1e-15)
+    assert_close(gx, old_grads["x"], 1e-14)
+    assert_close(gs, old_grads["s"], 1e-14)
+    s_shared = qb.array([0.9])
+    old_out, old_grads = qb.tensor_vmap_vjp_fn(f, specs, 2, in_axes=[0, None])(
+        {"x": values["x"], "s": s_shared}, cotangent
+    )
+    out, pullback = qb.vjp(qb.vmap(f, in_axes=(0, None)), values["x"], s_shared)
+    gx, gs = pullback(cotangent)
+    assert_close(gx, old_grads["x"], 1e-14)
+    assert_close(gs, old_grads["s"], 1e-14)
+    # Where the semantics differ: vmap(grad) with respect to an unmapped
+    # argument gives one gradient per example (JAX); the helper's VJP sums
+    # them over the batch.
+    per_point = qb.vmap(qb.grad(lambda x, s: qb.sum(f(x, s)), argnums=1), in_axes=(0, None))
+    per_example = per_point(values["x"], s_shared)
+    assert per_example.shape == [2, 1]
+    ones = qb.ones([2, 3])
+    _, summed = qb.tensor_vmap_vjp_fn(f, specs, 2, in_axes=[0, None])(
+        {"x": values["x"], "s": s_shared}, ones
+    )
+    assert_close(qb.sum(per_example, 0), summed["s"], 1e-14)
+
+    # HVP of the summed per-example scalar loss with respect to a mapped input.
+    def g(x, s):
+        return qb.sum(qb.tanh(x * s) * x)
+
+    direction = qb.array([[0.7, -0.4, 0.2], [0.1, 0.3, -0.5]])
+    old_hvp = qb.tensor_vmap_hvp_scalar_fn(g, specs, 2, "x")(values, direction)
+    batched_loss = qb.grad(lambda x, s: qb.sum(qb.vmap(g)(x, s)))
+    _, hvp = qb.jvp(batched_loss, (values["x"], values["s"]), (direction, qb.zeros([2, 1])))
+    assert_close(hvp, old_hvp, 1e-14)
+    # The same HVP per example, as vmap of a jvp of grad.
+    per_example_hvp = qb.vmap(
+        lambda x, s, v: qb.jvp(qb.grad(g), (x, s), (v, qb.zeros([1])))[1]
+    )
+    assert_close(per_example_hvp(values["x"], values["s"], direction), old_hvp, 1e-14)
+
+
+def test_vmap_composes_with_grad_jit_and_itself():
+    def f(x, w):
+        return qb.sum(qb.tanh(x * w) * x)
+
+    xs = qb.array([[0.1, -0.2, 0.3], [0.5, 0.25, -1.0], [2.0, -0.7, 0.4], [0.0, 1.0, -1.5]])
+    w = qb.array([0.9, -0.3, 1.2])
+    # vmap(grad) with respect to the mapped argument, and jit(vmap(...)).
+    per_x = qb.vmap(qb.grad(f), in_axes=(0, None))
+    for batched in [per_x, qb.jit(per_x)]:
+        assert_close(batched(xs, w), per_example(qb.grad(f), (True, False), xs, w), 1e-14)
+    # Per-example gradients with respect to the unmapped argument (JAX).
+    per_w = qb.vmap(qb.grad(f, argnums=1), in_axes=(0, None))(xs, w)
+    assert per_w.shape == [4, 3]
+    assert_close(per_w, per_example(qb.grad(f, argnums=1), (True, False), xs, w), 1e-14)
+    both = qb.vmap(qb.grad(f, argnums=(0, 1)), in_axes=(0, None))(xs, w)
+    assert_close(both[1], per_w, 1e-15)
+    # grad of a loss over vmap with respect to an unmapped parameter: an
+    # ordinary gradient of a scalar, equal to the per-point loop form.
+
+    def loss(w, xs):
+        return qb.mean(qb.vmap(f, in_axes=(0, None))(xs, w) ** 2)
+
+    def loop_loss(w, xs):
+        return qb.mean(qb.stack([f(xs[i], w) for i in range(xs.shape[0])], 0) ** 2)
+
+    value, gradient = qb.value_and_grad(loss)(w, xs)
+    loop_value, loop_gradient = qb.value_and_grad(loop_loss)(w, xs)
+    assert_close(value, loop_value, 1e-14)
+    assert_close(gradient, loop_gradient, 1e-14)
+    assert_close(qb.jit(qb.grad(loss))(w, xs), loop_gradient, 1e-14)
+    # vmap inside a plain jit function, on tracers and eager arrays.
+    inside = qb.jit(lambda xs: qb.vmap(f, in_axes=(0, None))(xs, w))
+    assert_close(inside(xs), per_example(f, (True, False), xs, w), 1e-14)
+    # Nested vmap: an outer batch of parameter vectors.
+    ws = qb.array([[0.9, -0.3, 1.2], [0.1, 0.2, 0.3]])
+    nested = qb.vmap(qb.vmap(f, in_axes=(0, None)), in_axes=(None, 0))(xs, ws)
+    assert nested.shape == [2, 4]
+    for j in range(2):
+        expected = per_example(f, (True, False), xs, qb.asarray(ws[j]))
+        assert_close(qb.asarray(nested[j]), expected, 1e-14)
+    # A jvp of grad inside vmap: per-example Hessian-vector products.
+    hvp_rows = qb.vmap(
+        lambda x: qb.jvp(qb.grad(lambda t: qb.sum(t**3)), (x,), (qb.ones([3]),))[1]
+    )(xs)
+    assert_close(hvp_rows, xs * 6.0, 1e-14)
+    # Captured eager arrays inside vmap are unmapped constants.
+    offset = qb.array([1.0, 2.0, 3.0])
+    assert_close(qb.vmap(lambda x: x + offset)(xs), xs + offset)
+    weighted = qb.vmap(lambda x: qb.sum(x * offset))(xs)
+    assert_close(weighted, per_example(lambda x: qb.sum(x * offset), (True,), xs))
+
+
+def test_vmap_keeps_float32_and_the_dtype_rules():
+    x32 = qb.array([[0.5, -1.0], [2.0, 0.25]], dtype=qb.float32)
+    w32 = qb.array([0.3, -0.7], dtype=qb.float32)
+    result = qb.vmap(lambda x, w: qb.sin(x * w) * 2.0, in_axes=(0, None))(x32, w32)
+    assert result.dtype == qb.float32
+    second = qb.vmap(qb.grad(qb.grad(lambda x, w: qb.sin(x * w[0]))), in_axes=(0, None))
+    derivative = second(qb.array([0.1, 0.2], dtype=qb.float32), w32)
+    assert derivative.dtype == qb.float32
+    assert_close(derivative, [-(0.3**2) * math.sin(0.03), -(0.3**2) * math.sin(0.06)], 1e-6)
+    c32 = qb.array([1.0, 2.0], dtype=qb.float32)
+    assert qb.vmap(lambda x: x * c32)(x32).dtype == qb.float32
+    # A strong float64 constant with a float32 tracer asks for astype.
+    assert_raises(ValueError, qb.vmap(lambda x: x * qb.array([1.0, 2.0])), x32, match="astype")
+    mask = qb.vmap(lambda x: x > 0.0)(x32)
+    assert mask.dtype == qb.bool_ and mask.tolist() == [[True, False], [True, True]]
+
+
+def test_pinn_in_the_canonical_vmap_form_reproduces_the_readme():
+    u_xx = qb.vmap(qb.grad(qb.grad(pinn_u)), in_axes=(0, None))  # design 2.4 and Q1
+
+    def loss(w, x):
+        return qb.mean((u_xx(x, w) + math.pi**2 * qb.sin(math.pi * x)) ** 2)
+
+    x, w = qb.linspace(0.05, 0.95, PINN_POINTS), qb.array(2.5)
+    assert_close(u_xx(x, w), [-(2.5**2) * math.sin(2.5 * p) for p in x.tolist()], 1e-14)
+    step = qb.jit(qb.value_and_grad(loss))
+    value, grad_w = step(w, x)
+    # The per-point S3 form and the README's symbolic_jvp path agree.
+    loop_value, loop_grad = qb.jit(qb.value_and_grad(pinn_loss))(w, x)
+    assert_close(value, loop_value, 1e-13)
+    assert_close(grad_w, loop_grad, 1e-13)
+    plan = readme_symbolic_jvp_loss().compile_cpu()
+    readme_inputs = {"x": x.reshape([PINN_POINTS, 1]), "w": w.reshape([1, 1])}
+    old_value, old_grads = plan.evaluate_value_and_vjp(readme_inputs, qb.Tensor([], [1.0]))
+    assert_close(value, old_value.item(), 1e-12)
+    assert_close(grad_w, old_grads["w"].item(), 1e-12)
+    # Finite differences in w.
+    h = 1e-6
+    fd = (step(w + h, x)[0].item() - step(w - h, x)[0].item()) / (2.0 * h)
+    assert_close(grad_w, fd, 1e-7)
+    params, adam = {"w": w}, qb.Adam(learning_rate=0.05)
+    for _ in range(300):
+        value, grad_w = step(params["w"], x)
+        params = adam.step(params, {"w": grad_w})
+    assert f"{params['w'].item():.6f}" == "3.141593", params["w"].item()
+    assert value.item() < 1e-10
+
+
+def test_vmapped_pinn_plan_size_does_not_grow_with_the_points():
+    from quabla import _transforms
+
+    u_xx = qb.vmap(qb.grad(qb.grad(pinn_u)), in_axes=(0, None))
+
+    def loss(w, x):
+        return qb.mean((u_xx(x, w) + math.pi**2 * qb.sin(math.pi * x)) ** 2)
+
+    def sizes(points):
+        x, w = qb.linspace(0.05, 0.95, points), qb.array(2.5)
+        staged = qb.value_and_grad(loss)._stage(
+            (tuple, (_transforms._LEAF, _transforms._LEAF)), [w, x], ["w", "x"]
+        )
+        executable = staged.graph._compile_cpu(staged.outputs, staged.input_names)
+        return staged.graph._node_count, executable.node_count
+
+    # Graph / plan nodes on this build: 92 / 42 for any number of points,
+    # against 516 / 206 for the per-point form with 8 points (S3).
+    assert sizes(8) == sizes(64) == sizes(1)
+
+
+def test_pinn_gradients_in_vector_parameters_through_vmap_match_the_loop_form():
+    def u(x, p):
+        return p["a"] * qb.tanh(p["b"] * x) + p["c"] * x**3
+
+    u_xx = qb.vmap(qb.grad(qb.grad(u)), in_axes=(0, None))
+    point_u_xx = qb.grad(qb.grad(u))
+
+    def loss(p, x):
+        return qb.mean((u_xx(x, p) - qb.sin(x)) ** 2)
+
+    def loop_loss(p, x):
+        residual = qb.stack([point_u_xx(x[i], p) for i in range(x.shape[0])], 0) - qb.sin(x)
+        return qb.mean(residual**2)
+
+    params = {"a": qb.array(0.7), "b": qb.array(-1.3), "c": qb.array(0.2)}
+    x = qb.linspace(-1.0, 1.0, 6)
+    value, grads = qb.jit(qb.value_and_grad(loss))(params, x)
+    loop_value, loop_grads = qb.value_and_grad(loop_loss)(params, x)
+    assert_close(value, loop_value, 1e-13)
+    for name in "abc":
+        assert_close(grads[name], loop_grads[name], 1e-13)
+        h = 1e-6
+        plus = dict(params, **{name: params[name] + h})
+        minus = dict(params, **{name: params[name] - h})
+        fd = (qb.jit(loss)(plus, x).item() - qb.jit(loss)(minus, x).item()) / (2.0 * h)
+        assert_close(grads[name], fd, 1e-6)
 
 if __name__ == "__main__":
     # Run every test_* function in definition order so new tests cannot be left out of a manual list

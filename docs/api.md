@@ -116,6 +116,7 @@ qb.jvp(fun, primals, tangents)                    # -> (out, tangent_out)
 qb.vjp(fun, *primals, has_aux=False)              # -> (out, vjp_fun[, aux])
 qb.jacobian(fun, argnums=0)                       # blocks [*out.shape, *in.shape]
 qb.hessian(fun, argnums=0)                        # blocks [*in.shape, *in.shape]
+qb.vmap(fun, in_axes=0, out_axes=0)               # -> batched fun
 qb.jit(fun, device=None, static_argnums=(), max_traces=8)
 ```
 
@@ -131,28 +132,48 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8)
   other directly (`grad(grad(f))`, `jvp(grad(f), (x,), (v,))`,
   `jit(value_and_grad(f))`) and when a transformed function is called
   inside a function that another transform traces: `grad`,
-  `value_and_grad`, `jvp`, `vjp`, and `jit` stage their graph once per
-  signature and inline it into the enclosing trace, so a derivative can be
-  used inside a loss that is differentiated again:
+  `value_and_grad`, `jvp`, `vjp`, `vmap`, and `jit` stage their graph once
+  per signature and inline it into the enclosing trace, so a derivative can
+  be used inside a loss that is differentiated again:
 
   ```python
-  u_xx = qb.grad(qb.grad(lambda x, w: qb.sin(x * w)))  # scalar x
+  def u(x, w):                                          # one point, scalar x
+      return qb.sin(x * w)
+
+  u_xx = qb.vmap(qb.grad(qb.grad(u)), in_axes=(0, None))  # d2u/dx2 per point
 
   def loss(w, x):                                       # x: [n] points
-      residual = qb.stack([u_xx(x[i], w) for i in range(x.shape[0])], 0)
-      return qb.mean((residual + math.pi**2 * qb.sin(math.pi * x)) ** 2)
+      return qb.mean((u_xx(x, w) + math.pi**2 * qb.sin(math.pi * x)) ** 2)
 
   x = qb.linspace(0.05, 0.95, 8)
   value, grad_w = qb.jit(qb.value_and_grad(loss))(qb.array(2.5), x)
   ```
 
-  Eager array arguments of such an inner call bind as constants. The graph
-  grows linearly with the number of inner calls (per-point loops become a
-  `vmap` once it lands). `jacobian`/`hessian` cannot be called on traced
-  values or transformed further, calls on `vmap` tracers are not
-  supported yet, and second-order reverse mode through `fori`/`scan`
-  regions is rejected; these raise `quabla.UnsupportedOperationError`
-  (the region case a `ValueError`).
+  Eager array arguments of such an inner call bind as constants. Each
+  inner call adds its graph once, so per-point Python loops grow the graph
+  linearly; `vmap` keeps it independent of the number of points.
+  `jacobian`/`hessian` cannot be called on traced values or transformed
+  further, and second-order reverse mode through `fori`/`scan` regions is
+  rejected; these raise `quabla.UnsupportedOperationError` (the region case
+  a `ValueError`).
+- `vmap(fun, in_axes=0, out_axes=0)` vectorizes `fun`, which sees one
+  example, with JAX semantics. `in_axes` is an int (the mapped axis,
+  negative counts from the end), `None` (an argument shared by every
+  example), or a tuple, list, or dict of them matching the arguments as a
+  pytree prefix; all mapped axes must have one size, and Python scalars can
+  only be unmapped. `out_axes` places the batch axis of each result leaf
+  the same way: results that do not depend on a mapped argument are
+  broadcast over the batch, and `None` returns them unbatched (a mapped
+  result with `out_axes=None` is an error). `fun` is staged for one example
+  and the graph is batched node by node, so `vmap` composes with every
+  transform in both directions and with itself: `vmap(grad(f))`,
+  `jit(vmap(f))`, `grad` of a loss over `vmap`, `jvp`/`vjp` of `vmap`, and
+  `vmap(vmap(f))`. `vmap(grad(f, argnums=1), in_axes=(0, None))` returns
+  one gradient per example, `[B, *w.shape]`, as in JAX, while
+  `vjp(vmap(f, in_axes=(0, None)), x, w)` sums the unmapped gradient over
+  the batch, as reverse mode must. A mapped `solve`, `cond`, `fori`, or
+  `scan` raises `quabla.UnsupportedOperationError` (the deprecated
+  `tensor_vmap_*` helpers batch `fori`/`scan` bodies).
 - Closures and constants: an eager array (`Tensor` or `TensorView`,
   including a result such as `qb.sin(math.pi * 0.3)`) that meets a traced
   value becomes a constant of the graph. This covers arithmetic in either
@@ -677,6 +698,6 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - StableHLO export (`stablehlo_text`) covers only a small inspection subset
   and is not an execution path.
 - The legacy 2D `Matrix`/`TraceGraph` API is not migrated to the facade.
-- The v0.2 transforms run on the CPU only. `vmap` is not part of the v0.2
-  layer yet. `jacobian` and `hessian` are
-  dense and cannot be transformed further.
+- The v0.2 transforms run on the CPU only. `quabla.vmap` cannot batch
+  `solve` or `cond`/`fori`/`scan` regions over a mapped argument.
+  `jacobian` and `hessian` are dense and cannot be transformed further.

@@ -1,5 +1,5 @@
 """Composable function transforms on the CPU (docs/api_v0_2_design.md,
-sections 3.3-3.5 and 3.11, decisions D5-D8 and D16-D17; slice S2).
+sections 3.3-3.5 and 3.11, decisions D5-D8 and D16-D17; slices S2-S4).
 
 Every transform is staged, as `jit` is: the first call with a new argument
 signature traces the function into a Tensor IR graph, applies the symbolic
@@ -29,8 +29,10 @@ dtypes in a graph of its own, cached per signature like a compiled program,
 and inlines that graph into the enclosing trace (`TensorIr::inline`): its
 inputs bind to the tracers, so a derivative can be used inside a loss that
 is differentiated again. `jit` of a plain Python function traces through it
-instead, which is exact. `jacobian` and `hessian` evaluate column by column
-and cannot be staged or inlined until `vmap` exists.
+instead, which is exact. `vmap` stages its function for one example and
+splices that graph batched into its own (`TensorIr::inline_batched`, slice
+S4), so it composes the same way. `jacobian` and `hessian` evaluate column
+by column and cannot be staged or inlined yet.
 """
 
 import inspect
@@ -40,14 +42,28 @@ from . import _quabla
 from ._array import asarray, eye, zeros
 from ._errors import RetraceLimitError, UnsupportedOperationError
 from ._quabla import Tensor, TensorTraceGraph, TraceTensor, bool_, stack
-from .tree import _LEAF, _flatten, _leaf_count, _leaf_paths, _unflatten
+from .tree import _LEAF, _describe, _flatten, _leaf_count, _leaf_paths, _unflatten
 
-__all__ = ["grad", "hessian", "jacobian", "jit", "jvp", "value_and_grad", "vjp"]
+__all__ = ["grad", "hessian", "jacobian", "jit", "jvp", "value_and_grad", "vjp", "vmap"]
 
 _STATIC_TYPES = (bool, int, float)
-# Leaves that become graph inputs when a function is staged: arrays, and the
-# tracers of an enclosing trace when a transformed function is inlined.
-_ARRAY_LEAVES = (Tensor, TraceTensor)
+
+
+class _Aval:
+    """The shape and dtype of an array leaf without data: `vmap` stages its
+    function for one example with these leaves."""
+
+    __slots__ = ("shape", "dtype")
+
+    def __init__(self, shape, dtype):
+        self.shape = shape
+        self.dtype = dtype
+
+
+# Leaves that become graph inputs when a function is staged: arrays, the
+# tracers of an enclosing trace when a transformed function is inlined, and
+# the per-example leaves of `vmap`.
+_ARRAY_LEAVES = (Tensor, TraceTensor, _Aval)
 _DEFAULT_MAX_TRACES = 8
 # Graph input names starting with `__quabla_` are reserved (design 3.11).
 _TANGENT_PREFIX = "__quabla_tangent/"
@@ -191,8 +207,9 @@ def _traced_signature(args, static_argnums, converted_argnums):
             if kind is TraceTensor:
                 if leaf._batched:
                     raise UnsupportedOperationError(
-                        "a transformed function was called on a batched tracer inside vmap; "
-                        "composing transforms with vmap is not implemented yet",
+                        "a transformed function was called on a batched tracer of a "
+                        "tensor_vmap_* helper; batch transformed functions with quabla.vmap "
+                        "instead",
                         op="nested transform",
                     )
                 bindings.append(leaf)
@@ -291,7 +308,7 @@ def _trace(fun, in_node, leaves, names):
     input_names = []
     for leaf, name in zip(leaves, names):
         kind = type(leaf)
-        if kind is Tensor or kind is TraceTensor:
+        if kind is Tensor or kind is TraceTensor or kind is _Aval:
             values.append(graph.input(name, leaf.shape, leaf.dtype))
             input_names.append(name)
         elif kind is _Static:
@@ -485,6 +502,18 @@ class _Transform:
     def _names(self, in_node):
         return _leaf_names(self._root, in_node)
 
+    def __call__(self, *args):
+        converted = self._converted_positions(len(args))
+        in_node, leaves, arrays, key, traced = _signature(args, (), converted)
+        if traced:
+            return self._call_traced(args, (), converted)
+        program = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
+        return program.run(arrays)
+
+    def _compile(self, in_node, leaves):
+        staged = self._stage(in_node, leaves, self._names(in_node))
+        return _Program(staged.graph, staged.input_names, staged.outputs, staged.out_node)
+
     def _call_traced(self, args, static_argnums, converted_argnums):
         """A call on tracers of an enclosing trace: stages this transform for
         their shapes and dtypes and inlines it into that trace."""
@@ -596,18 +625,6 @@ class _ValueAndGrad(_Transform):
             out_node = grads_node
         return _Staged(graph, staged.input_names, outputs, out_node)
 
-    def __call__(self, *args):
-        converted = self._converted_positions(len(args))
-        in_node, leaves, arrays, key, traced = _signature(args, (), converted)
-        if traced:
-            return self._call_traced(args, (), converted)
-        program = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
-        return program.run(arrays)
-
-    def _compile(self, in_node, leaves):
-        staged = self._stage(in_node, leaves, self._names(in_node))
-        return _Program(staged.graph, staged.input_names, staged.outputs, staged.out_node)
-
 
 class _Jit(_Transform):
     def __init__(self, fun, device, static_argnums, max_traces):
@@ -649,10 +666,6 @@ class _Jit(_Transform):
             return self._fun(*args)
         program = self._trace_cache().lookup(key, lambda: self._compile(in_node, leaves), self)
         return program.run(arrays)
-
-    def _compile(self, in_node, leaves):
-        staged = self._stage(in_node, leaves, self._names(in_node))
-        return _Program(staged.graph, staged.input_names, staged.outputs, staged.out_node)
 
 
 def _check_device(device):
@@ -944,6 +957,176 @@ class _Vjp(_Transform):
         return staged, reverse, cotangent_specs, out_node
 
 
+# -- vectorization -------------------------------------------------------------------
+
+
+def _axes_config(axes, what):
+    """`in_axes`/`out_axes` in a hashable form: an int or `None` applies to
+    a whole subtree, and tuples, lists, and dicts of them are pytree
+    prefixes. `None` is a leaf here, unlike in argument pytrees."""
+    if axes is None or (isinstance(axes, int) and not isinstance(axes, bool)):
+        return axes
+    kind = type(axes)
+    if kind is tuple or kind is list:
+        return (tuple, tuple(_axes_config(child, what) for child in axes))
+    if kind is dict:
+        if not all(type(key) is str for key in axes):
+            raise TypeError(f"vmap {what} dict keys must be strings, got {axes!r}")
+        keys = tuple(sorted(axes))
+        return (dict, keys, tuple(_axes_config(axes[key], what) for key in keys))
+    raise TypeError(
+        f"vmap {what} must be an int, None, or a tuple, list, or dict of them, got {axes!r}"
+    )
+
+
+def _leaf_axes(spec, node, axes, what):
+    """Appends the axis of every leaf of the structure `node` to `axes`,
+    where `spec` (from `_axes_config`) is a prefix of that structure. Lists
+    and tuples match each other, as their leaves are positional in both."""
+    if spec is None or isinstance(spec, int):
+        axes.extend([spec] * _leaf_count(node))
+        return
+    if spec[0] is tuple and type(node) is tuple and node[0] in (tuple, list):
+        if len(spec[1]) == len(node[1]):
+            for child_spec, child in zip(spec[1], node[1]):
+                _leaf_axes(child_spec, child, axes, what)
+            return
+    elif spec[0] is dict and type(node) is tuple and node[0] is dict and spec[1] == node[1]:
+        for child_spec, child in zip(spec[2], node[2]):
+            _leaf_axes(child_spec, child, axes, what)
+        return
+    raise ValueError(
+        f"vmap {what} {_render_axes(spec)!r} does not match the structure {_describe(node)} of "
+        f"the {'arguments' if what == 'in_axes' else 'result'}: give an int or None, or a "
+        "tuple/dict with one entry per element"
+    )
+
+
+def _render_axes(spec):
+    """The user-facing form of an `_axes_config` spec, for messages."""
+    if spec is None or isinstance(spec, int):
+        return spec
+    if spec[0] is dict:
+        return {key: _render_axes(child) for key, child in zip(spec[1], spec[2])}
+    return tuple(_render_axes(child) for child in spec[1])
+
+
+def _move_batch_axis(value, axis):
+    """`value` (batch axis leading) with the batch axis moved to `axis`."""
+    if axis == 0:
+        return value
+    rank = len(value.shape)
+    return value.transpose(list(range(1, axis + 1)) + [0] + list(range(axis + 1, rank)))
+
+
+class _Vmap(_Transform):
+    """Vectorization by staging: the function is staged for one example
+    (the mapped axes removed), then that graph is spliced into the caller's
+    graph with every node that depends on a mapped argument batched
+    (`TensorIr::inline_batched`). The result is an ordinary graph, so vmap
+    composes with every transform, including another vmap."""
+
+    def __init__(self, fun, in_axes, out_axes):
+        in_config = _axes_config(in_axes, "in_axes")
+        out_config = _axes_config(out_axes, "out_axes")
+        super().__init__(fun, ("vmap", in_config, out_config))
+        self._in_axes = in_config
+        self._out_axes = out_config
+
+    def _stage(self, in_node, leaves, names):
+        in_axes = []
+        _leaf_axes(self._in_axes, in_node, in_axes, "in_axes")
+        graph = TensorTraceGraph()
+        example_leaves = []
+        bound = {}
+        batch = None
+        for leaf, name, axis in zip(leaves, names, in_axes):
+            if type(leaf) not in _ARRAY_LEAVES:
+                if axis is not None:
+                    value = leaf.value if type(leaf) is _Static else leaf
+                    raise ValueError(
+                        f"vmap cannot map the static argument leaf {name!r} ({value!r}) along "
+                        f"axis {axis}: Python scalars are constants; pass an array to map it, "
+                        "or give it in_axes None"
+                    )
+                example_leaves.append(leaf)
+                continue
+            tracer = graph.input(name, leaf.shape, leaf.dtype)
+            if axis is None:
+                example_leaves.append(_Aval(leaf.shape, leaf.dtype))
+                bound[name] = (tracer, False)
+                continue
+            shape = list(leaf.shape)
+            if not -len(shape) <= axis < len(shape):
+                raise ValueError(
+                    f"vmap in_axes {axis} is out of range for the argument leaf {name!r} of "
+                    f"shape {shape}"
+                )
+            axis %= len(shape)
+            if batch is None:
+                batch = shape[axis]
+            elif shape[axis] != batch:
+                raise ValueError(
+                    f"vmap got inconsistent sizes for the mapped axes: {name!r} has "
+                    f"{shape[axis]} along axis {axis}, the earlier mapped leaves {batch}"
+                )
+            if axis:
+                tracer = tracer.transpose([axis] + [a for a in range(len(shape)) if a != axis])
+            example_leaves.append(_Aval(shape[:axis] + shape[axis + 1 :], leaf.dtype))
+            bound[name] = (tracer, True)
+        if batch is None:
+            raise ValueError(
+                "vmap needs at least one mapped array argument, but in_axes maps none"
+            )
+        inner = _stage(self._fun, in_node, example_leaves, names)
+        traced = [output for output in inner.outputs if _is_traced(output)]
+        if traced:
+            bindings = [bound[name] for name in inner.input_names]
+            spliced = iter(
+                inner.graph._inline_batched(
+                    inner.input_names,
+                    [tracer for tracer, _ in bindings],
+                    [mapped for _, mapped in bindings],
+                    batch,
+                    traced,
+                )
+            )
+        out_axes = []
+        _leaf_axes(self._out_axes, inner.out_node, out_axes, "out_axes")
+        outputs = []
+        for output, out_axis in zip(inner.outputs, out_axes):
+            mapped = False
+            if _is_traced(output):
+                output, mapped = next(spliced)
+            outputs.append(_place_output(graph, output, mapped, out_axis, batch))
+        input_names = [name for name in names if name in bound]
+        return _Staged(graph, input_names, outputs, inner.out_node)
+
+
+def _place_output(graph, value, mapped, out_axis, batch):
+    """A vmap result leaf in the caller's layout: its batch axis at
+    `out_axis`, where an unmapped value is broadcast over the batch, or the
+    unmapped value itself for `out_axis=None`."""
+    if out_axis is None:
+        if mapped:
+            raise ValueError(
+                "vmap out_axes=None requires an output that does not depend on the mapped "
+                "arguments, but this output does; give it an integer out_axes"
+            )
+        return value
+    if not _is_traced(value):
+        value = graph._constant(value if isinstance(value, Tensor) else asarray(value))
+    if not mapped:
+        value = value.broadcast_to([batch] + list(value.shape))
+    rank = len(value.shape)
+    if not -rank <= out_axis < rank:
+        raise ValueError(
+            f"vmap out_axes {out_axis} is out of range for an output of rank {rank} "
+            "(batch axis included)"
+        )
+    return _move_batch_axis(value, out_axis % rank)
+
+
 # -- dense Jacobians ------------------------------------------------------------------
 
 
@@ -983,7 +1166,7 @@ class _Jacobian(_Transform):
         return UnsupportedOperationError(
             f"{self!r} cannot be transformed further or called on traced values: {kind} "
             "evaluates one forward-mode column per input element instead of staging a single "
-            "program, and staging it needs vmap, which is not implemented yet. Inside a traced "
+            "program, and it is not staged through vmap yet. Inside a traced "
             "function, use grad(grad(f)) for the second derivative of a scalar function, or "
             "jvp(grad(f), (x,), (v,)) for a Hessian-vector product",
             op=kind,
@@ -1205,3 +1388,18 @@ def hessian(fun, argnums=0):
     `jacobian(grad(fun, argnums), argnums)`: blocks of shape
     `[*in.shape, *in.shape]`, evaluated forward-over-reverse on the CPU."""
     return _Jacobian(_ValueAndGrad(fun, argnums, False, "grad"), argnums, "hessian")
+
+
+def vmap(fun, in_axes=0, out_axes=0):
+    """`fun` vectorized over a batch axis, with JAX semantics. `in_axes`
+    gives the mapped axis of each argument (an int), or `None` for an
+    argument shared by every example; an int or `None` applies to every
+    leaf of an argument, and a tuple, list, or dict gives axes per element
+    as a pytree prefix of the arguments. The mapped axes must agree in size.
+    `out_axes` places the batch axis of each result leaf the same way;
+    `None` requires a result that does not depend on the mapped arguments.
+    `fun` sees one example, without the mapped axes. Staged and cached like
+    the other transforms; composes with them and with itself: for example
+    `vmap(grad(grad(u)), in_axes=(0, None))` is the second derivative of a
+    scalar `u(x, w)` at every point of `x`."""
+    return _Vmap(fun, in_axes, out_axes)

@@ -7,10 +7,10 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use quabla_core::tensor_ir::{
-    CudaBackend, CudaDataParallelExecutionPlan, CudaDataParallelTiming, CudaExecutionPlan,
-    DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs, SymbolicCotangent, TensorBackend,
-    TensorComparison, TensorCondExecutionPlan, TensorDType, TensorExecutionPlan,
-    TensorForiExecutionPlan, TensorIr, TensorNodeId, TensorReplicaReduction,
+    BatchingError, CudaBackend, CudaDataParallelExecutionPlan, CudaDataParallelTiming,
+    CudaExecutionPlan, DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs,
+    SymbolicCotangent, TensorBackend, TensorComparison, TensorCondExecutionPlan, TensorDType,
+    TensorExecutionPlan, TensorForiExecutionPlan, TensorIr, TensorNodeId, TensorReplicaReduction,
     TensorScanExecutionPlan,
 };
 use quabla_core::{
@@ -19,7 +19,7 @@ use quabla_core::{
 };
 
 use crate::dtype::PyDType;
-use crate::errors::{concrete_value_error, tracer_error};
+use crate::errors::{concrete_value_error, tracer_error, unsupported_operation_error};
 use crate::tensor::bool_operation_error;
 use crate::tensor::{
     extract_scalar, parse_axis_indices, parse_tensor_indices, PyTensor, PyTensorView, TensorIndex,
@@ -789,8 +789,9 @@ impl TensorTraceGraph {
     /// Splices `outputs` of this staged graph into the graph of the traced
     /// bindings (see [`TensorIr::inline`]) and returns them as tracers there.
     /// `bindings[i]` binds input `input_names[i]`; a scalar binding becomes
-    /// a constant of that input's dtype. Unbatched tracers only: `vmap`
-    /// composition is slice S4 of docs/api_v0_2_design.md.
+    /// a constant of that input's dtype. The tracers of the `tensor_vmap_*`
+    /// helpers are rejected; `quabla.vmap` batches through
+    /// [`Self::inline_batched_into`] instead.
     pub fn inline_into(
         &self,
         input_names: &[String],
@@ -865,6 +866,84 @@ impl TensorTraceGraph {
                     node_id,
                     ir.node_shape(node_id)?,
                     None,
+                ))
+            })
+            .collect()
+    }
+}
+
+impl TensorTraceGraph {
+    /// Splices `outputs` of this staged per-example graph into the graph of
+    /// the traced bindings, vectorized over `batch_size` examples (see
+    /// [`TensorIr::inline_batched`]); this is how `quabla.vmap` stages its
+    /// function. `bindings[i]` binds input `input_names[i]` and is mapped
+    /// (leading batch axis) when `mapped[i]` is set. Returns each output as
+    /// a tracer of the enclosing graph with its mapped flag.
+    pub fn inline_batched_into(
+        &self,
+        input_names: &[String],
+        bindings: &[TraceTensor],
+        mapped: &[bool],
+        batch_size: usize,
+        outputs: &[TraceTensor],
+    ) -> Result<Vec<(TraceTensor, bool)>, BatchingError> {
+        self.ensure_owns(&outputs.iter().collect::<Vec<_>>())?;
+        if input_names.len() != bindings.len() || input_names.len() != mapped.len() {
+            return Err(BatchingError::Invalid(format!(
+                "{} callee inputs with {} bindings and {} mapped flags",
+                input_names.len(),
+                bindings.len(),
+                mapped.len()
+            )));
+        }
+        let target = bindings
+            .first()
+            .map(|tensor| tensor.graph.clone())
+            .ok_or_else(|| "vmap needs at least one traced binding".to_string())?;
+        target
+            .ensure_owns(&bindings.iter().collect::<Vec<_>>())
+            .map_err(|_| "the bindings of a vmap splice belong to different traces".to_string())?;
+        if bindings.iter().any(|tensor| tensor.batch_axis.is_some()) {
+            return Err(BatchingError::Invalid(
+                "a batched tracer of a tensor_vmap_* helper cannot be bound to a vmap splice"
+                    .to_string(),
+            ));
+        }
+        if Arc::ptr_eq(&self.ir, &target.ir) {
+            return Err(BatchingError::Invalid(
+                "a staged graph cannot be inlined into itself".to_string(),
+            ));
+        }
+        let callee = self
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let mut ir = target
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let mut bound = BTreeMap::new();
+        for ((name, binding), is_mapped) in input_names.iter().zip(bindings).zip(mapped) {
+            if bound
+                .insert(name.clone(), (binding.node_id, *is_mapped))
+                .is_some()
+            {
+                return Err(BatchingError::Invalid(format!(
+                    "callee input {name:?} is bound twice"
+                )));
+            }
+        }
+        let output_ids = outputs
+            .iter()
+            .map(|output| output.node_id)
+            .collect::<Vec<_>>();
+        let spliced = ir.inline_batched(&callee, &bound, batch_size, &output_ids)?;
+        spliced
+            .into_iter()
+            .map(|(node_id, is_mapped)| {
+                Ok((
+                    TraceTensor::from_node(target.clone(), node_id, ir.node_shape(node_id)?, None),
+                    is_mapped,
                 ))
             })
             .collect()
@@ -2285,6 +2364,41 @@ impl TensorTraceGraph {
             .collect::<PyResult<Vec<_>>>()?;
         self.inline_into(&input_names, &bindings, &outputs)
             .map_err(PyValueError::new_err)
+    }
+
+    /// `inline_batched_into` for `quabla._transforms` (`quabla.vmap`): a
+    /// mapped op without a batching rule raises `UnsupportedOperationError`.
+    #[pyo3(name = "_inline_batched")]
+    fn py_inline_batched(
+        &self,
+        py: Python<'_>,
+        input_names: Vec<String>,
+        bindings: Vec<TraceTensor>,
+        mapped: Vec<bool>,
+        batch_size: usize,
+        outputs: Vec<TraceTensor>,
+    ) -> PyResult<Vec<(TraceTensor, bool)>> {
+        self.inline_batched_into(&input_names, &bindings, &mapped, batch_size, &outputs)
+            .map_err(|error| match &error {
+                BatchingError::Unsupported { op } => {
+                    unsupported_operation_error(py, error.to_string(), op)
+                }
+                BatchingError::Invalid(message) => PyValueError::new_err(message.clone()),
+            })
+    }
+
+    /// An eager tensor as a constant of this graph, keeping its dtype and
+    /// weak type (the constants of `quabla.vmap` and `quabla.jacobian`).
+    #[pyo3(name = "_constant")]
+    fn py_constant(&self, value: PyRef<'_, PyTensor>) -> PyResult<TraceTensor> {
+        let dynamic = value.to_dynamic_tensor().map_err(PyValueError::new_err)?;
+        let mut ir = self
+            .ir
+            .lock()
+            .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?;
+        let node_id = ir.constant(dynamic, value.is_weak());
+        let shape = ir.node_shape(node_id).map_err(PyValueError::new_err)?;
+        Ok(TraceTensor::from_node(self.clone(), node_id, shape, None))
     }
 
     /// Number of nodes in the graph, including nodes no output depends on.
