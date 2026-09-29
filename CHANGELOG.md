@@ -5,6 +5,40 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before
 1.0, minor releases may change the public API.
 
+## [Unreleased]
+
+Work toward the v0.2 JAX-style Python API described in
+`docs/api_v0_2_design.md` (slices S0 through S4b of S0-S9). All v0.1 names
+keep working unchanged.
+
+### Added
+
+- **Packaging.** The Python package is a mixed Rust/Python project: a
+  pure-Python `quabla` package over the compiled `quabla._quabla` extension.
+- **Arrays and NumPy.** `quabla.array`/`asarray` from nested lists, scalars,
+  and NumPy arrays; `zeros`, `ones`, `full`, `arange`, `linspace`, `eye`;
+  `Tensor.numpy()`, `tolist()`, `item()`, `__array__`, and the buffer
+  protocol; module-level math functions such as `quabla.sin`; `-x` and
+  `x ** n` on traced values.
+- **Pow.** A differentiable elementwise `Pow` op on CPU, CUDA, and MLX,
+  exposed as `quabla.power` and `x ** y` for float and tensor exponents.
+- **Function transforms.** `grad`, `value_and_grad`, `jvp`, `vjp`,
+  `jacobian`, `hessian`, `jit`, and `vmap` with `argnums`, `has_aux`,
+  pytrees (`quabla.tree`), and trace-on-first-call caching. Transforms nest
+  inside traced functions, eager arrays and closed-over tracers are captured
+  automatically, and the canonical PINN form
+  `vmap(grad(grad(u)), in_axes=(0, None))` works. New error classes
+  `QuablaError`, `TracerError`, `RetraceLimitError`, and
+  `UnsupportedOperationError`.
+
+### Fixed
+
+- Square-root derivatives are NaN for negative inputs, including `-inf`, on
+  every backend; MLX previously returned 0 and CPU/CUDA returned 0 or inf at
+  `-inf`.
+- Symbolic Hessians, HVPs, and zero gradients no longer turn into NaN when an
+  input or the loss value is infinite or NaN.
+
 ## [0.1.0] - 2026-09-28
 
 First public release: a research-grade, source-only pre-release published as a
@@ -97,4 +131,5 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/latteine1217/quabla/releases/tag/v0.1.0
