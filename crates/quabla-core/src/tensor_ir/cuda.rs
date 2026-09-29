@@ -19,7 +19,7 @@ use cudarc::nvrtc::compile_ptx;
 use cudarc::nccl::{group_end, group_start, Comm as NcclComm, ReduceOp as NcclReduceOp};
 
 use super::{
-    contiguous_strides, element_count, sqrt_derivative_coefficient, tensor_op_inputs,
+    contiguous_strides, cuda_sqrt_derivative_expression, element_count, tensor_op_inputs,
     DynamicTensor, TensorBackend, TensorDType, TensorDeviceBackend, TensorExecutionPlan,
     TensorForiExecutionPlan, TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget,
     TensorFusionRegion, TensorNodeId, TensorOp, TensorReplicaReduction, TensorScanExecutionPlan,
@@ -4175,12 +4175,7 @@ fn cuda_fori_body_expression(
         TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
         TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
         TensorOp::SqrtDerivative { input, order } => {
-            let input = child(*input)?;
-            let coefficient = cuda_float_literal(sqrt_derivative_coefficient(*order));
-            let exponent = cuda_float_literal(0.5 - *order as f64);
-            Ok(format!(
-                "(({input} == 0.0f) ? 0.0f : ({coefficient} * powf({input}, {exponent})))"
-            ))
+            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
         }
         TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
         TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
@@ -4313,12 +4308,7 @@ fn cuda_scan_body_expression_in_half(
         TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
         TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
         TensorOp::SqrtDerivative { input, order } => {
-            let input = child(*input)?;
-            let coefficient = cuda_float_literal(sqrt_derivative_coefficient(*order));
-            let exponent = cuda_float_literal(0.5 - *order as f64);
-            Ok(format!(
-                "(({input} == 0.0f) ? 0.0f : ({coefficient} * powf({input}, {exponent})))"
-            ))
+            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
         }
         TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
         TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
@@ -4443,12 +4433,7 @@ fn cuda_elementwise_plan_expression_with_index(
         TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
         TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
         TensorOp::SqrtDerivative { input, order } => {
-            let input = child(*input)?;
-            let coefficient = cuda_float_literal(sqrt_derivative_coefficient(*order));
-            let exponent = cuda_float_literal(0.5 - *order as f64);
-            Ok(format!(
-                "(({input} == 0.0f) ? 0.0f : ({coefficient} * powf({input}, {exponent})))"
-            ))
+            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
         }
         TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
         TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
@@ -6640,11 +6625,7 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                     TensorOp::Exp { .. } => "expf(input[index])".to_string(),
                     TensorOp::Sqrt { .. } => "sqrtf(input[index])".to_string(),
                     TensorOp::SqrtDerivative { order, .. } => {
-                        let coefficient = cuda_float_literal(sqrt_derivative_coefficient(*order));
-                        let exponent = cuda_float_literal(0.5 - *order as f64);
-                        format!(
-                            "input[index] == 0.0f ? 0.0f : {coefficient} * powf(input[index], {exponent})"
-                        )
+                        cuda_sqrt_derivative_expression("input[index]", *order)
                     }
                     TensorOp::Sin { .. } => "sinf(input[index])".to_string(),
                     TensorOp::Cos { .. } => "cosf(input[index])".to_string(),

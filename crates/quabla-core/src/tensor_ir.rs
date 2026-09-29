@@ -1682,18 +1682,11 @@ impl DynamicTensor {
     }
 
     fn sqrt_derivative(&self, order: u32) -> Result<Self, String> {
-        let coefficient = sqrt_derivative_coefficient(order);
         Self::new(
             self.shape.clone(),
             self.data
                 .iter()
-                .map(|value| {
-                    if *value == 0.0 {
-                        0.0
-                    } else {
-                        coefficient * value.powf(0.5 - order as f64)
-                    }
-                })
+                .map(|value| sqrt_derivative_value(*value, order))
                 .collect(),
         )
     }
@@ -10939,12 +10932,7 @@ fn cuda_expression(nodes: &[TensorNode], node_id: TensorNodeId) -> Result<String
         TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
         TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
         TensorOp::SqrtDerivative { input, order } => {
-            let input = child(*input)?;
-            let coefficient = cuda_scalar_literal(sqrt_derivative_coefficient(*order));
-            let exponent = cuda_scalar_literal(0.5 - *order as f64);
-            Ok(format!(
-                "(({input} == 0.0f) ? 0.0f : ({coefficient} * powf({input}, {exponent})))"
-            ))
+            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
         }
         TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
         TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
@@ -11038,12 +11026,7 @@ fn cuda_region_expression(
         TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
         TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
         TensorOp::SqrtDerivative { input, order } => {
-            let input = child(*input)?;
-            let coefficient = cuda_scalar_literal(sqrt_derivative_coefficient(*order));
-            let exponent = cuda_scalar_literal(0.5 - *order as f64);
-            Ok(format!(
-                "(({input} == 0.0f) ? 0.0f : ({coefficient} * powf({input}, {exponent})))"
-            ))
+            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
         }
         TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
         TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
@@ -11298,12 +11281,7 @@ fn evaluate_fused_element(
             Ok(value.sqrt())
         }
         TensorOp::SqrtDerivative { input, order } => {
-            let value = child(*input)?;
-            Ok(if value == 0.0 {
-                0.0
-            } else {
-                sqrt_derivative_coefficient(*order) * value.powf(0.5 - *order as f64)
-            })
+            Ok(sqrt_derivative_value(child(*input)?, *order))
         }
         TensorOp::Sin { input } => Ok(child(*input)?.sin()),
         TensorOp::Cos { input } => Ok(child(*input)?.cos()),
@@ -12811,6 +12789,36 @@ fn pow_second_derivatives(base: f64, exponent: f64) -> [f64; 4] {
         )
     };
     [base_base, base_exponent, exponent_base, exponent_exponent]
+}
+
+/// The `order`-th derivative of `sqrt` (order 0 is `sqrt` itself), the CPU
+/// reference that the CUDA and MLX lowerings reproduce.
+///
+/// Every order is `0` at `+-0`, the zero subgradient that keeps higher-order
+/// AD away from `0 * inf` at the origin. A negative input, `-inf` included, is
+/// outside the domain and gives NaN as IEEE `sqrt` does; the explicit branch
+/// is needed because `powf(-inf, y)` is `inf` or `0` rather than NaN. NaN
+/// propagates through `powf`.
+fn sqrt_derivative_value(value: f64, order: u32) -> f64 {
+    if value == 0.0 {
+        0.0
+    } else if value < 0.0 {
+        f64::NAN
+    } else {
+        sqrt_derivative_coefficient(order) * value.powf(0.5 - order as f64)
+    }
+}
+
+/// CUDA C for [`sqrt_derivative_value`] applied to the `float` expression
+/// `input`. `powf` alone would give `inf` or `0` at `-inf`, so negative
+/// inputs select a quiet NaN explicitly.
+fn cuda_sqrt_derivative_expression(input: &str, order: u32) -> String {
+    let coefficient = cuda_scalar_literal(sqrt_derivative_coefficient(order));
+    let exponent = cuda_scalar_literal(0.5 - order as f64);
+    format!(
+        "(({input} == 0.0f) ? 0.0f : (({input} < 0.0f) ? __int_as_float(0x7fc00000) : \
+         ({coefficient} * powf({input}, {exponent}))))"
+    )
 }
 
 fn sqrt_derivative_coefficient(order: u32) -> f64 {

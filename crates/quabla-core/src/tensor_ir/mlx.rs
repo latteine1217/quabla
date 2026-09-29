@@ -915,9 +915,13 @@ impl MlxBackend {
                 TensorOp::Sqrt { input } => mlx_value(&values, *input)?
                     .sqrt_device(&stream)
                     .map_err(|error| error.to_string()),
+                // Matches the CPU `sqrt_derivative_value`: zero at +-0, NaN for every negative
+                // input (`-inf` included, where `power` alone is not NaN), and NaN propagated
+                // through `power`.
                 TensorOp::SqrtDerivative { input, order } => {
                     let input = mlx_value(&values, *input)?;
                     let zero = Array::from_f32(0.0);
+                    let nan = Array::from_f32(f32::NAN);
                     let exponent = Array::from_f32(0.5 - *order as f32);
                     let coefficient = Array::from_f32(sqrt_derivative_coefficient(*order) as f32);
                     let power = input
@@ -926,10 +930,15 @@ impl MlxBackend {
                     let scaled = power
                         .multiply_device(&coefficient, &stream)
                         .map_err(|error| error.to_string())?;
-                    let positive = input
-                        .gt_device(&zero, &stream)
+                    let negative = input
+                        .lt_device(&zero, &stream)
                         .map_err(|error| error.to_string())?;
-                    ops::r#where_device(&positive, &scaled, &zero, &stream)
+                    let domain = ops::r#where_device(&negative, &nan, &scaled, &stream)
+                        .map_err(|error| error.to_string())?;
+                    let origin = input
+                        .eq_device(&zero, &stream)
+                        .map_err(|error| error.to_string())?;
+                    ops::r#where_device(&origin, &zero, &domain, &stream)
                         .map_err(|error| error.to_string())
                 }
                 TensorOp::Sin { input } => mlx_value(&values, *input)?

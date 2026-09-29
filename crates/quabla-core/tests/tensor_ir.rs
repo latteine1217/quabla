@@ -8082,7 +8082,7 @@ fn pow_fuses_into_elementwise_kernels_and_exports_stablehlo() {
     all(feature = "mlx", target_os = "macos"),
     all(feature = "cuda", target_os = "linux")
 ))]
-type PowDeviceCase = (QuablaMultiOutputProgram, BTreeMap<String, DynamicTensor>);
+type DeviceParityCase = (QuablaMultiOutputProgram, BTreeMap<String, DynamicTensor>);
 
 /// f32 device programs: pow values at the edge cases; gradients in both
 /// operands with a forward-over-reverse directional derivative of each; and a
@@ -8092,7 +8092,7 @@ type PowDeviceCase = (QuablaMultiOutputProgram, BTreeMap<String, DynamicTensor>)
     all(feature = "mlx", target_os = "macos"),
     all(feature = "cuda", target_os = "linux")
 ))]
-fn pow_device_programs() -> Result<Vec<PowDeviceCase>, String> {
+fn pow_device_programs() -> Result<Vec<DeviceParityCase>, String> {
     let base = [
         0.0,
         0.0,
@@ -8185,9 +8185,9 @@ fn pow_device_programs() -> Result<Vec<PowDeviceCase>, String> {
     all(feature = "mlx", target_os = "macos"),
     all(feature = "cuda", target_os = "linux")
 ))]
-fn assert_pow_device_parity(target: QuablaTarget) {
+fn assert_device_parity(target: QuablaTarget, programs: Result<Vec<DeviceParityCase>, String>) {
     let compiler = QuablaCompiler;
-    for (index, (program, inputs)) in must!(pow_device_programs()).into_iter().enumerate() {
+    for (index, (program, inputs)) in must!(programs).into_iter().enumerate() {
         let cpu = must!(must!(compiler.compile_many(&program, QuablaTarget::Cpu)).execute(&inputs));
         let device = must!(must!(compiler.compile_many(&program, target)).execute(&inputs));
         assert_eq!(device.len(), cpu.len());
@@ -8213,7 +8213,7 @@ fn assert_pow_device_parity(target: QuablaTarget) {
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
 fn mlx_pow_values_derivatives_and_loop_bodies_match_cpu() {
-    assert_pow_device_parity(QuablaTarget::Mlx);
+    assert_device_parity(QuablaTarget::Mlx, pow_device_programs());
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
@@ -8222,7 +8222,10 @@ fn cuda_pow_values_derivatives_and_loop_bodies_match_cpu_when_enabled() {
     if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
         return;
     }
-    assert_pow_device_parity(QuablaTarget::Cuda { device_ordinal: 0 });
+    assert_device_parity(
+        QuablaTarget::Cuda { device_ordinal: 0 },
+        pow_device_programs(),
+    );
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
@@ -8257,4 +8260,155 @@ fn cuda_fuses_pow_chains_into_one_region_when_enabled() {
     for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
         assert!((actual - expected).abs() < 1e-5, "{actual} vs {expected}");
     }
+}
+
+/// `sqrt` inputs across its domain edges: negative (finite and infinite),
+/// signed zeros, positive (finite and infinite), and NaN.
+const SQRT_EDGE_INPUTS: [f64; 9] = [
+    -4.0,
+    -1.0e-3,
+    f64::NEG_INFINITY,
+    -0.0,
+    0.0,
+    0.25,
+    4.0,
+    f64::INFINITY,
+    f64::NAN,
+];
+
+/// Value, gradient, and forward-over-reverse directional derivative of an
+/// elementwise `sqrt`, as outputs `[sqrt, d sqrt, jvp(sqrt), jvp(d sqrt)]`.
+/// The cotangent is a vector, so no reduction takes part and the outputs are
+/// `sqrt` and its `SqrtDerivative` orders 1 and 2 scaled by the unit seeds.
+fn sqrt_derivative_program(
+    dtype: TensorDType,
+) -> Result<(QuablaMultiOutputProgram, BTreeMap<String, DynamicTensor>), String> {
+    let count = SQRT_EDGE_INPUTS.len();
+    let mut graph = TensorIr::new();
+    let x = graph.input_typed("x", vec![count], dtype)?;
+    let root = graph.sqrt(x)?;
+    let reverse = graph.symbolic_vjp(root, "cotangent")?;
+    let forward = reverse.graph.symbolic_jvp_many_with_tangent_inputs(
+        &[reverse.value, reverse.gradients["x"]],
+        &BTreeMap::from([("x".to_string(), "dx".to_string())]),
+    )?;
+    let mut outputs = forward.values.clone();
+    outputs.extend(&forward.tangents);
+    let program = QuablaMultiOutputProgram::new(forward.graph, outputs)?;
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            DynamicTensor::new(vec![count], SQRT_EDGE_INPUTS.to_vec())?,
+        ),
+        (
+            "cotangent".to_string(),
+            DynamicTensor::filled(vec![count], 1.0)?,
+        ),
+        ("dx".to_string(), DynamicTensor::filled(vec![count], 1.0)?),
+    ]);
+    Ok((program, inputs))
+}
+
+#[test]
+fn sqrt_derivatives_are_nan_below_zero_and_zero_at_the_origin() {
+    let nan = f64::NAN;
+    let inf = f64::INFINITY;
+    // Columns follow SQRT_EDGE_INPUTS. Every negative input, -inf included, is outside the
+    // domain (NaN, as IEEE sqrt); every derivative order at +-0 is the zero subgradient.
+    let expected_value = [nan, nan, nan, 0.0, 0.0, 0.5, 2.0, inf, nan];
+    let expected_first = [nan, nan, nan, 0.0, 0.0, 1.0, 0.25, 0.0, nan];
+    let expected_second = [nan, nan, nan, 0.0, 0.0, -2.0, -0.03125, -0.0, nan];
+    let expected = [
+        expected_value,
+        expected_first,
+        expected_first,
+        expected_second,
+    ];
+    let (program, inputs) = must!(sqrt_derivative_program(TensorDType::F64));
+    let compiled =
+        must!(must!(QuablaCompiler.compile_many(&program, QuablaTarget::Cpu)).execute(&inputs));
+    // Single-output CPU plans take the fused elementwise kernel where the chain allows it.
+    let single = program
+        .output_node_ids()
+        .iter()
+        .map(|output| CpuBackend.execute(&program.ir().compile_cpu(*output)?, &inputs))
+        .collect::<Result<Vec<_>, _>>();
+    let single = must!(single);
+    let interpreted = program
+        .output_node_ids()
+        .iter()
+        .map(|output| program.ir().evaluate(*output, &inputs))
+        .collect::<Result<Vec<_>, _>>();
+    let interpreted = must!(interpreted);
+    for (route, results) in [
+        ("compiled", &compiled),
+        ("single-output", &single),
+        ("interpreted", &interpreted),
+    ] {
+        for (output, (actual, expected)) in results.iter().zip(&expected).enumerate() {
+            for (element, (actual, expected)) in actual.data().iter().zip(expected).enumerate() {
+                // Zeros compare by value: IEEE sqrt(-0) is -0, the zero convention returns +0.
+                assert!(
+                    (*actual == 0.0 && *expected == 0.0) || same_float(*actual, *expected),
+                    "{route} output {output}[{element}] at x = {}: {actual} vs {expected}",
+                    SQRT_EDGE_INPUTS[element]
+                );
+            }
+        }
+    }
+}
+
+/// f32 device programs for `sqrt`: the edge-case values with derivative
+/// orders 1 and 2, and a fixed `Fori` whose loop body applies `sqrt`, with
+/// gradients through the loop. The loop starts at a negative, a zero, a
+/// positive, an infinite, and a NaN carry.
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn sqrt_device_programs() -> Result<Vec<DeviceParityCase>, String> {
+    let derivatives = sqrt_derivative_program(TensorDType::F32)?;
+
+    let mut body = TensorIr::new();
+    let carry = body.input_typed("carry", vec![5], TensorDType::F32)?;
+    let root = body.sqrt(carry)?;
+    let quarter = body.scalar_constant(0.25);
+    let step = body.mul(root, quarter)?;
+    let next = body.add(carry, step)?;
+    let loop_plan = TensorForiExecutionPlan::new(0, 3, body.compile_cpu(next)?, "carry", "index")?;
+    let mut graph = TensorIr::new();
+    let initial = graph.input_typed("initial", vec![5], TensorDType::F32)?;
+    let result = graph.fori(initial, loop_plan, vec![])?;
+    let loss = graph.sum(result)?;
+    let reverse = graph.symbolic_vjp(loss, "cotangent")?;
+    let looped = QuablaMultiOutputProgram::new(
+        reverse.graph,
+        vec![reverse.value, reverse.gradients["initial"]],
+    )?;
+    let loop_inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            DynamicTensor::new(vec![5], vec![-1.0, 0.0, 2.25, f64::INFINITY, f64::NAN])?,
+        ),
+        ("cotangent".to_string(), DynamicTensor::filled(vec![], 1.0)?),
+    ]);
+    Ok(vec![derivatives, (looped, loop_inputs)])
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_sqrt_values_derivatives_and_loop_bodies_match_cpu() {
+    assert_device_parity(QuablaTarget::Mlx, sqrt_device_programs());
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_sqrt_values_derivatives_and_loop_bodies_match_cpu_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    assert_device_parity(
+        QuablaTarget::Cuda { device_ordinal: 0 },
+        sqrt_device_programs(),
+    );
 }
