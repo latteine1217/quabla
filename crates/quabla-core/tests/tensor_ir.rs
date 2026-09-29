@@ -8545,3 +8545,237 @@ fn reduction_cotangent_broadcast_ignores_nan_and_infinite_values() {
         assert_eq!(tangent.data(), [0.0; 4], "mean={mean}");
     }
 }
+
+/// NaN and both infinities, followed by a finite value.
+const NON_FINITE_POINT: [f64; 4] = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.5];
+
+#[test]
+fn symbolic_vjp_gives_exact_zero_gradients_to_unused_non_finite_inputs() {
+    // `y` receives no cotangent, so its gradient is the zero tensor whatever `y` holds, with the
+    // f32 dtype of `y`; the gradient of `x` is not polluted either.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input_typed("x", vec![4], TensorDType::F32));
+    must!(graph.input_typed("y", vec![4], TensorDType::F32));
+    let loss = must!(graph.sum(x));
+    let reverse = must!(graph.symbolic_vjp(loss, "cotangent"));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![4], NON_FINITE_POINT.to_vec())),
+        ),
+        (
+            "y".to_string(),
+            must!(DynamicTensor::new(vec![4], NON_FINITE_POINT.to_vec())),
+        ),
+        (
+            "cotangent".to_string(),
+            must!(DynamicTensor::filled(vec![], 1.0)),
+        ),
+    ]);
+    let x_gradient = must!(reverse.graph.evaluate(reverse.gradients["x"], &inputs));
+    let y_gradient = must!(reverse.graph.evaluate(reverse.gradients["y"], &inputs));
+    assert_eq!(x_gradient.data(), [1.0; 4]);
+    assert_eq!(y_gradient.data(), [0.0; 4]);
+    assert_eq!(y_gradient.shape(), [4]);
+    assert_eq!(y_gradient.dtype(), TensorDType::F32);
+}
+
+#[test]
+fn symbolic_jvp_gives_exact_zero_tangents_to_non_finite_inputs_without_a_direction() {
+    // Only `x` has a tangent input, so the tangent of `x + y` is `dx` even where `y` is NaN or
+    // infinite.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input_typed("x", vec![4], TensorDType::F32));
+    let y = must!(graph.input_typed("y", vec![4], TensorDType::F32));
+    let output = must!(graph.add(x, y));
+    let forward = must!(graph.symbolic_jvp_with_tangent_inputs(
+        output,
+        &BTreeMap::from([("x".to_string(), "dx".to_string())]),
+    ));
+    let inputs = BTreeMap::from([
+        ("x".to_string(), must!(DynamicTensor::filled(vec![4], 1.0))),
+        (
+            "y".to_string(),
+            must!(DynamicTensor::new(vec![4], NON_FINITE_POINT.to_vec())),
+        ),
+        (
+            "dx".to_string(),
+            must!(DynamicTensor::new(vec![4], vec![1.0, 2.0, 3.0, 4.0])),
+        ),
+    ]);
+    let tangent = must!(forward.graph.evaluate(forward.tangent, &inputs));
+    assert_eq!(tangent.data(), [1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(tangent.dtype(), TensorDType::F32);
+}
+
+#[test]
+fn powi_zero_tangents_are_exact_zeros_at_non_finite_inputs() {
+    // powi(x, 0) is the constant 1, so its tangent is 0 at every x, and so is the second
+    // directional derivative of x + x, whose symbolic JVP seeds x with ones.
+    let inputs = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| {
+                let data = if name.starts_with('d') {
+                    vec![1.0; 4]
+                } else {
+                    NON_FINITE_POINT.to_vec()
+                };
+                DynamicTensor::new(vec![4], data).map(|value| (name.to_string(), value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+    };
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input_typed("x", vec![4], TensorDType::F32));
+    let ones = must!(graph.powi(x, 0));
+    let forward = must!(graph.symbolic_jvp_with_tangent_inputs(
+        ones,
+        &BTreeMap::from([("x".to_string(), "dx".to_string())]),
+    ));
+    let bound = must!(inputs(&["x", "dx"]));
+    assert_eq!(
+        must!(forward.graph.evaluate(forward.value, &bound)).data(),
+        [1.0; 4]
+    );
+    let tangent = must!(forward.graph.evaluate(forward.tangent, &bound));
+    assert_eq!(tangent.data(), [0.0; 4]);
+    assert_eq!(tangent.dtype(), TensorDType::F32);
+
+    let doubled = must!(graph.add(x, x));
+    let first = must!(graph.symbolic_jvp(doubled, "x"));
+    let second = must!(first.graph.symbolic_jvp_with_tangent_inputs(
+        first.tangent,
+        &BTreeMap::from([("x".to_string(), "dx".to_string())]),
+    ));
+    let bound = must!(inputs(&["x", "dx"]));
+    assert_eq!(
+        must!(second.graph.evaluate(second.value, &bound)).data(),
+        [2.0; 4]
+    );
+    assert_eq!(
+        must!(second.graph.evaluate(second.tangent, &bound)).data(),
+        [0.0; 4]
+    );
+    // The ones seed of `symbolic_jvp` does not read `x`: the compiled tangent needs no inputs.
+    assert_eq!(
+        must!(first
+            .graph
+            .compile_cpu(first.tangent)
+            .and_then(|plan| plan.evaluate(&BTreeMap::new())))
+        .data(),
+        [2.0; 4]
+    );
+}
+
+#[test]
+fn cond_vjp_gives_exact_zero_gradients_to_captures_unused_by_the_taken_branch() {
+    // The false branch reads `y` only through a comparison, so the gradient of `y` there is 0
+    // even for a non-finite `y`.
+    let mut on_true = TensorIr::new();
+    let true_x = must!(on_true.input("x", vec![4]));
+    let true_y = must!(on_true.input("y", vec![4]));
+    let true_output = must!(on_true.mul(true_x, true_y));
+    let mut on_false = TensorIr::new();
+    let false_x = must!(on_false.input("x", vec![4]));
+    let false_y = must!(on_false.input("y", vec![4]));
+    let two = on_false.scalar_constant(2.0);
+    let doubled = must!(on_false.mul(false_x, two));
+    let zero = on_false.scalar_constant(0.0);
+    let positive = must!(on_false.greater(false_y, zero));
+    let false_output = must!(on_false.where_select(positive, doubled, doubled));
+    let branches = must!(TensorCondExecutionPlan::new(
+        must!(on_true.compile_cpu(true_output)),
+        must!(on_false.compile_cpu(false_output)),
+    ));
+    let mut graph = TensorIr::new();
+    let predicate = must!(graph.input("predicate", vec![]));
+    let x = must!(graph.input("x", vec![4]));
+    let y = must!(graph.input("y", vec![4]));
+    let output = must!(graph.cond_with_captures(
+        predicate,
+        branches,
+        vec![("x".to_string(), x), ("y".to_string(), y)],
+    ));
+    let loss = must!(graph.sum(output));
+    let reverse = must!(graph.symbolic_vjp(loss, "cotangent"));
+    let inputs = BTreeMap::from([
+        (
+            "predicate".to_string(),
+            must!(DynamicTensor::new(vec![], vec![0.0])),
+        ),
+        ("x".to_string(), must!(DynamicTensor::filled(vec![4], 3.0))),
+        (
+            "y".to_string(),
+            must!(DynamicTensor::new(vec![4], NON_FINITE_POINT.to_vec())),
+        ),
+        (
+            "cotangent".to_string(),
+            must!(DynamicTensor::filled(vec![], 1.0)),
+        ),
+    ]);
+    assert_eq!(
+        must!(reverse.graph.evaluate(reverse.gradients["x"], &inputs)).data(),
+        [2.0; 4]
+    );
+    assert_eq!(
+        must!(reverse.graph.evaluate(reverse.gradients["y"], &inputs)).data(),
+        [0.0; 4]
+    );
+}
+
+#[test]
+fn scan_vjp_gives_an_exact_zero_cotangent_to_an_unused_non_finite_output() {
+    // Only the final carry reaches the loss, so the stacked outputs, which are infinite, receive
+    // a zero cotangent: the gradients are those of carry * scale^3 and 0 for the offset.
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    must!(body.input("index", vec![]));
+    let scale = must!(body.input("scale", vec![]));
+    let offset = must!(body.input("offset", vec![]));
+    let next = must!(body.mul(carry, scale));
+    let output = must!(body.add(carry, offset));
+    let scan_plan = must!(TensorScanExecutionPlan::new(
+        0,
+        3,
+        must!(body.compile_cpu_many(&[next, output])).0,
+        "carry",
+        "index",
+    ));
+    let mut graph = TensorIr::new();
+    let initial = must!(graph.input("initial", vec![]));
+    let scale = must!(graph.input("scale", vec![]));
+    let offset = must!(graph.input("offset", vec![]));
+    let (final_carry, _outputs) = must!(graph.scan(
+        initial,
+        scan_plan,
+        vec![("scale".to_string(), scale), ("offset".to_string(), offset)],
+    ));
+    let reverse = must!(graph.symbolic_vjp(final_carry, "cotangent"));
+    for offset in [f64::INFINITY, f64::NAN] {
+        let inputs = BTreeMap::from([
+            (
+                "initial".to_string(),
+                must!(DynamicTensor::filled(vec![], 1.0)),
+            ),
+            (
+                "scale".to_string(),
+                must!(DynamicTensor::filled(vec![], 2.0)),
+            ),
+            (
+                "offset".to_string(),
+                must!(DynamicTensor::filled(vec![], offset)),
+            ),
+            (
+                "cotangent".to_string(),
+                must!(DynamicTensor::filled(vec![], 1.0)),
+            ),
+        ]);
+        for (name, expected) in [("initial", 8.0), ("scale", 12.0), ("offset", 0.0)] {
+            assert_eq!(
+                must!(reverse.graph.evaluate(reverse.gradients[name], &inputs)).data(),
+                [expected],
+                "offset={offset} {name}"
+            );
+        }
+    }
+}

@@ -2131,7 +2131,7 @@ impl TensorIr {
         let transformed = self.symbolic_jvp_with_seed(output, |transformed, name, value, _| {
             if name == differentiated_input {
                 found_input = true;
-                Ok(Some(transformed.powi(value, 0)?))
+                Ok(Some(symbolic_full_like(transformed, 1.0, value)?))
             } else {
                 Ok(None)
             }
@@ -2305,7 +2305,7 @@ impl TensorIr {
                     } else {
                         match input_tangent(&mut transformed, name, value, &node.shape)? {
                             Some(tangent) => tangent,
-                            None => transformed.sub(value, value)?,
+                            None => symbolic_zero_like(&mut transformed, value)?,
                         }
                     };
                     (value, tangent)
@@ -2616,7 +2616,7 @@ impl TensorIr {
                     let (input_value, input_tangent) = pairs[*input];
                     let value = transformed.powi(input_value, *exponent)?;
                     let tangent = if *exponent == 0 {
-                        transformed.sub(input_value, input_value)?
+                        symbolic_zero_like(&mut transformed, input_value)?
                     } else {
                         let coefficient = transformed.scalar_constant(*exponent as f64);
                         let lower_power = transformed.powi(input_value, *exponent - 1)?;
@@ -2991,9 +2991,7 @@ impl TensorIr {
                             }
                             let group_upstream = match cotangents[scan_node_id] {
                                 Some(cotangent) => cotangent,
-                                None => {
-                                    transformed.sub(values[scan_node_id], values[scan_node_id])?
-                                }
+                                None => symbolic_zero_like(&mut transformed, values[scan_node_id])?,
                             };
                             match target {
                                 TensorScanTarget::Carry => {
@@ -3452,8 +3450,10 @@ impl TensorIr {
                 if node.dtype == TensorDType::Bool {
                     continue;
                 }
-                let gradient = cotangents[node_id]
-                    .unwrap_or(symbolic_zero_like(&mut transformed, values[node_id])?);
+                let gradient = match cotangents[node_id] {
+                    Some(cotangent) => cotangent,
+                    None => symbolic_zero_like(&mut transformed, values[node_id])?,
+                };
                 gradients.insert(name.clone(), gradient);
             }
         }
@@ -8430,8 +8430,36 @@ fn symbolic_vjp_cond_captures(
         .collect()
 }
 
-fn symbolic_zero_like(graph: &mut TensorIr, value: TensorNodeId) -> Result<TensorNodeId, String> {
-    graph.sub(value, value)
+/// A tensor filled with `value`, with the shape, dtype and weakness of
+/// `target`: a scalar constant broadcast to `target`'s shape (no broadcast
+/// for a scalar `target`).
+///
+/// Neither the result nor any of its derivatives reads the values of
+/// `target`, so it stays exact where `target` is infinite or NaN; zeros
+/// built as `target - target` would be NaN there.
+fn symbolic_full_like(
+    graph: &mut TensorIr,
+    value: f64,
+    target: TensorNodeId,
+) -> Result<TensorNodeId, String> {
+    let target_node = graph.node(target)?;
+    let (shape, dtype, weak) = (
+        target_node.shape.clone(),
+        target_node.dtype,
+        target_node.weak,
+    );
+    let constant = graph.constant_like(value, dtype, weak);
+    if shape.is_empty() {
+        Ok(constant)
+    } else {
+        graph.broadcast_to(constant, shape)
+    }
+}
+
+/// Zeros shaped and typed like `target` (see [`symbolic_full_like`]): the
+/// tangent or cotangent that an AD rule knows to be exactly zero.
+fn symbolic_zero_like(graph: &mut TensorIr, target: TensorNodeId) -> Result<TensorNodeId, String> {
+    symbolic_full_like(graph, 0.0, target)
 }
 
 /// Weak `f64` zero of `shape`: the tangent of a `Bool` value.
@@ -8447,29 +8475,15 @@ fn symbolic_zero_tangent(graph: &mut TensorIr, shape: &[usize]) -> Result<Tensor
 /// Broadcasts `value` to the shape of `target`, promoted with the dtype of
 /// `target` as `value * ones_like(target)`.
 ///
-/// The ones are a constant of `target`'s dtype and weakness broadcast to its
-/// shape, so neither the result nor any of its derivatives reads the values
-/// of `target`. Deriving them from `target` (`powi(target - target, 0)`)
-/// would give the tangent `target - target`, which is NaN wherever `target`
-/// is infinite or NaN and turns forward-over-reverse Hessians of such a loss
-/// into NaN.
+/// The ones come from [`symbolic_full_like`], so neither the result nor any
+/// of its derivatives reads the values of `target`, and forward-over-reverse
+/// Hessians of a loss with an infinite or NaN entry stay finite.
 fn symbolic_broadcast_like(
     graph: &mut TensorIr,
     value: TensorNodeId,
     target: TensorNodeId,
 ) -> Result<TensorNodeId, String> {
-    let target_node = graph.node(target)?;
-    let (shape, dtype, weak) = (
-        target_node.shape.clone(),
-        target_node.dtype,
-        target_node.weak,
-    );
-    let one = graph.constant_like(1.0, dtype, weak);
-    let ones = if shape.is_empty() {
-        one
-    } else {
-        graph.broadcast_to(one, shape)?
-    };
+    let ones = symbolic_full_like(graph, 1.0, target)?;
     graph.mul(value, ones)
 }
 

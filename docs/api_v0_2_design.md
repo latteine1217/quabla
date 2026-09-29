@@ -77,7 +77,7 @@ names); the full per-name list is in [Appendix A](#appendix-a-name-mapping).
    calls the function positionally with `TraceTensor`s, and requires exactly
    one `TraceTensor` back (`py/tensor_trace.rs:4375-4399`; Exp 2).
 2. **Transforms produce new graphs.** `symbolic_jvp(name)` seeds a ones
-   tangent (`powi(x, 0)`, `core/tensor_ir.rs:2109-2127`), so it is the
+   tangent (a broadcast constant, `core/tensor_ir.rs:2109-2127`), so it is the
    coordinate JVP `J·1`, not a gradient. `symbolic_vjp(ct_name)` adds a named
    cotangent input and returns one gradient node per input
    (`core/tensor_ir.rs:2672-2690`). Both replay into a fresh `TensorIr` that
