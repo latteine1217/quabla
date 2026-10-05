@@ -821,6 +821,18 @@ pub(super) fn validate_cuda_plan(plan: &TensorExecutionPlan) -> Result<(), (Stri
                 })?;
                 ("Scan VJP JVP", cuda_scan_vjp_jvp_is_lowerable(scan_hvp))
             }
+            // A host-driven predicate loop would need a region executor with
+            // ping-pong carry buffers; until then the loop is rejected before
+            // any device work so callers get UnsupportedOperationError.
+            TensorOp::While { .. } => {
+                return Err((
+                    "While".into(),
+                    format!(
+                        "CUDA lowering does not yet support while_loop (node {node_id}); run it \
+                         on the CPU or MLX target, or use a bounded fori_loop"
+                    ),
+                ))
+            }
             TensorOp::Cond { branches, .. } => {
                 validate_cuda_plan(&branches.on_true.plan)?;
                 validate_cuda_plan(&branches.on_false.plan)?;
@@ -1936,6 +1948,12 @@ fn execute_cuda_device_program(
                     plan.nodes[*matrix].shape[0],
                     plan.nodes[*rhs].shape[1],
                 )?;
+            }
+            // `validate_cuda_plan` rejects While before compilation.
+            TensorOp::While { .. } => {
+                return Err(format!(
+                    "CUDA While node {node_id} reached execution without validation"
+                ))
             }
             TensorOp::Cond {
                 predicate,
@@ -7406,7 +7424,9 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
             }
             TensorOp::Cholesky { .. } => cholesky_backend::primal_source(&function, *node.shape.last().expect("matrix shape")),
             TensorOp::CholeskyAd { kind, .. } => cholesky_backend::ad_source(&function, *node.shape.last().expect("matrix shape"), *kind),
-            TensorOp::Solve { .. } | TensorOp::Cond { .. } => String::new(),
+            TensorOp::Solve { .. } | TensorOp::Cond { .. } | TensorOp::While { .. } => {
+                String::new()
+            }
             TensorOp::Fori {
                 loop_plan,
                 captures,
@@ -7923,6 +7943,7 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Where { .. } => "where",
         TensorOp::Cond { .. } => "cond",
         TensorOp::Fori { .. } => "fori",
+        TensorOp::While { .. } => "while",
         TensorOp::ForiJvp { .. } => "fori_jvp",
         TensorOp::ForiVjp { .. } => "fori_vjp",
         TensorOp::ForiVjpJvp { .. } => "fori_vjp_jvp",

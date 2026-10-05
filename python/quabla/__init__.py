@@ -60,6 +60,7 @@ __all__ = list(
             "cond",
             "fori_loop",
             "scan",
+            "while_loop",
         ]
     )
 )

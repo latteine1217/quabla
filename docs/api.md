@@ -486,6 +486,18 @@ branches and bodies may ignore operands, and `cond` branches may return
 constants of the other branch's dtype. Unsupported implicit capture raises
 `TracerError` naming `operands=`.
 
+`qb.while_loop(cond_fun, body_fun, init, operands=())` repeats
+`carry = body_fun(carry, *operands)` while `cond_fun(carry, *operands)`, a
+scalar bool, is true. A traced carry or operand forms one region; CPU and
+MLX evaluate the predicate, read it back to the host once per iteration, and
+then run the body, so the trip count may depend on traced values. CUDA
+raises `UnsupportedOperationError` for now. Forward mode (`jvp`) runs the
+same loop over a packed primal/tangent carry. Reverse mode (`grad`, `vjp`,
+and the reverse-mode `jacobian`/`hessian`) raises an error naming
+`fori_loop`, as in JAX: a data-dependent trip count leaves no fixed tape, so
+write a bounded `fori_loop` whose body masks finished iterations with
+`where` instead. `vmap` over a while loop is rejected for the same reason.
+
 `qb.ode.odeint(f, y0, (t0, t1), steps=n, method="rk4", args=(), save=False)`
 integrates `dy/dt = f(y, t, *args)` with `n` equal steps of classical RK4,
 Heun's method (`"heun"`), or forward Euler (`"euler"`), at times
@@ -496,8 +508,27 @@ to `y0`, `t0`, `t1`, and `args` and run under `jit` on every device (CUDA
 supports the forward solve; its loop VJP needs operands of the carry's
 shape, while the solver passes scalar time operands). `y0` is
 a single array, and `f` must receive traced values through `args`, as loop
-bodies do. Adaptive step-size control needs a traced loop condition and is
-not provided.
+bodies do.
+
+`qb.ode.odeint(f, y0, (t0, t1), method="dopri5", rtol=1e-6, atol=1e-9,
+max_steps=512, info=False)` is the adaptive Dormand-Prince 5(4) pair with
+first-same-as-last stages. Steps are accepted when the RMS norm of the
+embedded error estimate scaled by `atol + rtol * max(|y|, |y_new|)` is at
+most one; a PI controller (gains 0.7/5 and 0.4/5, safety 0.9, factor
+clipped to [0.2, 10]) picks the next step, rejected steps fall back to the
+I-controller, and the first step follows Hairer and Wanner's starting-step
+algorithm. The last step lands exactly on `t1`, and integration may run
+backward. The solve is a bounded `fori_loop` whose body stops advancing
+once `t1` is reached, so it is reverse-mode differentiable; a traced solve
+therefore always pays `max_steps` step attempts. It runs on the CPU and
+MLX; the fused CUDA loop kernel cannot lower its carry slicing yet and
+raises `UnsupportedOperationError`. Step sizes are controller
+outputs without gradients (only the final step depends on `t1`), so
+derivatives are those of the discrete scheme on the chosen mesh and are
+piecewise smooth across accept/reject changes. An eager solve stops at
+`t1` and raises `RuntimeError` when `max_steps` attempts do not reach it;
+under `jit` it cannot raise, and `info=True` returns `(y, info)` with
+`t`, `accepted_steps`, `rejected_steps`, and a bool `success`.
 
 `qb.distributed.value_and_grad(fun, devices=["cuda:0", "cuda:1"], shard_argnums=(1,),
 argnums=0, reduction="mean")` is experimental single-node CUDA/NCCL execution.
@@ -520,9 +551,10 @@ The v0.1 entrypoints below keep their original spec/dictionary call forms:
 | Data parallelism (`cuda-nccl`) | `tensor_value_and_grad_data_parallel_cuda_fn` | not available |
 
 The core control-flow wrappers reuse the region builders `tensor_cond`,
-`tensor_fori_loop_region`, and `tensor_scan_region`, with their existing
-backend limits. `Compiler.capabilities()` reports which targets the build
-contains; it is not a hardware probe. The PINN examples in
+`tensor_fori_loop_region`, `tensor_scan_region`, and
+`tensor_while_loop_region`, with their existing backend limits.
+`Compiler.capabilities()` reports which targets the build contains; it is
+not a hardware probe. The PINN examples in
 `examples/pinn_poisson_{mlx,cuda}.py` and `examples/pinn_mlp_{mlx,cuda}.py`
 train on each device with these helpers. Their behaviour and limits are
 described under [Compiler Facade](#compiler-facade) and
