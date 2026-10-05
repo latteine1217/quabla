@@ -3,8 +3,12 @@
 import array
 import sys
 
-import numpy as np
 import quabla as qb
+
+try:
+    import numpy as np
+except ImportError:  # NumPy is optional for quabla; every test here needs it.
+    np = None
 
 
 def assert_f32_import(source):
@@ -95,6 +99,9 @@ def test_endian_rejection_and_bool_import():
 
 
 if __name__ == "__main__":
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
+    if np is None:
+        print("skipped test_buffer_narrow_import: numpy is not installed")
+    else:
+        for name, test in list(globals().items()):
+            if name.startswith("test_") and callable(test):
+                test()
