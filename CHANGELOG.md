@@ -17,6 +17,10 @@ deprecated names keep working until 1.0 (see
   training loop whose batch shape changes keeps running. Trace caches,
   including `distributed.value_and_grad`, no longer raise
   `RetraceLimitError`; the class remains for existing handlers.
+- `norm` computes `m * sqrt(sum((x / m)**2))` with `m = max|x|`, so it no
+  longer overflows or underflows: the `float32` norm of `[1e20, 1e20]` is
+  1.414e20 with gradient 0.707 instead of `inf` with gradient 0. Results and
+  gradients can change in the last bits.
 
 ## [0.2.3] - 2026-10-06
 

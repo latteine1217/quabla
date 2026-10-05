@@ -2093,11 +2093,28 @@ impl TraceTensor {
         Ok(reduced)
     }
 
+    // `max|x| * sqrt(sum((x / max|x|)^2))`: scaling keeps the sum of squares
+    // from overflowing or underflowing when |x| is outside the square root of
+    // the dtype's range. A zero, infinite or NaN scale falls back to 1, which
+    // keeps those inputs' unscaled results. The scale's derivative terms
+    // cancel, so gradients stay `x / norm` up to rounding.
     fn norm_tensor(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
         self.ensure_not_bool("norm")?;
-        self.powi_tensor(2)?
+        let largest = self
+            .abs_tensor()?
+            .extrema_axes_tensor(axes.clone(), true, true)?;
+        let usable = largest
+            .compare_scalar(0.0, TensorComparison::Greater)?
+            .logical_tensor(&largest.classify_tensor(false)?, true)?;
+        let scale = usable.where_tensor(&largest, &largest.scalar_tensor(1.0)?)?;
+        let reduced = self
+            .binary(&scale, "div")?
+            .powi_tensor(2)?
             .reduce_axes_tensor(axes, keepdims, false)?
-            .sqrt_tensor()
+            .sqrt_tensor()?;
+        let batch_offset = usize::from(reduced.batch_axis.is_some());
+        let scale = scale.reshape_tensor(reduced.shape[batch_offset..].to_vec())?;
+        reduced.binary(&scale, "mul")
     }
 
     fn extrema_axes_tensor(

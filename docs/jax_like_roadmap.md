@@ -31,6 +31,8 @@ Decisions taken by the owner on 2026-10-06 and implemented:
   `RetraceWarning` beyond `max_traces` instead of raising
   `RetraceLimitError`, so a training loop whose collocation count changes
   every epoch keeps running.
+- `norm` scales by `max|x|`, so it no longer overflows for float32
+  magnitudes above about 1e19; results change in the last bits.
 
 Smaller observations kept for later: `abs` has gradient -1 at 0 (JAX uses
 +1), `max` gives the whole gradient of a tie to the last element (JAX

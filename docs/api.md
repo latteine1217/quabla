@@ -612,8 +612,12 @@ name keeps working through 0.x.
   the same contract; multi-axis reductions lower to existing axis-reduction
   and reshape nodes, preserving CPU, CUDA, MLX, JVP, and VJP behavior.
 - `Tensor.norm(axis=None, keepdims=False)` and `TraceTensor.norm(...)` provide
-  an L2 norm over the selected axes. It is composed as `sqrt(sum(x.powi(2)))`
-  and therefore preserves the same normalized-axis, backend, and AD contract.
+  an L2 norm over the selected axes, composed as
+  `m * sqrt(sum((x / m).powi(2)))` with `m = max|x|` over those axes (1 when
+  `m` is zero, infinite, or `NaN`), so the sum of squares neither overflows
+  nor underflows for `float32` magnitudes above about 1e19 or below about
+  1e-19. It preserves the normalized-axis, backend, and AD contract of its
+  parts; gradients equal `x / norm` up to rounding.
 - `Tensor.max(axis=None, keepdims=False)` / `Tensor.min(...)` and traced
   equivalents reduce one or more axes. Their static-shape trace lowering uses
   existing slice and selection nodes; when extrema tie, the final coordinate

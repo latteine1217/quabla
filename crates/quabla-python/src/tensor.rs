@@ -1328,9 +1328,21 @@ impl PyTensor {
         self.try_reduce_axes(axes, keepdims, true)
     }
 
+    // The same scaled expression as the traced `norm`, so eager and jit agree.
     pub fn try_norm(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
         self.ensure_not_bool("norm")?;
-        self.try_powi(2)?.try_sum_axes(axes, keepdims)?.try_sqrt()
+        let largest = self.try_abs()?.try_max_axes(axes.clone(), true)?;
+        let usable = largest
+            .try_compare_scalar(0.0, TensorComparison::Greater)?
+            .try_logical(&largest.try_classify("isfinite", f64::is_finite)?, true)?;
+        let one = Self::from_shape_data_typed(vec![], vec![1.0], largest.dtype)?;
+        let scale = Self::try_where(&usable, &largest, &one)?;
+        let reduced = self
+            .try_div(&scale)?
+            .try_powi(2)?
+            .try_sum_axes(axes, keepdims)?
+            .try_sqrt()?;
+        reduced.try_mul(&scale.try_reshape(reduced.shape.clone())?)
     }
 
     pub fn try_max_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {

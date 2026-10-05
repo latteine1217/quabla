@@ -535,6 +535,31 @@ def test_module_level_unary_and_reduction_ops_match_methods():
     assert qb.all(mask, axis=1).tolist() == [False, True]
 
 
+def test_norm_scales_to_avoid_overflow_and_underflow():
+    def bits(values):
+        return [struct.pack("<d", v) for v in values]
+
+    for scale in (1e20, 1e-25, 1.0):
+        x = qb.array([scale, -scale, 0.0], dtype=qb.float32)
+        expected = math.sqrt(2.0) * scale
+        eager = qb.norm(x).item()
+        assert math.isclose(eager, expected, rel_tol=1e-6), (scale, eager)
+        assert bits([qb.jit(qb.norm)(x).item()]) == bits([eager])
+        gradient = qb.grad(qb.norm)(x).tolist()
+        assert all(
+            math.isclose(g, w, rel_tol=1e-6, abs_tol=1e-30)
+            for g, w in zip(gradient, [0.5**0.5, -(0.5**0.5), 0.0])
+        ), (scale, gradient)
+    rows = qb.array([[3.0, 4.0], [1e20, 0.0]], dtype=qb.float32)
+    assert_close(qb.norm(rows, axis=1), [5.0, 1e20], 1e-6 * 1e20)
+    assert qb.jit(lambda a: qb.norm(a, axis=0, keepdims=True))(rows).shape == [1, 2]
+    # Zero, infinite and NaN scales keep the unscaled results.
+    assert qb.norm(qb.zeros([3])).item() == 0.0
+    assert qb.grad(qb.norm)(qb.zeros([3])).tolist() == [0.0, 0.0, 0.0]
+    assert qb.norm(qb.array([math.inf, 1.0])).item() == math.inf
+    assert math.isnan(qb.jit(qb.norm)(qb.array([math.nan, 1.0])).item())
+
+
 def test_module_level_ops_accept_python_scalars_and_lists():
     assert_tensor(qb.sin(0.0), 0.0, qb.float64)
     assert_close(qb.exp([0.0, 1.0]), [1.0, math.e])
