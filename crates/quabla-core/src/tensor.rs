@@ -47,16 +47,18 @@ impl<const ROWS: usize, const COLS: usize> Tensor2<ROWS, COLS> {
         rhs: &Tensor2<COLS, OUT_COLS>,
     ) -> Tensor2<ROWS, OUT_COLS> {
         let mut data = vec![0.0; ROWS * OUT_COLS];
+        if data.is_empty() {
+            return Tensor2 { data };
+        }
 
         for row in 0..ROWS {
-            for col in 0..OUT_COLS {
-                let mut sum = 0.0;
-
-                for inner in 0..COLS {
-                    sum += self.get(row, inner) * rhs.get(inner, col);
+            let output_row = &mut data[row * OUT_COLS..(row + 1) * OUT_COLS];
+            for inner in 0..COLS {
+                let lhs = self.data[row * COLS + inner];
+                let rhs_row = &rhs.data[inner * OUT_COLS..(inner + 1) * OUT_COLS];
+                for (output, &value) in output_row.iter_mut().zip(rhs_row) {
+                    *output += lhs * value;
                 }
-
-                data[row * OUT_COLS + col] = sum;
             }
         }
 

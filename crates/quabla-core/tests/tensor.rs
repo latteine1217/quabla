@@ -22,6 +22,34 @@ fn tensor2_matmul_returns_compile_time_output_shape() {
 }
 
 #[test]
+fn tensor2_matmul_preserves_inner_accumulation_and_empty_shapes() {
+    let a = Tensor2::<2, 4>::from_array([[1e16, 1.0, -1e16, 0.25], [-0.0, 2.0, -3.0, 4.0]]);
+    let b = Tensor2::<4, 3>::from_array([
+        [1.0, -1.0, 0.5],
+        [1.0, 2.0, -3.0],
+        [1.0, -1.0, 0.5],
+        [4.0, -0.0, 2.0],
+    ]);
+    let actual = a.matmul(&b);
+    for row in 0..2 {
+        for column in 0..3 {
+            let mut expected = 0.0;
+            for inner in 0..4 {
+                expected += a.get(row, inner) * b.get(inner, column);
+            }
+            assert_eq!(actual.get(row, column).to_bits(), expected.to_bits());
+        }
+    }
+    let empty = Tensor2::<2, 0>::from_array([[], []]).matmul(&Tensor2::<0, 3>::from_array([]));
+    assert!(empty
+        .as_slice()
+        .iter()
+        .all(|value| value.to_bits() == 0.0_f64.to_bits()));
+    let no_columns = a.matmul(&Tensor2::<4, 0>::from_array([[], [], [], []]));
+    assert!(no_columns.as_slice().is_empty());
+}
+
+#[test]
 fn tensor2_map_supports_elementwise_transforms_without_losing_shape() {
     let tensor = Tensor2::<2, 2>::from_array([[1.0, -2.0], [3.0, -4.0]]);
 

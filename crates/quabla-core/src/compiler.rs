@@ -303,7 +303,39 @@ impl QuablaMultiOutputExecutable {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct QuablaCompiler;
 
+/// Typed compile failures for the v0.2 entrypoints. Legacy helpers still return strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuablaCompileError {
+    Unavailable(String),
+    InvalidProgram(String),
+    Unsupported { op: String, message: String },
+    Backend(String),
+}
+
 impl QuablaCompiler {
+    /// Compiles v0.2 programs, validating lazy MLX operations before execution.
+    pub fn compile_many_checked(
+        &self,
+        program: &QuablaMultiOutputProgram,
+        target: QuablaTarget,
+    ) -> Result<QuablaMultiOutputExecutable, QuablaCompileError> {
+        ensure_built(target).map_err(QuablaCompileError::Unavailable)?;
+        let plan = program
+            .freeze()
+            .map_err(QuablaCompileError::InvalidProgram)?;
+        if target == QuablaTarget::Mlx {
+            plan.validate_mlx()
+                .map_err(|(op, message)| QuablaCompileError::Unsupported { op, message })?;
+        }
+        if matches!(target, QuablaTarget::Cuda { .. }) {
+            plan.validate_cuda()
+                .map_err(|(op, message)| QuablaCompileError::Unsupported { op, message })?;
+        }
+        lower(plan, target)
+            .map(|executable| QuablaMultiOutputExecutable { executable })
+            .map_err(QuablaCompileError::Backend)
+    }
+
     pub fn program(&self, ir: TensorIr, output: TensorNodeId) -> Result<QuablaProgram, String> {
         QuablaProgram::new(ir, output)
     }

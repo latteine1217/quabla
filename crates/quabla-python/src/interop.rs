@@ -5,10 +5,9 @@
 //! The bridge never links against NumPy (design D2 in
 //! `docs/api_v0_2_design.md`): NumPy arrays are read through the buffer
 //! protocol, and `Tensor.numpy()`/`Tensor.__array__` import NumPy lazily and
-//! hand it the buffer export. Importing always copies into owned `f64`
-//! storage, so a tensor never aliases foreign memory. Exporting `float64`
-//! storage is zero-copy; `float32` and `bool` exports materialize their
-//! element type, because host storage is `f64`.
+//! hand it the buffer export. Importing copies into owned dtype-sized storage,
+//! so a tensor never aliases foreign memory. Exports pin immutable storage
+//! without copying for float64, float32, and bool.
 
 use std::ffi::{c_int, c_void, CStr};
 use std::ptr;
@@ -19,7 +18,7 @@ use pyo3::exceptions::{PyBufferError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyFloat, PyList, PyMemoryView, PyTuple};
-use quabla_core::tensor_ir::TensorDType;
+use quabla_core::tensor_ir::{HostTensorStorage, TensorDType};
 
 use crate::tensor::PyTensor;
 
@@ -148,42 +147,74 @@ pub(crate) fn tensor_from_buffer(
              for example with numpy.asarray(a, dtype=a.dtype.newbyteorder(\"=\"))"
         )));
     }
-    let (data, inferred) = match ElementType::from_format(&format) {
-        ElementType::Float { bytes: 8 } => {
-            (buffer.into_typed::<f64>()?.to_vec(py)?, TensorDType::F64)
+    if matches!(
+        ElementType::from_format(&format),
+        ElementType::Float { bytes: 4 }
+    ) {
+        let typed = buffer.into_typed::<f32>()?;
+        // Preserve the old widening/rounding NaN policy without an F64 array temporary.
+        let round = |value: f32| TensorDType::F32.round(f64::from(value)) as f32;
+        let values = if let Some(values) = typed.as_slice(py) {
+            values.iter().map(|value| round(value.get())).collect()
+        } else {
+            typed.to_vec(py)?.into_iter().map(round).collect()
+        };
+        let storage = quabla_core::tensor_ir::HostTensorStorage::F32(Arc::new(values))
+            .into_dtype(dtype.unwrap_or(TensorDType::F32));
+        let tensor = quabla_core::tensor_ir::DynamicTensor::from_storage(shape, storage)
+            .map_err(PyValueError::new_err)?;
+        return PyTensor::from_dynamic_tensor(tensor)
+            .map(Some)
+            .map_err(PyValueError::new_err);
+    }
+    if ElementType::from_format(&format) == ElementType::Bool {
+        drop(buffer);
+        let bytes = view.call_method0("tobytes")?;
+        let values = bytes
+            .cast::<PyBytes>()?
+            .as_bytes()
+            .iter()
+            .map(|byte| u8::from(*byte != 0))
+            .collect();
+        let storage = quabla_core::tensor_ir::HostTensorStorage::Bool(Arc::new(values))
+            .into_dtype(dtype.unwrap_or(TensorDType::Bool));
+        let tensor = quabla_core::tensor_ir::DynamicTensor::from_storage(shape, storage)
+            .map_err(PyValueError::new_err)?;
+        return PyTensor::from_dynamic_tensor(tensor)
+            .map(Some)
+            .map_err(PyValueError::new_err);
+    }
+    let target = dtype.unwrap_or(TensorDType::F64);
+    let storage = match ElementType::from_format(&format) {
+        ElementType::Float { bytes: 8 } if target == TensorDType::F64 => {
+            HostTensorStorage::F64(Arc::new(buffer.into_typed::<f64>()?.to_vec(py)?))
         }
-        ElementType::Float { bytes: 4 } => (widen::<f32>(py, buffer, f64::from)?, TensorDType::F32),
-        ElementType::Bool => {
-            drop(buffer);
-            (bool_buffer_values(&view)?, TensorDType::Bool)
-        }
+        ElementType::Float { bytes: 8 } => buffer_storage::<f64>(py, buffer, |v| v, target)?,
         ElementType::SignedInteger { bytes: 1 } => {
-            (widen::<i8>(py, buffer, f64::from)?, TensorDType::F64)
+            buffer_storage::<i8>(py, buffer, f64::from, target)?
         }
         ElementType::SignedInteger { bytes: 2 } => {
-            (widen::<i16>(py, buffer, f64::from)?, TensorDType::F64)
+            buffer_storage::<i16>(py, buffer, f64::from, target)?
         }
         ElementType::SignedInteger { bytes: 4 } => {
-            (widen::<i32>(py, buffer, f64::from)?, TensorDType::F64)
+            buffer_storage::<i32>(py, buffer, f64::from, target)?
         }
-        // Integers above 2**53 round to the nearest float64, as in NumPy.
-        ElementType::SignedInteger { bytes: 8 } => (
-            widen::<i64>(py, buffer, |value| value as f64)?,
-            TensorDType::F64,
-        ),
+        // Retain the historical F64 rounding before the requested dtype conversion.
+        ElementType::SignedInteger { bytes: 8 } => {
+            buffer_storage::<i64>(py, buffer, |v| v as f64, target)?
+        }
         ElementType::UnsignedInteger { bytes: 1 } => {
-            (widen::<u8>(py, buffer, f64::from)?, TensorDType::F64)
+            buffer_storage::<u8>(py, buffer, f64::from, target)?
         }
         ElementType::UnsignedInteger { bytes: 2 } => {
-            (widen::<u16>(py, buffer, f64::from)?, TensorDType::F64)
+            buffer_storage::<u16>(py, buffer, f64::from, target)?
         }
         ElementType::UnsignedInteger { bytes: 4 } => {
-            (widen::<u32>(py, buffer, f64::from)?, TensorDType::F64)
+            buffer_storage::<u32>(py, buffer, f64::from, target)?
         }
-        ElementType::UnsignedInteger { bytes: 8 } => (
-            widen::<u64>(py, buffer, |value| value as f64)?,
-            TensorDType::F64,
-        ),
+        ElementType::UnsignedInteger { bytes: 8 } => {
+            buffer_storage::<u64>(py, buffer, |v| v as f64, target)?
+        }
         ElementType::Float { bytes: 2 } => {
             return Err(PyTypeError::new_err(
                 "float16 data is not supported; convert it to float32 or float64 first",
@@ -196,7 +227,9 @@ pub(crate) fn tensor_from_buffer(
             )))
         }
     };
-    PyTensor::from_shape_data_typed(shape, data, dtype.unwrap_or(inferred))
+    let tensor = quabla_core::tensor_ir::DynamicTensor::from_storage(shape, storage)
+        .map_err(PyValueError::new_err)?;
+    PyTensor::from_dynamic_tensor(tensor)
         .map(Some)
         .map_err(PyValueError::new_err)
 }
@@ -213,27 +246,45 @@ fn is_native_byte_order(format: &CStr) -> bool {
     }
 }
 
-/// Copies a typed buffer in C order and widens each element to `f64`.
-fn widen<T: Element>(
+/// Copies into the requested physical storage, preserving conversion through F64
+/// per element without allocating a full widened array for narrow output dtypes.
+fn buffer_storage<T: Element>(
     py: Python<'_>,
     buffer: PyUntypedBuffer,
     convert: impl Fn(T) -> f64,
-) -> PyResult<Vec<f64>> {
+    dtype: TensorDType,
+) -> PyResult<HostTensorStorage> {
     let typed: PyBuffer<T> = buffer.into_typed()?;
-    Ok(typed.to_vec(py)?.into_iter().map(convert).collect())
+    // Contiguous exporters copy straight into final storage. Strided exporters
+    // require a C-order source copy, but never an additional widened F64 array.
+    if let Some(values) = typed.as_slice(py) {
+        return Ok(converted_storage(
+            values.iter().map(|value| value.get()),
+            convert,
+            dtype,
+        ));
+    }
+    Ok(converted_storage(
+        typed.to_vec(py)?.into_iter(),
+        convert,
+        dtype,
+    ))
 }
 
-/// PyO3 has no typed `bool` buffer element, so `bool` data goes through
-/// `memoryview.tobytes()`, which also gathers non-contiguous layouts in C
-/// order. Each `?` element is one byte.
-fn bool_buffer_values(view: &Bound<'_, PyMemoryView>) -> PyResult<Vec<f64>> {
-    let bytes = view.call_method0("tobytes")?;
-    Ok(bytes
-        .cast::<PyBytes>()?
-        .as_bytes()
-        .iter()
-        .map(|byte| f64::from(*byte != 0))
-        .collect())
+fn converted_storage<T>(
+    values: impl Iterator<Item = T>,
+    convert: impl Fn(T) -> f64,
+    dtype: TensorDType,
+) -> HostTensorStorage {
+    match dtype {
+        TensorDType::F64 => HostTensorStorage::F64(Arc::new(values.map(convert).collect())),
+        TensorDType::F32 => {
+            HostTensorStorage::F32(Arc::new(values.map(|v| convert(v) as f32).collect()))
+        }
+        TensorDType::Bool => HostTensorStorage::Bool(Arc::new(
+            values.map(|v| u8::from(convert(v) != 0.0)).collect(),
+        )),
+    }
 }
 
 /// A Python scalar of the tensor dtype: `bool` for `bool` tensors, `float`
@@ -279,12 +330,11 @@ pub(crate) fn single_item<'py>(
     }
 }
 
-/// Element storage of one buffer export. `float64` shares the tensor's
-/// immutable `Arc` storage; the other dtypes own a converted copy.
+/// An export pins the immutable physical storage for every dtype.
 enum ExportStorage {
     F64(Arc<Vec<f64>>),
-    F32(Vec<f32>),
-    Bool(Vec<u8>),
+    F32(Arc<Vec<f32>>),
+    Bool(Arc<Vec<u8>>),
 }
 
 /// Everything a filled `Py_buffer` points into. It lives in `view.internal`
@@ -298,20 +348,17 @@ pub(crate) struct BufferExport {
 }
 
 impl BufferExport {
-    pub(crate) fn new(shape: &[usize], storage: &Arc<Vec<f64>>, dtype: TensorDType) -> Self {
-        let storage = match dtype {
-            TensorDType::F64 => ExportStorage::F64(Arc::clone(storage)),
-            // Values of a `float32` tensor are already rounded to `f32`, so
-            // the narrowing is exact.
-            TensorDType::F32 => {
-                ExportStorage::F32(storage.iter().map(|value| *value as f32).collect())
-            }
-            TensorDType::Bool => ExportStorage::Bool(
-                storage
-                    .iter()
-                    .map(|value| u8::from(*value != 0.0))
-                    .collect(),
-            ),
+    pub(crate) fn new(
+        shape: &[usize],
+        storage: &quabla_core::tensor_ir::HostTensorStorage,
+        dtype: TensorDType,
+    ) -> Self {
+        use quabla_core::tensor_ir::HostTensorStorage;
+        assert_eq!(storage.dtype(), dtype);
+        let storage = match storage {
+            HostTensorStorage::F64(values) => ExportStorage::F64(Arc::clone(values)),
+            HostTensorStorage::F32(values) => ExportStorage::F32(Arc::clone(values)),
+            HostTensorStorage::Bool(values) => ExportStorage::Bool(Arc::clone(values)),
         };
         let itemsize = storage.itemsize();
         let shape = shape
@@ -464,6 +511,37 @@ pub(crate) unsafe fn release_buffer(view: *mut ffi::Py_buffer) {
         if !internal.is_null() {
             (*view).internal = ptr::null_mut();
             drop(Box::from_raw(internal));
+        }
+    }
+}
+
+#[cfg(test)]
+mod typed_export_tests {
+    use super::*;
+    use quabla_core::tensor_ir::HostTensorStorage;
+
+    #[test]
+    fn all_typed_exports_pin_original_storage_without_conversion() {
+        for dtype in [TensorDType::F64, TensorDType::F32, TensorDType::Bool] {
+            let storage = HostTensorStorage::from_f64(vec![0.0, 1.0, 2.0, 3.0], dtype);
+            let pointer = match &storage {
+                HostTensorStorage::F64(values) => values.as_ptr().cast::<c_void>(),
+                HostTensorStorage::F32(values) => values.as_ptr().cast::<c_void>(),
+                HostTensorStorage::Bool(values) => values.as_ptr().cast::<c_void>(),
+            };
+            let export = BufferExport::new(&[2, 2], &storage, dtype);
+            assert_eq!(export.data_ptr(), pointer);
+            assert_eq!(export.element_count(), 4);
+            let (format, itemsize) = match dtype {
+                TensorDType::F64 => (c"d", 8),
+                TensorDType::F32 => (c"f", 4),
+                TensorDType::Bool => (c"?", 1),
+            };
+            assert_eq!(export.format(), format);
+            assert_eq!(export.strides, [2 * itemsize, itemsize]);
+            drop(storage);
+            assert_eq!(export.data_ptr(), pointer);
+            assert_eq!(export.element_count(), 4);
         }
     }
 }

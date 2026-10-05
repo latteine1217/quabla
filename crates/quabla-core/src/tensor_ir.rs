@@ -1,5 +1,13 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+
+mod cholesky;
+#[cfg(test)]
+mod cholesky_tests;
+pub use cholesky::CholeskyAdKind;
+mod host_storage;
+pub use host_storage::HostTensorStorage;
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 mod cuda;
@@ -294,6 +302,14 @@ impl CudaExecutionPlan {
         self.execute(inputs).map(|value| vec![value])
     }
 
+    pub fn execute_primary_retaining(
+        &self,
+        inputs: &BTreeMap<String, DynamicTensor>,
+        retained_inputs: &BTreeSet<String>,
+    ) -> Result<DynamicTensor, String> {
+        self.execute_retaining(inputs, retained_inputs)
+    }
+
     pub fn sgd_step_input_from_output(
         &self,
         _parameter_name: &str,
@@ -392,13 +408,11 @@ impl TensorBackend for CudaBackend {
 
 pub type TensorNodeId = usize;
 
-/// Host tensor value. Storage is always `f64`; `dtype` records the logical
-/// element type, and an `F32` tensor only holds values exactly representable
-/// in `f32` (rounded to nearest-even on construction).
+/// Immutable host tensor with storage matching its logical element type.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DynamicTensor {
     shape: Vec<usize>,
-    data: Vec<f64>,
+    data: HostTensorStorage,
     dtype: TensorDType,
 }
 
@@ -446,7 +460,7 @@ impl TensorConstant {
                 && lhs
                     .data
                     .iter()
-                    .zip(&rhs.data)
+                    .zip(rhs.data.iter())
                     .all(|(lhs, rhs)| lhs.to_bits() == rhs.to_bits()))
     }
 
@@ -457,7 +471,7 @@ impl TensorConstant {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         value.dtype.hash(&mut hasher);
         value.shape.hash(&mut hasher);
-        for element in &value.data {
+        for element in value.data.iter() {
             element.to_bits().hash(&mut hasher);
         }
         hasher.finish()
@@ -618,6 +632,13 @@ enum TensorOp {
     Solve {
         matrix: TensorNodeId,
         rhs: TensorNodeId,
+    },
+    Cholesky {
+        input: TensorNodeId,
+    },
+    CholeskyAd {
+        inputs: Vec<TensorNodeId>,
+        kind: CholeskyAdKind,
     },
     Triangular {
         input: TensorNodeId,
@@ -785,7 +806,8 @@ struct TensorNode {
 
 #[derive(Clone, Debug, Default)]
 pub struct TensorIr {
-    nodes: Vec<TensorNode>,
+    nodes: Arc<Vec<TensorNode>>,
+    input_nodes: Arc<HashMap<String, TensorNodeId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -875,7 +897,8 @@ impl From<String> for BatchingError {
 
 #[derive(Clone, Debug)]
 pub struct TensorExecutionPlan {
-    nodes: Vec<TensorNode>,
+    nodes: Arc<Vec<TensorNode>>,
+    input_nodes: Arc<HashMap<String, TensorNodeId>>,
     output_node_id: TensorNodeId,
     output_node_ids: Vec<TensorNodeId>,
     fused_elementwise_output: bool,
@@ -1043,6 +1066,13 @@ struct TensorForiMlxForwardJvpPlan {
 pub struct TensorScanTape {
     carries: Vec<DynamicTensor>,
 }
+
+type TensorScanCheckpointVjpResult = (
+    DynamicTensor,
+    Option<DynamicTensor>,
+    DynamicTensor,
+    BTreeMap<String, DynamicTensor>,
+);
 
 pub type TensorScanJvpResult = (
     (DynamicTensor, DynamicTensor),
@@ -1593,6 +1623,154 @@ struct MixedTangent {
     mixed: DynamicTensor,
 }
 
+// Completed lower columns record historical multipliers and do not follow later
+// row swaps. RHS replay preserves solve_lu's swap/subtraction arithmetic order.
+struct SolveReplayPlan {
+    factor: Vec<f64>,
+    pivots: Vec<usize>,
+    n: usize,
+}
+
+impl SolveReplayPlan {
+    fn for_finite_dense(matrix: &DynamicTensor) -> Option<Self> {
+        let n = matrix.shape[0];
+        if matrix.data.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let mut lower = true;
+        let mut upper = true;
+        for row in 0..n {
+            for column in 0..row {
+                upper &= matrix.data.get(row * n + column) == 0.0;
+                lower &= matrix.data.get(column * n + row) == 0.0;
+            }
+        }
+        if lower || upper {
+            return None;
+        }
+        let mut factor = matrix.data.to_vec();
+        let mut pivots = Vec::with_capacity(n);
+        for pivot in 0..n {
+            let pivot_row = (pivot..n).max_by(|&left, &right| {
+                factor[left * n + pivot]
+                    .abs()
+                    .total_cmp(&factor[right * n + pivot].abs())
+            })?;
+            if factor[pivot_row * n + pivot] == 0.0 {
+                return None;
+            }
+            pivots.push(pivot_row);
+            for column in pivot..n {
+                factor.swap(pivot * n + column, pivot_row * n + column);
+            }
+            let diagonal = factor[pivot * n + pivot];
+            for row in pivot + 1..n {
+                let multiplier = factor[row * n + pivot] / diagonal;
+                factor[row * n + pivot] = multiplier;
+                for column in pivot + 1..n {
+                    factor[row * n + column] -= multiplier * factor[pivot * n + column];
+                }
+            }
+        }
+        factor
+            .iter()
+            .all(|value| value.is_finite())
+            .then_some(Self { factor, pivots, n })
+    }
+
+    fn solve_finite(&self, rhs: &DynamicTensor) -> Option<DynamicTensor> {
+        if rhs.data.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        let columns = rhs.shape[1];
+        let n = self.n;
+        let mut result = rhs.data.to_vec();
+        for (pivot, &pivot_row) in self.pivots.iter().enumerate() {
+            for column in 0..columns {
+                result.swap(pivot * columns + column, pivot_row * columns + column);
+            }
+            for row in pivot + 1..n {
+                let multiplier = self.factor[row * n + pivot];
+                for column in 0..columns {
+                    result[row * columns + column] -= multiplier * result[pivot * columns + column];
+                }
+            }
+        }
+        for row in (0..n).rev() {
+            let diagonal = self.factor[row * n + row];
+            for column in 0..columns {
+                let mut value = result[row * columns + column];
+                for inner in row + 1..n {
+                    value -= self.factor[row * n + inner] * result[inner * columns + column];
+                }
+                result[row * columns + column] = value / diagonal;
+            }
+        }
+        if result.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        // Replay preserves the validated RHS shape and element count.
+        Some(DynamicTensor {
+            shape: rhs.shape.clone(),
+            data: HostTensorStorage::from_f64(result, TensorDType::F64),
+            dtype: TensorDType::F64,
+        })
+    }
+}
+
+impl MixedTangent {
+    fn solve_reusing_finite_factor(&self, rhs: &Self) -> Result<Option<Self>, String> {
+        solve_shape(&self.value.shape, &rhs.value.shape)?;
+        let Some(plan) = SolveReplayPlan::for_finite_dense(&self.value) else {
+            return Ok(None);
+        };
+        let Some(value) = plan.solve_finite(&rhs.value) else {
+            return Ok(None);
+        };
+        let first_rhs = rhs.first.sub(&self.first.matmul(&value)?)?;
+        solve_shape(&self.value.shape, &first_rhs.shape)?;
+        let Some(first) = plan.solve_finite(&first_rhs) else {
+            return Ok(None);
+        };
+        let second_rhs = rhs.second.sub(&self.second.matmul(&value)?)?;
+        solve_shape(&self.value.shape, &second_rhs.shape)?;
+        let Some(second) = plan.solve_finite(&second_rhs) else {
+            return Ok(None);
+        };
+        let mixed_rhs = rhs
+            .mixed
+            .sub(&self.mixed.matmul(&value)?)?
+            .sub(&self.first.matmul(&second)?)?
+            .sub(&self.second.matmul(&first)?)?;
+        solve_shape(&self.value.shape, &mixed_rhs.shape)?;
+        Ok(plan.solve_finite(&mixed_rhs).map(|mixed| Self {
+            value,
+            first,
+            second,
+            mixed,
+        }))
+    }
+}
+
+fn matmul_host_float_block<L: Copy + Into<f64>, R: Copy + Into<f64>>(
+    lhs: &[L],
+    rhs: &[R],
+    output: &mut [f64],
+    [rows, inner, columns]: [usize; 3],
+) {
+    for row in 0..rows {
+        let output = &mut output[row * columns..(row + 1) * columns];
+        for k in 0..inner {
+            let lhs = lhs[row * inner + k].into();
+            let rhs = &rhs[k * columns..(k + 1) * columns];
+            // Preserve F64 accumulation and increasing-inner arithmetic order.
+            for (output, &rhs) in output.iter_mut().zip(rhs) {
+                *output += lhs * rhs.into();
+            }
+        }
+    }
+}
+
 impl DynamicTensor {
     pub fn new(shape: Vec<usize>, data: Vec<f64>) -> Result<Self, String> {
         let expected = element_count(&shape)?;
@@ -1606,7 +1784,7 @@ impl DynamicTensor {
 
         Ok(Self {
             shape,
-            data,
+            data: HostTensorStorage::from_f64(data, TensorDType::F64),
             dtype: TensorDType::F64,
         })
     }
@@ -1624,7 +1802,7 @@ impl DynamicTensor {
         let count = element_count(&shape)?;
         Ok(Self {
             shape,
-            data: vec![value; count],
+            data: HostTensorStorage::from_f64(vec![value; count], TensorDType::F64),
             dtype: TensorDType::F64,
         })
     }
@@ -1633,17 +1811,18 @@ impl DynamicTensor {
         self.dtype
     }
 
+    /// Consumes the tensor, transferring its shape, storage, and dtype without copying.
+    pub fn into_parts(self) -> (Vec<usize>, HostTensorStorage, TensorDType) {
+        (self.shape, self.data, self.dtype)
+    }
+
     /// Converts to `dtype` with round-to-nearest-even (exact for widening).
     pub fn astype(&self, dtype: TensorDType) -> Self {
         self.clone().into_dtype(dtype)
     }
 
     fn into_dtype(mut self, dtype: TensorDType) -> Self {
-        if dtype != TensorDType::F64 {
-            for value in &mut self.data {
-                *value = dtype.round(*value);
-            }
-        }
+        self.data = self.data.into_dtype(dtype);
         self.dtype = dtype;
         self
     }
@@ -1664,8 +1843,44 @@ impl DynamicTensor {
         &self.shape
     }
 
-    pub fn data(&self) -> &[f64] {
+    /// Borrows F64 storage; other dtypes widen only for this accessor's lifetime.
+    pub fn data(&self) -> Cow<'_, [f64]> {
+        self.data.to_f64()
+    }
+
+    pub fn storage(&self) -> &HostTensorStorage {
         &self.data
+    }
+
+    pub fn from_storage(shape: Vec<usize>, data: HostTensorStorage) -> Result<Self, String> {
+        let expected = element_count(&shape)?;
+        if data.len() != expected {
+            return Err(format!(
+                "tensor data length {} does not match shape {:?} with {expected} elements",
+                data.len(),
+                shape
+            ));
+        }
+        let dtype = data.dtype();
+        Ok(Self { shape, data, dtype })
+    }
+
+    fn add_assign(&mut self, rhs: &Self) -> Result<(), String> {
+        if self.shape == rhs.shape
+            && !self.data.iter().any(|value| value.is_nan())
+            && !rhs.data.iter().any(|value| value.is_nan())
+        {
+            if let HostTensorStorage::F64(values) = &mut self.data {
+                // NaNs retain the original kernel's payload selection on each architecture.
+                // Copy shared storage so caller-visible seeds and sibling aliases stay immutable.
+                for (value, contribution) in Arc::make_mut(values).iter_mut().zip(rhs.data.iter()) {
+                    *value += contribution;
+                }
+                return Ok(());
+            }
+        }
+        *self = self.add(rhs)?;
+        Ok(())
     }
 
     fn add(&self, rhs: &Self) -> Result<Self, String> {
@@ -1713,15 +1928,25 @@ impl DynamicTensor {
         let false_strides = contiguous_strides(&on_false.shape);
         let mut data = Vec::with_capacity(count);
 
+        let mut offsets = [0; 3];
         for index in 0..count {
-            let condition_index = broadcast_offset(index, &shape, &self.shape, &condition_strides);
-            let true_index = broadcast_offset(index, &shape, &on_true.shape, &true_strides);
-            let false_index = broadcast_offset(index, &shape, &on_false.shape, &false_strides);
-            data.push(if self.data[condition_index] != 0.0 {
-                on_true.data[true_index]
+            data.push(if self.data.get(offsets[0]) != 0.0 {
+                on_true.data.get(offsets[1])
             } else {
-                on_false.data[false_index]
+                on_false.data.get(offsets[2])
             });
+            if index + 1 < count {
+                advance_broadcast_offsets(
+                    index + 1,
+                    &shape,
+                    [
+                        (&self.shape, &condition_strides),
+                        (&on_true.shape, &true_strides),
+                        (&on_false.shape, &false_strides),
+                    ],
+                    &mut offsets,
+                );
+            }
         }
 
         Self::new(shape, data)
@@ -1750,25 +1975,19 @@ impl DynamicTensor {
 
     fn reduce_axis(&self, axis: usize, scale: f64) -> Result<Self, String> {
         let output_shape = reduced_shape(&self.shape, axis)?;
-        let output_strides = contiguous_strides(&output_shape);
         let mut data = vec![0.0; element_count(&output_shape)?];
+        let inner = element_count(&self.shape[axis + 1..])?;
+        let reduced = self.shape[axis];
 
-        for (source_index, value) in self.data.iter().enumerate() {
-            let mut remaining = source_index;
-            let mut output_index = 0;
-            for source_axis in (0..self.shape.len()).rev() {
-                let coordinate = remaining % self.shape[source_axis];
-                remaining /= self.shape[source_axis];
-                if source_axis != axis {
-                    let output_axis = if source_axis < axis {
-                        source_axis
-                    } else {
-                        source_axis - 1
-                    };
-                    output_index += coordinate * output_strides[output_axis];
+        // Contiguous blocks visit source values in the original linear order,
+        // retaining +0 initialization and multiplication before each addition.
+        for (outer, output_block) in data.chunks_exact_mut(inner).enumerate() {
+            for row in 0..reduced {
+                let source_start = (outer * reduced + row) * inner;
+                for (column, output) in output_block.iter_mut().enumerate() {
+                    *output += self.data.get(source_start + column) * scale;
                 }
             }
-            data[output_index] += value * scale;
         }
 
         Self::new(output_shape, data)
@@ -1800,7 +2019,7 @@ impl DynamicTensor {
                     source_index += coordinate * source_strides[source_axis];
                 }
             }
-            data.push(self.data[source_index]);
+            data.push(self.data.get(source_index));
         }
 
         Self::new(target_shape.to_vec(), data)
@@ -1829,7 +2048,7 @@ impl DynamicTensor {
             self.shape.clone(),
             self.data
                 .iter()
-                .map(|value| sqrt_derivative_value(*value, order))
+                .map(|value| sqrt_derivative_value(value, order))
                 .collect(),
         )
     }
@@ -1842,7 +2061,7 @@ impl DynamicTensor {
                 shape
             ));
         }
-        Self::new(shape, self.data.clone())
+        Self::from_storage(shape, self.data.clone())
     }
 
     fn concat(inputs: &[&Self], axis: usize) -> Result<Self, String> {
@@ -1858,7 +2077,7 @@ impl DynamicTensor {
             for input in inputs {
                 let start = outer_index * input.shape[axis] * inner;
                 let end = start + input.shape[axis] * inner;
-                data.extend_from_slice(&input.data[start..end]);
+                data.extend((start..end).map(|index| input.data.get(index)));
             }
         }
         Self::new(shape, data)
@@ -1887,7 +2106,7 @@ impl DynamicTensor {
         for outer_index in 0..outer {
             let source_start = (outer_index * self.shape[axis] + start) * inner;
             let source_end = source_start + length * inner;
-            data.extend_from_slice(&self.data[source_start..source_end]);
+            data.extend((source_start..source_end).map(|index| self.data.get(index)));
         }
         Self::new(shape, data).map(|slice| slice.into_dtype(self.dtype))
     }
@@ -1928,8 +2147,12 @@ impl DynamicTensor {
             let source_start = outer_index * self.shape[axis] * inner;
             let destination_start = (outer_index * output_shape[axis] + start) * inner;
             let width = self.shape[axis] * inner;
-            data[destination_start..destination_start + width]
-                .copy_from_slice(&self.data[source_start..source_start + width]);
+            for (offset, value) in data[destination_start..destination_start + width]
+                .iter_mut()
+                .enumerate()
+            {
+                *value = self.data.get(source_start + offset);
+            }
         }
         Self::new(output_shape.to_vec(), data)
     }
@@ -1977,7 +2200,7 @@ impl DynamicTensor {
     }
 
     fn log(&self) -> Result<Self, String> {
-        if self.data.iter().any(|value| *value <= 0.0) {
+        if self.data.iter().any(|value| value <= 0.0) {
             return Err("log requires strictly positive tensor values".to_string());
         }
         Self::new(
@@ -2029,14 +2252,56 @@ impl DynamicTensor {
                 rhs_batch_shape,
                 &rhs_batch_strides,
             );
-            for row in 0..lhs_rows {
-                let lhs_row_start = lhs_batch * lhs_rows * lhs_inner + row * lhs_inner;
-                let output_row_start = batch_index * lhs_rows * rhs_cols + row * rhs_cols;
-                for inner in 0..lhs_inner {
-                    let lhs_value = self.data[lhs_row_start + inner];
-                    let rhs_row_start = rhs_batch * lhs_inner * rhs_cols + inner * rhs_cols;
-                    for col in 0..rhs_cols {
-                        data[output_row_start + col] += lhs_value * rhs.data[rhs_row_start + col];
+            let lhs_start = lhs_batch * lhs_rows * lhs_inner;
+            let rhs_start = rhs_batch * lhs_inner * rhs_cols;
+            let output_start = batch_index * lhs_rows * rhs_cols;
+            let output = &mut data[output_start..output_start + lhs_rows * rhs_cols];
+            let dimensions = [lhs_rows, lhs_inner, rhs_cols];
+            match (&self.data, &rhs.data) {
+                (HostTensorStorage::F64(lhs), HostTensorStorage::F64(rhs)) => {
+                    matmul_host_float_block(
+                        &lhs[lhs_start..],
+                        &rhs[rhs_start..],
+                        output,
+                        dimensions,
+                    )
+                }
+                (HostTensorStorage::F32(lhs), HostTensorStorage::F32(rhs)) => {
+                    matmul_host_float_block(
+                        &lhs[lhs_start..],
+                        &rhs[rhs_start..],
+                        output,
+                        dimensions,
+                    )
+                }
+                (HostTensorStorage::F32(lhs), HostTensorStorage::F64(rhs)) => {
+                    matmul_host_float_block(
+                        &lhs[lhs_start..],
+                        &rhs[rhs_start..],
+                        output,
+                        dimensions,
+                    )
+                }
+                (HostTensorStorage::F64(lhs), HostTensorStorage::F32(rhs)) => {
+                    matmul_host_float_block(
+                        &lhs[lhs_start..],
+                        &rhs[rhs_start..],
+                        output,
+                        dimensions,
+                    )
+                }
+                _ => {
+                    for row in 0..lhs_rows {
+                        let lhs_row_start = lhs_batch * lhs_rows * lhs_inner + row * lhs_inner;
+                        let output_row_start = batch_index * lhs_rows * rhs_cols + row * rhs_cols;
+                        for inner in 0..lhs_inner {
+                            let lhs_value = self.data.get(lhs_row_start + inner);
+                            let rhs_row_start = rhs_batch * lhs_inner * rhs_cols + inner * rhs_cols;
+                            for col in 0..rhs_cols {
+                                data[output_row_start + col] +=
+                                    lhs_value * rhs.data.get(rhs_row_start + col);
+                            }
+                        }
                     }
                 }
             }
@@ -2047,10 +2312,17 @@ impl DynamicTensor {
 
     fn solve(&self, rhs: &Self) -> Result<Self, String> {
         solve_shape(&self.shape, &rhs.shape)?;
+        if let Some(result) = self.finite_triangular_solution(rhs) {
+            return Self::new(rhs.shape.clone(), result);
+        }
+        self.solve_lu(rhs)
+    }
+
+    fn solve_lu(&self, rhs: &Self) -> Result<Self, String> {
         let n = self.shape[0];
         let columns = rhs.shape[1];
-        let mut factor = self.data.clone();
-        let mut result = rhs.data.clone();
+        let mut factor = self.data.to_vec();
+        let mut result = rhs.data.to_vec();
 
         for pivot in 0..n {
             let pivot_row = (pivot..n)
@@ -2096,6 +2368,86 @@ impl DynamicTensor {
         Self::new(rhs.shape.clone(), result)
     }
 
+    // Exact triangular structure permits substitution without a factor matrix.
+    // Exceptional values keep the pivoted solver's existing error/IEEE behavior.
+    fn finite_triangular_solution(&self, rhs: &Self) -> Option<Vec<f64>> {
+        if self
+            .data
+            .iter()
+            .chain(rhs.data.iter())
+            .any(|value| !value.is_finite())
+        {
+            return None;
+        }
+        let n = self.shape[0];
+        let columns = rhs.shape[1];
+        let mut lower = true;
+        let mut upper = true;
+        for row in 0..n {
+            if self.data.get(row * n + row) == 0.0 {
+                return None;
+            }
+            for column in 0..row {
+                upper &= self.data.get(row * n + column) == 0.0;
+                lower &= self.data.get(column * n + row) == 0.0;
+            }
+        }
+        if !lower && !upper {
+            return None;
+        }
+        let mut result = rhs.data.to_vec();
+        for step in 0..n {
+            let row = if lower { step } else { n - 1 - step };
+            let diagonal = self.data.get(row * n + row);
+            let dependencies = if lower { 0..row } else { row + 1..n };
+            for column in 0..columns {
+                let mut value = result[row * columns + column];
+                for inner in dependencies.clone() {
+                    value -= self.data.get(row * n + inner) * result[inner * columns + column];
+                    if !value.is_finite() {
+                        return None;
+                    }
+                }
+                let solved = value / diagonal;
+                if !solved.is_finite() {
+                    return None;
+                }
+                result[row * columns + column] = solved;
+            }
+        }
+        Some(result)
+    }
+
+    fn cholesky(&self) -> Result<Self, String> {
+        let n = self.shape[self.shape.len() - 1];
+        let mut output = Vec::with_capacity(self.data.len());
+        for input in self.data().chunks_exact(n * n) {
+            let mut values = vec![0.0; n * n];
+            for row in 0..n {
+                for column in 0..=row {
+                    let mut reduced = input[row * n + column];
+                    for inner in 0..column {
+                        let product = self
+                            .dtype
+                            .round(values[row * n + inner] * values[column * n + inner]);
+                        reduced = self.dtype.round(reduced - product);
+                    }
+                    values[row * n + column] = self.dtype.round(if row == column {
+                        sqrt_derivative_value(reduced, 0)
+                    } else {
+                        let diagonal = values[column * n + column];
+                        if diagonal == 0.0 {
+                            return Err("division by zero is not supported".to_string());
+                        }
+                        reduced / diagonal
+                    });
+                }
+            }
+            output.extend(values);
+        }
+        Self::with_dtype(self.shape.clone(), output, self.dtype)
+    }
+
     fn triangular(&self, lower: bool) -> Result<Self, String> {
         if self.shape.len() < 2 {
             return Err(format!(
@@ -2110,17 +2462,17 @@ impl DynamicTensor {
             .ok_or_else(|| "triangular matrix size overflows usize".to_string())?;
         let data = self
             .data
-            .chunks_exact(matrix_size)
-            .flat_map(|matrix| {
-                matrix.iter().enumerate().map(move |(index, value)| {
-                    let row = index / columns;
-                    let column = index % columns;
-                    if (lower && row >= column) || (!lower && row <= column) {
-                        *value
-                    } else {
-                        0.0
-                    }
-                })
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let index = index % matrix_size;
+                let row = index / columns;
+                let column = index % columns;
+                if (lower && row >= column) || (!lower && row <= column) {
+                    value
+                } else {
+                    0.0
+                }
             })
             .collect();
         Self::new(self.shape.clone(), data)
@@ -2145,7 +2497,7 @@ impl DynamicTensor {
             for row in 0..rows {
                 for col in 0..cols {
                     data[batch * cols * rows + col * rows + row] =
-                        self.data[batch * rows * cols + row * cols + col];
+                        self.data.get(batch * rows * cols + row * cols + col);
                 }
             }
         }
@@ -2170,7 +2522,7 @@ impl DynamicTensor {
                 remaining /= output_shape[output_axis];
                 input_index += coordinate * input_strides[axes[output_axis]];
             }
-            *output_value = self.data[input_index];
+            *output_value = self.data.get(input_index);
         }
 
         Self::new(output_shape, data)
@@ -2195,23 +2547,67 @@ impl DynamicTensor {
 
         let count = element_count(target_shape)?;
         let strides = contiguous_strides(&self.shape);
-        let data = (0..count)
-            .map(|index| self.data[broadcast_offset(index, target_shape, &self.shape, &strides)])
-            .collect();
+        let mut data = Vec::with_capacity(count);
+        let mut offsets = [0];
+        for index in 0..count {
+            data.push(self.data.get(offsets[0]));
+            if index + 1 < count {
+                advance_broadcast_offsets(
+                    index + 1,
+                    target_shape,
+                    [(&self.shape, &strides)],
+                    &mut offsets,
+                );
+            }
+        }
         Self::new(target_shape.to_vec(), data)
     }
 
     fn elementwise(&self, rhs: &Self, f: impl Fn(f64, f64) -> f64) -> Result<Self, String> {
         let shape = broadcast_shape(&self.shape, &rhs.shape)?;
         let count = element_count(&shape)?;
+        if self.shape == rhs.shape {
+            let data = self
+                .data
+                .iter()
+                .zip(rhs.data.iter())
+                .map(|(lhs, rhs)| f(lhs, rhs))
+                .collect();
+            return Self::new(shape, data);
+        }
+        // A one-element operand broadcasts without changing the other operand's
+        // linear order, including additional leading singleton dimensions.
+        if self.data.len() == 1 && rhs.data.len() == count {
+            let data = rhs
+                .data
+                .iter()
+                .map(|rhs| f(self.data.get(0), rhs))
+                .collect();
+            return Self::new(shape, data);
+        }
+        if rhs.data.len() == 1 && self.data.len() == count {
+            let data = self
+                .data
+                .iter()
+                .map(|lhs| f(lhs, rhs.data.get(0)))
+                .collect();
+            return Self::new(shape, data);
+        }
         let lhs_strides = contiguous_strides(&self.shape);
         let rhs_strides = contiguous_strides(&rhs.shape);
         let mut data = Vec::with_capacity(count);
 
+        let mut offsets = [0; 2];
         for index in 0..count {
-            let lhs_index = broadcast_offset(index, &shape, &self.shape, &lhs_strides);
-            let rhs_index = broadcast_offset(index, &shape, &rhs.shape, &rhs_strides);
-            data.push(f(self.data[lhs_index], rhs.data[rhs_index]));
+            data.push(f(self.data.get(offsets[0]), rhs.data.get(offsets[1])));
+            if index + 1 < count {
+                advance_broadcast_offsets(
+                    index + 1,
+                    &shape,
+                    [(&self.shape, &lhs_strides), (&rhs.shape, &rhs_strides)],
+                    &mut offsets,
+                );
+            }
         }
 
         Self::new(shape, data)
@@ -2457,7 +2853,7 @@ impl TensorIr {
         remap: &HashMap<TensorNodeId, TensorNodeId>,
         groups: &mut HashMap<usize, usize>,
     ) -> Result<TensorNodeId, String> {
-        let mut op = remap_tensor_op(&node.op, remap)?;
+        let mut op = remap_tensor_op(&node.op, &|id| remap.get(&id).copied())?;
         if let Some(group) = tensor_op_group_mut(&mut op) {
             *group = *groups.entry(*group).or_insert(self.nodes.len());
         }
@@ -2493,7 +2889,7 @@ impl TensorIr {
             | TensorOp::Powi { .. }
             | TensorOp::Log { .. }
             | TensorOp::Triangular { .. }
-            | TensorOp::Reshape { .. } => remap_tensor_op(&node.op, remap)?,
+            | TensorOp::Reshape { .. } => remap_tensor_op(&node.op, &|id| remap.get(&id).copied())?,
             TensorOp::Add { .. }
             | TensorOp::Sub { .. }
             | TensorOp::Div { .. }
@@ -2514,7 +2910,7 @@ impl TensorIr {
                     };
                     local.insert(operand, spliced);
                 }
-                remap_tensor_op(&node.op, &local)?
+                remap_tensor_op(&node.op, &|id| local.get(&id).copied())?
             }
             TensorOp::Sum { input } | TensorOp::Mean { input } => {
                 let count = element_count(&callee.node(*input)?.shape)?;
@@ -2589,6 +2985,30 @@ impl TensorIr {
                 axis: axis + 1,
                 start: *start,
             },
+            TensorOp::Cholesky { input } => TensorOp::Cholesky {
+                input: target(*input)?,
+            },
+            TensorOp::CholeskyAd { inputs, kind } => {
+                let mut arguments = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    let argument = target(*input)?;
+                    arguments.push(if mapped[*input] {
+                        argument
+                    } else {
+                        let source = self.node(argument)?;
+                        self.push_node(
+                            TensorOp::Broadcast { input: argument },
+                            batched_shape(batch_size, &source.shape),
+                            source.dtype,
+                            source.weak,
+                        )
+                    });
+                }
+                TensorOp::CholeskyAd {
+                    inputs: arguments,
+                    kind: *kind,
+                }
+            }
             TensorOp::Solve { .. }
             | TensorOp::Cond { .. }
             | TensorOp::Fori { .. }
@@ -2796,12 +3216,25 @@ impl TensorIr {
             &[usize],
         ) -> Result<Option<TensorNodeId>, String>,
     {
+        if let Some((expanded, mapped)) = self.expand_cholesky_for_ad()? {
+            let outputs = outputs
+                .iter()
+                .map(|output| {
+                    mapped
+                        .get(*output)
+                        .copied()
+                        .ok_or_else(|| format!("output node {output} does not exist"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return expanded.symbolic_jvp_many_with_seed(&outputs, input_tangent);
+        }
         if outputs.is_empty() {
             return Err("symbolic JVP requires at least one output".to_string());
         }
         for output in outputs {
             self.node(*output)?;
         }
+        let reachable = tensor_output_reachability(&self.nodes, outputs);
         let mut transformed = TensorIr::new();
         let mut pairs = Vec::with_capacity(self.nodes.len());
         let mut scan_jvp_results = HashMap::new();
@@ -2809,6 +3242,10 @@ impl TensorIr {
         let mut scan_vjp_jvp_groups = HashMap::new();
 
         for (node_index, node) in self.nodes.iter().enumerate() {
+            if !reachable[node_index] && !matches!(node.op, TensorOp::Input { .. }) {
+                pairs.push((usize::MAX, usize::MAX));
+                continue;
+            }
             let pair = match &node.op {
                 TensorOp::Input { name } => {
                     let value =
@@ -2949,7 +3386,7 @@ impl TensorIr {
                 TensorOp::ForiJvp { .. } => {
                     return Err(
                         "symbolic JVP through a Fori JVP result is not implemented".to_string()
-                    )
+                    );
                 }
                 TensorOp::ForiVjp {
                     carry,
@@ -2975,7 +3412,7 @@ impl TensorIr {
                 TensorOp::ForiVjpJvp { .. } => {
                     return Err(
                         "symbolic JVP through a Fori VJP JVP result is not implemented".to_string(),
-                    )
+                    );
                 }
                 TensorOp::Scan {
                     carry,
@@ -3029,7 +3466,7 @@ impl TensorIr {
                 TensorOp::ScanVjpJvp { .. } => {
                     return Err(
                         "symbolic JVP through a Scan VJP JVP result is not implemented".to_string(),
-                    )
+                    );
                 }
                 TensorOp::Tanh { input } => {
                     let (input_value, input_tangent) = pairs[*input];
@@ -3089,6 +3526,28 @@ impl TensorIr {
                         transformed.matmul(lhs_value, rhs_value)?,
                         transformed.add(left_term, right_term)?,
                     )
+                }
+                TensorOp::Cholesky { input } => {
+                    let (value, tangent) = pairs[*input];
+                    (
+                        transformed.cholesky(value)?,
+                        transformed.cholesky_ad(vec![value, tangent], CholeskyAdKind::Jvp)?,
+                    )
+                }
+                TensorOp::CholeskyAd { inputs, kind } => {
+                    let values = inputs.iter().map(|id| pairs[*id].0).collect::<Vec<_>>();
+                    let tangent = match kind {
+                        CholeskyAdKind::Jvp => transformed.cholesky_ad(
+                            vec![values[0], values[1], pairs[inputs[0]].1, pairs[inputs[1]].1],
+                            CholeskyAdKind::Mixed,
+                        )?,
+                        CholeskyAdKind::Vjp => transformed.cholesky_ad(
+                            vec![values[0], pairs[inputs[0]].1, values[1], pairs[inputs[1]].1],
+                            CholeskyAdKind::VjpJvp,
+                        )?,
+                        _ => unreachable!("higher Cholesky derivatives expanded"),
+                    };
+                    (transformed.cholesky_ad(values, *kind)?, tangent)
                 }
                 TensorOp::Solve { matrix, rhs } => {
                     let (matrix_value, matrix_tangent) = pairs[*matrix];
@@ -3233,8 +3692,10 @@ impl TensorIr {
         output: TensorNodeId,
         cotangent_name: &str,
     ) -> Result<SymbolicVjp, String> {
-        let transformed = self
-            .symbolic_vjp_many(&[(output, SymbolicCotangent::Input(cotangent_name.to_string()))])?;
+        let transformed = self.symbolic_vjp_many_impl(
+            &[(output, SymbolicCotangent::Input(cotangent_name.to_string()))],
+            true,
+        )?;
         Ok(SymbolicVjp {
             value: transformed.primals[output],
             cotangent: transformed.cotangents[0],
@@ -3255,6 +3716,29 @@ impl TensorIr {
         &self,
         outputs: &[(TensorNodeId, SymbolicCotangent)],
     ) -> Result<SymbolicVjpMany, String> {
+        self.symbolic_vjp_many_impl(outputs, false)
+    }
+
+    fn symbolic_vjp_many_impl(
+        &self,
+        outputs: &[(TensorNodeId, SymbolicCotangent)],
+        prune_dead_primals: bool,
+    ) -> Result<SymbolicVjpMany, String> {
+        if let Some((expanded, mapped)) = self.expand_cholesky_for_ad()? {
+            let outputs = outputs
+                .iter()
+                .map(|(output, seed)| {
+                    mapped
+                        .get(*output)
+                        .copied()
+                        .map(|id| (id, seed.clone()))
+                        .ok_or_else(|| format!("output node {output} does not exist"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut result = expanded.symbolic_vjp_many_impl(&outputs, prune_dead_primals)?;
+            result.primals = mapped.iter().map(|id| result.primals[*id]).collect();
+            return Ok(result);
+        }
         if outputs.is_empty() {
             return Err("symbolic VJP requires at least one output".to_string());
         }
@@ -3278,10 +3762,22 @@ impl TensorIr {
             }
         }
 
+        let requested = outputs
+            .iter()
+            .map(|(output, _)| *output)
+            .collect::<Vec<_>>();
+        let reachable = tensor_output_reachability(&self.nodes, &requested);
         let mut transformed = TensorIr::new();
         let mut values = Vec::with_capacity(self.nodes.len());
         let mut scan_values = HashMap::new();
         for (node_index, node) in self.nodes.iter().enumerate() {
+            if prune_dead_primals
+                && !reachable[node_index]
+                && !matches!(node.op, TensorOp::Input { .. })
+            {
+                values.push(usize::MAX);
+                continue;
+            }
             let value = match &node.op {
                 TensorOp::Input { name } => {
                     transformed.input_typed(name.clone(), node.shape.clone(), node.dtype)?
@@ -3334,17 +3830,17 @@ impl TensorIr {
                 TensorOp::ForiVjp { .. } => {
                     return Err(
                         "symbolic VJP through a Fori VJP result is not implemented".to_string()
-                    )
+                    );
                 }
                 TensorOp::ForiJvp { .. } => {
                     return Err(
                         "symbolic VJP through a Fori JVP result is not implemented".to_string()
-                    )
+                    );
                 }
                 TensorOp::ForiVjpJvp { .. } => {
                     return Err(
                         "symbolic VJP through a Fori VJP JVP result is not implemented".to_string(),
-                    )
+                    );
                 }
                 TensorOp::Scan {
                     carry,
@@ -3384,18 +3880,22 @@ impl TensorIr {
                 TensorOp::ScanVjp { .. } => {
                     return Err(
                         "symbolic VJP through a Scan VJP result is not implemented".to_string()
-                    )
+                    );
                 }
                 TensorOp::ScanVjpJvp { .. } => {
                     return Err(
                         "symbolic VJP through a Scan VJP JVP result is not implemented".to_string(),
-                    )
+                    );
                 }
                 TensorOp::Sum { input } => transformed.sum(values[*input])?,
                 TensorOp::SumAxis { input, axis } => {
                     transformed.sum_axis(values[*input], *axis as isize)?
                 }
                 TensorOp::Matmul { lhs, rhs } => transformed.matmul(values[*lhs], values[*rhs])?,
+                TensorOp::Cholesky { input } => transformed.cholesky(values[*input])?,
+                TensorOp::CholeskyAd { inputs, kind } => {
+                    transformed.cholesky_ad(inputs.iter().map(|id| values[*id]).collect(), *kind)?
+                }
                 TensorOp::Solve { matrix, rhs } => {
                     transformed.solve(values[*matrix], values[*rhs])?
                 }
@@ -3542,17 +4042,17 @@ impl TensorIr {
                 TensorOp::ForiVjp { .. } => {
                     return Err(
                         "symbolic VJP through a Fori VJP result is not implemented".to_string()
-                    )
+                    );
                 }
                 TensorOp::ForiJvp { .. } => {
                     return Err(
                         "symbolic VJP through a Fori JVP result is not implemented".to_string()
-                    )
+                    );
                 }
                 TensorOp::ForiVjpJvp { .. } => {
                     return Err(
                         "symbolic VJP through a Fori VJP JVP result is not implemented".to_string(),
-                    )
+                    );
                 }
                 TensorOp::Scan {
                     carry,
@@ -3578,7 +4078,16 @@ impl TensorIr {
                             }
                             let group_upstream = match cotangents[scan_node_id] {
                                 Some(cotangent) => cotangent,
-                                None => symbolic_zero_like(&mut transformed, values[scan_node_id])?,
+                                None => {
+                                    // An unrequested sibling may have no rebuilt primal. Its
+                                    // zero seed needs only shape/type, never the primal data.
+                                    let zero = transformed.constant_like(
+                                        0.0,
+                                        scan_node.dtype,
+                                        scan_node.weak,
+                                    );
+                                    transformed.broadcast_to(zero, scan_node.shape.clone())?
+                                }
                             };
                             match target {
                                 TensorScanTarget::Carry => {
@@ -3620,12 +4129,12 @@ impl TensorIr {
                 TensorOp::ScanVjp { .. } => {
                     return Err(
                         "symbolic VJP through a Scan VJP result is not implemented".to_string()
-                    )
+                    );
                 }
                 TensorOp::ScanVjpJvp { .. } => {
                     return Err(
                         "symbolic VJP through a Scan VJP JVP result is not implemented".to_string(),
-                    )
+                    );
                 }
                 TensorOp::Add { lhs, rhs } => {
                     let lhs_contribution = symbolic_reduce_to_shape(
@@ -3790,6 +4299,49 @@ impl TensorIr {
                     )?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *lhs, lhs_contribution)?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *rhs, rhs_contribution)?;
+                }
+                TensorOp::Cholesky { input } => {
+                    let contribution = transformed
+                        .cholesky_ad(vec![values[*input], upstream], CholeskyAdKind::Vjp)?;
+                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
+                }
+                TensorOp::CholeskyAd { inputs, kind } => {
+                    let zero = symbolic_full_like(&mut transformed, 0.0, upstream)?;
+                    let (input_gradient, other_gradient) = match kind {
+                        CholeskyAdKind::Jvp => (
+                            transformed.cholesky_ad(
+                                vec![values[inputs[0]], values[inputs[1]], upstream, zero],
+                                CholeskyAdKind::VjpJvp,
+                            )?,
+                            transformed.cholesky_ad(
+                                vec![values[inputs[0]], upstream],
+                                CholeskyAdKind::Vjp,
+                            )?,
+                        ),
+                        CholeskyAdKind::Vjp => (
+                            transformed.cholesky_ad(
+                                vec![values[inputs[0]], upstream, values[inputs[1]], zero],
+                                CholeskyAdKind::VjpJvp,
+                            )?,
+                            transformed.cholesky_ad(
+                                vec![values[inputs[0]], upstream],
+                                CholeskyAdKind::Jvp,
+                            )?,
+                        ),
+                        _ => unreachable!("higher Cholesky derivatives expanded"),
+                    };
+                    symbolic_accumulate(
+                        &mut transformed,
+                        &mut cotangents,
+                        inputs[0],
+                        input_gradient,
+                    )?;
+                    symbolic_accumulate(
+                        &mut transformed,
+                        &mut cotangents,
+                        inputs[1],
+                        other_gradient,
+                    )?;
                 }
                 TensorOp::Solve { matrix, rhs } => {
                     let matrix_shape = self.node(*matrix)?.shape.clone();
@@ -4071,9 +4623,7 @@ impl TensorIr {
     ) -> Result<TensorNodeId, String> {
         element_count(&shape)?;
         let name = name.into();
-        if self.nodes.iter().any(
-            |node| matches!(node.op, TensorOp::Input { name: ref existing } if existing == &name),
-        ) {
+        if self.input_nodes.contains_key(&name) {
             return Err(format!("input {name:?} already exists"));
         }
 
@@ -5009,6 +5559,198 @@ impl TensorIr {
         self.push_derived(TensorOp::Solve { matrix, rhs }, shape)
     }
 
+    /// Compact staged lower-triangle factorization. Validation follows the
+    /// reference staged recurrence, which differs from the eager SPD contract.
+    pub fn cholesky(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        let source = self.node(input)?;
+        let shape = source.shape.clone();
+        if shape.len() < 2 || shape[shape.len() - 2] != shape[shape.len() - 1] {
+            return Err(format!("cholesky reference tracing requires a square unbatched rank-2 tensor, got {shape:?}"));
+        }
+        if !source.dtype.is_floating() {
+            return Err("cholesky requires a floating-point tensor".into());
+        }
+        self.push_derived(TensorOp::Cholesky { input }, shape)
+    }
+
+    fn cholesky_ad(
+        &mut self,
+        inputs: Vec<TensorNodeId>,
+        kind: CholeskyAdKind,
+    ) -> Result<TensorNodeId, String> {
+        let expected = if matches!(kind, CholeskyAdKind::Jvp | CholeskyAdKind::Vjp) {
+            2
+        } else {
+            4
+        };
+        if inputs.len() != expected {
+            return Err("invalid Cholesky derivative arity".into());
+        }
+        let shape = self.node(inputs[0])?.shape.clone();
+        for input in &inputs {
+            if self.node(*input)?.shape != shape {
+                return Err("Cholesky derivative operand shape mismatch".into());
+            }
+        }
+        Ok(self.push_node(
+            TensorOp::CholeskyAd { inputs, kind },
+            shape,
+            TensorDType::F64,
+            false,
+        ))
+    }
+
+    // Preserve the established scalar derivative and exceptional-value rules
+    // until a compact differentiable device factorization is available.
+    #[allow(clippy::needless_range_loop)] // The recurrence indexes earlier triangular rows.
+    fn expanded_cholesky(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        let shape = self.node(input)?.shape.clone();
+        let n = shape[shape.len() - 1];
+        if shape.len() > 2 {
+            let count = element_count(&shape[..shape.len() - 2])?;
+            let flattened = self.reshape(input, vec![count, n, n])?;
+            let mut outputs = Vec::with_capacity(count);
+            for batch in 0..count {
+                let matrix = self.slice(flattened, 0, batch, 1)?;
+                let matrix = self.reshape(matrix, vec![n, n])?;
+                let factor = self.expanded_cholesky(matrix)?;
+                outputs.push(self.reshape(factor, vec![1, n, n])?);
+            }
+            let stacked = self.concat(outputs, 0)?;
+            return self.reshape(stacked, shape);
+        }
+        let mut rows: Vec<Vec<TensorNodeId>> = Vec::with_capacity(n);
+        for row in 0..n {
+            let mut current = Vec::with_capacity(n);
+            for column in 0..n {
+                if column > row {
+                    current.push(self.scalar_constant(0.0));
+                    continue;
+                }
+                let entry = self.slice(input, 0, row, 1)?;
+                let entry = self.slice(entry, 1, column, 1)?;
+                let mut reduced = self.reshape(entry, vec![])?;
+                for inner in 0..column {
+                    let other = if row == column {
+                        current[inner]
+                    } else {
+                        rows[column][inner]
+                    };
+                    let product = self.mul(current[inner], other)?;
+                    reduced = self.sub(reduced, product)?;
+                }
+                let value = if row == column {
+                    self.sqrt(reduced)?
+                } else {
+                    self.div(reduced, rows[column][column])?
+                };
+                current.push(value);
+            }
+            rows.push(current);
+        }
+        let mut output_rows = Vec::with_capacity(n);
+        for row in rows {
+            let entries = row
+                .into_iter()
+                .map(|entry| self.reshape(entry, vec![1]))
+                .collect::<Result<Vec<_>, _>>()?;
+            let row = self.concat(entries, 0)?;
+            output_rows.push(self.reshape(row, vec![1, n])?);
+        }
+        self.concat(output_rows, 0)
+    }
+
+    fn expanded_cholesky_ad(
+        &mut self,
+        inputs: &[TensorNodeId],
+        kind: CholeskyAdKind,
+    ) -> Result<TensorNodeId, String> {
+        let shape = self.node(inputs[0])?.shape.clone();
+        let dtype = self.node(inputs[0])?.dtype;
+        let mut reference = TensorIr::new();
+        let argument = reference.input_typed("matrix", shape, dtype)?;
+        let factor = reference.expanded_cholesky(argument)?;
+        let mut bindings = BTreeMap::from([("matrix".to_string(), inputs[0])]);
+        let (graph, output) = match kind {
+            CholeskyAdKind::Jvp | CholeskyAdKind::Mixed => {
+                let first = reference.symbolic_jvp_with_tangent_inputs(
+                    factor,
+                    &BTreeMap::from([("matrix".into(), "direction".into())]),
+                )?;
+                bindings.insert("direction".into(), inputs[1]);
+                if kind == CholeskyAdKind::Jvp {
+                    (first.graph, first.tangent)
+                } else {
+                    let mixed = first.graph.symbolic_jvp_with_tangent_inputs(
+                        first.tangent,
+                        &BTreeMap::from([
+                            ("matrix".into(), "second".into()),
+                            ("direction".into(), "mixed".into()),
+                        ]),
+                    )?;
+                    bindings.insert("second".into(), inputs[2]);
+                    bindings.insert("mixed".into(), inputs[3]);
+                    (mixed.graph, mixed.tangent)
+                }
+            }
+            CholeskyAdKind::Vjp | CholeskyAdKind::VjpJvp => {
+                let reverse = reference.symbolic_vjp(factor, "cotangent")?;
+                let gradient = reverse.gradients["matrix"];
+                if kind == CholeskyAdKind::Vjp {
+                    bindings.insert("cotangent".into(), inputs[1]);
+                    (reverse.graph, gradient)
+                } else {
+                    let direction = reverse.graph.symbolic_jvp_with_tangent_inputs(
+                        gradient,
+                        &BTreeMap::from([
+                            ("matrix".into(), "direction".into()),
+                            ("cotangent".into(), "cotangent_direction".into()),
+                        ]),
+                    )?;
+                    bindings.insert("direction".into(), inputs[1]);
+                    bindings.insert("cotangent".into(), inputs[2]);
+                    bindings.insert("cotangent_direction".into(), inputs[3]);
+                    (direction.graph, direction.tangent)
+                }
+            }
+        };
+        Ok(self.inline(&graph, &bindings, &[output])?[0])
+    }
+
+    fn expand_cholesky_for_ad(&self) -> Result<Option<(Self, Vec<TensorNodeId>)>, String> {
+        if !self.nodes.iter().any(|node| {
+            matches!(node.op, TensorOp::Cholesky { .. }) && node.dtype != TensorDType::F64
+                || matches!(
+                    node.op,
+                    TensorOp::CholeskyAd {
+                        kind: CholeskyAdKind::Mixed | CholeskyAdKind::VjpJvp,
+                        ..
+                    }
+                )
+        }) {
+            return Ok(None);
+        }
+        self.expand_all_cholesky().map(Some)
+    }
+
+    fn expand_all_cholesky(&self) -> Result<(Self, Vec<TensorNodeId>), String> {
+        let mut graph = Self::new();
+        let mut mapped = Vec::with_capacity(self.nodes.len());
+        for node in self.nodes.iter() {
+            let id = if let TensorOp::Cholesky { input } = node.op {
+                graph.expanded_cholesky(mapped[input])?
+            } else if let TensorOp::CholeskyAd { inputs, kind } = &node.op {
+                let inputs = inputs.iter().map(|id| mapped[*id]).collect::<Vec<_>>();
+                graph.expanded_cholesky_ad(&inputs, *kind)?
+            } else {
+                let op = remap_tensor_op(&node.op, &|id| mapped.get(id).copied())?;
+                graph.push_node(op, node.shape.clone(), node.dtype, node.weak)
+            };
+            mapped.push(id);
+        }
+        Ok((graph, mapped))
+    }
+
     pub fn triangular(&mut self, input: TensorNodeId, lower: bool) -> Result<TensorNodeId, String> {
         let shape = self.node(input)?.shape.clone();
         if shape.len() < 2 {
@@ -5400,78 +6142,108 @@ impl TensorIr {
         for output in outputs {
             self.node(*output)?;
         }
-        let mut reachable = HashSet::new();
-        let mut pending = outputs.to_vec();
-        while let Some(node_id) = pending.pop() {
-            if !reachable.insert(node_id) {
-                continue;
-            }
-            pending.extend(tensor_op_inputs(&self.node(node_id)?.op));
-        }
-
-        let mut remap = HashMap::new();
+        let reachable = tensor_output_reachability(&self.nodes, outputs);
+        let reachable_count = reachable.iter().filter(|keep| **keep).count();
+        // Node ids are dense and strictly below the allocated node count.
+        let mut remap = TensorNodeRemap::new(self.nodes.len(), reachable_count);
         let mut cse_nodes = HashMap::new();
         // Array constants by `TensorConstant::bits_hash`; candidates in one bucket are compared
         // bitwise, so a hash collision never merges different values.
         let mut constant_nodes = HashMap::<u64, Vec<TensorNodeId>>::new();
-        let mut nodes = Vec::with_capacity(reachable.len());
+        let mut nodes = Vec::with_capacity(reachable_count);
+        let mut source_uses = vec![0usize; self.nodes.len()];
+        for &output in outputs {
+            source_uses[output] += 1;
+        }
+        for (node_id, &keep) in reachable.iter().enumerate() {
+            if !keep {
+                continue;
+            }
+            for input in tensor_op_inputs(&self.nodes[node_id].op) {
+                source_uses[input] += 1;
+            }
+        }
+        let mut pending_uses = vec![0usize; self.nodes.len()];
+        let mut retained = vec![false; self.nodes.len()];
         for (old_id, node) in self.nodes.iter().enumerate() {
-            if !reachable.contains(&old_id) {
+            if !reachable[old_id] {
                 continue;
             }
-            let mut op = remap_tensor_op(&node.op, &remap)?;
-            if let Some(alias) = canonicalize_tensor_op(&mut op, &node.shape, node.dtype, &nodes)? {
-                remap.insert(old_id, alias);
-                continue;
-            }
-            if let Some(value) = fold_scalar_constant_op(&op, &nodes) {
-                // Folded values are rounded to the node dtype, matching per-node execution
-                // semantics.
-                op = TensorOp::ScalarConstant {
-                    value: node.dtype.round(value),
-                };
-            } else if let Some(value) = fold_tensor_constant_op(&op, &nodes) {
-                op = TensorOp::Constant {
-                    value: TensorConstant::new(value.into_dtype(node.dtype)),
-                };
-            }
-            if let TensorOp::Constant { value } = &op {
-                let bucket = constant_nodes.entry(value.bits_hash()).or_default();
-                let existing = bucket.iter().copied().find(|id| {
+            let source_inputs = tensor_op_inputs(&node.op);
+            let compiled_id = (|| -> Result<TensorNodeId, String> {
+                let mut op = remap_tensor_op(&node.op, &|id| remap.get(id))?;
+                if let Some(alias) =
+                    canonicalize_tensor_op(&mut op, &node.shape, node.dtype, &nodes)?
+                {
+                    return Ok(alias);
+                }
+                if let Some(value) = fold_scalar_constant_op(&op, &nodes) {
+                    // Folded values are rounded to the node dtype, matching per-node execution
+                    // semantics.
+                    op = TensorOp::ScalarConstant {
+                        value: node.dtype.round(value),
+                    };
+                } else if let Some(value) = fold_tensor_constant_op(&op, &nodes) {
+                    op = TensorOp::Constant {
+                        value: TensorConstant::new(value.into_dtype(node.dtype)),
+                    };
+                }
+                if let TensorOp::Constant { value } = &op {
+                    let bucket = constant_nodes.entry(value.bits_hash()).or_default();
+                    let existing = bucket.iter().copied().find(|id| {
                     let existing: &TensorNode = &nodes[*id];
                     existing.weak == node.weak
                         && matches!(&existing.op, TensorOp::Constant { value: other } if other.same_bits(value))
                 });
-                if let Some(existing_id) = existing {
-                    remap.insert(old_id, existing_id);
-                    continue;
+                    if let Some(existing_id) = existing {
+                        return Ok(existing_id);
+                    }
+                    bucket.push(nodes.len());
                 }
-                bucket.push(nodes.len());
-            }
-            if let Some(key) = pure_tensor_op_cse_key(&op, &node.shape) {
-                // dtype and weakness are part of a value's identity: cast(x, f32) must not be
-                // merged with x.
-                let key = format!("{key}:{}:{}", node.dtype, node.weak);
-                if let Some(existing_id) = cse_nodes.get(&key) {
-                    remap.insert(old_id, *existing_id);
-                    continue;
+                if let Some(key) = pure_tensor_op_cse_key(&op, &node.shape) {
+                    // dtype and weakness are part of a value's identity: cast(x, f32) must not be
+                    // merged with x.
+                    let key = (key, node.dtype, node.weak);
+                    if let Some(existing_id) = cse_nodes.get(&key) {
+                        return Ok(*existing_id);
+                    }
+                    cse_nodes.insert(key, nodes.len());
                 }
-                cse_nodes.insert(key, nodes.len());
+                // A surviving operation pins its operands for execution. Folded constants
+                // have no runtime dependencies and may release their temporary inputs.
+                for input in tensor_op_inputs(&op) {
+                    retained[input] = true;
+                }
+                let compiled_id = nodes.len();
+                nodes.push(TensorNode {
+                    op,
+                    shape: node.shape.clone(),
+                    dtype: node.dtype,
+                    weak: node.weak,
+                });
+                Ok(compiled_id)
+            })()?;
+            remap.insert(old_id, compiled_id);
+            pending_uses[compiled_id] += source_uses[old_id];
+            for input in source_inputs {
+                let id = remap
+                    .get(input)
+                    .expect("operand remap was validated while compiling the node");
+                pending_uses[id] -= 1;
+                release_folded_constant(&mut nodes, id, pending_uses[id], retained[id]);
             }
-            remap.insert(old_id, nodes.len());
-            nodes.push(TensorNode {
-                op,
-                shape: node.shape.clone(),
-                dtype: node.dtype,
-                weak: node.weak,
-            });
+            release_folded_constant(
+                &mut nodes,
+                compiled_id,
+                pending_uses[compiled_id],
+                retained[compiled_id],
+            );
         }
         let output_node_ids = outputs
             .iter()
             .map(|output| {
                 remap
-                    .get(output)
-                    .copied()
+                    .get(*output)
                     .ok_or_else(|| format!("output node {output} is not reachable"))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -5486,7 +6258,8 @@ impl TensorIr {
             output_node_ids.len() == 1 && is_fusable_elementwise_subgraph(&nodes, output_node_id);
         Ok((
             TensorExecutionPlan {
-                nodes,
+                input_nodes: Arc::new(tensor_input_nodes(&nodes)),
+                nodes: Arc::new(nodes),
                 output_node_id,
                 output_node_ids: output_node_ids.clone(),
                 fused_elementwise_output,
@@ -5528,10 +6301,25 @@ impl TensorIr {
         outputs: &[(TensorNodeId, DynamicTensor)],
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<(Vec<DynamicTensor>, BTreeMap<String, DynamicTensor>), String> {
+        if let Some((expanded, mapped)) = self.expand_cholesky_for_ad()? {
+            let outputs = outputs
+                .iter()
+                .map(|(output, seed)| {
+                    mapped
+                        .get(*output)
+                        .copied()
+                        .map(|id| (id, seed.clone()))
+                        .ok_or_else(|| format!("output node {output} does not exist"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return expanded.value_and_vjp_many(&outputs, inputs);
+        }
         if outputs.is_empty() {
             return Err("multi-output VJP requires at least one output".to_string());
         }
-        let values = self.evaluate_all(inputs)?;
+        let retained = tensor_reverse_retained_primals(&self.nodes, outputs);
+        let mut values =
+            Self::evaluate_tensor_nodes_with_outputs(&self.nodes, inputs, Some(&retained))?;
         let output_values = outputs
             .iter()
             .map(|(output, cotangent)| {
@@ -5545,6 +6333,7 @@ impl TensorIr {
                 }
                 values
                     .get(*output)
+                    .and_then(Option::as_ref)
                     .cloned()
                     .ok_or_else(|| format!("output node {output} has no value"))
             })
@@ -5556,9 +6345,18 @@ impl TensorIr {
         let mut processed_scan_groups = HashSet::new();
 
         for node_id in (0..self.nodes.len()).rev() {
-            let cotangent = match cotangents[node_id].clone() {
+            // Input cotangents are the returned gradients. Other cotangents have no
+            // remaining consumers once their reverse rule has run.
+            if matches!(self.nodes[node_id].op, TensorOp::Input { .. }) {
+                values[node_id] = None;
+                continue;
+            }
+            let cotangent = match cotangents[node_id].take() {
                 Some(value) => value,
-                None => continue,
+                None => {
+                    values[node_id] = None;
+                    continue;
+                }
             };
             match &self.nodes[node_id].op {
                 TensorOp::Input { .. }
@@ -5588,9 +6386,11 @@ impl TensorIr {
                 TensorOp::Div { lhs, rhs } => {
                     let lhs_value = values
                         .get(*lhs)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {lhs} has no evaluated value"))?;
                     let rhs_value = values
                         .get(*rhs)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {rhs} has no evaluated value"))?;
                     let reciprocal = rhs_value.reciprocal()?;
                     let reciprocal_squared = reciprocal.mul(&reciprocal)?;
@@ -5608,9 +6408,11 @@ impl TensorIr {
                 TensorOp::Mul { lhs, rhs } => {
                     let lhs_value = values
                         .get(*lhs)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {lhs} has no evaluated value"))?;
                     let rhs_value = values
                         .get(*rhs)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {rhs} has no evaluated value"))?;
                     let lhs_contribution = cotangent
                         .mul(rhs_value)?
@@ -5629,6 +6431,7 @@ impl TensorIr {
                 } => {
                     let condition_value = values
                         .get(*condition)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {condition} has no evaluated value"))?;
                     let zero = DynamicTensor::filled(vec![], 0.0)?;
                     let true_contribution = condition_value
@@ -5648,9 +6451,10 @@ impl TensorIr {
                     let predicate = tensor_scalar_predicate(
                         values
                             .get(*predicate)
+                            .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {predicate} has no evaluated value"))?,
                     )?;
-                    let branch_inputs = tensor_cond_capture_values(captures, &values)?;
+                    let branch_inputs = tensor_forward_capture_values(captures, &values)?;
                     let (_, branch_gradients) =
                         branches.value_and_vjp(predicate, &branch_inputs, cotangent)?;
                     for (name, gradient) in branch_gradients {
@@ -5668,10 +6472,11 @@ impl TensorIr {
                     loop_plan,
                     captures,
                 } => {
-                    let external = tensor_fori_capture_values(captures, &values)?;
+                    let external = tensor_forward_capture_values(captures, &values)?;
                     let (_, carry_gradient, external_gradients) = loop_plan.value_and_vjp(
                         values
                             .get(*carry)
+                            .and_then(Option::as_ref)
                             .cloned()
                             .ok_or_else(|| format!("node {carry} has no evaluated value"))?,
                         &external,
@@ -5711,6 +6516,7 @@ impl TensorIr {
                     ..
                 } => {
                     if processed_scan_groups.insert(*group) {
+                        let mut current_cotangent = Some(cotangent);
                         let mut carry_cotangent = None;
                         let mut output_cotangent = None;
                         for (scan_node_id, scan_node) in self.nodes.iter().enumerate() {
@@ -5725,9 +6531,15 @@ impl TensorIr {
                             if candidate_group != group {
                                 continue;
                             }
-                            let group_cotangent = cotangents[scan_node_id]
-                                .clone()
-                                .unwrap_or(DynamicTensor::filled(scan_node.shape.clone(), 0.0)?);
+                            let group_cotangent = if scan_node_id == node_id {
+                                current_cotangent.take()
+                            } else {
+                                cotangents[scan_node_id].take()
+                            };
+                            let group_cotangent = match group_cotangent {
+                                Some(value) => value,
+                                None => DynamicTensor::filled(scan_node.shape.clone(), 0.0)?,
+                            };
                             match target {
                                 TensorScanTarget::Carry => {
                                     if carry_cotangent.replace(group_cotangent).is_some() {
@@ -5753,10 +6565,11 @@ impl TensorIr {
                             Some(cotangent) => cotangent,
                             None => DynamicTensor::filled(scan_plan.output_shape()?, 0.0)?,
                         };
-                        let external_inputs = tensor_fori_capture_values(captures, &values)?;
-                        let (_, _, carry_gradient, external_gradients) = scan_plan.value_and_vjp(
+                        let external_inputs = tensor_forward_capture_values(captures, &values)?;
+                        let (carry_gradient, external_gradients) = scan_plan.vjp(
                             values
                                 .get(*carry)
+                                .and_then(Option::as_ref)
                                 .cloned()
                                 .ok_or_else(|| format!("node {carry} has no evaluated value"))?,
                             &external_inputs,
@@ -5797,9 +6610,11 @@ impl TensorIr {
                 TensorOp::Matmul { lhs, rhs } => {
                     let lhs_value = values
                         .get(*lhs)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {lhs} has no evaluated value"))?;
                     let rhs_value = values
                         .get(*rhs)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {rhs} has no evaluated value"))?;
                     let lhs_contribution = cotangent
                         .matmul(&rhs_value.transpose_last_two()?)?
@@ -5811,15 +6626,53 @@ impl TensorIr {
                     accumulate(&mut cotangents[*lhs], lhs_contribution)?;
                     accumulate(&mut cotangents[*rhs], rhs_contribution)?;
                 }
+                TensorOp::Cholesky { input } => {
+                    let value = values[*input]
+                        .as_ref()
+                        .ok_or_else(|| format!("node {input} has no value"))?;
+                    accumulate(
+                        &mut cotangents[*input],
+                        cholesky::evaluate(CholeskyAdKind::Vjp, &[value, &cotangent])?,
+                    )?;
+                }
+                TensorOp::CholeskyAd { inputs, kind } => {
+                    let value = values[inputs[0]].as_ref().ok_or("missing Cholesky value")?;
+                    let other = values[inputs[1]]
+                        .as_ref()
+                        .ok_or("missing Cholesky derivative operand")?;
+                    let zero = DynamicTensor::filled(self.nodes[node_id].shape.clone(), 0.0)?;
+                    let (first, second) = match kind {
+                        CholeskyAdKind::Jvp => (
+                            cholesky::evaluate(
+                                CholeskyAdKind::VjpJvp,
+                                &[value, other, &cotangent, &zero],
+                            )?,
+                            cholesky::evaluate(CholeskyAdKind::Vjp, &[value, &cotangent])?,
+                        ),
+                        CholeskyAdKind::Vjp => (
+                            cholesky::evaluate(
+                                CholeskyAdKind::VjpJvp,
+                                &[value, &cotangent, other, &zero],
+                            )?,
+                            cholesky::evaluate(CholeskyAdKind::Jvp, &[value, &cotangent])?,
+                        ),
+                        _ => unreachable!("higher Cholesky derivatives expanded"),
+                    };
+                    accumulate(&mut cotangents[inputs[0]], first)?;
+                    accumulate(&mut cotangents[inputs[1]], second)?;
+                }
                 TensorOp::Solve { matrix, rhs } => {
                     let matrix_value = values
                         .get(*matrix)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {matrix} has no evaluated value"))?;
                     let rhs_value = values
                         .get(*rhs)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {rhs} has no evaluated value"))?;
                     let output_value = values
                         .get(node_id)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {node_id} has no evaluated value"))?;
                     let transposed = matrix_value.transpose_last_two()?;
                     let rhs_contribution = transposed.solve(&cotangent)?;
@@ -5836,6 +6689,7 @@ impl TensorIr {
                 TensorOp::Tanh { input } => {
                     let output_value = values
                         .get(node_id)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {node_id} has no evaluated value"))?;
                     let contribution = cotangent
                         .mul(&output_value.tanh_derivative_from_output()?)?
@@ -5845,6 +6699,7 @@ impl TensorIr {
                 TensorOp::Exp { input } => {
                     let output_value = values
                         .get(node_id)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {node_id} has no evaluated value"))?;
                     let contribution = cotangent
                         .mul(output_value)?
@@ -5854,6 +6709,7 @@ impl TensorIr {
                 TensorOp::Sqrt { input } => {
                     let input_value = values
                         .get(*input)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?;
                     let contribution = cotangent
                         .mul(&input_value.sqrt_derivative(1)?)?
@@ -5863,6 +6719,7 @@ impl TensorIr {
                 TensorOp::SqrtDerivative { input, order } => {
                     let input_value = values
                         .get(*input)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?;
                     let next_order = order
                         .checked_add(1)
@@ -5894,6 +6751,7 @@ impl TensorIr {
                 TensorOp::Sin { input } => {
                     let input_value = values
                         .get(*input)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?;
                     let contribution = cotangent
                         .mul(&input_value.cos()?)?
@@ -5903,6 +6761,7 @@ impl TensorIr {
                 TensorOp::Cos { input } => {
                     let input_value = values
                         .get(*input)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?;
                     let contribution = cotangent
                         .mul(&input_value.sin()?)?
@@ -5916,6 +6775,7 @@ impl TensorIr {
                     }
                     let input_value = values
                         .get(*input)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?;
                     let contribution = cotangent
                         .mul(&input_value.powi(*exponent - 1)?)?
@@ -5926,9 +6786,11 @@ impl TensorIr {
                 TensorOp::Pow { base, exponent } => {
                     let base_value = values
                         .get(*base)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {base} has no evaluated value"))?;
                     let exponent_value = values
                         .get(*exponent)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {exponent} has no evaluated value"))?;
                     // Constant operands are skipped, as in the symbolic rule.
                     if self.scalar_constant_value(*base).is_none() {
@@ -5951,6 +6813,7 @@ impl TensorIr {
                 TensorOp::Log { input } => {
                     let input_value = values
                         .get(*input)
+                        .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?;
                     let contribution = cotangent
                         .mul(&input_value.reciprocal()?)?
@@ -5983,6 +6846,7 @@ impl TensorIr {
                     cotangent.reduce_to_shape(&self.node(*input)?.shape)?,
                 )?,
             }
+            values[node_id] = None;
         }
 
         // Eager backpropagation does derivative arithmetic in f64 and rounds by dtype only at casts
@@ -5995,7 +6859,7 @@ impl TensorIr {
                 if node.dtype == TensorDType::Bool {
                     continue;
                 }
-                let gradient = match cotangents[node_id].clone() {
+                let gradient = match cotangents[node_id].take() {
                     Some(value) => value,
                     None => DynamicTensor::filled(node.shape.clone(), 0.0)?,
                 };
@@ -6011,7 +6875,111 @@ impl TensorIr {
         inputs: &BTreeMap<String, DynamicTensor>,
         input_tangents: &BTreeMap<String, DynamicTensor>,
     ) -> Result<(DynamicTensor, DynamicTensor), String> {
-        self.node(output)?;
+        self.jvp_many(&[output], inputs, input_tangents)?
+            .pop()
+            .ok_or_else(|| format!("output node {output} has no value"))
+    }
+
+    // Direct input solves can share one finite LU factor without retaining factors for
+    // an entire graph. Replay keeps the existing pivot/subtraction order and rounds
+    // the primal before forming the tangent correction, including for F32 outputs.
+    fn direct_solve_jvp(
+        &self,
+        outputs: &[TensorNodeId],
+        inputs: &BTreeMap<String, DynamicTensor>,
+        input_tangents: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<Option<(DynamicTensor, DynamicTensor)>, String> {
+        let Some((&output, [])) = outputs.split_first() else {
+            return Ok(None);
+        };
+        if output + 1 != self.nodes.len() {
+            return Ok(None);
+        }
+        let node = &self.nodes[output];
+        let TensorOp::Solve { matrix, rhs } = node.op else {
+            return Ok(None);
+        };
+        let prefix = &self.nodes[..output];
+        if prefix
+            .iter()
+            .any(|node| !matches!(node.op, TensorOp::Input { .. }))
+        {
+            return Ok(None);
+        }
+        // Validate every primal before any tangent, as the general JVP does.
+        let values =
+            Self::evaluate_tensor_nodes_with_outputs(prefix, inputs, Some(&[matrix, rhs]))?;
+        let matrix_value = values[matrix].as_ref().expect("retained solve matrix");
+        let rhs_value = values[rhs].as_ref().expect("retained solve RHS");
+        solve_shape(&matrix_value.shape, &rhs_value.shape)?;
+        let Some(plan) = SolveReplayPlan::for_finite_dense(matrix_value) else {
+            return Ok(None);
+        };
+        let Some(value) = plan.solve_finite(rhs_value) else {
+            return Ok(None);
+        };
+        let value = value.into_dtype(node.dtype);
+        let mut matrix_tangent = None;
+        let mut rhs_tangent = None;
+        for (id, input_node) in prefix.iter().enumerate() {
+            let TensorOp::Input { name } = &input_node.op else {
+                unreachable!("input-only prefix was checked above");
+            };
+            if input_node.dtype == TensorDType::Bool {
+                if input_tangents
+                    .get(name)
+                    .is_some_and(|tangent| tangent.data.iter().any(|value| value != 0.0))
+                {
+                    return Err(bool_input_derivative_error(name));
+                }
+                continue;
+            }
+            let tangent = input_tangents
+                .get(name)
+                .ok_or_else(|| format!("missing input tangent {name:?}"))?;
+            if tangent.shape != input_node.shape {
+                return Err(format!(
+                    "input tangent {name:?} has shape {:?}, expected {:?}",
+                    tangent.shape, input_node.shape
+                ));
+            }
+            if id == matrix {
+                matrix_tangent = Some(tangent.astype(input_node.dtype));
+            }
+            if id == rhs {
+                rhs_tangent = Some(tangent.astype(input_node.dtype));
+            }
+        }
+        let correction = rhs_tangent.expect("floating solve RHS").sub(
+            &matrix_tangent
+                .expect("floating solve matrix")
+                .matmul(&value)?,
+        )?;
+        let Some(tangent) = plan.solve_finite(&correction) else {
+            return Ok(None);
+        };
+        Ok(Some((value, tangent.into_dtype(node.dtype))))
+    }
+
+    fn jvp_many(
+        &self,
+        outputs: &[TensorNodeId],
+        inputs: &BTreeMap<String, DynamicTensor>,
+        input_tangents: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<Vec<(DynamicTensor, DynamicTensor)>, String> {
+        for &output in outputs {
+            self.node(output)?;
+        }
+        if let Some((expanded, mapped)) = self.expand_cholesky_for_ad()? {
+            let outputs = outputs
+                .iter()
+                .map(|output| mapped[*output])
+                .collect::<Vec<_>>();
+            return expanded.jvp_many(&outputs, inputs, input_tangents);
+        }
+        if let Some(result) = self.direct_solve_jvp(outputs, inputs, input_tangents)? {
+            return Ok(vec![result]);
+        }
         let values = self.evaluate_all(inputs)?;
         let mut tangents: Vec<DynamicTensor> = Vec::with_capacity(self.nodes.len());
         let mut scan_jvp_cache: HashMap<usize, TensorScanJvpEvaluation> = HashMap::new();
@@ -6024,7 +6992,7 @@ impl TensorIr {
                 TensorOp::Input { name } if node.dtype == TensorDType::Bool => {
                     if input_tangents
                         .get(name)
-                        .is_some_and(|tangent| tangent.data.iter().any(|value| *value != 0.0))
+                        .is_some_and(|tangent| tangent.data.iter().any(|value| value != 0.0))
                     {
                         return Err(bool_input_derivative_error(name));
                     }
@@ -6232,6 +7200,30 @@ impl TensorIr {
                         .matmul(rhs_value)?
                         .add(&lhs_value.matmul(rhs_tangent)?)?
                 }
+                TensorOp::Cholesky { input } => {
+                    cholesky::evaluate(CholeskyAdKind::Jvp, &[&values[*input], &tangents[*input]])?
+                }
+                TensorOp::CholeskyAd { inputs, kind } => match kind {
+                    CholeskyAdKind::Jvp => cholesky::evaluate(
+                        CholeskyAdKind::Mixed,
+                        &[
+                            &values[inputs[0]],
+                            &values[inputs[1]],
+                            &tangents[inputs[0]],
+                            &tangents[inputs[1]],
+                        ],
+                    )?,
+                    CholeskyAdKind::Vjp => cholesky::evaluate(
+                        CholeskyAdKind::VjpJvp,
+                        &[
+                            &values[inputs[0]],
+                            &tangents[inputs[0]],
+                            &values[inputs[1]],
+                            &tangents[inputs[1]],
+                        ],
+                    )?,
+                    _ => unreachable!("higher Cholesky derivatives expanded"),
+                },
                 TensorOp::Solve { matrix, rhs } => {
                     let matrix_value = values
                         .get(*matrix)
@@ -6408,23 +7400,27 @@ impl TensorIr {
             tangents.push(tangent);
         }
 
-        let value = values
-            .get(output)
-            .cloned()
-            .ok_or_else(|| format!("output node {output} has no value"))?;
-        // As in the VJP: derivative arithmetic runs in f64 and output tangents are rounded to the
-        // output dtype; the tangent of a Bool output is an f64 zero (matching the weak f64 zero of
-        // the symbolic JVP).
-        let tangent_dtype = match self.node(output)?.dtype {
-            TensorDType::Bool => TensorDType::F64,
-            dtype => dtype,
-        };
-        let tangent = tangents
-            .get(output)
-            .cloned()
-            .ok_or_else(|| format!("output node {output} has no tangent"))?
-            .into_dtype(tangent_dtype);
-        Ok((value, tangent))
+        outputs
+            .iter()
+            .map(|&output| {
+                let value = values
+                    .get(output)
+                    .cloned()
+                    .ok_or_else(|| format!("output node {output} has no value"))?;
+                // Derivative arithmetic runs in f64; round only each requested output tangent.
+                // Bool outputs retain the weak f64 zero used by the single-output JVP.
+                let tangent_dtype = match self.node(output)?.dtype {
+                    TensorDType::Bool => TensorDType::F64,
+                    dtype => dtype,
+                };
+                let tangent = tangents
+                    .get(output)
+                    .cloned()
+                    .ok_or_else(|| format!("output node {output} has no tangent"))?
+                    .into_dtype(tangent_dtype);
+                Ok((value, tangent))
+            })
+            .collect()
     }
 
     pub fn hessian_scalar(
@@ -6459,6 +7455,31 @@ impl TensorIr {
         let input_count = element_count(&input_shape)?;
         let mut hessian = vec![vec![0.0; input_count]; input_count];
 
+        if input_count > 1 && self.supports_finite_symbolic_second_order(inputs, 1.0)? {
+            let (graph, tangent_output, cotangent_name, tangent_name) =
+                self.scalar_hvp_graph(output, input_name)?;
+            let mut transformed_inputs = inputs.clone();
+            transformed_inputs.insert(cotangent_name, DynamicTensor::filled(vec![], 1.0)?);
+            let mut finite = true;
+            for column in 0..input_count {
+                transformed_inputs.insert(
+                    tangent_name.clone(),
+                    DynamicTensor::one_hot(input_shape.clone(), column)?,
+                );
+                let value = graph.evaluate(tangent_output, &transformed_inputs)?;
+                if value.data.iter().any(|entry| !entry.is_finite()) {
+                    finite = false;
+                    break;
+                }
+                for (row, entries) in hessian.iter_mut().enumerate() {
+                    entries[column] = value.data.get(row);
+                }
+            }
+            if finite {
+                return Ok(hessian);
+            }
+        }
+
         for (row, hessian_row) in hessian.iter_mut().enumerate() {
             for (col, entry) in hessian_row.iter_mut().enumerate() {
                 let first_tangents = BTreeMap::from([(
@@ -6471,7 +7492,7 @@ impl TensorIr {
                 )]);
                 let result =
                     self.evaluate_mixed(output, inputs, &first_tangents, &second_tangents)?;
-                *entry = result.mixed.data[0];
+                *entry = result.mixed.data.get(0);
             }
         }
 
@@ -6522,6 +7543,28 @@ impl TensorIr {
         }
 
         let input_count = element_count(&input_shape)?;
+        if input_count > 1
+            && input_tangent.dtype == TensorDType::F64
+            && input_tangent.data.iter().all(|value| value.is_finite())
+            && self.supports_finite_symbolic_second_order(
+                inputs,
+                input_tangent
+                    .data
+                    .iter()
+                    .fold(1.0_f64, |bound, value| bound.max(value.abs())),
+            )?
+        {
+            let result = self.symbolic_hvp_scalar_through_regions(
+                output,
+                input_name,
+                inputs,
+                input_tangent.clone(),
+            )?;
+            if result.data.iter().all(|value| value.is_finite()) {
+                return Ok(result);
+            }
+        }
+
         let second_tangents = BTreeMap::from([(input_name.to_string(), input_tangent)]);
         let mut data = Vec::with_capacity(input_count);
         for index in 0..input_count {
@@ -6530,7 +7573,7 @@ impl TensorIr {
                 DynamicTensor::one_hot(input_shape.clone(), index)?,
             )]);
             let result = self.evaluate_mixed(output, inputs, &first_tangents, &second_tangents)?;
-            data.push(result.mixed.data[0]);
+            data.push(result.mixed.data.get(0));
         }
         DynamicTensor::new(input_shape, data)
     }
@@ -6553,7 +7596,7 @@ impl TensorIr {
             .collect::<Result<Vec<_>, _>>()?;
         let mut hessian = vec![vec![0.0; input_count]; input_count];
         for (row, hessian_row) in hessian.iter_mut().enumerate() {
-            *hessian_row = columns.iter().map(|column| column.data[row]).collect();
+            *hessian_row = columns.iter().map(|column| column.data.get(row)).collect();
         }
         Ok(hessian)
     }
@@ -6565,6 +7608,153 @@ impl TensorIr {
         inputs: &BTreeMap<String, DynamicTensor>,
         input_tangent: DynamicTensor,
     ) -> Result<DynamicTensor, String> {
+        let (graph, tangent_output, cotangent_name, tangent_name) =
+            self.scalar_hvp_graph(output, input_name)?;
+        let mut transformed_inputs = inputs.clone();
+        transformed_inputs.insert(cotangent_name, DynamicTensor::filled(vec![], 1.0)?);
+        transformed_inputs.insert(tangent_name, input_tangent);
+        graph.evaluate(tangent_output, &transformed_inputs)
+    }
+
+    // F32 rounding and the explicit singular/discontinuous derivative conventions
+    // retain the mixed-dual route. Smooth finite F64 graphs can share one
+    // forward-over-reverse graph instead of evaluating every coordinate pair.
+    fn supports_finite_symbolic_second_order(
+        &self,
+        inputs: &BTreeMap<String, DynamicTensor>,
+        direction_bound: f64,
+    ) -> Result<bool, String> {
+        if self.nodes.iter().any(|node| {
+            node.dtype != TensorDType::F64
+                || !matches!(
+                    node.op,
+                    TensorOp::Input { .. }
+                        | TensorOp::ScalarConstant { .. }
+                        | TensorOp::Constant { .. }
+                        | TensorOp::Add { .. }
+                        | TensorOp::Sub { .. }
+                        | TensorOp::Mul { .. }
+                        | TensorOp::Powi { .. }
+                        | TensorOp::Sin { .. }
+                        | TensorOp::Cos { .. }
+                        | TensorOp::Tanh { .. }
+                        | TensorOp::Exp { .. }
+                        | TensorOp::Matmul { .. }
+                        | TensorOp::Sum { .. }
+                        | TensorOp::SumAxis { .. }
+                        | TensorOp::Mean { .. }
+                        | TensorOp::MeanAxis { .. }
+                        | TensorOp::Reshape { .. }
+                        | TensorOp::Transpose { .. }
+                )
+        }) || inputs.values().any(|value| {
+            value.dtype != TensorDType::F64 || value.data.iter().any(|entry| !entry.is_finite())
+        }) {
+            return Ok(false);
+        }
+        let values = self.evaluate_all(inputs)?;
+        let mut bounds: Vec<(f64, f64, f64)> = Vec::with_capacity(self.nodes.len());
+        // Absolute element bounds for primal, first and mixed derivatives also
+        // guard intermediate arithmetic that a symbolic zero could eliminate.
+        // All inputs are conservatively assigned a unit first-derivative bound.
+        // Keep conservative headroom for the four-term mixed product sum and
+        // rounding differences between the two derivative evaluation orders.
+        let safe = |bound: f64| bound.is_finite() && bound < f64::MAX / 16.0;
+        for (id, node) in self.nodes.iter().enumerate() {
+            if values[id].data.iter().any(|value| !value.is_finite()) {
+                return Ok(false);
+            }
+            let magnitude = values[id]
+                .data
+                .iter()
+                .fold(0.0_f64, |bound, value| bound.max(value.abs()));
+            let unary = |input: TensorNodeId, first: f64, second: f64| {
+                let (_, linear, mixed) = bounds[input];
+                // The mixed-dual rule forms this product before applying even
+                // a zero second derivative (e.g. powi(1) or saturated tanh).
+                let product = linear * linear;
+                (first * linear, first * mixed + second * product, product)
+            };
+            let (linear, mixed, intermediate) = match &node.op {
+                TensorOp::Input { .. } => (1.0, 0.0, 0.0),
+                TensorOp::ScalarConstant { .. } | TensorOp::Constant { .. } => (0.0, 0.0, 0.0),
+                TensorOp::Add { lhs, rhs } | TensorOp::Sub { lhs, rhs } => {
+                    let (_, ll, hl) = bounds[*lhs];
+                    let (_, lr, hr) = bounds[*rhs];
+                    (ll + lr, hl + hr, 0.0)
+                }
+                TensorOp::Mul { lhs, rhs } | TensorOp::Matmul { lhs, rhs } => {
+                    let (ml, ll, hl) = bounds[*lhs];
+                    let (mr, lr, hr) = bounds[*rhs];
+                    let factor = if matches!(node.op, TensorOp::Matmul { .. }) {
+                        *self.nodes[*lhs]
+                            .shape
+                            .last()
+                            .expect("matmul has rank at least two") as f64
+                    } else {
+                        1.0
+                    };
+                    (
+                        factor * (mr * ll + ml * lr),
+                        factor * (mr * hl + ml * hr + 2.0 * ll * lr),
+                        0.0,
+                    )
+                }
+                TensorOp::Powi { input, exponent } => {
+                    if *exponent == 0 {
+                        (0.0, 0.0, 0.0)
+                    } else {
+                        let magnitude = bounds[*input].0;
+                        let first = *exponent as f64 * magnitude.powi((*exponent - 1) as i32);
+                        let second = if *exponent == 1 {
+                            0.0
+                        } else {
+                            *exponent as f64
+                                * (*exponent - 1) as f64
+                                * magnitude.powi((*exponent - 2) as i32)
+                        };
+                        if !safe(first) || !safe(second) {
+                            return Ok(false);
+                        }
+                        unary(*input, first, second)
+                    }
+                }
+                TensorOp::Sin { input } | TensorOp::Cos { input } => unary(*input, 1.0, 1.0),
+                TensorOp::Tanh { input } => unary(*input, 1.0, 2.0),
+                TensorOp::Exp { input } => unary(*input, magnitude, magnitude),
+                TensorOp::Sum { input } | TensorOp::Mean { input } => {
+                    let (_, linear, mixed) = bounds[*input];
+                    let count = values[*input].data.len() as f64;
+                    (count * linear, count * mixed, 0.0)
+                }
+                TensorOp::SumAxis { input, axis } | TensorOp::MeanAxis { input, axis } => {
+                    let (_, linear, mixed) = bounds[*input];
+                    let count = self.nodes[*input].shape[*axis] as f64;
+                    (count * linear, count * mixed, 0.0)
+                }
+                TensorOp::Reshape { input } | TensorOp::Transpose { input, .. } => {
+                    let (_, linear, mixed) = bounds[*input];
+                    (linear, mixed, 0.0)
+                }
+                _ => return Ok(false),
+            };
+            if !safe(magnitude)
+                || !safe(linear * direction_bound)
+                || !safe(mixed * direction_bound)
+                || !safe(intermediate * direction_bound)
+            {
+                return Ok(false);
+            }
+            bounds.push((magnitude, linear, mixed));
+        }
+        Ok(true)
+    }
+
+    fn scalar_hvp_graph(
+        &self,
+        output: TensorNodeId,
+        input_name: &str,
+    ) -> Result<(TensorIr, TensorNodeId, String, String), String> {
         let cotangent_name = fresh_tensor_input_name(self, "__quabla_hvp_cotangent");
         let vjp = self.symbolic_vjp(output, &cotangent_name)?;
         let gradient = *vjp
@@ -6576,12 +7766,12 @@ impl TensorIr {
             gradient,
             &BTreeMap::from([(input_name.to_string(), tangent_name.clone())]),
         )?;
-        let mut transformed_inputs = inputs.clone();
-        transformed_inputs.insert(cotangent_name, DynamicTensor::filled(vec![], 1.0)?);
-        transformed_inputs.insert(tangent_name, input_tangent);
-        directional
-            .graph
-            .evaluate(directional.tangent, &transformed_inputs)
+        Ok((
+            directional.graph,
+            directional.tangent,
+            cotangent_name,
+            tangent_name,
+        ))
     }
 
     pub fn lower_text(&self) -> String {
@@ -6715,6 +7905,8 @@ impl TensorIr {
                     "%{id} = matmul(%{lhs}, %{rhs}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
+                TensorOp::CholeskyAd { inputs, kind } => format!("%{id} = cholesky_{kind:?}({inputs:?}) : {}", format_tensor_type(&node.shape, node.dtype)),
+                TensorOp::Cholesky { input } => format!("%{id} = cholesky(%{input}) : {}", format_tensor_type(&node.shape, node.dtype)),
                 TensorOp::Solve { matrix, rhs } => format!(
                     "%{id} = solve(%{matrix}, %{rhs}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
@@ -6978,7 +8170,10 @@ impl TensorIr {
         weak: bool,
     ) -> TensorNodeId {
         let id = self.nodes.len();
-        self.nodes.push(TensorNode {
+        if let TensorOp::Input { name } = &op {
+            Arc::make_mut(&mut self.input_nodes).insert(name.clone(), id);
+        }
+        Arc::make_mut(&mut self.nodes).push(TensorNode {
             op,
             shape,
             dtype,
@@ -7045,15 +8240,34 @@ impl TensorIr {
         nodes: &[TensorNode],
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<Vec<DynamicTensor>, String> {
-        let mut values: Vec<DynamicTensor> = Vec::with_capacity(nodes.len());
+        Self::evaluate_tensor_nodes_with_outputs(nodes, inputs, None)?
+            .into_iter()
+            .enumerate()
+            .map(|(id, value)| value.ok_or_else(|| format!("node {id} has no evaluated value")))
+            .collect()
+    }
+
+    // Retention roots cover forward outputs or the primals required by reverse rules.
+    fn evaluate_tensor_nodes_with_outputs(
+        nodes: &[TensorNode],
+        inputs: &BTreeMap<String, DynamicTensor>,
+        outputs: Option<&[TensorNodeId]>,
+    ) -> Result<Vec<Option<DynamicTensor>>, String> {
+        let mut values: Vec<Option<DynamicTensor>> = Vec::with_capacity(nodes.len());
+        let mut last_uses = outputs.map(|outputs| tensor_forward_last_uses(nodes, outputs));
         let mut fori_vjp_cache: HashMap<usize, TensorForiVjpEvaluation> = HashMap::new();
         let mut fori_vjp_jvp_cache: HashMap<usize, TensorForiVjpJvpEvaluation> = HashMap::new();
         let mut scan_cache: HashMap<usize, TensorScanEvaluation> = HashMap::new();
         let mut scan_vjp_cache: HashMap<usize, TensorScanVjpEvaluation> = HashMap::new();
         let mut scan_vjp_jvp_cache: HashMap<usize, TensorScanVjpJvpEvaluation> = HashMap::new();
 
-        for node in nodes {
+        for (node_id, node) in nodes.iter().enumerate() {
+            let reused = match reuse_forward_unary(node, &mut values, last_uses.as_ref())? {
+                Some(value) => Some(value),
+                None => reuse_forward_binary(node, &mut values, last_uses.as_ref())?,
+            };
             let value = match &node.op {
+                _ if reused.is_some() => reused.expect("reused value was checked above"),
                 TensorOp::Input { name } => {
                     let input = inputs
                         .get(name)
@@ -7070,54 +8284,67 @@ impl TensorIr {
                 TensorOp::Constant { value } => value.value().clone(),
                 TensorOp::Cast { input } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .clone(),
                 TensorOp::Add { lhs, rhs } => values
                     .get(*lhs)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {lhs} has no evaluated value"))?
                     .add(
                         values
                             .get(*rhs)
+                            .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
                     )?,
                 TensorOp::Sub { lhs, rhs } => values
                     .get(*lhs)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {lhs} has no evaluated value"))?
                     .sub(
                         values
                             .get(*rhs)
+                            .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
                     )?,
                 TensorOp::Div { lhs, rhs } => values
                     .get(*lhs)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {lhs} has no evaluated value"))?
                     .div(
                         values
                             .get(*rhs)
+                            .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
                     )?,
                 TensorOp::Mul { lhs, rhs } => values
                     .get(*lhs)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {lhs} has no evaluated value"))?
                     .mul(
                         values
                             .get(*rhs)
+                            .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
                     )?,
                 TensorOp::Greater { lhs, rhs } => values
                     .get(*lhs)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {lhs} has no evaluated value"))?
                     .greater(
                         values
                             .get(*rhs)
+                            .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
                     )?,
                 TensorOp::Compare { lhs, rhs, kind } => values
                     .get(*lhs)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {lhs} has no evaluated value"))?
                     .compare(
                         values
                             .get(*rhs)
+                            .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
                         *kind,
                     )?,
@@ -7127,13 +8354,16 @@ impl TensorIr {
                     on_false,
                 } => values
                     .get(*condition)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {condition} has no evaluated value"))?
                     .where_select(
                         values
                             .get(*on_true)
+                            .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {on_true} has no evaluated value"))?,
                         values
                             .get(*on_false)
+                            .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {on_false} has no evaluated value"))?,
                     )?,
                 TensorOp::Cond {
@@ -7144,9 +8374,10 @@ impl TensorIr {
                     let predicate = tensor_scalar_predicate(
                         values
                             .get(*predicate)
+                            .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {predicate} has no evaluated value"))?,
                     )?;
-                    let branch_inputs = tensor_cond_capture_values(captures, &values)?;
+                    let branch_inputs = tensor_forward_capture_values(captures, &values)?;
                     branches.evaluate(predicate, &branch_inputs)?
                 }
                 TensorOp::Fori {
@@ -7154,10 +8385,11 @@ impl TensorIr {
                     loop_plan,
                     captures,
                 } => {
-                    let external_inputs = tensor_fori_capture_values(captures, &values)?;
+                    let external_inputs = tensor_forward_capture_values(captures, &values)?;
                     loop_plan.evaluate(
                         values
                             .get(*carry)
+                            .and_then(Option::as_ref)
                             .cloned()
                             .ok_or_else(|| format!("node {carry} has no evaluated value"))?,
                         &external_inputs,
@@ -7170,17 +8402,23 @@ impl TensorIr {
                     captures,
                     tangent_captures,
                 } => {
-                    let external_inputs = tensor_fori_capture_values(captures, &values)?;
-                    let external_tangents = tensor_fori_capture_values(tangent_captures, &values)?;
+                    let external_inputs = tensor_forward_capture_values(captures, &values)?;
+                    let external_tangents =
+                        tensor_forward_capture_values(tangent_captures, &values)?;
                     loop_plan
                         .jvp(
                             values
                                 .get(*carry)
+                                .and_then(Option::as_ref)
                                 .cloned()
                                 .ok_or_else(|| format!("node {carry} has no evaluated value"))?,
-                            values.get(*carry_tangent).cloned().ok_or_else(|| {
-                                format!("node {carry_tangent} has no evaluated value")
-                            })?,
+                            values
+                                .get(*carry_tangent)
+                                .and_then(Option::as_ref)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    format!("node {carry_tangent} has no evaluated value")
+                                })?,
                             &external_inputs,
                             &external_tangents,
                         )?
@@ -7195,16 +8433,21 @@ impl TensorIr {
                     group,
                 } => {
                     if !fori_vjp_cache.contains_key(group) {
-                        let external_inputs = tensor_fori_capture_values(captures, &values)?;
+                        let external_inputs = tensor_forward_capture_values(captures, &values)?;
                         let (_, carry_gradient, external_gradients) = loop_plan.value_and_vjp(
                             values
                                 .get(*carry)
+                                .and_then(Option::as_ref)
                                 .cloned()
                                 .ok_or_else(|| format!("node {carry} has no evaluated value"))?,
                             &external_inputs,
-                            values.get(*output_cotangent).cloned().ok_or_else(|| {
-                                format!("node {output_cotangent} has no evaluated value")
-                            })?,
+                            values
+                                .get(*output_cotangent)
+                                .and_then(Option::as_ref)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    format!("node {output_cotangent} has no evaluated value")
+                                })?,
                         )?;
                         fori_vjp_cache.insert(
                             *group,
@@ -7238,30 +8481,41 @@ impl TensorIr {
                     group,
                 } => {
                     if !fori_vjp_jvp_cache.contains_key(group) {
-                        let external_inputs = tensor_fori_capture_values(captures, &values)?;
+                        let external_inputs = tensor_forward_capture_values(captures, &values)?;
                         let external_tangents =
-                            tensor_fori_capture_values(tangent_captures, &values)?;
-                        let gradients =
-                            plan.jvp(
-                                values.get(*carry).cloned().ok_or_else(|| {
-                                    format!("node {carry} has no evaluated value")
-                                })?,
-                                values.get(*carry_tangent).cloned().ok_or_else(|| {
+                            tensor_forward_capture_values(tangent_captures, &values)?;
+                        let gradients = plan.jvp(
+                            values
+                                .get(*carry)
+                                .and_then(Option::as_ref)
+                                .cloned()
+                                .ok_or_else(|| format!("node {carry} has no evaluated value"))?,
+                            values
+                                .get(*carry_tangent)
+                                .and_then(Option::as_ref)
+                                .cloned()
+                                .ok_or_else(|| {
                                     format!("node {carry_tangent} has no evaluated value")
                                 })?,
-                                &external_inputs,
-                                &external_tangents,
-                                values.get(*output_cotangent).cloned().ok_or_else(|| {
+                            &external_inputs,
+                            &external_tangents,
+                            values
+                                .get(*output_cotangent)
+                                .and_then(Option::as_ref)
+                                .cloned()
+                                .ok_or_else(|| {
                                     format!("node {output_cotangent} has no evaluated value")
                                 })?,
-                                values.get(*output_cotangent_tangent).cloned().ok_or_else(
-                                    || {
-                                        format!(
-                                            "node {output_cotangent_tangent} has no evaluated value"
-                                        )
-                                    },
-                                )?,
-                            )?;
+                            values
+                                .get(*output_cotangent_tangent)
+                                .and_then(Option::as_ref)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    format!(
+                                        "node {output_cotangent_tangent} has no evaluated value"
+                                    )
+                                })?,
+                        )?;
                         fori_vjp_jvp_cache.insert(*group, TensorForiVjpJvpEvaluation { gradients });
                     }
                     let cached = fori_vjp_jvp_cache.get(group).ok_or_else(|| {
@@ -7285,10 +8539,11 @@ impl TensorIr {
                     group,
                 } => {
                     if !scan_cache.contains_key(group) {
-                        let external_inputs = tensor_fori_capture_values(captures, &values)?;
+                        let external_inputs = tensor_forward_capture_values(captures, &values)?;
                         let (carry, outputs) = scan_plan.evaluate(
                             values
                                 .get(*carry)
+                                .and_then(Option::as_ref)
                                 .cloned()
                                 .ok_or_else(|| format!("node {carry} has no evaluated value"))?,
                             &external_inputs,
@@ -7313,19 +8568,28 @@ impl TensorIr {
                     group,
                 } => {
                     if !scan_vjp_cache.contains_key(group) {
-                        let external_inputs = tensor_fori_capture_values(captures, &values)?;
-                        let (_, _, carry_gradient, external_gradients) = scan_plan.value_and_vjp(
+                        let external_inputs = tensor_forward_capture_values(captures, &values)?;
+                        let (carry_gradient, external_gradients) = scan_plan.vjp(
                             values
                                 .get(*carry)
+                                .and_then(Option::as_ref)
                                 .cloned()
                                 .ok_or_else(|| format!("node {carry} has no evaluated value"))?,
                             &external_inputs,
-                            values.get(*final_carry_cotangent).cloned().ok_or_else(|| {
-                                format!("node {final_carry_cotangent} has no evaluated value")
-                            })?,
-                            values.get(*output_cotangent).cloned().ok_or_else(|| {
-                                format!("node {output_cotangent} has no evaluated value")
-                            })?,
+                            values
+                                .get(*final_carry_cotangent)
+                                .and_then(Option::as_ref)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    format!("node {final_carry_cotangent} has no evaluated value")
+                                })?,
+                            values
+                                .get(*output_cotangent)
+                                .and_then(Option::as_ref)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    format!("node {output_cotangent} has no evaluated value")
+                                })?,
                         )?;
                         scan_vjp_cache.insert(
                             *group,
@@ -7361,36 +8625,36 @@ impl TensorIr {
                     group,
                 } => {
                     if !scan_vjp_jvp_cache.contains_key(group) {
-                        let external_inputs = tensor_fori_capture_values(captures, &values)?;
+                        let external_inputs = tensor_forward_capture_values(captures, &values)?;
                         let external_tangents =
-                            tensor_fori_capture_values(tangent_captures, &values)?;
+                            tensor_forward_capture_values(tangent_captures, &values)?;
                         let gradients = plan.jvp(
-                                values.get(*carry).cloned().ok_or_else(|| {
+                                values.get(*carry).and_then(Option::as_ref).cloned().ok_or_else(|| {
                                     format!("node {carry} has no evaluated value")
                                 })?,
-                                values.get(*carry_tangent).cloned().ok_or_else(|| {
+                                values.get(*carry_tangent).and_then(Option::as_ref).cloned().ok_or_else(|| {
                                     format!("node {carry_tangent} has no evaluated value")
                                 })?,
                                 &external_inputs,
                                 &external_tangents,
-                                values.get(*final_carry_cotangent).cloned().ok_or_else(|| {
+                                values.get(*final_carry_cotangent).and_then(Option::as_ref).cloned().ok_or_else(|| {
                                     format!(
                                         "node {final_carry_cotangent} has no evaluated value"
                                     )
                                 })?,
                                 values
-                                    .get(*final_carry_cotangent_tangent)
+                                    .get(*final_carry_cotangent_tangent).and_then(Option::as_ref)
                                     .cloned()
                                     .ok_or_else(|| {
                                         format!(
                                             "node {final_carry_cotangent_tangent} has no evaluated value"
                                         )
                                     })?,
-                                values.get(*output_cotangent).cloned().ok_or_else(|| {
+                                values.get(*output_cotangent).and_then(Option::as_ref).cloned().ok_or_else(|| {
                                     format!("node {output_cotangent} has no evaluated value")
                                 })?,
                                 values
-                                    .get(*output_cotangent_tangent)
+                                    .get(*output_cotangent_tangent).and_then(Option::as_ref)
                                     .cloned()
                                     .ok_or_else(|| {
                                         format!(
@@ -7415,86 +8679,123 @@ impl TensorIr {
                 }
                 TensorOp::Sum { input } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .sum_all()?,
                 TensorOp::SumAxis { input, axis } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .reduce_axis(*axis, 1.0)?,
                 TensorOp::Matmul { lhs, rhs } => values
                     .get(*lhs)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {lhs} has no evaluated value"))?
                     .matmul(
                         values
                             .get(*rhs)
+                            .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
                     )?,
+                TensorOp::CholeskyAd { inputs, kind } => {
+                    let operands = inputs
+                        .iter()
+                        .map(|id| {
+                            values[*id]
+                                .as_ref()
+                                .ok_or_else(|| format!("node {id} has no value"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    cholesky::evaluate_symbolic(*kind, &operands)?
+                }
+                TensorOp::Cholesky { input } => values
+                    .get(*input)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .cholesky()?,
                 TensorOp::Solve { matrix, rhs } => values
                     .get(*matrix)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {matrix} has no evaluated value"))?
                     .solve(
                         values
                             .get(*rhs)
+                            .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
                     )?,
                 TensorOp::Triangular { input, lower } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .triangular(*lower)?,
                 TensorOp::Tanh { input } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .tanh()?,
                 TensorOp::Exp { input } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .exp()?,
                 TensorOp::Sqrt { input } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .sqrt()?,
                 TensorOp::SqrtDerivative { input, order } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .sqrt_derivative(*order)?,
                 TensorOp::Reshape { input } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .reshape(node.shape.clone())?,
                 TensorOp::Mean { input } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .mean_all()?,
                 TensorOp::MeanAxis { input, axis } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .reduce_axis(*axis, 1.0 / nodes[*input].shape[*axis] as f64)?,
                 TensorOp::Sin { input } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .sin()?,
                 TensorOp::Cos { input } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .cos()?,
                 TensorOp::Powi { input, exponent } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .powi(*exponent)?,
                 TensorOp::Pow { base, exponent } => values
                     .get(*base)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {base} has no evaluated value"))?
                     .pow(
                         values
                             .get(*exponent)
+                            .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {exponent} has no evaluated value"))?,
                     )?,
                 TensorOp::Transpose { input, axes } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .transpose(axes)?,
                 TensorOp::Log { input } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .log()?,
                 TensorOp::Concat { inputs, axis } => DynamicTensor::concat(
@@ -7503,6 +8804,7 @@ impl TensorIr {
                         .map(|input| {
                             values
                                 .get(*input)
+                                .and_then(Option::as_ref)
                                 .ok_or_else(|| format!("node {input} has no evaluated value"))
                         })
                         .collect::<Result<Vec<_>, _>>()?,
@@ -7515,21 +8817,51 @@ impl TensorIr {
                     length,
                 } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .slice_axis(*axis, *start, *length)?,
                 TensorOp::PadSlice { input, axis, start } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .pad_slice(&node.shape, *axis, *start)?,
                 TensorOp::Broadcast { input } => values
                     .get(*input)
+                    .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .broadcast_to_shape(&node.shape)?,
             };
             // Each node computes in f64 and rounds to the node dtype: inputs are rounded
             // automatically, casts convert, and f32 nodes get the correctly rounded f64 result
             // (`+ - * / sqrt` are bit-identical to IEEE f32).
-            values.push(value.into_dtype(node.dtype));
+            values.push(Some(value.into_dtype(node.dtype)));
+            #[cfg(test)]
+            if last_uses.is_some() {
+                let elements = values.iter().flatten().map(|value| value.data.len()).sum();
+                CPU_FORWARD_PEAK_ELEMENTS.with(|peak| peak.set(peak.get().max(elements)));
+            }
+            if let Some(last_uses) = &mut last_uses {
+                for input in tensor_op_inputs(&node.op) {
+                    last_uses.remaining[input] -= 1;
+                    if last_uses.remaining[input] == 0 && !last_uses.retained[input] {
+                        values[input] = None;
+                    }
+                }
+                if last_uses.remaining[node_id] == 0 && !last_uses.retained[node_id] {
+                    values[node_id] = None;
+                }
+                // Region siblings share one evaluation, but its cached tensors need not outlive
+                // the final sibling. Node values above protect any requested output separately.
+                if let Some(group) = tensor_op_group(&node.op) {
+                    if last_uses.group_last_nodes.get(&group) == Some(&node_id) {
+                        fori_vjp_cache.remove(&group);
+                        fori_vjp_jvp_cache.remove(&group);
+                        scan_cache.remove(&group);
+                        scan_vjp_cache.remove(&group);
+                        scan_vjp_jvp_cache.remove(&group);
+                    }
+                }
+            }
         }
         Ok(values)
     }
@@ -7559,9 +8891,32 @@ impl TensorIr {
         input_mixed: &BTreeMap<String, DynamicTensor>,
     ) -> Result<MixedTangent, String> {
         self.node(output)?;
+        if self
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, TensorOp::CholeskyAd { .. }))
+        {
+            let (expanded, mapped) = self.expand_all_cholesky()?;
+            return expanded.evaluate_mixed_with_input_mixed(
+                mapped[output],
+                inputs,
+                first_tangents,
+                second_tangents,
+                input_mixed,
+            );
+        }
+        if let Some((expanded, mapped)) = self.expand_cholesky_for_ad()? {
+            return expanded.evaluate_mixed_with_input_mixed(
+                mapped[output],
+                inputs,
+                first_tangents,
+                second_tangents,
+                input_mixed,
+            );
+        }
         let mut values: Vec<MixedTangent> = Vec::with_capacity(self.nodes.len());
 
-        for node in &self.nodes {
+        for node in self.nodes.iter() {
             let value = match &node.op {
                 TensorOp::Input { name } => {
                     let value = input_value(inputs, name, &node.shape)?;
@@ -8091,6 +9446,14 @@ impl TensorIr {
                             .add(&lhs.value.matmul(&rhs.mixed)?)?,
                     }
                 }
+                TensorOp::Cholesky { input } => {
+                    let input = &values[*input];
+                    MixedTangent { value: input.value.cholesky()?,
+                        first: cholesky::evaluate(CholeskyAdKind::Jvp, &[&input.value, &input.first])?,
+                        second: cholesky::evaluate(CholeskyAdKind::Jvp, &[&input.value, &input.second])?,
+                        mixed: cholesky::evaluate(CholeskyAdKind::Mixed, &[&input.value, &input.first, &input.second, &input.mixed])? }
+                }
+                TensorOp::CholeskyAd { .. } => unreachable!("Cholesky AD expanded before mixed evaluation"),
                 TensorOp::Solve { matrix, rhs } => {
                     let matrix = values
                         .get(*matrix)
@@ -8098,23 +9461,27 @@ impl TensorIr {
                     let rhs = values
                         .get(*rhs)
                         .ok_or_else(|| format!("node {rhs} has no evaluated value"))?;
-                    let value = matrix.value.solve(&rhs.value)?;
-                    let first = matrix
-                        .value
-                        .solve(&rhs.first.sub(&matrix.first.matmul(&value)?)?)?;
-                    let second = matrix
-                        .value
-                        .solve(&rhs.second.sub(&matrix.second.matmul(&value)?)?)?;
-                    let mixed_rhs = rhs
-                        .mixed
-                        .sub(&matrix.mixed.matmul(&value)?)?
-                        .sub(&matrix.first.matmul(&second)?)?
-                        .sub(&matrix.second.matmul(&first)?)?;
-                    MixedTangent {
-                        value,
-                        first,
-                        second,
-                        mixed: matrix.value.solve(&mixed_rhs)?,
+                    if let Some(result) = matrix.solve_reusing_finite_factor(rhs)? {
+                        result
+                    } else {
+                        let value = matrix.value.solve(&rhs.value)?;
+                        let first = matrix
+                            .value
+                            .solve(&rhs.first.sub(&matrix.first.matmul(&value)?)?)?;
+                        let second = matrix
+                            .value
+                            .solve(&rhs.second.sub(&matrix.second.matmul(&value)?)?)?;
+                        let mixed_rhs = rhs
+                            .mixed
+                            .sub(&matrix.mixed.matmul(&value)?)?
+                            .sub(&matrix.first.matmul(&second)?)?
+                            .sub(&matrix.second.matmul(&first)?)?;
+                        MixedTangent {
+                            value,
+                            first,
+                            second,
+                            mixed: matrix.value.solve(&mixed_rhs)?,
+                        }
                     }
                 }
                 TensorOp::Triangular { input, lower } => {
@@ -8479,7 +9846,7 @@ fn symbolic_clone_with_input_replacements(
                 format!("symbolic Fori JVP is missing input replacement {name:?}")
             })?,
             _ => {
-                let op = remap_tensor_op(&node.op, &remap)?;
+                let op = remap_tensor_op(&node.op, &|id| remap.get(&id).copied())?;
                 destination.push_node(op, node.shape.clone(), node.dtype, node.weak)
             }
         };
@@ -9399,6 +10766,84 @@ fn build_tensor_fori_mlx_vjp_plan(
     })
 }
 
+// VJP consumers need block boundaries rather than the public complete carry tape.
+// Rematerialize each block in forward order, then consume it in reverse order.
+#[cfg(test)]
+thread_local! {
+    // Tests compare replay with the complete-tape fallback on the same long loop.
+    static LOOP_CHECKPOINT_TEST_FULL_TAPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct TensorCarryCheckpoints<T = DynamicTensor> {
+    carries: Vec<T>,
+    block: usize,
+    steps: usize,
+}
+
+impl<T: Clone> TensorCarryCheckpoints<T> {
+    fn block_size(steps: usize) -> Option<usize> {
+        #[cfg(test)]
+        if LOOP_CHECKPOINT_TEST_FULL_TAPE.with(|value| value.get()) {
+            return None;
+        }
+        if steps == 0 {
+            return None;
+        }
+        let root = steps.isqrt();
+        let block = root + usize::from(root * root < steps);
+        // Include both checkpoint and block entries conservatively. Short loops
+        // retain the complete tape when separate workspace would not shrink it.
+        steps
+            .div_ceil(block)
+            .checked_add(block)
+            .filter(|&states| states < steps)?;
+        Some(block)
+    }
+
+    fn forward(
+        initial: T,
+        steps: usize,
+        block: usize,
+        mut evaluate: impl FnMut(usize, T) -> Result<T, String>,
+    ) -> Result<(T, Self), String> {
+        let mut checkpoints = Vec::with_capacity(steps.div_ceil(block));
+        let mut carry = initial;
+        checkpoints.push(carry.clone());
+        for offset in 0..steps {
+            carry = evaluate(offset, carry)?;
+            if (offset + 1).is_multiple_of(block) && offset + 1 < steps {
+                checkpoints.push(carry.clone());
+            }
+        }
+        Ok((
+            carry,
+            Self {
+                carries: checkpoints,
+                block,
+                steps,
+            },
+        ))
+    }
+
+    fn pop_block(
+        &mut self,
+        mut evaluate: impl FnMut(usize, T) -> Result<T, String>,
+    ) -> Result<Option<(usize, Vec<T>)>, String> {
+        let Some(mut carry) = self.carries.pop() else {
+            return Ok(None);
+        };
+        let start = self.carries.len() * self.block;
+        let length = self.block.min(self.steps - start);
+        let mut carries = Vec::with_capacity(length);
+        carries.push(carry.clone());
+        for offset in start..start + length - 1 {
+            carry = evaluate(offset, carry)?;
+            carries.push(carry.clone());
+        }
+        Ok(Some((start, carries)))
+    }
+}
+
 impl TensorForiExecutionPlan {
     pub fn new(
         lower: usize,
@@ -9486,8 +10931,20 @@ impl TensorForiExecutionPlan {
         initial_carry: DynamicTensor,
         external_inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<DynamicTensor, String> {
-        self.evaluate_with_tape(initial_carry, external_inputs)
-            .map(|(output, _)| output)
+        self.validate_external_inputs(external_inputs)?;
+        if initial_carry.shape != self.carry_shape()? {
+            return Err(format!(
+                "fori initial carry shape {:?} does not match {:?}",
+                initial_carry.shape,
+                self.carry_shape()?
+            ));
+        }
+        let mut carry = initial_carry;
+        for index in self.lower..self.upper {
+            let inputs = self.body_inputs(carry, index, external_inputs)?;
+            carry = self.body.plan.evaluate(&inputs)?;
+        }
+        Ok(carry)
     }
 
     /// Executes the forward loop once and returns both the final carry and its
@@ -9563,7 +11020,26 @@ impl TensorForiExecutionPlan {
                 "fori carry and output cotangent must both have shape {carry_shape:?}"
             ));
         }
-        let (output, tape) = self.evaluate_with_tape(initial_carry, external_inputs)?;
+        let steps = self.upper - self.lower;
+        let mut checkpoints = None;
+        let mut full_tape = None;
+        let output = if let Some(block) = TensorCarryCheckpoints::<DynamicTensor>::block_size(steps)
+        {
+            let (output, tape) =
+                TensorCarryCheckpoints::forward(initial_carry, steps, block, |offset, carry| {
+                    self.body.plan.evaluate(&self.body_inputs(
+                        carry,
+                        self.lower + offset,
+                        external_inputs,
+                    )?)
+                })?;
+            checkpoints = Some(tape);
+            output
+        } else {
+            let (output, tape) = self.evaluate_with_tape(initial_carry, external_inputs)?;
+            full_tape = Some(tape);
+            output
+        };
         let mut carry_cotangent = output_cotangent;
         let mut external_gradients = self
             .external_captures
@@ -9572,29 +11048,44 @@ impl TensorForiExecutionPlan {
                 DynamicTensor::filled(shape.clone(), 0.0).map(|value| (name.clone(), value))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        for (offset, carry) in tape.carries[..tape.carries.len() - 1]
-            .iter()
-            .cloned()
-            .enumerate()
-            .rev()
-        {
-            let index = self.lower + offset;
-            let (_, gradients) = self.body.plan.value_and_vjp(
-                &self.body_inputs(carry, index, external_inputs)?,
-                carry_cotangent,
-            )?;
-            carry_cotangent = gradients
-                .get(&self.carry_name)
-                .cloned()
-                .ok_or_else(|| "fori loop body did not return a carry gradient".to_string())?;
-            for name in self.external_captures.keys() {
-                let contribution = gradients.get(name).ok_or_else(|| {
-                    format!("fori loop body did not return a gradient for capture {name:?}")
-                })?;
-                let accumulated = external_gradients
-                    .get_mut(name)
-                    .ok_or_else(|| format!("fori loop external gradient {name:?} is missing"))?;
-                *accumulated = accumulated.add(contribution)?;
+        loop {
+            let block = if let Some(checkpoints) = &mut checkpoints {
+                checkpoints.pop_block(|offset, carry| {
+                    self.body.plan.evaluate(&self.body_inputs(
+                        carry,
+                        self.lower + offset,
+                        external_inputs,
+                    )?)
+                })?
+            } else {
+                full_tape.take().map(|mut tape| {
+                    tape.carries.pop();
+                    (0, tape.carries)
+                })
+            };
+            let Some((start, carries)) = block else {
+                break;
+            };
+            for (local_offset, carry) in carries.into_iter().enumerate().rev() {
+                let offset = start + local_offset;
+                let index = self.lower + offset;
+                let (_, gradients) = self.body.plan.value_and_vjp(
+                    &self.body_inputs(carry, index, external_inputs)?,
+                    carry_cotangent,
+                )?;
+                carry_cotangent = gradients
+                    .get(&self.carry_name)
+                    .cloned()
+                    .ok_or_else(|| "fori loop body did not return a carry gradient".to_string())?;
+                for name in self.external_captures.keys() {
+                    let contribution = gradients.get(name).ok_or_else(|| {
+                        format!("fori loop body did not return a gradient for capture {name:?}")
+                    })?;
+                    let accumulated = external_gradients.get_mut(name).ok_or_else(|| {
+                        format!("fori loop external gradient {name:?} is missing")
+                    })?;
+                    accumulated.add_assign(contribution)?;
+                }
             }
         }
         Ok((output, carry_cotangent, external_gradients))
@@ -9740,26 +11231,34 @@ impl TensorForiVjpJvpExecutionPlan {
                 "Fori VJP JVP carry or cotangent shape does not match carry shape".to_string(),
             );
         }
-        let mut carries = vec![initial_carry.clone()];
-        let mut carry_tangents = vec![initial_tangent.clone()];
-        let mut carry = initial_carry;
-        let mut carry_tangent = initial_tangent;
-        for index in self.loop_plan.lower..self.loop_plan.upper {
-            let inputs = self
-                .loop_plan
-                .body_inputs(carry.clone(), index, external_inputs)?;
-            let tangents = self
-                .loop_plan
-                .body_tangents(carry_tangent.clone(), external_tangents)?;
-            let (next, next_tangent) = self.loop_plan.body.plan.as_ir().jvp(
+        let steps = self.loop_plan.upper - self.loop_plan.lower;
+        let evaluate = |offset, (carry, tangent)| {
+            let inputs = self.loop_plan.body_inputs(
+                carry,
+                self.loop_plan.lower + offset,
+                external_inputs,
+            )?;
+            let tangents = self.loop_plan.body_tangents(tangent, external_tangents)?;
+            self.loop_plan.body.plan.as_ir().jvp(
                 self.loop_plan.body.plan.output_node_id,
                 &inputs,
                 &tangents,
-            )?;
-            carry = next;
-            carry_tangent = next_tangent;
-            carries.push(carry.clone());
-            carry_tangents.push(carry_tangent.clone());
+            )
+        };
+        let mut checkpoints = None;
+        let mut full_tape = None;
+        let initial = (initial_carry, initial_tangent);
+        if let Some(block) = TensorCarryCheckpoints::<DynamicTensor>::block_size(steps) {
+            let (_, tape) = TensorCarryCheckpoints::forward(initial, steps, block, evaluate)?;
+            checkpoints = Some(tape);
+        } else {
+            let mut state = initial;
+            let mut states = Vec::with_capacity(steps);
+            for offset in 0..steps {
+                states.push(state.clone());
+                state = evaluate(offset, state)?;
+            }
+            full_tape = Some(states);
         }
 
         let mut carry_cotangent = output_cotangent;
@@ -9772,66 +11271,77 @@ impl TensorForiVjpJvpExecutionPlan {
                 DynamicTensor::filled(shape.clone(), 0.0).map(|value| (name.clone(), value))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        for offset in (0..self.loop_plan.upper - self.loop_plan.lower).rev() {
-            let inputs = self.loop_plan.body_inputs(
-                carries[offset].clone(),
-                self.loop_plan.lower + offset,
-                external_inputs,
-            )?;
-            let body_gradients = self
-                .loop_plan
-                .body
-                .plan
-                .value_and_vjp(&inputs, carry_cotangent.clone())?
-                .1;
-            let mut jvp_inputs = inputs;
-            jvp_inputs.insert(self.cotangent_name.clone(), carry_cotangent.clone());
-            let mut jvp_tangents = BTreeMap::new();
-            jvp_tangents.insert(
-                self.tangent_names
+        loop {
+            let block = if let Some(checkpoints) = &mut checkpoints {
+                checkpoints.pop_block(evaluate)?
+            } else {
+                full_tape.take().map(|states| (0, states))
+            };
+            let Some((start, states)) = block else {
+                break;
+            };
+            for (local_offset, (carry, tangent)) in states.into_iter().enumerate().rev() {
+                let offset = start + local_offset;
+                let inputs = self.loop_plan.body_inputs(
+                    carry,
+                    self.loop_plan.lower + offset,
+                    external_inputs,
+                )?;
+                let body_gradients = self
+                    .loop_plan
+                    .body
+                    .plan
+                    .value_and_vjp(&inputs, carry_cotangent.clone())?
+                    .1;
+                let mut jvp_inputs = inputs;
+                jvp_inputs.insert(self.cotangent_name.clone(), carry_cotangent.clone());
+                let mut jvp_tangents = BTreeMap::new();
+                jvp_tangents.insert(
+                    self.tangent_names
+                        .get(&self.loop_plan.carry_name)
+                        .cloned()
+                        .ok_or_else(|| "Fori VJP JVP has no carry tangent input".to_string())?,
+                    tangent,
+                );
+                for (name, tangent_name) in &self.tangent_names {
+                    if name == &self.loop_plan.carry_name || name == &self.cotangent_name {
+                        continue;
+                    }
+                    if let Some(tangent) = external_tangents.get(name) {
+                        jvp_tangents.insert(tangent_name.clone(), tangent.clone());
+                    }
+                }
+                let cotangent_tangent_name = self
+                    .tangent_names
+                    .get(&self.cotangent_name)
+                    .ok_or_else(|| "Fori VJP JVP has no cotangent tangent input".to_string())?;
+                jvp_tangents.insert(
+                    cotangent_tangent_name.clone(),
+                    carry_cotangent_tangent.clone(),
+                );
+                jvp_inputs.extend(jvp_tangents);
+                let next_carry_cotangent_tangent = self
+                    .gradient_tangent_plans
+                    .get(&self.loop_plan.carry_name)
+                    .ok_or_else(|| "Fori VJP JVP has no carry gradient plan".to_string())?
+                    .evaluate(&jvp_inputs)?;
+                for name in self.loop_plan.external_captures.keys() {
+                    let contribution = self
+                        .gradient_tangent_plans
+                        .get(name)
+                        .ok_or_else(|| format!("Fori VJP JVP has no gradient plan for {name:?}"))?
+                        .evaluate(&jvp_inputs)?;
+                    let accumulated = gradients
+                        .get_mut(name)
+                        .ok_or_else(|| format!("Fori VJP JVP gradient {name:?} is missing"))?;
+                    accumulated.add_assign(&contribution)?;
+                }
+                carry_cotangent = body_gradients
                     .get(&self.loop_plan.carry_name)
                     .cloned()
-                    .ok_or_else(|| "Fori VJP JVP has no carry tangent input".to_string())?,
-                carry_tangents[offset].clone(),
-            );
-            for (name, tangent_name) in &self.tangent_names {
-                if name == &self.loop_plan.carry_name || name == &self.cotangent_name {
-                    continue;
-                }
-                if let Some(tangent) = external_tangents.get(name) {
-                    jvp_tangents.insert(tangent_name.clone(), tangent.clone());
-                }
+                    .ok_or_else(|| "Fori body VJP has no carry gradient".to_string())?;
+                carry_cotangent_tangent = next_carry_cotangent_tangent;
             }
-            let cotangent_tangent_name = self
-                .tangent_names
-                .get(&self.cotangent_name)
-                .ok_or_else(|| "Fori VJP JVP has no cotangent tangent input".to_string())?;
-            jvp_tangents.insert(
-                cotangent_tangent_name.clone(),
-                carry_cotangent_tangent.clone(),
-            );
-            jvp_inputs.extend(jvp_tangents);
-            let next_carry_cotangent_tangent = self
-                .gradient_tangent_plans
-                .get(&self.loop_plan.carry_name)
-                .ok_or_else(|| "Fori VJP JVP has no carry gradient plan".to_string())?
-                .evaluate(&jvp_inputs)?;
-            for name in self.loop_plan.external_captures.keys() {
-                let contribution = self
-                    .gradient_tangent_plans
-                    .get(name)
-                    .ok_or_else(|| format!("Fori VJP JVP has no gradient plan for {name:?}"))?
-                    .evaluate(&jvp_inputs)?;
-                let accumulated = gradients
-                    .get_mut(name)
-                    .ok_or_else(|| format!("Fori VJP JVP gradient {name:?} is missing"))?;
-                *accumulated = accumulated.add(&contribution)?;
-            }
-            carry_cotangent = body_gradients
-                .get(&self.loop_plan.carry_name)
-                .cloned()
-                .ok_or_else(|| "Fori body VJP has no carry gradient".to_string())?;
-            carry_cotangent_tangent = next_carry_cotangent_tangent;
         }
         gradients.insert(self.loop_plan.carry_name.clone(), carry_cotangent_tangent);
         Ok(gradients)
@@ -9977,23 +11487,34 @@ impl TensorScanVjpJvpExecutionPlan {
                 "Scan VJP JVP input shapes do not match the Scan result shapes".to_string(),
             );
         }
-        let mut carries = vec![initial_carry.clone()];
-        let mut carry_tangents = vec![initial_tangent.clone()];
-        let mut carry = initial_carry;
-        let mut carry_tangent = initial_tangent;
-        for index in self.scan_plan.lower..self.scan_plan.upper {
-            let inputs = self.scan_plan.inputs(carry, index, external_inputs)?;
-            let tangents = self.scan_plan.tangents(carry_tangent, external_tangents)?;
-            let (next_carry, next_tangent) = self.scan_plan.body.plan.as_ir().jvp(
+        let steps = self.scan_plan.upper - self.scan_plan.lower;
+        let evaluate = |offset, (carry, tangent)| {
+            let inputs =
+                self.scan_plan
+                    .inputs(carry, self.scan_plan.lower + offset, external_inputs)?;
+            let tangents = self.scan_plan.tangents(tangent, external_tangents)?;
+            self.scan_plan.body.plan.as_ir().jvp(
                 self.scan_plan.body.plan.output_node_ids[0],
                 &inputs,
                 &tangents,
-            )?;
-            carry = next_carry;
-            carry_tangent = next_tangent;
-            carries.push(carry.clone());
-            carry_tangents.push(carry_tangent.clone());
+            )
+        };
+        let mut checkpoints = None;
+        let mut full_tape = None;
+        let initial = (initial_carry, initial_tangent);
+        if let Some(block) = TensorCarryCheckpoints::<DynamicTensor>::block_size(steps) {
+            let (_, tape) = TensorCarryCheckpoints::forward(initial, steps, block, evaluate)?;
+            checkpoints = Some(tape);
+        } else {
+            let mut state = initial;
+            let mut states = Vec::with_capacity(steps);
+            for offset in 0..steps {
+                states.push(state.clone());
+                state = evaluate(offset, state)?;
+            }
+            full_tape = Some(states);
         }
+
         let output_step_shape = self.scan_plan.body.output_shapes()[1].clone();
         let mut carry_cotangent = final_carry_cotangent;
         let mut carry_cotangent_tangent = final_carry_cotangent_tangent;
@@ -10005,88 +11526,98 @@ impl TensorScanVjpJvpExecutionPlan {
                 DynamicTensor::filled(shape.clone(), 0.0).map(|value| (name.clone(), value))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        for offset in (0..self.scan_plan.upper - self.scan_plan.lower).rev() {
-            let inputs = self.scan_plan.inputs(
-                carries[offset].clone(),
-                self.scan_plan.lower + offset,
-                external_inputs,
-            )?;
-            let output_step_cotangent = output_cotangent
-                .slice_axis(0, offset, 1)?
-                .reshape(output_step_shape.clone())?;
-            let output_step_cotangent_tangent = output_cotangent_tangent
-                .slice_axis(0, offset, 1)?
-                .reshape(output_step_shape.clone())?;
-            let (_, primal_gradients) = self.scan_plan.body.plan.value_and_vjp_many(
-                &inputs,
-                vec![carry_cotangent.clone(), output_step_cotangent.clone()],
-            )?;
-            let mut jvp_inputs = inputs;
-            jvp_inputs.insert(self.carry_cotangent_name.clone(), carry_cotangent.clone());
-            jvp_inputs.insert(self.output_cotangent_name.clone(), output_step_cotangent);
-            let mut jvp_tangents = BTreeMap::new();
-            jvp_tangents.insert(
-                self.tangent_names
+        loop {
+            let block = if let Some(checkpoints) = &mut checkpoints {
+                checkpoints.pop_block(evaluate)?
+            } else {
+                full_tape.take().map(|states| (0, states))
+            };
+            let Some((start, states)) = block else {
+                break;
+            };
+            for (local_offset, (carry, tangent)) in states.into_iter().enumerate().rev() {
+                let offset = start + local_offset;
+                let inputs =
+                    self.scan_plan
+                        .inputs(carry, self.scan_plan.lower + offset, external_inputs)?;
+                let output_step_cotangent = output_cotangent
+                    .slice_axis(0, offset, 1)?
+                    .reshape(output_step_shape.clone())?;
+                let output_step_cotangent_tangent = output_cotangent_tangent
+                    .slice_axis(0, offset, 1)?
+                    .reshape(output_step_shape.clone())?;
+                let (_, primal_gradients) = self.scan_plan.body.plan.value_and_vjp_many(
+                    &inputs,
+                    vec![carry_cotangent.clone(), output_step_cotangent.clone()],
+                )?;
+                let mut jvp_inputs = inputs;
+                jvp_inputs.insert(self.carry_cotangent_name.clone(), carry_cotangent.clone());
+                jvp_inputs.insert(self.output_cotangent_name.clone(), output_step_cotangent);
+                let mut jvp_tangents = BTreeMap::new();
+                jvp_tangents.insert(
+                    self.tangent_names
+                        .get(&self.scan_plan.carry_name)
+                        .cloned()
+                        .ok_or_else(|| "Scan VJP JVP has no carry tangent input".to_string())?,
+                    tangent,
+                );
+                for name in self.scan_plan.external_captures.keys() {
+                    if let Some(tangent) = external_tangents.get(name) {
+                        let tangent_name = self.tangent_names.get(name).ok_or_else(|| {
+                            format!("Scan VJP JVP has no tangent input for {name:?}")
+                        })?;
+                        jvp_tangents.insert(tangent_name.clone(), tangent.clone());
+                    }
+                }
+                jvp_tangents.insert(
+                    self.tangent_names
+                        .get(&self.carry_cotangent_name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            "Scan VJP JVP has no carry cotangent tangent input".to_string()
+                        })?,
+                    carry_cotangent_tangent.clone(),
+                );
+                jvp_tangents.insert(
+                    self.tangent_names
+                        .get(&self.output_cotangent_name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            "Scan VJP JVP has no output cotangent tangent input".to_string()
+                        })?,
+                    output_step_cotangent_tangent,
+                );
+                jvp_inputs.extend(jvp_tangents);
+                let directional_gradient = |name: &str| -> Result<DynamicTensor, String> {
+                    let carry_term = self
+                        .carry_gradient_tangent_plans
+                        .get(name)
+                        .ok_or_else(|| {
+                            format!("Scan VJP JVP has no carry gradient plan for {name:?}")
+                        })?
+                        .evaluate(&jvp_inputs)?;
+                    let output_term = self
+                        .output_gradient_tangent_plans
+                        .get(name)
+                        .ok_or_else(|| {
+                            format!("Scan VJP JVP has no output gradient plan for {name:?}")
+                        })?
+                        .evaluate(&jvp_inputs)?;
+                    carry_term.add(&output_term)
+                };
+                carry_cotangent_tangent = directional_gradient(&self.scan_plan.carry_name)?;
+                for name in self.scan_plan.external_captures.keys() {
+                    let contribution = directional_gradient(name)?;
+                    let accumulated = gradients
+                        .get_mut(name)
+                        .ok_or_else(|| format!("Scan VJP JVP gradient {name:?} is missing"))?;
+                    accumulated.add_assign(&contribution)?;
+                }
+                carry_cotangent = primal_gradients
                     .get(&self.scan_plan.carry_name)
                     .cloned()
-                    .ok_or_else(|| "Scan VJP JVP has no carry tangent input".to_string())?,
-                carry_tangents[offset].clone(),
-            );
-            for name in self.scan_plan.external_captures.keys() {
-                if let Some(tangent) = external_tangents.get(name) {
-                    let tangent_name = self
-                        .tangent_names
-                        .get(name)
-                        .ok_or_else(|| format!("Scan VJP JVP has no tangent input for {name:?}"))?;
-                    jvp_tangents.insert(tangent_name.clone(), tangent.clone());
-                }
+                    .ok_or_else(|| "Scan body VJP has no carry gradient".to_string())?;
             }
-            jvp_tangents.insert(
-                self.tangent_names
-                    .get(&self.carry_cotangent_name)
-                    .cloned()
-                    .ok_or_else(|| {
-                        "Scan VJP JVP has no carry cotangent tangent input".to_string()
-                    })?,
-                carry_cotangent_tangent.clone(),
-            );
-            jvp_tangents.insert(
-                self.tangent_names
-                    .get(&self.output_cotangent_name)
-                    .cloned()
-                    .ok_or_else(|| {
-                        "Scan VJP JVP has no output cotangent tangent input".to_string()
-                    })?,
-                output_step_cotangent_tangent,
-            );
-            jvp_inputs.extend(jvp_tangents);
-            let directional_gradient = |name: &str| -> Result<DynamicTensor, String> {
-                let carry_term = self
-                    .carry_gradient_tangent_plans
-                    .get(name)
-                    .ok_or_else(|| format!("Scan VJP JVP has no carry gradient plan for {name:?}"))?
-                    .evaluate(&jvp_inputs)?;
-                let output_term = self
-                    .output_gradient_tangent_plans
-                    .get(name)
-                    .ok_or_else(|| {
-                        format!("Scan VJP JVP has no output gradient plan for {name:?}")
-                    })?
-                    .evaluate(&jvp_inputs)?;
-                carry_term.add(&output_term)
-            };
-            carry_cotangent_tangent = directional_gradient(&self.scan_plan.carry_name)?;
-            for name in self.scan_plan.external_captures.keys() {
-                let contribution = directional_gradient(name)?;
-                let accumulated = gradients
-                    .get_mut(name)
-                    .ok_or_else(|| format!("Scan VJP JVP gradient {name:?} is missing"))?;
-                *accumulated = accumulated.add(&contribution)?;
-            }
-            carry_cotangent = primal_gradients
-                .get(&self.scan_plan.carry_name)
-                .cloned()
-                .ok_or_else(|| "Scan body VJP has no carry gradient".to_string())?;
         }
         gradients.insert(self.scan_plan.carry_name.clone(), carry_cotangent_tangent);
         Ok(gradients)
@@ -10207,8 +11738,24 @@ impl TensorScanExecutionPlan {
         initial_carry: DynamicTensor,
         external_inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<(DynamicTensor, DynamicTensor), String> {
-        self.evaluate_with_tape(initial_carry, external_inputs)
-            .map(|(carry, outputs, _)| (carry, outputs))
+        self.validate(initial_carry.clone(), external_inputs)?;
+        let mut carry = initial_carry;
+        let mut outputs = Vec::with_capacity(self.upper - self.lower);
+        for index in self.lower..self.upper {
+            let mut values = self
+                .body
+                .evaluate(&self.inputs(carry, index, external_inputs)?)?
+                .into_iter();
+            carry = values
+                .next()
+                .ok_or_else(|| "scan body has no carry".to_string())?;
+            outputs.push(
+                values
+                    .next()
+                    .ok_or_else(|| "scan body has no output".to_string())?,
+            );
+        }
+        Ok((carry, stack_scan_outputs(outputs)?))
     }
 
     pub fn evaluate_with_tape(
@@ -10252,10 +11799,16 @@ impl TensorScanExecutionPlan {
             let inputs = self.inputs(carry, index, external_inputs)?;
             let tangents = self.tangents(tangent, external_tangents)?;
             let body = self.body.plan.as_ir();
-            let (next_carry, next_tangent) =
-                body.jvp(self.body.plan.output_node_ids[0], &inputs, &tangents)?;
-            let (output, output_tangent) =
-                body.jvp(self.body.plan.output_node_ids[1], &inputs, &tangents)?;
+            // Both outputs share the primal and numeric tangent traversal, including nested scans.
+            let mut results = body
+                .jvp_many(&self.body.plan.output_node_ids, &inputs, &tangents)?
+                .into_iter();
+            let (next_carry, next_tangent) = results
+                .next()
+                .ok_or_else(|| "scan body has no carry".to_string())?;
+            let (output, output_tangent) = results
+                .next()
+                .ok_or_else(|| "scan body has no output".to_string())?;
             carry = next_carry;
             tangent = next_tangent;
             outputs.push(output);
@@ -10282,10 +11835,99 @@ impl TensorScanExecutionPlan {
         ),
         String,
     > {
-        let (final_carry, outputs, tape) =
-            self.evaluate_with_tape(initial_carry, external_inputs)?;
+        let (carry, outputs, gradient, captures) = self.value_and_vjp_internal(
+            initial_carry,
+            external_inputs,
+            final_carry_cotangent,
+            output_cotangent,
+            true,
+        )?;
+        Ok((
+            carry,
+            outputs.expect("requested Scan outputs"),
+            gradient,
+            captures,
+        ))
+    }
+
+    // Gradient-only region consumers need no stacked primal scan output.
+    fn vjp(
+        &self,
+        initial_carry: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+        final_carry_cotangent: DynamicTensor,
+        output_cotangent: DynamicTensor,
+    ) -> Result<(DynamicTensor, BTreeMap<String, DynamicTensor>), String> {
+        let (_, _, gradient, captures) = self.value_and_vjp_internal(
+            initial_carry,
+            external_inputs,
+            final_carry_cotangent,
+            output_cotangent,
+            false,
+        )?;
+        Ok((gradient, captures))
+    }
+
+    fn value_and_vjp_internal(
+        &self,
+        initial_carry: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+        final_carry_cotangent: DynamicTensor,
+        output_cotangent: DynamicTensor,
+        keep_outputs: bool,
+    ) -> Result<TensorScanCheckpointVjpResult, String> {
+        self.validate(initial_carry.clone(), external_inputs)?;
+        let steps = self.upper - self.lower;
+        if steps == 0 {
+            return Err("scan requires at least one output".to_string());
+        }
+        let mut outputs = if keep_outputs {
+            Vec::with_capacity(steps)
+        } else {
+            Vec::new()
+        };
+        let mut checkpoints = None;
+        let mut full_tape = None;
+        let final_carry = if let Some(block) =
+            TensorCarryCheckpoints::<DynamicTensor>::block_size(steps)
+        {
+            let (carry, tape) =
+                TensorCarryCheckpoints::forward(initial_carry, steps, block, |offset, carry| {
+                    let values = self.body.evaluate(&self.inputs(
+                        carry,
+                        self.lower + offset,
+                        external_inputs,
+                    )?)?;
+                    if keep_outputs {
+                        outputs.push(values[1].clone());
+                    }
+                    Ok(values[0].clone())
+                })?;
+            checkpoints = Some(tape);
+            carry
+        } else {
+            let mut carry = initial_carry;
+            let mut carries = vec![carry.clone()];
+            for index in self.lower..self.upper {
+                let values = self
+                    .body
+                    .evaluate(&self.inputs(carry, index, external_inputs)?)?;
+                carry = values[0].clone();
+                if keep_outputs {
+                    outputs.push(values[1].clone());
+                }
+                carries.push(carry.clone());
+            }
+            full_tape = Some(carries);
+            carry
+        };
+        let outputs = if keep_outputs {
+            Some(stack_scan_outputs(outputs)?)
+        } else {
+            None
+        };
         if final_carry_cotangent.shape != final_carry.shape
-            || output_cotangent.shape != outputs.shape
+            || output_cotangent.shape != self.output_shape()?
         {
             return Err("scan cotangent shapes do not match outputs".to_string());
         }
@@ -10298,32 +11940,48 @@ impl TensorScanExecutionPlan {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let output_shape = self.body.output_shapes()[1].clone();
-        for (offset, carry) in tape.carries[..tape.carries.len() - 1]
-            .iter()
-            .cloned()
-            .enumerate()
-            .rev()
-        {
-            let output_gradient = output_cotangent
-                .slice_axis(0, offset, 1)?
-                .reshape(output_shape.clone())?;
-            let inputs = self.inputs(carry, self.lower + offset, external_inputs)?;
-            let (_, gradients) = self
-                .body
-                .plan
-                .value_and_vjp_many(&inputs, vec![carry_cotangent, output_gradient])?;
-            carry_cotangent = gradients
-                .get(&self.carry_name)
-                .cloned()
-                .ok_or_else(|| "scan body has no carry gradient".to_string())?;
-            for name in self.external_captures.keys() {
-                let contribution = gradients
-                    .get(name)
-                    .ok_or_else(|| format!("scan body has no gradient for {name:?}"))?;
-                let accumulated = external_gradients
-                    .get_mut(name)
-                    .ok_or_else(|| format!("scan gradient {name:?} is missing"))?;
-                *accumulated = accumulated.add(contribution)?;
+        loop {
+            let block = if let Some(checkpoints) = &mut checkpoints {
+                checkpoints.pop_block(|offset, carry| {
+                    let values = self.body.evaluate(&self.inputs(
+                        carry,
+                        self.lower + offset,
+                        external_inputs,
+                    )?)?;
+                    Ok(values[0].clone())
+                })?
+            } else {
+                full_tape.take().map(|mut carries| {
+                    carries.pop();
+                    (0, carries)
+                })
+            };
+            let Some((start, carries)) = block else {
+                break;
+            };
+            for (local_offset, carry) in carries.into_iter().enumerate().rev() {
+                let offset = start + local_offset;
+                let output_gradient = output_cotangent
+                    .slice_axis(0, offset, 1)?
+                    .reshape(output_shape.clone())?;
+                let inputs = self.inputs(carry, self.lower + offset, external_inputs)?;
+                let (_, gradients) = self
+                    .body
+                    .plan
+                    .value_and_vjp_many(&inputs, vec![carry_cotangent, output_gradient])?;
+                carry_cotangent = gradients
+                    .get(&self.carry_name)
+                    .cloned()
+                    .ok_or_else(|| "scan body has no carry gradient".to_string())?;
+                for name in self.external_captures.keys() {
+                    let contribution = gradients
+                        .get(name)
+                        .ok_or_else(|| format!("scan body has no gradient for {name:?}"))?;
+                    let accumulated = external_gradients
+                        .get_mut(name)
+                        .ok_or_else(|| format!("scan gradient {name:?} is missing"))?;
+                    accumulated.add_assign(contribution)?;
+                }
             }
         }
         Ok((final_carry, outputs, carry_cotangent, external_gradients))
@@ -10683,6 +12341,65 @@ impl TensorScanTape {
 }
 
 impl TensorExecutionPlan {
+    /// Checks CUDA device-loop forms before driver/NVRTC initialization.
+    pub fn validate_cuda(&self) -> Result<(), (String, String)> {
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        {
+            cuda::validate_cuda_plan(self)
+        }
+        #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+        {
+            Err((
+                "cuda".into(),
+                "CUDA target is unavailable in this build".into(),
+            ))
+        }
+    }
+
+    /// Checks lazy MLX lowering without allocating arrays or executing a branch.
+    /// The compatibility helpers keep their historical execution-time errors.
+    pub fn validate_mlx(&self) -> Result<(), (String, String)> {
+        for node in self.nodes.iter() {
+            if node
+                .shape
+                .iter()
+                .any(|extent| i32::try_from(*extent).is_err())
+            {
+                return Err(("shape".into(), "MLX shape extent exceeds i32".into()));
+            }
+            match &node.op {
+                TensorOp::Solve { .. } => return Err(("solve".into(),
+                    "MLX GPU backend does not yet support solve: MLX linalg::solve only accepts a CPU stream".into())),
+                TensorOp::ScalarConstant { value } if !value.is_finite() => return Err((
+                    "constant".into(), "MLX backend does not support non-finite constants".into())),
+                TensorOp::Cond { branches, .. } => {
+                    branches.on_true.plan.validate_mlx()?;
+                    branches.on_false.plan.validate_mlx()?;
+                }
+                TensorOp::Fori { loop_plan, .. }
+                | TensorOp::ForiJvp { loop_plan, .. }
+                | TensorOp::ForiVjp { loop_plan, .. } => loop_plan.body.plan.validate_mlx()?,
+                TensorOp::ForiVjpJvp { plan, .. } => {
+                    plan.loop_plan.body.plan.validate_mlx()?;
+                    for gradient in plan.gradient_tangent_plans.values() {
+                        gradient.validate_mlx()?;
+                    }
+                }
+                TensorOp::Scan { scan_plan, .. }
+                | TensorOp::ScanVjp { scan_plan, .. } => scan_plan.body.plan.validate_mlx()?,
+                TensorOp::ScanVjpJvp { plan, .. } => {
+                    plan.scan_plan.body.plan.validate_mlx()?;
+                    for gradient in plan.carry_gradient_tangent_plans.values()
+                        .chain(plan.output_gradient_tangent_plans.values()) {
+                        gradient.validate_mlx()?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
@@ -10708,24 +12425,16 @@ impl TensorExecutionPlan {
     }
 
     pub fn input_shape(&self, name: &str) -> Result<Vec<usize>, String> {
-        self.nodes
-            .iter()
-            .find_map(|node| match &node.op {
-                TensorOp::Input { name: candidate } if candidate == name => {
-                    Some(node.shape.clone())
-                }
-                _ => None,
-            })
+        self.input_nodes
+            .get(name)
+            .map(|id| self.nodes[*id].shape.clone())
             .ok_or_else(|| format!("execution plan input {name:?} does not exist"))
     }
 
     pub fn input_dtype(&self, name: &str) -> Result<TensorDType, String> {
-        self.nodes
-            .iter()
-            .find_map(|node| match &node.op {
-                TensorOp::Input { name: candidate } if candidate == name => Some(node.dtype),
-                _ => None,
-            })
+        self.input_nodes
+            .get(name)
+            .map(|id| self.nodes[*id].dtype)
             .ok_or_else(|| format!("execution plan input {name:?} does not exist"))
     }
 
@@ -10906,7 +12615,7 @@ impl TensorExecutionPlan {
 
         let mut sharded_inputs = BTreeSet::new();
         let mut batch_extent = None;
-        for (placed, node) in sharding.program.nodes.iter().zip(&self.nodes) {
+        for (placed, node) in sharding.program.nodes.iter().zip(self.nodes.iter()) {
             let partition = match &placed.placement {
                 TensorPlacement::Unplaced => continue,
                 TensorPlacement::Mesh {
@@ -10985,7 +12694,7 @@ impl TensorExecutionPlan {
         for ((local, node), placed) in replica
             .nodes
             .iter()
-            .zip(&self.nodes)
+            .zip(self.nodes.iter())
             .zip(&sharding.program.nodes)
         {
             if tensor_op_inputs(&local.op) != tensor_op_inputs(&node.op) {
@@ -11008,6 +12717,7 @@ impl TensorExecutionPlan {
         Ok(TensorDataParallelProgram {
             replica_plan: TensorExecutionPlan {
                 nodes: replica.nodes,
+                input_nodes: replica.input_nodes,
                 output_node_id: self.output_node_id,
                 output_node_ids: self.output_node_ids.clone(),
                 fused_elementwise_output: self.fused_elementwise_output,
@@ -11052,7 +12762,7 @@ impl TensorExecutionPlan {
     }
 
     pub fn buffer_plan(&self) -> Result<TensorBufferPlan, String> {
-        build_tensor_buffer_plan(&self.nodes, self.output_node_id)
+        build_tensor_buffer_plan(&self.nodes, &self.output_node_ids)
     }
 
     /// Returns maximal elementwise regions that backends may lower as one
@@ -11123,7 +12833,7 @@ impl TensorExecutionPlan {
 {offsets}\n\
 extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
     const unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
-    if (index < count) output[index] = {expression};\n\
+    if (index < count) {{\n{expression}    }}\n\
 }}\n"
         ))
     }
@@ -11174,7 +12884,7 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
         Ok(format!(
             "{offsets}\nextern \"C\" __global__ void {function}({parameters}) {{\n\
     const unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
-    if (index < count) output[index] = {expression};\n\
+    if (index < count) {{\n{expression}    }}\n\
 }}\n"
         ))
     }
@@ -11194,14 +12904,28 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
         if self.fused_elementwise_output {
             return self.evaluate(inputs).map(|value| vec![value]);
         }
-        let values = TensorIr::evaluate_tensor_nodes(&self.nodes, inputs)?;
+        let mut values = TensorIr::evaluate_tensor_nodes_with_outputs(
+            &self.nodes,
+            inputs,
+            Some(&self.output_node_ids),
+        )?;
+        let mut output_uses = vec![0usize; self.nodes.len()];
+        for output in &self.output_node_ids {
+            output_uses[*output] += 1;
+        }
         self.output_node_ids
             .iter()
             .map(|output| {
-                values
-                    .get(*output)
-                    .cloned()
-                    .ok_or_else(|| format!("output node {output} has no value"))
+                output_uses[*output] -= 1;
+                let value = values
+                    .get_mut(*output)
+                    .ok_or_else(|| format!("output node {output} has no value"))?;
+                if output_uses[*output] == 0 {
+                    value.take()
+                } else {
+                    value.clone()
+                }
+                .ok_or_else(|| format!("output node {output} has no value"))
             })
             .collect()
     }
@@ -11213,10 +12937,14 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
         if self.fused_elementwise_output {
             return evaluate_fused_elementwise(&self.nodes, self.output_node_id, inputs);
         }
-        TensorIr::evaluate_tensor_nodes(&self.nodes, inputs)?
-            .get(self.output_node_id)
-            .cloned()
-            .ok_or_else(|| format!("output node {} has no value", self.output_node_id))
+        TensorIr::evaluate_tensor_nodes_with_outputs(
+            &self.nodes,
+            inputs,
+            Some(&[self.output_node_id]),
+        )?
+        .get_mut(self.output_node_id)
+        .and_then(Option::take)
+        .ok_or_else(|| format!("output node {} has no value", self.output_node_id))
     }
 
     pub fn vjp(
@@ -11401,6 +13129,7 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
     fn as_ir(&self) -> TensorIr {
         TensorIr {
             nodes: self.nodes.clone(),
+            input_nodes: self.input_nodes.clone(),
         }
     }
 
@@ -11411,7 +13140,7 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
     ) -> Result<TensorIr, String> {
         let mut specialized = TensorIr::new();
         let mut remap = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
+        for node in self.nodes.iter() {
             let mapped = |node_id: TensorNodeId| {
                 remap.get(node_id).copied().ok_or_else(|| {
                     format!("data-parallel specialization operand {node_id} is missing")
@@ -11467,6 +13196,14 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                 TensorOp::Matmul { lhs, rhs } => {
                     specialized.matmul(mapped(*lhs)?, mapped(*rhs)?)?
                 }
+                TensorOp::CholeskyAd { inputs, kind } => specialized.cholesky_ad(
+                    inputs
+                        .iter()
+                        .map(|id| mapped(*id))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    *kind,
+                )?,
+                TensorOp::Cholesky { input } => specialized.cholesky(mapped(*input)?)?,
                 TensorOp::Solve { matrix, rhs } => {
                     specialized.solve(mapped(*matrix)?, mapped(*rhs)?)?
                 }
@@ -11575,10 +13312,75 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
 }
 
 fn cuda_expression(nodes: &[TensorNode], node_id: TensorNodeId) -> Result<String, String> {
+    cuda_dag_statements(nodes, node_id, None)
+}
+
+fn cuda_dag_statements(
+    nodes: &[TensorNode],
+    root: TensorNodeId,
+    region_leaves: Option<&HashSet<TensorNodeId>>,
+) -> Result<String, String> {
+    let mut reachable = vec![false; nodes.len()];
+    let mut pending = vec![root];
+    while let Some(id) = pending.pop() {
+        let node = nodes
+            .get(id)
+            .ok_or_else(|| format!("CUDA lowering references missing node {id}"))?;
+        if reachable[id] {
+            continue;
+        }
+        reachable[id] = true;
+        if !region_leaves.is_some_and(|leaves| leaves.contains(&id)) {
+            pending.extend(tensor_op_inputs(&node.op));
+        }
+    }
+    let reference = |id| format!("quabla_value_{id}");
+    let mut source = String::new();
+    for (id, node) in nodes.iter().enumerate() {
+        if !reachable[id] {
+            continue;
+        }
+        let expression = if region_leaves.is_some_and(|leaves| leaves.contains(&id)) {
+            format!("input_{id}[quabla_region_{root}_offset_{id}(index)]")
+        } else {
+            if region_leaves.is_some()
+                && matches!(node.op, TensorOp::ScalarConstant { value } if !value.is_finite())
+            {
+                return Err(
+                    "CUDA fusion region does not support non-finite scalar constants".to_string(),
+                );
+            }
+            if region_leaves.is_some()
+                && !is_fusable_elementwise_compute_op(&node.op)
+                && !matches!(node.op, TensorOp::ScalarConstant { .. })
+            {
+                return Err(format!(
+                    "CUDA fusion region cannot inline {} node {id}",
+                    tensor_op_name(&node.op)
+                ));
+            }
+            cuda_scalar_expression(nodes, id, |child| Ok(reference(child)))?
+        };
+        // These CUDA elementwise operations are pure and have no checked-domain
+        // errors. Where still selects one value with a ternary, so NaNs in its
+        // unused operand do not propagate. SSA also avoids recursive device
+        // calls or exponentially expanded expressions in the CUDA compiler.
+        source.push_str(&format!(
+            "        const float quabla_value_{id} = {expression};\n"
+        ));
+    }
+    source.push_str(&format!("        output[index] = {};\n", reference(root)));
+    Ok(source)
+}
+
+fn cuda_scalar_expression(
+    nodes: &[TensorNode],
+    node_id: TensorNodeId,
+    child: impl Fn(TensorNodeId) -> Result<String, String>,
+) -> Result<String, String> {
     let node = nodes
         .get(node_id)
         .ok_or_else(|| format!("CUDA lowering references missing node {node_id}"))?;
-    let child = |child_id| cuda_expression(nodes, child_id);
     match &node.op {
         TensorOp::Input { .. } => Ok(format!("input_{node_id}[quabla_offset_{node_id}(index)]")),
         TensorOp::ScalarConstant { value } if value.is_finite() => Ok(cuda_scalar_literal(*value)),
@@ -11641,6 +13443,8 @@ fn cuda_expression(nodes: &[TensorNode], node_id: TensorNodeId) -> Result<String
         | TensorOp::SumAxis { .. }
         | TensorOp::Matmul { .. }
         | TensorOp::Solve { .. }
+        | TensorOp::Cholesky { .. }
+        | TensorOp::CholeskyAd { .. }
         | TensorOp::Triangular { .. }
         | TensorOp::Reshape { .. }
         | TensorOp::Mean { .. }
@@ -11669,67 +13473,9 @@ fn cuda_region_expression(
     nodes: &[TensorNode],
     node_id: TensorNodeId,
     leaves: &HashSet<TensorNodeId>,
-    region_output_node_id: TensorNodeId,
+    _region_output_node_id: TensorNodeId,
 ) -> Result<String, String> {
-    if leaves.contains(&node_id) {
-        return Ok(format!(
-            "input_{node_id}[{}(index)]",
-            cuda_fusion_region_offset_function_name(region_output_node_id, node_id)
-        ));
-    }
-    let node = nodes
-        .get(node_id)
-        .ok_or_else(|| format!("CUDA fusion region references missing node {node_id}"))?;
-    let child = |child_id| cuda_region_expression(nodes, child_id, leaves, region_output_node_id);
-    match &node.op {
-        TensorOp::ScalarConstant { value } if value.is_finite() => Ok(cuda_scalar_literal(*value)),
-        TensorOp::ScalarConstant { .. } => {
-            Err("CUDA fusion region does not support non-finite scalar constants".to_string())
-        }
-        TensorOp::Cast { input } => child(*input),
-        TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Greater { lhs, rhs } => Ok(format!(
-            "(({} > {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            child(*rhs)?
-        )),
-        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
-            "(({} {} {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            kind.operator(),
-            child(*rhs)?
-        )),
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => Ok(format!(
-            "(({} != 0.0f) ? {} : {})",
-            child(*condition)?,
-            child(*on_true)?,
-            child(*on_false)?
-        )),
-        TensorOp::Tanh { input } => Ok(format!("tanhf({})", child(*input)?)),
-        TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
-        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
-        TensorOp::SqrtDerivative { input, order } => {
-            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
-        }
-        TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
-        TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
-        TensorOp::Powi { input, exponent } => {
-            Ok(format!("quabla_powi({}, {}U)", child(*input)?, exponent))
-        }
-        TensorOp::Pow { base, exponent } => {
-            Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
-        }
-        _ => Err(format!(
-            "CUDA fusion region cannot inline {} node {node_id}",
-            tensor_op_name(&node.op)
-        )),
-    }
+    cuda_dag_statements(nodes, node_id, Some(leaves))
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
@@ -11799,67 +13545,21 @@ fn cuda_scalar_literal(value: f64) -> String {
 }
 
 fn is_fusable_elementwise_subgraph(nodes: &[TensorNode], node_id: TensorNodeId) -> bool {
-    let Some(node) = nodes.get(node_id) else {
+    if node_id >= nodes.len() {
         return false;
-    };
-    match &node.op {
-        TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } => true,
-        // A whole-plan kernel binds only plan inputs; a plan with an array constant runs the
-        // per-node program, where fusion regions read the constant's buffer.
-        TensorOp::Constant { .. } => false,
-        TensorOp::Add { lhs, rhs }
-        | TensorOp::Sub { lhs, rhs }
-        | TensorOp::Mul { lhs, rhs }
-        | TensorOp::Greater { lhs, rhs }
-        | TensorOp::Compare { lhs, rhs, .. }
-        | TensorOp::Pow {
-            base: lhs,
-            exponent: rhs,
-        } => {
-            is_fusable_elementwise_subgraph(nodes, *lhs)
-                && is_fusable_elementwise_subgraph(nodes, *rhs)
-        }
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => {
-            is_fusable_elementwise_subgraph(nodes, *condition)
-                && is_fusable_elementwise_subgraph(nodes, *on_true)
-                && is_fusable_elementwise_subgraph(nodes, *on_false)
-        }
-        TensorOp::Tanh { input }
-        | TensorOp::Exp { input }
-        | TensorOp::Sqrt { input }
-        | TensorOp::SqrtDerivative { input, .. }
-        | TensorOp::Sin { input }
-        | TensorOp::Cos { input }
-        | TensorOp::Powi { input, .. }
-        | TensorOp::Cast { input } => is_fusable_elementwise_subgraph(nodes, *input),
-        TensorOp::Sum { .. }
-        | TensorOp::SumAxis { .. }
-        | TensorOp::Matmul { .. }
-        | TensorOp::Solve { .. }
-        | TensorOp::Triangular { .. }
-        | TensorOp::Reshape { .. }
-        | TensorOp::Mean { .. }
-        | TensorOp::MeanAxis { .. }
-        | TensorOp::Transpose { .. }
-        | TensorOp::Div { .. }
-        | TensorOp::Log { .. }
-        | TensorOp::Concat { .. }
-        | TensorOp::Slice { .. }
-        | TensorOp::PadSlice { .. }
-        | TensorOp::Broadcast { .. }
-        | TensorOp::Cond { .. }
-        | TensorOp::Fori { .. }
-        | TensorOp::ForiJvp { .. }
-        | TensorOp::ForiVjp { .. }
-        | TensorOp::ForiVjpJvp { .. }
-        | TensorOp::Scan { .. }
-        | TensorOp::ScanVjp { .. }
-        | TensorOp::ScanVjpJvp { .. } => false,
     }
+    let mut eligible = vec![false; node_id + 1];
+    for (id, node) in nodes.iter().enumerate().take(node_id + 1) {
+        eligible[id] = match &node.op {
+            TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } => true,
+            op if is_fusable_elementwise_compute_op(op) => tensor_op_inputs(op)
+                .into_iter()
+                .all(|input| input < id && eligible[input]),
+            // Array constants and non-elementwise operators use the per-node program.
+            _ => false,
+        };
+    }
+    eligible[node_id]
 }
 
 fn is_fusable_elementwise_compute_op(op: &TensorOp) -> bool {
@@ -11907,13 +13607,16 @@ fn evaluate_fused_elementwise(
 
     let count = element_count(&output.shape)?;
     let mut data = Vec::with_capacity(count);
+    let mut memo = vec![None; nodes.len()];
     for index in 0..count {
+        memo.fill(None);
         data.push(evaluate_fused_element(
             nodes,
             output_node_id,
             index,
             &output.shape,
             inputs,
+            &mut memo,
         )?);
     }
     DynamicTensor::new(output.shape.clone(), data).map(|value| value.into_dtype(output.dtype))
@@ -11925,19 +13628,29 @@ fn evaluate_fused_element(
     output_index: usize,
     output_shape: &[usize],
     inputs: &BTreeMap<String, DynamicTensor>,
+    memo: &mut [Option<f64>],
 ) -> Result<f64, String> {
+    if let Some(value) = memo.get(node_id).copied().flatten() {
+        return Ok(value);
+    }
     let node = nodes
         .get(node_id)
         .ok_or_else(|| format!("node {node_id} does not exist"))?;
-    let child =
-        |child_id| evaluate_fused_element(nodes, child_id, output_index, output_shape, inputs);
+    let mut child = |child_id| {
+        evaluate_fused_element(nodes, child_id, output_index, output_shape, inputs, memo)
+    };
     let value = match &node.op {
         TensorOp::Input { name } => {
             let input = inputs
                 .get(name)
                 .ok_or_else(|| format!("missing input {name:?}"))?;
             let strides = contiguous_strides(&node.shape);
-            Ok(input.data[broadcast_offset(output_index, output_shape, &node.shape, &strides)])
+            Ok(input.data.get(broadcast_offset(
+                output_index,
+                output_shape,
+                &node.shape,
+                &strides,
+            )))
         }
         TensorOp::ScalarConstant { value } => Ok(*value),
         TensorOp::Constant { .. } => {
@@ -11997,6 +13710,8 @@ fn evaluate_fused_element(
         | TensorOp::SumAxis { .. }
         | TensorOp::Matmul { .. }
         | TensorOp::Solve { .. }
+        | TensorOp::Cholesky { .. }
+        | TensorOp::CholeskyAd { .. }
         | TensorOp::Triangular { .. }
         | TensorOp::Reshape { .. }
         | TensorOp::Mean { .. }
@@ -12018,7 +13733,9 @@ fn evaluate_fused_element(
         )),
     };
     // Same as the per-node interpreter: every fused node rounds to its own dtype.
-    value.map(|value| node.dtype.round(value))
+    let value = node.dtype.round(value?);
+    memo[node_id] = Some(value);
+    Ok(value)
 }
 
 fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
@@ -12037,7 +13754,8 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         }
         TensorOp::Pow { base, exponent } => vec![*base, *exponent],
         TensorOp::Solve { matrix, rhs } => vec![*matrix, *rhs],
-        TensorOp::Triangular { input, .. } => vec![*input],
+        TensorOp::CholeskyAd { inputs, .. } => inputs.clone(),
+        TensorOp::Cholesky { input } | TensorOp::Triangular { input, .. } => vec![*input],
         TensorOp::Where {
             condition,
             on_true,
@@ -12178,7 +13896,7 @@ fn bool_input_derivative_error(name: &str) -> String {
 /// Loop-region AD transforms pair every body input with a tangent or
 /// gradient, so D2 keeps `Bool` values out of loop regions entirely.
 fn check_loop_region_inputs(plan: &TensorExecutionPlan, context: &str) -> Result<(), String> {
-    for node in &plan.nodes {
+    for node in plan.nodes.iter() {
         if let TensorOp::Input { name } = &node.op {
             if !node.dtype.is_floating() {
                 return Err(format!(
@@ -12218,7 +13936,7 @@ fn tensor_scalar_predicate(value: &DynamicTensor) -> Result<bool, String> {
             value.shape
         ));
     }
-    let scalar = *value
+    let scalar = value
         .data
         .first()
         .ok_or_else(|| "scalar conditional predicate has no value".to_string())?;
@@ -12226,6 +13944,310 @@ fn tensor_scalar_predicate(value: &DynamicTensor) -> Result<bool, String> {
         return Err("conditional predicate must be finite".to_string());
     }
     Ok(scalar != 0.0)
+}
+
+#[cfg(test)]
+thread_local! {
+    // Counts simultaneously retained interpreter-node elements, independent of allocator RSS.
+    static CPU_FORWARD_PEAK_ELEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct TensorForwardLastUses {
+    remaining: Vec<usize>,
+    retained: Vec<bool>,
+    group_last_nodes: HashMap<usize, TensorNodeId>,
+}
+
+fn reuse_forward_unary(
+    node: &TensorNode,
+    values: &mut [Option<DynamicTensor>],
+    last_uses: Option<&TensorForwardLastUses>,
+) -> Result<Option<DynamicTensor>, String> {
+    let Some(last_uses) = last_uses else {
+        return Ok(None);
+    };
+    type UnaryOperation = Option<fn(f64) -> f64>;
+    let (input, operation): (usize, UnaryOperation) = match node.op {
+        TensorOp::Sin { input } => (input, Some(f64::sin)),
+        TensorOp::Cos { input } => (input, Some(f64::cos)),
+        TensorOp::Tanh { input } => (input, Some(f64::tanh)),
+        TensorOp::Exp { input } => (input, Some(f64::exp)),
+        TensorOp::Reshape { input } => (input, None),
+        _ => return Ok(None),
+    };
+    if last_uses.remaining.get(input) != Some(&1) || last_uses.retained.get(input) != Some(&false) {
+        return Ok(None);
+    }
+    let source = values
+        .get_mut(input)
+        .and_then(Option::as_mut)
+        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+    if operation.is_none() && element_count(&node.shape)? != source.data.len() {
+        return Err(format!(
+            "cannot reshape tensor with {} elements to shape {:?}",
+            source.data.len(),
+            node.shape
+        ));
+    }
+    // Only the final, unretained use moves storage; reverse tapes never enter this path.
+    let mut value = values[input].take().expect("source was validated above");
+    if let Some(operation) = operation {
+        match &mut value.data {
+            HostTensorStorage::F64(data) => {
+                for element in Arc::make_mut(data) {
+                    *element = operation(*element);
+                }
+            }
+            HostTensorStorage::F32(data) => {
+                // Each lane keeps the F64 intermediate and the original final F32 rounding.
+                for element in Arc::make_mut(data) {
+                    *element = operation(f64::from(*element)) as f32;
+                }
+            }
+            HostTensorStorage::Bool(_) => {
+                value.data = HostTensorStorage::from_f64(
+                    value.data.iter().map(operation).collect(),
+                    TensorDType::F64,
+                );
+                value.dtype = TensorDType::F64;
+            }
+        }
+    }
+    value.shape = node.shape.clone();
+    Ok(Some(value))
+}
+
+fn reuse_forward_binary(
+    node: &TensorNode,
+    values: &mut [Option<DynamicTensor>],
+    last_uses: Option<&TensorForwardLastUses>,
+) -> Result<Option<DynamicTensor>, String> {
+    let Some(last_uses) = last_uses else {
+        return Ok(None);
+    };
+    let (lhs, rhs, operation): (usize, usize, fn(f64, f64) -> f64) = match node.op {
+        TensorOp::Add { lhs, rhs } => (lhs, rhs, |a, b| a + b),
+        TensorOp::Sub { lhs, rhs } => (lhs, rhs, |a, b| a - b),
+        TensorOp::Mul { lhs, rhs } => (lhs, rhs, |a, b| a * b),
+        TensorOp::Div { lhs, rhs } => (lhs, rhs, |a, b| a / b),
+        _ => return Ok(None),
+    };
+    let uses = if lhs == rhs { 2 } else { 1 };
+    if last_uses.remaining.get(lhs) != Some(&uses) || last_uses.retained.get(lhs) != Some(&false) {
+        return Ok(None);
+    }
+    let left = values
+        .get(lhs)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| format!("node {lhs} has no evaluated value"))?;
+    let right = values
+        .get(rhs)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| format!("node {rhs} has no evaluated value"))?;
+    if left.shape != node.shape
+        || !(right.shape == node.shape || right.shape.is_empty())
+        || left.dtype == TensorDType::Bool
+    {
+        return Ok(None);
+    }
+    // Preserve the established error path before taking or mutating any operand.
+    if matches!(node.op, TensorOp::Div { .. }) && right.data.contains(&0.0) {
+        return Ok(None);
+    }
+    let scalar = right.shape.is_empty();
+    let right = (lhs != rhs).then(|| right.data.clone());
+    let mut value = values[lhs].take().expect("operand was validated above");
+    let lane = |index: usize, left: f64| {
+        let right = right
+            .as_ref()
+            .map_or(left, |data| data.get(if scalar { 0 } else { index }));
+        operation(left, right)
+    };
+    match &mut value.data {
+        HostTensorStorage::F64(data) => {
+            for (index, value) in Arc::make_mut(data).iter_mut().enumerate() {
+                *value = lane(index, *value);
+            }
+        }
+        HostTensorStorage::F32(data) => {
+            for (index, value) in Arc::make_mut(data).iter_mut().enumerate() {
+                *value = lane(index, f64::from(*value)) as f32;
+            }
+        }
+        HostTensorStorage::Bool(_) => unreachable!("Bool operands use the original evaluator"),
+    }
+    Ok(Some(value))
+}
+
+#[cfg(test)]
+mod forward_storage_reuse_tests {
+    use super::*;
+
+    #[test]
+    fn graph_snapshots_share_metadata_until_mutation_and_keep_name_index() {
+        let mut graph = TensorIr::new();
+        let input = graph.input_typed("x", vec![2], TensorDType::F32).unwrap();
+        let snapshot = graph.clone();
+        assert!(Arc::ptr_eq(&graph.nodes, &snapshot.nodes));
+        graph.sin(input).unwrap();
+        assert!(!Arc::ptr_eq(&graph.nodes, &snapshot.nodes));
+        assert_eq!(snapshot.node_count(), 1);
+        assert_eq!(
+            graph.input("x", vec![2]).unwrap_err(),
+            "input \"x\" already exists"
+        );
+        let plan = snapshot.compile_cpu(input).unwrap();
+        let cloned = plan.clone();
+        assert!(Arc::ptr_eq(&plan.nodes, &cloned.nodes));
+        let thawed = plan.as_ir();
+        assert!(Arc::ptr_eq(&plan.nodes, &thawed.nodes));
+        assert_eq!(plan.input_shape("x").unwrap(), vec![2]);
+        assert_eq!(plan.input_dtype("x").unwrap(), TensorDType::F32);
+        assert_eq!(
+            plan.input_shape("missing").unwrap_err(),
+            "execution plan input \"missing\" does not exist"
+        );
+    }
+
+    #[test]
+    fn last_use_reuses_owned_storage_and_preserves_node_rounding() {
+        for dtype in [TensorDType::F32, TensorDType::F64] {
+            let original = DynamicTensor::with_dtype(
+                vec![4],
+                vec![-0.0, 0.125, f64::INFINITY, f64::NAN],
+                dtype,
+            )
+            .unwrap();
+            let mut ir = TensorIr::new();
+            let input = ir.input_typed("x", vec![4], dtype).unwrap();
+            let output = ir.sin(input).unwrap();
+            let expected = original.sin().unwrap().into_dtype(dtype);
+            let mut values = vec![Some(original)];
+            let address = match &values[0].as_ref().unwrap().data {
+                HostTensorStorage::F64(data) => data.as_ptr() as usize,
+                HostTensorStorage::F32(data) => data.as_ptr() as usize,
+                HostTensorStorage::Bool(_) => unreachable!(),
+            };
+            let uses = tensor_forward_last_uses(&ir.nodes, &[output]);
+            let actual = reuse_forward_unary(&ir.nodes[output], &mut values, Some(&uses))
+                .unwrap()
+                .unwrap()
+                .into_dtype(dtype);
+            let actual_address = match &actual.data {
+                HostTensorStorage::F64(data) => data.as_ptr() as usize,
+                HostTensorStorage::F32(data) => data.as_ptr() as usize,
+                HostTensorStorage::Bool(_) => unreachable!(),
+            };
+            assert_eq!(actual_address, address);
+            assert!(values[0].is_none());
+            assert_eq!(actual.dtype, dtype);
+            for (actual, expected) in actual.data.iter().zip(expected.data.iter()) {
+                assert_eq!(actual.to_bits(), expected.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn reshape_shares_typed_storage_and_unary_protects_external_alias() {
+        for dtype in [TensorDType::F64, TensorDType::F32, TensorDType::Bool] {
+            let tensor =
+                DynamicTensor::with_dtype(vec![4], vec![0.0, 1.0, 2.0, 3.0], dtype).unwrap();
+            let reshaped = tensor.reshape(vec![2, 2]).unwrap();
+            let shared = match (&tensor.data, &reshaped.data) {
+                (HostTensorStorage::F64(a), HostTensorStorage::F64(b)) => Arc::ptr_eq(a, b),
+                (HostTensorStorage::F32(a), HostTensorStorage::F32(b)) => Arc::ptr_eq(a, b),
+                (HostTensorStorage::Bool(a), HostTensorStorage::Bool(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            assert!(shared);
+            assert_eq!(reshaped.dtype, dtype);
+        }
+        let tensor = DynamicTensor::new(vec![2], vec![1.0, 2.0]).unwrap();
+        let alias = tensor.clone();
+        let mut ir = TensorIr::new();
+        let input = ir.input("x", vec![2]).unwrap();
+        let output = ir.sin(input).unwrap();
+        let uses = tensor_forward_last_uses(&ir.nodes, &[output]);
+        let mut values = vec![Some(tensor)];
+        let result = reuse_forward_unary(&ir.nodes[output], &mut values, Some(&uses))
+            .unwrap()
+            .unwrap();
+        assert_eq!(alias.data().as_ref(), [1.0, 2.0]);
+        assert_eq!(result.data().as_ref(), [1.0_f64.sin(), 2.0_f64.sin()]);
+    }
+
+    #[test]
+    fn retained_outputs_and_reverse_tapes_keep_source_storage() {
+        let mut ir = TensorIr::new();
+        let input = ir.input("x", vec![2]).unwrap();
+        let output = ir.sin(input).unwrap();
+        let mut values = vec![Some(DynamicTensor::new(vec![2], vec![1.0, 2.0]).unwrap())];
+        let uses = tensor_forward_last_uses(&ir.nodes, &[input, output]);
+        assert!(
+            reuse_forward_unary(&ir.nodes[output], &mut values, Some(&uses))
+                .unwrap()
+                .is_none()
+        );
+        assert!(reuse_forward_unary(&ir.nodes[output], &mut values, None)
+            .unwrap()
+            .is_none());
+        assert_eq!(values[0].as_ref().unwrap().data().as_ref(), [1.0, 2.0]);
+    }
+}
+
+fn tensor_forward_last_uses(
+    nodes: &[TensorNode],
+    outputs: &[TensorNodeId],
+) -> TensorForwardLastUses {
+    let mut remaining = vec![0; nodes.len()];
+    let mut retained = vec![false; nodes.len()];
+    let mut group_last_nodes = HashMap::new();
+    for (id, node) in nodes.iter().enumerate() {
+        for input in tensor_op_inputs(&node.op) {
+            remaining[input] += 1;
+        }
+        if let Some(group) = tensor_op_group(&node.op) {
+            group_last_nodes.insert(group, id);
+        }
+    }
+    for output in outputs {
+        if let Some(retained) = retained.get_mut(*output) {
+            *retained = true;
+        }
+    }
+    TensorForwardLastUses {
+        remaining,
+        retained,
+        group_last_nodes,
+    }
+}
+
+fn tensor_op_group(op: &TensorOp) -> Option<usize> {
+    match op {
+        TensorOp::ForiVjp { group, .. }
+        | TensorOp::ForiVjpJvp { group, .. }
+        | TensorOp::Scan { group, .. }
+        | TensorOp::ScanVjp { group, .. }
+        | TensorOp::ScanVjpJvp { group, .. } => Some(*group),
+        _ => None,
+    }
+}
+
+fn tensor_forward_capture_values(
+    captures: &[(String, TensorNodeId)],
+    values: &[Option<DynamicTensor>],
+) -> Result<BTreeMap<String, DynamicTensor>, String> {
+    captures
+        .iter()
+        .map(|(name, node_id)| {
+            values
+                .get(*node_id)
+                .and_then(Option::as_ref)
+                .cloned()
+                .map(|value| (name.clone(), value))
+                .ok_or_else(|| format!("conditional capture node {node_id} has no evaluated value"))
+        })
+        .collect()
 }
 
 fn tensor_cond_capture_values(
@@ -12356,7 +14378,8 @@ fn infer_tensor_placement(
             reject_sharded_placement(node_id, &placement, "matmul/solve lowering")?;
             Ok(placement)
         }
-        TensorOp::Triangular { input, .. } => {
+        TensorOp::CholeskyAd { inputs, .. } => { let placement = merge(inputs)?; reject_sharded_placement(node_id, &placement, "cholesky AD lowering")?; Ok(placement) },
+        TensorOp::Cholesky { input } | TensorOp::Triangular { input, .. } => {
             let placement = unary(*input)?;
             reject_sharded_placement(node_id, &placement, "triangular lowering")?;
             Ok(placement)
@@ -12711,6 +14734,8 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::Matmul { .. } => "matmul",
         TensorOp::Solve { .. } => "solve",
+        TensorOp::Cholesky { .. } => "cholesky",
+        TensorOp::CholeskyAd { .. } => "cholesky_ad",
         TensorOp::Triangular { .. } => "triangular",
         TensorOp::Tanh { .. } => "tanh",
         TensorOp::Exp { .. } => "exp",
@@ -12875,7 +14900,9 @@ fn build_tensor_fusion_regions(nodes: &[TensorNode]) -> Vec<TensorFusionRegion> 
     for (node_id, node) in nodes.iter().enumerate() {
         for input in tensor_op_inputs(&node.op) {
             if let Some(input_users) = users.get_mut(input) {
-                if !input_users.contains(&node_id) {
+                // Nodes are visited in order, so duplicate operands can only
+                // repeat the most recently recorded user.
+                if input_users.last() != Some(&node_id) {
                     input_users.push(node_id);
                 }
             }
@@ -12942,31 +14969,101 @@ fn collect_fusion_region_nodes(
     }
 }
 
+// IDs remain stable until final DCE; retired constants are unreachable tombstones.
+fn release_folded_constant(nodes: &mut [TensorNode], id: usize, uses: usize, retained: bool) {
+    if uses == 0 && !retained && matches!(nodes[id].op, TensorOp::Constant { .. }) {
+        nodes[id].op = TensorOp::ScalarConstant { value: 0.0 };
+    }
+}
+
+// Reverse rules for these operations need only cotangents and static node metadata.
+// Every other rule conservatively retains its own primal and every operand.
+fn tensor_reverse_retained_primals(
+    nodes: &[TensorNode],
+    outputs: &[(TensorNodeId, DynamicTensor)],
+) -> Vec<TensorNodeId> {
+    let roots = outputs
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| *id < nodes.len())
+        .collect::<Vec<_>>();
+    let active = tensor_output_reachability(nodes, &roots);
+    let mut retained = vec![false; nodes.len()];
+    for &id in &roots {
+        retained[id] = true;
+    }
+    for (id, node) in nodes.iter().enumerate() {
+        if !active[id]
+            || matches!(
+                node.op,
+                TensorOp::Input { .. }
+                    | TensorOp::Constant { .. }
+                    | TensorOp::ScalarConstant { .. }
+                    | TensorOp::Cast { .. }
+                    | TensorOp::Add { .. }
+                    | TensorOp::Sub { .. }
+                    | TensorOp::Greater { .. }
+                    | TensorOp::Compare { .. }
+                    | TensorOp::Sum { .. }
+                    | TensorOp::SumAxis { .. }
+                    | TensorOp::Mean { .. }
+                    | TensorOp::MeanAxis { .. }
+                    | TensorOp::Triangular { .. }
+                    | TensorOp::Reshape { .. }
+                    | TensorOp::Transpose { .. }
+                    | TensorOp::Concat { .. }
+                    | TensorOp::Slice { .. }
+                    | TensorOp::PadSlice { .. }
+                    | TensorOp::Broadcast { .. }
+            )
+        {
+            continue;
+        }
+        retained[id] = true;
+        for input in tensor_op_inputs(&node.op) {
+            retained[input] = true;
+        }
+    }
+    retained
+        .into_iter()
+        .enumerate()
+        .filter_map(|(id, keep)| keep.then_some(id))
+        .collect()
+}
+
+fn tensor_output_reachability(nodes: &[TensorNode], outputs: &[TensorNodeId]) -> Vec<bool> {
+    let mut reachable = vec![false; nodes.len()];
+    let mut pending = outputs.to_vec();
+    while let Some(id) = pending.pop() {
+        if reachable[id] {
+            continue;
+        }
+        reachable[id] = true;
+        pending.extend(tensor_op_inputs(&nodes[id].op));
+    }
+    reachable
+}
+
 fn prune_unreachable_tensor_nodes(
     nodes: Vec<TensorNode>,
     outputs: &[TensorNodeId],
 ) -> Result<(Vec<TensorNode>, Vec<TensorNodeId>), String> {
-    let mut reachable = HashSet::new();
-    let mut pending = outputs.to_vec();
-    while let Some(node_id) = pending.pop() {
-        if !reachable.insert(node_id) {
-            continue;
+    for &output in outputs {
+        if output >= nodes.len() {
+            return Err(format!("execution plan output node {output} is missing"));
         }
-        let node = nodes
-            .get(node_id)
-            .ok_or_else(|| format!("execution plan output node {node_id} is missing"))?;
-        pending.extend(tensor_op_inputs(&node.op));
     }
-
-    let mut remap = HashMap::new();
-    let mut compacted = Vec::with_capacity(reachable.len());
+    let reachable = tensor_output_reachability(&nodes, outputs);
+    let reachable_count = reachable.iter().filter(|keep| **keep).count();
+    let mut remap = TensorNodeRemap::new(nodes.len(), reachable_count);
+    let mut compacted = Vec::with_capacity(reachable_count);
     for (old_id, node) in nodes.iter().enumerate() {
-        if !reachable.contains(&old_id) {
+        if !reachable[old_id] {
             continue;
         }
         remap.insert(old_id, compacted.len());
         compacted.push(TensorNode {
-            op: remap_tensor_op(&node.op, &remap)?,
+            op: remap_tensor_op(&node.op, &|id| remap.get(id))?,
             shape: node.shape.clone(),
             dtype: node.dtype,
             weak: node.weak,
@@ -12976,8 +15073,7 @@ fn prune_unreachable_tensor_nodes(
         .iter()
         .map(|output| {
             remap
-                .get(output)
-                .copied()
+                .get(*output)
                 .ok_or_else(|| format!("execution plan output node {output} is unreachable"))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -12986,9 +15082,16 @@ fn prune_unreachable_tensor_nodes(
 
 fn build_tensor_buffer_plan(
     nodes: &[TensorNode],
-    output_node_id: TensorNodeId,
+    output_node_ids: &[TensorNodeId],
 ) -> Result<TensorBufferPlan, String> {
+    let output_node_id = *output_node_ids
+        .first()
+        .ok_or_else(|| "tensor buffer plan has no output".to_string())?;
     let output_backing_node_id = tensor_storage_root(nodes, output_node_id)?;
+    let retained_roots = output_node_ids
+        .iter()
+        .map(|output| tensor_storage_root(nodes, *output))
+        .collect::<Result<BTreeSet<_>, _>>()?;
     let mut remaining_uses = vec![0usize; nodes.len()];
     for node in nodes {
         for input in tensor_op_inputs(&node.op) {
@@ -13034,7 +15137,7 @@ fn build_tensor_buffer_plan(
             *uses = uses
                 .checked_sub(1)
                 .ok_or_else(|| format!("tensor buffer input node {root} has invalid use count"))?;
-            if *uses == 0 && root != output_backing_node_id {
+            if *uses == 0 && !retained_roots.contains(&root) {
                 if let Some(slot) = node_slots[root] {
                     let count = slots
                         .get(slot)
@@ -13070,30 +15173,34 @@ fn tensor_storage_root(
     }
 }
 
-fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<String> {
-    let key = match op {
-        TensorOp::Input { .. } => return None,
-        TensorOp::ScalarConstant { value } => format!("constant:{value}:{shape:?}"),
-        // Array constants are deduplicated by value in `compile_cpu_many`, without formatting
-        // their elements into a key.
-        TensorOp::Constant { .. } => return None,
-        TensorOp::Cast { input } => format!("cast:{input}:{shape:?}"),
-        TensorOp::Add { lhs, rhs } => format!("add:{lhs}:{rhs}:{shape:?}"),
-        TensorOp::Sub { lhs, rhs } => format!("sub:{lhs}:{rhs}:{shape:?}"),
-        TensorOp::Div { lhs, rhs } => format!("div:{lhs}:{rhs}:{shape:?}"),
-        TensorOp::Mul { lhs, rhs } => format!("mul:{lhs}:{rhs}:{shape:?}"),
-        TensorOp::Greater { lhs, rhs } => format!("greater:{lhs}:{rhs}:{shape:?}"),
-        TensorOp::Compare { lhs, rhs, kind } => {
-            format!("compare:{}:{lhs}:{rhs}:{shape:?}", kind.name())
-        }
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => format!("where:{condition}:{on_true}:{on_false}:{shape:?}"),
-        // Region identity is intentionally not CSE'd: control-flow owns
-        // executable region plans, not only scalar operands.
-        TensorOp::Cond { .. }
+fn tensor_input_nodes(nodes: &[TensorNode]) -> HashMap<String, TensorNodeId> {
+    nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(id, node)| {
+            if let TensorOp::Input { name } = &node.op {
+                Some((name.clone(), id))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PureTensorOpKey {
+    operation: std::mem::Discriminant<TensorOp>,
+    words: Box<[u64]>,
+}
+
+fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOpKey> {
+    let mut arguments = [0; 4];
+    let mut list = None;
+    match op {
+        TensorOp::Input { .. }
+        | TensorOp::Constant { .. }
+        | TensorOp::CholeskyAd { .. }
+        | TensorOp::Cond { .. }
         | TensorOp::Fori { .. }
         | TensorOp::ForiJvp { .. }
         | TensorOp::ForiVjp { .. }
@@ -13101,41 +15208,128 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<String> {
         | TensorOp::Scan { .. }
         | TensorOp::ScanVjp { .. }
         | TensorOp::ScanVjpJvp { .. } => return None,
-        TensorOp::Sum { input } => format!("sum:{input}:{shape:?}"),
-        TensorOp::SumAxis { input, axis } => format!("sum_axis:{input}:{axis}:{shape:?}"),
-        TensorOp::Matmul { lhs, rhs } => format!("matmul:{lhs}:{rhs}:{shape:?}"),
-        TensorOp::Solve { matrix, rhs } => format!("solve:{matrix}:{rhs}:{shape:?}"),
-        TensorOp::Triangular { input, lower } => format!("triangular:{input}:{lower}:{shape:?}"),
-        TensorOp::Tanh { input } => format!("tanh:{input}:{shape:?}"),
-        TensorOp::Exp { input } => format!("exp:{input}:{shape:?}"),
-        TensorOp::Sqrt { input } => format!("sqrt:{input}:{shape:?}"),
-        TensorOp::SqrtDerivative { input, order } => {
-            format!("sqrt_derivative:{input}:{order}:{shape:?}")
+        TensorOp::ScalarConstant { value } => arguments[0] = value.to_bits(),
+        TensorOp::Add { lhs, rhs }
+        | TensorOp::Sub { lhs, rhs }
+        | TensorOp::Mul { lhs, rhs }
+        | TensorOp::Div { lhs, rhs }
+        | TensorOp::Greater { lhs, rhs }
+        | TensorOp::Matmul { lhs, rhs }
+        | TensorOp::Solve { matrix: lhs, rhs }
+        | TensorOp::Pow {
+            base: lhs,
+            exponent: rhs,
+        } => {
+            arguments[0] = *lhs as u64;
+            arguments[1] = *rhs as u64;
         }
-        TensorOp::Reshape { input } => format!("reshape:{input}:{shape:?}"),
-        TensorOp::Mean { input } => format!("mean:{input}:{shape:?}"),
-        TensorOp::MeanAxis { input, axis } => format!("mean_axis:{input}:{axis}:{shape:?}"),
-        TensorOp::Sin { input } => format!("sin:{input}:{shape:?}"),
-        TensorOp::Cos { input } => format!("cos:{input}:{shape:?}"),
-        TensorOp::Powi { input, exponent } => format!("powi:{input}:{exponent}:{shape:?}"),
-        TensorOp::Pow { base, exponent } => format!("pow:{base}:{exponent}:{shape:?}"),
-        TensorOp::Transpose { input, axes } => format!("transpose:{input}:{axes:?}:{shape:?}"),
-        TensorOp::Log { input } => format!("log:{input}:{shape:?}"),
-        TensorOp::Concat { inputs, axis } => format!("concat:{inputs:?}:{axis}:{shape:?}"),
+        TensorOp::Compare { lhs, rhs, kind } => {
+            arguments[0] = *lhs as u64;
+            arguments[1] = *rhs as u64;
+            arguments[2] = *kind as u64;
+        }
+        TensorOp::Where {
+            condition,
+            on_true,
+            on_false,
+        } => {
+            arguments[0] = *condition as u64;
+            arguments[1] = *on_true as u64;
+            arguments[2] = *on_false as u64;
+        }
+        TensorOp::Cast { input }
+        | TensorOp::Sum { input }
+        | TensorOp::Tanh { input }
+        | TensorOp::Exp { input }
+        | TensorOp::Sqrt { input }
+        | TensorOp::Reshape { input }
+        | TensorOp::Mean { input }
+        | TensorOp::Sin { input }
+        | TensorOp::Cos { input }
+        | TensorOp::Log { input }
+        | TensorOp::Broadcast { input }
+        | TensorOp::Cholesky { input } => arguments[0] = *input as u64,
+        TensorOp::SumAxis { input, axis } | TensorOp::MeanAxis { input, axis } => {
+            arguments[0] = *input as u64;
+            arguments[1] = *axis as u64;
+        }
+        TensorOp::Triangular { input, lower } => {
+            arguments[0] = *input as u64;
+            arguments[1] = u64::from(*lower);
+        }
+        TensorOp::SqrtDerivative { input, order }
+        | TensorOp::Powi {
+            input,
+            exponent: order,
+        } => {
+            arguments[0] = *input as u64;
+            arguments[1] = *order as u64;
+        }
+        TensorOp::Transpose { input, axes } => {
+            arguments[0] = *input as u64;
+            list = Some(axes.as_slice());
+        }
+        TensorOp::Concat { inputs, axis } => {
+            arguments[0] = *axis as u64;
+            list = Some(inputs.as_slice());
+        }
         TensorOp::Slice {
             input,
             axis,
             start,
             length,
         } => {
-            format!("slice:{input}:{axis}:{start}:{length}:{shape:?}")
+            arguments = [*input as u64, *axis as u64, *start as u64, *length as u64];
         }
         TensorOp::PadSlice { input, axis, start } => {
-            format!("pad_slice:{input}:{axis}:{start}:{shape:?}")
+            arguments[0] = *input as u64;
+            arguments[1] = *axis as u64;
+            arguments[2] = *start as u64;
         }
-        TensorOp::Broadcast { input } => format!("broadcast:{input}:{shape:?}"),
+    }
+    let argument_count = match op {
+        TensorOp::Slice { .. } => 4,
+        TensorOp::Compare { .. } | TensorOp::Where { .. } | TensorOp::PadSlice { .. } => 3,
+        TensorOp::Add { .. }
+        | TensorOp::Sub { .. }
+        | TensorOp::Mul { .. }
+        | TensorOp::Div { .. }
+        | TensorOp::Greater { .. }
+        | TensorOp::Matmul { .. }
+        | TensorOp::Solve { .. }
+        | TensorOp::Cholesky { .. }
+        | TensorOp::CholeskyAd { .. }
+        | TensorOp::Pow { .. }
+        | TensorOp::SumAxis { .. }
+        | TensorOp::MeanAxis { .. }
+        | TensorOp::Triangular { .. }
+        | TensorOp::SqrtDerivative { .. }
+        | TensorOp::Powi { .. } => 2,
+        _ => 1,
     };
-    Some(key)
+    // Validated operand ids determine output shapes except for shape-changing ops
+    // whose target shape is not encoded in the op. Avoid duplicating inferred shapes.
+    let shape = if matches!(
+        op,
+        TensorOp::Reshape { .. } | TensorOp::Broadcast { .. } | TensorOp::PadSlice { .. }
+    ) {
+        shape
+    } else {
+        &[]
+    };
+    // Variable operand lists carry their length so they cannot collide with shape words.
+    let list_words = list.map_or(0, |values| values.len() + 1);
+    let mut words = Vec::with_capacity(argument_count + list_words + shape.len());
+    words.extend_from_slice(&arguments[..argument_count]);
+    if let Some(values) = list {
+        words.push(values.len() as u64);
+        words.extend(values.iter().map(|value| *value as u64));
+    }
+    words.extend(shape.iter().map(|value| *value as u64));
+    Some(PureTensorOpKey {
+        operation: std::mem::discriminant(op),
+        words: words.into_boxed_slice(),
+    })
 }
 
 /// The execution-group id of a node that shares one region execution with
@@ -13151,15 +15345,44 @@ fn tensor_op_group_mut(op: &mut TensorOp) -> Option<&mut usize> {
     }
 }
 
+// Dense indexing removes hash work without allocating a full table for sparse outputs.
+enum TensorNodeRemap {
+    Dense(Vec<TensorNodeId>),
+    Sparse(HashMap<TensorNodeId, TensorNodeId>),
+}
+
+impl TensorNodeRemap {
+    fn new(total: usize, reachable: usize) -> Self {
+        if total <= reachable.saturating_mul(2) {
+            Self::Dense(vec![usize::MAX; total])
+        } else {
+            Self::Sparse(HashMap::with_capacity(reachable))
+        }
+    }
+
+    fn insert(&mut self, source: TensorNodeId, target: TensorNodeId) {
+        match self {
+            Self::Dense(values) => values[source] = target,
+            Self::Sparse(values) => {
+                values.insert(source, target);
+            }
+        }
+    }
+
+    fn get(&self, source: TensorNodeId) -> Option<TensorNodeId> {
+        match self {
+            Self::Dense(values) => values.get(source).copied().filter(|id| *id != usize::MAX),
+            Self::Sparse(values) => values.get(&source).copied(),
+        }
+    }
+}
+
 fn remap_tensor_op(
     op: &TensorOp,
-    remap: &HashMap<TensorNodeId, TensorNodeId>,
+    remap: &impl Fn(TensorNodeId) -> Option<TensorNodeId>,
 ) -> Result<TensorOp, String> {
     let remap_node = |node_id: TensorNodeId| {
-        remap
-            .get(&node_id)
-            .copied()
-            .ok_or_else(|| format!("node {node_id} is missing from execution plan remap"))
+        remap(node_id).ok_or_else(|| format!("node {node_id} is missing from execution plan remap"))
     };
     match op {
         TensorOp::Input { name } => Ok(TensorOp::Input { name: name.clone() }),
@@ -13374,6 +15597,16 @@ fn remap_tensor_op(
             matrix: remap_node(*matrix)?,
             rhs: remap_node(*rhs)?,
         }),
+        TensorOp::Cholesky { input } => Ok(TensorOp::Cholesky {
+            input: remap_node(*input)?,
+        }),
+        TensorOp::CholeskyAd { inputs, kind } => Ok(TensorOp::CholeskyAd {
+            inputs: inputs
+                .iter()
+                .map(|id| remap_node(*id))
+                .collect::<Result<Vec<_>, _>>()?,
+            kind: *kind,
+        }),
         TensorOp::Triangular { input, lower } => Ok(TensorOp::Triangular {
             input: remap_node(*input)?,
             lower: *lower,
@@ -13454,7 +15687,7 @@ fn remap_tensor_op(
 fn accumulate(slot: &mut Option<DynamicTensor>, contribution: DynamicTensor) -> Result<(), String> {
     match slot {
         Some(existing) => {
-            *existing = existing.add(&contribution)?;
+            existing.add_assign(&contribution)?;
         }
         None => *slot = Some(contribution),
     }
@@ -13792,6 +16025,36 @@ fn solve_shape(matrix: &[usize], rhs: &[usize]) -> Result<Vec<usize>, String> {
     Ok(rhs.to_vec())
 }
 
+// Advance row-major broadcast offsets with stack-only operand metadata. Only
+// wrapped axes propagate a carry, so ordinary elements avoid full rank decoding.
+// Inlining specializes the one-to-three operand loop and removes per-element calls.
+#[inline(always)]
+fn advance_broadcast_offsets<const N: usize>(
+    mut next: usize,
+    shape: &[usize],
+    operands: [(&[usize], &[usize]); N],
+    offsets: &mut [usize; N],
+) {
+    for axis in (0..shape.len()).rev() {
+        let wrapped = next.is_multiple_of(shape[axis]);
+        for (offset, (input_shape, strides)) in offsets.iter_mut().zip(operands) {
+            let rank_offset = shape.len() - input_shape.len();
+            if axis >= rank_offset && input_shape[axis - rank_offset] != 1 {
+                let step = strides[axis - rank_offset];
+                if wrapped {
+                    *offset -= (shape[axis] - 1) * step;
+                } else {
+                    *offset += step;
+                }
+            }
+        }
+        if !wrapped {
+            break;
+        }
+        next /= shape[axis];
+    }
+}
+
 fn broadcast_offset(
     output_index: usize,
     output_shape: &[usize],
@@ -13829,4 +16092,715 @@ fn format_tensor_type(shape: &[usize], dtype: TensorDType) -> String {
         .collect::<Vec<_>>()
         .join("x");
     format!("tensor<{dimensions}x{dtype}>")
+}
+
+#[cfg(test)]
+mod triangular_solve_tests {
+    use super::*;
+
+    #[test]
+    fn triangular_substitution_matches_pivoted_lu_and_residuals() -> Result<(), String> {
+        for n in [1, 3, 17] {
+            let mut data = vec![0.0; n * n];
+            for row in 0..n {
+                for column in 0..n {
+                    data[row * n + column] = if row == column {
+                        2.0 + row as f64
+                    } else {
+                        ((row * 7 + column * 3) % 11) as f64 / 7.0 - 0.5
+                    };
+                }
+            }
+            // Force partial pivoting in the old lower-triangular route.
+            if n > 1 {
+                data[n] = 3.5;
+            }
+            let original = DynamicTensor::new(vec![n, n], data)?;
+            let expected = DynamicTensor::new(
+                vec![n, 3],
+                (0..n * 3).map(|index| index as f64 / 17.0 - 1.0).collect(),
+            )?;
+            for lower in [false, true] {
+                for transpose in [false, true] {
+                    let projected = original.triangular(lower)?;
+                    let matrix = if transpose {
+                        projected.transpose_last_two()?
+                    } else {
+                        projected
+                    };
+                    let rhs = matrix.matmul(&expected)?;
+                    assert!(matrix.finite_triangular_solution(&rhs).is_some());
+                    let result = matrix.solve(&rhs)?;
+                    let previous = matrix.solve_lu(&rhs)?;
+                    for (actual, old) in result.data.iter().zip(previous.data.iter()) {
+                        assert!((actual - old).abs() < 1e-11 * old.abs().max(1.0));
+                    }
+                    for (actual, expected) in result.data.iter().zip(expected.data.iter()) {
+                        assert!((actual - expected).abs() < 1e-11 * expected.abs().max(1.0));
+                    }
+                    for (actual, rhs) in matrix.matmul(&result)?.data.iter().zip(rhs.data.iter()) {
+                        assert!((actual - rhs).abs() < 1e-11 * rhs.abs().max(1.0));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn triangular_substitution_preserves_exceptional_lu_fallbacks() -> Result<(), String> {
+        let cases = [
+            (vec![2.0, 1.0, 1.0, 2.0], vec![1.0, 2.0]),
+            (vec![0.0, 0.0, 1.0, 2.0], vec![1.0, 2.0]),
+            (vec![1.0, 0.0, f64::NAN, 2.0], vec![1.0, 2.0]),
+            (vec![1.0, 0.0, 1.0, 2.0], vec![f64::INFINITY, 2.0]),
+            (vec![1e-320, 0.0, 1.0, 2.0], vec![f64::MAX, 2.0]),
+        ];
+        for (matrix, rhs) in cases {
+            let matrix = DynamicTensor::new(vec![2, 2], matrix)?;
+            let rhs = DynamicTensor::new(vec![2, 1], rhs)?;
+            assert!(matrix.finite_triangular_solution(&rhs).is_none());
+            match (matrix.solve(&rhs), matrix.solve_lu(&rhs)) {
+                (Ok(actual), Ok(old)) => {
+                    for (actual, old) in actual.data.iter().zip(old.data.iter()) {
+                        assert!(
+                            actual.to_bits() == old.to_bits() || (actual.is_nan() && old.is_nan())
+                        );
+                    }
+                }
+                (Err(actual), Err(old)) => assert_eq!(actual, old),
+                _ => panic!("fallback changed LU success/error behavior"),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cpu_memory_regressions {
+    use super::*;
+
+    #[test]
+    fn shared_fused_dag_evaluates_each_node_once_per_element() -> Result<(), String> {
+        let mut graph = TensorIr::new();
+        let x = graph.input("x", vec![2])?;
+        let mut output = x;
+        // A recursive tree walk would perform more than one trillion child visits.
+        for _ in 0..40 {
+            output = graph.add(output, output)?;
+        }
+        let plan = graph.compile_cpu(output)?;
+        assert!(plan.uses_fused_elementwise_kernel());
+        let inputs = BTreeMap::from([("x".into(), DynamicTensor::new(vec![2], vec![1.0, -2.0])?)]);
+        let mut memo = vec![None; plan.nodes.len()];
+        let result = evaluate_fused_element(
+            &plan.nodes,
+            plan.output_node_id,
+            0,
+            &[2],
+            &inputs,
+            &mut memo,
+        )?;
+        assert_eq!(result, 2.0f64.powi(40));
+        assert_eq!(memo.iter().flatten().count(), plan.node_count());
+        assert_eq!(
+            plan.evaluate(&inputs)?.data().as_ref(),
+            &[2.0f64.powi(40), -2.0f64.powi(41)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fused_memo_skips_errors_in_an_inactive_where_branch() -> Result<(), String> {
+        let mut graph = TensorIr::new();
+        let x = graph.input("x", vec![2])?;
+        let mask = graph.input("mask", vec![2])?;
+        let invalid = graph.powi(x, 2)?;
+        let output = graph.where_select(mask, x, invalid)?;
+        let mut plan = graph.compile_cpu(output)?;
+        // Public construction rejects this exponent. Inject it into the private evaluator
+        // fixture so evaluating an inactive branch has an observable failure.
+        for node in Arc::make_mut(&mut plan.nodes).iter_mut() {
+            if let TensorOp::Powi { exponent, .. } = &mut node.op {
+                *exponent = u32::MAX;
+            }
+        }
+        let mut inputs = BTreeMap::from([
+            ("x".into(), DynamicTensor::new(vec![2], vec![-2.0, 3.0])?),
+            ("mask".into(), DynamicTensor::filled(vec![2], 1.0)?),
+        ]);
+        assert_eq!(plan.evaluate(&inputs)?, inputs["x"]);
+        inputs.insert("mask".into(), DynamicTensor::new(vec![2], vec![1.0, 0.0])?);
+        assert_eq!(
+            plan.evaluate(&inputs).unwrap_err(),
+            "powi exponent must fit in a signed 32-bit integer"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_forward_chain_retains_only_the_live_frontier() -> Result<(), String> {
+        const N: usize = 128;
+        let mut graph = TensorIr::new();
+        let x = graph.input("x", vec![N])?;
+        let early = graph.sin(x)?;
+        let mut output = early;
+        for _ in 0..100 {
+            output = graph.sin(output)?;
+        }
+        let loss = graph.sum(output)?;
+        let (plan, _) = graph.compile_cpu_many(&[early, output, loss, early])?;
+        let inputs = BTreeMap::from([("x".into(), DynamicTensor::filled(vec![N], 0.2)?)]);
+        CPU_FORWARD_PEAK_ELEMENTS.with(|peak| peak.set(0));
+        let values = plan.evaluate_many(&inputs)?;
+        // Unary last-use execution moves the predecessor buffer. The peak is the two
+        // requested vectors plus their scalar reduction, independent of chain depth.
+        let peak = CPU_FORWARD_PEAK_ELEMENTS.with(|peak| peak.get());
+        assert_eq!(peak, 2 * N + 1);
+        assert_eq!(values[0], values[3]);
+        assert_eq!(values[2].data()[0], values[1].data().iter().sum::<f64>());
+        let retained = TensorIr::evaluate_tensor_nodes_with_outputs(
+            &plan.nodes,
+            &inputs,
+            Some(&plan.output_node_ids),
+        )?;
+        assert_eq!(retained.iter().flatten().count(), 3);
+        // Reverse consumers still obtain the full tape from the unchanged entry point.
+        assert_eq!(
+            TensorIr::evaluate_tensor_nodes(&plan.nodes, &inputs)?.len(),
+            plan.node_count()
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "solve_replay_tests.rs"]
+mod solve_replay_tests;
+
+#[cfg(test)]
+#[path = "cpu_kernel_indexing_tests.rs"]
+mod cpu_kernel_indexing_tests;
+
+#[cfg(test)]
+mod structural_key_tests {
+    use super::*;
+
+    #[test]
+    fn keys_preserve_scalar_bits_operation_shape_and_variable_boundaries() {
+        let key = |op, shape: &[usize]| pure_tensor_op_cse_key(&op, shape).unwrap();
+        assert_ne!(
+            key(TensorOp::ScalarConstant { value: 0.0 }, &[]),
+            key(TensorOp::ScalarConstant { value: -0.0 }, &[])
+        );
+        assert_ne!(
+            key(
+                TensorOp::ScalarConstant {
+                    value: f64::from_bits(0x7ff8000000000001)
+                },
+                &[]
+            ),
+            key(
+                TensorOp::ScalarConstant {
+                    value: f64::from_bits(0x7ff8000000000002)
+                },
+                &[]
+            )
+        );
+        assert_ne!(
+            key(TensorOp::Sin { input: 1 }, &[2]),
+            key(TensorOp::Cos { input: 1 }, &[2])
+        );
+        assert_ne!(
+            key(TensorOp::Reshape { input: 1 }, &[2, 3]),
+            key(TensorOp::Reshape { input: 1 }, &[6])
+        );
+        assert_ne!(
+            key(
+                TensorOp::Concat {
+                    inputs: vec![1],
+                    axis: 0
+                },
+                &[2, 3]
+            ),
+            key(
+                TensorOp::Concat {
+                    inputs: vec![1, 2],
+                    axis: 0
+                },
+                &[3]
+            )
+        );
+        assert_eq!(
+            key(
+                TensorOp::Slice {
+                    input: 1,
+                    axis: 0,
+                    start: 0,
+                    length: 2
+                },
+                &[2]
+            ),
+            key(
+                TensorOp::Slice {
+                    input: 1,
+                    axis: 0,
+                    start: 0,
+                    length: 2
+                },
+                &[2]
+            )
+        );
+        assert!(std::mem::size_of::<PureTensorOpKey>() <= 32);
+    }
+}
+
+#[cfg(test)]
+mod adaptive_remap_tests {
+    use super::*;
+    #[test]
+    fn sparse_source_graphs_do_not_allocate_dense_id_tables() {
+        let mut sparse = TensorNodeRemap::new(1_000_000, 2);
+        assert!(matches!(sparse, TensorNodeRemap::Sparse(_)));
+        sparse.insert(999_999, 1);
+        assert_eq!(sparse.get(999_999), Some(1));
+        assert_eq!(sparse.get(0), None);
+        let mut dense = TensorNodeRemap::new(8, 6);
+        assert!(matches!(dense, TensorNodeRemap::Dense(_)));
+        dense.insert(3, 0);
+        assert_eq!(dense.get(3), Some(0));
+        assert_eq!(dense.get(4), None);
+    }
+}
+
+#[cfg(test)]
+mod binary_reuse_tests {
+    use super::*;
+
+    #[test]
+    fn reused_binary_buffers_match_reference_bits_and_preserve_aliases() {
+        for dtype in [TensorDType::F32, TensorDType::F64] {
+            for scalar in [false, true] {
+                for kind in ["add", "sub", "mul", "div"] {
+                    let original = DynamicTensor::with_dtype(
+                        vec![4],
+                        vec![-0.0, 0.1, f64::NAN, f64::INFINITY],
+                        dtype,
+                    )
+                    .unwrap();
+                    let right = if scalar {
+                        DynamicTensor::with_dtype(vec![], vec![2.0], dtype).unwrap()
+                    } else {
+                        DynamicTensor::with_dtype(
+                            vec![4],
+                            vec![1.0, -1.0, 3.0, f64::INFINITY],
+                            dtype,
+                        )
+                        .unwrap()
+                    };
+                    let expected = match kind {
+                        "add" => original.add(&right),
+                        "sub" => original.sub(&right),
+                        "mul" => original.mul(&right),
+                        _ => original.div(&right),
+                    }
+                    .unwrap()
+                    .into_dtype(dtype);
+                    let alias = original.clone();
+                    let mut graph = TensorIr::new();
+                    let lhs = graph.input_typed("lhs", vec![4], dtype).unwrap();
+                    let rhs = graph
+                        .input_typed("rhs", right.shape.clone(), dtype)
+                        .unwrap();
+                    let output = match kind {
+                        "add" => graph.add(lhs, rhs),
+                        "sub" => graph.sub(lhs, rhs),
+                        "mul" => graph.mul(lhs, rhs),
+                        _ => graph.div(lhs, rhs),
+                    }
+                    .unwrap();
+                    let uses = tensor_forward_last_uses(&graph.nodes, &[output]);
+                    let mut values = vec![Some(original), Some(right)];
+                    let actual =
+                        reuse_forward_binary(&graph.nodes[output], &mut values, Some(&uses))
+                            .unwrap()
+                            .unwrap()
+                            .into_dtype(dtype);
+                    assert_eq!(
+                        actual
+                            .storage()
+                            .iter()
+                            .map(f64::to_bits)
+                            .collect::<Vec<_>>(),
+                        expected
+                            .storage()
+                            .iter()
+                            .map(f64::to_bits)
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(alias.storage().get(0).to_bits(), (-0.0f64).to_bits());
+                    assert_eq!(alias.storage().get(1).to_bits(), dtype.round(0.1).to_bits());
+                }
+            }
+            let mut graph = TensorIr::new();
+            let input = graph.input_typed("x", vec![2], dtype).unwrap();
+            let output = graph.mul(input, input).unwrap();
+            let mut values = vec![Some(
+                DynamicTensor::with_dtype(vec![2], vec![-0.0, 0.1], dtype).unwrap(),
+            )];
+            let expected = values[0]
+                .as_ref()
+                .unwrap()
+                .mul(values[0].as_ref().unwrap())
+                .unwrap()
+                .into_dtype(dtype);
+            let uses = tensor_forward_last_uses(&graph.nodes, &[output]);
+            let actual = reuse_forward_binary(&graph.nodes[output], &mut values, Some(&uses))
+                .unwrap()
+                .unwrap()
+                .into_dtype(dtype);
+            assert_eq!(
+                actual
+                    .storage()
+                    .iter()
+                    .map(f64::to_bits)
+                    .collect::<Vec<_>>(),
+                expected
+                    .storage()
+                    .iter()
+                    .map(f64::to_bits)
+                    .collect::<Vec<_>>()
+            );
+            let division = graph.div(input, input).unwrap();
+            let mut values = vec![Some(
+                DynamicTensor::with_dtype(vec![2], vec![-0.0, 0.1], dtype).unwrap(),
+            )];
+            let uses = tensor_forward_last_uses(&graph.nodes, &[division]);
+            assert!(
+                reuse_forward_binary(&graph.nodes[division], &mut values, Some(&uses))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(values[0].is_some());
+        }
+    }
+}
+
+#[cfg(test)]
+mod broadcast_carry_tests {
+    use super::*;
+
+    fn reference(lhs: &DynamicTensor, rhs: &DynamicTensor) -> Result<DynamicTensor, String> {
+        let shape = broadcast_shape(&lhs.shape, &rhs.shape)?;
+        let count = element_count(&shape)?;
+        let lhs_strides = contiguous_strides(&lhs.shape);
+        let rhs_strides = contiguous_strides(&rhs.shape);
+        let mut data = Vec::with_capacity(count);
+        for index in 0..count {
+            let left = broadcast_offset(index, &shape, &lhs.shape, &lhs_strides);
+            let right = broadcast_offset(index, &shape, &rhs.shape, &rhs_strides);
+            data.push(lhs.data.get(left) - rhs.data.get(right));
+        }
+        DynamicTensor::new(shape, data)
+    }
+
+    fn fixture(shape: Vec<usize>, dtype: TensorDType) -> DynamicTensor {
+        let count = element_count(&shape).unwrap();
+        DynamicTensor::with_dtype(
+            shape,
+            (0..count)
+                .map(|index| match index % 7 {
+                    0 => -0.0,
+                    1 => 0.0,
+                    2 => f64::INFINITY,
+                    3 => f64::NAN,
+                    _ => index as f64 * 0.13 - 0.7,
+                })
+                .collect(),
+            dtype,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn carried_elementwise_preserves_f64_arithmetic_and_shapes() {
+        for dtype in [TensorDType::F32, TensorDType::F64] {
+            for (lhs_shape, rhs_shape) in [
+                (vec![3, 1], vec![1, 5]),
+                (vec![2, 1, 4, 1], vec![3, 1, 5]),
+                (vec![2, 1, 1, 1, 3, 1], vec![1, 4]),
+                (vec![2, 3], vec![3]),
+                (vec![2, 3], vec![4]),
+            ] {
+                let lhs = fixture(lhs_shape, dtype);
+                let rhs = fixture(rhs_shape, dtype);
+                match (lhs.sub(&rhs), reference(&lhs, &rhs)) {
+                    (Ok(actual), Ok(expected)) => {
+                        assert_eq!(actual.shape, expected.shape);
+                        assert_eq!(actual.dtype, TensorDType::F64);
+                        assert_eq!(
+                            actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+                            expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
+                        );
+                    }
+                    (Err(actual), Err(expected)) => assert_eq!(actual, expected),
+                    pair => panic!("different broadcast outcomes: {pair:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "complete core broadcast release timing probe"]
+    fn profile_broadcast_carry() {
+        use std::time::Instant;
+        for (lhs_shape, rhs_shape) in [
+            (vec![4, 1], vec![1, 4]),
+            (vec![256, 1], vec![1, 256]),
+            (vec![16, 1, 16, 1], vec![1, 16, 1, 16]),
+            (vec![4, 1, 4, 1, 4, 1, 4, 1], vec![1, 4, 1, 4, 1, 4, 1, 4]),
+        ] {
+            let rank = lhs_shape.len();
+            let elements =
+                element_count(&broadcast_shape(&lhs_shape, &rhs_shape).unwrap()).unwrap();
+            let lhs = fixture(lhs_shape, TensorDType::F32);
+            let rhs = fixture(rhs_shape, TensorDType::F32);
+            let modes = if std::env::var_os("QUABLA_BROADCAST_CARRY_FIRST").is_some() {
+                [false, true]
+            } else {
+                [true, false]
+            };
+            for old in modes {
+                let mut times = Vec::new();
+                for _ in 0..15 {
+                    let start = Instant::now();
+                    let result = if old {
+                        reference(&lhs, &rhs)
+                    } else {
+                        lhs.sub(&rhs)
+                    }
+                    .unwrap();
+                    std::hint::black_box(result);
+                    times.push(start.elapsed().as_nanos());
+                }
+                times.sort();
+                println!("{{\"rank\":{rank},\"elements\":{elements},\"reference\":{old},\"median_ns\":{}}}", times[7]);
+            }
+        }
+    }
+    fn reference_where(
+        mask: &DynamicTensor,
+        on_true: &DynamicTensor,
+        on_false: &DynamicTensor,
+    ) -> Result<DynamicTensor, String> {
+        let shape = broadcast_shape(
+            &broadcast_shape(&mask.shape, &on_true.shape)?,
+            &on_false.shape,
+        )?;
+        let strides = [
+            contiguous_strides(&mask.shape),
+            contiguous_strides(&on_true.shape),
+            contiguous_strides(&on_false.shape),
+        ];
+        let mut data = Vec::with_capacity(element_count(&shape)?);
+        for index in 0..element_count(&shape)? {
+            let m = broadcast_offset(index, &shape, &mask.shape, &strides[0]);
+            let t = broadcast_offset(index, &shape, &on_true.shape, &strides[1]);
+            let f = broadcast_offset(index, &shape, &on_false.shape, &strides[2]);
+            data.push(if mask.data.get(m) != 0.0 {
+                on_true.data.get(t)
+            } else {
+                on_false.data.get(f)
+            });
+        }
+        DynamicTensor::new(shape, data)
+    }
+
+    fn reference_broadcast(
+        input: &DynamicTensor,
+        target: &[usize],
+    ) -> Result<DynamicTensor, String> {
+        if broadcast_shape(&input.shape, target)? != target {
+            return Err(format!(
+                "cannot broadcast tensor shape {:?} to {:?}",
+                input.shape, target
+            ));
+        }
+        let strides = contiguous_strides(&input.shape);
+        let data = (0..element_count(target)?)
+            .map(|index| {
+                input
+                    .data
+                    .get(broadcast_offset(index, target, &input.shape, &strides))
+            })
+            .collect();
+        DynamicTensor::new(target.to_vec(), data)
+    }
+
+    #[test]
+    fn selection_and_unary_broadcast_preserve_bits_dtype_and_errors() {
+        for dtype in [TensorDType::F64, TensorDType::F32, TensorDType::Bool] {
+            let mask =
+                DynamicTensor::with_dtype(vec![2, 1, 1, 1], vec![0.0, 1.0], TensorDType::Bool)
+                    .unwrap();
+            let on_true = fixture(vec![1, 3, 1, 4], dtype);
+            let on_false = fixture(vec![2, 1, 5, 1], dtype);
+            let actual = mask.where_select(&on_true, &on_false).unwrap();
+            let expected = reference_where(&mask, &on_true, &on_false).unwrap();
+            assert_eq!(actual.dtype, expected.dtype);
+            assert_eq!(actual.shape, expected.shape);
+            assert_eq!(
+                actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+                expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
+            );
+            let input = fixture(vec![3, 1, 4], dtype);
+            for target in [vec![2, 3, 5, 4], vec![3, 5, 4], vec![2, 3, 5, 7]] {
+                match (
+                    input.broadcast_to_shape(&target),
+                    reference_broadcast(&input, &target),
+                ) {
+                    (Ok(actual), Ok(expected)) => {
+                        assert_eq!(actual.dtype, expected.dtype);
+                        assert_eq!(actual.shape, expected.shape);
+                        assert_eq!(
+                            actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+                            expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
+                        );
+                    }
+                    (Err(actual), Err(expected)) => assert_eq!(actual, expected),
+                    pair => panic!("different broadcast outcomes: {pair:?}"),
+                }
+            }
+            let mask = fixture(vec![7], TensorDType::Bool);
+            assert_eq!(
+                mask.where_select(&on_true, &on_false).unwrap_err(),
+                reference_where(&mask, &on_true, &on_false).unwrap_err()
+            );
+        }
+        // A legacy NaN mask is nonzero; unselected NaNs remain unobserved.
+        let mask = fixture(vec![4, 1], TensorDType::F64);
+        let on_true = fixture(vec![1, 7], TensorDType::F64);
+        let on_false = fixture(vec![4, 1], TensorDType::F64);
+        let actual = mask.where_select(&on_true, &on_false).unwrap();
+        let expected = reference_where(&mask, &on_true, &on_false).unwrap();
+        assert_eq!(
+            actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+            expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "complete where and unary broadcast release timing probe"]
+    fn profile_selection_carry() {
+        use std::time::Instant;
+        let mask = fixture(vec![16, 1, 1, 1], TensorDType::Bool);
+        let on_true = fixture(vec![1, 16, 16, 1], TensorDType::F32);
+        let on_false = fixture(vec![1, 1, 1, 16], TensorDType::F32);
+        let input = fixture(vec![1, 16, 1, 16], TensorDType::F32);
+        let target = vec![16; 4];
+        let modes = if std::env::var_os("QUABLA_BROADCAST_CARRY_FIRST").is_some() {
+            [false, true]
+        } else {
+            [true, false]
+        };
+        for operation in ["where", "broadcast"] {
+            for old in modes {
+                let mut times = Vec::new();
+                for _ in 0..15 {
+                    let start = Instant::now();
+                    let result = match (operation, old) {
+                        ("where", true) => reference_where(&mask, &on_true, &on_false),
+                        ("where", false) => mask.where_select(&on_true, &on_false),
+                        (_, true) => reference_broadcast(&input, &target),
+                        (_, false) => input.broadcast_to_shape(&target),
+                    }
+                    .unwrap();
+                    std::hint::black_box(result);
+                    times.push(start.elapsed().as_nanos());
+                }
+                times.sort();
+                println!(
+                    "{{\"operation\":\"{operation}\",\"reference\":{old},\"median_ns\":{}}}",
+                    times[7]
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gradient_accumulation_reuse_tests {
+    use super::*;
+
+    #[test]
+    fn accumulation_preserves_bits_dtype_broadcast_and_shared_seeds() -> Result<(), String> {
+        for dtype in [TensorDType::F64, TensorDType::F32, TensorDType::Bool] {
+            for shape in [vec![], vec![1], vec![4]] {
+                let mut value = DynamicTensor::with_dtype(
+                    vec![4],
+                    vec![-0.0, 0.5, f64::INFINITY, f64::NAN],
+                    dtype,
+                )?;
+                let seed_alias = value.clone();
+                let contribution = DynamicTensor::with_dtype(
+                    shape.clone(),
+                    vec![0.25; element_count(&shape)?],
+                    TensorDType::F32,
+                )?;
+                let expected = value.add(&contribution)?;
+                let seed_bits = value.data.iter().map(f64::to_bits).collect::<Vec<_>>();
+                value.add_assign(&contribution)?;
+                assert_eq!(value.dtype, expected.dtype);
+                assert_eq!(value.shape, expected.shape);
+                assert_eq!(
+                    value.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+                    expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    seed_alias.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+                    seed_bits
+                );
+            }
+        }
+        let mut value = DynamicTensor::new(
+            vec![4],
+            vec![
+                f64::from_bits(0x7ff0000000000001),
+                f64::from_bits(0xfff8000000000005),
+                -0.0,
+                0.0,
+            ],
+        )?;
+        let contribution = DynamicTensor::new(
+            vec![4],
+            vec![
+                f64::from_bits(0x7ff8000000000007),
+                f64::from_bits(0x7ff0000000000003),
+                0.0,
+                -0.0,
+            ],
+        )?;
+        let expected = value.add(&contribution)?;
+        value.add_assign(&contribution)?;
+        assert_eq!(
+            value.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+            expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
+        );
+        let mut value = DynamicTensor::filled(vec![4], 1.0)?;
+        let HostTensorStorage::F64(data) = &value.data else {
+            unreachable!()
+        };
+        let pointer = data.as_ptr();
+        value.add_assign(&DynamicTensor::filled(vec![4], 0.5)?)?;
+        let HostTensorStorage::F64(data) = &value.data else {
+            unreachable!()
+        };
+        assert_eq!(pointer, data.as_ptr());
+        let previous = value.clone();
+        let invalid = DynamicTensor::filled(vec![3], 1.0)?;
+        let error = value.add(&invalid).unwrap_err();
+        assert_eq!(value.add_assign(&invalid).unwrap_err(), error);
+        assert_eq!(value.data(), previous.data());
+        Ok(())
+    }
 }

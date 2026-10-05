@@ -41,9 +41,15 @@ fn staged_vjp_compiles_value_and_gradients_into_one_program() -> Result<(), Stri
         matrix(2, 2, &[1.0, 0.5, -1.0, 2.0])?,
     ])?;
     assert_eq!(outputs.len(), 3);
-    assert_eq!(outputs[0].data(), &[58.0, 64.0, 139.0, 154.0]);
-    assert_eq!(outputs[1].data(), &[11.0, 14.0, 17.0, 9.0, 11.0, 13.0]);
-    assert_eq!(outputs[2].data(), &[-3.0, 8.5, -3.0, 11.0, -3.0, 13.5]);
+    assert_eq!(outputs[0].data().as_ref(), &[58.0, 64.0, 139.0, 154.0]);
+    assert_eq!(
+        outputs[1].data().as_ref(),
+        &[11.0, 14.0, 17.0, 9.0, 11.0, 13.0]
+    );
+    assert_eq!(
+        outputs[2].data().as_ref(),
+        &[-3.0, 8.5, -3.0, 11.0, -3.0, 13.5]
+    );
 
     let error = executable
         .execute(vec![matrix(2, 3, &[0.0; 6])?])
@@ -78,9 +84,9 @@ fn staged_jvp_over_a_ones_seeded_vjp_gives_hessian_columns() -> Result<(), Strin
         DynamicTensor::with_dtype(vec![2, 1], vec![5.0, 6.0], TensorDType::F32)?,
         DynamicTensor::with_dtype(vec![2, 1], vec![0.0, 1.0], TensorDType::F32)?,
     ])?;
-    assert_eq!(outputs[0].data(), &[17.0, 39.0]);
+    assert_eq!(outputs[0].data().as_ref(), &[17.0, 39.0]);
     assert_eq!(outputs[0].dtype(), TensorDType::F32);
-    assert_eq!(outputs[1].data(), &[2.0, 4.0]);
+    assert_eq!(outputs[1].data().as_ref(), &[2.0, 4.0]);
     assert_eq!(outputs[1].dtype(), TensorDType::F32);
     Ok(())
 }
@@ -156,10 +162,13 @@ fn inline_batched_splices_a_per_example_graph_over_the_batch() -> Result<(), Str
         matrix(2, 1, &[0.5, -2.0])?,
     ])?;
     assert_eq!(values[0].shape(), &[3, 1, 1]);
-    assert_eq!(values[0].data(), &[-3.5, -6.5, -1.5]);
+    assert_eq!(values[0].data().as_ref(), &[-3.5, -6.5, -1.5]);
     assert_eq!(values[1].shape(), &[3, 2, 1]);
     // weight @ (row @ weight) per example: the row products scale weight.
-    assert_eq!(values[1].data(), &[-1.75, 7.0, -3.25, 13.0, -0.75, 3.0]);
+    assert_eq!(
+        values[1].data().as_ref(),
+        &[-1.75, 7.0, -3.25, 13.0, -0.75, 3.0]
+    );
     assert_eq!(values[2].shape(), &[4, 1]);
     Ok(())
 }
@@ -236,8 +245,8 @@ fn tracers_of_an_enclosing_trace_lift_into_the_inner_trace() -> Result<(), Strin
     outer.end_trace()?;
     let executable = outer.compile_cpu_many(&spliced, vec!["w".into()])?;
     let values = executable.execute(vec![matrix(1, 1, &[3.0])?])?;
-    assert_eq!(values[0].data(), &[36.0]);
-    assert_eq!(values[1].data(), &[3.0]);
+    assert_eq!(values[0].data().as_ref(), &[36.0]);
+    assert_eq!(values[1].data().as_ref(), &[3.0]);
     Ok(())
 }
 

@@ -143,7 +143,7 @@ impl PyAdam {
             let mut values = Vec::with_capacity(parameter_data.len());
             for ((value, gradient), (first, second)) in parameter_data
                 .iter()
-                .zip(gradient_data)
+                .zip(gradient_data.iter())
                 .zip(first.iter_mut().zip(second.iter_mut()))
             {
                 *first = self.beta1 * *first + (1.0 - self.beta1) * *gradient;

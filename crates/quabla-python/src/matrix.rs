@@ -369,6 +369,14 @@ impl PyMatrix {
         self.try_elementwise_broadcast(rhs, "+", |lhs, rhs| lhs + rhs)
     }
 
+    pub(crate) fn accumulate_owned_same_shape(&mut self, rhs: &Self) {
+        assert_eq!(self.dims(), rhs.dims());
+        // Cotangent buffers are owned; preserve the old left-plus-right order.
+        for (existing, incoming) in self.data.iter_mut().zip(&rhs.data) {
+            *existing += incoming;
+        }
+    }
+
     pub fn try_add_scalar(&self, rhs: f64) -> Result<Self, String> {
         self.try_add(&Self::filled(self.rows, self.cols, rhs))
     }
@@ -460,16 +468,23 @@ impl PyMatrix {
         }
 
         let mut data = vec![0.0; self.rows * rhs.cols];
+        if data.is_empty() {
+            return Ok(Self {
+                rows: self.rows,
+                cols: rhs.cols,
+                data,
+            });
+        }
 
         for row in 0..self.rows {
-            for col in 0..rhs.cols {
-                let mut sum = 0.0;
-
-                for inner in 0..self.cols {
-                    sum += self.data[row * self.cols + inner] * rhs.data[inner * rhs.cols + col];
+            let output = &mut data[row * rhs.cols..(row + 1) * rhs.cols];
+            for inner in 0..self.cols {
+                let lhs = self.data[row * self.cols + inner];
+                let rhs_row = &rhs.data[inner * rhs.cols..(inner + 1) * rhs.cols];
+                // Each output keeps its original increasing-inner accumulation order.
+                for (value, rhs_value) in output.iter_mut().zip(rhs_row) {
+                    *value += lhs * rhs_value;
                 }
-
-                data[row * rhs.cols + col] = sum;
             }
         }
 
@@ -665,5 +680,64 @@ impl PyMatrix {
 
     fn __repr__(&self) -> String {
         format!("Matrix(shape=({}, {}))", self.rows, self.cols)
+    }
+}
+
+#[cfg(test)]
+mod matmul_tests {
+    use super::PyMatrix;
+
+    #[test]
+    fn contiguous_matmul_preserves_scalar_accumulation_order() {
+        let lhs = PyMatrix {
+            rows: 5,
+            cols: 37,
+            data: (0..185)
+                .map(|i| match i % 6 {
+                    0 => 1e16,
+                    1 => 1.0,
+                    2 => -1e16,
+                    _ => (i as f64 - 71.0) / 13.0,
+                })
+                .collect(),
+        };
+        let rhs = PyMatrix {
+            rows: 37,
+            cols: 29,
+            data: (0..1073).map(|i| (i as f64 % 17.0 - 8.0) / 7.0).collect(),
+        };
+        let actual = lhs.try_matmul(&rhs).unwrap();
+        for row in 0..lhs.rows {
+            for col in 0..rhs.cols {
+                let mut expected = 0.0;
+                for inner in 0..lhs.cols {
+                    expected += lhs.data[row * lhs.cols + inner] * rhs.data[inner * rhs.cols + col];
+                }
+                assert_eq!(
+                    actual.data[row * rhs.cols + col].to_bits(),
+                    expected.to_bits()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn matmul_keeps_empty_shapes_and_validation() {
+        let empty_inner = PyMatrix::filled(2, 0, 0.0)
+            .try_matmul(&PyMatrix::filled(0, 3, 0.0))
+            .unwrap();
+        assert_eq!(empty_inner.dims(), (2, 3));
+        assert_eq!(empty_inner.data(), &[0.0; 6]);
+        let empty_output = PyMatrix::filled(2, 3, 1.0)
+            .try_matmul(&PyMatrix::filled(3, 0, 1.0))
+            .unwrap();
+        assert_eq!(empty_output.dims(), (2, 0));
+        assert!(empty_output.data().is_empty());
+        assert_eq!(
+            PyMatrix::filled(2, 3, 1.0)
+                .try_matmul(&PyMatrix::filled(4, 2, 1.0))
+                .unwrap_err(),
+            "incompatible matmul shapes: (2, 3) x (4, 2)"
+        );
     }
 }

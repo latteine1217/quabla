@@ -637,7 +637,7 @@ impl TensorTraceGraph {
     /// Builds the ordered facade program behind
     /// [`Self::compile_multi_output_executable`]; the CUDA data-parallel
     /// helper freezes it directly because it targets a replica set.
-    fn into_multi_output_program(
+    pub(crate) fn into_multi_output_program(
         self,
         output_node_ids: Vec<TensorNodeId>,
     ) -> Result<QuablaMultiOutputProgram, String> {
@@ -1598,7 +1598,6 @@ impl TraceTensor {
         matrix.solve_tensor(rhs)
     }
 
-    #[allow(clippy::needless_range_loop)]
     fn cholesky_tensor(&self) -> Result<Self, String> {
         if self.batch_axis.is_some() || self.shape.len() != 2 || self.shape[0] != self.shape[1] {
             return Err(format!(
@@ -1606,46 +1605,7 @@ impl TraceTensor {
                 self.shape
             ));
         }
-        let n = self.shape[0];
-        let mut rows: Vec<Vec<Self>> = Vec::with_capacity(n);
-        for row in 0..n {
-            let mut current = Vec::with_capacity(n);
-            for column in 0..n {
-                if column > row {
-                    current.push(self.scalar_tensor(0.0)?);
-                    continue;
-                }
-                let mut reduced =
-                    self.index_tensor(&[TensorIndex::Integer(row), TensorIndex::Integer(column)])?;
-                for inner in 0..column {
-                    let column_value = if row == column {
-                        &current[inner]
-                    } else {
-                        &rows[column][inner]
-                    };
-                    let product = current[inner].binary(column_value, "mul")?;
-                    reduced = reduced.binary(&product, "sub")?;
-                }
-                let value = if row == column {
-                    reduced.sqrt_tensor()?
-                } else {
-                    reduced.binary(&rows[column][column], "div")?
-                };
-                current.push(value);
-            }
-            rows.push(current);
-        }
-        let rows = rows
-            .into_iter()
-            .map(|row| {
-                let entries = row
-                    .into_iter()
-                    .map(|value| value.reshape_tensor(vec![1]))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Self::try_concat(&entries, 0)?.reshape_tensor(vec![1, n])
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::try_concat(&rows, 0)
+        self.apply(&[], |ir| ir.cholesky(self.node_id))
     }
 
     pub fn where_tensor(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
@@ -2555,6 +2515,58 @@ impl TensorTraceGraph {
             .map_err(PyValueError::new_err)
     }
 
+    /// Compiles the ordered v0.2 output program for an explicitly selected backend.
+    #[pyo3(name = "_compile", signature = (outputs, input_names, target = "cpu", device_ordinal = 0))]
+    fn py_compile_target(
+        &self,
+        py: Python<'_>,
+        outputs: Vec<TraceTensor>,
+        input_names: Vec<String>,
+        target: &str,
+        device_ordinal: usize,
+    ) -> PyResult<StagedExecutable> {
+        self.ensure_owns(&outputs.iter().collect::<Vec<_>>())
+            .map_err(PyValueError::new_err)?;
+        let target = match target {
+            "cpu" => QuablaTarget::Cpu,
+            "cuda" => QuablaTarget::Cuda { device_ordinal },
+            "mlx" => QuablaTarget::Mlx,
+            _ => return Err(PyValueError::new_err("unknown compilation target")),
+        };
+        let program = self
+            .clone()
+            .into_multi_output_program(outputs.iter().map(|output| output.node_id).collect())
+            .map_err(PyValueError::new_err)?;
+        Ok(StagedExecutable {
+            executable: QuablaCompiler
+                .compile_many_checked(&program, target)
+                .map_err(|error| {
+                    use quabla_core::compiler::QuablaCompileError;
+                    match error {
+                        QuablaCompileError::Unavailable(message) => {
+                            crate::errors::device_operation_error(py, message, "jit", target.name())
+                        }
+                        QuablaCompileError::Unsupported { op, message } => {
+                            crate::errors::device_operation_error(py, message, &op, target.name())
+                        }
+                        QuablaCompileError::InvalidProgram(message)
+                        | QuablaCompileError::Backend(message) => PyValueError::new_err(message),
+                    }
+                })?,
+            input_names,
+        })
+    }
+
+    #[pyo3(name = "_as_program")]
+    fn py_as_program(
+        &self,
+        outputs: Vec<TraceTensor>,
+    ) -> PyResult<crate::compiler::PyQuablaProgram> {
+        self.ensure_owns(&outputs.iter().collect::<Vec<_>>())
+            .map_err(PyValueError::new_err)?;
+        crate::compiler::PyQuablaProgram::from_outputs(self.clone(), outputs)
+    }
+
     /// `inline_into` for `quabla._transforms`: each binding is a tracer of
     /// the enclosing trace, a Python number, or an eager array.
     #[pyo3(name = "_inline")]
@@ -2673,6 +2685,20 @@ impl TensorTraceGraph {
             .lock()
             .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
             .node_count())
+    }
+
+    #[getter(_has_f32_nodes)]
+    fn py_has_f32_nodes(&self) -> PyResult<bool> {
+        let ir = self
+            .ir
+            .lock()
+            .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?;
+        for node_id in 0..ir.node_count() {
+            if ir.node_dtype(node_id).map_err(PyValueError::new_err)? == TensorDType::F32 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn evaluate_value_and_vjp(
@@ -6877,6 +6903,51 @@ pub fn tensor_value_and_grad_data_parallel_cuda_fn(
     })
 }
 
+/// Copies each mapped element once across all replicas. Replicated tensors
+/// still have independent storage per replica; the full input map stays owned
+/// by the caller. Mapped shapes and divisibility are checked at compilation.
+fn build_data_parallel_host_inputs(
+    inputs: &BTreeMap<String, DynamicTensor>,
+    input_shapes: &BTreeMap<String, Vec<usize>>,
+    mapped_input_names: &BTreeSet<String>,
+    replica_count: usize,
+    cotangent_name: &str,
+) -> Result<Vec<BTreeMap<String, DynamicTensor>>, String> {
+    if inputs.len() != input_shapes.len()
+        || input_shapes.iter().any(|(name, shape)| {
+            inputs
+                .get(name)
+                .is_none_or(|input| input.shape() != shape.as_slice())
+        })
+    {
+        return Err(format!(
+            "CUDA data-parallel value-and-grad expects exactly input shapes {input_shapes:?}"
+        ));
+    }
+    if replica_count == 0 {
+        return Err("CUDA data-parallel plan has no compiled replicas".to_string());
+    }
+    let mut replica_inputs = Vec::with_capacity(replica_count);
+    for replica in 0..replica_count {
+        let mut shard_inputs = BTreeMap::new();
+        for (name, input) in inputs {
+            let value = if mapped_input_names.contains(name) {
+                let shard_extent = input.shape()[0] / replica_count;
+                input.slice_axis(0, replica * shard_extent, shard_extent)?
+            } else {
+                input.clone()
+            };
+            shard_inputs.insert(name.clone(), value);
+        }
+        shard_inputs.insert(
+            cotangent_name.to_string(),
+            DynamicTensor::new(vec![], vec![1.0])?,
+        );
+        replica_inputs.push(shard_inputs);
+    }
+    Ok(replica_inputs)
+}
+
 #[pymethods]
 impl TensorCudaDataParallelValueAndGradFunction {
     fn __call__(
@@ -6884,43 +6955,14 @@ impl TensorCudaDataParallelValueAndGradFunction {
         values: &Bound<'_, PyDict>,
     ) -> PyResult<(PyTensor, BTreeMap<String, PyTensor>)> {
         let inputs = extract_tensor_map(values)?;
-        if inputs.len() != self.input_shapes.len()
-            || self.input_shapes.iter().any(|(name, shape)| {
-                inputs
-                    .get(name)
-                    .is_none_or(|input| input.shape() != shape.as_slice())
-            })
-        {
-            return Err(PyValueError::new_err(format!(
-                "CUDA data-parallel value-and-grad expects exactly input shapes {:?}",
-                self.input_shapes
-            )));
-        }
-        let replica_count = self.plan.replica_count();
-        if replica_count == 0 {
-            return Err(PyValueError::new_err(
-                "CUDA data-parallel plan has no compiled replicas",
-            ));
-        }
-        let mut replica_inputs = Vec::with_capacity(replica_count);
-        for replica in 0..replica_count {
-            let mut shard_inputs = inputs.clone();
-            for name in &self.mapped_input_names {
-                let input = &inputs[name];
-                let shard_extent = input.shape()[0] / replica_count;
-                shard_inputs.insert(
-                    name.clone(),
-                    input
-                        .slice_axis(0, replica * shard_extent, shard_extent)
-                        .map_err(PyValueError::new_err)?,
-                );
-            }
-            shard_inputs.insert(
-                self.cotangent_name.clone(),
-                DynamicTensor::new(vec![], vec![1.0]).map_err(PyValueError::new_err)?,
-            );
-            replica_inputs.push(shard_inputs);
-        }
+        let replica_inputs = build_data_parallel_host_inputs(
+            &inputs,
+            &self.input_shapes,
+            &self.mapped_input_names,
+            self.plan.replica_count(),
+            &self.cotangent_name,
+        )
+        .map_err(PyValueError::new_err)?;
         let result = self
             .plan
             .execute_replicas(&replica_inputs, self.reduction)
@@ -7949,7 +7991,7 @@ impl TensorCudaAdamOptimizer {
         let loss = shared_plan
             .plan
             .plan
-            .execute_retaining(&self.inputs, &retained_inputs)
+            .execute_primary_retaining(&self.inputs, &retained_inputs)
             .map_err(PyValueError::new_err)?;
         PyTensor::from_dynamic_tensor(loss).map_err(PyValueError::new_err)
     }
@@ -8147,4 +8189,125 @@ pub(crate) fn extract_tensor_map(
         );
     }
     Ok(tensors)
+}
+
+#[cfg(test)]
+mod data_parallel_host_input_tests {
+    use super::*;
+
+    #[test]
+    fn mapped_leaves_cover_batch_once_and_preserve_dtype() {
+        let inputs = BTreeMap::from([
+            (
+                "x".to_string(),
+                DynamicTensor::with_dtype(
+                    vec![12, 2],
+                    (0..24).map(f64::from).collect(),
+                    TensorDType::F32,
+                )
+                .unwrap(),
+            ),
+            (
+                "y".to_string(),
+                DynamicTensor::new(vec![12], (100..112).map(f64::from).collect()).unwrap(),
+            ),
+            (
+                "weights".to_string(),
+                DynamicTensor::with_dtype(vec![2], vec![0.5, 1.5], TensorDType::F32).unwrap(),
+            ),
+            (
+                "seed".to_string(),
+                DynamicTensor::new(vec![], vec![7.0]).unwrap(),
+            ),
+        ]);
+        let shapes = inputs
+            .iter()
+            .map(|(name, input)| (name.clone(), input.shape().to_vec()))
+            .collect();
+        let mapped = BTreeSet::from(["x".to_string(), "y".to_string()]);
+        for replica_count in [1, 2, 3, 4, 6, 12] {
+            let shards =
+                build_data_parallel_host_inputs(&inputs, &shapes, &mapped, replica_count, "seed")
+                    .unwrap();
+            assert_eq!(shards.len(), replica_count);
+            for name in &mapped {
+                let original = &inputs[name];
+                let reconstructed = shards
+                    .iter()
+                    .flat_map(|shard| shard[name].data().into_owned().into_iter())
+                    .collect::<Vec<_>>();
+                assert_eq!(reconstructed, original.data().as_ref());
+                for (replica, shard) in shards.iter().enumerate() {
+                    let value = &shard[name];
+                    assert_eq!(value.dtype(), original.dtype());
+                    assert_eq!(value.shape()[0], original.shape()[0] / replica_count);
+                    assert_eq!(&value.shape()[1..], &original.shape()[1..]);
+                    let extent = original.data().len() / replica_count;
+                    assert_eq!(
+                        value.data(),
+                        &original.data()[replica * extent..(replica + 1) * extent]
+                    );
+                }
+            }
+            for shard in &shards {
+                assert_eq!(shard.len(), inputs.len());
+                assert_eq!(shard["weights"].data(), inputs["weights"].data());
+                assert_eq!(shard["weights"].dtype(), TensorDType::F32);
+                assert_eq!(shard["weights"].shape(), &[2]);
+                assert_ne!(
+                    shard["weights"].data().as_ptr(),
+                    inputs["weights"].data().as_ptr()
+                );
+                assert_eq!(shard["seed"].shape(), &[] as &[usize]);
+                assert_eq!(shard["seed"].data().as_ref(), &[1.0]);
+                assert_eq!(shard["seed"].dtype(), TensorDType::F64);
+            }
+            assert_eq!(inputs["seed"].data().as_ref(), &[7.0]);
+        }
+    }
+
+    #[test]
+    fn runtime_validation_keeps_exact_shape_errors_and_precedence() {
+        let shapes = BTreeMap::from([("x".to_string(), vec![4, 2])]);
+        let mapped = BTreeSet::from(["x".to_string()]);
+        let expected =
+            format!("CUDA data-parallel value-and-grad expects exactly input shapes {shapes:?}");
+        for inputs in [
+            BTreeMap::new(),
+            BTreeMap::from([(
+                "x".to_string(),
+                DynamicTensor::filled(vec![4], 0.0).unwrap(),
+            )]),
+            BTreeMap::from([(
+                "wrong".to_string(),
+                DynamicTensor::filled(vec![4, 2], 0.0).unwrap(),
+            )]),
+            BTreeMap::from([
+                (
+                    "x".to_string(),
+                    DynamicTensor::filled(vec![4, 2], 0.0).unwrap(),
+                ),
+                (
+                    "extra".to_string(),
+                    DynamicTensor::filled(vec![], 0.0).unwrap(),
+                ),
+            ]),
+        ] {
+            for replicas in [0, 2] {
+                assert_eq!(
+                    build_data_parallel_host_inputs(&inputs, &shapes, &mapped, replicas, "seed")
+                        .unwrap_err(),
+                    expected,
+                );
+            }
+        }
+        let valid = BTreeMap::from([(
+            "x".to_string(),
+            DynamicTensor::filled(vec![4, 2], 0.0).unwrap(),
+        )]);
+        assert_eq!(
+            build_data_parallel_host_inputs(&valid, &shapes, &mapped, 0, "seed").unwrap_err(),
+            "CUDA data-parallel plan has no compiled replicas",
+        );
+    }
 }

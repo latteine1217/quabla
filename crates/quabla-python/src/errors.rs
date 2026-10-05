@@ -62,3 +62,26 @@ pub(crate) fn unsupported_operation_error(
         Err(_) => PyValueError::new_err(message),
     }
 }
+
+/// A typed device lowering rejection; no message substring classification.
+pub(crate) fn device_operation_error(
+    py: Python<'_>,
+    message: impl Into<String>,
+    op: &str,
+    device: &str,
+) -> PyErr {
+    let message = message.into();
+    let error = py
+        .import("quabla._errors")
+        .and_then(|module| module.getattr("UnsupportedOperationError"))
+        .and_then(|class| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("op", op)?;
+            kwargs.set_item("device", device)?;
+            class.call((message.as_str(),), Some(&kwargs))
+        });
+    match error {
+        Ok(error) => PyErr::from_value(error),
+        Err(_) => PyValueError::new_err(message),
+    }
+}

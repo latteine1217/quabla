@@ -542,6 +542,7 @@ dependencies = [
  "cudarc",
  "libloading 0.9.0",
  "mlx-rs",
+ "mlx-sys",
  "quabla-macros",
 ]
 

@@ -27,10 +27,18 @@ use super::{
     TensorScanTarget, TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget, TensorShardingPlan,
 };
 
+#[cfg(test)]
+thread_local! {
+    static CUDA_LOOP_TEST_TAPE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 const CUDA_MATMUL_TILE: usize = 32;
 const CUDA_MATMUL_TILE_U64: u64 = 32;
 const CUDA_MATMUL_BLOCK: u32 = 16;
 const CUDA_REDUCTION_BLOCK: u32 = 256;
+
+#[path = "cuda_cholesky.rs"]
+mod cholesky_backend;
 
 /// NVIDIA CUDA backend for fused rank-N elementwise and rank-two matmul plans.
 ///
@@ -56,12 +64,14 @@ pub struct CudaExecutionPlan {
     context: Arc<CudaContext>,
     module: Arc<CudaModule>,
     blas: Option<Arc<Mutex<CudaBlas>>>,
-    solver: Option<Arc<Mutex<DnHandle>>>,
+    solver: Option<Arc<Mutex<CudaSolver>>>,
     state: Arc<Mutex<CudaExecutionState>>,
     cond_branches: BTreeMap<TensorNodeId, CudaCondBranches>,
     /// Host-to-device copies of array constants made by this plan's
     /// executions; see [`CudaExecutionPlan::constant_upload_count`].
     constant_uploads: Arc<AtomicUsize>,
+    /// Forward-only executable for querying a shared value-and-gradient plan.
+    primary_plan: Arc<Mutex<Option<CudaExecutionPlan>>>,
 }
 
 /// Device plans for the two regions of one `Cond` node.
@@ -151,8 +161,148 @@ struct CudaMatmulBiasTanhEpilogue {
 #[derive(Debug, Default)]
 struct CudaExecutionState {
     values: Vec<Option<CudaSlice<f32>>>,
-    free_buffers: BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    free_buffers: CudaBufferPool,
     adam: BTreeMap<String, CudaAdamState>,
+}
+
+#[derive(Debug, Default)]
+struct CudaBufferPool {
+    buffers: BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    elements: usize,
+    budget: usize,
+}
+
+impl CudaBufferPool {
+    fn take(&mut self, count: usize) -> Option<CudaSlice<f32>> {
+        let values = self.buffers.get_mut(&count)?;
+        let buffer = values.pop()?;
+        self.elements -= count;
+        if values.is_empty() {
+            self.buffers.remove(&count);
+        }
+        Some(buffer)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Vec<CudaSlice<f32>>> {
+        self.buffers.values()
+    }
+
+    fn recycle(&mut self, buffer: CudaSlice<f32>) {
+        let count = buffer.len();
+        if count > self.budget {
+            return;
+        }
+        // Prefer reusable large allocations; never retain more than one live frontier.
+        while self.elements > self.budget - count {
+            let Some((&smallest, _)) = self.buffers.first_key_value() else {
+                break;
+            };
+            if smallest >= count {
+                return;
+            }
+            let values = self
+                .buffers
+                .get_mut(&smallest)
+                .expect("key was found above");
+            values.pop();
+            self.elements -= smallest;
+            if values.is_empty() {
+                self.buffers.remove(&smallest);
+            }
+        }
+        self.elements += count;
+        self.buffers.entry(count).or_default().push(buffer);
+    }
+}
+
+fn cuda_pool_frontier_budget(plan: &TensorExecutionPlan) -> Result<usize, String> {
+    let counts = plan
+        .nodes
+        .iter()
+        .map(|node| element_count(&node.shape))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut uses = cuda_remaining_use_counts(plan);
+    let outputs = plan
+        .output_node_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let pinned = |id: usize| {
+        outputs.contains(&id)
+            || matches!(
+                plan.nodes[id].op,
+                TensorOp::Input { .. } | TensorOp::Constant { .. }
+            )
+    };
+    let mut live = 0usize;
+    let mut peak = 0usize;
+    for (id, node) in plan.nodes.iter().enumerate() {
+        live = live.saturating_add(counts[id]);
+        peak = peak.max(live);
+        for input in tensor_op_inputs(&node.op) {
+            uses[input] -= 1;
+            if uses[input] == 0 && !pinned(input) {
+                live -= counts[input];
+            }
+        }
+        if uses[id] == 0 && !pinned(id) {
+            live -= counts[id];
+        }
+    }
+    Ok(peak)
+}
+
+#[cfg(test)]
+mod pool_profile_tests {
+    use super::*;
+    use crate::tensor_ir::TensorIr;
+    use std::time::Instant;
+
+    #[test]
+    fn profile_shrinking_shape_pool() -> Result<(), String> {
+        if std::env::var_os("QUABLA_CUDA_PROFILE").is_none() {
+            return Ok(());
+        }
+        let mut graph = TensorIr::new();
+        let input = graph.input_typed("x", vec![65536], TensorDType::F32)?;
+        let mut value = input;
+        for depth in 1..=24 {
+            value = graph.sin(value)?;
+            value = graph.slice_axis(value, 0, 0, 65536 - depth * 1024)?;
+        }
+        let plan = CudaBackend::new(0).compile(graph.compile_cpu(value)?)?;
+        let inputs = BTreeMap::from([("x".into(), DynamicTensor::filled(vec![65536], 0.125)?)]);
+        let mut expected = 0.125f64;
+        for _ in 0..24 {
+            expected = expected.sin();
+        }
+        let mut samples = Vec::new();
+        for _ in 0..15 {
+            let start = Instant::now();
+            let output = plan.execute(&inputs)?;
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert!((output.storage().get(0) - expected).abs() < 1e-5);
+        }
+        samples.sort_by(f64::total_cmp);
+        let state = plan
+            .state
+            .lock()
+            .map_err(|_| "CUDA state lock was poisoned")?;
+        let pooled_elements = state
+            .free_buffers
+            .values()
+            .flatten()
+            .map(CudaSlice::len)
+            .sum::<usize>();
+        let retained_elements = state
+            .values
+            .iter()
+            .flatten()
+            .map(CudaSlice::len)
+            .sum::<usize>();
+        println!("{{\"case\":\"cuda_pool_shrinking\",\"pooled_elements\":{pooled_elements},\"retained_elements\":{retained_elements},\"median_ms\":{},\"samples_ms\":{:?}}}", samples[7], samples);
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -292,68 +442,7 @@ impl CudaBackend {
         plan: TensorExecutionPlan,
         region_context: Option<&Arc<CudaContext>>,
     ) -> Result<CudaExecutionPlan, String> {
-        ensure_cuda_f32_execution(&plan)?;
-        for (node_id, node) in plan.nodes.iter().enumerate() {
-            match &node.op {
-                TensorOp::Fori { loop_plan, .. } => {
-                    cuda_fori_body_is_lowerable(loop_plan).map_err(|error| {
-                        format!("CUDA Fori node {node_id} cannot lower to a device loop: {error}")
-                    })?;
-                }
-                TensorOp::ForiJvp { loop_plan, .. } => {
-                    cuda_fori_jvp_is_lowerable(loop_plan).map_err(|error| {
-                        format!(
-                            "CUDA Fori JVP node {node_id} cannot lower to a device loop: {error}"
-                        )
-                    })?;
-                }
-                TensorOp::ForiVjp {
-                    loop_plan, target, ..
-                } => {
-                    cuda_fori_vjp_plan(loop_plan, target).map_err(|error| {
-                        format!(
-                            "CUDA Fori VJP node {node_id} cannot lower to a device loop: {error}"
-                        )
-                    })?;
-                }
-                TensorOp::ForiVjpJvp { plan, .. } => {
-                    cuda_fori_vjp_jvp_is_lowerable(plan).map_err(|error| {
-                        format!(
-                            "CUDA Fori VJP JVP node {node_id} cannot lower to a device loop: {error}"
-                        )
-                    })?;
-                }
-                TensorOp::Scan { scan_plan, .. } => {
-                    cuda_scan_body_is_lowerable(scan_plan).map_err(|error| {
-                        format!("CUDA Scan node {node_id} cannot lower to a device loop: {error}")
-                    })?;
-                }
-                TensorOp::ScanVjp {
-                    scan_plan, target, ..
-                } => {
-                    cuda_scan_vjp_plans(scan_plan, target).map_err(|error| {
-                        format!(
-                            "CUDA Scan VJP node {node_id} cannot lower to a device loop: {error}"
-                        )
-                    })?;
-                }
-                TensorOp::ScanVjpJvp {
-                    plan: scan_hvp,
-                    group,
-                    ..
-                } => {
-                    cuda_scan_vjp_jvp_is_lowerable(scan_hvp).map_err(|error| {
-                        format!("CUDA Scan VJP JVP node {node_id} cannot lower to a device loop: {error}")
-                    })?;
-                    cuda_scan_vjp_jvp_group(&plan, *group).map_err(|error| {
-                        format!(
-                            "CUDA Scan VJP JVP node {node_id} has invalid group bindings: {error}"
-                        )
-                    })?;
-                }
-                _ => {}
-            }
-        }
+        validate_cuda_plan(&plan).map_err(|(_, message)| message)?;
         ensure_nvrtc_runtime_available()?;
         // The fused epilogue binds only uploaded inputs and never runs `Cond` first; region plans
         // need the per-node program.
@@ -420,6 +509,7 @@ impl CudaBackend {
                 },
             );
         }
+        let pool_budget = cuda_pool_frontier_budget(&plan)?;
         Ok(CudaExecutionPlan {
             plan,
             fused_elementwise,
@@ -430,9 +520,16 @@ impl CudaBackend {
             module,
             blas,
             solver,
-            state: Arc::new(Mutex::new(CudaExecutionState::default())),
+            state: Arc::new(Mutex::new(CudaExecutionState {
+                free_buffers: CudaBufferPool {
+                    budget: pool_budget,
+                    ..CudaBufferPool::default()
+                },
+                ..CudaExecutionState::default()
+            })),
             cond_branches,
             constant_uploads: Arc::new(AtomicUsize::new(0)),
+            primary_plan: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -684,6 +781,63 @@ fn create_nccl_communicators(replicas: &[CudaExecutionPlan]) -> Result<Vec<NcclC
     .map_err(|error| format!("failed to initialize NCCL communicators: {error:?}"))
 }
 
+/// Pure lowering validation shared by v0.1 compilation and the typed v0.2 facade.
+pub(super) fn validate_cuda_plan(plan: &TensorExecutionPlan) -> Result<(), (String, String)> {
+    ensure_cuda_f32_execution(plan).map_err(|message| ("dtype".into(), message))?;
+    for (node_id, node) in plan.nodes.iter().enumerate() {
+        let (op, result) = match &node.op {
+            TensorOp::Fori { loop_plan, .. } => ("Fori", cuda_fori_body_is_lowerable(loop_plan)),
+            TensorOp::ForiJvp { loop_plan, .. } => {
+                ("Fori JVP", cuda_fori_jvp_is_lowerable(loop_plan))
+            }
+            TensorOp::ForiVjp {
+                loop_plan, target, ..
+            } => (
+                "Fori VJP",
+                cuda_fori_vjp_plan(loop_plan, target).map(|_| ()),
+            ),
+            TensorOp::ForiVjpJvp { plan, .. } => {
+                ("Fori VJP JVP", cuda_fori_vjp_jvp_is_lowerable(plan))
+            }
+            TensorOp::Scan { scan_plan, .. } => ("Scan", cuda_scan_body_is_lowerable(scan_plan)),
+            TensorOp::ScanVjp {
+                scan_plan, target, ..
+            } => (
+                "Scan VJP",
+                cuda_scan_vjp_plans(scan_plan, target).map(|_| ()),
+            ),
+            TensorOp::ScanVjpJvp {
+                plan: scan_hvp,
+                group,
+                ..
+            } => {
+                cuda_scan_vjp_jvp_group(plan, *group).map_err(|error| {
+                    (
+                        "Scan VJP JVP".into(),
+                        format!(
+                            "CUDA Scan VJP JVP node {node_id} has invalid group bindings: {error}"
+                        ),
+                    )
+                })?;
+                ("Scan VJP JVP", cuda_scan_vjp_jvp_is_lowerable(scan_hvp))
+            }
+            TensorOp::Cond { branches, .. } => {
+                validate_cuda_plan(&branches.on_true.plan)?;
+                validate_cuda_plan(&branches.on_false.plan)?;
+                continue;
+            }
+            _ => continue,
+        };
+        result.map_err(|error| {
+            (
+                op.to_string(),
+                format!("CUDA {op} node {node_id} cannot lower to a device loop: {error}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(feature = "cuda-nccl")]
 fn validate_cuda_data_parallel_devices(device_ordinals: &[usize]) -> Result<(), String> {
     if device_ordinals.len() < 2 {
@@ -778,12 +932,22 @@ impl CudaExecutionPlan {
     /// Number of allocated device buffers currently owned by this plan,
     /// including reusable temporary buffers and retained values.
     pub fn device_buffer_count(&self) -> Result<usize, String> {
+        let primary = self
+            .primary_plan
+            .lock()
+            .map_err(|_| "CUDA primary plan cache lock is poisoned".to_string())?;
         let state = self
             .state
             .lock()
             .map_err(|_| "CUDA execution plan state lock is poisoned".to_string())?;
+        let primary_count = primary
+            .as_ref()
+            .map(CudaExecutionPlan::device_buffer_count)
+            .transpose()?
+            .unwrap_or(0);
         Ok(state.values.iter().flatten().count()
-            + state.free_buffers.values().map(Vec::len).sum::<usize>())
+            + state.free_buffers.values().map(Vec::len).sum::<usize>()
+            + primary_count)
     }
 
     /// Number of array constants this plan has copied to the device.
@@ -861,6 +1025,80 @@ impl CudaExecutionPlan {
     ) -> Result<(), String> {
         self.execute_retaining_inner(inputs, retained_inputs, false)
             .map(|_| ())
+    }
+
+    /// Evaluates only the primary output while updating the original retained
+    /// input bindings. A later optimizer step therefore sees the latest batch,
+    /// and the forward query reads device-resident updated parameters.
+    pub fn execute_primary_retaining(
+        &self,
+        inputs: &BTreeMap<String, DynamicTensor>,
+        retained_inputs: &BTreeSet<String>,
+    ) -> Result<DynamicTensor, String> {
+        if self.plan.output_node_ids().len() == 1 {
+            return self.execute_retaining(inputs, retained_inputs);
+        }
+        validate_cuda_program_inputs(&self.plan, inputs)?;
+        let mut cached = self
+            .primary_plan
+            .lock()
+            .map_err(|_| "CUDA primary plan cache lock is poisoned".to_string())?;
+        if cached.is_none() {
+            let forward = self.plan.as_ir().compile_cpu(self.plan.output_node_id)?;
+            *cached = Some(
+                CudaBackend::new(self.device_ordinal)
+                    .compile_in_context(forward, Some(&self.context))?,
+            );
+        }
+        let forward = cached.as_ref().expect("primary plan was compiled above");
+        let stream = self.context.default_stream();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "CUDA execution plan state lock is poisoned".to_string())?;
+        let CudaExecutionState {
+            values,
+            free_buffers,
+            ..
+        } = &mut *state;
+        if values.len() != self.plan.nodes.len() {
+            *values = std::iter::repeat_with(|| None)
+                .take(self.plan.nodes.len())
+                .collect();
+        }
+        for (node_id, node) in self.plan.nodes.iter().enumerate() {
+            let TensorOp::Input { name } = &node.op else {
+                continue;
+            };
+            if retained_inputs.contains(name) && values[node_id].is_some() {
+                continue;
+            }
+            let host = inputs[name].storage().to_f32();
+            upload_cuda_input(&stream, &mut values[node_id], free_buffers, &host, name)?;
+        }
+        let captures = forward
+            .plan
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                TensorOp::Input { name } => Some(name),
+                _ => None,
+            })
+            .map(|name| {
+                let node_id = input_node_id(&self.plan, name)?;
+                Ok((name.clone(), cuda_value(values, node_id)?))
+            })
+            .collect::<Result<BTreeMap<_, _>, String>>()?;
+        let output = stream
+            .alloc_zeros::<f32>(element_count(
+                &forward.plan.nodes[forward.plan.output_node_id].shape,
+            )?)
+            .map_err(|error| format!("failed to allocate CUDA primary output: {error:?}"))?;
+        let output = forward.execute_region(&captures, output)?;
+        let data = stream
+            .clone_dtoh(&output)
+            .map_err(|error| format!("failed to copy CUDA primary output: {error:?}"))?;
+        cuda_host_tensor(&forward.plan, forward.plan.output_node_id, data)
     }
 
     /// Executes this `Cond` region with parent device buffers as captures and
@@ -1339,20 +1577,14 @@ impl TensorBackend for CudaBackend {
 
         let host_inputs = input_nodes
             .iter()
-            .map(|(name, _)| {
-                inputs[*name]
-                    .data()
-                    .iter()
-                    .map(|value| *value as f32)
-                    .collect::<Vec<_>>()
-            })
+            .map(|(name, _)| inputs[*name].storage().to_f32())
             .collect::<Vec<_>>();
         let device_inputs = host_inputs
             .iter()
             .zip(input_nodes.iter())
             .map(|(input, (name, _))| {
                 stream
-                    .clone_htod(input)
+                    .clone_htod(input.as_ref())
                     .map_err(|error| format!("failed to copy input {name:?} to CUDA: {error:?}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1398,7 +1630,7 @@ struct CudaProgramRuntime<'a> {
     stream: &'a Arc<CudaStream>,
     module: &'a Arc<CudaModule>,
     blas: Option<&'a Arc<Mutex<CudaBlas>>>,
-    solver: Option<&'a Arc<Mutex<DnHandle>>>,
+    solver: Option<&'a Arc<Mutex<CudaSolver>>>,
     cond_branches: &'a BTreeMap<TensorNodeId, CudaCondBranches>,
     /// When non-empty, this program is a `Cond` region: every input is bound to a parent-plan
     /// device buffer.
@@ -1409,7 +1641,7 @@ struct CudaProgramRuntime<'a> {
 
 fn cuda_remaining_use_counts(plan: &TensorExecutionPlan) -> Vec<usize> {
     let mut counts = vec![0; plan.nodes.len()];
-    for node in &plan.nodes {
+    for node in plan.nodes.iter() {
         for input in tensor_op_inputs(&node.op) {
             counts[input] += 1;
         }
@@ -1465,14 +1697,11 @@ fn cuda_matmul_bias_tanh_epilogue(
 
 fn take_cuda_buffer(
     stream: &Arc<CudaStream>,
-    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    free_buffers: &mut CudaBufferPool,
     count: usize,
     node_id: usize,
 ) -> Result<CudaSlice<f32>, String> {
-    if let Some(buffer) = free_buffers
-        .get_mut(&count)
-        .and_then(|buffers| buffers.pop())
-    {
+    if let Some(buffer) = free_buffers.take(count) {
         return Ok(buffer);
     }
     stream
@@ -1483,7 +1712,7 @@ fn take_cuda_buffer(
 fn upload_cuda_input(
     stream: &Arc<CudaStream>,
     slot: &mut Option<CudaSlice<f32>>,
-    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    free_buffers: &mut CudaBufferPool,
     host: &[f32],
     name: &str,
 ) -> Result<(), String> {
@@ -1506,14 +1735,14 @@ fn upload_cuda_input(
 
 fn release_cuda_value(
     values: &mut [Option<CudaSlice<f32>>],
-    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    free_buffers: &mut CudaBufferPool,
     node_id: usize,
 ) -> Result<(), String> {
     let slot = values
         .get_mut(node_id)
         .ok_or_else(|| format!("CUDA node {node_id} is missing its buffer slot"))?;
     if let Some(buffer) = slot.take() {
-        free_buffers.entry(buffer.len()).or_default().push(buffer);
+        free_buffers.recycle(buffer);
     }
     Ok(())
 }
@@ -1532,14 +1761,14 @@ fn release_cuda_value(
 fn recycle_cuda_computed_values(
     plan: &TensorExecutionPlan,
     values: &mut [Option<CudaSlice<f32>>],
-    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    free_buffers: &mut CudaBufferPool,
 ) {
-    for (slot, node) in values.iter_mut().zip(&plan.nodes) {
+    for (slot, node) in values.iter_mut().zip(plan.nodes.iter()) {
         if matches!(node.op, TensorOp::Input { .. } | TensorOp::Constant { .. }) {
             continue;
         }
         if let Some(buffer) = slot.take() {
-            free_buffers.entry(buffer.len()).or_default().push(buffer);
+            free_buffers.recycle(buffer);
         }
     }
 }
@@ -1548,7 +1777,7 @@ fn release_dead_cuda_values(
     plan: &TensorExecutionPlan,
     node_id: usize,
     values: &mut [Option<CudaSlice<f32>>],
-    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    free_buffers: &mut CudaBufferPool,
     retained_inputs: &BTreeSet<String>,
     remaining_uses: &mut [usize],
 ) -> Result<(), String> {
@@ -1578,7 +1807,7 @@ fn execute_cuda_device_program(
     inputs: &BTreeMap<String, DynamicTensor>,
     runtime: CudaProgramRuntime<'_>,
     values: &mut Vec<Option<CudaSlice<f32>>>,
-    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    free_buffers: &mut CudaBufferPool,
     retained_inputs: &BTreeSet<String>,
     copy_output: bool,
 ) -> Result<Option<DynamicTensor>, String> {
@@ -1656,17 +1885,13 @@ fn execute_cuda_device_program(
                         })?;
                     continue;
                 }
-                let host = inputs[name]
-                    .data()
-                    .iter()
-                    .map(|value| *value as f32)
-                    .collect::<Vec<_>>();
                 let slot = values
                     .get_mut(node_id)
                     .ok_or_else(|| format!("CUDA input node {node_id} is missing its buffer"))?;
                 if retained_inputs.contains(name) && slot.is_some() {
                     continue;
                 }
+                let host = inputs[name].storage().to_f32();
                 upload_cuda_input(stream, slot, free_buffers, &host, name)?;
                 continue;
             }
@@ -1677,13 +1902,8 @@ fn execute_cuda_device_program(
                     .get_mut(node_id)
                     .ok_or_else(|| format!("CUDA constant node {node_id} is missing its buffer"))?;
                 if slot.is_none() {
-                    let host = value
-                        .value()
-                        .data()
-                        .iter()
-                        .map(|value| *value as f32)
-                        .collect::<Vec<_>>();
-                    *slot = Some(stream.clone_htod(&host).map_err(|error| {
+                    let host = value.value().storage().to_f32();
+                    *slot = Some(stream.clone_htod(host.as_ref()).map_err(|error| {
                         format!("failed to copy CUDA constant node {node_id}: {error:?}")
                     })?);
                     constant_uploads.fetch_add(1, Ordering::Relaxed);
@@ -1877,15 +2097,24 @@ fn execute_cuda_device_program(
                             "CUDA Fori VJP group {group} reached node {node_id} before its producer"
                         ));
                     }
-                    let tape_count = loop_plan
-                        .upper
-                        .checked_sub(loop_plan.lower)
-                        .and_then(|steps| steps.checked_add(1))
-                        .and_then(|states| states.checked_mul(carry_count))
-                        .ok_or_else(|| {
-                            "CUDA Fori VJP carry tape size overflowed usize".to_string()
-                        })?;
+                    let tape_count = cuda_loop_tape_states(
+                        loop_plan.lower,
+                        loop_plan.upper,
+                        cuda_loop_checkpoint_block(
+                            loop_plan.lower,
+                            loop_plan.upper,
+                            &loop_plan.carry_shape()?,
+                            loop_plan.external_captures(),
+                            None,
+                            true,
+                        ),
+                    )
+                    .and_then(|states| states.checked_mul(carry_count))
+                    .ok_or_else(|| "CUDA Fori VJP carry tape size overflowed usize".to_string())?;
                     let mut tape = take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
+                    #[cfg(test)]
+                    CUDA_LOOP_TEST_TAPE_BYTES
+                        .with(|value| value.set(tape.len() * std::mem::size_of::<f32>()));
                     let carry_launch_count = u32::try_from(carry_count).map_err(|_| {
                         format!("CUDA Fori VJP node {node_id} launch exceeds u32 element count")
                     })?;
@@ -1938,7 +2167,7 @@ fn execute_cuda_device_program(
                             carry_launch_count,
                         )?;
                     }
-                    free_buffers.entry(tape.len()).or_default().push(tape);
+                    free_buffers.recycle(tape);
                     let mut cached = CudaForiVjpCache::default();
                     for ((member_id, _), output) in members.into_iter().zip(outputs) {
                         if member_id == node_id {
@@ -1982,18 +2211,29 @@ fn execute_cuda_device_program(
                     format!("CUDA Fori VJP JVP node {node_id} buffer was not allocated")
                 })?;
                 let carry_count = element_count(&fori_plan.loop_plan.carry_shape()?)?;
-                let tape_count = fori_plan
-                    .loop_plan
-                    .upper
-                    .checked_sub(fori_plan.loop_plan.lower)
-                    .and_then(|steps| steps.checked_add(1))
-                    .and_then(|states| states.checked_mul(carry_count))
-                    .ok_or_else(|| {
-                        "CUDA Fori VJP JVP carry tape size overflowed usize".to_string()
-                    })?;
+                let tape_count = cuda_loop_tape_states(
+                    fori_plan.loop_plan.lower,
+                    fori_plan.loop_plan.upper,
+                    cuda_loop_checkpoint_block(
+                        fori_plan.loop_plan.lower,
+                        fori_plan.loop_plan.upper,
+                        &fori_plan.loop_plan.carry_shape()?,
+                        fori_plan.loop_plan.external_captures(),
+                        None,
+                        true,
+                    ),
+                )
+                .and_then(|states| states.checked_mul(carry_count))
+                .ok_or_else(|| "CUDA Fori VJP JVP carry tape size overflowed usize".to_string())?;
                 let mut carry_tape = take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
                 let mut carry_tangent_tape =
                     take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
+                #[cfg(test)]
+                CUDA_LOOP_TEST_TAPE_BYTES.with(|value| {
+                    value.set(
+                        (carry_tape.len() + carry_tangent_tape.len()) * std::mem::size_of::<f32>(),
+                    )
+                });
                 let launch_count = u32::try_from(carry_count).map_err(|_| {
                     format!("CUDA Fori VJP JVP node {node_id} launch exceeds u32 element count")
                 })?;
@@ -2017,14 +2257,8 @@ fn execute_cuda_device_program(
                     tangent_captures,
                     launch_count,
                 )?;
-                free_buffers
-                    .entry(carry_tape.len())
-                    .or_default()
-                    .push(carry_tape);
-                free_buffers
-                    .entry(carry_tangent_tape.len())
-                    .or_default()
-                    .push(carry_tangent_tape);
+                free_buffers.recycle(carry_tape);
+                free_buffers.recycle(carry_tangent_tape);
                 release_dead_cuda_values(
                     plan,
                     node_id,
@@ -2184,15 +2418,27 @@ fn execute_cuda_device_program(
                             "CUDA Scan VJP group {group} reached node {node_id} before its producer"
                         ));
                     }
-                    let tape_count = scan_plan
-                        .upper
-                        .checked_sub(scan_plan.lower)
-                        .and_then(|steps| steps.checked_add(1))
-                        .and_then(|states| states.checked_mul(carry_count))
-                        .ok_or_else(|| {
-                            "CUDA Scan VJP carry tape size overflowed usize".to_string()
-                        })?;
+                    let tape_count = cuda_loop_tape_states(
+                        scan_plan.lower,
+                        scan_plan.upper,
+                        cuda_loop_checkpoint_block(
+                            scan_plan.lower,
+                            scan_plan.upper,
+                            &scan_plan.carry_shape()?,
+                            scan_plan.external_captures(),
+                            Some(
+                                &scan_plan.body.plan.nodes[scan_plan.body.plan.output_node_ids[1]]
+                                    .shape,
+                            ),
+                            !cuda_scan_uses_packed_halves(scan_plan),
+                        ),
+                    )
+                    .and_then(|states| states.checked_mul(carry_count))
+                    .ok_or_else(|| "CUDA Scan VJP carry tape size overflowed usize".to_string())?;
                     let mut tape = take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
+                    #[cfg(test)]
+                    CUDA_LOOP_TEST_TAPE_BYTES
+                        .with(|value| value.set(tape.len() * std::mem::size_of::<f32>()));
                     let launch_count = u32::try_from(carry_count).map_err(|_| {
                         format!("CUDA Scan VJP node {node_id} launch exceeds u32 element count")
                     })?;
@@ -2249,7 +2495,7 @@ fn execute_cuda_device_program(
                             output_count as u64,
                         )?;
                     }
-                    free_buffers.entry(tape.len()).or_default().push(tape);
+                    free_buffers.recycle(tape);
                     let mut cached = CudaScanVjpCache::default();
                     for ((member_id, _), output) in members.into_iter().zip(outputs) {
                         if member_id == node_id {
@@ -2311,19 +2557,36 @@ fn execute_cuda_device_program(
                             [scan_hvp.scan_plan.body.plan.output_node_ids[1]]
                             .shape,
                     )?;
-                    let tape_count = scan_hvp
-                        .scan_plan
-                        .upper
-                        .checked_sub(scan_hvp.scan_plan.lower)
-                        .and_then(|steps| steps.checked_add(1))
-                        .and_then(|states| states.checked_mul(carry_count))
-                        .ok_or_else(|| {
-                            "CUDA Scan VJP JVP carry tape size overflowed usize".to_string()
-                        })?;
+                    let tape_count = cuda_loop_tape_states(
+                        scan_hvp.scan_plan.lower,
+                        scan_hvp.scan_plan.upper,
+                        cuda_loop_checkpoint_block(
+                            scan_hvp.scan_plan.lower,
+                            scan_hvp.scan_plan.upper,
+                            &scan_hvp.scan_plan.carry_shape()?,
+                            scan_hvp.scan_plan.external_captures(),
+                            Some(
+                                &scan_hvp.scan_plan.body.plan.nodes
+                                    [scan_hvp.scan_plan.body.plan.output_node_ids[1]]
+                                    .shape,
+                            ),
+                            !cuda_scan_uses_packed_halves(&scan_hvp.scan_plan),
+                        ),
+                    )
+                    .and_then(|states| states.checked_mul(carry_count))
+                    .ok_or_else(|| {
+                        "CUDA Scan VJP JVP carry tape size overflowed usize".to_string()
+                    })?;
                     let mut carry_tape =
                         take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
                     let mut tangent_tape =
                         take_cuda_buffer(stream, free_buffers, tape_count, node_id)?;
+                    #[cfg(test)]
+                    CUDA_LOOP_TEST_TAPE_BYTES.with(|value| {
+                        value.set(
+                            (carry_tape.len() + tangent_tape.len()) * std::mem::size_of::<f32>(),
+                        )
+                    });
                     let launch_count = u32::try_from(carry_count).map_err(|_| {
                         format!("CUDA Scan VJP JVP node {node_id} launch exceeds u32 element count")
                     })?;
@@ -2371,14 +2634,8 @@ fn execute_cuda_device_program(
                         launch_count,
                         output_count as u64,
                     )?;
-                    free_buffers
-                        .entry(carry_tape.len())
-                        .or_default()
-                        .push(carry_tape);
-                    free_buffers
-                        .entry(tangent_tape.len())
-                        .or_default()
-                        .push(tangent_tape);
+                    free_buffers.recycle(carry_tape);
+                    free_buffers.recycle(tangent_tape);
                     let mut cached = CudaScanVjpJvpCache::default();
                     for ((member_id, _), output) in members.into_iter().zip(outputs) {
                         if member_id == node_id {
@@ -2401,7 +2658,65 @@ fn execute_cuda_device_program(
                 )?;
                 continue;
             }
+            TensorOp::CholeskyAd {
+                inputs: operands,
+                kind,
+            } => {
+                let (before, current_and_after) = values.split_at_mut(node_id);
+                let slot = &mut current_and_after[0];
+                if slot.is_none() {
+                    *slot = Some(take_cuda_buffer(stream, free_buffers, count, node_id)?);
+                }
+                let scratch_count = count
+                    .checked_mul(cholesky_backend::scratch_lanes(*kind))
+                    .ok_or_else(|| {
+                        "CUDA Cholesky derivative scratch size overflowed usize".to_string()
+                    })?;
+                let mut scratch = take_cuda_buffer(stream, free_buffers, scratch_count, node_id)?;
+                let kernel = module
+                    .load_function(&cuda_node_function_name(node_id))
+                    .map_err(|error| {
+                        format!("failed to load CUDA Cholesky derivative kernel: {error:?}")
+                    })?;
+                let mut launch = stream.launch_builder(&kernel);
+                for operand in operands {
+                    launch.arg(cuda_value(before, *operand)?);
+                }
+                launch.arg(slot.as_mut().expect("allocated above"));
+                launch.arg(&mut scratch);
+                // SAFETY: generated derivative kernels accept the ordered operand pointers,
+                // n*n output lanes, and the exact checked Jet workspace allocation above.
+                // One block owns the complete factorization and sequential reverse traversal.
+                unsafe {
+                    launch.launch(LaunchConfig {
+                        grid_dim: (
+                            u32::try_from(
+                                node.shape[..node.shape.len() - 2].iter().product::<usize>(),
+                            )
+                            .map_err(|_| "CUDA Cholesky batch count exceeds u32".to_string())?,
+                            1,
+                            1,
+                        ),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(|error| {
+                    format!("failed to launch CUDA Cholesky derivative kernel: {error:?}")
+                })?;
+                free_buffers.recycle(scratch);
+                release_dead_cuda_values(
+                    plan,
+                    node_id,
+                    values,
+                    free_buffers,
+                    retained_inputs,
+                    &mut remaining_uses,
+                )?;
+                continue;
+            }
             TensorOp::ScalarConstant { .. }
+            | TensorOp::Cholesky { .. }
             | TensorOp::Add { .. }
             | TensorOp::Sub { .. }
             | TensorOp::Div { .. }
@@ -2516,7 +2831,7 @@ fn execute_cuda_fusion_region(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
     values: &mut [Option<CudaSlice<f32>>],
-    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    free_buffers: &mut CudaBufferPool,
 ) -> Result<(), String> {
     let output_node_id = region.output_node_id;
     let output_node = plan
@@ -2572,7 +2887,7 @@ fn execute_cuda_fused_elementwise_program(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
     values: &mut Vec<Option<CudaSlice<f32>>>,
-    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    free_buffers: &mut CudaBufferPool,
     retained_inputs: &BTreeSet<String>,
     copy_output: bool,
 ) -> Result<Option<DynamicTensor>, String> {
@@ -2587,17 +2902,13 @@ fn execute_cuda_fused_elementwise_program(
         let TensorOp::Input { name } = &node.op else {
             continue;
         };
-        let host = inputs[name]
-            .data()
-            .iter()
-            .map(|value| *value as f32)
-            .collect::<Vec<_>>();
         let slot = values
             .get_mut(node_id)
             .ok_or_else(|| format!("CUDA input node {node_id} is missing its buffer"))?;
         if retained_inputs.contains(name) && slot.is_some() {
             continue;
         }
+        let host = inputs[name].storage().to_f32();
         upload_cuda_input(stream, slot, free_buffers, &host, name)?;
     }
 
@@ -2672,7 +2983,7 @@ fn execute_cuda_matmul_bias_tanh_program(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
     values: &mut Vec<Option<CudaSlice<f32>>>,
-    free_buffers: &mut BTreeMap<usize, Vec<CudaSlice<f32>>>,
+    free_buffers: &mut CudaBufferPool,
     retained_inputs: &BTreeSet<String>,
     copy_output: bool,
     epilogue: CudaMatmulBiasTanhEpilogue,
@@ -2691,11 +3002,7 @@ fn execute_cuda_matmul_bias_tanh_program(
         if retained_inputs.contains(name) && slot.is_some() {
             continue;
         }
-        let host = inputs[name]
-            .data()
-            .iter()
-            .map(|value| *value as f32)
-            .collect::<Vec<_>>();
+        let host = inputs[name].storage().to_f32();
         upload_cuda_input(stream, slot, free_buffers, &host, name)?;
     }
     let output_node_id = plan.output_node_id;
@@ -2807,16 +3114,8 @@ impl CudaBackend {
         let inner =
             u64::try_from(inner).map_err(|_| "CUDA matmul inner size exceeds u64".to_string())?;
         let cols = u64::try_from(cols).map_err(|_| "CUDA matmul columns exceed u64".to_string())?;
-        let lhs_host = lhs
-            .data()
-            .iter()
-            .map(|value| *value as f32)
-            .collect::<Vec<_>>();
-        let rhs_host = rhs
-            .data()
-            .iter()
-            .map(|value| *value as f32)
-            .collect::<Vec<_>>();
+        let lhs_host = lhs.storage().to_f32();
+        let rhs_host = rhs.storage().to_f32();
 
         let context = CudaContext::new(self.device_ordinal)
             .map_err(|error| format!("failed to create CUDA context: {error:?}"))?;
@@ -2831,10 +3130,10 @@ impl CudaBackend {
             .load_function("quabla_rank_two_matmul")
             .map_err(|error| format!("failed to load CUDA matmul kernel: {error:?}"))?;
         let lhs_device = stream
-            .clone_htod(&lhs_host)
+            .clone_htod(lhs_host.as_ref())
             .map_err(|error| format!("failed to copy CUDA matmul lhs: {error:?}"))?;
         let rhs_device = stream
-            .clone_htod(&rhs_host)
+            .clone_htod(rhs_host.as_ref())
             .map_err(|error| format!("failed to copy CUDA matmul rhs: {error:?}"))?;
         let mut output_device = stream
             .alloc_zeros::<f32>(count)
@@ -2879,10 +3178,9 @@ fn cuda_host_tensor(
         .nodes
         .get(node_id)
         .ok_or_else(|| format!("CUDA readback node {node_id} is missing"))?;
-    DynamicTensor::with_dtype(
+    DynamicTensor::from_storage(
         node.shape.clone(),
-        data.into_iter().map(f64::from).collect(),
-        node.dtype,
+        super::HostTensorStorage::from_f32(data, node.dtype),
     )
 }
 
@@ -2904,7 +3202,7 @@ fn validate_cuda_program_inputs(
     plan: &TensorExecutionPlan,
     inputs: &BTreeMap<String, DynamicTensor>,
 ) -> Result<(), String> {
-    for node in &plan.nodes {
+    for node in plan.nodes.iter() {
         if let TensorOp::Input { name } = &node.op {
             let input = inputs
                 .get(name)
@@ -2927,7 +3225,7 @@ fn validate_cuda_region_captures(
     plan: &TensorExecutionPlan,
     captures: &BTreeMap<String, &CudaSlice<f32>>,
 ) -> Result<(), String> {
-    for node in &plan.nodes {
+    for node in plan.nodes.iter() {
         if let TensorOp::Input { name } = &node.op {
             let capture = captures
                 .get(name)
@@ -3057,7 +3355,8 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
             launch.arg(output);
             launch.arg(&count);
         }
-        TensorOp::Tanh { input }
+        TensorOp::Cholesky { input }
+        | TensorOp::Tanh { input }
         | TensorOp::Exp { input }
         | TensorOp::Sqrt { input }
         | TensorOp::SqrtDerivative { input, .. }
@@ -3153,13 +3452,36 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
                 shared_mem_bytes: 0,
             }
         }
+        TensorOp::Cholesky { .. } => LaunchConfig {
+            grid_dim: (
+                u32::try_from(
+                    output_shape[..output_shape.len() - 2]
+                        .iter()
+                        .product::<usize>(),
+                )
+                .map_err(|_| "CUDA Cholesky batch count exceeds u32".to_string())?,
+                1,
+                1,
+            ),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        TensorOp::SumAxis { input, axis } | TensorOp::MeanAxis { input, axis }
+            if plan.nodes[*input].shape[*axis] >= CUDA_REDUCTION_BLOCK as usize =>
+        {
+            LaunchConfig {
+                grid_dim: (launch_count, 1, 1),
+                block_dim: (CUDA_REDUCTION_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            }
+        }
         _ => LaunchConfig::for_num_elems(launch_count),
     };
     // SAFETY: the argument pushes above follow the per-op signatures emitted by
     // `cuda_program_source` for this node, and the launch shape matches the emitted variant: the
     // 16x16 tiled grid only when `use_tiled_rank_two_matmul` also selected the tiled kernel,
-    // `CUDA_REDUCTION_BLOCK` (256) threads for the `partial[256]` reduction, and a flat grid
-    // otherwise. Operands are node buffers sized by their node shapes, the output holds `count`
+    // `CUDA_REDUCTION_BLOCK` (256) threads for each reduction block (one block per
+    // output for long-axis reductions), and a flat grid otherwise. Operands are node buffers sized by their node shapes, the output holds `count`
     // elements, and every kernel bounds its index by the count or dimensions it receives.
     unsafe {
         launch.launch(config).map_err(|error| {
@@ -3597,12 +3919,32 @@ fn cuda_blas(stream: Arc<CudaStream>) -> Result<Option<Arc<Mutex<CudaBlas>>>, St
         .map_err(|error| format!("failed to initialize cuBLAS: {error:?}"))
 }
 
-fn cuda_solver(stream: Arc<CudaStream>) -> Result<Option<Arc<Mutex<DnHandle>>>, String> {
+#[derive(Debug)]
+struct CudaSolver {
+    handle: DnHandle,
+    workspaces: BTreeMap<(usize, usize), CudaSolveWorkspace>,
+}
+
+#[derive(Debug)]
+struct CudaSolveWorkspace {
+    factor: CudaSlice<f32>,
+    column_rhs: CudaSlice<f32>,
+    pivots: CudaSlice<i32>,
+    info: CudaSlice<i32>,
+    scratch: CudaSlice<f32>,
+}
+
+fn cuda_solver(stream: Arc<CudaStream>) -> Result<Option<Arc<Mutex<CudaSolver>>>, String> {
     if !cuda_library_available("cusolver") {
         return Ok(None);
     }
     DnHandle::new(stream)
-        .map(|solver| Some(Arc::new(Mutex::new(solver))))
+        .map(|handle| {
+            Some(Arc::new(Mutex::new(CudaSolver {
+                handle,
+                workspaces: BTreeMap::new(),
+            })))
+        })
         .map_err(|error| format!("failed to initialize CUSOLVER: {error:?}"))
 }
 
@@ -3660,7 +4002,7 @@ fn launch_cuda_transpose_copy(
 fn launch_cusolver_rank_two_solve(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
-    solver: &Arc<Mutex<DnHandle>>,
+    solver: &Arc<Mutex<CudaSolver>>,
     matrix: &CudaSlice<f32>,
     rhs: &CudaSlice<f32>,
     output: &mut CudaSlice<f32>,
@@ -3670,52 +4012,77 @@ fn launch_cusolver_rank_two_solve(
     let n_i32 = i32::try_from(n).map_err(|_| "CUSOLVER solve dimension exceeds i32".to_string())?;
     let rhs_columns_i32 = i32::try_from(rhs_columns)
         .map_err(|_| "CUSOLVER solve right-hand-side columns exceed i32".to_string())?;
-    // SAFETY: the uninitialized factor is fully written by the `n x n` transpose copy below before
-    // CUSOLVER reads it.
-    let mut factor = unsafe { stream.alloc::<f32>(n * n) }
-        .map_err(|error| format!("failed to allocate CUSOLVER factor buffer: {error:?}"))?;
-    // SAFETY: the uninitialized right-hand side is fully written by the `n x rhs_columns` transpose
-    // copy below before CUSOLVER reads it.
-    let mut column_rhs = unsafe { stream.alloc::<f32>(n * rhs_columns) }.map_err(|error| {
-        format!("failed to allocate CUSOLVER right-hand-side buffer: {error:?}")
-    })?;
-    launch_cuda_transpose_copy(stream, module, matrix, &mut factor, n, n)?;
-    launch_cuda_transpose_copy(stream, module, rhs, &mut column_rhs, n, rhs_columns)?;
-    // SAFETY: `cusolverDnSgetrf` writes all `n` pivots before `cusolverDnSgetrs` reads them.
-    let mut pivots = unsafe { stream.alloc::<i32>(n) }
-        .map_err(|error| format!("failed to allocate CUSOLVER pivot buffer: {error:?}"))?;
-    let mut info = stream
-        .alloc_zeros::<i32>(1)
-        .map_err(|error| format!("failed to allocate CUSOLVER status buffer: {error:?}"))?;
-    let solver = solver
+    let mut solver = solver
         .lock()
         .map_err(|_| "CUSOLVER handle lock is poisoned".to_string())?;
+    let CudaSolver { handle, workspaces } = &mut *solver;
+    // A plan may visit many Solve shapes; retaining each factorization workspace
+    // accumulates their device storage. Keep only the current shape for reuse.
+    if !workspaces.contains_key(&(n, rhs_columns)) {
+        workspaces.clear();
+    }
+    if let std::collections::btree_map::Entry::Vacant(entry) = workspaces.entry((n, rhs_columns)) {
+        let mut factor = stream
+            .alloc_zeros::<f32>(n * n)
+            .map_err(|error| format!("failed to allocate CUSOLVER factor buffer: {error:?}"))?;
+        let mut workspace_elements = 0_i32;
+        {
+            let (factor_ptr, _factor_read) = factor.device_ptr_mut(stream);
+            // SAFETY: the live handle owns this stream, factor holds n*n floats,
+            // and workspace_elements is a valid host output location.
+            unsafe {
+                cusolver_sys::cusolverDnSgetrf_bufferSize(
+                    handle.cu(),
+                    n_i32,
+                    n_i32,
+                    factor_ptr as *mut f32,
+                    n_i32,
+                    &mut workspace_elements,
+                )
+                .result()
+                .map_err(|error| format!("CUSOLVER Sgetrf workspace query failed: {error:?}"))?;
+            }
+        }
+        let workspace_elements = usize::try_from(workspace_elements)
+            .map_err(|_| "CUSOLVER returned a negative workspace size".to_string())?;
+        entry.insert(CudaSolveWorkspace {
+            factor,
+            column_rhs: stream
+                .alloc_zeros::<f32>(n * rhs_columns)
+                .map_err(|error| {
+                    format!("failed to allocate CUSOLVER right-hand-side buffer: {error:?}")
+                })?,
+            pivots: stream
+                .alloc_zeros::<i32>(n)
+                .map_err(|error| format!("failed to allocate CUSOLVER pivot buffer: {error:?}"))?,
+            info: stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|error| format!("failed to allocate CUSOLVER status buffer: {error:?}"))?,
+            scratch: stream
+                .alloc_zeros::<f32>(workspace_elements)
+                .map_err(|error| format!("failed to allocate CUSOLVER workspace: {error:?}"))?,
+        });
+    }
+    let CudaSolveWorkspace {
+        factor,
+        column_rhs,
+        pivots,
+        info,
+        scratch,
+    } = workspaces
+        .get_mut(&(n, rhs_columns))
+        .expect("solver workspace was initialized above");
+    launch_cuda_transpose_copy(stream, module, matrix, factor, n, n)?;
+    launch_cuda_transpose_copy(stream, module, rhs, column_rhs, n, rhs_columns)?;
+    stream
+        .memcpy_htod(&[0_i32], info)
+        .map_err(|error| format!("failed to reset CUSOLVER status: {error:?}"))?;
     {
         let (factor_ptr, _factor_read) = factor.device_ptr_mut(stream);
         let (rhs_ptr, _rhs_read) = column_rhs.device_ptr_mut(stream);
         let (pivot_ptr, _pivot_read) = pivots.device_ptr_mut(stream);
         let (info_ptr, _info_read) = info.device_ptr_mut(stream);
-        let mut workspace_elements = 0_i32;
-        // SAFETY: `solver.cu()` is a live handle guarded by the `Mutex`, `factor_ptr` points to
-        // `n * n` floats with leading dimension `n`, and `workspace_elements` is a valid output
-        // location.
-        unsafe {
-            cusolver_sys::cusolverDnSgetrf_bufferSize(
-                solver.cu(),
-                n_i32,
-                n_i32,
-                factor_ptr as *mut f32,
-                n_i32,
-                &mut workspace_elements,
-            )
-            .result()
-            .map_err(|error| format!("CUSOLVER Sgetrf workspace query failed: {error:?}"))?;
-        }
-        // SAFETY: the workspace is scratch memory that `cusolverDnSgetrf` writes before reading;
-        // its size comes from the buffer-size query above.
-        let mut workspace = unsafe { stream.alloc::<f32>(workspace_elements as usize) }
-            .map_err(|error| format!("failed to allocate CUSOLVER workspace: {error:?}"))?;
-        let (workspace_ptr, _workspace_read) = workspace.device_ptr_mut(stream);
+        let (workspace_ptr, _workspace_read) = scratch.device_ptr_mut(stream);
         // SAFETY: all device pointers come from buffers of the sizes CUSOLVER expects (factor
         // `n * n` with `lda = n`, right-hand side `n * rhs_columns` column-major with `ldb = n`,
         // `n` pivots, one info word, and the queried workspace) whose `device_ptr_mut` guards stay
@@ -3723,7 +4090,7 @@ fn launch_cusolver_rank_two_solve(
         // stream that ordered the transpose copies, so the inputs are written before they are read.
         unsafe {
             cusolver_sys::cusolverDnSgetrf(
-                solver.cu(),
+                handle.cu(),
                 n_i32,
                 n_i32,
                 factor_ptr as *mut f32,
@@ -3735,7 +4102,7 @@ fn launch_cusolver_rank_two_solve(
             .result()
             .map_err(|error| format!("CUSOLVER Sgetrf failed: {error:?}"))?;
             cusolver_sys::cusolverDnSgetrs(
-                solver.cu(),
+                handle.cu(),
                 cusolver_sys::cublasOperation_t::CUBLAS_OP_N,
                 n_i32,
                 rhs_columns_i32,
@@ -3752,7 +4119,7 @@ fn launch_cusolver_rank_two_solve(
     }
     let mut host_info = [0_i32; 1];
     stream
-        .memcpy_dtoh(&info, &mut host_info)
+        .memcpy_dtoh(info, &mut host_info)
         .map_err(|error| format!("failed to read CUSOLVER status: {error:?}"))?;
     if host_info[0] != 0 {
         return Err(format!(
@@ -3760,7 +4127,7 @@ fn launch_cusolver_rank_two_solve(
             host_info[0]
         ));
     }
-    launch_cuda_transpose_copy(stream, module, &column_rhs, output, rhs_columns, n)
+    launch_cuda_transpose_copy(stream, module, column_rhs, output, rhs_columns, n)
 }
 
 fn launch_cublas_rank_two_matmul(
@@ -4194,20 +4561,84 @@ fn cuda_scan_packed_half_lane(half: usize, stride: usize) -> String {
     )
 }
 
+/// One flat scalar block per expression keeps shared region DAGs linear in
+/// emitted statements. Pure operand computations preserve their original
+/// arithmetic; `where` still selects its value with a ternary.
+#[derive(Default)]
+struct CudaScalarExpressionBuilder {
+    references: std::cell::RefCell<BTreeMap<CudaScalarReferenceKey, String>>,
+    statements: std::cell::RefCell<Vec<String>>,
+}
+
+type CudaScalarReferenceKey = (TensorNodeId, Option<(usize, usize)>);
+
+impl CudaScalarExpressionBuilder {
+    fn emit(
+        &self,
+        node_id: TensorNodeId,
+        half: Option<(usize, usize)>,
+        expression: String,
+    ) -> String {
+        let reference = format!("quabla_body_value_{}", self.statements.borrow().len());
+        self.statements
+            .borrow_mut()
+            .push(format!("const float {reference} = {expression};"));
+        self.references
+            .borrow_mut()
+            .insert((node_id, half), reference.clone());
+        reference
+    }
+
+    fn finish(&self, reference: &str) -> String {
+        format!(
+            "([&]() -> float {{ {} return {reference}; }}())",
+            self.statements.borrow().join("\n")
+        )
+    }
+}
+
 fn cuda_fori_body_expression(
     loop_plan: &TensorForiExecutionPlan,
     node_id: TensorNodeId,
     capture_parameters: &BTreeMap<String, usize>,
     carry_shape: &[usize],
 ) -> Result<String, String> {
+    let builder = CudaScalarExpressionBuilder::default();
+    let reference = cuda_fori_body_expression_inner(
+        loop_plan,
+        node_id,
+        capture_parameters,
+        carry_shape,
+        &builder,
+    )?;
+    Ok(builder.finish(&reference))
+}
+
+fn cuda_fori_body_expression_inner(
+    loop_plan: &TensorForiExecutionPlan,
+    node_id: TensorNodeId,
+    capture_parameters: &BTreeMap<String, usize>,
+    carry_shape: &[usize],
+    builder: &CudaScalarExpressionBuilder,
+) -> Result<String, String> {
+    if let Some(reference) = builder.references.borrow().get(&(node_id, None)) {
+        return Ok(reference.clone());
+    }
     let body = &loop_plan.body.plan;
     let node = body
         .nodes
         .get(node_id)
         .ok_or_else(|| format!("CUDA Fori body node {node_id} is missing"))?;
-    let child =
-        |child_id| cuda_fori_body_expression(loop_plan, child_id, capture_parameters, carry_shape);
-    match &node.op {
+    let child = |child_id| {
+        cuda_fori_body_expression_inner(
+            loop_plan,
+            child_id,
+            capture_parameters,
+            carry_shape,
+            builder,
+        )
+    };
+    let expression = match &node.op {
         TensorOp::Input { name } if name == &loop_plan.carry_name => Ok("carry".to_string()),
         TensorOp::Input { name } if name == &loop_plan.index_name => Ok("loop_index".to_string()),
         TensorOp::Input { name } => {
@@ -4266,7 +4697,8 @@ fn cuda_fori_body_expression(
             "CUDA Fori body {} is not elementwise-lowerable",
             cuda_op_name(&node.op)
         )),
-    }
+    }?;
+    Ok(builder.emit(node_id, None, expression))
 }
 
 fn cuda_scan_body_expression(
@@ -4314,23 +4746,49 @@ fn cuda_scan_body_expression_in_half(
     carry_expression: &str,
     packed_half: Option<(usize, usize)>,
 ) -> Result<String, String> {
+    let builder = CudaScalarExpressionBuilder::default();
+    let reference = cuda_scan_body_expression_in_half_inner(
+        scan_plan,
+        node_id,
+        capture_parameters,
+        reference_shape,
+        carry_expression,
+        packed_half,
+        &builder,
+    )?;
+    Ok(builder.finish(&reference))
+}
+
+fn cuda_scan_body_expression_in_half_inner(
+    scan_plan: &TensorScanExecutionPlan,
+    node_id: TensorNodeId,
+    capture_parameters: &BTreeMap<String, usize>,
+    reference_shape: &[usize],
+    carry_expression: &str,
+    packed_half: Option<(usize, usize)>,
+    builder: &CudaScalarExpressionBuilder,
+) -> Result<String, String> {
+    if let Some(reference) = builder.references.borrow().get(&(node_id, packed_half)) {
+        return Ok(reference.clone());
+    }
     let body = &scan_plan.body.plan;
     let node = body
         .nodes
         .get(node_id)
         .ok_or_else(|| format!("CUDA Scan body node {node_id} is missing"))?;
     let in_half = |child_id, packed_half| {
-        cuda_scan_body_expression_in_half(
+        cuda_scan_body_expression_in_half_inner(
             scan_plan,
             child_id,
             capture_parameters,
             reference_shape,
             carry_expression,
             packed_half,
+            builder,
         )
     };
     let child = |child_id| in_half(child_id, packed_half);
-    match &node.op {
+    let expression = match &node.op {
         TensorOp::Input { name } if name == &scan_plan.carry_name => Ok(match packed_half {
             Some((half, _)) => format!("{carry_expression}_{half}"),
             None => carry_expression.to_string(),
@@ -4426,7 +4884,8 @@ fn cuda_scan_body_expression_in_half(
             "CUDA Scan body {} is not elementwise-lowerable",
             cuda_op_name(&node.op)
         )),
-    }
+    }?;
+    Ok(builder.emit(node_id, packed_half, expression))
 }
 
 #[derive(Clone, Debug)]
@@ -4451,20 +4910,44 @@ fn cuda_elementwise_plan_expression_with_index(
     reference_shape: &[usize],
     index_expression: &str,
 ) -> Result<String, String> {
+    let builder = CudaScalarExpressionBuilder::default();
+    let reference = cuda_elementwise_plan_expression_with_index_inner(
+        plan,
+        node_id,
+        inputs,
+        reference_shape,
+        index_expression,
+        &builder,
+    )?;
+    Ok(builder.finish(&reference))
+}
+
+fn cuda_elementwise_plan_expression_with_index_inner(
+    plan: &TensorExecutionPlan,
+    node_id: TensorNodeId,
+    inputs: &BTreeMap<String, CudaElementwiseInput>,
+    reference_shape: &[usize],
+    index_expression: &str,
+    builder: &CudaScalarExpressionBuilder,
+) -> Result<String, String> {
+    if let Some(reference) = builder.references.borrow().get(&(node_id, None)) {
+        return Ok(reference.clone());
+    }
     let node = plan
         .nodes
         .get(node_id)
         .ok_or_else(|| format!("CUDA elementwise plan node {node_id} is missing"))?;
     let child = |child_id| {
-        cuda_elementwise_plan_expression_with_index(
+        cuda_elementwise_plan_expression_with_index_inner(
             plan,
             child_id,
             inputs,
             reference_shape,
             index_expression,
+            builder,
         )
     };
-    match &node.op {
+    let expression = match &node.op {
         TensorOp::Input { name } => match inputs.get(name) {
             Some(CudaElementwiseInput::Scalar(expression)) => Ok(expression.clone()),
             Some(CudaElementwiseInput::Buffer(parameter)) => Ok(format!(
@@ -4524,7 +5007,8 @@ fn cuda_elementwise_plan_expression_with_index(
             "CUDA Fori VJP body uses unsupported {} operation",
             cuda_op_name(&node.op)
         )),
-    }
+    }?;
+    Ok(builder.emit(node_id, None, expression))
 }
 
 fn cuda_fori_vjp_plan(
@@ -5229,6 +5713,90 @@ fn cuda_scan_vjp_jvp_group(
     Ok(members)
 }
 
+/// Replay independent lanes once per reverse block. Broadcast capture reductions
+/// retain their original tape and launch timing because atomic accumulation order
+/// is not part of the approved numerical changes.
+fn cuda_loop_checkpoint_block(
+    lower: usize,
+    upper: usize,
+    carry_shape: &[usize],
+    captures: &BTreeMap<String, Vec<usize>>,
+    output_shape: Option<&[usize]>,
+    independent_lanes: bool,
+) -> Option<usize> {
+    if !independent_lanes
+        || captures.values().any(|shape| shape != carry_shape)
+        || output_shape.is_some_and(|shape| shape != carry_shape)
+    {
+        return None;
+    }
+    super::TensorCarryCheckpoints::<DynamicTensor>::block_size(upper.checked_sub(lower)?)
+}
+
+fn cuda_loop_tape_states(lower: usize, upper: usize, block: Option<usize>) -> Option<usize> {
+    let steps = upper.checked_sub(lower)?;
+    match block {
+        Some(block) => steps.div_ceil(block).checked_add(block),
+        None => steps.checked_add(1),
+    }
+}
+
+fn cuda_loop_tape_source(
+    lower: usize,
+    upper: usize,
+    count: &str,
+    next: &str,
+    next_tangent: Option<&str>,
+    block: Option<usize>,
+) -> (String, String) {
+    let update = match next_tangent {
+        Some(tangent) => format!(
+            "float checkpoint_next = {next}; float checkpoint_next_tangent = {tangent}; carry = checkpoint_next; carry_tangent = checkpoint_next_tangent;"
+        ),
+        None => format!("carry = {next};"),
+    };
+    let store = |position: &str| {
+        let carry = format!("carry_tape[({position}) * {count} + index] = carry;");
+        match next_tangent {
+            Some(_) => format!(
+                "{carry} carry_tangent_tape[({position}) * {count} + index] = carry_tangent;"
+            ),
+            None => carry,
+        }
+    };
+    let load = |position: &str| {
+        let carry = format!("carry = carry_tape[({position}) * {count} + index];");
+        match next_tangent {
+            Some(_) => format!(
+                "{carry} carry_tangent = carry_tangent_tape[({position}) * {count} + index];"
+            ),
+            None => carry,
+        }
+    };
+    let initial = store("0ULL");
+    match block {
+        None => (
+            format!("{initial}\nfor (unsigned long long step = {lower}ULL; step < {upper}ULL; ++step) {{ float loop_index = (float)step; {update} {} }}\n", store(&format!("step - {lower}ULL + 1ULL"))),
+            load(&format!("step - {lower}ULL")),
+        ),
+        Some(block) => {
+            let checkpoints = (upper - lower).div_ceil(block);
+            let forward = format!(
+                "{initial}\nfor (unsigned long long step = {lower}ULL; step < {upper}ULL; ++step) {{ float loop_index = (float)step; {update} unsigned long long offset = step - {lower}ULL + 1ULL; if (offset % {block}ULL == 0ULL && step + 1ULL < {upper}ULL) {{ {} }} }}\n",
+                store(&format!("offset / {block}ULL"))
+            );
+            let reverse = format!(
+                "unsigned long long block_start = (step - {lower}ULL) / {block}ULL * {block}ULL + {lower}ULL; unsigned long long block_end = {upper}ULL; if ({upper}ULL - block_start > {block}ULL) block_end = block_start + {block}ULL; if (step + 1ULL == block_end) {{ {} {} for (unsigned long long replay = block_start; replay + 1ULL < block_end; ++replay) {{ float loop_index = (float)replay; {update} {} }} }} {}",
+                load(&format!("(block_start - {lower}ULL) / {block}ULL")),
+                store(&format!("{checkpoints}ULL")),
+                store(&format!("{checkpoints}ULL + replay - block_start + 1ULL")),
+                load(&format!("{checkpoints}ULL + step - block_start")),
+            );
+            (forward, reverse)
+        }
+    }
+}
+
 fn cuda_fori_vjp_node_kernel_source(
     node_id: TensorNodeId,
     loop_plan: &TensorForiExecutionPlan,
@@ -5331,38 +5899,36 @@ fn cuda_fori_vjp_node_kernel_source(
         ])
         .collect::<Vec<_>>()
         .join(", ");
+    let lower = loop_plan.lower;
+    let upper = loop_plan.upper;
+    let function = cuda_node_function_name(node_id);
+    let block = cuda_loop_checkpoint_block(
+        lower,
+        upper,
+        &carry_shape,
+        loop_plan.external_captures(),
+        None,
+        true,
+    );
+    let (tape_forward, tape_reverse) =
+        cuda_loop_tape_source(lower, upper, "count", &forward_expression, None, block);
     Ok(format!(
-        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+        "extern \"C\" __global__ void {function}({parameters}) {{\n\\
             unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
             if (index >= count) return;\n\\
             float carry = initial_carry[index];\n\\
-            carry_tape[index] = carry;\n\\
-            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
-                float loop_index = (float)step;\n\\
-                carry = {forward_expression};\n\\
-                carry_tape[(step - {}ULL + 1ULL) * count + index] = carry;\n\\
-            }}\n\\
+            {tape_forward}\n\
             float cotangent = output_cotangent[index];\n\\
             float gradient = 0.0f;\n\\
-            for (unsigned long long reverse = {}ULL; reverse > {}ULL; --reverse) {{\n\\
+            for (unsigned long long reverse = {upper}ULL; reverse > {lower}ULL; --reverse) {{\n\\
                 unsigned long long step = reverse - 1ULL;\n\\
                 float loop_index = (float)step;\n\\
-                carry = carry_tape[(step - {}ULL) * count + index];\n\\
+                {tape_reverse}\n\\
                 float contribution = {gradient_expression};\n\\
                 {reverse_update}\n\\
             }}\n\\
-            {}\n}}\n",
-        cuda_node_function_name(node_id),
-        loop_plan.lower,
-        loop_plan.upper,
-        loop_plan.lower,
-        loop_plan.upper,
-        loop_plan.lower,
-        loop_plan.lower,
-        target_write,
-    ))
+            {target_write}\n}}\n"))
 }
-
 fn cuda_fori_vjp_group_kernel_source(
     node_id: TensorNodeId,
     loop_plan: &TensorForiExecutionPlan,
@@ -5462,38 +6028,37 @@ fn cuda_fori_vjp_group_kernel_source(
         .chain(["unsigned long long count".to_string()])
         .collect::<Vec<_>>()
         .join(", ");
+    let lower = loop_plan.lower;
+    let upper = loop_plan.upper;
+    let function = cuda_node_function_name(node_id);
+    let block = cuda_loop_checkpoint_block(
+        lower,
+        upper,
+        &carry_shape,
+        loop_plan.external_captures(),
+        None,
+        true,
+    );
+    let (tape_forward, tape_reverse) =
+        cuda_loop_tape_source(lower, upper, "count", &forward_expression, None, block);
     Ok(format!(
-        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+        "extern \"C\" __global__ void {function}({parameters}) {{\n\\
             unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
             if (index >= count) return;\n\\
             float carry = initial_carry[index];\n\\
-            carry_tape[index] = carry;\n\\
-            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
-                float loop_index = (float)step;\n\\
-                carry = {forward_expression};\n\\
-                carry_tape[(step - {}ULL + 1ULL) * count + index] = carry;\n\\
-            }}\n\\
+            {tape_forward}\n\
             float cotangent = output_cotangent[index];\n\\
             {gradient_declarations}\
-            for (unsigned long long reverse = {}ULL; reverse > {}ULL; --reverse) {{\n\\
+            for (unsigned long long reverse = {upper}ULL; reverse > {lower}ULL; --reverse) {{\n\\
                 unsigned long long step = reverse - 1ULL;\n\\
                 float loop_index = (float)step;\n\\
-                carry = carry_tape[(step - {}ULL) * count + index];\n\\
+                {tape_reverse}\n\\
                 {contribution_updates}\
                 cotangent = {carry_gradient_expression};\n\\
             }}\n\\
             {target_writes}\
-        }}\n",
-        cuda_node_function_name(node_id),
-        loop_plan.lower,
-        loop_plan.upper,
-        loop_plan.lower,
-        loop_plan.upper,
-        loop_plan.lower,
-        loop_plan.lower,
-    ))
+        }}\n"))
 }
-
 fn cuda_fori_vjp_jvp_node_kernel_source(
     node_id: TensorNodeId,
     plan: &TensorForiVjpJvpExecutionPlan,
@@ -5626,31 +6191,39 @@ fn cuda_fori_vjp_jvp_node_kernel_source(
         ])
         .collect::<Vec<_>>()
         .join(", ");
+    let lower = loop_plan.lower;
+    let upper = loop_plan.upper;
+    let function = cuda_node_function_name(node_id);
+    let block = cuda_loop_checkpoint_block(
+        lower,
+        upper,
+        &carry_shape,
+        loop_plan.external_captures(),
+        None,
+        true,
+    );
+    let (tape_forward, tape_reverse) = cuda_loop_tape_source(
+        lower,
+        upper,
+        "count",
+        &forward_expression,
+        Some(&forward_tangent_expression),
+        block,
+    );
     Ok(format!(
-        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+        "extern \"C\" __global__ void {function}({parameters}) {{\n\\
             unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
             if (index >= count) return;\n\\
             float carry = initial_carry[index];\n\\
             float carry_tangent = initial_carry_tangent[index];\n\\
-            carry_tape[index] = carry;\n\\
-            carry_tangent_tape[index] = carry_tangent;\n\\
-            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
-                float loop_index = (float)step;\n\\
-                float next_carry = {forward_expression};\n\\
-                float next_carry_tangent = {forward_tangent_expression};\n\\
-                carry = next_carry;\n\\
-                carry_tangent = next_carry_tangent;\n\\
-                carry_tape[(step - {}ULL + 1ULL) * count + index] = carry;\n\\
-                carry_tangent_tape[(step - {}ULL + 1ULL) * count + index] = carry_tangent;\n\\
-            }}\n\\
+            {tape_forward}\n\
             float cotangent = output_cotangent[index];\n\\
             float cotangent_tangent = output_cotangent_tangent[index];\n\\
             float gradient = 0.0f;\n\\
-            for (unsigned long long reverse = {}ULL; reverse > {}ULL; --reverse) {{\n\\
+            for (unsigned long long reverse = {upper}ULL; reverse > {lower}ULL; --reverse) {{\n\\
                 unsigned long long step = reverse - 1ULL;\n\\
                 float loop_index = (float)step;\n\\
-                carry = carry_tape[(step - {}ULL) * count + index];\n\\
-                carry_tangent = carry_tangent_tape[(step - {}ULL) * count + index];\n\\
+                {tape_reverse}\n\\
                 gradient += {target_expression};\n\\
                 float next_cotangent = {carry_cotangent_expression};\n\\
                 float next_cotangent_tangent = {carry_tangent_expression};\n\\
@@ -5658,19 +6231,8 @@ fn cuda_fori_vjp_jvp_node_kernel_source(
                 cotangent_tangent = next_cotangent_tangent;\n\\
             }}\n\\
             {target_write}\n\\
-        }}\n",
-        cuda_node_function_name(node_id),
-        loop_plan.lower,
-        loop_plan.upper,
-        loop_plan.lower,
-        loop_plan.lower,
-        loop_plan.upper,
-        loop_plan.lower,
-        loop_plan.lower,
-        loop_plan.lower,
-    ))
+        }}\n"))
 }
-
 fn cuda_fori_jvp_node_kernel_source(
     node_id: TensorNodeId,
     loop_plan: &TensorForiExecutionPlan,
@@ -5988,10 +6550,14 @@ fn cuda_scan_vjp_node_kernel_source(
     if !unequal_output_lanes {
         output_inputs.insert(
             scan_plan.carry_name.clone(),
-            CudaElementwiseInput::Scalar(format!(
-                "carry_tape[(step - {}ULL) * carry_count + {output_carry_offset}]",
-                scan_plan.lower
-            )),
+            CudaElementwiseInput::Scalar(if output_step_shape == carry_shape {
+                "carry".to_string()
+            } else {
+                format!(
+                    "carry_tape[(step - {}ULL) * carry_count + {output_carry_offset}]",
+                    scan_plan.lower
+                )
+            }),
         );
     }
     output_inputs.remove("__quabla_cuda_scan_vjp_carry_cotangent");
@@ -6120,29 +6686,43 @@ fn cuda_scan_vjp_node_kernel_source(
         ])
         .collect::<Vec<_>>()
         .join(", ");
+    let lower = scan_plan.lower;
+    let upper = scan_plan.upper;
+    let function = cuda_node_function_name(node_id);
+    let block = cuda_loop_checkpoint_block(
+        lower,
+        upper,
+        &carry_shape,
+        scan_plan.external_captures(),
+        Some(&scan_plan.body.plan.nodes[scan_plan.body.plan.output_node_ids[1]].shape),
+        !cuda_scan_uses_packed_halves(scan_plan),
+    );
+    let (tape_forward, tape_reverse) = cuda_loop_tape_source(
+        lower,
+        upper,
+        "carry_count",
+        &forward_next_expression,
+        None,
+        block,
+    );
     Ok(format!(
-        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+        "extern \"C\" __global__ void {function}({parameters}) {{\n\\
             unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
             if (index >= carry_count) return;\n\\
             float carry = initial_carry[index];\n\\
-            carry_tape[index] = carry;\n\\
-            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
-                float loop_index = (float)step;\n\\
-                carry = {forward_next_expression};\n\\
-                carry_tape[(step - {}ULL + 1ULL) * carry_count + index] = carry;\n\\
-            }}\n\\
+            {tape_forward}\n\
             float carry_cotangent = final_carry_cotangent[index];\n\\
             float gradient = 0.0f;\n\\
-            for (unsigned long long reverse = {}ULL; reverse > {}ULL; --reverse) {{\n\\
+            for (unsigned long long reverse = {upper}ULL; reverse > {lower}ULL; --reverse) {{\n\\
                 unsigned long long step = reverse - 1ULL;\n\\
                 float loop_index = (float)step;\n\\
-                carry = carry_tape[(step - {}ULL) * carry_count + index];\n\\
+                {tape_reverse}\n\\
                 float output_contribution = 0.0f;\n\\
                 float output_reverse_contribution = 0.0f;\n\\
                 float output_cotangent_aggregate = 0.0f;\n\\
                 for (unsigned long long output_index = 0ULL; output_index < output_count; ++output_index) {{\n\\
                     if ({output_carry_offset} == index) {{\n\\
-                        float output_cotangent_step = output_cotangent[(step - {}ULL) * output_count + output_index];\n\\
+                        float output_cotangent_step = output_cotangent[(step - {lower}ULL) * output_count + output_index];\n\\
                         output_cotangent_aggregate += output_cotangent_step;\n\\
                         {output_loop_update}\n\\
                     }}\n\\
@@ -6151,19 +6731,8 @@ fn cuda_scan_vjp_node_kernel_source(
                 float contribution = ({carry_target_expression} + output_contribution);\n\\
                 {reverse_update}\n\\
             }}\n\\
-            {}\n}}\n",
-        cuda_node_function_name(node_id),
-        scan_plan.lower,
-        scan_plan.upper,
-        scan_plan.lower,
-        scan_plan.upper,
-        scan_plan.lower,
-        scan_plan.lower,
-        scan_plan.lower,
-        target_write,
-    ))
+            {target_write}\n}}\n"))
 }
-
 fn cuda_scan_vjp_group_kernel_source(
     node_id: TensorNodeId,
     scan_plan: &TensorScanExecutionPlan,
@@ -6319,39 +6888,44 @@ fn cuda_scan_vjp_group_kernel_source(
         ])
         .collect::<Vec<_>>()
         .join(", ");
+    let lower = scan_plan.lower;
+    let upper = scan_plan.upper;
+    let function = cuda_node_function_name(node_id);
+    let block = cuda_loop_checkpoint_block(
+        lower,
+        upper,
+        &carry_shape,
+        scan_plan.external_captures(),
+        Some(&scan_plan.body.plan.nodes[scan_plan.body.plan.output_node_ids[1]].shape),
+        !cuda_scan_uses_packed_halves(scan_plan),
+    );
+    let (tape_forward, tape_reverse) = cuda_loop_tape_source(
+        lower,
+        upper,
+        "carry_count",
+        &forward_next_expression,
+        None,
+        block,
+    );
     Ok(format!(
-        "extern \"C\" __global__ void {}({parameters}) {{\n\\
+        "extern \"C\" __global__ void {function}({parameters}) {{\n\\
             unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
             if (index >= carry_count) return;\n\\
             float carry = initial_carry[index];\n\\
-            carry_tape[index] = carry;\n\\
-            for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{\n\\
-                float loop_index = (float)step;\n\\
-                carry = {forward_next_expression};\n\\
-                carry_tape[(step - {}ULL + 1ULL) * carry_count + index] = carry;\n\\
-            }}\n\\
+            {tape_forward}\n\
             float carry_cotangent = final_carry_cotangent[index];\n\\
             {gradient_declarations}\
-            for (unsigned long long reverse = {}ULL; reverse > {}ULL; --reverse) {{\n\\
+            for (unsigned long long reverse = {upper}ULL; reverse > {lower}ULL; --reverse) {{\n\\
                 unsigned long long step = reverse - 1ULL;\n\\
                 float loop_index = (float)step;\n\\
-                carry = carry_tape[(step - {}ULL) * carry_count + index];\n\\
+                {tape_reverse}\n\\
                 {output_cotangent_setup}\
                 {contribution_updates}\
                 carry_cotangent = ({carry_reverse_expression} + {output_reverse_expression});\n\\
             }}\n\\
             {target_writes}\
-        }}\n",
-        cuda_node_function_name(node_id),
-        scan_plan.lower,
-        scan_plan.upper,
-        scan_plan.lower,
-        scan_plan.upper,
-        scan_plan.lower,
-        scan_plan.lower,
-    ))
+        }}\n"))
 }
-
 fn cuda_scan_vjp_jvp_group_kernel_source(
     node_id: TensorNodeId,
     plan: &TensorScanVjpJvpExecutionPlan,
@@ -6593,15 +7167,32 @@ fn cuda_scan_vjp_jvp_group_kernel_source(
         ])
         .collect::<Vec<_>>()
         .join(", ");
-    Ok(format!("extern \"C\" __global__ void {}({parameters}) {{\n\
+    let lower = scan.lower;
+    let upper = scan.upper;
+    let function = cuda_node_function_name(node_id);
+    let block = cuda_loop_checkpoint_block(
+        lower,
+        upper,
+        &shape,
+        scan.external_captures(),
+        Some(&scan.body.plan.nodes[scan.body.plan.output_node_ids[1]].shape),
+        !cuda_scan_uses_packed_halves(scan),
+    );
+    let (tape_forward, tape_reverse) = cuda_loop_tape_source(
+        lower,
+        upper,
+        "carry_count",
+        &next,
+        Some(&next_tangent),
+        block,
+    );
+    Ok(format!("extern \"C\" __global__ void {function}({parameters}) {{\n\
         unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; if (index >= carry_count) return;\n\
-        float carry = initial_carry[index]; float carry_tangent = initial_carry_tangent[index]; carry_tape[index] = carry; carry_tangent_tape[index] = carry_tangent;\n\
-        for (unsigned long long step = {}ULL; step < {}ULL; ++step) {{ float loop_index = (float)step; float n = {next}; float nt = {next_tangent}; carry = n; carry_tangent = nt; carry_tape[(step - {}ULL + 1ULL) * carry_count + index] = carry; carry_tangent_tape[(step - {}ULL + 1ULL) * carry_count + index] = carry_tangent; }}\n\
-        float carry_cotangent = final_carry_cotangent[index]; float carry_cotangent_tangent = final_carry_cotangent_tangent[index]; {gradient_declarations}\n\
-        for (unsigned long long reverse_step = {}ULL; reverse_step > {}ULL; --reverse_step) {{ unsigned long long step = reverse_step - 1ULL; float loop_index = (float)step; carry = carry_tape[(step - {}ULL) * carry_count + index]; carry_tangent = carry_tangent_tape[(step - {}ULL) * carry_count + index]; {reverse_output_setup} {gradient_updates} float nc = ({primal_carry} + {primal_output}); float nct = {next_cotangent_tangent}; carry_cotangent = nc; carry_cotangent_tangent = nct; }}\n\
-        {target_writes}\n}}\n", cuda_node_function_name(node_id), scan.lower, scan.upper, scan.lower, scan.lower, scan.upper, scan.lower, scan.lower, scan.lower))
+        float carry = initial_carry[index]; float carry_tangent = initial_carry_tangent[index]; {tape_forward}\n\
+            float carry_cotangent = final_carry_cotangent[index]; float carry_cotangent_tangent = final_carry_cotangent_tangent[index]; {gradient_declarations}\n\
+        for (unsigned long long reverse_step = {upper}ULL; reverse_step > {lower}ULL; --reverse_step) {{ unsigned long long step = reverse_step - 1ULL; float loop_index = (float)step; {tape_reverse} {reverse_output_setup} {gradient_updates} float nc = ({primal_carry} + {primal_output}); float nct = {next_cotangent_tangent}; carry_cotangent = nc; carry_cotangent_tangent = nct; }}\n\
+        {target_writes}\n}}\n"))
 }
-
 fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
     let mut source = String::from(
         "__device__ __forceinline__ float quabla_powi(float base, unsigned int exponent) {\n\
@@ -6745,6 +7336,8 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                 )
                 }
             }
+            TensorOp::Cholesky { .. } => cholesky_backend::primal_source(&function, *node.shape.last().expect("matrix shape")),
+            TensorOp::CholeskyAd { kind, .. } => cholesky_backend::ad_source(&function, *node.shape.last().expect("matrix shape"), *kind),
             TensorOp::Solve { .. } | TensorOp::Cond { .. } => String::new(),
             TensorOp::Fori {
                 loop_plan,
@@ -6883,6 +7476,52 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                 } else {
                     String::new()
                 };
+                if input_shape[*axis] >= CUDA_REDUCTION_BLOCK as usize {
+                    // A block owns one output: no partial-sum allocation or atomic races.
+                    // Wide accumulation limits cancellation error; extreme magnitudes keep
+                    // the original serial overflow behavior before narrowing the result.
+                    let extent = input_shape[*axis];
+                    let stride = input_strides[*axis];
+                    let divisor = if matches!(&node.op, TensorOp::MeanAxis { .. }) {
+                        format!(" / (double){extent}ULL")
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        r#"extern "C" __global__ void {function}(const float* input, float* out, unsigned long long count) {{
+    unsigned long long index = blockIdx.x;
+    if (index >= count) return;
+    unsigned int thread = threadIdx.x;
+    unsigned long long base = {base};
+    __shared__ double partial[256];
+    __shared__ unsigned int extreme;
+    if (thread == 0U) extreme = 0U;
+    __syncthreads();
+    double value = 0.0;
+    for (unsigned long long k = thread; k < {extent}ULL; k += 256ULL) {{
+        float lane = input[base + k * {stride}ULL];
+        if (isfinite(lane) && fabsf(lane) > 3.4028234663852886e38f / (float){extent}ULL) atomicExch(&extreme, 1U);
+        value += (double)lane;
+    }}
+    partial[thread] = value;
+    __syncthreads();
+    if (extreme) {{
+        if (thread == 0U) {{
+            float serial = 0.0f;
+            for (unsigned long long k = 0; k < {extent}ULL; ++k) serial += input[base + k * {stride}ULL];
+            out[index] = serial{scale};
+        }}
+        return;
+    }}
+    for (unsigned int stride = 128U; stride > 0U; stride >>= 1U) {{
+        if (thread < stride) partial[thread] += partial[thread + stride];
+        __syncthreads();
+    }}
+    if (thread == 0U) out[index] = (float)(partial[0]{divisor});
+}}
+"#
+                    )
+                } else {
                 format!(
                     "extern \"C\" __global__ void {function}(const float* input, float* out, unsigned long long count) {{\n\
                         unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
@@ -6892,6 +7531,7 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                         out[index] = value{scale};\n}}\n",
                     input_shape[*axis], input_strides[*axis]
                 )
+                }
             }
             TensorOp::Broadcast { input } => {
                 let offset = cuda_offset_expression(&node.shape, &plan.nodes[*input].shape);
@@ -7119,6 +7759,8 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::Matmul { .. } => "matmul",
         TensorOp::Solve { .. } => "solve",
+        TensorOp::Cholesky { .. } => "cholesky",
+        TensorOp::CholeskyAd { .. } => "cholesky_ad",
         TensorOp::Triangular { .. } => "triangular",
         TensorOp::Tanh { .. } => "tanh",
         TensorOp::Exp { .. } => "exp",
@@ -7326,3 +7968,471 @@ extern "C" __global__ void QUABLA_MATMUL_FUNCTION(
     if (row + 16ULL < rows && col + 16ULL < cols) out[(row + 16ULL) * cols + col + 16ULL] = value_11;
 }
 "#;
+
+#[cfg(test)]
+mod region_codegen_tests {
+    use super::*;
+    use crate::tensor_ir::TensorIr;
+
+    #[test]
+    fn shared_fori_and_scan_body_sources_are_linear() -> Result<(), String> {
+        for depth in [6, 18, 40] {
+            let mut body = TensorIr::new();
+            let carry = body.input("carry", vec![8])?;
+            let index = body.input("index", vec![])?;
+            let mut next = carry;
+            for _ in 0..depth {
+                next = body.add(next, next)?;
+            }
+            next = body.add(next, index)?;
+            let fori =
+                TensorForiExecutionPlan::new(0, 2, body.compile_cpu(next)?, "carry", "index")?;
+            let source = cuda_fori_body_expression(
+                &fori,
+                fori.body.plan.output_node_id,
+                &BTreeMap::new(),
+                &[8],
+            )?;
+            assert_eq!(
+                source.matches("const float quabla_body_value_").count(),
+                fori.body.plan.node_count()
+            );
+            assert_eq!(source.matches("[&]").count(), 1);
+            assert!(source.len() < 256 * fori.body.plan.node_count());
+            let (plan, _) = body.compile_cpu_many(&[next, next])?;
+            let scan = TensorScanExecutionPlan::new(0, 2, plan, "carry", "index")?;
+            let source = cuda_scan_body_expression(
+                &scan,
+                scan.body.plan.output_node_ids[0],
+                &BTreeMap::new(),
+                &[8],
+            )?;
+            assert_eq!(
+                source.matches("const float quabla_body_value_").count(),
+                scan.body.plan.node_count()
+            );
+            assert_eq!(source.matches("[&]").count(), 1);
+            assert!(source.len() < 256 * scan.body.plan.node_count());
+            let input_bindings = BTreeMap::from([
+                ("carry".into(), CudaElementwiseInput::Scalar("carry".into())),
+                (
+                    "index".into(),
+                    CudaElementwiseInput::Scalar("loop_index".into()),
+                ),
+            ]);
+            let source = cuda_elementwise_plan_expression(
+                &fori.body.plan,
+                fori.body.plan.output_node_id,
+                &input_bindings,
+                &[8],
+            )?;
+            assert_eq!(
+                source.matches("const float quabla_body_value_").count(),
+                fori.body.plan.node_count()
+            );
+            assert!(source.len() < 256 * fori.body.plan.node_count());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn packed_scan_keeps_distinct_half_references() -> Result<(), String> {
+        let mut body = TensorIr::new();
+        let carry = body.input("carry", vec![2, 8])?;
+        let index = body.input("index", vec![])?;
+        let first = body.slice_axis(carry, 0, 0, 1)?;
+        let second = body.slice_axis(carry, 0, 1, 2)?;
+        let combined = body.add(first, second)?;
+        let combined = body.add(combined, index)?;
+        let packed = body.concat(vec![combined, second], 0)?;
+        let (plan, _) = body.compile_cpu_many(&[packed, packed])?;
+        let scan = TensorScanExecutionPlan::new(0, 2, plan, "carry", "index")?;
+        let source = cuda_scan_body_expression_in_half(
+            &scan,
+            scan.body.plan.output_node_ids[0],
+            &BTreeMap::new(),
+            &[2, 8],
+            "carry",
+            Some((0, 8)),
+        )?;
+        assert!(source.contains("= carry_0;"));
+        assert!(source.contains("= carry_1;"));
+        assert_eq!(source.matches("[&]").count(), 1);
+        assert!(source.len() < 512 * scan.body.plan.node_count());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod solver_workspace_profile_tests {
+    use super::*;
+    use crate::tensor_ir::TensorIr;
+    use std::hash::{Hash, Hasher};
+    use std::time::Instant;
+
+    #[test]
+    fn profile_solver_workspace_shape_changes() -> Result<(), String> {
+        if std::env::var_os("QUABLA_CUDA_PROFILE").is_none() {
+            return Ok(());
+        }
+        let mut graph = TensorIr::new();
+        let matrix = graph.input("matrix", vec![8, 8])?;
+        let rhs = graph.input("rhs", vec![8, 1])?;
+        let output = graph.solve(matrix, rhs)?;
+        let plan = CudaBackend::new(0).compile(graph.compile_cpu(output)?)?;
+        let solver = plan.solver.as_ref().ok_or("CUSOLVER is unavailable")?;
+        let stream = plan.context.default_stream();
+        let unbounded_baseline = std::env::var_os("QUABLA_CUDA_SOLVER_UNBOUNDED_PROFILE").is_some();
+        let mut samples = Vec::new();
+        let mut output_checksums = Vec::new();
+        let mut retained_bytes = Vec::new();
+        let mut entries = Vec::new();
+        let mut current_bytes = Vec::new();
+        // Revisit the largest shape after smaller shapes, then repeat it to
+        // distinguish bounded eviction from unchanged same-shape reuse.
+        for (n, columns) in [(192, 4), (64, 2), (8, 1), (64, 4), (192, 4), (192, 4)] {
+            let mut matrix = vec![0.01_f32; n * n];
+            for row in 0..n {
+                matrix[row * n + row] = 2.0;
+            }
+            let rhs = vec![1.0_f32; n * columns];
+            let matrix = stream
+                .clone_htod(&matrix)
+                .map_err(|error| format!("failed to upload test matrix: {error:?}"))?;
+            let rhs = stream
+                .clone_htod(&rhs)
+                .map_err(|error| format!("failed to upload test RHS: {error:?}"))?;
+            let mut output = stream
+                .alloc_zeros::<f32>(n * columns)
+                .map_err(|error| format!("failed to allocate test output: {error:?}"))?;
+            let start = Instant::now();
+            launch_cusolver_rank_two_solve(
+                &stream,
+                &plan.module,
+                solver,
+                &matrix,
+                &rhs,
+                &mut output,
+                n,
+                columns,
+            )?;
+            let actual = stream
+                .clone_dtoh(&output)
+                .map_err(|error| format!("failed to read test solution: {error:?}"))?;
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            let expected = 1.0 / (2.0 + (n - 1) as f64 * 0.01);
+            let mut checksum = std::collections::hash_map::DefaultHasher::new();
+            for value in actual {
+                value.to_bits().hash(&mut checksum);
+                assert!((f64::from(value) - expected).abs() < 1e-5);
+            }
+            output_checksums.push(checksum.finish());
+            let solver = solver.lock().map_err(|_| "solver lock was poisoned")?;
+            let bytes = |workspace: &CudaSolveWorkspace| {
+                4 * (workspace.factor.len()
+                    + workspace.column_rhs.len()
+                    + workspace.pivots.len()
+                    + workspace.info.len()
+                    + workspace.scratch.len())
+            };
+            let current = solver
+                .workspaces
+                .get(&(n, columns))
+                .ok_or("current solver workspace is missing")?;
+            current_bytes.push(bytes(current));
+            entries.push(solver.workspaces.len());
+            retained_bytes.push(solver.workspaces.values().map(bytes).sum::<usize>());
+            if !unbounded_baseline {
+                assert_eq!(solver.workspaces.len(), 1);
+                assert_eq!(*retained_bytes.last().unwrap(), bytes(current));
+            }
+        }
+        println!(
+            "{{\"case\":\"cuda_solver_shape_changes\",\"entries\":{entries:?},\"retained_bytes\":{retained_bytes:?},\"current_bytes\":{current_bytes:?},\"samples_ms\":{samples:?},\"output_checksums\":{output_checksums:?}}}"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod loop_checkpoint_tests {
+    use super::*;
+    use crate::tensor_ir::{TensorIr, LOOP_CHECKPOINT_TEST_FULL_TAPE};
+    use std::time::Instant;
+
+    fn plan(
+        scan: bool,
+        directional: bool,
+        steps: usize,
+        n: usize,
+        lower: usize,
+    ) -> Result<(TensorExecutionPlan, BTreeMap<String, DynamicTensor>), String> {
+        let mut body = TensorIr::new();
+        let carry = body.input_typed("carry", vec![n], TensorDType::F32)?;
+        let index = body.input_typed("index", vec![], TensorDType::F32)?;
+        let scale = body.input_typed("scale", vec![n], TensorDType::F32)?;
+        let scaled = body.mul(carry, scale)?;
+        let scaled = if lower == 3 {
+            let delta = body.scalar_constant(0.00001);
+            let delta = body.mul(index, delta)?;
+            body.add(scaled, delta)?
+        } else {
+            scaled
+        };
+        let next = body.tanh(scaled)?;
+        let mut graph = TensorIr::new();
+        let initial = graph.input_typed("initial", vec![n], TensorDType::F32)?;
+        let scale = graph.input_typed("scale", vec![n], TensorDType::F32)?;
+        let captures = vec![("scale".to_string(), scale)];
+        let loss = if scan {
+            let body = body.compile_cpu_many(&[next, next])?.0;
+            let scan_plan =
+                TensorScanExecutionPlan::new(lower, lower + steps, body, "carry", "index")?;
+            let (final_carry, outputs) = graph.scan(initial, scan_plan, captures)?;
+            let output_sum = graph.sum(outputs)?;
+            let final_sum = graph.sum(final_carry)?;
+            graph.add(final_sum, output_sum)?
+        } else {
+            let loop_plan = TensorForiExecutionPlan::new(
+                lower,
+                lower + steps,
+                body.compile_cpu(next)?,
+                "carry",
+                "index",
+            )?;
+            let output = graph.fori(initial, loop_plan, captures)?;
+            graph.sum(output)?
+        };
+        let vjp = graph.symbolic_vjp(loss, "seed")?;
+        let targets = [vjp.gradients["initial"], vjp.gradients["scale"]];
+        let plan = if directional {
+            let jvp = vjp.graph.symbolic_jvp_many_with_tangent_inputs(
+                &targets,
+                &BTreeMap::from([("scale".into(), "scale_tangent".into())]),
+            )?;
+            jvp.graph.compile_cpu_many(&jvp.tangents)?.0
+        } else {
+            vjp.graph.compile_cpu_many(&targets)?.0
+        };
+        let tensor = |value| DynamicTensor::with_dtype(vec![n], vec![value; n], TensorDType::F32);
+        let mut inputs = BTreeMap::from([
+            (
+                "initial".into(),
+                DynamicTensor::with_dtype(
+                    vec![n],
+                    (0..n).map(|i| ((i % 29) as f64 - 14.0) * 0.007).collect(),
+                    TensorDType::F32,
+                )?,
+            ),
+            (
+                "scale".into(),
+                DynamicTensor::with_dtype(
+                    vec![n],
+                    (0..n).map(|i| 0.97 + (i % 23) as f64 * 0.001).collect(),
+                    TensorDType::F32,
+                )?,
+            ),
+            (
+                "seed".into(),
+                DynamicTensor::with_dtype(vec![], vec![1.0], TensorDType::F32)?,
+            ),
+        ]);
+        if directional {
+            inputs.insert("scale_tangent".into(), tensor(0.02)?);
+        }
+        Ok((plan, inputs))
+    }
+
+    fn run(
+        plan: &TensorExecutionPlan,
+        inputs: &BTreeMap<String, DynamicTensor>,
+        full: bool,
+    ) -> Result<Vec<DynamicTensor>, String> {
+        LOOP_CHECKPOINT_TEST_FULL_TAPE.with(|value| value.set(full));
+        let result = CudaBackend::new(0)
+            .compile(plan.clone())
+            .and_then(|plan| plan.execute_many(inputs));
+        LOOP_CHECKPOINT_TEST_FULL_TAPE.with(|value| value.set(false));
+        result
+    }
+
+    #[test]
+    fn checkpoint_vjp_and_directional_match_full_tape_on_device() -> Result<(), String> {
+        if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+            return Ok(());
+        }
+        for scan in [false, true] {
+            for directional in [false, true] {
+                for steps in [1, 8, 17, 64, 512] {
+                    let (plan, inputs) = plan(scan, directional, steps, 257, 3)?;
+                    if steps == 17 {
+                        for output in &plan.output_node_ids {
+                            let single = plan.as_ir().compile_cpu(*output)?;
+                            let old = run(&single, &inputs, true)?;
+                            let new = run(&single, &inputs, false)?;
+                            assert!(
+                                old[0]
+                                    .data()
+                                    .iter()
+                                    .zip(new[0].data().iter())
+                                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                                "single scan={scan} directional={directional}"
+                            );
+                        }
+                    }
+                    let old = run(&plan, &inputs, true)?;
+                    let new = run(&plan, &inputs, false)?;
+                    assert_eq!(old.len(), new.len());
+                    for (old, new) in old.iter().zip(&new) {
+                        assert_eq!(old.shape(), new.shape());
+                        assert!(
+                            old.data()
+                                .iter()
+                                .zip(new.data().iter())
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "scan={scan} directional={directional} steps={steps}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_device_bounds_and_input_errors_match_full_tape() -> Result<(), String> {
+        if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+            return Ok(());
+        }
+        for scan in [false, true] {
+            for directional in [false, true] {
+                let (plan, inputs) = plan(scan, directional, 17, 5, usize::MAX - 17)?;
+                let old = run(&plan, &inputs, true)?;
+                let new = run(&plan, &inputs, false)?;
+                for (old, new) in old.iter().zip(&new) {
+                    assert!(
+                        old.data()
+                            .iter()
+                            .zip(new.data().iter())
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "upper usizeMAX scan={scan} directional={directional}"
+                    );
+                }
+                let mut missing = inputs.clone();
+                missing.remove("scale");
+                assert_eq!(
+                    run(&plan, &missing, true).unwrap_err(),
+                    run(&plan, &missing, false).unwrap_err()
+                );
+                let mut wrong_shape = inputs.clone();
+                wrong_shape.insert(
+                    "scale".into(),
+                    DynamicTensor::with_dtype(vec![4], vec![0.99; 4], TensorDType::F32)?,
+                );
+                assert_eq!(
+                    run(&plan, &wrong_shape, true).unwrap_err(),
+                    run(&plan, &wrong_shape, false).unwrap_err()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_layout_preserves_broadcast_fallback() {
+        let shape = [257];
+        let captures = BTreeMap::from([("scale".into(), vec![257])]);
+        assert_eq!(
+            cuda_loop_checkpoint_block(3, 67, &shape, &captures, Some(&shape), true),
+            Some(8)
+        );
+        assert_eq!(cuda_loop_tape_states(3, 67, Some(8)), Some(16));
+        assert_eq!(
+            cuda_loop_checkpoint_block(3, 67, &shape, &captures, Some(&shape), false),
+            None
+        );
+        let (_, reverse) =
+            cuda_loop_tape_source(usize::MAX - 64, usize::MAX, "count", "carry", None, Some(8));
+        assert!(reverse.contains(&format!("if ({}ULL - block_start > 8ULL)", usize::MAX)));
+        assert_eq!(
+            cuda_loop_checkpoint_block(
+                3,
+                67,
+                &shape,
+                &BTreeMap::from([("scale".into(), vec![])]),
+                None,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            cuda_loop_checkpoint_block(3, 67, &shape, &captures, Some(&[1, 257]), true),
+            None
+        );
+    }
+
+    #[test]
+    fn profile_complete_checkpoint_vjp_on_device() -> Result<(), String> {
+        if std::env::var_os("QUABLA_CUDA_CHECKPOINT_PROFILE").is_none() {
+            return Ok(());
+        }
+        let n = 8192;
+        for scan in [false, true] {
+            for directional in [false, true] {
+                for steps in [64, 512] {
+                    let (plan, inputs) = plan(scan, directional, steps, n, 3)?;
+                    let mut expected_bits: Option<Vec<Vec<u64>>> = None;
+                    for full in if std::env::var_os("QUABLA_CHECKPOINT_FIRST").is_some() {
+                        [false, true]
+                    } else {
+                        [true, false]
+                    } {
+                        LOOP_CHECKPOINT_TEST_FULL_TAPE.with(|value| value.set(full));
+                        let device = CudaBackend::new(0).compile(plan.clone())?;
+                        let warm = device.execute_many(&inputs)?;
+                        let bits = warm
+                            .iter()
+                            .map(|output| {
+                                output
+                                    .data()
+                                    .iter()
+                                    .map(|value| value.to_bits())
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>();
+                        if let Some(expected) = &expected_bits {
+                            assert_eq!(
+                                &bits, expected,
+                                "profile scan={scan} directional={directional} steps={steps}"
+                            );
+                        } else {
+                            expected_bits = Some(bits);
+                        }
+                        let mut times = Vec::new();
+                        for _ in 0..7 {
+                            let start = Instant::now();
+                            let output = device.execute_many(&inputs)?;
+                            times.push(start.elapsed().as_nanos());
+                            std::hint::black_box(output);
+                        }
+                        times.sort_unstable();
+                        let block = if full {
+                            None
+                        } else {
+                            super::super::TensorCarryCheckpoints::<DynamicTensor>::block_size(steps)
+                        };
+                        let states =
+                            cuda_loop_tape_states(3, 3 + steps, block).ok_or("invalid tape")?;
+                        assert_eq!(
+                            CUDA_LOOP_TEST_TAPE_BYTES.with(|value| value.get()),
+                            states * n * 4 * if directional { 2 } else { 1 }
+                        );
+                        println!("{{\"scan\":{scan},\"directional\":{directional},\"steps\":{steps},\"full\":{full},\"tape_bytes\":{},\"median_ns\":{}}}",CUDA_LOOP_TEST_TAPE_BYTES.with(|value| value.get()),times[3]);
+                        LOOP_CHECKPOINT_TEST_FULL_TAPE.with(|value| value.set(false));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}

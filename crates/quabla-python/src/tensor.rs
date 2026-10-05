@@ -2,7 +2,8 @@ use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyMemoryView, PySlice, PySliceMethods, PyTuple};
-use quabla_core::tensor_ir::{TensorComparison, TensorDType};
+use quabla_core::tensor_ir::{HostTensorStorage, TensorComparison, TensorDType};
+use std::borrow::Cow;
 use std::ffi::c_int;
 use std::sync::Arc;
 
@@ -46,8 +47,8 @@ fn traced(
         .map(|result| result.map(EagerOrTraced::Traced))
 }
 
-/// Eager host tensor. Storage is `f64`; a `float32` tensor holds only values
-/// rounded to `f32`, and every eager op on it rounds its `f64` result the way
+/// Eager host tensor with physical storage matching its logical dtype.
+/// Every eager op rounds its `f64` intermediate result the way
 /// the CPU Tensor IR backend rounds an `f32` node. Python scalars are weak:
 /// they are rounded to the tensor dtype before the op. A `bool` tensor holds
 /// `0.0`/`1.0` and follows the Tensor IR promotion rule.
@@ -55,7 +56,7 @@ fn traced(
 #[derive(Clone, Debug)]
 pub struct PyTensor {
     shape: Vec<usize>,
-    data: Arc<Vec<f64>>,
+    data: HostTensorStorage,
     dtype: TensorDType,
     /// JAX-style weak type: set only when a `bool` tensor meets a Python
     /// scalar (`mask * 2.0`), so the result still adopts a later strong
@@ -66,7 +67,7 @@ pub struct PyTensor {
 #[pyclass(name = "TensorView", skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyTensorView {
-    data: Arc<Vec<f64>>,
+    data: HostTensorStorage,
     shape: Vec<usize>,
     strides: Vec<usize>,
     offset: usize,
@@ -297,6 +298,25 @@ fn extract_reduction_axes(axis: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Ve
     })
 }
 
+fn matmul_float_block<T: Copy + Into<f64>>(
+    lhs: &[T],
+    rhs: &[T],
+    output: &mut [f64],
+    [rows, inner, columns]: [usize; 3],
+) {
+    for row in 0..rows {
+        let output = &mut output[row * columns..(row + 1) * columns];
+        for k in 0..inner {
+            let lhs = lhs[row * inner + k].into();
+            let rhs = &rhs[k * columns..(k + 1) * columns];
+            // Accumulate in F64 in the original increasing-inner order.
+            for (output, &rhs) in output.iter_mut().zip(rhs) {
+                *output += lhs * rhs.into();
+            }
+        }
+    }
+}
+
 fn broadcast_shape(lhs: &[usize], rhs: &[usize]) -> Result<Vec<usize>, String> {
     let rank = lhs.len().max(rhs.len());
     let mut shape = Vec::with_capacity(rank);
@@ -321,6 +341,36 @@ fn broadcast_shape(lhs: &[usize], rhs: &[usize]) -> Result<Vec<usize>, String> {
 
     shape.reverse();
     Ok(shape)
+}
+
+// Advance row-major broadcast offsets with stack-only operand metadata. Only
+// wrapped axes propagate a carry, so ordinary elements avoid full rank decoding.
+// Inlining specializes the one-to-three operand loop and removes per-element calls.
+#[inline(always)]
+fn advance_broadcast_offsets<const N: usize>(
+    mut next: usize,
+    shape: &[usize],
+    operands: [(&[usize], &[usize]); N],
+    offsets: &mut [usize; N],
+) {
+    for axis in (0..shape.len()).rev() {
+        let wrapped = next.is_multiple_of(shape[axis]);
+        for (offset, (input_shape, strides)) in offsets.iter_mut().zip(operands) {
+            let rank_offset = shape.len() - input_shape.len();
+            if axis >= rank_offset && input_shape[axis - rank_offset] != 1 {
+                let step = strides[axis - rank_offset];
+                if wrapped {
+                    *offset -= (shape[axis] - 1) * step;
+                } else {
+                    *offset += step;
+                }
+            }
+        }
+        if !wrapped {
+            break;
+        }
+        next /= shape[axis];
+    }
 }
 
 fn broadcast_offset(
@@ -425,7 +475,7 @@ impl PyTensor {
 
         Ok(Self {
             shape,
-            data: Arc::new(data),
+            data: HostTensorStorage::from_f64(data, TensorDType::F64),
             dtype: TensorDType::F64,
             weak: false,
         })
@@ -435,7 +485,7 @@ impl PyTensor {
     pub fn weak_scalar(value: f64) -> Self {
         Self {
             shape: vec![],
-            data: Arc::new(vec![value]),
+            data: HostTensorStorage::from_f64(vec![value], TensorDType::F64),
             dtype: TensorDType::F64,
             weak: true,
         }
@@ -459,36 +509,30 @@ impl PyTensor {
         self.weak
     }
 
-    pub fn shape_data(&self) -> (&[usize], &[f64]) {
-        (&self.shape, self.data.as_ref())
+    pub fn shape_data(&self) -> (&[usize], Cow<'_, [f64]>) {
+        (&self.shape, self.data.to_f64())
     }
 
     pub fn to_dynamic_tensor(&self) -> Result<quabla_core::tensor_ir::DynamicTensor, String> {
-        quabla_core::tensor_ir::DynamicTensor::with_dtype(
-            self.shape.clone(),
-            self.data.as_ref().clone(),
-            self.dtype,
-        )
+        quabla_core::tensor_ir::DynamicTensor::from_storage(self.shape.clone(), self.data.clone())
     }
 
     pub fn from_dynamic_tensor(
         tensor: quabla_core::tensor_ir::DynamicTensor,
     ) -> Result<Self, String> {
-        Self::from_shape_data_typed(
-            tensor.shape().to_vec(),
-            tensor.data().to_vec(),
-            tensor.dtype(),
-        )
+        let (shape, data, dtype) = tensor.into_parts();
+        Ok(Self {
+            shape,
+            data,
+            dtype,
+            weak: false,
+        })
     }
 
     /// Rounds the values to `dtype` and records it as a strong dtype (exact
     /// for widening; nonzero and `NaN` become `1.0` for `bool`).
     fn typed(mut self, dtype: TensorDType) -> Self {
-        if dtype != TensorDType::F64 {
-            for value in Arc::make_mut(&mut self.data) {
-                *value = dtype.round(*value);
-            }
-        }
+        self.data = self.data.into_dtype(dtype);
         self.dtype = dtype;
         self.weak = false;
         self
@@ -605,21 +649,48 @@ impl PyTensor {
     ) -> Result<Self, String> {
         let shape = broadcast_shape(&self.shape, &rhs.shape)?;
         let output_size = element_count(&shape)?;
-        let lhs_strides = contiguous_strides(&self.shape);
-        let rhs_strides = contiguous_strides(&rhs.shape);
         let mut data = Vec::with_capacity(output_size);
 
-        for index in 0..output_size {
-            let lhs_index = broadcast_offset(index, &shape, &self.shape, &lhs_strides);
-            let rhs_index = broadcast_offset(index, &shape, &rhs.shape, &rhs_strides);
-            let value = f(self.data[lhs_index], rhs.data[rhs_index])
-                .map_err(|err| format!("failed to evaluate tensor {op}: {err}"))?;
-            data.push(dtype.round(value));
+        if self.shape == rhs.shape {
+            for (lhs, rhs) in self.data.iter().zip(rhs.data.iter()) {
+                let value =
+                    f(lhs, rhs).map_err(|err| format!("failed to evaluate tensor {op}: {err}"))?;
+                data.push(dtype.round(value));
+            }
+        } else if self.data.len() == 1 && rhs.data.len() == output_size {
+            for rhs in rhs.data.iter() {
+                let value = f(self.data.get(0), rhs)
+                    .map_err(|err| format!("failed to evaluate tensor {op}: {err}"))?;
+                data.push(dtype.round(value));
+            }
+        } else if rhs.data.len() == 1 && self.data.len() == output_size {
+            for lhs in self.data.iter() {
+                let value = f(lhs, rhs.data.get(0))
+                    .map_err(|err| format!("failed to evaluate tensor {op}: {err}"))?;
+                data.push(dtype.round(value));
+            }
+        } else {
+            let lhs_strides = contiguous_strides(&self.shape);
+            let rhs_strides = contiguous_strides(&rhs.shape);
+            let mut offsets = [0; 2];
+            for index in 0..output_size {
+                let value = f(self.data.get(offsets[0]), rhs.data.get(offsets[1]))
+                    .map_err(|err| format!("failed to evaluate tensor {op}: {err}"))?;
+                data.push(dtype.round(value));
+                if index + 1 < output_size {
+                    advance_broadcast_offsets(
+                        index + 1,
+                        &shape,
+                        [(&self.shape, &lhs_strides), (&rhs.shape, &rhs_strides)],
+                        &mut offsets,
+                    );
+                }
+            }
         }
 
         Ok(Self {
             shape,
-            data: Arc::new(data),
+            data: HostTensorStorage::from_f64(data, dtype),
             dtype,
             weak: false,
         })
@@ -640,13 +711,22 @@ impl PyTensor {
     }
 
     fn try_map(&self, f: impl Fn(f64) -> f64) -> Result<Self, String> {
-        let mut output = Self::from_shape_data_typed(
-            self.shape.clone(),
-            self.data.iter().copied().map(f).collect(),
-            self.dtype,
-        )?;
-        output.weak = self.weak;
-        Ok(output)
+        // Keep F64 arithmetic per lane, but write directly to dtype-sized output.
+        let data = match self.dtype {
+            TensorDType::F64 => HostTensorStorage::F64(Arc::new(self.data.iter().map(f).collect())),
+            TensorDType::F32 => {
+                HostTensorStorage::F32(Arc::new(self.data.iter().map(|v| f(v) as f32).collect()))
+            }
+            TensorDType::Bool => HostTensorStorage::Bool(Arc::new(
+                self.data.iter().map(|v| u8::from(f(v) != 0.0)).collect(),
+            )),
+        };
+        Ok(Self {
+            shape: self.shape.clone(),
+            data,
+            dtype: self.dtype,
+            weak: self.weak,
+        })
     }
 
     /// Elementwise float math; `bool` tensors must be converted explicitly.
@@ -674,7 +754,7 @@ impl PyTensor {
             base.shape.clone(),
             base.data
                 .iter()
-                .map(|lhs| f64::from(kind.evaluate(*lhs, rhs)))
+                .map(|lhs| f64::from(kind.evaluate(lhs, rhs)))
                 .collect(),
             TensorDType::Bool,
         )
@@ -702,7 +782,7 @@ impl PyTensor {
             self.shape.clone(),
             self.data
                 .iter()
-                .map(|value| f64::from(test(*value)))
+                .map(|value| f64::from(test(value)))
                 .collect(),
             TensorDType::Bool,
         )
@@ -725,7 +805,7 @@ impl PyTensor {
         if self.dtype != TensorDType::Bool {
             return Ok(true);
         }
-        match self.data.as_slice() {
+        match self.data.to_f64().as_ref() {
             [value] => Ok(*value != 0.0),
             _ => Err(format!(
                 "the truth value of a bool tensor with shape {:?} is ambiguous; use .any() or .all()",
@@ -792,7 +872,7 @@ impl PyTensor {
     pub fn try_scalar_div(&self, lhs: f64) -> Result<Self, String> {
         let base = self.arithmetic_base();
         let lhs = base.dtype.round(lhs);
-        if base.data.contains(&0.0) {
+        if base.data.iter().any(|value| value == 0.0) {
             return Err("division by zero is not supported".to_string());
         }
         base.try_map(|rhs| lhs / rhs)
@@ -845,15 +925,37 @@ impl PyTensor {
         let false_strides = contiguous_strides(&on_false.shape);
         let mut data = Vec::with_capacity(count);
 
+        if mask.shape == shape && on_true.shape == shape && on_false.shape == shape {
+            for ((mask, on_true), on_false) in mask
+                .data
+                .iter()
+                .zip(on_true.data.iter())
+                .zip(on_false.data.iter())
+            {
+                data.push(if mask != 0.0 { on_true } else { on_false });
+            }
+            return Self::from_shape_data_typed(shape, data, dtype);
+        }
+
+        let mut offsets = [0; 3];
         for index in 0..count {
-            let mask_index = broadcast_offset(index, &shape, &mask.shape, &mask_strides);
-            let true_index = broadcast_offset(index, &shape, &on_true.shape, &true_strides);
-            let false_index = broadcast_offset(index, &shape, &on_false.shape, &false_strides);
-            data.push(if mask.data[mask_index] != 0.0 {
-                on_true.data[true_index]
+            data.push(if mask.data.get(offsets[0]) != 0.0 {
+                on_true.data.get(offsets[1])
             } else {
-                on_false.data[false_index]
+                on_false.data.get(offsets[2])
             });
+            if index + 1 < count {
+                advance_broadcast_offsets(
+                    index + 1,
+                    &shape,
+                    [
+                        (&mask.shape, &mask_strides),
+                        (&on_true.shape, &true_strides),
+                        (&on_false.shape, &false_strides),
+                    ],
+                    &mut offsets,
+                );
+            }
         }
 
         Self::from_shape_data_typed(shape, data, dtype)
@@ -908,17 +1010,19 @@ impl PyTensor {
                 &rhs_batch_strides,
             );
 
-            for row in 0..lhs_rows {
-                for col in 0..rhs_cols {
-                    let mut value = 0.0;
-                    for inner in 0..lhs_inner {
-                        let lhs_index = lhs_batch * lhs_rows * lhs_inner + row * lhs_inner + inner;
-                        let rhs_index = rhs_batch * rhs_inner * rhs_cols + inner * rhs_cols + col;
-                        value += self.data[lhs_index] * rhs.data[rhs_index];
-                    }
-
-                    data[batch_index * lhs_rows * rhs_cols + row * rhs_cols + col] = value;
+            let lhs_start = lhs_batch * lhs_rows * lhs_inner;
+            let rhs_start = rhs_batch * rhs_inner * rhs_cols;
+            let output_start = batch_index * lhs_rows * rhs_cols;
+            let output = &mut data[output_start..output_start + lhs_rows * rhs_cols];
+            let dimensions = [lhs_rows, lhs_inner, rhs_cols];
+            match (&self.data, &rhs.data) {
+                (HostTensorStorage::F64(lhs), HostTensorStorage::F64(rhs)) => {
+                    matmul_float_block(&lhs[lhs_start..], &rhs[rhs_start..], output, dimensions);
                 }
+                (HostTensorStorage::F32(lhs), HostTensorStorage::F32(rhs)) => {
+                    matmul_float_block(&lhs[lhs_start..], &rhs[rhs_start..], output, dimensions);
+                }
+                _ => unreachable!("matmul operands have validated matching float dtypes"),
             }
         }
 
@@ -943,9 +1047,17 @@ impl PyTensor {
                 self.shape, rhs.shape
             ));
         }
+        if let Some(result) = self.finite_triangular_solution(rhs) {
+            return Self::from_shape_data_typed(rhs.shape.clone(), result, dtype);
+        }
+        self.solve_lu(rhs, dtype)
+    }
+
+    fn solve_lu(&self, rhs: &Self, dtype: TensorDType) -> Result<Self, String> {
+        let n = self.shape[0];
         let columns = rhs.shape[1];
-        let mut factor = self.data.as_ref().clone();
-        let mut result = rhs.data.as_ref().clone();
+        let mut factor = self.data.to_f64().into_owned();
+        let mut result = rhs.data.to_f64().into_owned();
         for pivot in 0..n {
             let pivot_row = (pivot..n)
                 .max_by(|&left, &right| {
@@ -989,6 +1101,56 @@ impl PyTensor {
         Self::from_shape_data_typed(rhs.shape.clone(), result, dtype)
     }
 
+    // Exact triangular structure permits substitution without a factor matrix.
+    // Exceptional values keep the pivoted solver's existing error/IEEE behavior.
+    fn finite_triangular_solution(&self, rhs: &Self) -> Option<Vec<f64>> {
+        if self
+            .data
+            .iter()
+            .chain(rhs.data.iter())
+            .any(|value| !value.is_finite())
+        {
+            return None;
+        }
+        let n = self.shape[0];
+        let columns = rhs.shape[1];
+        let mut lower = true;
+        let mut upper = true;
+        for row in 0..n {
+            if self.data.get(row * n + row) == 0.0 {
+                return None;
+            }
+            for column in 0..row {
+                upper &= self.data.get(row * n + column) == 0.0;
+                lower &= self.data.get(column * n + row) == 0.0;
+            }
+        }
+        if !lower && !upper {
+            return None;
+        }
+        let mut result = rhs.data.to_f64().into_owned();
+        for step in 0..n {
+            let row = if lower { step } else { n - 1 - step };
+            let diagonal = self.data.get(row * n + row);
+            let dependencies = if lower { 0..row } else { row + 1..n };
+            for column in 0..columns {
+                let mut value = result[row * columns + column];
+                for inner in dependencies.clone() {
+                    value -= self.data.get(row * n + inner) * result[inner * columns + column];
+                    if !value.is_finite() {
+                        return None;
+                    }
+                }
+                let solved = value / diagonal;
+                if !solved.is_finite() {
+                    return None;
+                }
+                result[row * columns + column] = solved;
+            }
+        }
+        Some(result)
+    }
+
     pub fn try_solve_triangular(
         &self,
         rhs: &Self,
@@ -1016,8 +1178,8 @@ impl PyTensor {
         let mut factor = vec![0.0; n * n];
         for row in 0..n {
             for column in 0..=row {
-                let symmetric = self.data[column * n + row];
-                let value = self.data[row * n + column];
+                let symmetric = self.data.get(column * n + row);
+                let value = self.data.get(row * n + column);
                 let tolerance = 1e-12 * value.abs().max(symmetric.abs()).max(1.0);
                 if (value - symmetric).abs() > tolerance {
                     return Err("cholesky requires a symmetric coefficient matrix".to_string());
@@ -1068,9 +1230,19 @@ impl PyTensor {
         }
         let count = element_count(&shape)?;
         let strides = contiguous_strides(&self.shape);
-        let data = (0..count)
-            .map(|index| self.data[broadcast_offset(index, &shape, &self.shape, &strides)])
-            .collect();
+        let mut data = Vec::with_capacity(count);
+        let mut offsets = [0];
+        for index in 0..count {
+            data.push(self.data.get(offsets[0]));
+            if index + 1 < count {
+                advance_broadcast_offsets(
+                    index + 1,
+                    &shape,
+                    [(&self.shape, &strides)],
+                    &mut offsets,
+                );
+            }
+        }
         Self::from_shape_data_typed(shape, data, self.dtype)
     }
 
@@ -1091,7 +1263,7 @@ impl PyTensor {
                 remaining /= shape[output_axis];
                 input_index += coordinate * input_strides[axes[output_axis]];
             }
-            *output_value = self.data[input_index];
+            *output_value = self.data.get(input_index);
         }
 
         Self::from_shape_data_typed(shape, data, self.dtype)
@@ -1109,25 +1281,19 @@ impl PyTensor {
         let axis = normalize_axis(axis, self.shape.len())?;
         let mut shape = self.shape.clone();
         shape.remove(axis);
-        let output_strides = contiguous_strides(&shape);
         let mut data = vec![0.0; element_count(&shape)?];
-
-        for (source_index, value) in self.data.iter().enumerate() {
-            let mut remaining = source_index;
-            let mut output_index = 0;
-            for source_axis in (0..self.shape.len()).rev() {
-                let coordinate = remaining % self.shape[source_axis];
-                remaining /= self.shape[source_axis];
-                if source_axis != axis {
-                    let output_axis = if source_axis < axis {
-                        source_axis
-                    } else {
-                        source_axis - 1
-                    };
-                    output_index += coordinate * output_strides[output_axis];
+        let inner = element_count(&self.shape[axis + 1..])?;
+        let outer = element_count(&self.shape[..axis])?;
+        let extent = self.shape[axis];
+        // Preserve each output's source order and scale before accumulation.
+        for block in 0..outer {
+            for reduced in 0..extent {
+                let source = (block * extent + reduced) * inner;
+                let output = block * inner;
+                for offset in 0..inner {
+                    data[output + offset] += self.data.get(source + offset) * scale;
                 }
             }
-            data[output_index] += value * scale;
         }
 
         Self::from_shape_data_typed(shape, data, self.dtype)
@@ -1237,17 +1403,13 @@ impl PyTensor {
             return Err("max/min reduction requires at least one tensor element".to_string());
         }
         let Some(axis) = axis else {
-            let value = self
-                .data
-                .iter()
-                .copied()
-                .fold(self.data[0], |current, value| {
-                    if (maximum && value >= current) || (!maximum && value <= current) {
-                        value
-                    } else {
-                        current
-                    }
-                });
+            let value = self.data.iter().fold(self.data.get(0), |current, value| {
+                if (maximum && value >= current) || (!maximum && value <= current) {
+                    value
+                } else {
+                    current
+                }
+            });
             return Self::from_shape_data_typed(vec![], vec![value], self.dtype);
         };
         let axis = normalize_axis(axis, self.shape.len())?;
@@ -1259,7 +1421,7 @@ impl PyTensor {
         let output_strides = contiguous_strides(&shape);
         let mut data = vec![None; element_count(&shape)?];
 
-        for (source_index, value) in self.data.iter().copied().enumerate() {
+        for (source_index, value) in self.data.iter().enumerate() {
             let mut remaining = source_index;
             let mut output_index = 0;
             for source_axis in (0..self.shape.len()).rev() {
@@ -1311,11 +1473,38 @@ impl PyTensor {
         self.try_maximum_scalar(0.0)
     }
 
+    #[allow(clippy::neg_multiply)] // Multiplication preserves the old NaN quieting behavior.
     pub fn try_abs(&self) -> Result<Self, String> {
         self.ensure_not_bool("abs")?;
-        let mask = self.try_gt_scalar(0.0)?;
-        let negative = self.try_mul_scalar(-1.0)?;
-        Self::try_where(&mask, self, &negative)
+        if self.data.iter().any(f64::is_nan) {
+            // LLVM may change NaN signs/payloads when fusing the multiply.
+            // Preserve the established kernels for exceptional inputs.
+            let mask = self.try_gt_scalar(0.0)?;
+            let negative = self.try_mul_scalar(-1.0)?;
+            return Self::try_where(&mask, self, &negative);
+        }
+        // Preserve the former where(x > 0, x, x * -1) semantics, including
+        // signed zero, NaNs, and the intermediate multiplication rounding.
+        // The final where result is strongly typed even for weak inputs.
+        Ok(Self {
+            shape: self.shape.clone(),
+            data: HostTensorStorage::from_f64(
+                self.data
+                    .iter()
+                    .map(|value| {
+                        let selected = if value > 0.0 {
+                            value
+                        } else {
+                            self.dtype.round(value * -1.0)
+                        };
+                        self.dtype.round(selected)
+                    })
+                    .collect(),
+                self.dtype,
+            ),
+            dtype: self.dtype,
+            weak: false,
+        })
     }
 
     pub fn try_sigmoid(&self) -> Result<Self, String> {
@@ -1346,7 +1535,7 @@ impl PyTensor {
                 let row = (index / columns) % rows;
                 let column = index % columns;
                 if (lower && row >= column) || (!lower && row <= column) {
-                    *value
+                    value
                 } else {
                     0.0
                 }
@@ -1440,7 +1629,7 @@ impl PyTensor {
                 let start = outer_index
                     .checked_mul(block)
                     .ok_or_else(|| "concat offset overflows usize".to_string())?;
-                data.extend_from_slice(&tensor.data[start..start + block]);
+                data.extend((start..start + block).map(|index| tensor.data.get(index)));
             }
         }
         Self::from_shape_data_typed(shape, data, first.dtype)
@@ -1487,25 +1676,33 @@ impl PyTensor {
     }
 
     pub fn try_index(&self, indices: &[TensorIndex]) -> Result<Self, String> {
-        let mut output = self.clone();
+        if indices.is_empty() {
+            return Ok(self.clone());
+        }
+        // Compose slice layouts before copying, so intermediate axes do not
+        // materialize arrays that the next index immediately discards.
+        let mut output = PyTensorView {
+            data: self.data.clone(),
+            shape: self.shape.clone(),
+            strides: contiguous_strides(&self.shape),
+            offset: 0,
+            dtype: self.dtype,
+        };
         let mut axis = 0;
         for index in indices {
             match *index {
                 TensorIndex::Slice { start, stop } => {
-                    output = output
-                        .try_slice(axis, start, stop - start, 1)?
-                        .materialize()?;
+                    output = output.try_slice(axis, start, stop - start, 1)?;
                     axis += 1;
                 }
                 TensorIndex::Integer(index) => {
-                    output = output.try_slice(axis, index, 1, 1)?.materialize()?;
-                    let mut shape = output.shape.clone();
-                    shape.remove(axis);
-                    output = output.try_reshape(shape)?;
+                    output = output.try_slice(axis, index, 1, 1)?;
+                    output.shape.remove(axis);
+                    output.strides.remove(axis);
                 }
             }
         }
-        Ok(output)
+        output.materialize()
     }
 
     pub fn try_gather(&self, indices: &[usize], axis: isize) -> Result<Self, String> {
@@ -1519,11 +1716,20 @@ impl PyTensor {
                 self.shape[axis]
             ));
         }
-        let gathered = indices
-            .iter()
-            .map(|index| self.try_slice(axis, *index, 1, 1)?.materialize())
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::try_concat(&gathered, axis)
+        let mut shape = self.shape.clone();
+        shape[axis] = indices.len();
+        let mut data = Vec::with_capacity(element_count(&shape)?);
+        let outer = self.shape[..axis].iter().product::<usize>();
+        let inner = self.shape[axis + 1..].iter().product::<usize>();
+        // Each selected element along the axis owns one contiguous inner
+        // block; copying it directly avoids retaining all sliced tensors.
+        for outer_index in 0..outer {
+            for &index in indices {
+                let start = (outer_index * self.shape[axis] + index) * inner;
+                data.extend((start..start + inner).map(|index| self.data.get(index)));
+            }
+        }
+        Self::from_shape_data_typed(shape, data, self.dtype)
     }
 
     pub fn try_scatter_add(
@@ -1563,8 +1769,8 @@ impl PyTensor {
             ));
         }
         let strides = contiguous_strides(&self.shape);
-        let mut data = self.data.as_ref().clone();
-        for (source_index, value) in updates.data.iter().copied().enumerate() {
+        let mut data = self.data.to_f64().into_owned();
+        for (source_index, value) in updates.data.iter().enumerate() {
             let mut remaining = source_index;
             let mut destination_index = 0;
             for dimension in (0..updates.shape.len()).rev() {
@@ -1599,7 +1805,7 @@ impl PyTensor {
 
         Ok(Self {
             shape,
-            data: Arc::new(vec![0.0; size]),
+            data: HostTensorStorage::from_f64(vec![0.0; size], TensorDType::F64),
             dtype: TensorDType::F64,
             weak: false,
         })
@@ -1615,7 +1821,7 @@ impl PyTensor {
         let size = element_count(&shape).map_err(PyValueError::new_err)?;
         Ok(Self {
             shape,
-            data: Arc::new(vec![value; size]),
+            data: HostTensorStorage::from_f64(vec![value; size], TensorDType::F64),
             dtype: TensorDType::F64,
             weak: false,
         })
@@ -1753,8 +1959,94 @@ impl PyTensor {
         self.clone().typed(dtype.dtype)
     }
 
+    /// Pure host SGD leaf update with one final rounding and owned output.
+    fn _sgd_update(&self, gradient: &Self, rate: f64) -> PyResult<Self> {
+        self.ensure_not_bool("sgd").map_err(PyValueError::new_err)?;
+        gradient
+            .ensure_not_bool("sgd")
+            .map_err(PyValueError::new_err)?;
+        if self.shape != gradient.shape {
+            return Err(PyValueError::new_err(
+                "gradient shape does not match parameter",
+            ));
+        }
+        // Keep F64 multiplication/subtraction and round only the final parameter.
+        let values = self
+            .data
+            .iter()
+            .zip(gradient.data.iter())
+            .map(|(parameter, gradient)| parameter - gradient * rate)
+            .collect();
+        Self::from_shape_data_typed(self.shape.clone(), values, self.dtype)
+            .map_err(PyValueError::new_err)
+    }
+
+    /// Pure host Adam leaf update with independent parameter and f64 moment
+    /// buffers. Keep the eager expression's operation order before rounding
+    /// the parameter once to its original dtype.
+    fn _adam_update(
+        &self,
+        gradient: &Self,
+        first: &Self,
+        second: &Self,
+        hyperparameters: (f64, f64, f64, f64, f64, f64),
+    ) -> PyResult<(Self, Self, Self)> {
+        for tensor in [self, gradient, first, second] {
+            if tensor.dtype == TensorDType::Bool {
+                return Err(PyTypeError::new_err(
+                    "Adam update requires floating-point Tensors",
+                ));
+            }
+            if tensor.shape != self.shape {
+                return Err(PyValueError::new_err(
+                    "Adam update shapes must match parameter shape",
+                ));
+            }
+        }
+        let (learning_rate, b1, b2, eps, correction1, correction2) = hyperparameters;
+        if correction1 == 0.0 || correction2 == 0.0 {
+            return Err(PyValueError::new_err(
+                "division by zero scalar is not supported",
+            ));
+        }
+        let mut parameters = Vec::with_capacity(self.data.len());
+        let mut moments = Vec::with_capacity(self.data.len());
+        let mut variances = Vec::with_capacity(self.data.len());
+        for (((parameter, gradient), m), v) in self
+            .data
+            .iter()
+            .zip(gradient.data.iter())
+            .zip(first.data.iter())
+            .zip(second.data.iter())
+        {
+            let m = m * b1 + gradient * (1.0 - b1);
+            let v = v * b2 + (gradient * gradient) * (1.0 - b2);
+            let denominator = (v / correction2).sqrt() + eps;
+            if denominator == 0.0 {
+                return Err(PyValueError::new_err(
+                    "failed to evaluate tensor /: division by zero is not supported",
+                ));
+            }
+            let delta = (m / correction1) / denominator;
+            parameters.push(self.dtype.round(parameter - delta * learning_rate));
+            moments.push(m);
+            variances.push(v);
+        }
+        let result = |data, dtype| Self {
+            shape: self.shape.clone(),
+            data: HostTensorStorage::from_f64(data, dtype),
+            dtype,
+            weak: false,
+        };
+        Ok((
+            result(parameters, self.dtype),
+            result(moments, TensorDType::F64),
+            result(variances, TensorDType::F64),
+        ))
+    }
+
     fn to_flat_list(&self) -> Vec<f64> {
-        self.data.as_ref().clone()
+        self.data.to_f64().into_owned()
     }
 
     /// Backend of `quabla.array` for Python scalars and nested lists/tuples
@@ -1776,17 +2068,17 @@ impl PyTensor {
     /// Nested Python lists (a bare scalar for rank 0); `bool` tensors give
     /// Python `bool`s.
     fn tolist<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        interop::nested_list(py, &self.shape, &self.data, self.dtype)
+        interop::nested_list(py, &self.shape, &self.data.to_f64(), self.dtype)
     }
 
     /// The single element as a Python `float` (or `bool` for `bool`
     /// tensors); any shape with exactly one element is accepted.
     fn item<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        interop::single_item(py, &self.shape, &self.data, self.dtype)
+        interop::single_item(py, &self.shape, &self.data.to_f64(), self.dtype)
     }
 
     fn __float__(&self) -> PyResult<f64> {
-        match self.data.as_slice() {
+        match self.data.to_f64().as_ref() {
             [value] => Ok(*value),
             _ => Err(PyTypeError::new_err(format!(
                 "only single-element tensors can be converted to a Python float, got shape {:?}",
@@ -1795,8 +2087,7 @@ impl PyTensor {
         }
     }
 
-    /// A read-only NumPy array over the buffer export: zero-copy for
-    /// `float64`, a converted copy for `float32` and `bool`. Imports NumPy
+    /// A read-only NumPy array sharing physical storage for every dtype. Imports NumPy
     /// on first use; `numpy.array(tensor)` gives a writable copy.
     fn numpy<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let numpy = slf.py().import("numpy")?;
@@ -2448,7 +2739,10 @@ impl PyTensorView {
     fn to_flat_vec(&self) -> Result<Vec<f64>, String> {
         let count = element_count(&self.shape)?;
         Ok((0..count)
-            .map(|index| self.data[view_offset(index, &self.shape, &self.strides, self.offset)])
+            .map(|index| {
+                self.data
+                    .get(view_offset(index, &self.shape, &self.strides, self.offset))
+            })
             .collect())
     }
 
@@ -2498,5 +2792,861 @@ impl PyTensorView {
             "TensorView(shape={:?}, strides={:?})",
             self.shape, self.strides
         )
+    }
+}
+
+#[cfg(test)]
+fn storage_address(storage: &HostTensorStorage) -> *const () {
+    match storage {
+        HostTensorStorage::F64(values) => values.as_ptr().cast(),
+        HostTensorStorage::F32(values) => values.as_ptr().cast(),
+        HostTensorStorage::Bool(values) => values.as_ptr().cast(),
+    }
+}
+
+#[cfg(test)]
+fn storage_ptr_eq(lhs: &HostTensorStorage, rhs: &HostTensorStorage) -> bool {
+    match (lhs, rhs) {
+        (HostTensorStorage::F64(lhs), HostTensorStorage::F64(rhs)) => Arc::ptr_eq(lhs, rhs),
+        (HostTensorStorage::F32(lhs), HostTensorStorage::F32(rhs)) => Arc::ptr_eq(lhs, rhs),
+        (HostTensorStorage::Bool(lhs), HostTensorStorage::Bool(rhs)) => Arc::ptr_eq(lhs, rhs),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+fn storage_capacity(storage: &HostTensorStorage) -> usize {
+    match storage {
+        HostTensorStorage::F64(values) => values.capacity(),
+        HostTensorStorage::F32(values) => values.capacity(),
+        HostTensorStorage::Bool(values) => values.capacity(),
+    }
+}
+
+#[cfg(test)]
+mod indexing_tests {
+    use super::*;
+
+    fn previous_index(input: &PyTensor, indices: &[TensorIndex]) -> Result<PyTensor, String> {
+        let mut output = input.clone();
+        let mut axis = 0;
+        for index in indices {
+            match *index {
+                TensorIndex::Slice { start, stop } => {
+                    output = output
+                        .try_slice(axis, start, stop - start, 1)?
+                        .materialize()?;
+                    axis += 1;
+                }
+                TensorIndex::Integer(index) => {
+                    output = output.try_slice(axis, index, 1, 1)?.materialize()?;
+                    let mut shape = output.shape.clone();
+                    shape.remove(axis);
+                    output = output.try_reshape(shape)?;
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    fn assert_same(actual: &PyTensor, expected: &PyTensor) {
+        assert_eq!(actual.shape, expected.shape);
+        assert_eq!(actual.dtype, expected.dtype);
+        assert_eq!(actual.weak, expected.weak);
+        assert_eq!(actual.data.len(), expected.data.len());
+        for (actual, expected) in actual.data.iter().zip(expected.data.iter()) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+    }
+
+    fn fixture(dtype: TensorDType) -> PyTensor {
+        let mut input = PyTensor::from_shape_data_typed(
+            vec![2, 3, 4],
+            (0..24)
+                .map(|i| match i {
+                    0 => -0.0,
+                    1 => f64::from_bits(0x7ff0_0000_0000_0001),
+                    2 => f64::INFINITY,
+                    _ => (i as f64 - 7.0) / 13.0,
+                })
+                .collect(),
+            dtype,
+        )
+        .unwrap();
+        input.weak = dtype != TensorDType::Bool;
+        input
+    }
+
+    #[test]
+    fn gather_preserves_order_duplicates_rounding_and_errors() {
+        for dtype in [TensorDType::F64, TensorDType::F32, TensorDType::Bool] {
+            let input = fixture(dtype);
+            let original = input.clone();
+            for axis in 0..3 {
+                let indices = [input.shape[axis] - 1, 0, input.shape[axis] - 1];
+                let slices = indices
+                    .iter()
+                    .map(|&index| input.try_slice(axis, index, 1, 1)?.materialize())
+                    .collect::<Result<Vec<_>, String>>()
+                    .unwrap();
+                let expected = PyTensor::try_concat(&slices, axis).unwrap();
+                for normalized in [axis as isize, axis as isize - 3] {
+                    let actual = input.try_gather(&indices, normalized).unwrap();
+                    assert_same(&actual, &expected);
+                    assert!(!storage_ptr_eq(&actual.data, &input.data));
+                }
+            }
+            assert_same(&input, &original);
+            assert_eq!(
+                input.try_gather(&[], 0).unwrap_err(),
+                "gather indices must not be empty"
+            );
+            assert_eq!(
+                input.try_gather(&[3], 1).unwrap_err(),
+                "gather index is out of bounds for axis 1 with extent 3"
+            );
+            assert!(input.try_gather(&[0], 3).is_err());
+        }
+        assert!(PyTensor::weak_scalar(2.0).try_gather(&[0], 0).is_err());
+    }
+
+    #[test]
+    fn composed_index_preserves_dropped_axes_scalar_results_and_empty_index() {
+        use TensorIndex::{Integer as I, Slice as S};
+        let selections = [
+            vec![],
+            vec![S { start: 1, stop: 2 }],
+            vec![S { start: 0, stop: 2 }, I(1), S { start: 1, stop: 4 }],
+            vec![I(1), S { start: 0, stop: 3 }, I(2)],
+            vec![I(1), I(2), I(3)],
+            vec![
+                S { start: 0, stop: 2 },
+                S { start: 0, stop: 3 },
+                S { start: 0, stop: 4 },
+            ],
+        ];
+        for dtype in [TensorDType::F64, TensorDType::F32, TensorDType::Bool] {
+            let input = fixture(dtype);
+            for indices in &selections {
+                let actual = input.try_index(indices).unwrap();
+                assert_same(&actual, &previous_index(&input, indices).unwrap());
+                assert_eq!(
+                    storage_ptr_eq(&actual.data, &input.data),
+                    indices.is_empty()
+                );
+            }
+            for indices in [
+                vec![I(2)],
+                vec![S { start: 1, stop: 1 }],
+                vec![I(0), I(0), I(0), I(0)],
+            ] {
+                assert_eq!(
+                    input.try_index(&indices).unwrap_err(),
+                    previous_index(&input, &indices).unwrap_err()
+                );
+            }
+        }
+        let scalar = PyTensor::weak_scalar(-0.0);
+        assert_same(&scalar.try_index(&[]).unwrap(), &scalar);
+    }
+}
+
+#[cfg(test)]
+mod triangular_solve_tests {
+    use super::*;
+
+    #[test]
+    fn eager_triangular_solve_preserves_projection_transpose_and_rounding() -> Result<(), String> {
+        for dtype in [TensorDType::F32, TensorDType::F64] {
+            let original = PyTensor::from_shape_data_typed(
+                vec![3, 3],
+                vec![2.0, 0.7, -0.2, 3.5, 4.0, 0.3, -0.6, 0.4, 5.0],
+                dtype,
+            )?;
+            let rhs = PyTensor::from_shape_data_typed(
+                vec![3, 2],
+                vec![0.3, -1.2, 2.1, 0.4, -0.1, 4.3],
+                dtype,
+            )?;
+            for lower in [false, true] {
+                for transpose in [false, true] {
+                    let projected = original.try_triangular(lower)?;
+                    let matrix = if transpose {
+                        projected.try_transpose(None)?
+                    } else {
+                        projected
+                    };
+                    let scratch = matrix.finite_triangular_solution(&rhs).unwrap();
+                    let actual = original.try_solve_triangular(&rhs, lower, transpose)?;
+                    let previous = matrix.solve_lu(&rhs, dtype)?;
+                    let rounded =
+                        PyTensor::from_shape_data_typed(rhs.shape.clone(), scratch, dtype)?;
+                    assert_eq!(actual.dtype, dtype);
+                    assert_eq!(
+                        actual.data.to_f64().as_ref(),
+                        rounded.data.to_f64().as_ref()
+                    );
+                    let tolerance = if dtype == TensorDType::F32 {
+                        1e-6
+                    } else {
+                        1e-12
+                    };
+                    for (actual, old) in actual.data.iter().zip(previous.data.iter()) {
+                        assert!((actual - old).abs() < tolerance * old.abs().max(1.0));
+                    }
+                    for (residual, expected) in
+                        matrix.try_matmul(&actual)?.data.iter().zip(rhs.data.iter())
+                    {
+                        assert!((residual - expected).abs() < tolerance * expected.abs().max(1.0));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn eager_triangular_solve_keeps_dtype_shape_and_singular_errors() -> Result<(), String> {
+        let matrix = PyTensor::from_shape_data_typed(
+            vec![2, 2],
+            vec![2.0, 0.0, 1.0, 3.0],
+            TensorDType::F32,
+        )?;
+        let rhs = PyTensor::from_shape_data_typed(vec![2, 1], vec![1.0, 2.0], TensorDType::F64)?;
+        assert!(matrix
+            .try_solve_triangular(&rhs, true, false)
+            .unwrap_err()
+            .contains("mismatched dtypes"));
+        let rhs = rhs.converted(TensorDType::F32);
+        let singular = PyTensor::from_shape_data_typed(
+            vec![2, 2],
+            vec![0.0, 0.0, 1.0, 3.0],
+            TensorDType::F32,
+        )?;
+        assert_eq!(
+            singular
+                .try_solve_triangular(&rhs, true, false)
+                .unwrap_err(),
+            "solve requires a non-singular coefficient matrix"
+        );
+        let vector = PyTensor::from_shape_data_typed(vec![2], vec![1.0, 2.0], TensorDType::F32)?;
+        assert!(matrix
+            .try_solve_triangular(&vector, true, false)
+            .unwrap_err()
+            .contains("rank-2"));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod abs_tests {
+    use super::*;
+
+    fn previous_abs(input: &PyTensor) -> PyTensor {
+        let mask = input.try_gt_scalar(0.0).unwrap();
+        let negative = input.try_mul_scalar(-1.0).unwrap();
+        PyTensor::try_where(&mask, input, &negative).unwrap()
+    }
+
+    #[test]
+    fn abs_preserves_ieee_bits_and_dtype_for_both_float_types() {
+        let values = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from_bits(0x7ff8_0000_0000_1234),
+            f64::from_bits(0xfff8_0000_0000_1234),
+            f64::from_bits(0x7ff0_0000_0000_1234),
+            f64::from_bits(0xfff0_0000_0000_1234),
+            f64::from_bits(1),
+            -f64::from_bits(1),
+            f64::from(f32::from_bits(1)),
+            -f64::from(f32::from_bits(1)),
+            1.000_000_06,
+            -1.000_000_06,
+            f64::MAX,
+            -f64::MAX,
+        ];
+        for dtype in [TensorDType::F32, TensorDType::F64] {
+            let input = PyTensor::from_shape_data_typed(vec![3, 6], values.clone(), dtype).unwrap();
+            let expected = previous_abs(&input);
+            let actual = input.try_abs().unwrap();
+            assert_eq!(actual.shape, input.shape);
+            assert_eq!(actual.dtype, dtype);
+            assert_eq!(storage_capacity(&actual.data), input.data.len());
+            assert!(!storage_ptr_eq(&actual.data, &input.data));
+            for (actual, expected) in actual.data.iter().zip(expected.data.iter()) {
+                assert_eq!(actual.to_bits(), expected.to_bits(), "dtype {dtype}");
+            }
+            assert_eq!(actual.data.get(0).to_bits(), (-0.0_f64).to_bits());
+            assert_eq!(actual.data.get(1).to_bits(), 0.0_f64.to_bits());
+        }
+    }
+
+    #[test]
+    fn abs_preserves_strong_result_of_weak_inputs_and_bool_error() {
+        let input = PyTensor::weak_scalar(-2.0);
+        let expected = previous_abs(&input);
+        let actual = input.try_abs().unwrap();
+        assert_eq!(actual.weak, expected.weak);
+        assert!(!actual.weak);
+        assert_eq!(actual.data.to_f64().as_ref(), &[2.0]);
+        assert!(input.weak);
+        assert_eq!(input.data.to_f64().as_ref(), &[-2.0]);
+
+        let input =
+            PyTensor::from_shape_data_typed(vec![2], vec![0.0, 1.0], TensorDType::Bool).unwrap();
+        assert_eq!(input.try_abs().unwrap_err(), bool_operation_error("abs"));
+    }
+}
+
+#[cfg(test)]
+mod matmul_tests {
+    use super::*;
+
+    #[test]
+    fn contiguous_batched_matmul_preserves_accumulation_and_rounding() {
+        for dtype in [TensorDType::F32, TensorDType::F64] {
+            let lhs = PyTensor::from_shape_data_typed(
+                vec![3, 5, 37],
+                (0..555)
+                    .map(|i| match i % 6 {
+                        0 => 1e16,
+                        1 => 1.0,
+                        2 => -1e16,
+                        _ => (i as f64 - 71.0) / 13.0,
+                    })
+                    .collect(),
+                dtype,
+            )
+            .unwrap();
+            let rhs = PyTensor::from_shape_data_typed(
+                vec![1, 37, 29],
+                (0..1073).map(|i| (i as f64 % 17.0 - 8.0) / 7.0).collect(),
+                dtype,
+            )
+            .unwrap();
+            let actual = lhs.try_matmul(&rhs).unwrap();
+            assert_eq!(actual.shape, [3, 5, 29]);
+            assert_eq!(actual.dtype, dtype);
+            for batch in 0..3 {
+                for row in 0..5 {
+                    for col in 0..29 {
+                        let mut expected = 0.0;
+                        for inner in 0..37 {
+                            expected += lhs.data.get(batch * 185 + row * 37 + inner)
+                                * rhs.data.get(inner * 29 + col);
+                        }
+                        assert_eq!(
+                            actual.data.get(batch * 145 + row * 29 + col).to_bits(),
+                            dtype.round(expected).to_bits(),
+                            "dtype {dtype}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod adam_tests {
+    use super::*;
+
+    #[test]
+    fn pure_adam_allocates_three_independent_buffers_and_preserves_aliases() {
+        let input = PyTensor::from_shape_data(vec![2], vec![1.0, -2.0]).unwrap();
+        let (parameters, moments, variances) = input
+            ._adam_update(&input, &input, &input, (0.1, 0.5, 0.75, 0.01, 0.5, 0.25))
+            .unwrap();
+        for output in [&parameters, &moments, &variances] {
+            assert!(!storage_ptr_eq(&input.data, &output.data));
+            assert_eq!(storage_capacity(&output.data), input.data.len());
+        }
+        assert!(!storage_ptr_eq(&parameters.data, &moments.data));
+        assert!(!storage_ptr_eq(&parameters.data, &variances.data));
+        assert!(!storage_ptr_eq(&moments.data, &variances.data));
+        assert_eq!(input.data.to_f64().as_ref(), &[1.0, -2.0]);
+        assert_eq!(moments.data.to_f64().as_ref(), &[1.0, -2.0]);
+        assert_eq!(variances.data.to_f64().as_ref(), &[1.0, -0.5]);
+        assert!(parameters.data.get(1).is_nan());
+    }
+
+    #[test]
+    fn same_shape_binary_preserves_rounding_and_broadcast_fallback() {
+        let shape = vec![1, 1, 2, 1, 1, 1];
+        let lhs = PyTensor::from_shape_data_typed(shape.clone(), vec![1.0, 2.0], TensorDType::F32)
+            .unwrap();
+        let rhs = PyTensor::from_shape_data_typed(shape.clone(), vec![0.1, 0.1], TensorDType::F32)
+            .unwrap();
+        let zipped = lhs.try_add(&rhs).unwrap();
+        let scalar = PyTensor::from_shape_data_typed(vec![], vec![0.1], TensorDType::F32).unwrap();
+        let broadcast = lhs.try_add(&scalar).unwrap();
+        assert_eq!(zipped.shape, shape);
+        assert_eq!(zipped.data, broadcast.data);
+        assert_eq!(zipped.dtype, TensorDType::F32);
+    }
+}
+
+#[cfg(test)]
+mod contiguous_reduction_tests {
+    use super::*;
+
+    #[test]
+    fn axis_reduction_preserves_coordinate_reference_bits() {
+        for shape in [vec![2, 3, 5], vec![1, 2, 1, 3], vec![6]] {
+            for dtype in [TensorDType::F32, TensorDType::F64] {
+                let values = (0..element_count(&shape).unwrap())
+                    .map(|i| match i % 8 {
+                        0 => 1e16,
+                        1 => 1.0,
+                        2 => -1e16,
+                        3 => -0.0,
+                        4 => f64::INFINITY,
+                        5 => f64::NEG_INFINITY,
+                        6 => f64::from_bits(0x7ff8_0000_0000_1234),
+                        _ => 0.125,
+                    })
+                    .collect();
+                let input = PyTensor::from_shape_data_typed(shape.clone(), values, dtype).unwrap();
+                for (axis, &extent) in shape.iter().enumerate() {
+                    for scale in [1.0, 1.0 / extent as f64] {
+                        let mut output_shape = shape.clone();
+                        output_shape.remove(axis);
+                        let strides = contiguous_strides(&output_shape);
+                        let mut expected = vec![0.0; element_count(&output_shape).unwrap()];
+                        for (index, value) in input.data.iter().enumerate() {
+                            let mut remaining = index;
+                            let mut output_index = 0;
+                            for source_axis in (0..shape.len()).rev() {
+                                let coordinate = remaining % shape[source_axis];
+                                remaining /= shape[source_axis];
+                                if source_axis != axis {
+                                    let output_axis = if source_axis < axis {
+                                        source_axis
+                                    } else {
+                                        source_axis - 1
+                                    };
+                                    output_index += coordinate * strides[output_axis];
+                                }
+                            }
+                            expected[output_index] += value * scale;
+                        }
+                        let actual = input.try_reduce(Some(axis as isize), scale).unwrap();
+                        assert_eq!(actual.shape, output_shape);
+                        assert_eq!(actual.dtype, dtype);
+                        for (actual, expected) in actual.data.iter().zip(expected) {
+                            assert_eq!(actual.to_bits(), dtype.round(expected).to_bits());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_broadcast_preserves_operand_order_and_shape_validation() {
+        let vector = PyTensor::from_shape_data(vec![2], vec![2.0, 4.0]).unwrap();
+        let scalar = PyTensor::from_shape_data(vec![1, 1], vec![8.0]).unwrap();
+        let left = scalar.try_sub(&vector).unwrap();
+        let right = vector.try_sub(&scalar).unwrap();
+        assert_eq!(left.shape, [1, 2]);
+        assert_eq!(left.data.to_f64().as_ref(), [6.0, 4.0]);
+        assert_eq!(right.data.to_f64().as_ref(), [-6.0, -4.0]);
+        let incompatible = PyTensor::from_shape_data(vec![3], vec![1.0; 3]).unwrap();
+        assert!(vector
+            .try_add(&incompatible)
+            .unwrap_err()
+            .contains("cannot broadcast"));
+    }
+}
+
+#[cfg(test)]
+mod owned_output_tests {
+    use super::*;
+
+    #[test]
+    fn native_storage_is_dtype_sized_and_shape_views_share_it() {
+        for (dtype, itemsize) in [
+            (TensorDType::F64, 8),
+            (TensorDType::F32, 4),
+            (TensorDType::Bool, 1),
+        ] {
+            let tensor =
+                PyTensor::from_shape_data_typed(vec![16, 16], vec![0.1; 256], dtype).unwrap();
+            assert_eq!(storage_capacity(&tensor.data) * itemsize, 256 * itemsize);
+            assert_eq!(tensor.data.dtype(), dtype);
+            let reshaped = tensor.try_reshape(vec![256]).unwrap();
+            assert!(storage_ptr_eq(&tensor.data, &reshaped.data));
+            let dynamic = tensor.to_dynamic_tensor().unwrap();
+            assert!(storage_ptr_eq(&tensor.data, dynamic.storage()));
+            let output = PyTensor::from_dynamic_tensor(dynamic).unwrap();
+            assert!(storage_ptr_eq(&tensor.data, &output.data));
+            let cast = tensor.clone().typed(TensorDType::F64);
+            assert_eq!(
+                cast.data.iter().collect::<Vec<_>>(),
+                tensor.data.iter().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn fused_sgd_preserves_f64_intermediate_bits_and_input_aliases() {
+        for dtype in [TensorDType::F64, TensorDType::F32] {
+            let parameter = PyTensor::from_shape_data_typed(
+                vec![6],
+                vec![-0.0, 1.0000001, 1e16, f64::INFINITY, f64::NAN, -2.0],
+                dtype,
+            )
+            .unwrap();
+            let gradient = PyTensor::from_shape_data_typed(
+                vec![6],
+                vec![0.0, 0.12345678, 1.0, 1.0, 2.0, -3.0],
+                dtype,
+            )
+            .unwrap();
+            let snapshot = parameter.data.iter().map(f64::to_bits).collect::<Vec<_>>();
+            let alias = parameter.clone();
+            for rate in [0.0, 0.123456789, -1.0] {
+                let output = parameter._sgd_update(&gradient, rate).unwrap();
+                let expected = parameter
+                    .data
+                    .iter()
+                    .zip(gradient.data.iter())
+                    .map(|(parameter, gradient)| dtype.round(parameter - gradient * rate).to_bits())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    output.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+                    expected
+                );
+                assert!(!storage_ptr_eq(&output.data, &parameter.data));
+                assert!(!output.weak);
+            }
+            assert_eq!(
+                alias.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+                snapshot
+            );
+        }
+    }
+
+    #[test]
+    fn conversion_preserves_storage_address_bits_dtype_and_strength() {
+        for dtype in [TensorDType::F64, TensorDType::F32, TensorDType::Bool] {
+            let tensor = quabla_core::tensor_ir::DynamicTensor::with_dtype(
+                vec![2, 2],
+                vec![-0.0, f64::from_bits(0x7ff0_0000_0000_0001), 0.1, -2.0],
+                dtype,
+            )
+            .unwrap();
+            let address = storage_address(tensor.storage());
+            let bits = tensor
+                .data()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>();
+            let output = PyTensor::from_dynamic_tensor(tensor).unwrap();
+            assert_eq!(storage_address(&output.data), address);
+            assert_eq!(output.shape, [2, 2]);
+            assert_eq!(output.dtype, dtype);
+            assert!(!output.weak);
+            assert_eq!(
+                output.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                bits
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod broadcast_carry_tests {
+    use super::*;
+
+    fn reference_zip(
+        lhs: &PyTensor,
+        rhs: &PyTensor,
+        dtype: TensorDType,
+        f: impl Fn(f64, f64) -> Result<f64, String>,
+    ) -> Result<PyTensor, String> {
+        let shape = broadcast_shape(&lhs.shape, &rhs.shape)?;
+        let lhs_strides = contiguous_strides(&lhs.shape);
+        let rhs_strides = contiguous_strides(&rhs.shape);
+        let mut data = Vec::with_capacity(element_count(&shape)?);
+        for index in 0..element_count(&shape)? {
+            let lhs_index = broadcast_offset(index, &shape, &lhs.shape, &lhs_strides);
+            let rhs_index = broadcast_offset(index, &shape, &rhs.shape, &rhs_strides);
+            let value = f(lhs.data.get(lhs_index), rhs.data.get(rhs_index))
+                .map_err(|err| format!("failed to evaluate tensor test: {err}"))?;
+            data.push(dtype.round(value));
+        }
+        Ok(PyTensor {
+            shape,
+            data: HostTensorStorage::from_f64(data, dtype),
+            dtype,
+            weak: false,
+        })
+    }
+
+    fn fixture(shape: Vec<usize>, dtype: TensorDType) -> PyTensor {
+        let count = element_count(&shape).unwrap();
+        PyTensor::from_shape_data_typed(
+            shape,
+            (0..count)
+                .map(|index| match index % 7 {
+                    0 => -0.0,
+                    1 => 0.0,
+                    2 => f64::INFINITY,
+                    3 => f64::NAN,
+                    _ => index as f64 * 0.13 - 0.7,
+                })
+                .collect(),
+            dtype,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn carried_offsets_preserve_output_bits_and_first_error() {
+        for dtype in [TensorDType::F32, TensorDType::F64] {
+            for (lhs_shape, rhs_shape) in [
+                (vec![3, 1], vec![1, 5]),
+                (vec![2, 1, 4, 1], vec![3, 1, 5]),
+                (vec![2, 1, 1, 1, 3, 1], vec![1, 4]),
+                (vec![2, 3], vec![3]),
+                (vec![2, 3], vec![4]),
+            ] {
+                let lhs = fixture(lhs_shape, dtype);
+                let rhs = fixture(rhs_shape, dtype);
+                for checked in [false, true] {
+                    let operation = |left, right| {
+                        if checked && right == 0.0 {
+                            Err("zero divisor".into())
+                        } else {
+                            Ok(left - right)
+                        }
+                    };
+                    match (
+                        lhs.zip_broadcast(&rhs, "test", dtype, operation),
+                        reference_zip(&lhs, &rhs, dtype, operation),
+                    ) {
+                        (Ok(actual), Ok(expected)) => {
+                            assert_eq!(actual.shape, expected.shape);
+                            assert_eq!(
+                                actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+                                expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
+                            );
+                        }
+                        (Err(actual), Err(expected)) => assert_eq!(actual, expected),
+                        pair => panic!("different broadcast outcomes: {pair:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_unary_storage_preserves_dtype_bits_and_weakness() {
+        for dtype in [TensorDType::F64, TensorDType::F32, TensorDType::Bool] {
+            let source = fixture(vec![7], dtype);
+            let operation = |value: f64| -value;
+            let expected = PyTensor::from_shape_data_typed(
+                source.shape.clone(),
+                source.data.iter().map(operation).collect(),
+                dtype,
+            )
+            .unwrap();
+            let actual = source.try_map(operation).unwrap();
+            assert_eq!(actual.dtype, expected.dtype);
+            assert_eq!(actual.shape, expected.shape);
+            assert_eq!(
+                actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+                expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
+            );
+        }
+        let scalar = PyTensor::weak_scalar(-0.0);
+        let result = scalar.try_map(|value| -value).unwrap();
+        assert!(result.weak);
+        assert_eq!(result.data.get(0).to_bits(), 0.0f64.to_bits());
+    }
+
+    #[test]
+    #[ignore = "complete native broadcast release timing probe"]
+    fn profile_broadcast_carry() {
+        use std::time::Instant;
+        for (lhs_shape, rhs_shape) in [
+            (vec![4, 1], vec![1, 4]),
+            (vec![256, 1], vec![1, 256]),
+            (vec![16, 1, 16, 1], vec![1, 16, 1, 16]),
+            (vec![4, 1, 4, 1, 4, 1, 4, 1], vec![1, 4, 1, 4, 1, 4, 1, 4]),
+        ] {
+            let rank = lhs_shape.len();
+            let elements =
+                element_count(&broadcast_shape(&lhs_shape, &rhs_shape).unwrap()).unwrap();
+            let lhs = fixture(lhs_shape, TensorDType::F32);
+            let rhs = fixture(rhs_shape, TensorDType::F32);
+            let modes = if std::env::var_os("QUABLA_BROADCAST_CARRY_FIRST").is_some() {
+                [false, true]
+            } else {
+                [true, false]
+            };
+            for reference in modes {
+                let mut times = Vec::new();
+                for _ in 0..15 {
+                    let start = Instant::now();
+                    let output = if reference {
+                        reference_zip(&lhs, &rhs, TensorDType::F32, |left, right| Ok(left - right))
+                    } else {
+                        lhs.zip_broadcast(&rhs, "test", TensorDType::F32, |left, right| {
+                            Ok(left - right)
+                        })
+                    }
+                    .unwrap();
+                    std::hint::black_box(output);
+                    times.push(start.elapsed().as_nanos());
+                }
+                times.sort();
+                println!("{{\"rank\":{rank},\"elements\":{elements},\"reference\":{reference},\"median_ns\":{}}}", times[7]);
+            }
+        }
+    }
+    fn reference_where(
+        mask: &PyTensor,
+        on_true: &PyTensor,
+        on_false: &PyTensor,
+    ) -> Result<PyTensor, String> {
+        let shape = broadcast_shape(
+            &mask.shape,
+            &broadcast_shape(&on_true.shape, &on_false.shape)?,
+        )?;
+        let strides = [
+            contiguous_strides(&mask.shape),
+            contiguous_strides(&on_true.shape),
+            contiguous_strides(&on_false.shape),
+        ];
+        let mut data = Vec::with_capacity(element_count(&shape)?);
+        for index in 0..element_count(&shape)? {
+            let m = broadcast_offset(index, &shape, &mask.shape, &strides[0]);
+            let t = broadcast_offset(index, &shape, &on_true.shape, &strides[1]);
+            let f = broadcast_offset(index, &shape, &on_false.shape, &strides[2]);
+            data.push(if mask.data.get(m) != 0.0 {
+                on_true.data.get(t)
+            } else {
+                on_false.data.get(f)
+            });
+        }
+        PyTensor::from_shape_data_typed(shape, data, on_true.dtype)
+    }
+
+    fn reference_broadcast(input: &PyTensor, target: &[usize]) -> Result<PyTensor, String> {
+        if broadcast_shape(&input.shape, target)? != target {
+            return Err(format!(
+                "cannot broadcast tensor shape {:?} to {:?}",
+                input.shape, target
+            ));
+        }
+        let strides = contiguous_strides(&input.shape);
+        let data = (0..element_count(target)?)
+            .map(|index| {
+                input
+                    .data
+                    .get(broadcast_offset(index, target, &input.shape, &strides))
+            })
+            .collect();
+        PyTensor::from_shape_data_typed(target.to_vec(), data, input.dtype)
+    }
+
+    #[test]
+    fn selection_and_unary_broadcast_preserve_bits_dtype_and_errors() {
+        for dtype in [TensorDType::F64, TensorDType::F32, TensorDType::Bool] {
+            let mask = PyTensor::from_shape_data_typed(
+                vec![2, 1, 1, 1],
+                vec![0.0, 1.0],
+                TensorDType::Bool,
+            )
+            .unwrap();
+            let on_true = fixture(vec![1, 3, 1, 4], dtype);
+            let on_false = fixture(vec![2, 1, 5, 1], dtype);
+            let actual = PyTensor::try_where(&mask, &on_true, &on_false).unwrap();
+            let expected = reference_where(&mask, &on_true, &on_false).unwrap();
+            assert_eq!(actual.dtype, expected.dtype);
+            assert_eq!(actual.shape, expected.shape);
+            assert_eq!(
+                actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+                expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
+            );
+            let input = fixture(vec![3, 1, 4], dtype);
+            for target in [vec![2, 3, 5, 4], vec![3, 5, 4], vec![2, 3, 5, 7]] {
+                match (
+                    input.try_broadcast_to(target.clone()),
+                    reference_broadcast(&input, &target),
+                ) {
+                    (Ok(actual), Ok(expected)) => {
+                        assert_eq!(actual.dtype, expected.dtype);
+                        assert_eq!(actual.shape, expected.shape);
+                        assert_eq!(
+                            actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+                            expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
+                        );
+                    }
+                    (Err(actual), Err(expected)) => assert_eq!(actual, expected),
+                    pair => panic!("different broadcast outcomes: {pair:?}"),
+                }
+            }
+            let mask = fixture(vec![7], TensorDType::Bool);
+            assert_eq!(
+                PyTensor::try_where(&mask, &on_true, &on_false).unwrap_err(),
+                reference_where(&mask, &on_true, &on_false).unwrap_err()
+            );
+        }
+        // A legacy NaN mask is nonzero; unselected NaNs remain unobserved.
+        let mask = fixture(vec![4, 1], TensorDType::F64);
+        let on_true = fixture(vec![1, 7], TensorDType::F64);
+        let on_false = fixture(vec![4, 1], TensorDType::F64);
+        let actual = PyTensor::try_where(&mask, &on_true, &on_false).unwrap();
+        let expected = reference_where(&mask, &on_true, &on_false).unwrap();
+        assert_eq!(
+            actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
+            expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[ignore = "complete where and unary broadcast release timing probe"]
+    fn profile_selection_carry() {
+        use std::time::Instant;
+        let mask = fixture(vec![16, 1, 1, 1], TensorDType::Bool);
+        let on_true = fixture(vec![1, 16, 16, 1], TensorDType::F32);
+        let on_false = fixture(vec![1, 1, 1, 16], TensorDType::F32);
+        let input = fixture(vec![1, 16, 1, 16], TensorDType::F32);
+        let target = vec![16; 4];
+        let modes = if std::env::var_os("QUABLA_BROADCAST_CARRY_FIRST").is_some() {
+            [false, true]
+        } else {
+            [true, false]
+        };
+        for operation in ["where", "broadcast"] {
+            for old in modes {
+                let mut times = Vec::new();
+                for _ in 0..15 {
+                    let start = Instant::now();
+                    let result = match (operation, old) {
+                        ("where", true) => reference_where(&mask, &on_true, &on_false),
+                        ("where", false) => PyTensor::try_where(&mask, &on_true, &on_false),
+                        (_, true) => reference_broadcast(&input, &target),
+                        (_, false) => input.try_broadcast_to(target.clone()),
+                    }
+                    .unwrap();
+                    std::hint::black_box(result);
+                    times.push(start.elapsed().as_nanos());
+                }
+                times.sort();
+                println!(
+                    "{{\"operation\":\"{operation}\",\"reference\":{old},\"median_ns\":{}}}",
+                    times[7]
+                );
+            }
+        }
     }
 }

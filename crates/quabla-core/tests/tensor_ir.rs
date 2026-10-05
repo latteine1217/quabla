@@ -31,6 +31,45 @@ macro_rules! must {
 }
 
 #[test]
+fn mlx_lowering_validation_rejects_solve_and_checks_inactive_regions_without_execution() {
+    let mut branch = TensorIr::new();
+    let a = must!(branch.input("a", vec![1, 1]));
+    let b = must!(branch.input("b", vec![1, 1]));
+    let solved = must!(branch.solve(a, b));
+    let bad = must!(branch.compile_cpu(solved));
+    assert_eq!(
+        bad.validate_mlx().map_err(|(op, _)| op),
+        Err("solve".into())
+    );
+    let mut good = TensorIr::new();
+    let a = must!(good.input("a", vec![1, 1]));
+    let b = must!(good.input("b", vec![1, 1]));
+    let sum = must!(good.add(a, b));
+    let good = must!(good.compile_cpu(sum));
+    let branches = must!(TensorCondExecutionPlan::new(good, bad));
+    let mut graph = TensorIr::new();
+    let predicate = graph.scalar_constant(1.0);
+    let a = must!(graph.input("a", vec![1, 1]));
+    let b = must!(graph.input("b", vec![1, 1]));
+    let output = must!(graph.cond_with_captures(
+        predicate,
+        branches,
+        vec![("a".into(), a), ("b".into(), b)]
+    ));
+    let plan = must!(graph.compile_cpu(output));
+    assert_eq!(
+        plan.validate_mlx().map_err(|(op, _)| op),
+        Err("solve".into())
+    );
+    // The unsupported region remains valid on CPU and the chosen branch is lazy.
+    let inputs = BTreeMap::from([
+        ("a".into(), must!(DynamicTensor::new(vec![1, 1], vec![2.0]))),
+        ("b".into(), must!(DynamicTensor::new(vec![1, 1], vec![3.0]))),
+    ]);
+    assert_eq!(must!(plan.evaluate(&inputs)).data().as_ref(), &[5.0]);
+}
+
+#[test]
 fn backend_precision_contract_keeps_cpu_reference_and_gpu_execution_explicit() {
     assert_eq!(
         TensorDeviceBackend::Cpu.precision(),
@@ -286,7 +325,7 @@ fn assert_multi_output_parity(target: QuablaTarget) {
     assert_eq!(actual.len(), expected.len());
     for (actual, expected) in actual.iter().zip(&expected) {
         assert_eq!(actual.shape(), expected.shape());
-        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+        for (actual, expected) in actual.data().iter().zip(expected.data().iter()) {
             assert!(
                 (actual - expected).abs() < 1e-5,
                 "actual={actual}, expected={expected}"
@@ -374,7 +413,7 @@ fn max_scaled_error(actual: &[DynamicTensor], expected: &[DynamicTensor]) -> f64
             actual
                 .data()
                 .iter()
-                .zip(expected.data())
+                .zip(expected.data().iter())
                 .map(|(actual, expected)| (actual - expected).abs() / expected.abs().max(1.0))
                 .collect::<Vec<_>>()
         })
@@ -427,7 +466,7 @@ fn assert_f32_mlp_parity(target: QuablaTarget) {
     let device = must!(must!(compiler.compile_many(&program, target)).execute(&inputs));
     for (actual, expected) in device.iter().zip(&cpu) {
         assert_eq!(actual.dtype(), expected.dtype());
-        assert_eq!(actual.data(), expected.data());
+        assert_eq!(actual.data().as_ref(), expected.data().as_ref());
     }
     assert_eq!(device[0].dtype(), TensorDType::F32);
     assert_eq!(device[1].dtype(), TensorDType::F64);
@@ -516,7 +555,7 @@ fn tensor_ir_evaluates_broadcasted_expression_and_vjp() {
     let value = must!(graph.evaluate(output, &inputs));
     assert_eq!(value.shape(), &[2, 4, 3]);
     assert_eq!(
-        value.data(),
+        value.data().as_ref(),
         &[
             11.0, 22.0, 33.0, 21.0, 42.0, 63.0, 31.0, 62.0, 93.0, 41.0, 82.0, 123.0, 44.0, 55.0,
             66.0, 84.0, 105.0, 126.0, 124.0, 155.0, 186.0, 164.0, 205.0, 246.0
@@ -525,8 +564,8 @@ fn tensor_ir_evaluates_broadcasted_expression_and_vjp() {
 
     let cotangent = must!(DynamicTensor::filled(vec![2, 4, 3], 1.0));
     let gradients = must!(graph.vjp(output, &inputs, cotangent));
-    assert_eq!(gradients["x"].data(), &[104.0; 6]);
-    assert_eq!(gradients["y"].data(), &[21.0; 4]);
+    assert_eq!(gradients["x"].data().as_ref(), &[104.0; 6]);
+    assert_eq!(gradients["y"].data().as_ref(), &[21.0; 4]);
     assert!(graph.lower_text().contains("tensor<2x4x3xf64>"));
 
     let tangents = BTreeMap::from([
@@ -543,7 +582,7 @@ fn tensor_ir_evaluates_broadcasted_expression_and_vjp() {
     assert_eq!(jvp_value, value);
     assert_eq!(jvp_tangent.shape(), &[2, 4, 3]);
     assert_eq!(
-        jvp_tangent.data(),
+        jvp_tangent.data().as_ref(),
         &[
             12.0, 13.0, 14.0, 22.0, 23.0, 24.0, 32.0, 33.0, 34.0, 42.0, 43.0, 44.0, 15.0, 16.0,
             17.0, 25.0, 26.0, 27.0, 35.0, 36.0, 37.0, 45.0, 46.0, 47.0
@@ -564,10 +603,10 @@ fn tensor_ir_sum_builds_a_scalar_loss_with_vjp_and_jvp() {
 
     let value = must!(graph.evaluate(loss, &inputs));
     assert_eq!(value.shape(), &[] as &[usize]);
-    assert_eq!(value.data(), &[30.0]);
+    assert_eq!(value.data().as_ref(), &[30.0]);
 
     let gradients = must!(graph.vjp(loss, &inputs, must!(DynamicTensor::filled(vec![], 1.0)),));
-    assert_eq!(gradients["x"].data(), &[2.0, 4.0, 6.0, 8.0]);
+    assert_eq!(gradients["x"].data().as_ref(), &[2.0, 4.0, 6.0, 8.0]);
 
     let tangents = BTreeMap::from([(
         "x".to_string(),
@@ -575,7 +614,7 @@ fn tensor_ir_sum_builds_a_scalar_loss_with_vjp_and_jvp() {
     )]);
     let (_, tangent) = must!(graph.jvp(loss, &inputs, &tangents));
     assert_eq!(tangent.shape(), &[] as &[usize]);
-    assert_eq!(tangent.data(), &[20.0]);
+    assert_eq!(tangent.data().as_ref(), &[20.0]);
 }
 
 #[test]
@@ -595,21 +634,23 @@ fn tensor_ir_where_routes_gradients_without_differentiating_the_condition() {
     )]);
 
     assert_eq!(
-        must!(graph.evaluate(selected, &inputs)).data(),
+        must!(graph.evaluate(selected, &inputs)).data().as_ref(),
         &[-6.0, -3.0, 0.0, 4.0]
     );
     let gradients = must!(graph.vjp(loss, &inputs, must!(DynamicTensor::filled(vec![], 1.0)),));
-    assert_eq!(gradients["x"].data(), &[3.0, 3.0, 3.0, 4.0]);
+    assert_eq!(gradients["x"].data().as_ref(), &[3.0, 3.0, 3.0, 4.0]);
     let (_, tangent) = must!(graph.jvp(
         loss,
         &inputs,
         &BTreeMap::from([("x".to_string(), must!(DynamicTensor::filled(vec![4], 1.0)))]),
     ));
-    assert_eq!(tangent.data(), &[13.0]);
+    assert_eq!(tangent.data().as_ref(), &[13.0]);
 
     let transformed = must!(graph.symbolic_jvp(loss, "x"));
     assert_eq!(
-        must!(transformed.graph.evaluate(transformed.tangent, &inputs)).data(),
+        must!(transformed.graph.evaluate(transformed.tangent, &inputs))
+            .data()
+            .as_ref(),
         &[13.0]
     );
 }
@@ -650,7 +691,7 @@ fn tensor_ir_cond_executes_only_the_selected_cpu_region_and_routes_ad() {
             must!(DynamicTensor::new(vec![], vec![2.0])),
         ),
     ]);
-    assert_eq!(must!(plan.evaluate(&true_inputs)).data(), &[16.0]);
+    assert_eq!(must!(plan.evaluate(&true_inputs)).data().as_ref(), &[16.0]);
     let (_, tangent) = must!(plan.jvp(
         &true_inputs,
         &BTreeMap::from([
@@ -664,10 +705,10 @@ fn tensor_ir_cond_executes_only_the_selected_cpu_region_and_routes_ad() {
             ),
         ]),
     ));
-    assert_eq!(tangent.data(), &[16.0]);
+    assert_eq!(tangent.data().as_ref(), &[16.0]);
     let gradients = must!(plan.vjp(&true_inputs, must!(DynamicTensor::new(vec![], vec![1.0]))));
-    assert_eq!(gradients["x"].data(), &[16.0]);
-    assert_eq!(gradients["predicate"].data(), &[0.0]);
+    assert_eq!(gradients["x"].data().as_ref(), &[16.0]);
+    assert_eq!(gradients["predicate"].data().as_ref(), &[0.0]);
 
     let false_inputs = BTreeMap::from([
         (
@@ -679,7 +720,7 @@ fn tensor_ir_cond_executes_only_the_selected_cpu_region_and_routes_ad() {
             must!(DynamicTensor::new(vec![], vec![2.0])),
         ),
     ]);
-    assert_eq!(must!(plan.evaluate(&false_inputs)).data(), &[12.0]);
+    assert_eq!(must!(plan.evaluate(&false_inputs)).data().as_ref(), &[12.0]);
 }
 
 #[test]
@@ -710,7 +751,10 @@ fn tensor_ir_cond_does_not_evaluate_an_inactive_failing_branch() {
             must!(DynamicTensor::new(vec![], vec![2.0])),
         ),
     ]);
-    assert_eq!(must!(graph.evaluate(output, &inputs)).data(), &[2.0]);
+    assert_eq!(
+        must!(graph.evaluate(output, &inputs)).data().as_ref(),
+        &[2.0]
+    );
 }
 
 #[test]
@@ -751,11 +795,15 @@ fn symbolic_jvp_transforms_cond_regions_with_explicit_captures() {
             ),
         ]);
         assert_eq!(
-            must!(transformed.graph.evaluate(transformed.value, &inputs)).data(),
+            must!(transformed.graph.evaluate(transformed.value, &inputs))
+                .data()
+                .as_ref(),
             &[expected_value]
         );
         assert_eq!(
-            must!(transformed.graph.evaluate(transformed.tangent, &inputs)).data(),
+            must!(transformed.graph.evaluate(transformed.tangent, &inputs))
+                .data()
+                .as_ref(),
             &[expected_tangent]
         );
     }
@@ -803,21 +851,25 @@ fn symbolic_vjp_transforms_cond_regions_with_explicit_captures() {
             ),
         ]);
         assert_eq!(
-            must!(transformed.graph.evaluate(transformed.value, &inputs)).data(),
+            must!(transformed.graph.evaluate(transformed.value, &inputs))
+                .data()
+                .as_ref(),
             &[expected_value]
         );
         assert_eq!(
             must!(transformed
                 .graph
                 .evaluate(transformed.gradients["x"], &inputs))
-            .data(),
+            .data()
+            .as_ref(),
             &[expected_gradient]
         );
         assert_eq!(
             must!(transformed
                 .graph
                 .evaluate(transformed.gradients["predicate"], &inputs))
-            .data(),
+            .data()
+            .as_ref(),
             &[0.0]
         );
     }
@@ -870,7 +922,8 @@ fn hessian_and_hvp_support_cond_regions_through_symbolic_ad() {
                 &inputs,
                 must!(DynamicTensor::new(vec![], vec![1.0])),
             ))
-            .data(),
+            .data()
+            .as_ref(),
             &[expected]
         );
     }
@@ -896,7 +949,9 @@ fn fori_region_executes_and_differentiates_without_static_unrolling() {
         must!(DynamicTensor::new(vec![], vec![2.0])),
     )]);
     assert_eq!(
-        must!(loop_plan.evaluate(must!(DynamicTensor::new(vec![], vec![1.0])), &external)).data(),
+        must!(loop_plan.evaluate(must!(DynamicTensor::new(vec![], vec![1.0])), &external))
+            .data()
+            .as_ref(),
         &[12.0]
     );
     let (_, tangent) = must!(loop_plan.jvp(
@@ -908,24 +963,24 @@ fn fori_region_executes_and_differentiates_without_static_unrolling() {
             must!(DynamicTensor::new(vec![], vec![0.0])),
         )]),
     ));
-    assert_eq!(tangent.data(), &[8.0]);
+    assert_eq!(tangent.data().as_ref(), &[8.0]);
     let (value, initial_gradient, external_gradients) = must!(loop_plan.value_and_vjp(
         must!(DynamicTensor::new(vec![], vec![1.0])),
         &external,
         must!(DynamicTensor::new(vec![], vec![1.0])),
     ));
-    assert_eq!(value.data(), &[12.0]);
-    assert_eq!(initial_gradient.data(), &[8.0]);
-    assert_eq!(external_gradients["scale"].data(), &[13.0]);
+    assert_eq!(value.data().as_ref(), &[12.0]);
+    assert_eq!(initial_gradient.data().as_ref(), &[8.0]);
+    assert_eq!(external_gradients["scale"].data().as_ref(), &[13.0]);
 
     let (_, tape) = must!(
         loop_plan.evaluate_with_tape(must!(DynamicTensor::new(vec![], vec![1.0])), &external,)
     );
     assert_eq!(tape.len(), 4);
-    assert_eq!(must!(tape.carry_at(0)).data(), &[1.0]);
-    assert_eq!(must!(tape.carry_at(1)).data(), &[2.0]);
-    assert_eq!(must!(tape.carry_at(2)).data(), &[5.0]);
-    assert_eq!(must!(tape.carry_at(3)).data(), &[12.0]);
+    assert_eq!(must!(tape.carry_at(0)).data().as_ref(), &[1.0]);
+    assert_eq!(must!(tape.carry_at(1)).data().as_ref(), &[2.0]);
+    assert_eq!(must!(tape.carry_at(2)).data().as_ref(), &[5.0]);
+    assert_eq!(must!(tape.carry_at(3)).data().as_ref(), &[12.0]);
 }
 
 #[test]
@@ -950,7 +1005,8 @@ fn fori_region_allows_an_unused_index_input() {
                 must!(DynamicTensor::new(vec![], vec![2.0])),
             )]),
         ))
-        .data(),
+        .data()
+        .as_ref(),
         &[7.0]
     );
 }
@@ -983,8 +1039,8 @@ fn multi_carry_fori_region_preserves_ordered_outputs_and_external_captures() {
             must!(DynamicTensor::new(vec![1], vec![3.0])),
         )]),
     ));
-    assert_eq!(carries[0].data(), &[2.0]);
-    assert_eq!(carries[1].data(), &[18.0]);
+    assert_eq!(carries[0].data().as_ref(), &[2.0]);
+    assert_eq!(carries[1].data().as_ref(), &[18.0]);
 
     let (_, initial_gradients, external_gradients) = must!(loop_plan.value_and_vjp(
         vec![
@@ -1000,9 +1056,9 @@ fn multi_carry_fori_region_preserves_ordered_outputs_and_external_captures() {
             must!(DynamicTensor::new(vec![1], vec![1.0])),
         ],
     ));
-    assert_eq!(initial_gradients[0].data(), &[1.0]);
-    assert_eq!(initial_gradients[1].data(), &[9.0]);
-    assert_eq!(external_gradients["scale"].data(), &[12.0]);
+    assert_eq!(initial_gradients[0].data().as_ref(), &[1.0]);
+    assert_eq!(initial_gradients[1].data().as_ref(), &[9.0]);
+    assert_eq!(external_gradients["scale"].data().as_ref(), &[12.0]);
 }
 
 #[test]
@@ -1022,9 +1078,9 @@ fn scan_region_stacks_fixed_shape_outputs_without_unrolling_the_body_plan() {
             must!(DynamicTensor::new(vec![], vec![2.0])),
         )]),
     ));
-    assert_eq!(carry.data(), &[12.0]);
+    assert_eq!(carry.data().as_ref(), &[12.0]);
     assert_eq!(outputs.shape(), &[3]);
-    assert_eq!(outputs.data(), &[2.0, 5.0, 12.0]);
+    assert_eq!(outputs.data().as_ref(), &[2.0, 5.0, 12.0]);
     let (_, _, tape) = must!(scan.evaluate_with_tape(
         must!(DynamicTensor::new(vec![], vec![1.0])),
         &BTreeMap::from([(
@@ -1033,7 +1089,7 @@ fn scan_region_stacks_fixed_shape_outputs_without_unrolling_the_body_plan() {
         )]),
     ));
     assert_eq!(tape.len(), 4);
-    assert_eq!(must!(tape.carry_at(2)).data(), &[5.0]);
+    assert_eq!(must!(tape.carry_at(2)).data().as_ref(), &[5.0]);
     let ((carry, outputs), (carry_tangent, output_tangents)) = must!(scan.jvp(
         must!(DynamicTensor::new(vec![], vec![1.0])),
         must!(DynamicTensor::new(vec![], vec![0.0])),
@@ -1046,10 +1102,10 @@ fn scan_region_stacks_fixed_shape_outputs_without_unrolling_the_body_plan() {
             must!(DynamicTensor::new(vec![], vec![1.0])),
         )]),
     ));
-    assert_eq!(carry.data(), &[12.0]);
-    assert_eq!(outputs.data(), &[2.0, 5.0, 12.0]);
-    assert_eq!(carry_tangent.data(), &[13.0]);
-    assert_eq!(output_tangents.data(), &[1.0, 4.0, 13.0]);
+    assert_eq!(carry.data().as_ref(), &[12.0]);
+    assert_eq!(outputs.data().as_ref(), &[2.0, 5.0, 12.0]);
+    assert_eq!(carry_tangent.data().as_ref(), &[13.0]);
+    assert_eq!(output_tangents.data().as_ref(), &[1.0, 4.0, 13.0]);
     let (_, _, initial_gradient, gradients) = must!(scan.value_and_vjp(
         must!(DynamicTensor::new(vec![], vec![1.0])),
         &BTreeMap::from([(
@@ -1059,8 +1115,8 @@ fn scan_region_stacks_fixed_shape_outputs_without_unrolling_the_body_plan() {
         must!(DynamicTensor::new(vec![], vec![0.0])),
         must!(DynamicTensor::new(vec![3], vec![1.0, 1.0, 1.0])),
     ));
-    assert_eq!(initial_gradient.data(), &[14.0]);
-    assert_eq!(gradients["scale"].data(), &[18.0]);
+    assert_eq!(initial_gradient.data().as_ref(), &[14.0]);
+    assert_eq!(gradients["scale"].data().as_ref(), &[18.0]);
 }
 
 #[test]
@@ -1097,12 +1153,18 @@ fn scan_region_integrates_with_parent_ir_execution_jvp_and_vjp() {
         ),
     ]);
 
-    assert_eq!(must!(graph.evaluate(final_carry, &inputs)).data(), &[12.0]);
     assert_eq!(
-        must!(graph.evaluate(outputs, &inputs)).data(),
+        must!(graph.evaluate(final_carry, &inputs)).data().as_ref(),
+        &[12.0]
+    );
+    assert_eq!(
+        must!(graph.evaluate(outputs, &inputs)).data().as_ref(),
         &[2.0, 5.0, 12.0]
     );
-    assert_eq!(must!(graph.evaluate(total, &inputs)).data(), &[31.0]);
+    assert_eq!(
+        must!(graph.evaluate(total, &inputs)).data().as_ref(),
+        &[31.0]
+    );
     assert!(graph.lower_text().contains("scan(group="));
     let (_, tangent) = must!(graph.jvp(
         total,
@@ -1118,22 +1180,22 @@ fn scan_region_integrates_with_parent_ir_execution_jvp_and_vjp() {
             ),
         ]),
     ));
-    assert_eq!(tangent.data(), &[31.0]);
+    assert_eq!(tangent.data().as_ref(), &[31.0]);
     let (_, gradients) =
         must!(graph.value_and_vjp(total, &inputs, must!(DynamicTensor::new(vec![], vec![1.0])),));
-    assert_eq!(gradients["initial"].data(), &[22.0]);
-    assert_eq!(gradients["scale"].data(), &[31.0]);
+    assert_eq!(gradients["initial"].data().as_ref(), &[22.0]);
+    assert_eq!(gradients["scale"].data().as_ref(), &[31.0]);
 
     let (_, final_carry_gradients) = must!(must!(graph.compile_cpu(final_carry))
         .value_and_vjp(&inputs, must!(DynamicTensor::new(vec![], vec![1.0])),));
-    assert_eq!(final_carry_gradients["initial"].data(), &[8.0]);
-    assert_eq!(final_carry_gradients["scale"].data(), &[13.0]);
+    assert_eq!(final_carry_gradients["initial"].data().as_ref(), &[8.0]);
+    assert_eq!(final_carry_gradients["scale"].data().as_ref(), &[13.0]);
     let (_, output_gradients) = must!(must!(graph.compile_cpu(outputs)).value_and_vjp(
         &inputs,
         must!(DynamicTensor::new(vec![3], vec![1.0, 1.0, 1.0])),
     ));
-    assert_eq!(output_gradients["initial"].data(), &[14.0]);
-    assert_eq!(output_gradients["scale"].data(), &[18.0]);
+    assert_eq!(output_gradients["initial"].data().as_ref(), &[14.0]);
+    assert_eq!(output_gradients["scale"].data().as_ref(), &[18.0]);
 }
 
 #[test]
@@ -1176,7 +1238,8 @@ fn symbolic_jvp_transforms_scan_region_without_unrolling_parent_loop() {
             .graph
             .compile_cpu(initial_jvp.tangent)
             .and_then(|plan| plan.evaluate(&base_inputs)))
-        .data(),
+        .data()
+        .as_ref(),
         &[22.0]
     );
     let scale_jvp = must!(graph.symbolic_jvp_with_tangent_inputs(
@@ -1193,7 +1256,8 @@ fn symbolic_jvp_transforms_scan_region_without_unrolling_parent_loop() {
             .graph
             .compile_cpu(scale_jvp.tangent)
             .and_then(|plan| plan.evaluate(&inputs)))
-        .data(),
+        .data()
+        .as_ref(),
         &[31.0]
     );
 }
@@ -1241,7 +1305,8 @@ fn symbolic_vjp_transforms_scan_region_with_joint_carry_and_output_cotangents() 
             .graph
             .compile_cpu(symbolic.gradients["initial"])
             .and_then(|plan| plan.evaluate(&inputs)))
-        .data(),
+        .data()
+        .as_ref(),
         &[22.0]
     );
     assert_eq!(
@@ -1249,7 +1314,8 @@ fn symbolic_vjp_transforms_scan_region_with_joint_carry_and_output_cotangents() 
             .graph
             .compile_cpu(symbolic.gradients["scale"])
             .and_then(|plan| plan.evaluate(&inputs)))
-        .data(),
+        .data()
+        .as_ref(),
         &[31.0]
     );
 }
@@ -1310,15 +1376,15 @@ fn symbolic_jvp_many_retains_scan_vjp_jvp_sibling_targets() {
     ]);
     let outputs = must!(plan.evaluate_many(&inputs));
     assert_eq!(output_ids.len(), 2);
-    assert_eq!(outputs[0].data(), &[29.0]);
-    assert_eq!(outputs[1].data(), &[26.0]);
+    assert_eq!(outputs[0].data().as_ref(), &[29.0]);
+    assert_eq!(outputs[1].data().as_ref(), &[26.0]);
 
     #[cfg(all(feature = "cuda", target_os = "linux"))]
     if std::env::var_os("QUABLA_CUDA_TEST").is_some() {
         let cuda = must!(CudaBackend::default().execute_many(&plan, &output_ids, &inputs));
         for (actual, expected) in cuda.iter().zip(&outputs) {
             assert_eq!(actual.shape(), expected.shape());
-            for (actual, expected) in actual.data().iter().zip(expected.data()) {
+            for (actual, expected) in actual.data().iter().zip(expected.data().iter()) {
                 assert!((actual - expected).abs() < 3e-5);
             }
         }
@@ -1489,7 +1555,7 @@ fn symbolic_jvp_of_scalar_vjp_gradient_propagates_cotangent_direction() {
         ),
     ]);
     let value = must!(must!(jvp.graph.compile_cpu(jvp.tangent)).evaluate(&inputs));
-    assert_eq!(value.data(), &[4.0]);
+    assert_eq!(value.data().as_ref(), &[4.0]);
 }
 
 #[test]
@@ -1508,8 +1574,8 @@ fn scan_region_allows_an_unused_index_input() {
             must!(DynamicTensor::new(vec![], vec![2.0])),
         )]),
     ));
-    assert_eq!(carry.data(), &[7.0]);
-    assert_eq!(outputs.data(), &[3.0, 5.0, 7.0]);
+    assert_eq!(carry.data().as_ref(), &[7.0]);
+    assert_eq!(outputs.data().as_ref(), &[3.0, 5.0, 7.0]);
 }
 
 #[test]
@@ -1542,8 +1608,8 @@ fn fori_vjp_jvp_plan_matches_exact_loop_gradient_direction() {
         must!(DynamicTensor::new(vec![], vec![1.0])),
         must!(DynamicTensor::new(vec![], vec![0.0])),
     ));
-    assert_eq!(tangents["carry"].data(), &[12.0]);
-    assert_eq!(tangents["scale"].data(), &[12.0]);
+    assert_eq!(tangents["carry"].data().as_ref(), &[12.0]);
+    assert_eq!(tangents["scale"].data().as_ref(), &[12.0]);
 }
 
 #[test]
@@ -1577,10 +1643,15 @@ fn fori_region_integrates_with_parent_ir_execution_and_ad() {
         ),
     ]);
 
-    assert_eq!(must!(graph.evaluate(output, &inputs)).data(), &[12.0]);
+    assert_eq!(
+        must!(graph.evaluate(output, &inputs)).data().as_ref(),
+        &[12.0]
+    );
     assert!(graph.lower_text().contains("fori(carry="));
     assert_eq!(
-        must!(must!(graph.compile_cpu(output)).evaluate(&inputs)).data(),
+        must!(must!(graph.compile_cpu(output)).evaluate(&inputs))
+            .data()
+            .as_ref(),
         &[12.0]
     );
     let (_, tangent) = must!(graph.jvp(
@@ -1597,14 +1668,14 @@ fn fori_region_integrates_with_parent_ir_execution_and_ad() {
             ),
         ]),
     ));
-    assert_eq!(tangent.data(), &[8.0]);
+    assert_eq!(tangent.data().as_ref(), &[8.0]);
     let (_, gradients) = must!(graph.value_and_vjp(
         output,
         &inputs,
         must!(DynamicTensor::new(vec![], vec![1.0])),
     ));
-    assert_eq!(gradients["initial"].data(), &[8.0]);
-    assert_eq!(gradients["scale"].data(), &[13.0]);
+    assert_eq!(gradients["initial"].data().as_ref(), &[8.0]);
+    assert_eq!(gradients["scale"].data().as_ref(), &[13.0]);
 }
 
 #[test]
@@ -1644,7 +1715,7 @@ fn symbolic_jvp_transforms_fori_region_without_unrolling_parent_loop() {
         .graph
         .compile_cpu(symbolic.tangent)
         .and_then(|plan| plan.evaluate(&inputs)));
-    assert_eq!(tangent.data(), &[8.0]);
+    assert_eq!(tangent.data().as_ref(), &[8.0]);
 
     let symbolic = must!(graph.symbolic_jvp_with_tangent_inputs(
         output,
@@ -1668,7 +1739,7 @@ fn symbolic_jvp_transforms_fori_region_without_unrolling_parent_loop() {
         .graph
         .compile_cpu(symbolic.tangent)
         .and_then(|plan| plan.evaluate(&tangent_inputs)));
-    assert_eq!(tangent.data(), &[13.0]);
+    assert_eq!(tangent.data().as_ref(), &[13.0]);
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
@@ -1763,8 +1834,8 @@ fn symbolic_vjp_transforms_fori_region_with_shared_reverse_loop_results() {
         .graph
         .compile_cpu(transformed.gradients["scale"])
         .and_then(|plan| plan.evaluate(&inputs)));
-    assert_eq!(initial_gradient.data(), &[8.0]);
-    assert_eq!(scale_gradient.data(), &[13.0]);
+    assert_eq!(initial_gradient.data().as_ref(), &[8.0]);
+    assert_eq!(scale_gradient.data().as_ref(), &[13.0]);
     let (plan, output_ids) = must!(transformed.graph.compile_cpu_many(&[
         transformed.gradients["initial"],
         transformed.gradients["scale"],
@@ -1820,7 +1891,8 @@ fn hessian_and_hvp_propagate_exactly_through_fori_regions() {
             &inputs,
             must!(DynamicTensor::new(vec![], vec![3.0])),
         ))
-        .data(),
+        .data()
+        .as_ref(),
         &[36.0]
     );
 }
@@ -1871,7 +1943,7 @@ fn symbolic_hvp_through_fori_lowers_to_structural_fori_vjp_jvp() {
             ),
         ]),
     ));
-    assert_eq!(value.data(), &[12.0]);
+    assert_eq!(value.data().as_ref(), &[12.0]);
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
@@ -2005,7 +2077,10 @@ fn cuda_backend_reuses_cond_regions_and_rejects_non_finite_predicates_when_enabl
                 must!(DynamicTensor::new(vec![], vec![3.0])),
             ),
         ]);
-        assert_eq!(must!(compiled.execute(&inputs)).data(), &[expected]);
+        assert_eq!(
+            must!(compiled.execute(&inputs)).data().as_ref(),
+            &[expected]
+        );
     }
     let inputs = BTreeMap::from([
         (
@@ -2162,7 +2237,7 @@ fn cuda_backend_executes_fixed_fori_vjp_with_device_resident_carry_tape_when_ena
         let cpu = must!(plan.evaluate(&inputs));
         let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
         assert_eq!(cuda.shape(), cpu.shape());
-        for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+        for (actual, expected) in cuda.data().iter().zip(cpu.data().iter()) {
             assert!(
                 (actual - expected).abs() < 2e-5,
                 "CUDA Fori VJP mismatch for {name}: {actual} vs {expected}"
@@ -2231,7 +2306,7 @@ fn cuda_backend_fuses_grouped_fori_vjp_targets_when_enabled() {
     let cuda = must!(CudaBackend::new(0).execute_many(&plan, &output_ids, &inputs));
     for (actual, expected) in cuda.iter().zip(cpu.iter()) {
         assert_eq!(actual.shape(), expected.shape());
-        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+        for (actual, expected) in actual.data().iter().zip(expected.data().iter()) {
             assert!(
                 (actual - expected).abs() < 3e-5,
                 "grouped CUDA Fori VJP mismatch: {actual} vs {expected}"
@@ -2340,7 +2415,7 @@ fn cuda_backend_reduces_broadcast_fori_capture_vjp_on_device_when_enabled() {
     let cpu = must!(plan.evaluate(&inputs));
     let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
     assert_eq!(cuda.shape(), cpu.shape());
-    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+    for (actual, expected) in cuda.data().iter().zip(cpu.data().iter()) {
         assert!((actual - expected).abs() < 5e-5);
     }
 }
@@ -2383,7 +2458,7 @@ fn cuda_backend_executes_fixed_scan_regions_with_shared_device_results_when_enab
     let cuda = must!(CudaBackend::new(0).execute_many(&plan, &output_ids, &inputs));
     for (actual, expected) in cuda.iter().zip(cpu) {
         assert_eq!(actual.shape(), expected.shape());
-        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+        for (actual, expected) in actual.data().iter().zip(expected.data().iter()) {
             assert!((actual - expected).abs() < 2e-5);
         }
     }
@@ -2435,7 +2510,7 @@ fn cuda_backend_executes_fixed_scan_vjp_with_device_resident_carry_tape_when_ena
         let cpu = must!(plan.evaluate(&inputs));
         let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
         assert_eq!(cuda.shape(), cpu.shape());
-        for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+        for (actual, expected) in cuda.data().iter().zip(cpu.data().iter()) {
             assert!(
                 (actual - expected).abs() < 3e-5,
                 "CUDA Scan VJP mismatch for {name}: {actual} vs {expected}"
@@ -2504,7 +2579,7 @@ fn cuda_backend_fuses_grouped_scan_vjp_targets_when_enabled() {
     let cuda = must!(CudaBackend::new(0).execute_many(&plan, &output_ids, &inputs));
     for (actual, expected) in cuda.iter().zip(cpu.iter()) {
         assert_eq!(actual.shape(), expected.shape());
-        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+        for (actual, expected) in actual.data().iter().zip(expected.data().iter()) {
             assert!(
                 (actual - expected).abs() < 4e-5,
                 "grouped CUDA Scan VJP mismatch: {actual} vs {expected}"
@@ -2613,7 +2688,7 @@ fn cuda_backend_reduces_broadcast_scan_capture_vjp_on_device_when_enabled() {
     let cpu = must!(plan.evaluate(&inputs));
     let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
     assert_eq!(cuda.shape(), cpu.shape());
-    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+    for (actual, expected) in cuda.data().iter().zip(cpu.data().iter()) {
         assert!((actual - expected).abs() < 6e-5);
     }
 }
@@ -2704,7 +2779,7 @@ fn assert_cuda_outputs_match_cpu(
     assert_eq!(cuda.len(), cpu.len(), "{label}: output count differs");
     for (output, (actual, expected)) in cuda.iter().zip(cpu).enumerate() {
         assert_eq!(actual.shape(), expected.shape(), "{label}: output {output}");
-        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+        for (actual, expected) in actual.data().iter().zip(expected.data().iter()) {
             assert!(
                 (actual - expected).abs() <= tolerance * expected.abs().max(1.0),
                 "{label}: output {output} CUDA {actual} vs CPU {expected}"
@@ -3284,7 +3359,7 @@ fn cuda_retained_adam_trains_through_grouped_scan_gradients_when_enabled() {
             let updated = parameter
                 .data()
                 .iter()
-                .zip(cpu[index + 1].data())
+                .zip(cpu[index + 1].data().iter())
                 .enumerate()
                 .map(|(lane, (value, gradient))| {
                     first[lane] =
@@ -3392,7 +3467,7 @@ fn assert_log_guard_cond_matches_cpu(
             if device.shape() != cpu.shape() {
                 return Err(format!("{backend} {label} at x={x} changed shape"));
             }
-            for (actual, expected) in device.data().iter().zip(cpu.data()) {
+            for (actual, expected) in device.data().iter().zip(cpu.data().iter()) {
                 if !actual.is_finite() || (actual - expected).abs() > 1e-4 * expected.abs().max(1.0)
                 {
                     return Err(format!(
@@ -3414,11 +3489,11 @@ fn assert_log_guard_cond_matches_cpu(
     ]);
     let gradient_x = execute(&vjp.graph.compile_cpu(vjp.gradients["x"])?, &negative)?;
     let gradient_y = execute(&vjp.graph.compile_cpu(vjp.gradients["y"])?, &negative)?;
-    if gradient_x.data() != [0.0] || gradient_y.data() != [2.0, 4.0, 6.0] {
+    if gradient_x.data().as_ref() != [0.0] || gradient_y.data().as_ref() != [2.0, 4.0, 6.0] {
         return Err(format!(
             "{backend} inactive-branch gradients leaked: {:?} {:?}",
-            gradient_x.data(),
-            gradient_y.data()
+            gradient_x.data().as_ref(),
+            gradient_y.data().as_ref()
         ));
     }
     Ok(())
@@ -3456,16 +3531,18 @@ fn mlx_backend_returns_float_masks_from_greater_like_cpu() {
     let mask_plan = must!(graph.compile_cpu(mask));
     let cpu_mask = must!(CpuBackend.execute(&mask_plan, &inputs));
     let cpu_count = must!(CpuBackend.execute(&must!(graph.compile_cpu(count)), &inputs));
-    assert_eq!(cpu_mask.data(), &[0.0, 0.0, 1.0]);
-    assert_eq!(cpu_count.data(), &[2.0]);
+    assert_eq!(cpu_mask.data().as_ref(), &[0.0, 0.0, 1.0]);
+    assert_eq!(cpu_count.data().as_ref(), &[2.0]);
     assert_eq!(
-        must!(MlxBackend.execute(&mask_plan, &inputs)).data(),
-        cpu_mask.data()
+        must!(MlxBackend.execute(&mask_plan, &inputs))
+            .data()
+            .as_ref(),
+        cpu_mask.data().as_ref()
     );
     let (plan, outputs) = must!(graph.compile_cpu_many(&[mask, count]));
     let mlx = must!(MlxBackend.execute_many(&plan, &outputs, &inputs));
-    assert_eq!(mlx[0].data(), cpu_mask.data());
-    assert_eq!(mlx[1].data(), cpu_count.data());
+    assert_eq!(mlx[0].data().as_ref(), cpu_mask.data().as_ref());
+    assert_eq!(mlx[1].data().as_ref(), cpu_count.data().as_ref());
 
     let mut true_branch = TensorIr::new();
     let true_x = must!(true_branch.input("x", vec![]));
@@ -3489,11 +3566,11 @@ fn mlx_backend_returns_float_masks_from_greater_like_cpu() {
             must!(DynamicTensor::new(vec![], vec![value])),
         )]);
         assert_eq!(
-            must!(CpuBackend.execute(&plan, &inputs)).data(),
+            must!(CpuBackend.execute(&plan, &inputs)).data().as_ref(),
             &[expected]
         );
         assert_eq!(
-            must!(MlxBackend.execute(&plan, &inputs)).data(),
+            must!(MlxBackend.execute(&plan, &inputs)).data().as_ref(),
             &[expected]
         );
     }
@@ -3551,7 +3628,7 @@ fn mlx_backend_executes_nested_cond_regions_and_rejects_non_finite_predicates() 
             ),
         ]);
         assert_eq!(
-            must!(MlxBackend.execute(&plan, &inputs)).data(),
+            must!(MlxBackend.execute(&plan, &inputs)).data().as_ref(),
             &[expected]
         );
     }
@@ -3657,7 +3734,7 @@ fn mlx_backend_executes_fixed_fori_symbolic_vjp_with_device_resident_tape() {
     let mlx = must!(MlxBackend.execute_many(&plan, &output_ids, &inputs));
     for (actual, expected) in mlx.iter().zip(cpu) {
         assert_eq!(actual.shape(), expected.shape());
-        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+        for (actual, expected) in actual.data().iter().zip(expected.data().iter()) {
             assert!((actual - expected).abs() < 1e-6);
         }
     }
@@ -3746,7 +3823,7 @@ fn mlx_backend_executes_fixed_scan_regions_with_device_resident_carry() {
     let mlx = must!(MlxBackend.execute_many(&plan, &output_ids, &inputs));
     for (actual, expected) in mlx.iter().zip(cpu) {
         assert_eq!(actual.shape(), expected.shape());
-        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+        for (actual, expected) in actual.data().iter().zip(expected.data().iter()) {
             assert!((actual - expected).abs() < 1e-6);
         }
     }
@@ -3796,7 +3873,7 @@ fn mlx_backend_executes_fixed_scan_symbolic_vjp_with_device_resident_tape() {
     let mlx = must!(MlxBackend.execute_many(&plan, &output_ids, &inputs));
     for (actual, expected) in mlx.iter().zip(cpu) {
         assert_eq!(actual.shape(), expected.shape());
-        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+        for (actual, expected) in actual.data().iter().zip(expected.data().iter()) {
             assert!((actual - expected).abs() < 1e-6);
         }
     }
@@ -3864,7 +3941,7 @@ fn symbolic_vjp_matches_direct_vjp_for_matmul_and_mean_axis() {
     for (name, gradient) in &transformed.gradients {
         let symbolic = must!(transformed.graph.evaluate(*gradient, &transformed_inputs));
         assert_eq!(symbolic.shape(), direct[name].shape());
-        for (actual, expected) in symbolic.data().iter().zip(direct[name].data()) {
+        for (actual, expected) in symbolic.data().iter().zip(direct[name].data().iter()) {
             assert!((actual - expected).abs() < 1e-12);
         }
     }
@@ -3920,11 +3997,11 @@ fn cpu_backend_executes_a_frozen_tensor_plan() {
     let value = must!(backend.execute(&plan, &inputs));
 
     assert_eq!(backend.name(), "cpu");
-    assert_eq!(value.data(), &[2.0, 4.0, 6.0, 8.0]);
+    assert_eq!(value.data().as_ref(), &[2.0, 4.0, 6.0, 8.0]);
     let (value, gradients) =
         must!(plan.value_and_vjp(&inputs, must!(DynamicTensor::filled(vec![2, 2], 1.0)),));
-    assert_eq!(value.data(), &[2.0, 4.0, 6.0, 8.0]);
-    assert_eq!(gradients["x"].data(), &[2.0, 2.0, 2.0, 2.0]);
+    assert_eq!(value.data().as_ref(), &[2.0, 4.0, 6.0, 8.0]);
+    assert_eq!(gradients["x"].data().as_ref(), &[2.0, 2.0, 2.0, 2.0]);
     let kernel = must!(graph.compile_cpu(output)).kernel_ir();
     must!(kernel.validate());
 }
@@ -4311,7 +4388,7 @@ fn cuda_data_parallel_program_preserves_schedule_order_and_matches_cpu_oracle() 
             replica_outputs[0][position].shape(),
             expected[position].shape()
         );
-        for (actual, reference) in reduced.iter().zip(expected[position].data()) {
+        for (actual, reference) in reduced.iter().zip(expected[position].data().iter()) {
             assert!(
                 (actual - reference).abs() <= 1e-12,
                 "node {node_id}: {actual} != {reference}"
@@ -4559,13 +4636,13 @@ fn cuda_data_parallel_sharded_schedule_matches_cpu_oracle_on_two_gpus() {
         let max_error = actual
             .data()
             .iter()
-            .zip(reference.data())
+            .zip(reference.data().iter())
             .map(|(actual, reference)| (actual - reference).abs())
             .fold(0.0_f64, f64::max);
         println!(
             "sharded-schedule output={position} cuda={:?} cpu={:?} max_abs_error={max_error:e}",
-            actual.data(),
-            reference.data()
+            actual.data().as_ref(),
+            reference.data().as_ref()
         );
         assert!(max_error <= 1e-5, "output {position}: {max_error}");
     }
@@ -4621,7 +4698,7 @@ fn assert_data_parallel_outputs_match(
         let max_error = actual
             .data()
             .iter()
-            .zip(reference.data())
+            .zip(reference.data().iter())
             .map(|(actual, reference)| (actual - reference).abs())
             .fold(0.0_f64, f64::max);
         assert!(max_error <= 1e-5, "{label} output {position}: {max_error}");
@@ -4833,7 +4910,10 @@ fn compile_cpu_folds_scalar_constant_subgraphs() {
         "x".to_string(),
         must!(DynamicTensor::new(vec![1], vec![4.0])),
     )]);
-    assert_eq!(must!(CpuBackend.execute(&plan, &inputs)).data(), &[20.0]);
+    assert_eq!(
+        must!(CpuBackend.execute(&plan, &inputs)).data().as_ref(),
+        &[20.0]
+    );
 }
 
 #[test]
@@ -4852,7 +4932,7 @@ fn compile_cpu_canonicalizes_identity_broadcast_and_reshape_chains() {
         must!(DynamicTensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0])),
     )]);
     assert_eq!(
-        must!(CpuBackend.execute(&plan, &inputs)).data(),
+        must!(CpuBackend.execute(&plan, &inputs)).data().as_ref(),
         &[1.0, 2.0, 3.0, 4.0]
     );
 }
@@ -5033,7 +5113,7 @@ fn cuda_backend_executes_fused_elementwise_plan_when_enabled() {
     let cpu = must!(plan.evaluate(&inputs));
     let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
     assert_eq!(cuda.shape(), cpu.shape());
-    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+    for (actual, expected) in cuda.data().iter().zip(cpu.data().iter()) {
         assert!((actual - expected).abs() < 1e-5);
     }
 }
@@ -5077,7 +5157,7 @@ fn cuda_execution_plan_reuses_buffers_for_updated_inputs_when_enabled() {
         let expected = must!(plan.evaluate(inputs));
         let actual = must!(cuda.execute(inputs));
         assert_eq!(actual.shape(), expected.shape());
-        for (actual, expected) in actual.data().iter().zip(expected.data()) {
+        for (actual, expected) in actual.data().iter().zip(expected.data().iter()) {
             assert!((actual - expected).abs() < 1e-5);
         }
     }
@@ -5345,7 +5425,7 @@ fn cuda_backend_executes_direct_rank_two_matmul_when_enabled() {
     let cpu = must!(plan.evaluate(&inputs));
     let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
     assert_eq!(cuda.shape(), cpu.shape());
-    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+    for (actual, expected) in cuda.data().iter().zip(cpu.data().iter()) {
         assert!((actual - expected).abs() < 1e-5);
     }
 }
@@ -5387,7 +5467,7 @@ fn cuda_backend_executes_tiled_rank_two_matmul_inside_generic_plan_when_enabled(
     let cpu = must!(plan.evaluate(&inputs));
     let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
     assert_eq!(cuda.shape(), cpu.shape());
-    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+    for (actual, expected) in cuda.data().iter().zip(cpu.data().iter()) {
         assert!((actual - expected).abs() < 1e-5);
     }
 }
@@ -5445,7 +5525,7 @@ fn cuda_matmul_bias_tanh_epilogue_only_fuses_plan_inputs_when_enabled() {
         assert_eq!(cuda_plan.uses_fused_matmul_bias_tanh(), computed.is_none());
         let cuda = must!(cuda_plan.execute(&inputs));
         assert_eq!(cuda.shape(), cpu.shape());
-        for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+        for (actual, expected) in cuda.data().iter().zip(cpu.data().iter()) {
             assert!(
                 (actual - expected).abs() < 1e-5,
                 "CUDA matmul-bias-tanh with computed {computed:?} mismatch: {actual} vs {expected}"
@@ -5502,7 +5582,7 @@ fn cuda_two_layer_mlp_matches_cpu_across_single_and_multi_output_plans_when_enab
         assert_eq!(cuda.len(), cpu.len());
         for (actual, expected) in cuda.iter().zip(cpu.iter()) {
             assert_eq!(actual.shape(), expected.shape());
-            for (actual, expected) in actual.data().iter().zip(expected.data()) {
+            for (actual, expected) in actual.data().iter().zip(expected.data().iter()) {
                 assert!(
                     (actual - expected).abs() < 1e-5,
                     "CUDA two-layer MLP mismatch: {actual} vs {expected}"
@@ -5544,7 +5624,7 @@ fn cuda_backend_executes_broadcast_batched_matmul_when_enabled() {
     let cpu = must!(plan.evaluate(&inputs));
     let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
     assert_eq!(cuda.shape(), &[2, 3, 4]);
-    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+    for (actual, expected) in cuda.data().iter().zip(cpu.data().iter()) {
         assert!((actual - expected).abs() < 1e-5);
     }
 }
@@ -5587,7 +5667,7 @@ fn cuda_backend_executes_broadcast_batched_matmul_vjp_when_enabled() {
         let plan = must!(transformed.graph.compile_cpu(transformed.gradients[name]));
         let cuda = must!(CudaBackend::new(0).execute(&plan, &cuda_inputs));
         assert_eq!(cuda.shape(), cpu[name].shape());
-        for (actual, expected) in cuda.data().iter().zip(cpu[name].data()) {
+        for (actual, expected) in cuda.data().iter().zip(cpu[name].data().iter()) {
             assert!((actual - expected).abs() < 1e-5);
         }
     }
@@ -5732,7 +5812,7 @@ fn cuda_backend_executes_symbolic_vjp_for_broadcast_bias_when_enabled() {
         let plan = must!(transformed.graph.compile_cpu(gradient));
         let cuda = must!(CudaBackend::new(0).execute(&plan, &transformed_inputs));
         assert_eq!(cuda.shape(), direct[name].shape());
-        for (actual, expected) in cuda.data().iter().zip(direct[name].data()) {
+        for (actual, expected) in cuda.data().iter().zip(direct[name].data().iter()) {
             assert!(
                 (actual - expected).abs() < 1e-5,
                 "gradient mismatch for {name}"
@@ -5757,14 +5837,17 @@ fn tensor_ir_axis_mean_and_transpose_preserve_ad_layout() {
 
     let value = must!(graph.evaluate(output, &inputs));
     assert_eq!(value.shape(), &[3]);
-    assert_eq!(value.data(), &[2.5, 3.5, 4.5]);
+    assert_eq!(value.data().as_ref(), &[2.5, 3.5, 4.5]);
 
     let gradients = must!(graph.vjp(
         output,
         &inputs,
         must!(DynamicTensor::new(vec![3], vec![2.0, 3.0, 4.0])),
     ));
-    assert_eq!(gradients["x"].data(), &[1.0, 1.5, 2.0, 1.0, 1.5, 2.0]);
+    assert_eq!(
+        gradients["x"].data().as_ref(),
+        &[1.0, 1.5, 2.0, 1.0, 1.5, 2.0]
+    );
 }
 
 #[test]
@@ -5856,8 +5939,8 @@ fn symbolic_jvp_with_tangent_inputs_uses_runtime_directions() {
 
     let value = must!(transformed.graph.evaluate(transformed.value, &inputs));
     let tangent = must!(transformed.graph.evaluate(transformed.tangent, &inputs));
-    assert_eq!(value.data(), &[8.0, -15.0]);
-    assert_eq!(tangent.data(), &[5.0, 10.75]);
+    assert_eq!(value.data().as_ref(), &[8.0, -15.0]);
+    assert_eq!(tangent.data().as_ref(), &[5.0, 10.75]);
 }
 
 #[test]
@@ -5903,7 +5986,7 @@ fn symbolic_jvp_preserves_transpose_reshape_and_axis_reduction() {
 
     let tangent = must!(transformed.graph.evaluate(transformed.tangent, &inputs));
     assert_eq!(tangent.shape(), &[] as &[usize]);
-    assert_eq!(tangent.data(), &[1.0]);
+    assert_eq!(tangent.data().as_ref(), &[1.0]);
 }
 
 #[test]
@@ -5929,7 +6012,7 @@ fn symbolic_jvp_supports_division_and_parameter_vjp() {
     ]);
 
     let tangent = must!(transformed.graph.evaluate(transformed.tangent, &inputs));
-    assert_eq!(tangent.data(), &[0.5]);
+    assert_eq!(tangent.data().as_ref(), &[0.5]);
     let gradients =
         must!(transformed
             .graph
@@ -5961,7 +6044,7 @@ fn symbolic_jvp_supports_log_and_parameter_vjp() {
     ]);
 
     let tangent = must!(transformed.graph.evaluate(transformed.tangent, &inputs));
-    assert_eq!(tangent.data(), &[0.2]);
+    assert_eq!(tangent.data().as_ref(), &[0.2]);
     let gradients =
         must!(transformed
             .graph
@@ -5986,7 +6069,7 @@ fn solve_evaluates_and_differentiates() {
         ),
     ]);
     let value = must!(graph.evaluate(output, &inputs));
-    assert_eq!(value.data(), &[2.0, 3.0]);
+    assert_eq!(value.data().as_ref(), &[2.0, 3.0]);
 
     let tangents = BTreeMap::from([
         (
@@ -6066,7 +6149,7 @@ fn cuda_backend_executes_rank_two_solve_when_enabled() {
     let cpu = must!(CpuBackend.execute(&plan, &inputs));
     let cuda = must!(CudaBackend::default().execute(&plan, &inputs));
     assert_eq!(cuda.shape(), cpu.shape());
-    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+    for (actual, expected) in cuda.data().iter().zip(cpu.data().iter()) {
         assert!((actual - expected).abs() < 1e-5);
     }
 }
@@ -6105,7 +6188,7 @@ fn mlx_backend_matches_cpu_for_concat_broadcast_and_tanh() {
     let cpu = must!(CpuBackend.execute(&plan, &inputs));
     let mlx = must!(MlxBackend.execute(&plan, &inputs));
     assert_eq!(mlx.shape(), cpu.shape());
-    for (actual, expected) in mlx.data().iter().zip(cpu.data()) {
+    for (actual, expected) in mlx.data().iter().zip(cpu.data().iter()) {
         assert!(
             (actual - expected).abs() < 1e-5,
             "actual={actual}, expected={expected}"
@@ -6130,7 +6213,11 @@ fn assert_mlx_readback_matches_cpu(
     assert_eq!(mlx.len(), cpu.len());
     for (index, (actual, expected)) in mlx.iter().zip(&cpu).enumerate() {
         assert_eq!(actual.shape(), expected.shape(), "output {index} shape");
-        assert_eq!(actual.data(), expected.data(), "output {index} data");
+        assert_eq!(
+            actual.data().as_ref(),
+            expected.data().as_ref(),
+            "output {index} data"
+        );
     }
 }
 
@@ -6156,7 +6243,7 @@ fn mlx_readback_of_transposed_output_is_row_major() {
     assert_mlx_readback_matches_cpu(&graph, &[output], &inputs);
     let plan = must!(graph.compile_cpu(output));
     assert_eq!(
-        must!(MlxBackend.execute(&plan, &inputs)).data(),
+        must!(MlxBackend.execute(&plan, &inputs)).data().as_ref(),
         &[1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
     );
 }
@@ -6177,7 +6264,7 @@ fn mlx_readback_of_broadcast_output_is_row_major() {
     assert_mlx_readback_matches_cpu(&graph, &[columns], &inputs);
     let plan = must!(graph.compile_cpu(rows));
     assert_eq!(
-        must!(MlxBackend.execute(&plan, &inputs)).data(),
+        must!(MlxBackend.execute(&plan, &inputs)).data().as_ref(),
         &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0]
     );
 }
@@ -6241,8 +6328,8 @@ fn mlx_retained_input_readback_of_transposed_weight_is_row_major() {
     let dynamic_inputs = BTreeMap::from([iota_input("x", vec![2, 3])]);
     let mlx =
         must!(MlxBackend.execute_many_with_state(&plan, &output_ids, &dynamic_inputs, &state));
-    assert_eq!(mlx[0].data(), cpu[0].data());
-    for (actual, expected) in mlx[1].data().iter().zip(cpu[1].data()) {
+    assert_eq!(mlx[0].data().as_ref(), cpu[0].data().as_ref());
+    for (actual, expected) in mlx[1].data().iter().zip(cpu[1].data().iter()) {
         assert!(
             (actual - expected).abs() < 1e-5,
             "actual={actual}, expected={expected}"
@@ -6514,7 +6601,7 @@ fn cast_round_trips_are_kept_and_same_dtype_casts_are_removed() {
     let inputs = f32_inputs(&[("x", vec![], vec![0.1])]);
     let value = must!(CpuBackend.execute(&plan, &inputs));
     assert_eq!(value.dtype(), TensorDType::F64);
-    assert_eq!(value.data(), &[0.10000000149011612]);
+    assert_eq!(value.data().as_ref(), &[0.10000000149011612]);
     assert_eq!(plan.node_count(), 3);
 
     // A lossy round trip of a constant must not be cancelled during folding either.
@@ -6525,7 +6612,9 @@ fn cast_round_trips_are_kept_and_same_dtype_casts_are_removed() {
     let plan = must!(graph.compile_cpu(double));
     assert_eq!(plan.node_count(), 1);
     assert_eq!(
-        must!(CpuBackend.execute(&plan, &BTreeMap::new())).data(),
+        must!(CpuBackend.execute(&plan, &BTreeMap::new()))
+            .data()
+            .as_ref(),
         &[0.10000000149011612]
     );
 
@@ -6670,14 +6759,14 @@ fn f64_host_data_fed_to_an_f32_input_is_rounded() {
         must!(graph.evaluate(x, &inputs)),
     ] {
         assert_eq!(value.dtype(), TensorDType::F32);
-        assert_eq!(value.data(), &[f64::from(0.1_f32), 1.0]);
+        assert_eq!(value.data().as_ref(), &[f64::from(0.1_f32), 1.0]);
     }
     let rounded = must!(DynamicTensor::with_dtype(
         vec![1],
         vec![0.1],
         TensorDType::F32
     ));
-    assert_eq!(rounded.data(), &[f64::from(0.1_f32)]);
+    assert_eq!(rounded.data().as_ref(), &[f64::from(0.1_f32)]);
     assert_eq!(rounded.astype(TensorDType::F64).dtype(), TensorDType::F64);
 }
 
@@ -6704,7 +6793,7 @@ fn f32_fori_carry_adopts_a_typed_index_and_rejects_mixed_captures() {
     let value = must!(graph.evaluate(output, &inputs));
     let expected = (0..4).fold(1.0_f32, |carry, index| carry + index as f32 * 0.1_f32);
     assert_eq!(value.dtype(), TensorDType::F32);
-    assert_eq!(value.data(), &[f64::from(expected)]);
+    assert_eq!(value.data().as_ref(), &[f64::from(expected)]);
 
     let mut graph = TensorIr::new();
     let initial = must!(graph.input("initial", vec![]));
@@ -6741,16 +6830,28 @@ fn cond_region_transforms_do_not_leak_non_finite_captures() {
         ("x", vec![3], vec![1.0, f64::NAN, f64::NEG_INFINITY]),
         ("seed", vec![], vec![1.0]),
     ]);
-    assert_eq!(must!(graph.evaluate(output, &inputs)).data(), &[1.0]);
+    assert_eq!(
+        must!(graph.evaluate(output, &inputs)).data().as_ref(),
+        &[1.0]
+    );
     let vjp = must!(graph.symbolic_vjp(output, "seed"));
     assert_eq!(
-        must!(vjp.graph.evaluate(vjp.gradients["x"], &inputs)).data(),
+        must!(vjp.graph.evaluate(vjp.gradients["x"], &inputs))
+            .data()
+            .as_ref(),
         &[1.0, 0.0, 0.0]
     );
     let jvp = must!(graph.symbolic_jvp(output, "x"));
-    assert_eq!(must!(jvp.graph.evaluate(jvp.value, &inputs)).data(), &[1.0]);
     assert_eq!(
-        must!(jvp.graph.evaluate(jvp.tangent, &inputs)).data(),
+        must!(jvp.graph.evaluate(jvp.value, &inputs))
+            .data()
+            .as_ref(),
+        &[1.0]
+    );
+    assert_eq!(
+        must!(jvp.graph.evaluate(jvp.tangent, &inputs))
+            .data()
+            .as_ref(),
         &[1.0]
     );
 }
@@ -6903,7 +7004,7 @@ fn bool_dtype_rounds_to_zero_one_and_lowers_to_f32_on_devices() {
         vec![0.0, 3.0, f64::NAN, f64::NEG_INFINITY],
         TensorDType::Bool,
     ));
-    assert_eq!(tensor.data(), &[0.0, 1.0, 1.0, 1.0]);
+    assert_eq!(tensor.data().as_ref(), &[0.0, 1.0, 1.0, 1.0]);
     assert_eq!(tensor.dtype(), TensorDType::Bool);
     assert_eq!(
         TensorDeviceBackend::Cpu.execution_dtype(TensorDType::Bool),
@@ -6940,7 +7041,7 @@ fn comparisons_logical_ops_and_reductions_follow_ieee_semantics_on_cpu() {
         let executed = must!(CpuBackend.execute(&plan, &inputs));
         for value in [&evaluated, &executed] {
             assert_eq!(value.dtype(), dtype, "output {index}");
-            assert_eq!(value.data(), expected.as_slice(), "output {index}");
+            assert_eq!(value.data().as_ref(), expected.as_slice(), "output {index}");
         }
         let program = plan.kernel_ir();
         must!(program.validate());
@@ -6974,7 +7075,9 @@ fn comparisons_logical_ops_and_reductions_follow_ieee_semantics_on_cpu() {
     let plan = must!(constant.compile_cpu(less));
     assert_eq!(plan.node_count(), 1);
     assert_eq!(
-        must!(CpuBackend.execute(&plan, &BTreeMap::new())).data(),
+        must!(CpuBackend.execute(&plan, &BTreeMap::new()))
+            .data()
+            .as_ref(),
         &[1.0]
     );
 }
@@ -7040,12 +7143,18 @@ fn bool_operands_promote_like_arithmetic_and_reject_bool_arithmetic() {
         ("x", vec![2], vec![f64::NAN, 0.0]),
         ("r", vec![2], vec![1.0, 1.0]),
     ]);
-    assert_eq!(must!(graph.evaluate(truthy, &inputs)).data(), &[1.0, 0.0]);
+    assert_eq!(
+        must!(graph.evaluate(truthy, &inputs)).data().as_ref(),
+        &[1.0, 0.0]
+    );
     let inputs = f32_inputs(&[
         ("x", vec![2], vec![3.0, -1.0]),
         ("r", vec![2], vec![1.0, 1.0]),
     ]);
-    assert_eq!(must!(graph.evaluate(numeric, &inputs)).data(), &[1.0, 0.0]);
+    assert_eq!(
+        must!(graph.evaluate(numeric, &inputs)).data().as_ref(),
+        &[1.0, 0.0]
+    );
 }
 
 #[test]
@@ -7060,20 +7169,26 @@ fn where_and_cond_accept_bool_and_legacy_float_predicates() {
     let float_abs = must!(graph.where_select(float_mask, x, negated));
     let inputs = f32_inputs(&[("x", vec![3], vec![-2.0, 0.0, 3.0])]);
     assert_eq!(
-        must!(graph.evaluate(bool_abs, &inputs)).data(),
+        must!(graph.evaluate(bool_abs, &inputs)).data().as_ref(),
         &[2.0, 0.0, 3.0]
     );
     assert_eq!(
-        must!(graph.evaluate(float_abs, &inputs)).data(),
+        must!(graph.evaluate(float_abs, &inputs)).data().as_ref(),
         &[2.0, -0.0, 3.0]
     );
 
     // all(isfinite(x)) as a Cond predicate; the false branch guards non-finite values itself.
     let (graph, output) = must!(finite_guard_cond_graph());
     let finite = f32_inputs(&[("x", vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]);
-    assert_eq!(must!(graph.evaluate(output, &finite)).data(), &[91.0]);
+    assert_eq!(
+        must!(graph.evaluate(output, &finite)).data().as_ref(),
+        &[91.0]
+    );
     let guarded = f32_inputs(&[("x", vec![2, 3], BOOL_X.to_vec())]);
-    assert_eq!(must!(graph.evaluate(output, &guarded)).data(), &[4.5]);
+    assert_eq!(
+        must!(graph.evaluate(output, &guarded)).data().as_ref(),
+        &[4.5]
+    );
 
     // Bool branch results and Bool loop carries are rejected explicitly in D2.
     let mut branch = TensorIr::new();
@@ -7138,7 +7253,7 @@ fn bool_masks_have_no_derivatives_and_nan_guards_keep_gradients_finite() {
     let inputs = bool_inputs(&BOOL_X);
     let seed = must!(DynamicTensor::new(vec![], vec![1.0]));
     let (value, eager) = must!(graph.value_and_vjp(loss, &inputs, seed.clone()));
-    assert_close(value.data(), &[MASKED_LOSS], 1e-12);
+    assert_close(value.data().as_ref(), &[MASKED_LOSS], 1e-12);
     let symbolic = must!(graph.symbolic_vjp(loss, "seed"));
     for gradients in [
         [eager["x"].data().to_vec(), eager["w"].data().to_vec()],
@@ -7212,15 +7327,17 @@ fn bool_masks_have_no_derivatives_and_nan_guards_keep_gradients_finite() {
     let gradient = must!(transformed
         .graph
         .evaluate(transformed.gradients["x"], &inputs));
-    assert_eq!(gradient.data(), &[1.0, 2.0, 0.0, 0.0, 0.0, 2.0]);
+    assert_eq!(gradient.data().as_ref(), &[1.0, 2.0, 0.0, 0.0, 0.0, 2.0]);
     let tangent = must!(cond_graph.symbolic_jvp(cond_output, "x"));
     assert_eq!(
-        must!(tangent.graph.evaluate(tangent.tangent, &inputs)).data(),
+        must!(tangent.graph.evaluate(tangent.tangent, &inputs))
+            .data()
+            .as_ref(),
         &[5.0]
     );
     let plan = must!(cond_graph.compile_cpu(cond_output));
     let eager = must!(plan.vjp(&inputs, seed.clone()));
-    assert_eq!(eager["x"].data(), &[1.0, 2.0, 0.0, 0.0, 0.0, 2.0]);
+    assert_eq!(eager["x"].data().as_ref(), &[1.0, 2.0, 0.0, 0.0, 0.0, 2.0]);
 }
 
 fn must_value(result: Result<DynamicTensor, String>) -> DynamicTensor {
@@ -7254,15 +7371,17 @@ fn differentiating_bool_values_is_an_error_and_bool_inputs_have_no_gradient() {
     ]);
     let seed = must!(DynamicTensor::new(vec![], vec![1.0]));
     let (value, gradients) = must!(graph.value_and_vjp(loss, &inputs, seed.clone()));
-    assert_eq!(value.data(), &[4.0]);
-    assert_eq!(gradients["x"].data(), &[0.0, 4.0, 0.0]);
+    assert_eq!(value.data().as_ref(), &[4.0]);
+    assert_eq!(gradients["x"].data().as_ref(), &[0.0, 4.0, 0.0]);
     assert!(!gradients.contains_key("mask"));
     let symbolic = must!(graph.symbolic_vjp(loss, "seed"));
     assert!(!symbolic.gradients.contains_key("mask"));
     let mut seeded = inputs.clone();
     seeded.insert("seed".to_string(), seed.clone());
     assert_eq!(
-        must!(symbolic.graph.evaluate(symbolic.gradients["x"], &seeded)).data(),
+        must!(symbolic.graph.evaluate(symbolic.gradients["x"], &seeded))
+            .data()
+            .as_ref(),
         &[0.0, 4.0, 0.0]
     );
 
@@ -7271,9 +7390,9 @@ fn differentiating_bool_values_is_an_error_and_bool_inputs_have_no_gradient() {
         must!(DynamicTensor::new(vec![3], vec![1.0, 1.0, 1.0])),
     )]);
     let (_, tangent) = must!(graph.jvp(loss, &inputs, &tangents));
-    assert_eq!(tangent.data(), &[4.0]);
+    assert_eq!(tangent.data().as_ref(), &[4.0]);
     let (_, mask_tangent) = must!(graph.jvp(both, &inputs, &tangents));
-    assert_eq!(mask_tangent.data(), &[0.0, 0.0, 0.0]);
+    assert_eq!(mask_tangent.data().as_ref(), &[0.0, 0.0, 0.0]);
     assert_eq!(mask_tangent.dtype(), TensorDType::F64);
 
     // A zero tangent is equivalent to omitting it (callers often supply a tangent per input); a
@@ -7284,8 +7403,11 @@ fn differentiating_bool_values_is_an_error_and_bool_inputs_have_no_gradient() {
         must!(DynamicTensor::filled(vec![3], 0.0)),
     );
     assert_eq!(
-        must!(graph.jvp(loss, &inputs, &with_mask)).1.data(),
-        tangent.data()
+        must!(graph.jvp(loss, &inputs, &with_mask))
+            .1
+            .data()
+            .as_ref(),
+        tangent.data().as_ref()
     );
     with_mask.insert(
         "mask".to_string(),
@@ -7335,10 +7457,12 @@ fn differentiating_bool_values_is_an_error_and_bool_inputs_have_no_gradient() {
     let transformed = must!(graph.symbolic_jvp(total, "x"));
     let (_, eager_tangent) = must!(graph.jvp(total, &inputs, &tangents));
     assert_eq!(
-        must!(transformed.graph.evaluate(transformed.tangent, &inputs)).data(),
-        eager_tangent.data()
+        must!(transformed.graph.evaluate(transformed.tangent, &inputs))
+            .data()
+            .as_ref(),
+        eager_tangent.data().as_ref()
     );
-    assert_eq!(eager_tangent.data(), &[0.0]);
+    assert_eq!(eager_tangent.data().as_ref(), &[0.0]);
     let hessian = must!(graph.hessian_scalar(loss, "x", &inputs));
     assert_eq!(hessian[1][1], 2.0);
     assert_eq!(hessian[0][0], 0.0);
@@ -7394,16 +7518,23 @@ fn cond_regions_capture_bool_masks_without_differentiating_them() {
             must!(DynamicTensor::new(vec![], vec![1.0])),
         ),
     ]);
-    assert_eq!(must!(graph.evaluate(output, &inputs)).data(), &[10.0]);
+    assert_eq!(
+        must!(graph.evaluate(output, &inputs)).data().as_ref(),
+        &[10.0]
+    );
     let vjp = must!(graph.symbolic_vjp(output, "seed"));
     assert!(!vjp.gradients.contains_key("mask"));
     assert_eq!(
-        must!(vjp.graph.evaluate(vjp.gradients["x"], &inputs)).data(),
+        must!(vjp.graph.evaluate(vjp.gradients["x"], &inputs))
+            .data()
+            .as_ref(),
         &[2.0, 0.0, 6.0]
     );
     let jvp = must!(graph.symbolic_jvp(output, "x"));
     assert_eq!(
-        must!(jvp.graph.evaluate(jvp.tangent, &inputs)).data(),
+        must!(jvp.graph.evaluate(jvp.tangent, &inputs))
+            .data()
+            .as_ref(),
         &[8.0]
     );
 }
@@ -7427,7 +7558,7 @@ fn assert_bool_parity(target: QuablaTarget) {
         // Bool readback is tagged bool with values identical to the CPU; f32 outputs are likewise
         // native f32 arithmetic.
         assert_eq!(
-            actual.data(),
+            actual.data().as_ref(),
             expected.as_slice(),
             "{target:?} output {index}"
         );
@@ -7463,7 +7594,11 @@ fn assert_bool_parity(target: QuablaTarget) {
         let cpu = must!(must!(compiler.compile_many(&program, QuablaTarget::Cpu)).execute(&inputs));
         let device = must!(must!(compiler.compile_many(&program, target)).execute(&inputs));
         for (actual, expected) in device.iter().zip(&cpu) {
-            assert_eq!(actual.data(), expected.data(), "{target:?} cond");
+            assert_eq!(
+                actual.data().as_ref(),
+                expected.data().as_ref(),
+                "{target:?} cond"
+            );
         }
     }
 }
@@ -7586,7 +7721,7 @@ fn pow_follows_powf_for_edge_cases_broadcasting_and_f32() {
     ]);
     let value = must!(graph.evaluate(output, &inputs));
     assert_eq!(
-        value.data(),
+        value.data().as_ref(),
         &[2.0_f64.sqrt(), 4.0, 0.5, 3.0, 81.0, 1.0 / 9.0]
     );
 
@@ -7817,18 +7952,34 @@ fn pow_derivative_conventions_at_zero_and_negative_bases() {
     ))
     .1;
     for (label, actual, expected) in [
-        ("runtime VJP d/dx", runtime["x"].data(), &expected_base),
-        ("runtime VJP d/dy", runtime["y"].data(), &expected_exponent),
-        ("symbolic VJP d/dx", symbolic_base.data(), &expected_base),
         (
-            "symbolic VJP d/dy",
-            symbolic_exponent.data(),
+            "runtime VJP d/dx",
+            runtime["x"].data().as_ref(),
+            &expected_base,
+        ),
+        (
+            "runtime VJP d/dy",
+            runtime["y"].data().as_ref(),
             &expected_exponent,
         ),
-        ("runtime JVP d/dx", forward_base.data(), &expected_base),
+        (
+            "symbolic VJP d/dx",
+            symbolic_base.data().as_ref(),
+            &expected_base,
+        ),
+        (
+            "symbolic VJP d/dy",
+            symbolic_exponent.data().as_ref(),
+            &expected_exponent,
+        ),
+        (
+            "runtime JVP d/dx",
+            forward_base.data().as_ref(),
+            &expected_base,
+        ),
         (
             "runtime JVP d/dy",
-            forward_exponent.data(),
+            forward_exponent.data().as_ref(),
             &expected_forward_exponent,
         ),
     ] {
@@ -7854,8 +8005,10 @@ fn pow_derivative_conventions_at_zero_and_negative_bases() {
     )]);
     let seed = must!(DynamicTensor::filled(vec![1], 1.0));
     assert_eq!(
-        must!(graph.vjp(power, &origin, seed.clone()))["x"].data(),
-        must!(graph.vjp(root, &origin, seed))["x"].data()
+        must!(graph.vjp(power, &origin, seed.clone()))["x"]
+            .data()
+            .as_ref(),
+        must!(graph.vjp(root, &origin, seed))["x"].data().as_ref()
     );
 }
 
@@ -7997,7 +8150,7 @@ fn pow_folds_constants_shares_cse_and_skips_constant_operand_derivatives() {
         must!(DynamicTensor::new(vec![2], vec![1.5, -2.0])),
     )]);
     assert_eq!(
-        must!(plan.evaluate(&inputs)).data(),
+        must!(plan.evaluate(&inputs)).data().as_ref(),
         &[8.0 * 1.5 + 2.0 * 1.5_f64.powf(3.0), -16.0 - 16.0]
     );
 
@@ -8197,7 +8350,7 @@ fn assert_device_parity(target: QuablaTarget, programs: Result<Vec<DeviceParityC
         for (output, (actual, expected)) in device.iter().zip(&cpu).enumerate() {
             assert_eq!(actual.shape(), expected.shape());
             for (element, (actual, expected)) in
-                actual.data().iter().zip(expected.data()).enumerate()
+                actual.data().iter().zip(expected.data().iter()).enumerate()
             {
                 let close = if expected.is_finite() {
                     (actual - expected).abs() <= 1e-5 * expected.abs().max(1.0)
@@ -8260,7 +8413,7 @@ fn cuda_fuses_pow_chains_into_one_region_when_enabled() {
     let compiled = must!(CudaBackend::new(0).compile(plan));
     assert!(compiled.fused_region_count() >= 1);
     let cuda = must!(compiled.execute(&inputs));
-    for (actual, expected) in cuda.data().iter().zip(cpu.data()) {
+    for (actual, expected) in cuda.data().iter().zip(cpu.data().iter()) {
         assert!((actual - expected).abs() < 1e-5, "{actual} vs {expected}");
     }
 }
@@ -8541,8 +8694,8 @@ fn reduction_cotangent_broadcast_ignores_nan_and_infinite_values() {
         let tangent = must!(forward.graph.evaluate(forward.tangent, &inputs));
         assert_eq!(value.dtype(), TensorDType::F32, "mean={mean}");
         assert_eq!(tangent.dtype(), TensorDType::F32, "mean={mean}");
-        assert_eq!(value.data(), [gradient; 4], "mean={mean}");
-        assert_eq!(tangent.data(), [0.0; 4], "mean={mean}");
+        assert_eq!(value.data().as_ref(), [gradient; 4], "mean={mean}");
+        assert_eq!(tangent.data().as_ref(), [0.0; 4], "mean={mean}");
     }
 }
 
@@ -8574,8 +8727,8 @@ fn symbolic_vjp_gives_exact_zero_gradients_to_unused_non_finite_inputs() {
     ]);
     let x_gradient = must!(reverse.graph.evaluate(reverse.gradients["x"], &inputs));
     let y_gradient = must!(reverse.graph.evaluate(reverse.gradients["y"], &inputs));
-    assert_eq!(x_gradient.data(), [1.0; 4]);
-    assert_eq!(y_gradient.data(), [0.0; 4]);
+    assert_eq!(x_gradient.data().as_ref(), [1.0; 4]);
+    assert_eq!(y_gradient.data().as_ref(), [0.0; 4]);
     assert_eq!(y_gradient.shape(), [4]);
     assert_eq!(y_gradient.dtype(), TensorDType::F32);
 }
@@ -8604,7 +8757,7 @@ fn symbolic_jvp_gives_exact_zero_tangents_to_non_finite_inputs_without_a_directi
         ),
     ]);
     let tangent = must!(forward.graph.evaluate(forward.tangent, &inputs));
-    assert_eq!(tangent.data(), [1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(tangent.data().as_ref(), [1.0, 2.0, 3.0, 4.0]);
     assert_eq!(tangent.dtype(), TensorDType::F32);
 }
 
@@ -8634,11 +8787,13 @@ fn powi_zero_tangents_are_exact_zeros_at_non_finite_inputs() {
     ));
     let bound = must!(inputs(&["x", "dx"]));
     assert_eq!(
-        must!(forward.graph.evaluate(forward.value, &bound)).data(),
+        must!(forward.graph.evaluate(forward.value, &bound))
+            .data()
+            .as_ref(),
         [1.0; 4]
     );
     let tangent = must!(forward.graph.evaluate(forward.tangent, &bound));
-    assert_eq!(tangent.data(), [0.0; 4]);
+    assert_eq!(tangent.data().as_ref(), [0.0; 4]);
     assert_eq!(tangent.dtype(), TensorDType::F32);
 
     let doubled = must!(graph.add(x, x));
@@ -8649,11 +8804,15 @@ fn powi_zero_tangents_are_exact_zeros_at_non_finite_inputs() {
     ));
     let bound = must!(inputs(&["x", "dx"]));
     assert_eq!(
-        must!(second.graph.evaluate(second.value, &bound)).data(),
+        must!(second.graph.evaluate(second.value, &bound))
+            .data()
+            .as_ref(),
         [2.0; 4]
     );
     assert_eq!(
-        must!(second.graph.evaluate(second.tangent, &bound)).data(),
+        must!(second.graph.evaluate(second.tangent, &bound))
+            .data()
+            .as_ref(),
         [0.0; 4]
     );
     // The ones seed of `symbolic_jvp` does not read `x`: the compiled tangent needs no inputs.
@@ -8662,7 +8821,8 @@ fn powi_zero_tangents_are_exact_zeros_at_non_finite_inputs() {
             .graph
             .compile_cpu(first.tangent)
             .and_then(|plan| plan.evaluate(&BTreeMap::new())))
-        .data(),
+        .data()
+        .as_ref(),
         [2.0; 4]
     );
 }
@@ -8714,11 +8874,15 @@ fn cond_vjp_gives_exact_zero_gradients_to_captures_unused_by_the_taken_branch() 
         ),
     ]);
     assert_eq!(
-        must!(reverse.graph.evaluate(reverse.gradients["x"], &inputs)).data(),
+        must!(reverse.graph.evaluate(reverse.gradients["x"], &inputs))
+            .data()
+            .as_ref(),
         [2.0; 4]
     );
     assert_eq!(
-        must!(reverse.graph.evaluate(reverse.gradients["y"], &inputs)).data(),
+        must!(reverse.graph.evaluate(reverse.gradients["y"], &inputs))
+            .data()
+            .as_ref(),
         [0.0; 4]
     );
 }
@@ -8772,7 +8936,9 @@ fn scan_vjp_gives_an_exact_zero_cotangent_to_an_unused_non_finite_output() {
         ]);
         for (name, expected) in [("initial", 8.0), ("scale", 12.0), ("offset", 0.0)] {
             assert_eq!(
-                must!(reverse.graph.evaluate(reverse.gradients[name], &inputs)).data(),
+                must!(reverse.graph.evaluate(reverse.gradients[name], &inputs))
+                    .data()
+                    .as_ref(),
                 [expected],
                 "offset={offset} {name}"
             );
@@ -8821,21 +8987,28 @@ fn symbolic_vjp_many_ones_seed_matches_an_input_seed_and_retains_primals() {
     );
     for name in ["x", "w"] {
         assert_eq!(
-            must!(ones.graph.evaluate(ones.gradients[name], &inputs)).data(),
+            must!(ones.graph.evaluate(ones.gradients[name], &inputs))
+                .data()
+                .as_ref(),
             must!(seeded
                 .graph
                 .evaluate(seeded.gradients[name], &seeded_inputs))
-            .data(),
+            .data()
+            .as_ref(),
             "{name}"
         );
     }
     assert_eq!(
-        must!(ones.graph.evaluate(ones.primals[loss], &inputs)).data(),
-        must!(graph.evaluate(loss, &inputs)).data()
+        must!(ones.graph.evaluate(ones.primals[loss], &inputs))
+            .data()
+            .as_ref(),
+        must!(graph.evaluate(loss, &inputs)).data().as_ref()
     );
     // The auxiliary node is rebuilt although the loss does not depend on it.
     assert_close(
-        must!(ones.graph.evaluate(ones.primals[aux], &inputs)).data(),
+        must!(ones.graph.evaluate(ones.primals[aux], &inputs))
+            .data()
+            .as_ref(),
         &[0.5],
         1e-15,
     );
@@ -8852,12 +9025,14 @@ fn symbolic_vjp_many_ones_seed_matches_an_input_seed_and_retains_primals() {
     let values = must!(executable.execute(&inputs));
     assert_eq!(values.len(), 4);
     assert_eq!(
-        values[0].data(),
-        must!(graph.evaluate(loss, &inputs)).data()
+        values[0].data().as_ref(),
+        must!(graph.evaluate(loss, &inputs)).data().as_ref()
     );
     assert_eq!(
-        values[3].data(),
-        must!(seeded.graph.evaluate(seeded.gradients["w"], &seeded_inputs)).data()
+        values[3].data().as_ref(),
+        must!(seeded.graph.evaluate(seeded.gradients["w"], &seeded_inputs))
+            .data()
+            .as_ref()
     );
 }
 
@@ -8886,11 +9061,13 @@ fn symbolic_vjp_many_sums_the_vjps_of_several_outputs() {
         let expected = loss_gradients[name]
             .data()
             .iter()
-            .zip(aux_gradients[name].data())
+            .zip(aux_gradients[name].data().iter())
             .map(|(lhs, rhs)| lhs + rhs)
             .collect::<Vec<_>>();
         assert_close(
-            must!(both.graph.evaluate(both.gradients[name], &seeded)).data(),
+            must!(both.graph.evaluate(both.gradients[name], &seeded))
+                .data()
+                .as_ref(),
             &expected,
             1e-14,
         );
@@ -8904,8 +9081,10 @@ fn symbolic_vjp_many_sums_the_vjps_of_several_outputs() {
     let (_, doubled) =
         must!(graph.value_and_vjp(loss, &inputs, must!(DynamicTensor::filled(vec![], 2.0))));
     assert_close(
-        must!(twice.graph.evaluate(twice.gradients["w"], &inputs)).data(),
-        doubled["w"].data(),
+        must!(twice.graph.evaluate(twice.gradients["w"], &inputs))
+            .data()
+            .as_ref(),
+        doubled["w"].data().as_ref(),
         1e-15,
     );
 }
@@ -8956,8 +9135,10 @@ fn symbolic_jvp_over_a_ones_seeded_vjp_is_the_hessian_vector_product() {
     tangent_inputs.insert("w_dot".to_string(), direction.clone());
     let expected = must!(graph.hvp_scalar(loss, "w", &inputs, direction));
     assert_close(
-        must!(forward.graph.evaluate(forward.tangents[0], &tangent_inputs)).data(),
-        expected.data(),
+        must!(forward.graph.evaluate(forward.tangents[0], &tangent_inputs))
+            .data()
+            .as_ref(),
+        expected.data().as_ref(),
         1e-14,
     );
 }
@@ -9009,8 +9190,12 @@ fn inline_splices_the_reachable_callee_with_bound_inputs() {
     ]);
     for (inlined, source) in outputs.iter().zip([total, shifted, a]) {
         assert_eq!(
-            must!(graph.evaluate(*inlined, &graph_inputs)).data(),
-            must!(callee.evaluate(source, &callee_inputs)).data()
+            must!(graph.evaluate(*inlined, &graph_inputs))
+                .data()
+                .as_ref(),
+            must!(callee.evaluate(source, &callee_inputs))
+                .data()
+                .as_ref()
         );
     }
     // The spliced nodes differentiate like nodes traced in place.
@@ -9025,7 +9210,8 @@ fn inline_splices_the_reachable_callee_with_bound_inputs() {
         must!(gradients
             .graph
             .evaluate(gradients.gradients["x"], &graph_inputs))
-        .data(),
+        .data()
+        .as_ref(),
         &expected_x,
         1e-15,
     );
@@ -9033,8 +9219,9 @@ fn inline_splices_the_reachable_callee_with_bound_inputs() {
         must!(gradients
             .graph
             .evaluate(gradients.gradients["y"], &graph_inputs))
-        .data(),
-        expected["b"].data(),
+        .data()
+        .as_ref(),
+        expected["b"].data().as_ref(),
         1e-15,
     );
 }
@@ -9125,12 +9312,13 @@ fn inline_preserves_dtypes_and_weak_constants() {
         TensorDType::F32
     );
     assert_eq!(
-        must!(graph.evaluate(outputs[1], &inputs)).data(),
+        must!(graph.evaluate(outputs[1], &inputs)).data().as_ref(),
         must!(callee.evaluate(
             scaled,
             &BTreeMap::from([("a".to_string(), inputs["x"].clone())])
         ))
         .data()
+        .as_ref()
     );
     let strong = must!(graph.input("strong", vec![]));
     assert!(graph.add(x, strong).is_err());
@@ -9270,13 +9458,15 @@ fn inline_splices_region_graphs_and_keeps_two_splices_separate() {
         for (index, (inlined, source_output)) in outputs.iter().zip(callee_outputs).enumerate() {
             let expected = must!(reverse.graph.evaluate(source_output, &callee_inputs));
             assert_eq!(
-                must!(graph.evaluate(*inlined, &graph_inputs)).data(),
-                expected.data(),
+                must!(graph.evaluate(*inlined, &graph_inputs))
+                    .data()
+                    .as_ref(),
+                expected.data().as_ref(),
                 "splice {splice} output {index}"
             );
             assert_eq!(
-                plan_values[3 * splice + index].data(),
-                expected.data(),
+                plan_values[3 * splice + index].data().as_ref(),
+                expected.data().as_ref(),
                 "compiled splice {splice} output {index}"
             );
         }
@@ -9296,7 +9486,9 @@ fn inline_splices_region_graphs_and_keeps_two_splices_separate() {
     ]);
     let expected = must!(source.hessian_scalar(loss, "s", &callee_inputs));
     assert_close(
-        must!(forward.graph.evaluate(forward.tangents[0], &tangent_inputs)).data(),
+        must!(forward.graph.evaluate(forward.tangents[0], &tangent_inputs))
+            .data()
+            .as_ref(),
         &[expected[0][0]],
         1e-12,
     );
@@ -9317,7 +9509,7 @@ fn array_constants_evaluate_with_a_strong_dtype() {
     let output = must!(graph.add(product, c));
     let inputs = BTreeMap::from([("x".to_string(), must!(vector(&[3.0, 4.0, -1.0])))]);
     assert_eq!(
-        must!(graph.evaluate(output, &inputs)).data(),
+        must!(graph.evaluate(output, &inputs)).data().as_ref(),
         &[4.0, -10.0, 0.0]
     );
     // The elements are not printed.
@@ -9371,7 +9563,7 @@ fn array_constants_evaluate_with_a_strong_dtype() {
         )),
     );
     assert_eq!(
-        must!(graph.evaluate(selected, &inputs)).data(),
+        must!(graph.evaluate(selected, &inputs)).data().as_ref(),
         &[3.0, 0.0, -1.0]
     );
 }
@@ -9407,7 +9599,7 @@ fn array_constants_fold_like_per_node_execution() {
     let folded = must!(plan.evaluate(&inputs));
     let unfolded = must!(graph.evaluate(output, &inputs));
     assert_eq!(folded.dtype(), TensorDType::F32);
-    assert_eq!(folded.data(), unfolded.data());
+    assert_eq!(folded.data().as_ref(), unfolded.data().as_ref());
 
     // A zero divisor is left to fail at execution, as without folding.
     let z = graph.constant(must!(vector(&[1.0, 0.0, 2.0])), false);
@@ -9484,12 +9676,14 @@ fn array_constants_have_zero_tangents_and_receive_no_cotangent() {
 
     let (_, gradients) = must!(graph.value_and_vjp(loss, &inputs, must!(scalar(1.0))));
     assert_eq!(gradients.keys().collect::<Vec<_>>(), vec!["x"]);
-    assert_close(gradients["x"].data(), &expected_gradient, 1e-15);
+    assert_close(gradients["x"].data().as_ref(), &expected_gradient, 1e-15);
 
     let symbolic = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
     assert_eq!(symbolic.gradients.keys().collect::<Vec<_>>(), vec!["x"]);
     assert_close(
-        must!(symbolic.graph.evaluate(symbolic.gradients["x"], &inputs)).data(),
+        must!(symbolic.graph.evaluate(symbolic.gradients["x"], &inputs))
+            .data()
+            .as_ref(),
         &expected_gradient,
         1e-15,
     );
@@ -9502,7 +9696,7 @@ fn array_constants_have_zero_tangents_and_receive_no_cotangent() {
         .sum::<f64>();
     let tangents = BTreeMap::from([("x".to_string(), must!(vector(&direction)))]);
     let (_, tangent) = must!(graph.jvp(loss, &inputs, &tangents));
-    assert_close(tangent.data(), &[expected_tangent], 1e-15);
+    assert_close(tangent.data().as_ref(), &[expected_tangent], 1e-15);
     let forward = must!(graph.symbolic_jvp_with_tangent_inputs(
         loss,
         &BTreeMap::from([("x".to_string(), "x_dot".to_string())]),
@@ -9510,7 +9704,9 @@ fn array_constants_have_zero_tangents_and_receive_no_cotangent() {
     let mut forward_inputs = inputs.clone();
     forward_inputs.insert("x_dot".to_string(), must!(vector(&direction)));
     assert_close(
-        must!(forward.graph.evaluate(forward.tangent, &forward_inputs)).data(),
+        must!(forward.graph.evaluate(forward.tangent, &forward_inputs))
+            .data()
+            .as_ref(),
         &[expected_tangent],
         1e-15,
     );
@@ -9523,11 +9719,11 @@ fn array_constants_have_zero_tangents_and_receive_no_cotangent() {
         .zip(direction)
         .map(|((x, c), direction)| -c * c * (x * c).sin() * direction)
         .collect::<Vec<_>>();
-    assert_close(hvp.data(), &expected_hvp, 1e-14);
+    assert_close(hvp.data().as_ref(), &expected_hvp, 1e-14);
 
     // The forward tangent of a constant output is a zero of its dtype.
     let (_, constant_tangent) = must!(graph.jvp(c, &inputs, &tangents));
-    assert_eq!(constant_tangent.data(), &[0.0, 0.0, 0.0]);
+    assert_eq!(constant_tangent.data().as_ref(), &[0.0, 0.0, 0.0]);
 }
 
 #[test]
@@ -9547,8 +9743,14 @@ fn inline_shares_array_constants_between_splices() {
         ("x".to_string(), must!(vector(&[1.0, 2.0]))),
         ("y".to_string(), must!(vector(&[-1.0, 0.5]))),
     ]);
-    assert_eq!(must!(graph.evaluate(first[0], &inputs)).data(), &[-5.0]);
-    assert_eq!(must!(graph.evaluate(second[0], &inputs)).data(), &[-5.0]);
+    assert_eq!(
+        must!(graph.evaluate(first[0], &inputs)).data().as_ref(),
+        &[-5.0]
+    );
+    assert_eq!(
+        must!(graph.evaluate(second[0], &inputs)).data().as_ref(),
+        &[-5.0]
+    );
     // Each splice copies the constant node; the plan holds it once.
     let (plan, _) = must!(graph.compile_cpu_many(&[first[0], second[0]]));
     assert_eq!(plan.lower_text().matches("constant[dense]").count(), 1);
@@ -9607,7 +9809,7 @@ fn assert_constant_chain_parity(target: QuablaTarget) {
         for _ in 0..2 {
             let actual = must!(device.execute(&inputs));
             for (actual, expected) in actual.iter().zip(&expected) {
-                assert_close(actual.data(), expected.data(), 1e-5);
+                assert_close(actual.data().as_ref(), expected.data().as_ref(), 1e-5);
             }
         }
     }
@@ -9649,8 +9851,8 @@ fn cuda_backend_uploads_array_constants_once_per_plan_when_enabled() {
     for x in [[0.1, 0.2, -0.3, 0.4], [1.0, -2.0, 0.5, 0.0], [0.0; 4]] {
         let inputs = BTreeMap::from([("x".to_string(), must!(vector(&x)))]);
         assert_close(
-            must!(plan.execute(&inputs)).data(),
-            must!(cpu_plan.evaluate(&inputs)).data(),
+            must!(plan.execute(&inputs)).data().as_ref(),
+            must!(cpu_plan.evaluate(&inputs)).data().as_ref(),
             1e-5,
         );
         assert_eq!(plan.constant_upload_count(), 1);
@@ -9688,8 +9890,8 @@ fn cuda_backend_uploads_array_constants_once_per_plan_when_enabled() {
             ("x".to_string(), must!(vector(&[1.0, 2.0, 3.0, 4.0]))),
         ]);
         assert_eq!(
-            must!(plan.execute(&inputs)).data(),
-            must!(cpu_plan.evaluate(&inputs)).data()
+            must!(plan.execute(&inputs)).data().as_ref(),
+            must!(cpu_plan.evaluate(&inputs)).data().as_ref()
         );
     }
 
@@ -9883,7 +10085,7 @@ fn assert_batched_matches_examples(
             };
             assert_eq!(actual.shape(), expected.shape(), "output {output}");
             assert_eq!(actual.dtype(), expected.dtype(), "output {output}");
-            assert_close(actual.data(), expected.data(), 1e-13);
+            assert_close(actual.data().as_ref(), expected.data().as_ref(), 1e-13);
         }
     }
 }
@@ -9974,7 +10176,7 @@ fn inline_batched_graphs_batch_again_for_nested_vmap() {
             }
         }
     }
-    assert_close(value.data(), &expected, 1e-15);
+    assert_close(value.data().as_ref(), &expected, 1e-15);
 }
 
 #[test]
