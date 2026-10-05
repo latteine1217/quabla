@@ -22,7 +22,8 @@ use crate::dtype::PyDType;
 use crate::errors::{concrete_value_error, tracer_error, unsupported_operation_error};
 use crate::tensor::bool_operation_error;
 use crate::tensor::{
-    extract_scalar, parse_axis_indices, parse_tensor_indices, PyTensor, PyTensorView, TensorIndex,
+    extract_scalar, parse_axis_indices, parse_index_plan, parse_reshape_args, PyTensor,
+    PyTensorView, TensorIndex,
 };
 
 /// One traced input declaration: `(name, shape)` for `float64`, or
@@ -3185,7 +3186,11 @@ impl TraceTensor {
         self.exp_tensor().map_err(PyValueError::new_err)
     }
 
-    fn reshape(&self, shape: Vec<usize>) -> PyResult<Self> {
+    #[pyo3(signature = (*shape))]
+    fn reshape(&self, shape: &Bound<'_, PyTuple>) -> PyResult<Self> {
+        let batch_offset = usize::from(self.batch_axis.is_some());
+        let size = self.shape[batch_offset..].iter().product();
+        let shape = parse_reshape_args(shape, size)?;
         self.reshape_tensor(shape).map_err(PyValueError::new_err)
     }
 
@@ -3197,8 +3202,19 @@ impl TraceTensor {
     fn __getitem__(&self, index: &Bound<'_, PyAny>) -> PyResult<Self> {
         let batch_offset = usize::from(self.batch_axis.is_some());
         let shape = &self.shape[batch_offset..];
-        let indices = parse_tensor_indices(index, shape.len(), shape)?;
-        self.index_tensor(&indices).map_err(PyValueError::new_err)
+        let plan = parse_index_plan(index, shape)?;
+        let mut output = self
+            .index_tensor(&plan.indices)
+            .map_err(PyValueError::new_err)?;
+        for (axis, positions) in &plan.gathers {
+            output = output
+                .gather_tensor(positions, *axis as isize)
+                .map_err(PyValueError::new_err)?;
+        }
+        match plan.shape {
+            Some(shape) => output.reshape_tensor(shape).map_err(PyValueError::new_err),
+            None => Ok(output),
+        }
     }
 
     fn broadcast_to(&self, shape: Vec<usize>) -> PyResult<Self> {
@@ -3269,6 +3285,12 @@ impl TraceTensor {
     #[pyo3(signature = (axes = None))]
     fn transpose(&self, axes: Option<Vec<isize>>) -> PyResult<Self> {
         self.transpose_tensor(axes).map_err(PyValueError::new_err)
+    }
+
+    /// The traced tensor with its axes reversed, as `transpose()`.
+    #[getter(T)]
+    fn reversed_axes(&self) -> PyResult<Self> {
+        self.transpose_tensor(None).map_err(PyValueError::new_err)
     }
 
     fn log(&self) -> PyResult<Self> {

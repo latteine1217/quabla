@@ -71,6 +71,49 @@ qb.eye(n, m=None, dtype=None)
   through `asarray`; a Python number stays a weak scalar. `abs`, `sum`,
   `max`, `min`, `any`, and `all` are attributes of `quabla` but not in
   `__all__`, so `from quabla import *` leaves the builtins alone.
+- Numerically stable compositions, built from the methods above, so they
+  work eagerly, under `jit`/`grad`/`vmap`, and on every device:
+  - `softmax(x, axis=-1)` and `log_softmax(x, axis=-1)` subtract the maximum
+    along `axis` before `exp`; `log_softmax` is
+    `(x - m) - log(sum(exp(x - m)))`. `softmax([1000, 0])` is `[1, 0]` and
+    `log_softmax` gives `[0, -1000]`, with finite gradients, in `float32` too.
+    A slice holding `+inf` or only `-inf` gives NaN, as in JAX.
+  - `logsumexp(x, axis=None, keepdims=False)` is `m + log(sum(exp(x - m)))`
+    with the shift `m` set to zero where the maximum is not finite, as in
+    JAX: an all-`-inf` slice gives `-inf`, a slice holding `+inf` gives
+    `+inf`, and NaN propagates. Its gradient is `softmax`.
+  - `var(x, axis=None, keepdims=False, ddof=0)` and `std(...)` take two
+    passes (the mean, then the mean squared deviation), never
+    `E[x^2] - E[x]^2`, so `var(1e8 + [1, 2, 3])` is exactly `2/3` in
+    `float64`. `n <= ddof` divides by zero (inf or NaN). `std` has
+    derivative zero at zero variance (the `sqrt` convention; JAX gives NaN).
+  - `silu(x)` is `x * sigmoid(x)`; `gelu(x, approximate=True)` is the tanh
+    approximation `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`,
+    evaluated as `x * sigmoid(2u)` so the negative tail keeps its relative
+    accuracy. `approximate=False` raises `NotImplementedError` until the
+    native `erf` op lands.
+  - `clip(x, lo=None, hi=None)` is `minimum(maximum(x, lo), hi)`: NaN
+    propagates, and at a bound the derivative goes to the bound, so `x`
+    gets zero there. `sign(x)` is -1, 0, or +1 (NaN for NaN) with derivative
+    zero. `square(x)` is `x * x` and `reciprocal(x)` is `1 / x`.
+  - The max shift of `softmax`, `log_softmax`, and `logsumexp` is
+    differentiated through; its contribution cancels to rounding.
+- Shape helpers, all reshapes, slices, and broadcasts that differentiate and
+  work under `vmap`:
+  - `x.reshape(3, 2)`, `x.reshape((3, 2))`, and `quabla.reshape(x, shape)`
+    accept one `-1` extent, inferred from the size. `x.T` reverses the axes
+    (`x.transpose()`). Indexing takes `None`, `...`, and strided slices
+    (`x[None]`, `x[..., 0]`, `x[:, None]`, `x[::-1]`).
+  - `squeeze(x, axis=None)`, `expand_dims(x, axis)`,
+    `split(x, indices_or_sections, axis=0)` (a list; pieces may not be
+    empty), and `meshgrid(*xs, indexing="xy")` (a list; `"ij"` keeps the
+    input order) follow NumPy.
+  - `zeros_like(x, dtype=None)`, `ones_like(...)`, and
+    `full_like(x, fill_value, dtype=None)` return a `Tensor` of the shape and
+    dtype of `x`; for a traced `x` it is a constant of the trace.
+  - `quabla.matmul` follows NumPy for rank-1 operands: vector @ vector is a
+    scalar, matrix @ vector and vector @ matrix drop the vector's unit axis.
+    The `@` operator keeps requiring rank-2 or higher operands.
 - Operators: `-x` and `x ** y` work on traced values as on eager ones;
   `x ** y` with a non-integer or tensor exponent is the differentiable
   elementwise `pow` op (`qb.power`), described under
@@ -627,11 +670,14 @@ name keeps working through 0.x.
   `quabla.einsum("...ij,...jk->...ik", [lhs, rhs])` are scoped matrix-product
   spellings that lower directly to the existing rank-N `matmul` plan. Other
   einsum equations are rejected rather than silently interpreted.
-- `Tensor` and `TraceTensor` support `__getitem__` with integer and
-  contiguous unit-step slice tuples, including negative indices. Integer
-  indices lower to a length-one slice plus reshape, so reverse-mode AD and
-  CUDA/MLX lowering preserve the same semantics. Empty/strided slices,
-  ellipsis, and advanced indexing are not supported.
+- `Tensor` and `TraceTensor` support `__getitem__` with NumPy basic
+  indexing: integers (negative ones count from the end), slices of any
+  non-zero step, `None` (a new unit axis), and one `...`. Integer indices
+  lower to a length-one slice plus reshape, a strided slice to the
+  contiguous slice spanning its elements plus a `gather`, and `None` to a
+  final reshape, so reverse-mode AD and CUDA/MLX lowering preserve the same
+  semantics. Empty slices and advanced (array or boolean-mask) indexing are
+  not supported.
 - `tensor_hessian_scalar_fn(fn, input_specs, input_name)` and
   `tensor_hvp_scalar_fn(fn, input_specs, input_name)` freeze a scalar rank-N
   trace for dense Hessian or Hessian-vector-product evaluation. They are
@@ -874,8 +920,7 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
   implemented. Host storage is physically typed F64/F32/Bool; narrow
   storage widens transiently only when an F64 view is requested.
 - `gather`/`scatter_add` take static Python integer indices; dynamic index
-  tensors, boolean-mask indexing, strided or empty slices, and ellipsis are
-  unsupported.
+  tensors, boolean-mask indexing, and empty slices are unsupported.
 - CUDA loop bodies must be pure elementwise: matmul, reductions, `solve`,
   nested regions, and `cond` inside `fori`/`scan` are rejected. `cond`
   results and loop-region inputs must be floating, not `bool`.

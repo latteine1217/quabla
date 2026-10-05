@@ -1,7 +1,7 @@
 use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyMemoryView, PySlice, PySliceMethods, PyTuple};
+use pyo3::types::{PyAny, PyEllipsis, PyMemoryView, PySlice, PySliceMethods, PyTuple};
 use quabla_core::tensor_ir::{HostTensorStorage, TensorComparison, TensorDType};
 use std::borrow::Cow;
 use std::ffi::c_int;
@@ -80,28 +80,72 @@ pub enum TensorIndex {
     Slice { start: usize, stop: usize },
 }
 
-pub fn parse_tensor_indices(
-    index: &Bound<'_, PyAny>,
-    rank: usize,
-    shape: &[usize],
-) -> PyResult<Vec<TensorIndex>> {
+/// A parsed `__getitem__` key, applied in three steps: the integer and
+/// contiguous-slice `indices`, then one gather per strided slice (`(axis,
+/// positions)` on the result of the first step, positions relative to the
+/// slice start), then a reshape to `shape` when the key inserts new axes.
+/// Strided slices and `None` reuse the differentiable slice, gather, and
+/// reshape nodes, so every key form works eagerly and under every transform.
+pub struct IndexPlan {
+    pub indices: Vec<TensorIndex>,
+    pub gathers: Vec<(usize, Vec<usize>)>,
+    pub shape: Option<Vec<usize>>,
+}
+
+/// Parses an index key with NumPy basic-indexing rules: integers (negative
+/// ones count from the end) drop their axis, non-empty slices of any step
+/// keep it, `None` inserts a unit axis, one `...` stands for as many full
+/// slices as needed, and axes left unindexed at the end are kept whole.
+pub fn parse_index_plan(index: &Bound<'_, PyAny>, shape: &[usize]) -> PyResult<IndexPlan> {
+    let rank = shape.len();
     let items = if let Ok(tuple) = index.cast::<PyTuple>() {
         tuple.iter().collect::<Vec<_>>()
     } else {
         vec![index.clone()]
     };
-    if items.len() > rank {
+    let ellipsis = PyEllipsis::get(index.py());
+    let is_ellipsis = |item: &Bound<'_, PyAny>| item.is(ellipsis);
+    if items.iter().filter(|item| is_ellipsis(item)).count() > 1 {
+        return Err(PyIndexError::new_err(
+            "an index can only have a single ellipsis ('...')",
+        ));
+    }
+    let consumed = items
+        .iter()
+        .filter(|item| !item.is_none() && !is_ellipsis(item))
+        .count();
+    if consumed > rank {
         return Err(PyIndexError::new_err(format!(
-            "too many indices for tensor of rank {rank}: got {}",
-            items.len()
+            "too many indices for tensor of rank {rank}: got {consumed}"
         )));
     }
-    let mut result = Vec::with_capacity(items.len());
+    let mut indices = Vec::with_capacity(consumed);
+    let mut gathers = Vec::new();
+    // Extents of the final result, with the unit axes of `None` included.
+    let mut output_shape = Vec::with_capacity(rank + items.len());
+    let mut new_axes = false;
+    // The next input axis, and the axis count of the first step's result.
     let mut axis = 0;
+    let mut kept = 0;
     for item in items {
-        let extent = *shape.get(axis).ok_or_else(|| {
-            PyIndexError::new_err(format!("too many indices for tensor of rank {rank}"))
-        })?;
+        if item.is_none() {
+            output_shape.push(1);
+            new_axes = true;
+            continue;
+        }
+        if is_ellipsis(&item) {
+            for _ in 0..rank - consumed {
+                indices.push(TensorIndex::Slice {
+                    start: 0,
+                    stop: shape[axis],
+                });
+                output_shape.push(shape[axis]);
+                axis += 1;
+                kept += 1;
+            }
+            continue;
+        }
+        let extent = shape[axis];
         if let Ok(value) = item.extract::<isize>() {
             let normalized = if value < 0 {
                 extent as isize + value
@@ -116,34 +160,96 @@ pub fn parse_tensor_indices(
                         "index {value} is out of bounds for axis {axis} with extent {extent}"
                     ))
                 })?;
-            result.push(TensorIndex::Integer(value));
+            indices.push(TensorIndex::Integer(value));
             axis += 1;
             continue;
         }
         if let Ok(slice) = item.cast::<PySlice>() {
-            let indices = slice.indices(extent as isize)?;
-            if indices.step != 1 {
-                return Err(PyValueError::new_err(
-                    "Tensor indexing currently requires slice step == 1; use Tensor.slice for eager strided views",
-                ));
-            }
-            if indices.slicelength == 0 {
+            let range = slice.indices(extent as isize)?;
+            if range.slicelength == 0 {
                 return Err(PyValueError::new_err(
                     "Tensor indexing currently rejects empty slices",
                 ));
             }
-            result.push(TensorIndex::Slice {
-                start: indices.start as usize,
-                stop: indices.stop as usize,
+            let length = range.slicelength;
+            let first = range.start;
+            let last = first + (length as isize - 1) * range.step;
+            let (low, high) = (first.min(last), first.max(last) + 1);
+            indices.push(TensorIndex::Slice {
+                start: low as usize,
+                stop: high as usize,
             });
+            if range.step != 1 {
+                // The contiguous slice spans every selected element; the
+                // gather then picks them in order, reversed for a negative step.
+                gathers.push((
+                    kept,
+                    (0..length as isize)
+                        .map(|k| (first + k * range.step - low) as usize)
+                        .collect(),
+                ));
+            }
+            output_shape.push(length);
             axis += 1;
+            kept += 1;
             continue;
         }
         return Err(PyTypeError::new_err(
-            "Tensor indexing supports integers and contiguous slices only",
+            "Tensor indexing supports integers, slices, None, and ... only",
         ));
     }
-    Ok(result)
+    output_shape.extend_from_slice(&shape[axis..]);
+    Ok(IndexPlan {
+        indices,
+        gathers,
+        shape: new_axes.then_some(output_shape),
+    })
+}
+
+/// Parses the arguments of `reshape`: the extents as separate ints, one int,
+/// or one sequence of ints, as in NumPy. One extent may be `-1`; it is
+/// inferred from `size`, the element count of the reshaped array.
+pub fn parse_reshape_args(args: &Bound<'_, PyTuple>, size: usize) -> PyResult<Vec<usize>> {
+    let invalid = || PyTypeError::new_err("reshape expects ints or a single sequence of ints");
+    let extents = match args.len() {
+        0 => return Err(invalid()),
+        1 => {
+            let arg = args.get_item(0)?;
+            match arg.extract::<isize>() {
+                Ok(extent) => vec![extent],
+                Err(_) => arg.extract::<Vec<isize>>().map_err(|_| invalid())?,
+            }
+        }
+        _ => args.extract::<Vec<isize>>().map_err(|_| invalid())?,
+    };
+    let mut inferred = None;
+    let mut known = 1usize;
+    for (axis, &extent) in extents.iter().enumerate() {
+        if extent == -1 {
+            if inferred.replace(axis).is_some() {
+                return Err(PyValueError::new_err(
+                    "reshape can only infer one dimension (-1)",
+                ));
+            }
+        } else {
+            let extent = usize::try_from(extent)
+                .map_err(|_| PyValueError::new_err(format!("negative reshape extent {extent}")))?;
+            known = known.saturating_mul(extent);
+        }
+    }
+    let mut shape = extents
+        .iter()
+        .map(|&extent| extent.max(0) as usize)
+        .collect::<Vec<_>>();
+    if let Some(axis) = inferred {
+        if known == 0 || !size.is_multiple_of(known) {
+            return Err(PyValueError::new_err(format!(
+                "cannot reshape an array of size {size} into shape {extents:?}"
+            )));
+        }
+        shape[axis] = size / known;
+    }
+    Ok(shape)
 }
 
 pub fn parse_axis_indices(indices: &Bound<'_, PyAny>, axis_extent: usize) -> PyResult<Vec<usize>> {
@@ -2182,7 +2288,9 @@ impl PyTensor {
         unsafe { interop::release_buffer(view) }
     }
 
-    fn reshape(&self, shape: Vec<usize>) -> PyResult<Self> {
+    #[pyo3(signature = (*shape))]
+    fn reshape(&self, shape: &Bound<'_, PyTuple>) -> PyResult<Self> {
+        let shape = parse_reshape_args(shape, self.data.len())?;
         self.try_reshape(shape).map_err(PyValueError::new_err)
     }
 
@@ -2193,6 +2301,12 @@ impl PyTensor {
     #[pyo3(signature = (axes = None))]
     fn transpose(&self, axes: Option<Vec<isize>>) -> PyResult<Self> {
         self.try_transpose(axes).map_err(PyValueError::new_err)
+    }
+
+    /// The tensor with its axes reversed, as `transpose()`.
+    #[getter(T)]
+    fn reversed_axes(&self) -> PyResult<Self> {
+        self.try_transpose(None).map_err(PyValueError::new_err)
     }
 
     #[pyo3(signature = (axis = None, keepdims = false))]
@@ -2315,8 +2429,19 @@ impl PyTensor {
     }
 
     fn __getitem__(&self, index: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let indices = parse_tensor_indices(index, self.shape.len(), &self.shape)?;
-        self.try_index(&indices).map_err(PyValueError::new_err)
+        let plan = parse_index_plan(index, &self.shape)?;
+        let mut output = self
+            .try_index(&plan.indices)
+            .map_err(PyValueError::new_err)?;
+        for (axis, positions) in &plan.gathers {
+            output = output
+                .try_gather(positions, *axis as isize)
+                .map_err(PyValueError::new_err)?;
+        }
+        match plan.shape {
+            Some(shape) => output.try_reshape(shape).map_err(PyValueError::new_err),
+            None => Ok(output),
+        }
     }
 
     // With a tracer operand, arithmetic, comparisons, `maximum`/`minimum`,

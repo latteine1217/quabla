@@ -587,7 +587,10 @@ def test_tensor_getitem_supports_contiguous_slices_and_negative_indices():
     assert tensor[-1, -1].shape == []
     assert tensor[-1, -1].to_flat_list() == [11.0]
 
-    for index in (slice(None, None, 2), slice(1, 1), (0, 1, 2)):
+    # Strided slices lower to a contiguous slice plus a gather.
+    assert tensor[::2].to_flat_list() == [0.0, 1.0, 2.0, 3.0, 8.0, 9.0, 10.0, 11.0]
+
+    for index in (slice(1, 1), (0, 1, 2)):
         try:
             tensor[index]
         except (IndexError, ValueError):
