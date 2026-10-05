@@ -9,6 +9,16 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Changed
+
+- `float32` Cholesky JVPs, VJPs, and second derivatives use the native
+  kernels instead of a scalar expansion whose graph grew as O(n^3); the CPU
+  rounds every jet operation to `f32`. A `float32` Cholesky gradient at
+  n = 512 takes 0.15 s on the CPU, 0.09 s on CUDA (GTX 1660 SUPER), and
+  0.09 s on Apple silicon. Staged gradients, JVPs, and HVPs on the CPU and
+  on Metal, and gradients on CUDA, are bitwise unchanged; forward-over-forward
+  results, and CUDA JVPs and HVPs, can differ in the last bit.
+
 ## [0.2.1] - 2026-10-06
 
 ### Changed

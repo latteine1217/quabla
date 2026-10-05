@@ -109,12 +109,12 @@ records are in [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md).
 | CUDA + NCCL | Linux, two or more GPUs on one node | `cuda-nccl` | `f32` | Scalar value-and-gradient with all-reduced replicated parameter gradients | As CUDA | Single node; equal axis-zero batch shards; mapped-input gradients rejected; optimizer update on the host; requires a loadable `libnccl.so` |
 | MLX | macOS, Apple silicon | `mlx` | `f32` | Symbolic JVP/VJP, multi-output value-and-gradient, `vmap` JVP/VJP, device Adam | `cond` via one host predicate readback; `fori`/`scan` dispatched from the host on device-resident arrays, with first-order VJP and forward-over-reverse HVP | `solve` rejected (MLX 0.32.2 `linalg::solve` is CPU-stream only); `vmap` HVP not lowered; no fused Metal loop kernels |
 
-Staged Cholesky uses a native operation on CPU, CUDA, and Metal. Logical
-`float64` JVP, VJP, and second derivatives use bounded IR and O(n²) numerical
-workspace with O(n³) arithmetic; `vmap`, Jacobian, and Hessian composition
-preserve their existing call forms. Explicit `float32` differentiation and
-third or higher derivatives retain scalar expansion to preserve rounding and
-composition. Non-finite and extreme-scale CPU symbolic derivatives retain the reference path.
+Staged Cholesky uses a native operation on CPU, CUDA, and Metal. `float32`
+and `float64` JVP, VJP, and second derivatives use bounded IR and O(n²)
+numerical workspace with O(n³) arithmetic, and the CPU rounds every `float32`
+jet operation to `f32`; `vmap`, Jacobian, and Hessian composition preserve
+their existing call forms. Third or higher derivatives retain scalar
+expansion to preserve rounding and composition. Non-finite and extreme-scale CPU symbolic derivatives retain the reference path.
 Eager Cholesky keeps its strict symmetric positive-definite validation;
 staged Cholesky keeps its lower-triangle recurrence and existing exceptional
 value behavior. CUDA axis sums and means use a block reduction for axes of
@@ -273,8 +273,8 @@ and its gradients in one device plan, and `mlx_adam_loss_optimizer` and
 - Indexing takes static Python integers; dynamic index tensors and
   boolean-mask indexing are unsupported.
 - CUDA loop bodies must be pure elementwise. MLX rejects `solve` and has no
-  `vmap` HVP lowering. `float32` Cholesky derivatives use a scalar expansion
-  that is slow beyond small matrices.
+  `vmap` HVP lowering. Third and higher Cholesky derivatives use a scalar
+  expansion that is slow beyond small matrices.
 - Data parallelism is single-node CUDA + NCCL only.
 - `quabla.vmap`
   cannot batch `solve` or `cond`/`fori`/`scan` regions over a mapped

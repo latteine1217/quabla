@@ -17,11 +17,18 @@ fn matrix(n: usize, dtype: TensorDType) -> Result<DynamicTensor, String> {
 
 fn assert_close(actual: &DynamicTensor, expected: &DynamicTensor) {
     assert_eq!(actual.shape(), expected.shape());
+    // Runtime jets reuse one reciprocal where the expansion divides, so they
+    // agree to roundoff of the operand dtype rather than bit for bit.
+    let tolerance = if actual.dtype() == TensorDType::F32 || expected.dtype() == TensorDType::F32 {
+        1e-6
+    } else {
+        1e-12
+    };
     for (actual, expected) in actual.data().iter().zip(expected.data().iter()) {
         assert!(
             actual.to_bits() == expected.to_bits()
                 || actual.is_nan() && expected.is_nan()
-                || (actual - expected).abs() <= 1e-12 + 1e-12 * expected.abs(),
+                || (actual - expected).abs() <= tolerance + tolerance * expected.abs(),
             "{actual} != {expected}"
         );
     }
@@ -182,8 +189,12 @@ fn compact_cholesky_derivatives_match_reference_and_stay_bounded() -> Result<(),
     Ok(())
 }
 
+fn bits(tensor: &DynamicTensor) -> Vec<u64> {
+    tensor.data().iter().map(|x| x.to_bits()).collect()
+}
+
 #[test]
-fn compact_cholesky_shape_and_f32_derivative_fallback() -> Result<(), String> {
+fn compact_cholesky_shape_checks_and_native_f32_derivatives() -> Result<(), String> {
     let mut ir = TensorIr::new();
     assert!(ir.input("empty_matrix", vec![0, 0]).is_err());
     assert!(ir.input("empty_batch", vec![0, 2, 2]).is_err());
@@ -192,29 +203,74 @@ fn compact_cholesky_shape_and_f32_derivative_fallback() -> Result<(), String> {
         let input = ir.input(format!("bad_{shape:?}"), shape)?;
         assert!(ir.cholesky(input).is_err());
     }
-    let input = ir.input_typed("matrix", vec![4, 4], TensorDType::F32)?;
-    let output = ir.cholesky(input)?;
-    let inputs = BTreeMap::from([("matrix".into(), matrix(4, TensorDType::F32)?)]);
-    // Isolate the valid graph so unused malformed inputs do not mask execution.
-    let plan = ir.compile_cpu(output)?;
-    let actual = plan.value_and_vjp(&inputs, DynamicTensor::filled(vec![4, 4], 1.0)?)?;
+    // Float32 jets round every operation to f32 in the expansion's order, so
+    // symbolic first derivatives and HVPs reproduce the scalar expansion bit
+    // for bit while the derivative graphs stay bounded; runtime derivatives
+    // agree to f32 roundoff, as they do to f64 roundoff in float64.
+    let mut native = TensorIr::new();
+    let input = native.input_typed("matrix", vec![4, 4], TensorDType::F32)?;
+    let output = native.cholesky(input)?;
     let mut reference = TensorIr::new();
-    let input = reference.input_typed("matrix", vec![4, 4], TensorDType::F32)?;
-    let output = reference.expanded_cholesky(input)?;
-    let expected =
-        reference.value_and_vjp(output, &inputs, DynamicTensor::filled(vec![4, 4], 1.0)?)?;
-    assert_eq!(
-        actual.1["matrix"]
-            .data()
-            .iter()
-            .map(|x| x.to_bits())
-            .collect::<Vec<_>>(),
-        expected.1["matrix"]
-            .data()
-            .iter()
-            .map(|x| x.to_bits())
-            .collect::<Vec<_>>()
+    let reference_input = reference.input_typed("matrix", vec![4, 4], TensorDType::F32)?;
+    let reference_output = reference.expanded_cholesky(reference_input)?;
+    let inputs = BTreeMap::from([("matrix".into(), matrix(4, TensorDType::F32)?)]);
+    let direction = DynamicTensor::with_dtype(
+        vec![4, 4],
+        (0..16).map(|i| (i as f64 + 1.0) * 0.013 - 0.04).collect(),
+        TensorDType::F32,
+    )?;
+    let directions = BTreeMap::from([("matrix".into(), direction.clone())]);
+    let cotangent = DynamicTensor::with_dtype(
+        vec![4, 4],
+        (0..16).map(|i| (i as f64 + 2.0) * 0.031).collect(),
+        TensorDType::F32,
+    )?;
+    let plan = native.compile_cpu(output)?;
+    let expected_plan = reference.compile_cpu(reference_output)?;
+    assert_close(
+        &plan.value_and_vjp(&inputs, cotangent.clone())?.1["matrix"],
+        &expected_plan.value_and_vjp(&inputs, cotangent.clone())?.1["matrix"],
     );
+    assert_close(
+        &native.jvp(output, &inputs, &directions)?.1,
+        &reference.jvp(reference_output, &inputs, &directions)?.1,
+    );
+    let reverse = native.symbolic_vjp(output, "cotangent")?;
+    assert!(reverse.graph.node_count() <= 6);
+    let hvp = reverse.graph.symbolic_jvp_with_tangent_inputs(
+        reverse.gradients["matrix"],
+        &BTreeMap::from([("matrix".into(), "direction".into())]),
+    )?;
+    assert!(hvp.graph.node_count() <= 12);
+    let old_reverse = reference.symbolic_vjp(reference_output, "cotangent")?;
+    let old_hvp = old_reverse.graph.symbolic_jvp_with_tangent_inputs(
+        old_reverse.gradients["matrix"],
+        &BTreeMap::from([("matrix".into(), "direction".into())]),
+    )?;
+    let mut seeded = inputs.clone();
+    seeded.insert("direction".into(), direction);
+    seeded.insert("cotangent".into(), cotangent);
+    assert_eq!(
+        bits(
+            &reverse
+                .graph
+                .evaluate(reverse.gradients["matrix"], &seeded)?
+        ),
+        bits(
+            &old_reverse
+                .graph
+                .evaluate(old_reverse.gradients["matrix"], &seeded)?
+        )
+    );
+    let actual = hvp.graph.evaluate(hvp.tangent, &seeded)?;
+    assert_eq!(actual.dtype(), TensorDType::F32);
+    assert_eq!(
+        bits(&actual),
+        bits(&old_hvp.graph.evaluate(old_hvp.tangent, &seeded)?)
+    );
+    let actual = native.evaluate_mixed(output, &inputs, &directions, &directions)?;
+    let expected = reference.evaluate_mixed(reference_output, &inputs, &directions, &directions)?;
+    assert_close(&actual.mixed, &expected.mixed);
     Ok(())
 }
 

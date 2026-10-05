@@ -5592,12 +5592,8 @@ impl TensorIr {
                 return Err("Cholesky derivative operand shape mismatch".into());
             }
         }
-        Ok(self.push_node(
-            TensorOp::CholeskyAd { inputs, kind },
-            shape,
-            TensorDType::F64,
-            false,
-        ))
+        let dtype = self.node(inputs[0])?.dtype;
+        Ok(self.push_node(TensorOp::CholeskyAd { inputs, kind }, shape, dtype, false))
     }
 
     // Preserve the established scalar derivative and exceptional-value rules
@@ -5718,15 +5714,16 @@ impl TensorIr {
     }
 
     fn expand_cholesky_for_ad(&self) -> Result<Option<(Self, Vec<TensorNodeId>)>, String> {
+        // Native jets cover first and second order in either float dtype; a
+        // derivative of a second-order node (third order) uses the expansion.
         if !self.nodes.iter().any(|node| {
-            matches!(node.op, TensorOp::Cholesky { .. }) && node.dtype != TensorDType::F64
-                || matches!(
-                    node.op,
-                    TensorOp::CholeskyAd {
-                        kind: CholeskyAdKind::Mixed | CholeskyAdKind::VjpJvp,
-                        ..
-                    }
-                )
+            matches!(
+                node.op,
+                TensorOp::CholeskyAd {
+                    kind: CholeskyAdKind::Mixed | CholeskyAdKind::VjpJvp,
+                    ..
+                }
+            )
         }) {
             return Ok(None);
         }

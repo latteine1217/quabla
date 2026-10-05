@@ -878,9 +878,9 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - MLX rejects `solve` (and `solve_triangular`, which composes it), and
   `vmap` HVP has no MLX lowering. Triangular-solve kernels are not
   implemented on devices.
-- `float32` Cholesky derivatives and third or higher orders use a scalar
-  expansion whose graph grows as O(n^3) and is impractical beyond small
-  matrices; `float64` first and second orders use the native kernels.
+- Third or higher Cholesky derivatives use a scalar expansion whose graph
+  grows as O(n^3) and is impractical beyond small matrices; first and second
+  orders use the native kernels in `float32` and `float64`.
 - Data parallelism is single-node CUDA + NCCL only: equal axis-zero batch
   shards, replicated parameter gradients, and an optimizer on the host. There
   is no multi-node transport, tensor parallelism, or sharded matmul.
