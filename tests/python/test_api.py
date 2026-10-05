@@ -1125,6 +1125,26 @@ def test_jit_matches_tensor_jit_fn_with_pytrees_and_static_argnums():
     jitted(x, 2)
     assert traces == [2, 3]
     assert_raises(TypeError, qb.jit(scaled, static_argnums=1), x, [2], match="hashable")
+    # Static values that compare equal but trace differently get their own
+    # cache entries: 1, True, and 1.0; 0.0 and -0.0; and the same inside tuples.
+    by_type = qb.jit(
+        lambda x, n: x * (100.0 if n is True else 10.0 if type(n) is float else 1.0),
+        static_argnums=1,
+    )
+    for value, factor in [(1, 1.0), (True, 100.0), (1.0, 10.0), ((1,), 1.0)]:
+        assert_close(by_type(x, value), [v * factor for v in QX])
+    signed = qb.jit(lambda x, z: x * math.copysign(1.0, z[0]), static_argnums=1)
+    assert_close(signed(x, (0.0,)), QX)
+    assert_close(signed(x, (-0.0,)), [-v for v in QX])
+    assert_raises(
+        ValueError, by_type.lower(x, 3).compile(), x, 3.0, match="statics"
+    )
+    # A NaN static value matches itself instead of retracing on every call.
+    nan_traces = []
+    nan_static = qb.jit(lambda x, n: nan_traces.append(n) or x, static_argnums=1)
+    for _ in range(3):
+        nan_static(x, float("nan"))
+    assert len(nan_traces) == 1
     # NumPy data is accepted as an array leaf.
     if np is not None:
         assert_close(qb.jit(masked_loss)(np.array(QX), np.array(QW)), old)
@@ -1568,6 +1588,10 @@ def test_legacy_grad_and_jit_call_forms_keep_v0_1_results():
         [6.0, 8.0],
     ]
     assert type(qb.jit(input_specs=[("a", (2, 2))])).__name__ == "JitTransform"
+    # A list of ints is v0.2 argnums, not a v0.1 input spec list.
+    x, y = qb.array([1.0, 2.0]), qb.array([3.0, 4.0])
+    grad_x, grad_y = qb.grad(lambda a, b: qb.sum(a * b), [0, 1])(x, y)
+    assert (grad_x.tolist(), grad_y.tolist()) == ([3.0, 4.0], [1.0, 2.0])
     assert qb.grad is not qb._quabla.grad and qb.jit is not qb._quabla.jit
     assert list(inspect.signature(qb.grad).parameters) == ["fun", "argnums", "has_aux"]
 

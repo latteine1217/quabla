@@ -50,6 +50,8 @@ with.
 """
 
 import inspect
+import os
+import sys
 import weakref
 import warnings
 
@@ -108,10 +110,41 @@ class _Text(str):
         return str(self)
 
 
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
+
+
+def _user_stacklevel():
+    """The `warnings.warn` stacklevel of the first caller outside quabla.
+
+    Compilation is reached through several cache layers whose depth depends
+    on the entry point, so a fixed stacklevel would blame quabla's frames.
+    """
+    frame, level = sys._getframe(1), 1
+    while frame is not None and frame.f_code.co_filename.startswith(_PACKAGE_DIR):
+        frame, level = frame.f_back, level + 1
+    return level
+
+
 def _static_key(value):
     # The type keeps 1, 1.0, and True apart; `hex` keeps -0.0 apart from 0.0
-    # and makes a NaN equal to itself.
-    return (type(value), value.hex() if type(value) is float else value)
+    # and makes a NaN equal to itself. Tuples, the usual static_argnums
+    # containers, apply the same rule to every element.
+    kind = type(value)
+    if kind is float:
+        return (kind, value.hex())
+    if kind is tuple:
+        return (kind, tuple(_static_key(item) for item in value))
+    return (kind, value)
+
+
+def _static_value(key):
+    """Inverts `_static_key` for rendering signatures."""
+    kind, value = key
+    if kind is float:
+        return float.fromhex(value)
+    if kind is tuple:
+        return tuple(_static_value(item) for item in value)
+    return value
 
 
 def _as_array_leaf(leaf):
@@ -188,7 +221,7 @@ def _signature(args, static_argnums, converted_argnums):
             key.append(_static_key(leaf))
             continue
         elif kind is _Static:
-            key.append((_Static, leaf.value))
+            key.append((_Static, _static_key(leaf.value)))
             continue
         elif kind is TraceTensor:
             traced = True
@@ -219,7 +252,7 @@ def _traced_signature(args, static_argnums, converted_argnums):
         if index in static_argnums:
             nodes.append(_LEAF)
             leaves.append(_Static(arg))
-            key.append((_Static, arg))
+            key.append((_Static, _static_key(arg)))
             continue
         start = len(leaves)
         nodes.append(_flatten(arg, leaves))
@@ -258,12 +291,11 @@ def _describe_signature(key):
     rendered = []
     for part in parts:
         if part[0] is _Static:
-            rendered.append(_Text(f"static {part[1]!r}"))
+            rendered.append(_Text(f"static {_static_value(part[1])!r}"))
         elif isinstance(part[0], tuple):
             rendered.append(_Text(_describe_aval(part[0], part[1])))
         else:
-            value = float.fromhex(part[1]) if part[0] is float else part[1]
-            rendered.append(_Text(repr(value)))
+            rendered.append(_Text(repr(_static_value(part))))
     return repr(_unflatten(in_node, iter(rendered)))
 
 
@@ -879,7 +911,7 @@ class _Jit(_Transform):
                 warnings.warn(
                     f"{self._target} executes float64 programs as float32",
                     UserWarning,
-                    stacklevel=3,
+                    stacklevel=_user_stacklevel(),
                 )
                 self._warned_precision = True
         return program
@@ -1821,14 +1853,15 @@ _LEGACY_GRAD_KEYWORDS = frozenset(
 
 
 def _is_input_specs(value):
-    if isinstance(value, list):
-        return True
-    return isinstance(value, tuple) and not all(isinstance(item, int) for item in value)
+    # v0.1 specs are `(name, shape)` pairs, so a list or tuple of ints is argnums.
+    return isinstance(value, (list, tuple)) and not all(
+        isinstance(item, int) for item in value
+    )
 
 
 def _is_legacy_grad_call(args, kwargs):
     # v0.1 takes four arguments with an input spec list second; the new form
-    # takes at most three, with an int or a tuple of ints second.
+    # takes at most three, with an int or a sequence of ints second.
     if len(args) > 3 or not _LEGACY_GRAD_KEYWORDS.isdisjoint(kwargs):
         return True
     return len(args) >= 2 and _is_input_specs(args[1])

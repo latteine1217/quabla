@@ -117,6 +117,8 @@ def test_device_jit_matches_cpu_for_nested_transforms_and_pytrees():
             f(qb.array([3.0, 4.0]))
             f(qb.array([1.0]))
         assert len(seen) == 1
+        # The warning names the caller's line, not quabla's cache layers.
+        assert seen[0].filename == __file__, seen[0].filename
         if device == "mlx":
             unsupported = qb.jit(lambda a, b: qb.solve(a, b), device="mlx")
             error = raises(
