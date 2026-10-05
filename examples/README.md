@@ -64,6 +64,18 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
 python examples/benchmark_pinn_cuda.py
 ```
 
+The v0.2 retained-training benchmark compares `optim.Trainer` against the
+native Adam executor on the same analytic Poisson residual. It checks loss
+and parameter trajectories and separates construction, submission,
+synchronization, and readback timings. The optional ratio gate applies to
+this workload and run; it does not establish a general performance bound.
+Use an extension built for the selected device:
+
+```sh
+python examples/benchmark_v02_training.py --device cuda:0 --max-step-ratio 1.02
+python examples/benchmark_v02_training.py --device mlx --max-step-ratio 1.02
+```
+
 CUDA + NCCL build (`--features cuda-nccl`, two GPUs):
 `examples/validate_data_parallel_cuda.py` checks single-call two-GPU parity
 against the CPU reference, and

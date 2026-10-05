@@ -11,6 +11,7 @@ import sys as _sys
 
 from . import _array, _errors, _ops, _quabla, _transforms
 from . import tree as tree
+from . import optim as optim
 from ._devices import ShapeDtype as ShapeDtype
 from ._devices import devices as devices
 from ._array import *  # noqa: F403
@@ -44,6 +45,7 @@ __all__ = list(
         + [
             "ShapeDtype",
             "devices",
+            "optim",
         ]
     )
 )
