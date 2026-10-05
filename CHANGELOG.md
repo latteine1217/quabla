@@ -10,10 +10,24 @@ deprecated names keep working until 1.0 (see
 ## [Unreleased]
 
 Work toward the v0.2 JAX-style Python API described in
-`docs/api_v0_2_design.md` (slices S0 through S4b of S0-S9). All v0.1 names
-keep working unchanged.
+`docs/api_v0_2_design.md` (slices S0 through S9). All v0.1 call forms remain
+available; migrated names now warn once as described below.
 
 ### Added
+
+- **Devices and AOT.** Explicit CPU/CUDA/MLX `jit`, `cuda:N`, built-target
+  `devices()`, `ShapeDtype` and `.lower().compile()` with ordered output
+  programs; eager typed MLX/CUDA lowering checks and a once-per-function
+  warning for float64 device execution.
+- **Training and control flow.** Pure pytree `optim.Adam`/`SGD`, CPU and
+  device Adam `optim.Trainer`, and `cond`/`fori_loop`/`scan` wrappers with
+  explicit region operands and the existing backend limits.
+- **Distributed.** Experimental single-node
+  `distributed.value_and_grad` with equal axis-zero shards, replicated
+  parameter gradients, bounded signature caching and explicit Sum/Mean.
+- **Migration.** `quabla.legacy` preserves the 2D API without warnings;
+  migrated top-level names warn once, legacy `grad`/`jit` forms still
+  dispatch, and `quabla.Adam` aliases the new Adam with its old `step`.
 
 - **Packaging.** The Python package is a mixed Rust/Python project: a
   pure-Python `quabla` package over the compiled `quabla._quabla` extension.

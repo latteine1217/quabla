@@ -3,20 +3,19 @@
 This document is the reference companion to the [README](../README.md). It
 describes the Python API on `main` in two layers:
 
-- The **core API** of the upcoming v0.2 release (unreleased; slices S0-S4b of
+- The **core API** of the upcoming v0.2 release (unreleased; slices S0-S9 of
   [api_v0_2_design.md](api_v0_2_design.md)): arrays with NumPy interop,
   module-level math, and the JAX-style function transforms `grad`,
   `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `vmap`, and `jit`.
-  New code should start here. These transforms compile for the CPU only so
-  far.
+  New code should start here. Device execution uses explicit
+  `jit(device="cpu" | "cuda:N" | "mlx")`.
 - The **v0.1 layer**, released in v0.1.0 and kept unchanged: the rank-N
   compiler facade (`Compiler`, `Program`, `Executable`), which is the
-  advanced layer for explicit compilation and, until `jit(device=...)` lands,
-  the way to run on CUDA and MLX; the `trace_tensor` and `tensor_*_fn`
+  advanced layer for explicit compilation; the `trace_tensor` and `tensor_*_fn`
   helpers with their device variants and device optimizers; the control-flow
   builders; and the legacy 2D `Matrix` API. The design deprecates most
-  `tensor_*_fn` helpers in favour of the core API in v0.2, but none of them
-  emits a warning yet, and all of them keep working through 0.x.
+  `tensor_*_fn` helpers in favour of the core API in v0.2. Migrated top-level
+  names warn once, and all old call forms keep working through 0.x.
 
 Paths in code spans (for example `examples/pinn_poisson.py`) are relative to
 the repository root. Per-feature status and validation records are in
@@ -82,7 +81,7 @@ qb.eye(n, m=None, dtype=None)
 ### Function Transforms
 
 The v0.2 transforms ([api_v0_2_design.md](api_v0_2_design.md), sections
-3.3-3.5; CPU only so far, see [Device Execution](#device-execution)) take
+3.3-3.5; see [Device Execution](#device-execution)) take
 positional pytree arguments (`dict` with string keys, `list`,
 `tuple`, `None`; `quabla.tree.flatten`/`unflatten`/`map`) of arrays and
 Python scalars, and need no input specs:
@@ -220,14 +219,62 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8)
 
 ## Device Execution
 
-`qb.jit(fun, device=...)` accepts only `None` and `"cpu"` so far; `"cuda"`,
-`"cuda:N"`, and `"mlx"` raise `quabla.UnsupportedOperationError` until slice
-S5 of the v0.2 design lands, and any other value is a `ValueError`. Until
-then, the v0.1 entrypoints below run on CUDA and MLX. They take name-keyed
-input specs (`[(name, shape, dtype), ...]`) and dictionaries of eager
-tensors, and they are unchanged since v0.1.0. The README
-[Quickstart](../README.md#quickstart) shows the facade on every built
-target.
+`qb.jit(fun, device=None, static_argnums=(), max_traces=8)` selects CPU by
+default, or explicitly `"cuda"`, `"cuda:N"`, or `"mlx"`. A missing build
+target raises `UnsupportedOperationError`; device-loop lowering rejections
+and MLX `solve` errors carry `.op` and `.device`. Invalid device spellings
+are `ValueError`. Eager array operations remain on the host. Device calls
+upload inputs and return host output pytrees; logical float64 device programs
+emit one `UserWarning` per compiled function because execution is float32.
+`qb.devices()` lists built targets, not physical GPU ordinals.
+
+`qb.jit(fun).lower(*args)` accepts arrays or `qb.ShapeDtype(shape, dtype)`
+inside pytrees and traces without execution. The lowered object exposes
+`.as_text()`, an ordered-output facade `.program`, and `.compile()` returning
+a positional callable that rejects changed structures, shapes, dtypes or
+static values. The facade's `.output_shapes` lists traced outputs (including
+duplicates); `.program.compile(target)(inputs_dict)` returns their ordered
+list. `.compile()` on the lowered object also restores constants and pytree
+structure. Transform the Python function before lowering; multi-output facade
+`Program.jvp`/`vjp` are explicitly rejected. Existing `Compiler.trace` keeps
+its single-output Tensor contract.
+
+`qb.optim.Adam(learning_rate=1e-3, b1=0.9, b2=0.999, eps=1e-8)` and
+`qb.optim.SGD(learning_rate=1e-2)` provide `init(params)` and pure
+`update(params, grads, state) -> (params, state)` over floating Tensor pytrees.
+Adam also preserves the old dictionary `step` and the keyword aliases
+`beta1`, `beta2`, `epsilon`. Pure host moments use float64 as the old host
+Adam does, and parameters keep their dtype.
+
+`qb.optim.Trainer(loss, params, optimizer, *data, device="cpu", batch_argnums=())`
+traces `loss(params, *data)`. CPU supports Adam/SGD; devices support Adam.
+`batch_argnums` indexes data positions, excluding params. `step(*batch)`
+replaces them in the declared order, with unchanged pytree/shapes/dtypes;
+`step()` reuses data without Python flattening on devices. Device parameters
+and moments stay retained; `.loss()` and `.params` explicitly read back.
+Compare the native and new training path with
+`python examples/benchmark_v02_training.py --device cuda:0 --max-step-ratio 1.02`
+(or `--device mlx`). This reports training parity and interleaved synchronized
+step samples separately from trace/compile and diagnostic readback.
+
+`qb.cond(pred, true_fun, false_fun, *operands)` runs one branch lazily.
+`qb.fori_loop(lower, upper, body, init, operands=(), unroll=False)` calls
+`body(i, carry, *operands)`. `qb.scan(f, init, length=n, operands=(), unroll=False)`
+calls `f(carry, i, *operands) -> (carry, output)` and stacks outputs on axis zero.
+Bounds are static non-negative integers, scan length is positive, and carries
+are single arrays. Region indices are scalar arrays; eager/unrolled indices
+are Python integers. Pass every outer tracer used by a region as an operand.
+Unsupported implicit capture raises `TracerError` naming `operands=`.
+
+`qb.distributed.value_and_grad(fun, devices=["cuda:0", "cuda:1"], shard_argnums=(1,),
+argnums=0, reduction="mean")` is experimental single-node CUDA/NCCL execution.
+Arguments and replicated parameters may be pytrees. Full batches split equally
+on axis zero; `sum` sums shard losses/parameter gradients and `mean` averages
+them. Mapped-input gradients and nested execution inside another transform
+are rejected. Optimizer updates stay on the host. The cache retains at most
+eight signatures; changed static values, shapes or dtypes specialize it.
+
+The v0.1 entrypoints below keep their original spec/dictionary call forms:
 
 | Task | CUDA (Linux, `cuda` feature) | MLX (Apple silicon, `mlx` feature) |
 | --- | --- | --- |
@@ -239,10 +286,9 @@ target.
 | Device-resident Adam training | `cuda_adam_vjp_optimizer`, `cuda_adam_loss_optimizer` | `mlx_adam_loss_optimizer` |
 | Data parallelism (`cuda-nccl`) | `tensor_value_and_grad_data_parallel_cuda_fn` | not available |
 
-Control flow on every backend uses the region builders `tensor_cond`,
-`tensor_fori_loop_region`, and `tensor_scan_region` inside a traced
-function, under the v0.2 transforms (CPU) and the v0.1 helpers alike; the
-core `qb.cond`, `qb.fori_loop`, and `qb.scan` wrappers are planned for v0.2. `Compiler.capabilities()` reports which targets the build
+The core control-flow wrappers reuse the region builders `tensor_cond`,
+`tensor_fori_loop_region`, and `tensor_scan_region`, with their existing
+backend limits. `Compiler.capabilities()` reports which targets the build
 contains; it is not a hardware probe. The PINN examples in
 `examples/pinn_poisson_{mlx,cuda}.py` and `examples/pinn_mlp_{mlx,cuda}.py`
 train on each device with these helpers. Their behaviour and limits are
@@ -253,8 +299,7 @@ described under [Compiler Facade](#compiler-facade) and
 
 The rank-N compiler path has one explicit lifecycle. It is the advanced
 layer of the v0.2 design, for explicit compilation and inspection from
-name-keyed input specs, and until `jit(device=...)` lands it is the
-target-independent way to run on CUDA and MLX. Integrations that need a
+name-keyed input specs on CPU, CUDA and MLX. Integrations that need a
 compiled program should use this facade instead of coupling to a
 backend-specific execution plan class; the legacy 2D `Matrix` tracer is
 intentionally outside it. The [Quickstart](../README.md#quickstart) shows the
@@ -340,7 +385,7 @@ Python frontend / PyO3 -> TensorTraceGraph -> TensorIr / AD transforms
 These entrypoints shipped in v0.1.0 and work unchanged on `main`. The v0.2
 design ([Appendix A](api_v0_2_design.md#appendix-a-name-mapping)) maps each
 of them to its core-API equivalent and deprecates most `tensor_*_fn` helpers
-from v0.2 on; the deprecation warnings are not implemented yet, and every
+from v0.2 on; migrated names now warn once on top-level access, and every
 name keeps working through 0.x.
 
 ### Rank-N Tensor API
@@ -387,7 +432,8 @@ name keeps working through 0.x.
   `f64` result rounded to `f32` (bit-exact IEEE for `+ - * / sqrt`), which
   serves as the reference for CUDA and MLX; both execute `float32` natively and
   keep lowering `float64` programs to `f32` kernels as before. `kernel_ir()`
-  reports `"f32"`/`"f64"`. Host storage stays `f64`, factories such as
+  reports `"f32"`/`"f64"`. Immutable host storage uses 8/4/1 bytes per
+  element for F64/F32/Bool, with no persistent widened cache. Factories such as
   `zeros`/`arange` create `float64`, and batch-specialized functions
   (`tensor_jit_batch_fn` and its value-and-grad variants) trace `float64`
   inputs.
@@ -695,7 +741,9 @@ name keeps working through 0.x.
 - Python `Adam` updates immutable dictionaries of named rank-N `Tensor`
   parameters from VJP gradients, including the gradient dictionaries that
   `qb.grad` and `qb.value_and_grad` return for a flat dict of parameters
-  (README "At a Glance"); `quabla.optim` is planned for v0.2. The test suite includes a manufactured 1D
+  (README "At a Glance"). It is the deprecated top-level alias of
+  `quabla.optim.Adam` (see [Device Execution](#device-execution)), which keeps
+  this stateful `step`. The test suite includes a manufactured 1D
   Poisson residual in which two symbolic coordinate JVP transforms form
   `u_xx`, then VJP and Adam recover one scalar MLP weight. This is a
   vertical-slice correctness proof. It includes batched collocation points and
@@ -815,7 +863,8 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
   symbolic dimensions.
 - Dtypes are `float32`, `float64`, and `bool`. `float16`/`bfloat16`, integer
   tensors, native device `f64`, and mixed-precision training are not
-  implemented. Host storage is `f64` for every dtype.
+  implemented. Host storage is physically typed F64/F32/Bool; narrow
+  storage widens transiently only when an F64 view is requested.
 - `gather`/`scatter_add` take static Python integer indices; dynamic index
   tensors, boolean-mask indexing, strided or empty slices, and ellipsis are
   unsupported.
@@ -833,10 +882,7 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - StableHLO export (`stablehlo_text`) covers only a small inspection subset
   and is not an execution path.
 - The legacy 2D `Matrix`/`TraceGraph` API is not migrated to the facade.
-- The v0.2 transforms run on the CPU only; `jit(device=...)` for CUDA and
-  MLX, `quabla.optim`, and the `cond`/`fori_loop`/`scan` wrappers are not
-  implemented yet (see [Device Execution](#device-execution)).
-  `quabla.vmap` cannot batch `solve` or `cond`/`fori`/`scan` regions over a
+- `quabla.vmap` cannot batch `solve` or `cond`/`fori`/`scan` regions over a
   mapped argument.
   `jacobian` and `hessian` are dense: their basis constant and result grow
   quadratically with the number of input elements.

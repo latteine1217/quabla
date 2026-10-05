@@ -1,5 +1,633 @@
 # Rust SciML Runtime Roadmap
 
+## v0.2 API Increment (2026-10-03)
+
+S5-S9 are implemented on the current working tree: explicit device `jit` and
+abstract lowering, pure optimizers and retained-buffer `Trainer`, control-flow
+wrappers, experimental distributed value-and-gradient, and compatibility
+warnings/legacy namespace. Dtype phases D2's integer indices and D3-D6 remain
+separate future work. The inherited backend restrictions are unchanged.
+
+The accepted API and implementation refinements are in `api_v0_2_design.md`.
+The macOS CPU extension, workspace tests, clippy, fmt, ruff, old Python matrix,
+new API tests, and five added Python suites pass. Ordered-output facade tests
+also preserve the original single-output `Compiler.trace` behavior.
+
+On the GTX 1660 SUPER CUDA host, workspace tests with CUDA runtime enabled,
+clippy with `cuda-nccl`, the existing Python matrix/API suites, and the new
+device jit/AOT, Trainer convergence, and control-flow suites pass.
+The interleaved Poisson PINN benchmark compares
+1,000 steps per executor: native and Trainer checkpoint losses/weights are
+identical; Trainer/native synchronized step ratio is 1.00267, below the 1.02
+gate. This is one host/run and one retained-input workload, not a general
+performance guarantee.
+
+A two-GPU validation run on a Linux node (2x RTX 3090, NCCL) completed in
+13 seconds with exit status 0. All five added suites, CUDA Trainer
+convergence, and NCCL parity pass. For both float64 and float32 input programs, Sum loss
+is 23.625 and Mean loss is 11.8125; the suite also checks replicated parameter
+gradients against an independent per-shard CPU oracle and the legacy CUDA
+helper. The retained Trainer benchmark has identical checkpoint losses and
+weights and a synchronized step ratio of 1.01039, below 1.02. This final run
+includes the Trainer failed-step regression fix. The run recorded a hash of
+the tested source snapshot together with its output and benchmark JSON;
+those records are not part of the repository.
+
+Reproduction on a Linux machine with two CUDA GPUs and a loadable
+`libnccl.so` (CUDA ordinals 0 and 1; select them with
+`CUDA_VISIBLE_DEVICES`):
+
+```sh
+QUABLA_CUDA_TEST=1 QUABLA_CUDA_NCCL_TEST=1 \
+  cargo test --workspace --features quabla-core/cuda-nccl
+maturin develop --release --features cuda-nccl
+QUABLA_CUDA_NCCL_TEST=1 python tests/python/test_distributed_api.py
+QUABLA_CUDA_TEST=1 python tests/python/test_devices_api.py
+QUABLA_CUDA_TEST=1 python tests/python/test_optim_api.py
+QUABLA_CUDA_TEST=1 python tests/python/test_control_api.py
+python examples/benchmark_v02_training.py --device cuda:0 --max-step-ratio 1.02
+```
+
+On a single GPU without NCCL, build with `--features cuda` and drop
+`QUABLA_CUDA_NCCL_TEST`; the distributed suite then checks the
+feature-unavailable contract instead of NCCL parity.
+
+The Metal Toolchain is now installed and the release MLX extension builds
+and loads on the Apple M3 / macOS 27.0.1 host. All five new Python suites,
+the existing Python matrix/API suites, and Rust workspace tests with
+`quabla-core/mlx` pass (201 passed, 0 failed, 1 ignored). MLX all-target
+clippy with `-D warnings` passes after retrying a GitHub DNS download failure;
+fmt, ruff, and diff checks also pass. The MLX solve-rejection fixture was corrected to use
+a rank-two right-hand side, so it reaches backend validation.
+
+For this local Rust/Xcode combination, the default release build linked but
+failed to load with `mis-aligned LINKEDIT string pool`. Building with the
+per-command `CARGO_PROFILE_RELEASE_STRIP=none` avoids the failure, matching
+[Rust issue 157750](https://github.com/rust-lang/rust/issues/157750).
+No project build defaults were changed. Reproduce with:
+
+```sh
+CARGO_PROFILE_RELEASE_STRIP=none maturin develop --release --features mlx
+QUABLA_MLX_TEST=1 python tests/python/test_devices_api.py
+QUABLA_MLX_TEST=1 python tests/python/test_optim_api.py
+QUABLA_MLX_TEST=1 python tests/python/test_control_api.py
+python examples/benchmark_v02_training.py --device mlx --max-step-ratio 1.02 \
+  --samples 19 --steps-per-sample 500
+```
+
+The isolated 9,600-step-per-executor MLX benchmark has identical loss/weight
+checkpoints and a synchronized Trainer/native step ratio of 0.81017,
+passing the 1.02 gate. The first run overlapped other verification and had
+ratio 1.07599 (failed performance gate, exact numerical parity). These measurements are workload/run-specific and do
+not establish a general speedup. One later MLX stream initialization failed
+before graph execution; a Metal device probe and the complete suite rerun
+passed without code changes. The cause of that transient failure remains
+unconfirmed.
+
+### Algorithm and Memory Review (2026-10-03)
+
+This records the pre-optimization review of the v0.2 working tree and its
+inherited executors. The implementation follow-up is recorded below.
+Source line references in this review refer to that earlier snapshot. The CPU
+probe scripts and their outputs were kept outside the repository.
+RSS observations include allocator/runtime effects, not exact buffer accounting.
+
+Notation: V/E are graph nodes/edges; N is a uniform tensor element count;
+D is the depth of the doubling DAG; T is loop iterations; C/Y are carry/output
+elements per iteration; L is selected parameter leaves; P/Q are flattened
+Jacobian input/output sizes; R is tensor rank; G is replica count and B/U
+are full mapped-batch/replicated-input elements. Costs exclude caller-owned
+inputs unless stated. Bounds describe these execution strategies, not a
+claim of globally optimal graph scheduling.
+
+| Priority | Path | Current cost | Concrete target |
+| --- | --- | --- | --- |
+| 1 | CPU fused shared DAG | Doubling graph time O(N * 2^D); fusion eligibility also repeats shared subgraphs | O(N * (V+E)) execution with reusable per-element memoization; O(V+E) eligibility; O(V) scratch |
+| 2 | CPU frozen forward executor | Retains every node value; a uniform chain uses O(VN) array storage | Last-use release/reuse: memory proportional to the live frontier plus retained outputs; O(N) for the chain |
+| 3 | CPU forward-only Fori/Scan | Fori records O(TC) carry tape and then discards it; Scan adds O(TC) to required O(TY) outputs | Separate no-tape forward path: O(C) carry storage for Fori, O(C+TY) for Scan, plus body workspace |
+| 4 | Dense Jacobian basis | L full P-by-P identity allocations: O(LP^2) initialization; retained basis is O(P^2) | Direct identity blocks reduce initialization to O(P^2); chunked JVP reduces basis workspace to O(bP), plus required O(PQ) result and chunked body workspace |
+| 5 | Pure CPU Adam | 14 full-size arithmetic allocations per leaf/update; identical-shape binaries still do O(NR) indexing | One fused pure leaf update with three result buffers and O(N) work; equal-shape binary fast path |
+| 6 | Distributed host sharding | Clones the full batch G times before replacing it with shards: O(GB) avoidable copy work | Construct maps from shards directly: O(B) mapped-data copy work; remove one transient full-batch copy |
+
+Evidence and correctness constraints:
+
+- **Shared DAG:** `evaluate_fused_element` recursively evaluates each child
+  occurrence (`tensor_ir.rs:11981`), including both references in `x+x`.
+  With eight elements, depths 6/10/14/18 take median hot times
+  0.031/0.386/5.892/94.225 ms. Each four extra levels approaches a 16x
+  increase. Preserve per-node dtype rounding, broadcast indexing and lazy
+  `where` semantics when memoizing. Eligibility recursion at line 11860
+  also needs a visited/memo table.
+- **Forward liveness:** `evaluate_tensor_nodes` retains its entire `values`
+  vector (`tensor_ir.rs:7048`); `evaluate_many` additionally clones outputs.
+  A 100,000-element sine chain returning its vector and sum has peak-RSS
+  increases of 9.93/26.07/42.17 MB at 10/30/50 nodes. The existing
+  `buffer_plan` only protects the first output; extend it to every output
+  and storage alias before reuse. Keep the AD tape evaluator distinct.
+  Test duplicate outputs, early outputs consumed later, shared DAGs,
+  reshape aliases and grouped loop outputs.
+- **Unneeded forward tape:** `TensorForiLoopPlan::evaluate` calls
+  `evaluate_with_tape` and drops its tape (`tensor_ir.rs:9489`); Scan does
+  the same at line 10210. Forward Fori with a 100,000-element carry has
+  peak-RSS increases of 14.63 MB for 10 iterations and 46.91 MB for 50.
+  Keep tape-producing paths for reverse-mode consumers; validate zero
+  iterations, explicit captures, nested loops and scan stacking. Reverse
+  differentiation may trade tape memory for recomputation via checkpointing;
+  that is a separate measured design decision.
+- **Jacobian:** `_Jacobian._stage` creates `eye(total)` inside the selected
+  leaf loop (`_transforms.py:1493`). Eight leaves with 64 total elements
+  create eight 64-by-64 identities (32,768 initialized elements), although
+  the basis blocks together contain only 4,096. Repeated allocation volume
+  is not peak memory: retained blocks are quadratic, and one full identity
+  is transient. A dense P-input/Q-output Jacobian inherently requires
+  Omega(PQ) result storage; a dense Hessian requires Omega(P^2). Use JVP,
+  VJP or forward-over-reverse HVP when only products are needed. A scalar
+  output Jacobian can potentially use reverse mode rather than a quadratic
+  forward basis, subject to derivative/shape/dtype equivalence tests.
+- **Adam:** `optim.py:98-105` materializes m, v, delta and parameter
+  expressions as separate eager arrays. Fourteen f64 arithmetic allocations
+  total 112N bytes per update (allocation volume, not peak); float32 output
+  conversion adds a copy. Widening to float64 shares host storage and is not
+  itself an elementwise copy. A pure update must preserve the old state and
+  return independent parameters/m/v; do not substitute the stateful legacy
+  optimizer. Test varying gradients, long trajectories, input-state
+  immutability, NaNs and float32 rounding. Host tensors use f64 backing for
+  every logical dtype; real f32 storage is a separate dtype/storage migration.
+- **Distributed sharding:** native `tensor_trace.rs:6959` clones the entire
+  input map per replica and then replaces mapped tensors with copied slices.
+  Build each map from sliced mapped inputs and cloned replicated inputs.
+  Retained maps still occupy O(B+GU); achieving shared replicated backing
+  requires a separate storage/interface decision. Verify exact shard
+  coverage, multiple mapped tensors, replica input validation and both
+  NCCL reductions. This finding is source-derived; no new GPU memory or
+  throughput measurement was run for this review.
+
+Secondary cold-path candidates: constant folding holds newly folded arrays
+until final DCE (potential O(VN) peak on a constant chain), and separately
+created Lowered objects do not share the normal JIT executable cache.
+Prioritize the confirmed hot-path complexity and memory issues above;
+closure snapshot semantics must be specified before combining caches.
+CUDA retained Adam `loss()` also executes the shared backward plan
+(`tensor_trace.rs:8001`, `cuda.rs:1616`) before returning its loss output;
+a cached forward-only loss plan is worth evaluating when loss is requested
+frequently. It does not eliminate the backward computation needed by `step()`.
+
+### Optimization Implementation and Verification (2026-10-03)
+
+The six prioritized items are implemented; public call forms, dtype policies
+and legacy stateful optimizers remain unchanged.
+
+- CPU fusion eligibility is topological O(V+E). Scalar evaluation memoizes
+  each reachable node per element with reusable O(V) scratch, preserving
+  lazy `where` and node rounding. At fixed rank, work is O(N(V+E)); input
+  broadcast indexing still includes rank-dependent work and the evaluator
+  retains an O(depth) recursion stack.
+- Frozen CPU forward execution releases values after their final consumer,
+  protects every ordered/duplicate output, moves final output occurrences,
+  and releases grouped-region caches after their last sibling. The buffer
+  plan now protects all output storage roots. Reverse tape evaluation keeps
+  its required values. This is last-use release, not in-place buffer reuse.
+- Forward-only Fori and Scan no longer build a carry tape. Fori uses O(C)
+  carry storage plus body workspace; Scan also needs O(TY) returned outputs.
+  Reverse consumers still use the explicit tape-producing paths.
+- Jacobian uses bounded 64-direction JVP chunks. Runtime basis generation
+  compares linear-size radix coordinates, with digits exactly representable
+  in GPU float32, rather than building full identities. Basis workspace is
+  O(bP), plus chunked body workspace and the required O(PQ) result. The graph
+  grows as O(ceil(P/b)V). Forward AD work remains O(P*C_f), where C_f is the
+  primal evaluation cost; basis comparison can still cost O(P^2). No adaptive
+  reverse-mode Jacobian or matrix-free result representation was added.
+- Pure CPU Adam computes each leaf in one native pass, producing independent
+  params/m/v backing buffers (24N output bytes with current f64 host storage).
+  It preserves old state, operation order and final parameter rounding.
+  Equal-shape eager binaries use zipped loops; broadcast fallback remains.
+- Distributed maps are built directly from mapped slices and replicated
+  clones. Mapped copy work is O(B), removing the O(GB) full-batch clones.
+  Replica maps still retain O(B+GU), in addition to original caller inputs.
+
+Same CPU probes, with outputs preserved separately from the baseline:
+
+| Probe | Before | After |
+| --- | --- | --- |
+| Eight elements, depth-18 shared doubling DAG, median hot time | 94.225 ms | 0.007375 ms |
+| 100,000 elements, 50-node sine chain, peak RSS increase | 42.17 MB | 1.85 MB |
+| 100,000-element carry, 50 Fori iterations, peak RSS increase | 46.91 MB | 5.88 MB |
+
+After optimization, the sine-chain RSS increase stays at 1.85 MB for
+10/30/50 nodes; Fori increases are 5.85/5.88 MB for 10/50 iterations.
+These are process-RSS observations for these fixtures, not allocator-exact
+bounds or general speedup promises. A scalar quadratic Jacobian with P=8192
+has observed compilation/execution RSS increases of 4.91/17.33 MiB;
+the original P-by-P f64 basis alone would require 512 MiB. Its runtime is
+2.495 s, consistent with remaining forward quadratic work for this loss.
+
+Verification passes: MLX-feature workspace Rust tests (212 passed, 0 failed,
+1 ignored), MLX all-target clippy with `-D warnings`, fmt, ruff and diff checks;
+the existing Python matrix/API and all five v0.2 suites; new fused-Adam and
+chunked-Jacobian Python suites. Deterministic Rust regressions check a depth-40
+shared DAG, a 100-node forward chain's actual retained-value peak, all-output
+storage roots, lazy branches, no-tape/taped equivalence and grouped outputs.
+Python regressions check 250-step exact eager Adam trajectories, immutable
+input state, chunk boundaries, captures and nested transforms.
+An additional forced-radix, float32 65-by-65 Jacobian identity probe passes
+on both MLX and CUDA, exercising the GPU-safe multi-digit basis coordinates.
+
+The CUDA host passes runtime-enabled workspace Rust tests and CUDA/NCCL
+all-target clippy, the existing/new Python suites and the two added suites.
+An unavailable-feature fixture initially assumed one error wording; it now
+checks the common CUDA error target and typed exception metadata, covering
+CPU-only and CUDA-without-NCCL builds without changing production messages.
+The affected suites were rerun and passed.
+
+The final two-GPU validation run on the same kind of node (2x RTX 3090,
+NCCL) completed with exit status 0 in 13 seconds. All seven Python suites and
+float32/float64 NCCL Sum/Mean parity pass. The retained Trainer benchmark has
+exact trajectory parity and Trainer/native step ratio 1.000583, passing the
+1.02 gate. Source hashes and output JSON for that run, and the original and
+Jacobian CPU probes, were kept outside the repository; no baseline was
+overwritten.
+
+At the close of the October 3 batch, opportunities still included secondary
+cold-path items, adaptive Jacobian direction, typed host storage, and
+reverse-loop checkpointing. The October 4 status below supersedes that list. These require separate compatibility and
+time/memory tradeoff decisions; the six completed optimizations do not claim
+globally optimal graph scheduling or memory use for every workload.
+
+### Comprehensive Optimization Audit (2026-10-03)
+
+This follow-up reviews production computation paths beyond the six completed
+optimizations: AD/compiler passes, CPU kernels/storage, CUDA/MLX/distributed
+execution, Python transforms, legacy Matrix execution, scalar AD/macros, ODEs
+and benchmark boundaries.
+This section records candidates, not newly implemented improvements. References
+below describe the current working-tree snapshot and may move after edits.
+
+#### Coverage and evidence limits
+
+| Area | Reviewed source families and paths |
+| --- | --- |
+| Graphs and AD | Core `compiler.rs`, `tensor_ir.rs`: freezing, folding, CSE, fusion metadata, symbolic/numeric JVP/VJP, Hessian/HVP, region derivatives, liveness and buffer planning |
+| CPU arrays | Core `tensor.rs`, `tensor_ir.rs`; native `tensor.rs`, `matrix.rs`, `interop.rs`: physical dtype storage, boundary conversion, broadcasting, reductions, indexing, matmul, solve, triangular solve, Cholesky and NumPy exports |
+| Device execution | `tensor_ir/cuda.rs`, `tensor_ir/mlx.rs`, native `tensor_trace.rs`: generated kernels, regions, pooling, solver workspace, retained Adam, host transfers, synchronization and NCCL execution |
+| Python orchestration | `_transforms.py`, `tree.py`, `_array.py`, `_ops.py`, `_control.py`, `optim.py`, `distributed.py`: signatures, trace caches, lowering, pytrees, dense derivatives, VJP pullbacks, eager loops and optimizer updates |
+| Legacy/scalar paths | Native `trace.rs`, `optim.rs`, compiler facade; core `autodiff.rs`, `ode.rs`, `models.rs`, `optim.rs`; macro expansion in `quabla-macros/src/lib.rs` |
+| Surface and measurement | Package/legacy/compat/device/dtype/error facades and retained-training benchmark: no separate numerical kernel bottleneck established in these facades; existing benchmark is a workload-specific parity/overhead gate |
+
+Source analysis establishes extra work and allocation, but not the speedup of a
+proposed implementation. The four probes below were actually executed locally.
+No new GPU execution, NVRTC compilation, two-GPU run, production edit or
+baseline replacement is part of this audit. Device throughput, allocator
+peaks, register pressure and collective overlap still need targeted profiling.
+Coverage of current paths is not proof that every possible optimization or a
+globally optimal schedule has been found.
+
+Notation: V/E are graph nodes/edges; N is array elements; P/Q are differentiated
+input/output elements; C_f is primal evaluation cost; T is loop iterations; C is
+carry size; U is external capture elements; n is a square system dimension;
+k is RHS columns; r is tensor rank.
+Priorities below order investigation; they are not correctness-bug severities.
+
+#### Highest-priority algorithm and compiler candidates
+
+| ID | Original audit evidence/cost | Proposed improvement and verification |
+| --- | --- | --- |
+| A1 | CUDA expression builders recursively expand each child occurrence (`tensor_ir.rs:11798`, `11878`; `cuda.rs:4193`, `4305`, `4443`). A shared doubling DAG has O(d) nodes but Theta(2^d) generated text. The local source-only probe reaches 9,437,779 bytes with just 19 nodes. | Emit topological scalar temporaries or bounded fusion regions. Merely memoizing strings still duplicates expanded text at parents. Verify source-size scaling and GPU parity; preserve lazy `where`, operation order and per-node dtype semantics. |
+| A2 | Non-region native `hvp_scalar` repeats `evaluate_mixed` P times (`tensor_ir.rs:6481`); work is O(P*C_f), although only P results are returned. | Reuse the existing symbolic VJP/JVP machinery, where supported, with a cached derivative plan. Verify all supported operators, bool/F32 rounding, singular/error behavior and region/nested AD. Eager derivative intermediates use F64 whereas symbolic nodes can round, so replacement is not automatically equivalent. |
+| A3 | Non-region native `hessian_scalar` has P-by-P mixed evaluations (`tensor_ir.rs:6430`), O(P^2*C_f) work plus the necessary P^2 result. | Build Hessian columns from batched/chunked JVP of a gradient, targeting O(P*C_f) derivative work. Preserve native return shape and numerical conventions; compare analytic, finite-difference and nested-transform fixtures. |
+| A4 | Eager/traced triangular solve masks/transposes A then calls generic LU (`tensor.rs:1000`, `tensor_trace.rs:1586`, core solve `tensor_ir.rs:2048`): O(n^3+n^2*k), with matrix-sized temporaries. | Dedicated forward/back substitution uses O(n^2*k) work. Recognizing the existing graph pattern can preserve the public API. Verify lower/upper/transposed systems, multiple RHS, dtype and singularity policies; changed arithmetic order requires an explicit tolerance decision. |
+| A5 | Folding creates fresh array constants and retains them through final DCE (`tensor_ir.rs:5433`, `5462`, `5481`). An N-element, V-operation constant chain can use Theta(VN) cold-path storage. | Use folding last-use information or a separate temporary-value arena, retaining only final needed constants. Measure cold compile peak/time on constant chains, fan-out and multiple outputs; keep constant rounding/error behavior. |
+| A6 | Fusion user construction checks `Vec::contains` for every new user (`tensor_ir.rs:13125`). One node with d distinct users causes Theta(d^2) membership work. | Since nodes are visited in order, deduplicate repeated operands with a last-user check or a set. Verify identical region boundaries/output protection and linear scaling of high-fan-out graph metadata. |
+| A7 | Symbolic JVP/VJP constructs/clones source graph state before output reachability pruning (`tensor_ir.rs:2811`, `3284`). Dead traced work costs graph storage and transformation time. | Prune before transformation, preserving requested retained outputs and the contract returning gradients for all named inputs. Verify unused inputs, auxiliaries, captures, errors and transformed node counts. |
+| A8 | Numeric Scan JVP calls the full body JVP separately for next carry and output every iteration (`tensor_ir.rs:10398`, `10400`, `10402`); both compute the primal/tangent graph. | Share one multi-output numeric JVP per step, preserving current F64 derivative arithmetic. The cost remains O(T*C_body), but duplicated traversal and workspace can be removed. Verify shared-prefix invocation counts, captures, nested scans and carry/output tangent parity. |
+| A9 | Fori body input/tangent construction clones dense external captures every iteration (`tensor_ir.rs:9756`, `9767`), including reverse replay: O(TU) copy volume for U immutable captured elements. | Borrow/share immutable capture storage separately from changing carry/index bindings. Count copied bytes over T and verify capture lifetime/immutability and nested derivative behavior; forward tape removal did not address these copies. |
+
+#### Storage, CPU kernels and legacy execution
+
+| ID | Original audit evidence/cost | Proposed improvement and verification |
+| --- | --- | --- |
+| B1 | Host `DynamicTensor` and native `PyTensor` physically store F64 (`tensor_ir.rs:401`, `tensor.rs:58`): F32 and bool cost 8N bytes too. F32/bool exports additionally materialize 4N/N bytes (`interop.rs:301`); F64 export shares its Arc. | Typed host storage can reduce resident bytes; this is a larger internal representation/interop change. Verify promotion, rounding, immutable aliases, views and buffer formats. Do not label F64 exports or Arc clones as full copies. |
+| B2 | `PyTensor` to `DynamicTensor` clones data; consuming conversion back still uses `to_vec` (`tensor.rs:466`, `474`). Staged calls perform both conversions (`tensor_trace.rs:2763`), and interpreter input binding clones again (`tensor_ir.rs:13723`). | First move owned outputs through an internal consuming conversion; consider shared/borrowed immutable input storage separately. Count copied bytes and test output lifetime, aliases, dtype rounding and original-input immutability. |
+| B3 | Numeric reverse AD retains every primal and clones/keeps processed cotangents (`tensor_ir.rs:5534`, `5559`; legacy `trace.rs:1446`). Primal tape plus adjoint retention can both scale with graph array volume. | Take processed non-input cotangents and reuse owned accumulation buffers; retain only primal values actually required by backward consumers. Verify fan-out, repeated operands, aliases and accumulation order. Tape reduction needs its own liveness analysis. |
+| B4 | The fixed rank-N forward executor now releases dead values, but does not use reusable CPU slots for arithmetic outputs (`tensor_ir.rs:11393`; `TensorBufferPlan` at `1428`). | Consume safe last-use buffers or add an internal pool. Memory is already independent of chain depth for the fixed fixture; target allocator traffic, not a second claim of fixing Theta(VN) forward retention. Protect all outputs/aliases and immutable inputs. |
+| B5 | Core/native generic broadcast/reduction paths perform per-element rank-dependent coordinate/div/mod work (`tensor_ir.rs:1751`, `2220`; native `tensor.rs:1110`, `1267`). Only native equal-shape binary arithmetic already has a zipped fast path. | Add contiguous/equal-shape and outer/reduced/inner block kernels where indexing allows O(N) traversal. Preserve reduction order, NaN/tie behavior and broadcasting for arbitrary ranks; benchmark equal shapes separately from true broadcasts. |
+| B6 | CPU matmul uses scalar loops. Core dynamic matmul already traverses row/inner/column with contiguous RHS/output (`tensor_ir.rs:2006`); native eager (`tensor.rs:870`), legacy (`matrix.rs:454`) and static (`core/tensor.rs:45`) use row/column/inner with strided RHS. Dense work remains O(mnk), or O(Bmnk) over batches. | Improve locality in the latter paths and evaluate blocking/size-gated SIMD or BLAS. Measure small/large and batched/broadcast products with memory; do not promise a new asymptotic bound or silently change reduction precision/order. |
+| B7 | Mixed Solve AD factors the same A for value, first, second and mixed results (`tensor_ir.rs:8217`). JVP/VJP also solve/refactor related systems (`6248`, `5824`). | Factor once and solve several RHS using that factor; use transpose solves without a full matrix transpose where safe. Verify pivot choices, singular diagnostics and F32/F64 gradients. Reuse within a call first; cross-call factor caching must not assume A is unchanged. |
+| B8 | Traced Cholesky expands scalar loops into O(n^3) graph operations (`tensor_trace.rs:1602`), beyond the O(n^2) matrix result. | A native IR operation and its AD/backend rules avoid graph/launch expansion while retaining O(n^3) arithmetic. This crosses modules; test SPD failures, lower-triangle conventions, batching and higher derivatives before adoption. |
+| B9 | Native multi-axis indexing materializes successive slices (`tensor.rs:1497`); gather materializes chunks and then concatenates them (`1520`). Full slices across r axes can copy O(rN) data; gather retains a result-sized chunk set before final output. | Compose validated layouts before one materialization; write gather directly into its final buffer. Verify noncontiguous/reversed views, bounds, repeated indices, output ordering and alias lifetime. Returned gather data itself remains necessary. |
+| B10 | Legacy Matrix forward execution retains all node values and clones its output (`trace.rs:1836`, `1358`). The depth-50 sine probe retains about 41.14 MB of additional process RSS. The rank-N fix did not modify this separate executor. | Apply separate forward liveness/output moves with legacy error/shape protection. Check old Matrix tests and chain memory scaling; do not change reverse tape semantics by applying forward release indiscriminately. |
+| B11 | Legacy dense Matrix Jacobian builds a seed and calls full VJP for every output row, repeating primal execution and cloning the input map (`trace.rs:2886`). `jacobians_fn` repeats this for each selected input. | Share one primal evaluation, derive all requested input blocks per seed, and choose forward/reverse direction by dimensions where supported. Keep the O(PQ) dense result and immutable legacy interface; compare all blocks and error behavior. |
+| B12 | Core DynamicTensor reshape clones the data (`tensor_ir.rs:1837`), taking O(N) time/storage; native eager reshape shares its Arc (`tensor.rs:1053`). Buffer-plan alias metadata does not make interpreter reshape zero-copy. | Share or move the backing storage for shape-only changes. Verify aliases, duplicate outputs, rounding and reverse tapes; preserve native eager sharing and do not conflate metadata with executed allocation behavior. |
+| B13 | Typed buffer import first copies into a typed temporary then widens into F64 (`interop.rs:221`); F32 input has an additional 4N-byte temporary. Owned import itself is part of the contract. | Gather/widen directly into final owned storage where buffer layout/lifetime permits. Test noncontiguous buffers, conversion failures and caller mutation isolation; avoid replacing a safe copy with mutable aliasing. |
+| B14 | Native eager abs builds a mask, negative tensor and where output (`tensor.rs:1323`), allocating three array results for O(N) work. | Fuse the existing comparison/negation selection into one pass. Verify NaN and signed-zero behavior explicitly; replacing it with generic `f64::abs` is not automatically equivalent. |
+
+#### Device runtime candidates requiring profiling
+
+| ID | Original audit evidence/cost | Proposed improvement and verification |
+| --- | --- | --- |
+| C1 | CUDA retained Adam `loss()` executes the shared loss-plus-gradient plan (`tensor_trace.rs:7996`, `cuda.rs:1616`), discarding gradients. MLX `loss()` lowers the shared graph but lazily evaluates only the requested loss (`mlx.rs:331`); it is not evidence of MLX GPU backward work. | Cache a forward-only loss plan, preserving current parameters/latest batch and retained input bindings. Measure loss separately from step, check unchanged state and loss parity on both devices. |
+| C2 | CUDA axis reduction assigns one output thread a serial loop over the reduction extent (`cuda.rs:6878`). Work stays O(N), but a few outputs leave little parallelism. | Evaluate warp/block/two-stage reductions for long axes and retain the current path for small reductions. Verify reduction tolerances, extreme values and small/large shapes; tree reductions alter summation order. |
+| C3 | CUDA free buffers are pooled by exact element count (`cuda.rs:1462`, `1513`). A fixed graph is bounded, but retained free storage across many sizes can substantially exceed peak live tensor bytes. | Profile size histograms/high-water marks; compare planned slots, capacity classes or bounded eviction. Measure both resident bytes and repeated-call allocation/time before changing retention policy. |
+| C4 | CUDA Solve allocates factor/RHS/pivot/status/workspace storage per call and reads status back (`cuda.rs:3663`, `3770`). | Cache appropriately sized solver workspaces per plan/context. Keep solver error observability and stream ordering; separately measure allocation, factorization and status synchronization. |
+| C5 | MLX region execution evaluates body outputs across iterations; reverse regions retain carry tapes (`mlx.rs:1127`, `1622`). Fewer host dispatch/eval boundaries may improve short bodies; batching more lazy work can increase memory. | Measure loop-length/body-size curves and bounded execution windows. CUDA and MLX VJP loops already use a forward tape plus reverse traversal; this review did not find quadratic prefix replay. Preserve lazy branch and failure behavior. |
+| C6 | Distributed host shard copying is fixed, but replicated transfers, per-gradient collectives, readback and host optimizer updates remain workflow costs. | Profile gradient-size/count and upload/collective/readback intervals; evaluate packed gradient collectives and a retained distributed optimizer only for measured workloads. Account for packing memory, reduction order and current per-parameter output contracts. |
+
+CUDA matmul already has specialized/tiled paths and fusion epilogues; no claim
+that every product uses a naive kernel is made. MLX delegates dense kernels to
+its runtime. Shape-specific dispatch, launch count, register pressure and library
+selection are profiling candidates. MLX host `Vec<Array>` references during
+lowering do not prove that all graph GPU buffers are simultaneously resident.
+
+#### Python transforms, cache and smaller candidates
+
+| ID | Original audit evidence/cost | Proposed improvement and verification |
+| --- | --- | --- |
+| D1 | Python dense Jacobian remains input-direction forward AD (`_transforms.py:1493`). Chunking bounds basis workspace, but derivative work is O(P*C_f) and dense comparison basis work can be O(P^2), even for Q much smaller than P. | Evaluate reverse directions for Q<P, structured seeds or matrix-free JVP/VJP when callers need products. Dense Hessian/Jacobian outputs still require P^2/PQ storage. Preserve pytree blocks, bool policy and nested transforms; compare direction-dependent rounding. |
+| D2 | Python VJP pullbacks recompute the primal on each call and keep no residuals (`_transforms.py:1101`, `1199`). | Optional/internal residual reuse can save repeated C_f work at the price of retained tape memory. Benchmark one versus many cotangents; keep nested tracing and captured-array snapshots correct. Recomputation can be the appropriate low-memory choice. |
+| D3 | `jit` cache and independently constructed lower/compile objects do not share entries (`_transforms.py:863`, `928`). The local identical-signature probe records three traces and three compilations. One Lowered object already reuses its compiled program. | Share only snapshot-equivalent staged/compiled programs or make reuse explicit internally. Test changing captured constants between lower calls; cache-key equality alone does not establish equal closure snapshots. |
+| D4 | Legacy native batch execution clones cached plans on hot calls (`tensor_trace.rs:4554`, `4659`); numeric plan AD also clones nodes via `as_ir` (`tensor_ir.rs:11622`). | Borrow immutable plans or share them with Arc, and operate directly on frozen nodes. Verify cache growth limits, locks and repeated/concurrent calls; target O(V) metadata traffic separately from tensor work. |
+| D5 | Adam validates/flatten parameters repeatedly; dictionary pytrees sort keys per traversal (`optim.py:87`, `tree.py:34`). Distributed hot calls also recompute names using `inspect.signature` (`distributed.py:81`, `_transforms.py:282`). | Reuse validated leaf structure/input names per cached signature while still validating live leaves and mutation-sensitive container structure. Measure many-small-leaf workloads; avoid identity-only caches for mutable dict/list arguments. |
+| D6 | Pure SGD builds separate scale/subtract tensors, with a final dtype cast when needed (`optim.py:130`). | A fused native leaf update can reduce allocation volume while preserving F64 intermediate arithmetic and final rounding. Compare exact F32/F64 old behavior and input immutability; it remains O(N) work. |
+| D7 | RK4 already has O(C) final-state storage, but allocates four derivative, three intermediate-state and one next-state vectors per step (`ode.rs:57`). Full trajectory storage is required by the separate trajectory-returning API. | Reuse an eight-buffer workspace, preserving arithmetic order and `FnMut` RHS calls. Count allocations and compare final/full trajectory values; do not claim the final-state path stores the trajectory. |
+| D8 | The alpha-only Lotka-Volterra gradient calls the full four-parameter gradient then selects element zero (`models.rs:73`). Macro `forward_gradient!` similarly expands one body evaluation per active parameter (`quabla-macros/src/lib.rs:110`). | The alpha helper can call its single-parameter implementation. For macro/general gradients, benchmark vector-tangent or reverse approaches separately: removing repeated primal work does not remove the gradient's dimensional work, and source/code-size changes have tradeoffs. |
+| D9 | Core input insertion checks names by scanning prior nodes; repeated insertion can cost O(I^2) for I inputs, and frozen shape/dtype lookup scans the graph (`tensor_ir.rs:4074`, `10913`, `10925`). | Add a name-to-node index where many-input profiles justify it. Verify duplicate-name diagnostics/order and captures. Index storage is extra O(I); small graphs may not benefit. |
+| D10 | CSE formats allocated string keys including operation, dtype and weakness (`tensor_ir.rs:13325`, `5454`); dense node remapping uses hash maps. | Typed structural keys and dense vectors/bitsets can reduce metadata allocation. Existing fixed-rank passes remain expected O(V+E); measure cold time/allocation before claiming an improvement, and preserve weak typing, float bit identity and mutable-trace snapshots. |
+
+Reverse-loop checkpointing is an additional explicit time/memory decision:
+the current O(TC) carry tape can be exchanged for recomputation/checkpoints.
+Fori forward execution already avoids that tape; Scan's returned O(TY) outputs
+cannot be removed without changing its result contract. Eager array imports
+intentionally copy caller-owned buffers; future sharing must protect the current
+ownership and immutability contract. Changes to public dtype/storage/export
+semantics, native IR operations or distributed training require a reviewed
+compatibility plan before implementation.
+
+#### Executed audit probes and next verification
+
+| Local probe | Observed result |
+| --- | --- |
+| Same signature: two normal JIT calls, two compile calls on one Lowered object, then a second Lowered object | Three traces/compilations total; the second compile on the first Lowered reuses its program |
+| Legacy sine chain, 100,000 elements, independent processes at depths 10/50 | Correct outputs; peak RSS increments 8,896,512 / 41,140,224 bytes |
+| CPU cubic HVP, warm median of five calls, P=64/256/1024 | Native 0.269/2.757/39.725 ms; existing `jit(jvp(grad))` composition 0.0151/0.0253/0.0701 ms; both return exactly 3 in each coordinate |
+| CUDA source generation on CPU, shared DAG depths 6/10/14/18 | Nodes 7/11/15/19; generated bytes 2,899/37,459/590,419/9,437,779; no GPU or NVRTC run |
+
+Probe sources and JSON outputs were kept outside the repository. RSS includes
+runtime/allocator effects; source bytes establish code-generation growth, not GPU speed; the HVP
+timing compares two existing paths on one analytic fixture, not an implemented
+replacement or a general speedup. The first legacy probe used the Rust-facing
+method name instead of its Python `evaluate` wrapper and failed before execution;
+the corrected script produced the successful observations above.
+
+Suggested implementation order: A1, A2/A3, A4, B2, A5/A6, then backward
+liveness/factor reuse and measured device-runtime candidates. Keep the larger
+storage/checkpointing/AD-direction work as separate compatibility and Pareto
+decisions. Every implementation needs a focused before/after cost probe plus
+relevant numerical/API regression checks; the earlier 212-test and GPU/NCCL
+results are previous validation, not newly executed tests for this audit.
+
+#### Optimization implementation follow-up (2026-10-03)
+
+The following changes implement selected candidates from the audit above.
+They preserve the public API, graph schema, dtype policy and default settings.
+The remaining candidates are still proposals; this batch does not establish
+globally optimal memory use or scheduling.
+
+| Candidate | Implemented scope and cost | Compatibility and limits |
+| --- | --- | --- |
+| A1, partial | Whole-plan and fusion-region CUDA elementwise code now emits one scalar SSA temporary per reachable node. Emitted statement/reference counts are linear in reachable nodes/edges; traversal also visits the full node list. Source bytes include identifier lengths and broadcast offset expressions. | `where` keeps ternary value selection; its pure CUDA operand calculations can execute before selection. An unused NaN does not propagate through selection, and checked-domain operators remain excluded. Lazy `Cond` regions are unchanged. Fori/Scan body expression builders remain a separate candidate. |
+| A2/A3, partial | Smooth F64 native HVP uses forward-over-reverse, O(C_f) derivative work instead of P mixed-dual evaluations. Hessian construction reuses one transformed graph for P columns, O(P*C_f), and writes directly into the necessary P-by-P result. | F32, casts, checked/singular/discontinuous operators and exceptional arithmetic retain the old mixed-dual route. Conservative bounds protect against intermediate derivative overflow even when a symbolic zero would hide it. F64 derivative arithmetic can reorder; verification uses numerical tolerance rather than a bitwise claim. The HVP transform is still constructed per invocation. |
+| A4 | Core and native eager solve detect exact finite lower/upper triangular structure and use substitution: O(n^2*k), without the LU factor scratch matrix. Existing traced triangular patterns and reverse transpose solves benefit on CPU. | General, zero-diagonal, non-finite and overflowing systems use the existing pivoted LU route. Mask/transpose temporaries and GPU lowering are unchanged. Finite results are compared with LU and residuals using tolerance. |
+| A6 | Fusion user-list construction deduplicates repeated operands using the last visited user ID: O(V+E) for this construction step. | Region boundaries and retained outputs stay covered by fan-out/duplicate-operand tests. Other fusion passes have their own costs. |
+| B3, partial | Numeric reverse execution takes and releases processed non-input cotangents. Scan sibling seeds are taken jointly. A chain no longer retains every cotangent buffer. | Input gradients, duplicate-output accumulation and joint Scan seeds are preserved. The primal tape still occupies O(V*N); this change does not make the entire reverse pass O(N) space. |
+| B6, partial | Native eager Tensor, legacy Matrix and static Tensor2 matmul traverse contiguous RHS/output rows while preserving each output's inner-index accumulation order. | Work remains O(m*k*n), with the same output allocation and final dtype rounding. Core DynamicTensor matmul already used this traversal; larger blocked/BLAS changes remain separate. |
+| B14 | Native eager abs constructs one result buffer instead of mask, negation and selection buffers. | Signed zero, NaN quieting, F32 intermediate/final rounding, bool errors and weak-to-strong behavior preserve the old implementation. |
+| D7/D8 | RK4 reuses five workspace buffers and updates the state in place; alpha-only model differentiation seeds one parameter rather than all four. | Callback order, partially written derivatives, arithmetic order and zero-step behavior are covered by tests. Final-state storage is O(C); a requested trajectory still needs O(T*C). |
+
+Changed production files are `quabla-core/src/tensor_ir.rs`, `tensor.rs`, `ode.rs`,
+`models.rs`, and `quabla-python/src/tensor.rs`, `matrix.rs`. Regression coverage
+was added to the existing CPU memory and ODE suites, private native/core unit
+tests, and `cuda_codegen_memory.rs` / `higher_order_optimization.rs`.
+
+Measurements and command logs were kept outside the repository; the original
+audit probes and baseline results were preserved. CPU probes use release builds on Apple M3/macOS,
+seven warmed timing samples (five for HVP) and fresh processes for RSS deltas.
+RSS is the increase in process high-water memory for the specified call,
+not the total process memory or a portable allocator metric. GPU checks use
+the single-GPU Linux host's GTX 1660 SUPER, CUDA 13.1 and opt-in runtime tests.
+No new two-GPU NCCL result is claimed for this batch.
+
+Archived local verification for the October 3 batch records 209 passing Rust
+tests and the rebuilt extension's cubic HVP median of 0.103208 ms at P=1024.
+The final shared-DAG source probe records 2,022 bytes at depth 18 (19 nodes).
+These are recorded October 3 measurements, not new GPU timing results.
+
+#### First continuation measurements (2026-10-04, archived batch)
+
+This continuation preserves Python interfaces, IR operations, dtype defaults,
+and numerical/error contracts. Each row describes its executed scope; the
+audit's other proposals and profiling questions remain open.
+
+| Candidate | Implemented scope | Compatibility and limits |
+| --- | --- | --- |
+| B7, partial | Finite dense CPU mixed Solve factors the coefficient matrix once and replays elimination for value, first, second, and mixed RHS. | Historical pivot swaps/subtractions and back substitution keep their order. Triangular, singular, non-finite, or overflowing cases use the prior path. Dense work is still O(n^3+n^2*k); this removes three factorizations, not an asymptotic order. Factor scratch remains O(n^2). JVP/VJP factor reuse is a separate candidate. |
+| B9 | Eager Gather writes contiguous inner blocks directly into one final buffer. Multi-axis indexing composes layouts before a single materialization. | Repeated indices, axis normalization, dropped axes, scalar outputs, dtype/weakness, and error behavior are covered. Empty indexing still shares the original tensor. Coordinate mapping in final index materialization remains rank-dependent. |
+| B13, partial | C-contiguous typed buffer import widens directly into final owned F64 storage, removing the typed temporary for F32/integer sources. | PyO3 validates format/alignment and pins the exporter during copying. Caller writes cannot affect imported values. Non-contiguous imports and the bool-specific route keep their existing gathering paths; resident host storage is still F64. |
+| A8 | Numeric Scan JVP shares one primal/tangent traversal for carry and output each step. | The original F64 derivative intermediates and final-output rounding are preserved, including Bool zero tangents, captures and nested Scan/Fori/Cond. Returned trajectory storage and per-step graph/capture copies remain. |
+| B5, partial | Core equal-shape and scalar elementwise arithmetic uses contiguous iteration. Axis reduction traverses outer/reduced/inner blocks. | Broadcasting is validated before dispatch. Reduction visits values in the original source order, retaining +0 initialization and multiplication before addition. These paths remove per-element rank-coordinate work; arbitrary broadcasts and native eager reductions remain separate. |
+| B10 | Legacy Matrix pure-forward execution releases each matrix after its final operand use and moves the root result. | Every node before the root still executes, preserving eager errors. Duplicate operands and fan-out are counted. JVP/VJP keep their full primal tapes. Live matrix storage follows the graph's frontier; O(V) metadata, caller/input copies, and concat operand copies remain. |
+
+Sources and raw measurements, including an unchanged copy of the previous
+native extension, were kept outside the repository. Comparisons use the same Python 3.14.7 interpreter
+and Apple M3 CPU. Native timings exclude interpreter startup and input creation.
+RSS is a fresh-process high-water increase, not the size of live tensor buffers.
+Scan's allocation counter measures cumulative allocation requests, not peak RSS.
+
+Integrated verification passed: 228 Rust tests and nine Python test scripts,
+release native-extension build with MLX enabled, workspace formatting, default
+and MLX Clippy checks, and Ruff checks. CUDA execution was not measured in this
+batch. The legacy before/after compatibility comparison matched all 107 output
+bit-pattern and error records.
+
+| Controlled CPU case | Before | After | Observed benefit |
+| --- | --- | --- | --- |
+| Gather, 256x128x32 input | 1.159 ms | 0.089 ms | 13.08x; RSS increase 8.33 MB to 4.28 MB |
+| Multi-axis indexing, 1,048,576 elements | 5.894 ms | 1.966 ms | 3.00x; RSS increase 16.84 MB to 8.47 MB |
+| Contiguous F32 import, 1,048,576 elements | 0.336 ms | 0.239 ms | 1.40x; RSS increase 12.78 MB to 8.55 MB |
+| Mixed Solve, n=192, four RHS columns | 2.931 ms | 1.464 ms | 2.00x; smaller tested systems gave 1.33x to 1.55x |
+| Scan JVP, 512 lanes, 24 shared layers, 20 steps | 2.637 ms | 1.370 ms | 1.93x; cumulative requested heap bytes 30,198,888 to 15,951,248 |
+| Core contiguous elementwise, 1,048,576 elements | 8.90 to 10.62 ms | 0.40 to 0.54 ms | 19.71x to 23.81x across equal-shape and scalar cases |
+| Core axis reductions, shape 16x64x1024 | 3.63 to 3.92 ms | 0.14 to 0.75 ms | 5.25x to 25.37x across the three axes |
+| Legacy graph forward, depth 50, 100,000 lanes | 9.347 ms | 7.494 ms | RSS increase 41.21 MB to 0.95 MB; total peak 69.12 MB to 28.83 MB |
+
+Native, Solve, Scan, and kernel timings use 12 balanced rounds; legacy timings
+use eight. MB denotes decimal megabytes. These are case-specific medians;
+speedup ratios across stages cannot be multiplied without a workload model.
+Scan uses a two-traversal reference in the same binary; it measures traversal
+sharing rather than a full old-extension comparison. The fixtures,
+individual measurements and source hashes were recorded outside the
+repository.
+
+#### Integrated optimization status (2026-10-05)
+
+B1 and B2 are approved and implemented. Core and native tensors now share
+immutable typed storage: F64 uses 8N bytes, F32 uses 4N bytes, and Bool uses N
+bytes, excluding shape and ownership metadata. `DynamicTensor::data()` returns
+`Cow<[f64]>`: F64 borrows its storage; narrow types widen only on request.
+`storage()` provides typed access, and consuming `into_parts()` transfers
+shape, storage, and dtype. Python interfaces are unchanged. Shape-only views
+share their backing buffer; numerical kernels preserve F64 intermediates and
+rounding at the original boundaries. Reverse tapes keep required aliases alive.
+
+| Candidates | Current executed scope | Remaining work or decision |
+| --- | --- | --- |
+| A1 | Flat CUDA SSA emission includes control-flow regions. | Integrated release CUDA tests and Linux CUDA/NCCL compilation pass; no current two-GPU parity claim. |
+| A2/A3/A4/A6/A8 | Earlier higher-order, triangular, fusion-user, and Scan changes remain integrated. | Preserve numerical fallbacks; do not multiply local ratios. |
+| A5/A7 | Constant folding releases last-use values; single symbolic transforms prune unused nodes before differentiation. | Full multi-VJP primal-map contract still retains all requested primals. |
+| A9/B1/B2/B12 | Typed immutable shared storage, consuming outputs, and shape-only aliases. | Metadata copies and transient conversion buffers are separate costs. |
+| B3/B4 | Reverse evaluation retains only active-rule primals and releases processed primals/cotangents. Last-use F64/F32 unary and same-shape/scalar binary buffers are reused with immutable alias protection. | CPU and MLX first-order and forward-over-reverse Fori/Scan now use block checkpoints; CUDA covers independent lanes with same-shape captures. Short loops and CUDA broadcast captures preserve the full-tape fallback. Owned F64 gradient additions reuse unique storage; NaN payload cases retain the original kernel. |
+| B5/B6/B9/B10/B11/B13/B14 | Contiguous paths and stack-only carry offsets for core/native binary, broadcast-to, and where; hoisted typed matmul; gather/indexing; legacy liveness/shared Jacobian primals; direct typed buffer imports; fused abs. | Native unary writes directly to dtype-sized output. Integer-to-F32/Bool preserves conversion through F64 per lane without a widened array. Eligible finite legacy numeric P<Q graphs use live single-direction forward tangents; general arithmetic and Q<=P retain reverse. |
+| B7 | Mixed Solve and direct-input single-Solve JVP reuse finite dense factors. | Eight balanced complete JVP rounds at n=8/64/192 give 1.247/1.390/1.649x with slightly lower incremental peak heap. General graphs and VJP preserve their previous numerical path. |
+| B8 | Approved native Cholesky is integrated on CPU/CUDA/Metal with bounded logical-F64 first/second-order IR, leading-batch support, O(n³) arithmetic and O(n²) numerical state. | F32 AD, third or higher derivatives, and exceptional CPU symbolic cases preserve scalar expansion. Native and reference composition tests pass; final Python/heap/device measurements were recorded outside the repository. |
+| C1/C4 | Forward-only retained CUDA and MLX loss; CUDA Solve retains only the current shape workspace. | Runtime checks pass; MLX loss probe improves 0.379 to 0.358 ms. Multi-shape Solve cache stays at one entry rather than four, with identical output checksums. Same-shape reuse remains; no reliable Solve timing gain is claimed. |
+| C2 | Approved SumAxis/MeanAxis block reduction is integrated for axis length >=256. Each output uses 256 threads, 2,052 shared bytes, and no global scratch. | Work stays O(N); normal per-block dependency depth becomes O(axis_length/256 + log 256). Small reductions and finite overflow-risk inputs preserve the serial path. Full CUDA gates pass; complete upload/execute/export speedups are 1.032–6.050x on the measured long-axis fixtures. |
+| C3 | Bounded CUDA free-buffer pool adopted for memory priority. | Eight balanced release rounds: pooled bytes 10,321,920 to 782,336, latency 0.900 to 1.495 ms. This memory saving has a measured latency cost. |
+| C5 | Pure MLX loop windows profiled; per-step evaluation remains the default. | Window 16 speeds the fixtures by 3.7–9.1x but fresh-process peak RSS rises by 974,848 bytes. Batching is not adopted for the memory target. |
+| C6 | Existing distributed execution preserved. | Packed collectives add a packed buffer and can change reduction order; current one-GPU validation cannot establish two-GPU numerical parity. |
+| D1 | Approved adaptive Jacobian selects reverse mode for eligible Q<P outputs, with bounded output seed batches. F64 outputs in graphs containing F32 nodes keep forward mode. | Pytree, dtype, nested-transform, and analytic regressions pass. Approved tolerances: F64 1e-12 + 1e-12*abs(reference); F32 1e-5 + 1e-5*abs(reference). Dense O(PQ) result storage remains. |
+| D2/D3 | VJP recomputation and snapshot-local caches retained for memory and correctness. | Sixteen pullbacks cost approximately sixteen single calls; caching residuals would retain extra buffers. Same-signature snapshots with different captured constants produce different values, so signature-only cache sharing is unsafe. |
+| D4/D5/D6/D9 | Shared immutable graph snapshots, Adam initialization leaf-structure reuse, fused SGD, and input-name index. Trainer batch specifications retain shape/dtype metadata rather than the initial Tensor. | Additional mutable-pytree caches would retain metadata and require container revalidation; no unmeasured cache is adopted. |
+| D7/D8 | Earlier ODE workspace and single-alpha changes remain integrated. | Final default, MLX, and CUDA workspace regression suites pass. |
+| D10 | Compact typed CSE keys and adaptive dense/sparse remapping preserve operation identity and exact scalar bits. | At 20,000 nodes, twelve paired release rounds reduce incremental peak heap from 23,057,523 to 21,404,557 bytes and median compilation from 14.567 to 8.987 ms; expected O(V+E) remains. |
+
+The pre-October-5-continuation CPU comparison uses the retained October 3
+extension, which already contains earlier optimizations, against the release
+extension recorded in the October 4 artifacts. Twelve balanced fresh-process rounds include construction,
+execution, and exports; warm medians exclude the first invocation:
+
+| Complete CPU workload | October 3 baseline (ms) | October 4 snapshot (ms) | Measured speedup |
+| --- | ---: | ---: | ---: |
+| F32 eager pipeline | 0.212834 | 0.169198 | 1.258x |
+| Twelve-step training | 0.642645 | 0.427802 | 1.502x |
+| Legacy Jacobians | 0.345459 | 0.138427 | 2.496x |
+| Scalar Jacobian, P=2048/Q=1 | 71.350073 | 0.110761 | 644.183x |
+| Vector Jacobian, P=128/Q=16 | 0.357781 | 0.097531 | 3.668x |
+
+All five outputs match bitwise. Raw samples and extension hashes were
+recorded outside the repository, as were the raw records of every measurement
+in this section. A combined invocation of these five workloads measures
+72.961823 to 0.973969 ms (74.912x), also bitwise equal. The scalar Jacobian
+dominates that mix; local ratios are never multiplied.
+
+The expanded combined suite includes those five workloads, Fori VJP T512/N512,
+Scan VJP T64/N512 with outputs, Adam initialization of 2,048 four-lane leaves,
+i64-to-F32/Bool imports of 250,000 lanes, cold tracing/compilation/execution of
+2,000 sin nodes, and numeric legacy P2/Q512 expansion. One invocation of each
+runs sequentially in one process, including checkpoint replay costs. Twelve
+balanced fresh-process rounds measure 145.884573 to 80.316355 ms (1.816x).
+Peak process RSS decreases from 57,483,264 to 52,781,056 bytes (8.18 percent);
+RSS increment decreases from 16,637,952 to 11,886,592 bytes. Maximum absolute
+output difference is 4.44e-16, within the approved F64 tolerance. This is not
+an original-pre-optimization-to-final project-wide ratio; each ratio applies
+to its specified mix. Training alone has slightly higher RSS, so no universal
+memory reduction is claimed. GPU results are separate host measurements.
+
+Six balanced resident-array rounds write nonzero storage pages: F32 process RSS
+increment falls from 101,072,896 to 59,269,120 bytes, Bool from 101,072,896 to
+21,151,744, and F64 is effectively unchanged. These process peaks include
+factory transients and allocator overhead; they are not exact payload sizes.
+The two-million-lane native F32 sin+tanh pipeline reduces process peak increment
+from 24,231,936 to 8,142,848 bytes and improves 14.497 to 12.810 ms (1.132x).
+Explicit i64 buffer import to F32/Bool improves 2.486/2.457x while reducing
+import peak increments by 66.5/88.3 percent. Complete-operation broadcast
+probes reduce rank-dependent decode costs without adding heap coordinates;
+worst-case O(N*rank) remains for frequent carries/singleton axes.
+
+Selective VJP plus last-use reuse reduces incremental live heap in the
+128-operation linear fixture from 34,097,840 to 799,424 bytes. Physical
+storage remains 8N/4N/N for F64/F32/Bool. Allocator probes and fresh-process
+RSS measure different costs and are reported separately.
+
+Legacy numeric Jacobians choose P live forward sweeps for eligible P<Q graphs,
+rather than Q reverse sweeps. Sin/Cos/Tanh, constant Add/Sub, shape operations,
+and comparison derivative stops are eligible; other arithmetic and nonfinite
+primals preserve reverse. Tangent slots release at last use, and candidate
+errors/nonfinite results fall back to reverse using the existing primals.
+Dense result storage remains O(PQ). Six balanced complete factory/call/export
+rounds give 4.759 to 0.129 ms (36.85x) for P2/Q512 and 54.592 to 2.672 ms
+(20.43x) for P1/Q128/depth2048; maximum errors are 4.44e-16 and 5.72e-35.
+The Q<=P control is bitwise equal. The long-chain process RSS increment is
+unchanged, so no general RSS saving is claimed. The fixed-size forward-gradient
+macro keeps its documented callback count and scalar Dual API: packing all
+parameter directions would increase live derivative storage and change that
+contract.
+
+Owned same-shape F64 gradient accumulation reuses unique storage, cloning
+shared seeds only when required. Narrow/broadcast cases and NaN operands
+retain the original addition kernel, preserving dtype, errors and NaN payloads
+on macOS and Linux. Twelve balanced complete VJP rounds at N=32768 and
+fanout depth 8/128 give 1.105–1.115x, with 262,184 fewer peak live heap bytes
+and fewer allocations. NaN compatibility scanning reduces the earlier
+pre-guard speedup. An earlier comparison that shared one Cargo target was
+invalid because both labels ran the same binary; the final before/after
+binaries are distinct, as their SHA-256 hashes confirm.
+
+CPU loop checkpoints retain approximately ceil(T/B)+B carry entries with
+B=ceil(sqrt(T)), reducing carry-tape space from O(TC) to O(sqrt(T)C) while
+preserving O(T) work for a fixed body. Replayed steps retain the original dtype
+rounding; reverse gradients accumulate in their original descending order.
+Public full-tape APIs remain unchanged. Public Scan still returns O(TY) output
+storage; internal gradient-only consumers omit an unused stacked primal output.
+Six balanced CPU F64 rounds at T=4096/N=512 reduce incremental live heap from
+17,209,763 to 568,380 bytes (96.7 percent), while complete VJP latency rises
+from 248.264 to 439.357 ms (1.770x). This implements the memory priority and
+has a measured replay cost, rather than a speedup.
+
+Real Metal bitwise tests compare first-order and forward-over-reverse Fori/Scan
+against full-tape execution at T=1/8/17/64. Block boundaries evaluate lazy
+capture-gradient accumulation, avoiding an unbounded accumulation history.
+Six balanced, separate fresh-process rounds at N=8192 reduce absolute active
+Metal peaks from 2,457,620 to 851,988 bytes at T=64 and 17,137,688 to 1,835,024
+at T=512. Complete VJP latency rises from 17.235 to 23.860 ms and 144.945 to
+198.344 ms. Allocator cache and Python RSS are separate costs. Earlier
+incremental Metal measurements are unsuitable because their baseline moves
+while prior command buffers release; the fresh-process absolute-peak report
+supersedes them.
+
+CUDA checkpoints retain O(sqrt(T)C) carry tape for independent lanes and
+same-shape captures, including paired carry/tangent state for higher-order AD.
+Six balanced fresh-process rounds at N=8192 reduce actual carry-tape allocations
+from 2,129,920 to 524,288 bytes at T=64 and 16,809,984 to 1,507,328 bytes at
+T=512; paired directional state doubles both counts. These are tape bytes,
+not total device peaks. At T=512, complete Fori/Scan VJP and VJP-JVP execution
+costs rise by 17–43 percent. Compilation is excluded; host upload and all
+sibling gradient downloads are included, and each full/checkpoint pair checks
+all result bits. Required Scan outputs/cotangents remain O(TY). The run
+produced 96 raw records.
+
+Trainer's replacement-batch regression first reproduced retention of the original
+Tensor through its shape/dtype specification; metadata-only specifications now
+release that alias. Twelve balanced complete Adam initialization rounds with
+2,048 four-lane leaves use the same native extension and reduce 2.498 to
+1.984 ms (1.259x), with three flatten traversals reduced to one. Independent
+F64 zero moments and optimizer behavior are preserved.
+
+The pre-continuation root verification passed 300 Rust tests in the MLX workspace, default
+and MLX all-target Clippy, fmt, Ruff, all nine required Python scripts plus
+the dedicated legacy Jacobian regression, and the opt-in Metal Python matrix.
+The rebuilt release extension is used for the final complete-workload reports.
+The root CUDA release suite passes 259 tests on GTX 1660 SUPER; Linux
+CUDA/NCCL all-target Clippy also passes after the final legacy test additions.
+The first Linux gate exposed two-NaN payload differences in owned addition;
+NaN operands now use the original kernel and the full gate passes. Those October 4 gates did not establish NCCL numerical parity for that snapshot.
+
+The October 4 adoptable checklist changes were integrated and measured.
+The October 5 continuation explicitly approves C2 tree-reduction numerical
+order, B8 native Cholesky IR/schema changes, and C6 two-GPU validation.
+Two-GPU NCCL parity has not been rerun on the final integrated source; the
+earlier two-GPU results remain valid only for their recorded source snapshots.
+Candidates rejected for extra retained memory, contract changes or missing
+two-GPU validation remain documented above. No globally optimal
+memory/scheduling claim is made.
+
 JAX can be summarized as:
 
 ```text
@@ -693,9 +1321,11 @@ executes.
   consumer's dtype (MLX `from_f32` constants must not promote half arrays).
 - D4. Native device `f64` as an opt-in execution dtype (CUDA double kernels,
   MLX where supported); `execution_dtype(F64)` then stops mapping to `f32`.
-- D5. Typed host storage: `DynamicTensor`/`Tensor` stop storing `f32` values
-  in `f64`, uploads avoid the conversion, and batch specialization keys its
-  plan cache by dtype as well as batch size.
+- D5. Typed host storage (implemented 2026-10-04): `DynamicTensor`/`Tensor`
+  use shared F64/F32/Bool buffers rather than permanently widening narrow
+  values. Typed interop preserves immutable aliases and owned imports.
+  Device upload borrows compatible F32 storage; narrow device readback adopts
+  typed buffers. Dtype-aware batch specialization remains follow-up work.
 - D6. Mixed-precision training policies: master weights, loss scaling, and
   dtype-aware optimizer state on device.
 

@@ -17,7 +17,7 @@ section 5):
 - From v0.2, names that have a replacement in the new API emit a
   `DeprecationWarning` once per name on first access, and the legacy 2D
   `Matrix` API moves to `quabla.legacy`, with a warning on top-level access.
-  These warnings arrive with the v0.2 release; `main` does not emit them yet.
+  These migration warnings are implemented on `main` for v0.2.
 - Deprecated names and the top-level legacy names are removed at 1.0;
   whether `quabla.legacy` stays is decided then. The new API and the
   `Compiler` facade are kept.

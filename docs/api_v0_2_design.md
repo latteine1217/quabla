@@ -1,14 +1,16 @@
 # Quabla v0.2 Python API Design
 
-Status: accepted by the owner on 2026-09-29; partially implemented on
-`main` (unreleased). Landed: S0 packaging (`89c07ad`), S1 arrays
-(`894dae4`, `5eaf708`), S1b `Pow` (`92d9e49`, `8ec9c57`), S2 CPU transforms
-(`a2bdf49` through `1ccb4ab`), S3 composition (`2dee031`, `6ec57b3`), S3b
-constants (`44c5c77`, `12d0706`), S4 `vmap` (`31e6bbf`, `ef76529`,
-`71e798b`), and S4b closed-over tracers (`17e01bb`), each described in its
-"as landed" note in section 6. Pending: S5 devices and errors, S6 optim and
-`Trainer`, S7 control flow, S8 distributed, and S9 deprecation and docs.
-Scope: slices S0 through S9 (plus S1b) ship as v0.2; S10 is deferred. The
+Status: accepted by the owner on 2026-09-29; slices S0 through S9 (plus
+S1b) are implemented on `main` and unreleased. Landed: S0 packaging
+(`89c07ad`), S1 arrays (`894dae4`, `5eaf708`), S1b `Pow` (`92d9e49`,
+`8ec9c57`), S2 CPU transforms (`a2bdf49` through `1ccb4ab`), S3 composition
+(`2dee031`, `6ec57b3`), S3b constants (`44c5c77`, `12d0706`), S4 `vmap`
+(`31e6bbf`, `ef76529`, `71e798b`), and S4b closed-over tracers (`17e01bb`),
+each described in its "as landed" note in section 6; S5 devices and errors,
+S6 optim and `Trainer`, S7 control flow, S8 distributed, and S9 deprecation
+and docs follow, described together in "S5-S9 as implemented" in section 6.
+No v0.2 release has been tagged. Scope: slices S0 through S9 (plus S1b)
+ship as v0.2; S10 is deferred. The
 plan made the repository public after these slices land; on 2026-09-29 the
 owner decided to make it public before S9 instead, with `main` documenting
 the landed slices as unreleased work (resolved question 8 is unchanged: no
@@ -239,10 +241,11 @@ Tensor.numpy() -> np.ndarray; Tensor.tolist(); Tensor.item(); float(t); np.asarr
   `>` as native on little-endian hosts. Import always copies, so a tensor
   never aliases foreign memory. Output through `__array__(dtype=None,
   copy=None)` backed by a read-only buffer export of the immutable
-  `Arc<Vec<f64>>` storage (`py/tensor.rs:14-24`). A `float64` export can be
-  zero-copy while the exporter holds an `Arc` clone (an `unsafe`
-  `__getbuffer__` with a `// SAFETY:` comment); `float32` exports copy,
-  because host storage is `f64` (`docs/api.md:570`). NumPy stays optional
+  typed shared storage (`crates/quabla-python/src/interop.rs`). Matching
+  `float64`, `float32`, and `bool_` exports are zero-copy while the exporter
+  holds an `Arc` clone (an `unsafe` `__getbuffer__` with a `// SAFETY:`
+  comment). Explicit dtype conversion or `copy=True` allocates a copy;
+  incompatible conversion with `copy=False` raises `ValueError`. NumPy stays optional
   (D2). `qb.array` of a `Tensor` returns a new object that shares the
   immutable storage.
 - **`Tensor` stays the class name;** `qb.Array` is an ABC with `Tensor`,
@@ -252,8 +255,8 @@ Tensor.numpy() -> np.ndarray; Tensor.tolist(); Tensor.item(); float(t); np.asarr
   `abs cos exp log relu sigmoid sin softplus sqrt tanh maximum minimum sum
   mean max min norm any all matmul reshape transpose broadcast_to astype
   solve cholesky tril triu`, plus the kept `where`, `concat`, `stack`,
-  `einsum`, comparisons, and logical ops, plus `qb.power`. The only new IR op
-  is `Pow` (below); no `tan`. `abs`, `sum`, `max`, `min`, `any`, and `all`
+  `einsum`, comparisons, and logical ops, plus `qb.power`. `Pow` (below) and
+  native `Cholesky`/`CholeskyAd` extend the IR; no `tan`. `abs`, `sum`, `max`, `min`, `any`, and `all`
   are attributes of `quabla` but not in `__all__`, so `from quabla import *`
   does not shadow the builtins.
 - **Operators:** add `__neg__`, `__pow__`, and `__rpow__` to `TraceTensor`
@@ -306,11 +309,15 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8) -> compiled fun (+ .lo
 - **HVP** has no separate name: `qb.jvp(qb.grad(f), (x,), (v,))` lowers to
   symbolic VJP followed by a tangent-input JVP, which is the graph
   `build_vmap_hvp_scalar_graph` already builds (`py/tensor_trace.rs:6384-6457`).
-- **`jacobian`/`hessian`** are dense and CPU-only in v0.2: per-column JVP as
-  in `TensorJacobianFunction` (`py/tensor_trace.rs:4324-4370`) and the core
-  `hessian_scalar` (`core/tensor_ir.rs:5536`). Inside `jit(device="cuda"|"mlx")`
-  they raise `UnsupportedOperationError`. (S4 stages them as `vmap` of a
-  JVP over the basis instead; see "S4 as landed".)
+- **`jacobian`/`hessian`** produce dense output-first blocks. The staged
+  Jacobian uses reverse mode when the traced floating output has fewer
+  elements than the selected inputs, and forward mode otherwise. Graphs
+  containing F32 nodes keep forward mode for F64 output blocks, avoiding
+  gradient narrowing before an F64 result. Basis
+  batches bound temporary seed storage; the dense result still costs
+  O(PQ). `hessian` remains `jacobian(grad(f))`, forward over reverse for
+  a scalar loss. Device execution follows the supported batching rules
+  of the resulting graph (see "S4 as landed").
 - Every transformed function is staged: calling `qb.grad(f)(x)` without `jit`
   traces and compiles on the CPU, cached like `jit`. Eager op-by-op
   differentiation does not exist today and is not added.
@@ -900,18 +907,24 @@ with batched tracers:
   only because the helpers' VJP sums over the batch; `quabla.vmap` does not
   use that path, and a rejection could only catch the direct spelling, not
   the same computation written through a lambda.
-- **`jacobian` and `hessian`** are staged like `jax.jacfwd`: one JVP graph
-  with a tangent input per selected non-`bool` leaf is spliced with
-  `inline_batched` over the rows of the identity of all `N` selected
-  elements together (each tangent is a mapped constant slice of it), and
-  each output's `[N, *out]` tangents are split per leaf and reshaped to
-  `[*out, *in]`. `hessian` stays `jacobian(grad(f))`, forward over reverse.
+- **`jacobian` and `hessian`** are single staged programs. With P selected
+  floating input elements and Q traced output elements, `jacobian` uses
+  a VJP graph when 0 < Q < P and every traced output is floating; it uses
+  a JVP graph otherwise. F64 output blocks also retain forward mode whenever
+  the source graph contains F32 nodes, because a reverse input gradient
+  can otherwise narrow an F64 derivative before block assembly. `inline_batched` splices bounded batches of
+  cotangent or tangent seeds. Radix coordinates generate the basis with
+  linear constants instead of a quadratic identity constant. Output and
+  input leaf boundaries are restored as `[*out, *in]`, retaining output
+  dtypes and `None` blocks for Boolean input leaves. `hessian` stays
+  `jacobian(grad(f))`, forward over reverse.
   Both are single staged programs, so `jit` compiles them, they inline
   when called on tracers, and `grad(hessian(f))`, `vmap(hessian(f))`, and
-  `jacobian(vmap(f))` work; results equal the column-by-column S2 path
-  (`tensor_hessian_scalar_fn` within `1e-13`) and central differences. The
-  basis is an `N x N` constant, so memory grows quadratically with the
-  number of input elements, as the dense result does.
+  `jacobian(vmap(f))` work. Direction selection can change final rounding;
+  validation allows absolute plus relative error of 1e-12 each for F64
+  and 1e-5 each for F32. Dense results still require O(PQ) storage, or
+  O(P^2) for a Hessian; adaptive direction reduces derivative directions
+  to min(P, Q) for eligible outputs without removing that output cost.
 - **Rejected.** A mapped `solve` (rank-2 only) and mapped `cond`, `fori`,
   and `scan` regions (their bodies are compiled plans, which have no batching
   rule yet; the helpers trace `fori`/`scan` bodies batched). The control-flow
@@ -1032,6 +1045,39 @@ bridge and the Python layer change; the core is untouched.
   `vmap(grad(grad(...)), in_axes=(0, None))`. For the README problem both
   forms stage the same graph and plan (92 / 42 nodes) and take the same
   step time (5.3 µs against 5.4 µs, `timeit` minimum, Apple silicon).
+
+**S5-S9 as implemented (2026-10-03).** The Python device `jit` now freezes
+one ordered output program through the facade, preserving pytrees, auxiliary
+values and duplicate outputs. `lower` accepts `ShapeDtype`, exposes an
+ordered-output facade `Program`, and compiles a callable with an exact input
+signature. Existing single-output `Compiler.trace` programs retain their
+Tensor result; ordered programs expose `output_shapes` and return a list
+from name-keyed facade execution. Native multi-output JVP/VJP are explicitly
+rejected: compose the Python transforms before lowering. Constant-only lowered
+functions are assembled without a native executable.
+
+Device `jit` rejects unavailable builds and performs typed pure lowering
+checks before device setup. MLX validation visits inactive branches and loop
+bodies, rejecting `solve`, non-finite scalar constants and invalid extents
+without executing them. Legacy helper error timing remains unchanged.
+`devices()` is a build-capability query, and logical float64 device programs
+warn once. CUDA validation reuses the existing device-loop rejection rules.
+
+Pure pytree Adam/SGD and `optim.Trainer` reuse the existing device Adam
+executors. Pure host moments remain float64; device moments retain the backend
+float32 contract. No-argument device steps delegate directly without flattening;
+batch replacements preserve declared structures, shapes and dtypes. The control
+wrappers preserve explicit captures and single-array carries. Scan uses a
+positive length and `(carry, index, *operands)`; region indices are scalar
+arrays. Distributed execution remains single-node equal axis-zero sharding
+with replicated gradients and a host optimizer, with an eight-signature bound.
+
+Migration warnings and `legacy` are active on `main`; old call forms remain
+available. `Adam` aliases `optim.Adam`, including its native-compatible
+stateful dictionary `step`. Development gates include the added Python
+suites listed in `CONTRIBUTING.md`. Runtime evidence and remaining hardware verification are recorded in
+`jax_like_roadmap.md`; implementation does not imply that every backend has
+been revalidated.
 
 ## 7. Resolved Questions
 

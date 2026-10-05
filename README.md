@@ -49,7 +49,7 @@ def loss(params, x):  # residual of u'' = -pi^2 sin(pi x), solved by w = pi
     return qb.mean((u_xx(x, params["w"]) + math.pi**2 * qb.sin(math.pi * x)) ** 2)
 
 x = qb.linspace(0.05, 0.95, 8)
-params, adam = {"w": qb.array(2.5)}, qb.Adam(learning_rate=0.05)
+params, adam = {"w": qb.array(2.5)}, qb.optim.Adam(learning_rate=0.05)
 step = qb.jit(qb.value_and_grad(loss))  # traced and compiled on the first call
 for _ in range(300):
     value, grads = step(params, x)
@@ -71,15 +71,18 @@ The latest release is **v0.1.0**, a research-grade, source-only pre-release
 unreleased v0.2 JAX-style API ([CHANGELOG](CHANGELOG.md#unreleased),
 [design](docs/api_v0_2_design.md)): the transforms `grad`, `value_and_grad`,
 `jvp`, `vjp`, `jacobian`, `hessian`, `vmap`, and `jit` over arrays and
-pytrees, and module-level math such as `quabla.sin`. They compile for the CPU
-so far; `jit(device="cuda" | "mlx")` is coming in v0.2. Until then, CUDA and
-MLX run through the v0.1 layer: the `quabla.Compiler` facade, the
-`tensor_*_fn` helpers with their `_cuda`/`_mlx` variants and device Adam
-optimizers, and the control-flow builders `tensor_cond`,
-`tensor_fori_loop_region`, and `tensor_scan_region`. The optimizer is
-`quabla.Adam` until `quabla.optim` lands.
+pytrees, and module-level math such as `quabla.sin`. `jit(device="cpu" |
+"cuda:N" | "mlx")` compiles the staged transforms for explicit built targets;
+eager operations remain on the host. `jit(f).lower(...)` accepts `ShapeDtype`
+leaves for tracing without data. `quabla.optim` provides pure Adam/SGD and a
+retained-buffer `Trainer`; `cond`, `fori_loop`, and `scan` wrap the existing
+regions. `quabla.distributed.value_and_grad` is experimental, single-node
+CUDA/NCCL data parallelism.
 
-All v0.1 names keep working unchanged and emit no deprecation warnings yet.
+All v0.1 call forms keep working. Migrated top-level names emit a
+`DeprecationWarning` once per name; the 2D API is available without warnings
+in `quabla.legacy`, and `quabla.Adam` aliases `quabla.optim.Adam` while
+preserving its stateful dictionary `step`.
 The 0.x API may still change between releases through additions and
 deprecations (see the [compatibility policy](CONTRIBUTING.md#scope-and-status)). The 2D `Matrix`,
 `trace(...)`, and `TraceGraph` API is legacy, kept for compatibility without
@@ -93,9 +96,9 @@ v0.1.
 ## Backend Support
 
 `float64` programs execute as `f32` on CUDA and MLX; `bool` values are held as
-`f32` `0`/`1` on both devices. The function transforms of the v0.2 API run on
-the CPU so far; the CUDA and MLX rows describe the compiler facade and the
-device helpers. The authoritative per-feature status and its validation
+`f32` `0`/`1` on both devices. Device `jit` warns once for logical `float64`
+programs. The v0.2 API inherits the backend limits below; it does not widen
+the supported loop bodies or derivatives. The per-feature status and validation
 records are in [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md).
 
 | Backend | Platform | Build feature | Execution dtype | Autodiff | Control flow | Notable limitations |
@@ -104,6 +107,19 @@ records are in [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md).
 | CUDA | Linux, NVIDIA driver | `cuda` | `f32` | Symbolic JVP/VJP plans, multi-output value-and-gradient, `vmap` JVP/VJP/HVP, device SGD/Adam | `cond` via one host predicate readback; `fori`/`scan` as fused kernels for pure-elementwise bodies, with first-order VJP and restricted HVP | Loop bodies with matmul, reductions, `solve`, or nested regions are rejected; `cond` inside a loop body is rejected; requires `libnvrtc` at runtime (cuBLAS optional, cuSOLVER for `solve`) |
 | CUDA + NCCL | Linux, two or more GPUs on one node | `cuda-nccl` | `f32` | Scalar value-and-gradient with all-reduced replicated parameter gradients | As CUDA | Single node; equal axis-zero batch shards; mapped-input gradients rejected; optimizer update on the host; requires a loadable `libnccl.so` |
 | MLX | macOS, Apple silicon | `mlx` | `f32` | Symbolic JVP/VJP, multi-output value-and-gradient, `vmap` JVP/VJP, device Adam | `cond` via one host predicate readback; `fori`/`scan` dispatched from the host on device-resident arrays, with first-order VJP and forward-over-reverse HVP | `solve` rejected (MLX 0.32.2 `linalg::solve` is CPU-stream only); `vmap` HVP not lowered; no fused Metal loop kernels |
+
+Staged Cholesky uses a native operation on CPU, CUDA, and Metal. Logical
+`float64` JVP, VJP, and second derivatives use bounded IR and O(n²) numerical
+workspace with O(n³) arithmetic; `vmap`, Jacobian, and Hessian composition
+preserve their existing call forms. Explicit `float32` differentiation and
+third or higher derivatives retain scalar expansion to preserve rounding and
+composition. Non-finite and extreme-scale CPU symbolic derivatives retain the reference path.
+Eager Cholesky keeps its strict symmetric positive-definite validation;
+staged Cholesky keeps its lower-triangle recurrence and existing exceptional
+value behavior. CUDA axis sums and means use a block reduction for axes of
+length at least 256, with bounded shared memory and no global scratch buffer.
+GPU results are checked with absolute and relative tolerances of `1e-5`;
+finite CPU derivative results use `1e-12`.
 
 ## Installation From Source
 
@@ -148,9 +164,19 @@ python -c "import quabla; print(quabla.Compiler().capabilities())"
 
 The snippets below run in sequence in one session. Arrays come from Python
 lists, scalars, or NumPy arrays (NumPy is optional), with dtype `float32`,
-`float64`, or `bool`. `grad` and `value_and_grad` differentiate with respect
-to the first argument (or `argnums`), and gradients mirror its pytree, here a
-dict of `float32` parameters:
+`float64`, or `bool`. Host arrays use immutable shared buffers with 4 bytes per
+`float32` element, 8 per `float64` element, and 1 per `bool` element, excluding
+metadata. Shape-only views share storage, and matching-dtype buffer exports
+are read-only and zero-copy. CPU/MLX Fori and Scan gradients use block
+checkpoints to reduce carry-tape storage from O(TC) to O(sqrt(T)C), with a
+measured replay cost. CUDA uses this path for independent lanes and same-shape
+captures; other captures keep the full tape. Public Scan outputs remain O(TY).
+Reproducible optimization results and limitations are recorded in the
+[roadmap](docs/jax_like_roadmap.md#integrated-optimization-status-2026-10-05).
+
+`grad` and `value_and_grad` differentiate with respect to the first argument
+(or `argnums`), and gradients mirror its pytree, here a dict of `float32`
+parameters:
 
 ```python
 import numpy as np
@@ -201,11 +227,10 @@ print(value.item(), grads["b"].item())
 0.6748224496841431 1.3702377080917358
 ```
 
-The transforms compile for the CPU so far; `jit(device="cuda" | "mlx")` is
-coming in v0.2. Until then, run on CUDA or MLX through the compiler facade,
-which traces one program from named input specs and compiles it for any
-target in the build. `capabilities()` reports the targets this build
-contains; it is not a hardware probe.
+To run this transformed step on a device, use
+`qb.jit(qb.value_and_grad(loss), device="cuda:0")` or `device="mlx"`.
+`qb.devices()` reports built targets, rather than enumerating hardware.
+The compiler facade remains available for named input specs:
 
 ```python
 compiler = qb.Compiler()
@@ -247,9 +272,12 @@ and its gradients in one device plan, and `mlx_adam_loss_optimizer` and
 - CUDA loop bodies must be pure elementwise. MLX rejects `solve` and has no
   `vmap` HVP lowering.
 - Data parallelism is single-node CUDA + NCCL only.
-- The v0.2 function transforms compile for the CPU only; `quabla.vmap`
+- `quabla.vmap`
   cannot batch `solve` or `cond`/`fori`/`scan` regions over a mapped
-  argument, and `jacobian`/`hessian` are dense.
+  argument. `jacobian` selects reverse mode for fewer floating output than
+  input elements, and forward mode otherwise; direction changes can affect
+  final rounding. Mixed precision graphs with F64 output blocks keep forward
+  mode. `jacobian`/`hessian` still return dense arrays.
 
 The full list is in [docs/api.md](docs/api.md#known-limitations).
 
