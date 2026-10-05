@@ -3,7 +3,7 @@
 import warnings
 
 REPLACEMENTS = {
-    "Adam": "alias of qb.optim.Adam (keeps .step(params, grads))",
+    "Adam": "qb.optim.Adam, which keeps the .step(params, grads) method",
     "CpuExecutionPlan": "quabla.legacy.CpuExecutionPlan",
     "GradFunction": "quabla.legacy.GradFunction",
     "GradScalarFunction": "quabla.legacy.GradScalarFunction",
@@ -61,7 +61,7 @@ REPLACEMENTS = {
     "jacobians_fn": "quabla.legacy.jacobians_fn",
     "jvp_fn": "quabla.legacy.jvp_fn",
     "mlx_adam_loss_optimizer": 'qb.optim.Trainer(..., device="mlx")',
-    "quabla": "alias of the native module quabla._quabla",
+    "quabla": "the native module quabla._quabla",
     "sum_gradients": "qb.tree.map(operator.add, a, b)",
     "tensor_cond": "qb.cond(pred, true_fun, false_fun, *operands)",
     "tensor_cond_fn": "Python if on a concrete flag + qb.jit(branch)",

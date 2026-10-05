@@ -477,7 +477,7 @@ pub(crate) unsafe fn fill_buffer(
     // freed only by `release_buffer`. `format` points to a `'static` C
     // string that consumers never write through. `readonly = 1` and the
     // `PyBUF_WRITABLE` rejection above keep consumers from writing through
-    // `buf`, so the shared `float64` storage stays immutable. `obj` takes a
+    // `buf`, so the shared typed storage stays immutable. `obj` takes a
     // strong reference that `PyBuffer_Release` drops.
     unsafe {
         (*view).buf = buf;
