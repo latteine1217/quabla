@@ -62,8 +62,8 @@ qb.eye(n, m=None, dtype=None)
 - NumPy is optional: importing `quabla` never imports it.
 - Module-level functions call the method of the same name on a `Tensor` or
   `TraceTensor`, so eager and traced code share one spelling (`qb.sin(x)` is
-  `x.sin()`): `sin`, `cos`, `tanh`, `exp`, `log`, `sqrt`, `relu`, `sigmoid`,
-  `softplus`, `sum`, `mean`, `max`, `min`, `any`, `all`, `norm`, `matmul`,
+  `x.sin()`): `sin`, `cos`, `tanh`, `exp`, `log`, `log1p`, `sqrt`, `relu`,
+  `sigmoid`, `softplus`, `sum`, `mean`, `max`, `min`, `any`, `all`, `norm`, `matmul`,
   `transpose`, `reshape`, `broadcast_to`, `astype`, `maximum`, `minimum`,
   `power`, `solve`, `cholesky`, `tril`, and `triu`, next to the v0.1
   functions `where`, `concat`, `stack`, `einsum`, and the comparison and
@@ -406,7 +406,7 @@ name keeps working through 0.x.
   Python-number base (also `quabla.power(x1, x2)`),
   NumPy-style batched `matmul`, rank-N `quabla.concat([...], axis=...)`,
   permutation-validated `transpose(axes=None)`, global or single-axis `sum`/`mean`/L2 `norm`,
-  common elementwise math (`tanh`, `exp`, `log`, `sqrt`, `sin`, `cos`, `powi`),
+  common elementwise math (`tanh`, `exp`, `log`, `log1p`, `sqrt`, `sin`, `cos`, `powi`),
   `gt(...)` masks, `maximum(...)`/`minimum(...)`, broadcasted `quabla.where(...)`, materialized `broadcast_to(shape)`,
   and element-count-preserving reshape.
   Eager `Tensor` operations run immediately on the host; differentiation and
@@ -416,12 +416,16 @@ name keeps working through 0.x.
   source tensors and views share immutable storage, while every arithmetic
   operation returns a new contiguous allocation.
 - Neural and linear-algebra primitives on eager and traced tensors: `relu`
-  (zero subgradient at zero), `abs`, `sigmoid`, numerically stable
-  `softplus`, rank-N `tril`/`triu` over the last two axes, and rank-2
-  `solve(rhs)` (partial-pivot LU), `solve_triangular(rhs, lower=True,
-  transpose=False)`, and `cholesky()`, each with JVP/VJP rules. `solve`
+  (zero subgradient at zero), `abs`, `sigmoid`, `softplus`, rank-N
+  `tril`/`triu` over the last two axes, and rank-2 `solve(rhs)`
+  (partial-pivot LU), `solve_triangular(rhs, lower=True, transpose=False)`,
+  and `cholesky()`, each with JVP/VJP rules. `solve`
   rejects non-square, rank-mismatched, and singular inputs; on CUDA it lowers
-  to cuSOLVER `Sgetrf`/`Sgetrs`, while MLX rejects it.
+  to cuSOLVER `Sgetrf`/`Sgetrs`, while MLX rejects it. `sigmoid` is
+  `where(x > 0, 1 / (1 + z), z / (1 + z))` with `z = exp(-|x|)`, so neither
+  branch overflows and its gradient stays finite for every finite `x`;
+  `softplus` is `maximum(x, 0) + log1p(exp(-|x|))`. Eager `Tensor` evaluates
+  both with the same per-op rounding as CPU `jit`, so the two agree bitwise.
 - Element dtypes `quabla.float32` and `quabla.float64` (dtype phase D1).
   `Tensor(shape, data, dtype=quabla.float32)` rounds `data` to `f32`, and
   `Tensor.dtype`/`Tensor.astype(dtype)` and `TraceTensor.dtype`/
@@ -477,7 +481,7 @@ name keeps working through 0.x.
 - `tensor_jacobian_fn(fn, input_specs, input_name)` freezes one rank-N trace
   and returns an output-flat by input-flat dense Jacobian for the selected input.
   Its `TraceTensor` values currently support broadcasted add/subtract/multiply/divide,
-  batched `matmul`, rank-N `concat`, `stack([...], axis=...)`, `slice(axis, start, stop)`, `broadcast_to(shape)`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `pow` (`x ** y` and `quabla.power`), `log`, reshape, global or single-axis `sum`/`mean`/L2 `norm`, `maximum`/`minimum`, `gt`/`where` masks, and the bool comparison, logical, `isfinite`/`isnan`, and `any`/`all` operations. `stack` is composed from reshape plus concat, so it inherits the same direct and symbolic CPU/CUDA AD rules. `concat` is linear: direct and symbolic VJP split the upstream cotangent with internal slice nodes, while its JVP and mixed second-direction transform concatenate the corresponding tangents. `slice` supports normalized negative axes and uses a zero-padded internal reverse node, keeping direct and symbolic gradients on the selected original coordinates. `broadcast_to` is a dedicated shape node whose VJP reduces repeated axes back to the input shape. `sqrt` is a native IR primitive: negative values, `-inf` included, follow IEEE floating-point `NaN` semantics for the value and every derivative order, while every derivative order at zero is defined as zero, avoiding `log(0)` during higher-order AD; CPU, CUDA, and MLX agree on these points. A `TraceTensor` `x ** y` lowers a non-negative Python int `y` to the exact `powi` and every other exponent (floats, negative ints, traced tensors, and `c ** x`) to the elementwise `pow` op, which follows `f64::powf` (NaN for a negative base with a non-integer exponent, `0 ** 0 == 1`) and differentiates in both operands: `d/dx = y x^(y-1)`, defined as zero where `x == 0` and `y < 1` (the `sqrt` convention; `y >= 1` keeps the finite limit, so `x ** 2.0` has second derivative 2 at zero), and `d/dy = x^y ln x`, defined as zero for every `x <= 0` (JAX returns `NaN` for `x < 0`). The rules mask these points out of the inner power too, so second derivatives stay finite there wherever the value is finite; at `x <= 0` the two mixed second partials follow the conventions and need not be equal. `pow` lowers to NVRTC `powf` on CUDA, including fused elementwise kernels and elementwise loop bodies, and to `power` on MLX. Comparisons are explicitly non-differentiable; `where` routes VJP/JVP contributions only through the selected data branch. `maximum` and `minimum` are composed from those primitives and route equality subgradients to their right operand. `TensorTraceGraph.evaluate_vjp(...)` and
+  batched `matmul`, rank-N `concat`, `stack([...], axis=...)`, `slice(axis, start, stop)`, `broadcast_to(shape)`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `pow` (`x ** y` and `quabla.power`), `log`, `log1p`, reshape, global or single-axis `sum`/`mean`/L2 `norm`, `maximum`/`minimum`, `gt`/`where` masks, and the bool comparison, logical, `isfinite`/`isnan`, and `any`/`all` operations. `stack` is composed from reshape plus concat, so it inherits the same direct and symbolic CPU/CUDA AD rules. `concat` is linear: direct and symbolic VJP split the upstream cotangent with internal slice nodes, while its JVP and mixed second-direction transform concatenate the corresponding tangents. `slice` supports normalized negative axes and uses a zero-padded internal reverse node, keeping direct and symbolic gradients on the selected original coordinates. `broadcast_to` is a dedicated shape node whose VJP reduces repeated axes back to the input shape. `sqrt` is a native IR primitive: negative values, `-inf` included, follow IEEE floating-point `NaN` semantics for the value and every derivative order, while every derivative order at zero is defined as zero, avoiding `log(0)` during higher-order AD; CPU, CUDA, and MLX agree on these points. A `TraceTensor` `x ** y` lowers a non-negative Python int `y` to the exact `powi` and every other exponent (floats, negative ints, traced tensors, and `c ** x`) to the elementwise `pow` op, which follows `f64::powf` (NaN for a negative base with a non-integer exponent, `0 ** 0 == 1`) and differentiates in both operands: `d/dx = y x^(y-1)`, defined as zero where `x == 0` and `y < 1` (the `sqrt` convention; `y >= 1` keeps the finite limit, so `x ** 2.0` has second derivative 2 at zero), and `d/dy = x^y ln x`, defined as zero for every `x <= 0` (JAX returns `NaN` for `x < 0`). The rules mask these points out of the inner power too, so second derivatives stay finite there wherever the value is finite; at `x <= 0` the two mixed second partials follow the conventions and need not be equal. `pow` lowers to NVRTC `powf` on CUDA, including fused elementwise kernels and elementwise loop bodies, and to `power` on MLX. Comparisons are explicitly non-differentiable; `where` routes VJP/JVP contributions only through the selected data branch. `maximum` and `minimum` are composed from those primitives as `where(isnan(x) | (x > y), x, y)` and `where(isnan(x) | (x < y), x, y)`: they route equality subgradients to their right operand and propagate `NaN` from either operand like NumPy, and so do `relu` and the `max`/`min` reductions, whatever the position of the `NaN`. `log1p` is a native IR primitive, `ln(1 + x)` with derivative `1 / (1 + x)`, that follows IEEE semantics on every backend instead of raising: `log1p(-1)` is `-inf` and `log1p(x)` is `NaN` for `x < -1`; it lowers to `log1pf` on CUDA and to `log1p` on MLX. `TensorTraceGraph.evaluate_vjp(...)` and
   `TensorTraceGraph.evaluate_jvp(...)` execute the corresponding rank-N CPU
   reverse and forward transforms. `TensorTraceGraph.hessian_scalar(...)`
   computes an exact dense Hessian for one named input and a scalar output using

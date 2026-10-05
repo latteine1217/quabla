@@ -26,6 +26,7 @@ __all__ = [
     "cos",
     "exp",
     "log",
+    "log1p",
     "matmul",
     "maximum",
     "mean",
@@ -88,6 +89,7 @@ abs = _unary("abs")
 cos = _unary("cos")
 exp = _unary("exp")
 log = _unary("log")
+log1p = _unary("log1p")
 relu = _unary("relu")
 sigmoid = _unary("sigmoid")
 sin = _unary("sin")

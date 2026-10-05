@@ -8,6 +8,7 @@ import math
 import os
 import pathlib
 import pickle
+import struct
 import subprocess
 import sys
 
@@ -503,6 +504,7 @@ def test_module_level_unary_and_reduction_ops_match_methods():
         "cos",
         "exp",
         "log",
+        "log1p",
         "relu",
         "sigmoid",
         "sin",
@@ -551,6 +553,174 @@ def test_module_level_ops_accept_python_scalars_and_lists():
     assert_raises(
         ValueError, qb.maximum, x, qb.array([0.0, 3.0]), match="mismatched dtypes"
     )
+
+
+def float_bits(values):
+    """IEEE bit patterns of `values` (floats read back from a tensor)."""
+    return [struct.pack("<d", value) for value in values]
+
+
+EXTREME_POINTS = [
+    -1000.0,
+    -100.0,
+    -80.0,
+    -20.0,
+    -15.0,
+    -1.0,
+    0.0,
+    1.0,
+    20.0,
+    100.0,
+    1000.0,
+]
+
+
+def exact_sigmoid(value):
+    """`1 / (1 + e^-x)` in float64 without overflow, as the reference."""
+    if value >= 0.0:
+        return 1.0 / (1.0 + math.exp(-value))
+    decay = math.exp(value)
+    return decay / (1.0 + decay)
+
+
+def test_log1p_follows_ieee_semantics_eagerly_and_traced():
+    points = [-2.0, -1.0, -0.5, -1e-10, 0.0, 1e-10, 3.0]
+    for dtype in [qb.float32, qb.float64]:
+        x = qb.array(points, dtype=dtype)
+        for result in [qb.log1p(x), qb.jit(qb.log1p)(x)]:
+            values = result.tolist()
+            assert result.dtype == dtype
+            assert math.isnan(values[0]) and values[1] == -math.inf, values
+            rounded = qb.array([math.log1p(p) for p in points[2:]], dtype=dtype)
+            assert values[2:] == rounded.tolist(), (values, rounded.tolist())
+    # log1p keeps the small-argument precision that log(1 + x) loses.
+    tiny = qb.array([1e-10], dtype=qb.float32)
+    assert qb.jit(qb.log1p)(tiny).item() == qb.array(1e-10, dtype=qb.float32).item()
+    gradient = qb.grad(lambda t: qb.sum(qb.log1p(t)))(qb.array([-0.5, 0.0, 3.0]))
+    assert_close(gradient, [2.0, 1.0, 0.25], 1e-15)
+
+
+def test_sigmoid_and_softplus_are_stable_and_eager_matches_jit_bitwise():
+    # Relative tolerances: about one ulp for values, a few ulp for gradients,
+    # which compose several rounded ops.
+    tolerances = {qb.float32: (1.2e-7, 6e-7), qb.float64: (3e-16, 1e-15)}
+    for dtype, (value_tolerance, gradient_tolerance) in tolerances.items():
+        x = qb.array(EXTREME_POINTS, dtype=dtype)
+        for name in ["sigmoid", "softplus", "log1p"]:
+            function = getattr(qb, name)
+            argument = (
+                x if name != "log1p" else qb.array([-0.5, 1e-10, 3.0], dtype=dtype)
+            )
+            eager, jitted = function(argument), qb.jit(function)(argument)
+            assert eager.dtype == jitted.dtype == dtype
+            assert float_bits(eager.tolist()) == float_bits(jitted.tolist()), (
+                name,
+                eager.tolist(),
+                jitted.tolist(),
+            )
+        sigmoid = qb.jit(qb.sigmoid)(x).tolist()
+        softplus = qb.jit(qb.softplus)(x).tolist()
+        gradient = qb.jit(qb.grad(lambda t: qb.sum(qb.sigmoid(t))))(x).tolist()
+        softplus_gradient = qb.jit(qb.grad(lambda t: qb.sum(qb.softplus(t))))(
+            x
+        ).tolist()
+        for index, point in enumerate(EXTREME_POINTS):
+            expected = exact_sigmoid(point)
+            # s(1 - s) as s(x) s(-x), without the cancellation in 1 - s.
+            slope = expected * exact_sigmoid(-point)
+            log_term = max(point, 0.0) + math.log1p(math.exp(-abs(point)))
+            for actual, reference, tolerance in [
+                (sigmoid[index], expected, value_tolerance),
+                (softplus[index], log_term, value_tolerance),
+                (softplus_gradient[index], expected, gradient_tolerance),
+                (gradient[index], slope, gradient_tolerance),
+            ]:
+                assert math.isfinite(actual), (point, actual)
+                # float32 subnormals (|x| = 100) keep only a few significant bits.
+                if dtype == qb.float32 and 0.0 < reference < 1.2e-38:
+                    assert abs(actual - reference) <= 2.0**-149, (
+                        point,
+                        actual,
+                        reference,
+                    )
+                else:
+                    assert abs(actual - reference) <= tolerance * reference, (
+                        dtype,
+                        point,
+                        actual,
+                        reference,
+                    )
+    # The textbook 1 / (1 + exp(-x)) underflowed or formed 0 * inf here.
+    x32 = qb.array([-100.0, -80.0, -20.0], dtype=qb.float32)
+    gradient = qb.grad(lambda t: qb.sum(qb.sigmoid(t)))(x32).tolist()
+    assert all(math.isfinite(value) and value > 0.0 for value in gradient), gradient
+    assert qb.sigmoid(qb.array(-80.0, dtype=qb.float32)).item() > 0.0
+    softplus = qb.jit(qb.softplus)(qb.array(-20.0, dtype=qb.float32)).item()
+    assert abs(softplus - 2.0611536e-9) <= 1e-15, softplus
+
+
+def test_maximum_minimum_relu_and_extrema_propagate_nan_at_every_position():
+    nan = math.nan
+    for dtype in [qb.float32, qb.float64]:
+        for position in range(3):
+            values = [1.0, 2.0, 3.0]
+            values[position] = nan
+            x = qb.array(values, dtype=dtype)
+            other = qb.array([2.0, 2.0, 2.0], dtype=dtype)
+            cases = [
+                (lambda t: qb.max(t), 0),
+                (lambda t: qb.min(t), 0),
+                (lambda t: qb.max(qb.reshape(t, (1, 3)), axis=1), 0),
+                (lambda t: qb.relu(t), position),
+                (lambda t: qb.maximum(t, other), position),
+                (lambda t: qb.maximum(other, t), position),
+                (lambda t: qb.minimum(t, other), position),
+                (lambda t: qb.minimum(other, t), position),
+                (lambda t: qb.maximum(t, 0.5), position),
+                (lambda t: qb.minimum(0.5, t), position),
+            ]
+            for function, nan_index in cases:
+                eager = function(x).to_flat_list()
+                jitted = qb.jit(function)(x).to_flat_list()
+                for result in [eager, jitted]:
+                    assert math.isnan(result[nan_index]), (values, result)
+                    others = [v for i, v in enumerate(result) if i != nan_index]
+                    assert not any(math.isnan(v) for v in others), (values, result)
+                assert [math.isnan(v) or v for v in eager] == [
+                    math.isnan(v) or v for v in jitted
+                ], (values, eager, jitted)
+
+
+def test_maximum_minimum_keep_nan_free_values_and_tie_gradients():
+    x = qb.array([-1.0, 0.0, 2.0, -0.0, 3.0])
+    y = qb.array([0.0, 0.0, 1.0, 0.0, 3.0])
+    assert float_bits(qb.maximum(x, y).tolist()) == float_bits(
+        [0.0, 0.0, 2.0, 0.0, 3.0]
+    )
+    assert float_bits(qb.jit(qb.maximum)(x, y).tolist()) == float_bits(
+        [0.0, 0.0, 2.0, 0.0, 3.0]
+    )
+    assert float_bits(qb.minimum(x, y).tolist()) == float_bits(
+        [-1.0, 0.0, 1.0, 0.0, 3.0]
+    )
+    signed_zeros = qb.array([-0.0, 0.0])
+    assert float_bits([qb.max(signed_zeros).item()]) == float_bits([0.0])
+    assert float_bits([qb.jit(qb.max)(signed_zeros).item()]) == float_bits([0.0])
+    # Ties route the whole subgradient to the right operand, as before.
+    for function in [qb.maximum, qb.minimum]:
+        dx, dy = qb.grad(lambda a, b: qb.sum(function(a, b)), argnums=(0, 1))(x, y)
+        mask = (
+            [0.0, 0.0, 1.0, 0.0, 0.0]
+            if function is qb.maximum
+            else [1.0, 0.0, 0.0, 0.0, 0.0]
+        )
+        assert dx.tolist() == mask, (function, dx.tolist())
+        assert dy.tolist() == [1.0 - m for m in mask], (function, dy.tolist())
+    relu_gradient = qb.grad(lambda t: qb.sum(qb.relu(t)))(qb.array([-1.0, 0.0, 2.0]))
+    assert relu_gradient.tolist() == [0.0, 0.0, 1.0]
+    # A max reduction routes ties to the later element.
+    gradient = qb.grad(lambda t: qb.max(t))(qb.array([3.0, 1.0, 3.0]))
+    assert gradient.tolist() == [0.0, 0.0, 1.0]
 
 
 def test_module_level_shape_and_linear_algebra_ops():

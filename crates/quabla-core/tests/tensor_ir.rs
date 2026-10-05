@@ -10277,3 +10277,198 @@ fn inline_batched_rejects_unbatchable_ops_and_invalid_bindings() {
         .expect_err("a zero batch must be rejected");
     assert!(error.to_string().contains("above zero"), "{error}");
 }
+
+fn log1p_input(values: &[f64]) -> Result<BTreeMap<String, DynamicTensor>, String> {
+    Ok(BTreeMap::from([(
+        "x".to_string(),
+        DynamicTensor::new(vec![values.len()], values.to_vec())?,
+    )]))
+}
+
+#[test]
+fn log1p_keeps_ieee_values_without_raising() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![8]));
+    let output = must!(graph.log1p(x));
+    let points = [-2.0, -1.0, -0.5, -1e-12, 0.0, 1e-12, 3.0, f64::INFINITY];
+    let inputs = must!(log1p_input(&points));
+    let plan = must!(graph.compile_cpu(output));
+    for value in [
+        must!(graph.evaluate(output, &inputs)),
+        must!(plan.evaluate(&inputs)),
+    ] {
+        let data = value.data();
+        assert!(data[0].is_nan(), "log1p(-2) is NaN: {data:?}");
+        assert_eq!(data[1], f64::NEG_INFINITY);
+        for (actual, point) in data.iter().zip(points).skip(2) {
+            assert_eq!(actual.to_bits(), point.ln_1p().to_bits(), "log1p({point})");
+        }
+    }
+    assert!(graph.lower_text().contains("log1p(%"));
+
+    // A constant operand folds through the same IEEE kernel instead of failing.
+    let mut folded = TensorIr::new();
+    let minus_one = folded.scalar_constant(-1.0);
+    let output = must!(folded.log1p(minus_one));
+    let value = must!(must!(folded.compile_cpu(output)).evaluate(&BTreeMap::new()));
+    assert_eq!(value.data()[0], f64::NEG_INFINITY);
+}
+
+#[test]
+fn log1p_derivatives_agree_across_runtime_and_symbolic_routes() {
+    let points = [-0.75, -0.5, 0.0, 1e-9, 3.0];
+    let expected = points.map(|point: f64| 1.0 / (1.0 + point));
+    let inputs = must!(log1p_input(&points));
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![points.len()]));
+    let output = must!(graph.log1p(x));
+    let ones = must!(DynamicTensor::filled(vec![points.len()], 1.0));
+    let close = |actual: &[f64]| {
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 1e-15 * expected.abs(),
+                "{actual} vs {expected}"
+            );
+        }
+    };
+
+    close(&must!(graph.vjp(output, &inputs, ones.clone()))["x"].data());
+    let tangents = BTreeMap::from([("x".to_string(), ones.clone())]);
+    let (value, tangent) = must!(graph.jvp(output, &inputs, &tangents));
+    close(&tangent.data());
+    assert_eq!(value.data()[0], (-0.75_f64).ln_1p());
+
+    let reverse = must!(graph.symbolic_vjp(output, "cotangent"));
+    let mut symbolic_inputs = inputs.clone();
+    symbolic_inputs.insert("cotangent".to_string(), ones.clone());
+    close(
+        &must!(reverse
+            .graph
+            .evaluate(reverse.gradients["x"], &symbolic_inputs))
+        .data(),
+    );
+    let forward = must!(graph.symbolic_jvp_with_tangent_inputs(
+        output,
+        &BTreeMap::from([("x".to_string(), "dx".to_string())]),
+    ));
+    let mut forward_inputs = inputs.clone();
+    forward_inputs.insert("dx".to_string(), ones);
+    close(&must!(forward.graph.evaluate(forward.tangent, &forward_inputs)).data());
+
+    // Second order: d2/dx2 log1p(x) = -1 / (1 + x)^2 on the runtime mixed
+    // route and by symbolic forward-over-reverse.
+    let point = 0.6_f64;
+    let second = -1.0 / ((1.0 + point) * (1.0 + point));
+    let mut scalar = TensorIr::new();
+    let x = must!(scalar.input("x", vec![]));
+    let log = must!(scalar.log1p(x));
+    let point_inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![], vec![point])),
+    )]);
+    let runtime = must!(scalar.hessian_scalar(log, "x", &point_inputs));
+    assert!((runtime[0][0] - second).abs() <= 1e-15, "{runtime:?}");
+    let reverse = must!(scalar.symbolic_vjp(log, "cotangent"));
+    let forward = must!(reverse.graph.symbolic_jvp_with_tangent_inputs(
+        reverse.gradients["x"],
+        &BTreeMap::from([("x".to_string(), "dx".to_string())]),
+    ));
+    let mut hessian_inputs = point_inputs.clone();
+    hessian_inputs.insert(
+        "cotangent".to_string(),
+        must!(DynamicTensor::filled(vec![], 1.0)),
+    );
+    hessian_inputs.insert("dx".to_string(), must!(DynamicTensor::filled(vec![], 1.0)));
+    let symbolic = must!(forward.graph.evaluate(forward.tangent, &hessian_inputs));
+    assert!((symbolic.data()[0] - second).abs() <= 1e-15, "{symbolic:?}");
+}
+
+#[cfg(any(
+    all(feature = "cuda", target_os = "linux"),
+    all(feature = "mlx", target_os = "macos")
+))]
+type PlanWithInputs = (TensorExecutionPlan, BTreeMap<String, DynamicTensor>);
+
+/// The gradient of `sum(log1p(x) * x)` and a Fori whose body applies
+/// `log1p`, so device backends lower log1p as a per-node kernel and inside a
+/// loop body.
+#[cfg(any(
+    all(feature = "cuda", target_os = "linux"),
+    all(feature = "mlx", target_os = "macos")
+))]
+fn log1p_device_plans() -> Result<Vec<PlanWithInputs>, String> {
+    let points = vec![-0.9, -0.5, 0.0, 1e-6, 0.25, 3.0];
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![points.len()])?;
+    let log = graph.log1p(x)?;
+    let product = graph.mul(log, x)?;
+    let loss = graph.sum(product)?;
+    let reverse = graph.symbolic_vjp(loss, "cotangent")?;
+    let gradient_plan = reverse.graph.compile_cpu(reverse.gradients["x"])?;
+    let gradient_inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            DynamicTensor::new(vec![points.len()], points.clone())?,
+        ),
+        ("cotangent".to_string(), DynamicTensor::filled(vec![], 1.0)?),
+    ]);
+
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![points.len()])?;
+    let index = body.input("index", vec![])?;
+    let log = body.log1p(carry)?;
+    let next = body.add(log, index)?;
+    let loop_plan = TensorForiExecutionPlan::new(0, 3, body.compile_cpu(next)?, "carry", "index")?;
+    let mut looped = TensorIr::new();
+    let initial = looped.input("x", vec![points.len()])?;
+    let output = looped.fori(initial, loop_plan, vec![])?;
+    let loop_inputs = BTreeMap::from([(
+        "x".to_string(),
+        DynamicTensor::new(
+            vec![points.len()],
+            points.iter().map(|point| point + 1.0).collect(),
+        )?,
+    )]);
+    Ok(vec![
+        (gradient_plan, gradient_inputs),
+        (looped.compile_cpu(output)?, loop_inputs),
+    ])
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_log1p_matches_cpu_values_and_gradients() {
+    if std::env::var_os("QUABLA_MLX_TEST").is_none() {
+        return;
+    }
+    for (plan, inputs) in must!(log1p_device_plans()) {
+        let cpu = must!(plan.evaluate(&inputs));
+        let mlx = must!(MlxBackend.execute(&plan, &inputs));
+        assert_eq!(mlx.shape(), cpu.shape());
+        for (device, host) in mlx.data().iter().zip(cpu.data().iter()) {
+            assert!(
+                (device - host).abs() <= 2e-6 * host.abs().max(1.0),
+                "{device} vs {host}"
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_log1p_matches_cpu_values_and_gradients() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    for (plan, inputs) in must!(log1p_device_plans()) {
+        let cpu = must!(plan.evaluate(&inputs));
+        let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+        assert_eq!(cuda.shape(), cpu.shape());
+        for (device, host) in cuda.data().iter().zip(cpu.data().iter()) {
+            assert!(
+                (device - host).abs() <= 2e-6 * host.abs().max(1.0),
+                "{device} vs {host}"
+            );
+        }
+    }
+}

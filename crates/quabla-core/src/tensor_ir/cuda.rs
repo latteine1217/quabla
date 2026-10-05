@@ -2734,6 +2734,7 @@ fn execute_cuda_device_program(
             | TensorOp::Powi { .. }
             | TensorOp::Pow { .. }
             | TensorOp::Log { .. }
+            | TensorOp::Log1p { .. }
             | TensorOp::Triangular { .. }
             | TensorOp::Matmul { .. }
             | TensorOp::Sum { .. }
@@ -3365,6 +3366,7 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
         | TensorOp::Cos { input }
         | TensorOp::Powi { input, .. }
         | TensorOp::Log { input }
+        | TensorOp::Log1p { input }
         | TensorOp::Transpose { input, .. }
         | TensorOp::Triangular { input, .. } => {
             launch.arg(cuda_value(values, *input)?);
@@ -4371,6 +4373,7 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
             | TensorOp::Powi { .. }
             | TensorOp::Pow { .. }
             | TensorOp::Log { .. }
+            | TensorOp::Log1p { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
             TensorOp::Reshape { input } if body.nodes[*input].shape == node.shape => {}
@@ -4463,6 +4466,7 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
             | TensorOp::Powi { .. }
             | TensorOp::Pow { .. }
             | TensorOp::Log { .. }
+            | TensorOp::Log1p { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
             TensorOp::Reshape { input }
@@ -4694,6 +4698,7 @@ fn cuda_fori_body_expression_inner(
             Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
+        TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
         // Cast source and target both execute as float, so the cast is the identity.
         TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
             child(*input)
@@ -4854,6 +4859,7 @@ fn cuda_scan_body_expression_in_half_inner(
             Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
+        TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
         // Cast source and target both execute as float, so the cast is the identity.
         TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
             child(*input)
@@ -5004,6 +5010,7 @@ fn cuda_elementwise_plan_expression_with_index_inner(
             Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
+        TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
         // Cast source and target both execute as float, so the cast is the identity.
         TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
             child(*input)
@@ -7290,7 +7297,8 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
             | TensorOp::Sin { input }
             | TensorOp::Cos { input }
             | TensorOp::Powi { input, .. }
-            | TensorOp::Log { input } => {
+            | TensorOp::Log { input }
+            | TensorOp::Log1p { input } => {
                 let expression = match &node.op {
                     TensorOp::Tanh { .. } => "tanhf(input[index])".to_string(),
                     TensorOp::Exp { .. } => "expf(input[index])".to_string(),
@@ -7304,6 +7312,7 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                         format!("quabla_powi(input[index], {exponent}U)")
                     }
                     TensorOp::Log { .. } => "logf(input[index])".to_string(),
+                    TensorOp::Log1p { .. } => "log1pf(input[index])".to_string(),
                     _ => unreachable!(),
                 };
                 let input_count = element_count(&plan.nodes[*input].shape)?;
@@ -7780,6 +7789,7 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Pow { .. } => "pow",
         TensorOp::Transpose { .. } => "transpose",
         TensorOp::Log { .. } => "log",
+        TensorOp::Log1p { .. } => "log1p",
         TensorOp::Concat { .. } => "concat",
         TensorOp::Slice { .. } => "slice",
         TensorOp::PadSlice { .. } => "pad_slice",

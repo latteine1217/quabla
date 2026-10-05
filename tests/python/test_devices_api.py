@@ -1,5 +1,6 @@
 """Device jit, ahead-of-time signatures and migration compatibility."""
 
+import math
 import os
 import warnings
 
@@ -130,6 +131,54 @@ def test_device_jit_matches_cpu_for_nested_transforms_and_pytrees():
             assert (error.op, error.device) == ("solve", "mlx")
     if not ran:
         print("SKIP device jit runtime: GPU gates unset")
+
+
+def test_device_stable_activations_and_nan_propagation_match_cpu():
+    ran = False
+    for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
+        if os.environ.get(gate) != "1":
+            continue
+        assert device in qb.devices(), f"{gate} requested but target not built"
+        ran = True
+        # Normal float32 range only: GPUs may flush subnormal results to zero.
+        x = qb.array([-30.0, -5.0, -1.0, 0.0, 0.5, 3.0, 25.0], dtype=qb.float32)
+        y = qb.array([-2.0, -5.0, 0.0, 0.0, 1.0, 2.0, 30.0], dtype=qb.float32)
+        functions = {
+            "log1p": lambda t, u: qb.log1p(qb.abs(t)),
+            "softplus": lambda t, u: qb.softplus(t),
+            "sigmoid": lambda t, u: qb.sigmoid(t),
+            "maximum": lambda t, u: qb.maximum(t, u),
+            "minimum": lambda t, u: qb.minimum(t, u),
+            "relu": lambda t, u: qb.relu(t),
+        }
+        for name, function in functions.items():
+            value = qb.jit(function, device=device)(x, y)
+            expected = qb.jit(function)(x, y)
+            for actual, reference in zip(value.to_flat_list(), expected.to_flat_list()):
+                assert abs(actual - reference) <= 2e-6 * max(1.0, abs(reference)), (
+                    device,
+                    name,
+                    value.tolist(),
+                    expected.tolist(),
+                )
+            gradient = qb.grad(lambda t, u: qb.sum(function(t, u)), argnums=(0, 1))
+            for actual, reference in zip(
+                qb.jit(gradient, device=device)(x, y), qb.jit(gradient)(x, y)
+            ):
+                close(actual, reference, 2e-6)
+        nan = qb.array([1.0, math.nan, 3.0], dtype=qb.float32)
+        other = qb.array([2.0, 2.0, 2.0], dtype=qb.float32)
+        for function in [
+            lambda t: qb.max(t),
+            lambda t: qb.min(t),
+            lambda t: qb.relu(t),
+            lambda t: qb.maximum(other, t),
+            lambda t: qb.minimum(t, other),
+        ]:
+            result = qb.jit(function, device=device)(nan).to_flat_list()
+            assert any(math.isnan(value) for value in result), (device, result)
+    if not ran:
+        print("SKIP device activation parity: GPU gates unset")
 
 
 if __name__ == "__main__":

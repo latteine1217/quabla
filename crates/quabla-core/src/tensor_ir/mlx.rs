@@ -966,6 +966,9 @@ impl MlxBackend {
                 TensorOp::Log { input } => mlx_value(&values, *input)?
                     .log_device(&stream)
                     .map_err(|error| error.to_string()),
+                TensorOp::Log1p { input } => mlx_value(&values, *input)?
+                    .log1p_device(&stream)
+                    .map_err(|error| error.to_string()),
                 TensorOp::Powi { input, exponent } => {
                     let exponent = Array::from_f32(*exponent as f32);
                     mlx_value(&values, *input)?
@@ -2008,6 +2011,7 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Pow { .. } => "pow",
         TensorOp::Transpose { .. } => "transpose",
         TensorOp::Log { .. } => "log",
+        TensorOp::Log1p { .. } => "log1p",
         TensorOp::Concat { .. } => "concat",
         TensorOp::Slice { .. } => "slice",
         TensorOp::PadSlice { .. } => "pad_slice",
