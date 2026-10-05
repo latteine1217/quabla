@@ -1,3 +1,8 @@
+// PyO3's `#[pyclass(from_py_object)]` expansion clones the extracted value,
+// and `PyDType` is `Copy`, so clippy >= 1.99 reports `clone_on_copy` inside
+// generated code that this module cannot change.
+#![allow(clippy::clone_on_copy)]
+
 use pyo3::prelude::*;
 use quabla_core::tensor_ir::TensorDType;
 
