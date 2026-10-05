@@ -46,9 +46,10 @@ deprecated names keep working until 1.0 (see
 
 ### Fixed
 
-- `Trainer(..., device="mlx")` accepts parameters the loss does not depend
-  on, such as an output bias that a second derivative removes; it used to
-  fail with "MLX Adam parameter ... is not a plan input".
+- Device `Trainer`s (MLX and CUDA) accept parameters the loss does not
+  depend on, such as an output bias that a second derivative removes, and
+  leave them unchanged like the CPU `Trainer`; they used to fail with
+  "... is not a plan input" or "CUDA plan has no input".
 - Traced `softplus` adds `log1p(exp(-|x|))` instead of `log(1 + exp(-|x|))`,
   which rounded the correction away in `float32`: `jit(softplus)(-20)` now
   returns 2.06e-9 instead of 0. Eager `softplus` evaluates the same per-op

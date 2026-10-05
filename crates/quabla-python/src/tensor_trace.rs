@@ -141,6 +141,10 @@ pub struct TensorCudaAdamOptimizer {
     shared_plan: Option<SharedCudaAdamPlan>,
     shared_plan_includes_loss: bool,
     parameter_names: BTreeSet<String>,
+    // Parameters the loss does not depend on. The compiled plan prunes them,
+    // so they have no device buffer; their gradient is zero and Adam leaves
+    // them unchanged, so their initial host values are returned as is.
+    frozen_parameters: BTreeMap<String, DynamicTensor>,
     inputs: BTreeMap<String, DynamicTensor>,
     retained_inputs: BTreeSet<String>,
     learning_rate: f32,
@@ -7990,6 +7994,12 @@ impl TensorCudaAdamOptimizer {
     }
 
     fn parameters(&self) -> PyResult<BTreeMap<String, PyTensor>> {
+        let frozen = self.frozen_parameters.iter().map(|(name, value)| {
+            Ok((
+                name.clone(),
+                PyTensor::from_dynamic_tensor(value.clone()).map_err(PyValueError::new_err)?,
+            ))
+        });
         if let Some(shared_plan) = &self.shared_plan {
             return self
                 .parameter_names
@@ -8005,6 +8015,7 @@ impl TensorCudaAdamOptimizer {
                         PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)?,
                     ))
                 })
+                .chain(frozen)
                 .collect();
         }
         self.parameter_plans
@@ -8105,6 +8116,7 @@ pub fn cuda_adam_optimizer(
         shared_plan: None,
         shared_plan_includes_loss: false,
         parameter_names,
+        frozen_parameters: BTreeMap::new(),
         inputs: extract_tensor_map(inputs)?,
         learning_rate,
         beta1,
@@ -8159,6 +8171,7 @@ pub fn cuda_adam_vjp_optimizer(
         }),
         shared_plan_includes_loss: false,
         parameter_names,
+        frozen_parameters: BTreeMap::new(),
         inputs: extract_tensor_map(inputs)?,
         retained_inputs,
         learning_rate,
@@ -8191,10 +8204,25 @@ pub fn cuda_adam_loss_optimizer(
             "cuda_adam_loss_optimizer loss must be a TraceTensor or TensorTraceResult",
         ));
     };
-    let (plan, _, gradient_node_ids) =
+    let (plan, _, mut gradient_node_ids) =
         compile_cuda_scalar_value_and_grad(&loss, parameter_names, device_ordinal)?;
-    let parameter_names = gradient_node_ids.keys().cloned().collect::<BTreeSet<_>>();
     let mut values = extract_tensor_map(inputs)?;
+    let frozen_names = gradient_node_ids
+        .keys()
+        .filter(|name| plan.plan.plan().input_shape(name).is_err())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut frozen_parameters = BTreeMap::new();
+    for name in frozen_names {
+        gradient_node_ids.remove(&name);
+        let value = values.get(&name).cloned().ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "cuda_adam_loss_optimizer parameter {name:?} has no value"
+            ))
+        })?;
+        frozen_parameters.insert(name, value);
+    }
+    let parameter_names = gradient_node_ids.keys().cloned().collect::<BTreeSet<_>>();
     if values.contains_key(CUDA_LOSS_COTANGENT_NAME) {
         return Err(PyValueError::new_err(format!(
             "cuda_adam_loss_optimizer reserves input name {CUDA_LOSS_COTANGENT_NAME:?}"
@@ -8217,6 +8245,7 @@ pub fn cuda_adam_loss_optimizer(
         }),
         shared_plan_includes_loss: true,
         parameter_names,
+        frozen_parameters,
         inputs: values,
         retained_inputs,
         learning_rate,
