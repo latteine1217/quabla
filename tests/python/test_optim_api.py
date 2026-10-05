@@ -1,5 +1,7 @@
 """Analytic optimizer updates and CPU/device Trainer behavior."""
 
+import collections
+import dataclasses
 import math
 import os
 from unittest.mock import patch
@@ -156,6 +158,53 @@ def train(device, optimizer):
 def test_cpu_trainer_adam_and_sgd_convergence():
     train("cpu", Adam(0.05))
     train("cpu", SGD(0.05))
+
+
+@dataclasses.dataclass(frozen=True)
+class Affine:
+    weight: object
+    bias: object
+    name: str = "affine"
+
+
+qb.tree.register_dataclass(Affine, meta_fields=("name",))
+Pair = collections.namedtuple("Pair", "first second")
+
+
+def test_optimizers_and_trainer_keep_custom_node_parameters():
+    def affine_loss(params, x, target):
+        layer = params.first
+        prediction = layer.weight * x + layer.bias + params.second
+        return ((prediction - target) ** 2).mean()
+
+    params = Pair(Affine(qb.array([0.0]), qb.array([0.0])), qb.array(0.0))
+    grads = Pair(Affine(qb.array([1.0]), qb.array([2.0])), qb.array(4.0))
+    updated, state = SGD(0.5).update(params, grads, None)
+    assert type(updated) is Pair and type(updated.first) is Affine
+    assert updated.first.name == "affine"
+    assert scalar(updated.first.bias) == -1.0 and scalar(updated.second) == -2.0
+    adam = Adam(0.1)
+    updated, state = adam.update(params, grads, adam.init(params))
+    assert type(state["m"]) is Pair and type(state["v"].first) is Affine
+    raises(ValueError, adam.update, params, (grads.first, grads.second), state)
+    x, target = qb.array([-1.0, 1.0]), qb.array([-1.0, 3.0])
+    trainer = Trainer(affine_loss, params, Adam(0.05), x, target)
+    initial = scalar(trainer.loss())
+    for _ in range(300):
+        trainer.step()
+    assert scalar(trainer.loss()) < initial * 1e-5
+    final = trainer.params
+    assert type(final) is Pair and type(final.first) is Affine
+    assert abs(scalar(final.first.weight) - 2) < 0.01
+    assert abs(scalar(final.first.bias) + scalar(final.second) - 1) < 0.01
+    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda:0", "QUABLA_CUDA_TEST")):
+        if os.environ.get(flag) != "1":
+            continue
+        on_device = Trainer(affine_loss, params, Adam(0.05), x, target, device=device)
+        for _ in range(300):
+            on_device.step()
+        assert type(on_device.params.first) is Affine, device
+        assert abs(scalar(on_device.params.first.weight) - 2) < 0.01, device
 
 
 def test_trainer_retained_data_batch_order_and_latest_loss():

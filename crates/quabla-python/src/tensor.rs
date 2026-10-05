@@ -1911,6 +1911,78 @@ impl PyTensor {
         Self::random_normal(shape, key, 0.0, stddev)
     }
 
+    /// Uniform samples of `dtype` (default `float64`) in `[minval, maxval)`
+    /// from the SplitMix64 stream seeded by `key`, one stream output per
+    /// element: its top 53 bits give `k * 2^-53` in `[0, 1)`, scaled to the
+    /// interval. Rounding the scaled value, or narrowing it to `float32`,
+    /// can land on `maxval` (or below `minval`), so each sample is clamped
+    /// to the representable values of `dtype` inside the interval.
+    #[staticmethod]
+    #[pyo3(signature = (shape, key, minval = 0.0, maxval = 1.0, dtype = None))]
+    fn random_uniform(
+        shape: Vec<usize>,
+        key: u64,
+        minval: f64,
+        maxval: f64,
+        dtype: Option<PyDType>,
+    ) -> PyResult<Self> {
+        let dtype = dtype.map_or(TensorDType::F64, |dtype| dtype.dtype);
+        let width = maxval - minval;
+        if !(minval < maxval && width.is_finite()) {
+            return Err(PyValueError::new_err(format!(
+                "random_uniform requires finite minval < maxval, got [{minval}, {maxval})"
+            )));
+        }
+        let (low, high) = match dtype {
+            TensorDType::F64 => (minval, maxval.next_down()),
+            TensorDType::F32 => {
+                let mut low = minval as f32;
+                if f64::from(low) < minval {
+                    low = low.next_up();
+                }
+                let mut high = maxval as f32;
+                if f64::from(high) >= maxval {
+                    high = high.next_down();
+                }
+                if low > high {
+                    return Err(PyValueError::new_err(format!(
+                        "no float32 value lies in [{minval}, {maxval})"
+                    )));
+                }
+                (f64::from(low), f64::from(high))
+            }
+            TensorDType::Bool => {
+                return Err(PyValueError::new_err(
+                    "random_uniform requires a floating-point dtype",
+                ))
+            }
+        };
+        let count = element_count(&shape).map_err(PyValueError::new_err)?;
+        let mut state = key;
+        let data = (0..count)
+            .map(|_| {
+                let unit = (next_random_key(&mut state) >> 11) as f64 / (1u64 << 53) as f64;
+                let value = minval + width * unit;
+                let value = if dtype == TensorDType::F32 {
+                    f64::from(value as f32)
+                } else {
+                    value
+                };
+                value.clamp(low, high)
+            })
+            .collect();
+        Self::from_shape_data_typed(shape, data, dtype).map_err(PyValueError::new_err)
+    }
+
+    /// A key derived from `key` and the integer `data` by SplitMix64 mixing,
+    /// distinct from the keys `split_key(key, count)` returns.
+    #[staticmethod]
+    fn fold_in_key(key: u64, data: u64) -> u64 {
+        let mut data_state = data;
+        let mut state = key ^ next_random_key(&mut data_state);
+        next_random_key(&mut state)
+    }
+
     #[staticmethod]
     #[pyo3(signature = (start, stop, step = 1.0))]
     fn arange(start: f64, stop: f64, step: f64) -> PyResult<Self> {

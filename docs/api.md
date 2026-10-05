@@ -27,6 +27,8 @@ the repository root. Per-feature status and validation records are in
 - [Core API](#core-api)
   - [Arrays and NumPy](#arrays-and-numpy)
   - [Function Transforms](#function-transforms)
+  - [Pytrees](#pytrees)
+  - [Random Numbers](#random-numbers)
 - [Device Execution](#device-execution)
 - [Compiler Facade](#compiler-facade)
 - [v0.1 API Reference](#v01-api-reference)
@@ -82,9 +84,8 @@ qb.eye(n, m=None, dtype=None)
 
 The v0.2 transforms ([api_v0_2_design.md](api_v0_2_design.md), sections
 3.3-3.5; see [Device Execution](#device-execution)) take
-positional pytree arguments (`dict` with string keys, `list`,
-`tuple`, `None`; `quabla.tree.flatten`/`unflatten`/`map`) of arrays and
-Python scalars, and need no input specs:
+pytree arguments (see [Pytrees](#pytrees)) of arrays and Python scalars,
+and need no input specs:
 
 ```python
 qb.grad(fun, argnums=0, has_aux=False)            # -> grads, or (grads, aux)
@@ -94,8 +95,11 @@ qb.vjp(fun, *primals, has_aux=False)              # -> (out, vjp_fun[, aux])
 qb.jacobian(fun, argnums=0)                       # blocks [*out.shape, *in.shape]
 qb.hessian(fun, argnums=0)                        # blocks [*in.shape, *in.shape]
 qb.vmap(fun, in_axes=0, out_axes=0)               # -> batched fun
-qb.jit(fun, device=None, static_argnums=(), max_traces=8)
+qb.jit(fun, device=None, static_argnums=(), max_traces=8, static_argnames=())
 ```
+
+`jit`, `grad`, and `value_and_grad` called with keywords only return a
+decorator: `@qb.jit(device="mlx", static_argnums=1)`, `@qb.grad(argnums=1)`.
 
 - Every transformed function traces and compiles one CPU program on its
   first call per signature (pytree structure, array shapes and dtypes, and
@@ -207,6 +211,16 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8)
   used after its trace ended (stored in a global or a container and used in
   a later trace), or inside a `tensor_*` helper or region trace, raises
   `quabla.TracerError`.
+- Arguments are positional, except for `jit`: a keyword argument that
+  names the next positional parameter of `fun` is bound to that position
+  (`f(x, n=2)` is `f(x, 2)` and shares its trace), and any other keyword
+  argument, including a keyword-only parameter, must be static.
+  `static_argnames` and `static_argnums` imply each other through `fun`'s
+  signature, as in JAX, so `jit(f, static_argnames="n")` makes `n` static
+  whether it is passed by position or by keyword. Static keyword values
+  must be hashable and are part of the trace cache key. A static keyword
+  argument cannot be passed to a `jit` of another transform
+  (`jit(grad(f))`); pass it positionally there.
 - `quabla.grad` and `quabla.jit` still accept the legacy 2D forms
   `grad(fn, input_specs, values, output_cotangent)` and `jit(input_specs)`
   and dispatch them to the v0.1 functions below.
@@ -221,6 +235,111 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8)
   caches no longer raise `RetraceLimitError`; it remains for existing
   handlers. `quabla.RetraceWarning` (a `UserWarning`) reports an evicted
   trace.
+
+### Pytrees
+
+Transform arguments and results, optimizer parameters, and `Trainer` data
+are pytrees: nested containers whose leaves are arrays or Python values.
+The containers are:
+
+- `dict`, traversed in sorted key order; keys must be mutually sortable
+  (all strings, or all integers, for example);
+- `list` and `tuple`; `None` is an empty container;
+- every `NamedTuple` class, automatically, as in JAX: the result of a
+  transform rebuilds the same class;
+- classes registered with `quabla.tree.register_dataclass` or
+  `quabla.tree.register`.
+
+Dataclasses are not containers until registered, as in JAX:
+
+```python
+@qb.tree.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class Layer:
+    w: qb.Tensor
+    b: qb.Tensor
+
+qb.tree.register_dataclass(Mlp, data_fields=("layers",), meta_fields=("activation",))
+qb.tree.register(Interval, flatten_fn, unflatten_fn)
+```
+
+`register_dataclass(cls, data_fields=None, meta_fields=())` makes the
+`data_fields` children (default: every `__init__` field not in
+`meta_fields`, in declaration order) and the `meta_fields` static; together
+they must name every `__init__` field once. Values are rebuilt with
+`cls(**fields)`, so frozen dataclasses work and `__post_init__` runs again.
+`register(cls, flatten_fn, unflatten_fn)` is the general form:
+`flatten_fn(value)` returns `(children, aux_data)` and
+`unflatten_fn(aux_data, children)` rebuilds the value. Only exact
+instances of a registered class are containers, and a class can be
+registered once.
+
+The structure includes each node's class and aux data (the meta fields of a
+dataclass), and is part of every trace cache key: two classes with the
+same fields, or two values of a meta field, never share a trace, so aux
+data must be hashable and a new value retraces. Gradients, `vmap` results,
+and Jacobian blocks keep the custom classes of their arguments; `vmap`
+`in_axes`/`out_axes` prefixes may use the same classes (with equal aux
+data), for example `in_axes=(Point(0, None),)`. Other container subclasses
+(`OrderedDict`, a `list` subclass) and unregistered dataclasses are
+rejected as transform arguments.
+
+`quabla.tree` provides `flatten(tree) -> (leaves, treedef)`,
+`unflatten(treedef, leaves)`, `leaves(tree)`, `structure(tree)`,
+`map(f, tree, *rest)` over trees of one structure, and
+`flatten_with_path(tree) -> ([(path, leaf), ...], treedef)`, where a path
+is a tuple of dict keys, field names, and integer positions. A `TreeDef`
+compares and hashes by structure and has `num_leaves` and
+`unflatten(leaves)`.
+
+### Random Numbers
+
+`quabla.random` samples with explicit keys, in the style of `jax.random`:
+
+```python
+key = qb.random.key(0)
+k1, k2 = qb.random.split(key)              # split(key, num=2) -> tuple of keys
+w = qb.random.glorot_normal(k1, (64, 32))  # float64 by default
+noise = qb.random.normal(k2, (128,), dtype=qb.float32)
+step_key = qb.random.fold_in(key, step)
+```
+
+| Function | Result |
+| --- | --- |
+| `key(seed)` | a `Key` from an integer seed (modulo 2**64) |
+| `split(key, num=2)` | a tuple of `num` new keys |
+| `fold_in(key, data)` | a new key from a key and an integer |
+| `uniform(key, shape=(), dtype=float64, minval=0.0, maxval=1.0)` | samples on `[minval, maxval)` |
+| `normal(key, shape=(), dtype=float64)` | standard normal samples |
+| `bernoulli(key, p=0.5, shape=())` | `bool_` samples, `True` with probability `p` |
+| `glorot_normal(key, shape, dtype=float64)` | std `sqrt(2 / (fan_in + fan_out))` |
+| `glorot_uniform(key, shape, dtype=float64)` | `[-l, l)` with `l = sqrt(6 / (fan_in + fan_out))` |
+| `he_normal(key, shape, dtype=float64)` | std `sqrt(2 / fan_in)` |
+
+- A `Key` is an immutable, hashable value; there is no global state, and the
+  same key gives the same numbers on every platform. Use each key once:
+  sampling with a key after splitting it reuses the stream of its children.
+- The generator is SplitMix64, shared with `Tensor.split_key`,
+  `Tensor.random_normal`, and `Tensor.glorot_normal`: `split(key, n)` is
+  `Tensor.split_key(key.value, n)`, `normal(key(s), shape)` equals
+  `Tensor.random_normal(shape, s)`, and `glorot_normal` equals
+  `Tensor.glorot_normal` for 2-D shapes. Uniform samples use the top 53
+  bits of one generator output each and are clamped after rounding, so
+  `float32` samples also stay below `maxval`. Normal samples use the
+  Box-Muller transform, bounded at about 8.6 standard deviations.
+  SplitMix64 is a statistical generator, not a cryptographic one.
+- Initializers compute fans as JAX does: `fan_in = shape[-2] * r` and
+  `fan_out = shape[-1] * r`, with `r` the product of the leading
+  dimensions; shapes must have rank 2 or more. `glorot_normal` and
+  `he_normal` are untruncated normals (JAX truncates at two standard
+  deviations and rescales).
+- Sampling is eager on the host. Keys are not traced: a key passed as a
+  traced argument of a transform, or a `seed`, `minval`, `maxval`, or `p`
+  that is a tracer, raises `TypeError`. Inside a traced function, a sample
+  drawn from a closure key, or from a key passed as a static argument (one
+  trace per key), is a constant of the trace, so every call of the compiled
+  program sees the same numbers. Draw samples outside and pass them as
+  arguments when they must change between calls.
 
 ## Device Execution
 
@@ -730,9 +849,11 @@ name keeps working through 0.x.
   same parameter snapshot, and updates them without any gradient D2H copy.
   Fused GEMM+bias+activation kernels remain future work; multi-GPU execution
   is the separate `cuda-nccl` data-parallel path described above.
-- `Tensor.split_key(key, count)`, `Tensor.random_normal(shape, key, ...)`, and
-  `Tensor.glorot_normal(shape, key)` provide stateless, deterministic host-side
-  initialization. They do not retain global RNG state; generated parameters are
+- `Tensor.split_key(key, count)`, `Tensor.random_normal(shape, key, ...)`,
+  `Tensor.random_uniform(shape, key, minval, maxval, dtype)`,
+  `Tensor.fold_in_key(key, data)`, and `Tensor.glorot_normal(shape, key)`
+  provide stateless, deterministic host-side initialization; `quabla.random`
+  is the keyed API over them. They do not retain global RNG state; generated parameters are
   uploaded once when a CUDA optimizer is created.
 - On Apple silicon, the `mlx` feature executes supported frozen
   Tensor IR plans as MLX arrays on `StreamOrDevice::gpu()`. Python exposes this

@@ -34,6 +34,16 @@ Decisions taken by the owner on 2026-10-06 and implemented:
 - `norm` scales by `max|x|`, so it no longer overflows for float32
   magnitudes above about 1e19; results change in the last bits.
 
+Implemented on 2026-10-06 (see [api.md](api.md)): item 5 (NamedTuples as
+automatic pytree nodes, `quabla.tree.register_dataclass` and `register`
+with node classes and aux data in trace cache keys, sortable non-string
+dict keys, `tree.leaves`/`structure`/`flatten_with_path`); item 6
+(`quabla.random` over the SplitMix64 host generator, with
+`Tensor.random_uniform` and `Tensor.fold_in_key` added to the bridge); and
+from item 9, `jit` `static_argnames`, keyword arguments of jitted
+functions, and the keyword decorator forms of `jit`, `grad`, and
+`value_and_grad`.
+
 Smaller observations kept for later: `abs` has gradient -1 at 0 (JAX uses
 +1), `max` gives the whole gradient of a tie to the last element (JAX
 splits it), and CPU float32 reductions accumulate in f64, so device
