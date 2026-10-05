@@ -30,12 +30,16 @@ from ._quabla import where as _where
 
 __all__ = [
     "astype",
+    "atan2",
     "broadcast_to",
     "cholesky",
     "clip",
     "cos",
+    "cumsum",
+    "erf",
     "exp",
     "expand_dims",
+    "expm1",
     "full_like",
     "gelu",
     "log",
@@ -65,6 +69,7 @@ __all__ = [
     "square",
     "squeeze",
     "std",
+    "stop_gradient",
     "tanh",
     "transpose",
     "tril",
@@ -115,6 +120,8 @@ def _symmetric_binary(name):
 abs = _unary("abs")
 cos = _unary("cos")
 exp = _unary("exp")
+expm1 = _unary("expm1")
+erf = _unary("erf")
 log = _unary("log")
 log1p = _unary("log1p")
 relu = _unary("relu")
@@ -123,6 +130,7 @@ sin = _unary("sin")
 softplus = _unary("softplus")
 sqrt = _unary("sqrt")
 tanh = _unary("tanh")
+stop_gradient = _unary("stop_gradient")
 cholesky = _unary("cholesky")
 tril = _unary("tril")
 triu = _unary("triu")
@@ -154,6 +162,28 @@ def power(x1, x2):
         # Called directly: `x1 ** x2` would let a NumPy scalar base take over.
         return _array(x2).__rpow__(x1)
     return _array(x1) ** (x2 if isinstance(x2, numbers.Number) else _array(x2))
+
+
+def atan2(x1, x2):
+    """Elementwise four-quadrant `atan2(x1, x2)`, the angle of the point
+    `(x2, x1)`; `quabla.atan2(y, x)` is `y.atan2(x)`.
+
+    Either operand may be a Python number, which adopts the dtype of the
+    array operand. Values follow `f64::atan2`. The derivative is
+    `(x2, -x1) / (x1^2 + x2^2)`, evaluated without overflow, and is defined as
+    zero at the origin (see `docs/api.md`).
+    """
+    if isinstance(x1, numbers.Number) and not isinstance(x2, numbers.Number):
+        x2 = _array(x2)
+        return asarray(x1, dtype=x2.dtype).atan2(x2)
+    return _array(x1).atan2(x2 if isinstance(x2, numbers.Number) else _array(x2))
+
+
+def cumsum(x, axis=None, reverse=False):
+    """Inclusive prefix sums along `axis`, over the flattened array when
+    `axis` is `None` (as in NumPy), from the last entry when `reverse`;
+    `quabla.cumsum(x, axis)` is `x.cumsum(axis)`."""
+    return _array(x).cumsum(axis=axis, reverse=reverse)
 
 
 def matmul(x1, x2):
@@ -268,6 +298,7 @@ def silu(x):
 
 # 2 * sqrt(2 / pi): the tanh-approximation argument, doubled for `sigmoid`.
 _GELU_SCALE = 2.0 * math.sqrt(2.0 / math.pi)
+_SQRT_HALF = math.sqrt(0.5)
 
 
 def gelu(x, approximate=True):
@@ -275,23 +306,19 @@ def gelu(x, approximate=True):
     `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`, evaluated through the
     identity `0.5 (1 + tanh(u)) == sigmoid(2u)`: the stable `sigmoid` keeps
     full relative accuracy in the negative tail, where `1 + tanh(u)` would
-    cancel to zero. `approximate=False` (the exact `erf` form) is not
-    available yet; it arrives with the native `erf` op."""
-    if not approximate:
-        raise NotImplementedError(
-            "gelu(approximate=False) needs erf, which arrives with the native erf op; "
-            "use the default tanh approximation"
-        )
+    cancel to zero. `approximate=False` gives the exact
+    `0.5 x (1 + erf(x / sqrt(2)))`; without `erfc`, its relative accuracy in
+    the far negative tail (x below about -4 in `float32`) is limited by the
+    cancellation of `1 + erf`."""
     x = _array(x)
+    if not approximate:
+        return x * 0.5 * (erf(x * _SQRT_HALF) + 1.0)
     return x * (x * (x * x * 0.044715 + 1.0) * _GELU_SCALE).sigmoid()
 
 
-# Normalizations and reductions.
-#
-# TODO: shift by `stop_gradient(max)` once the native `stop_gradient` op
-# lands. The shift cancels from every result below, so its derivative
-# contributes only rounding today, but it still costs a backward pass
-# through `max`.
+# Normalizations and reductions. The max shift cancels from every result
+# below, so it is taken through `stop_gradient`: derivatives skip `max`
+# and carry no rounding from the cancelled terms.
 
 
 def softmax(x, axis=-1):
@@ -301,7 +328,7 @@ def softmax(x, axis=-1):
     finite gradient. As in JAX, a slice that holds `+inf` or only `-inf`
     gives NaN."""
     x = _array(x)
-    unnormalized = (x - x.max(axis=axis, keepdims=True)).exp()
+    unnormalized = (x - stop_gradient(x.max(axis=axis, keepdims=True))).exp()
     return unnormalized / unnormalized.sum(axis=axis, keepdims=True)
 
 
@@ -311,7 +338,7 @@ def log_softmax(x, axis=-1):
     neither overflows nor takes the log of an underflowed probability, so
     `log_softmax([1000, 0])` is `[0, -1000]`."""
     x = _array(x)
-    shifted = x - x.max(axis=axis, keepdims=True)
+    shifted = x - stop_gradient(x.max(axis=axis, keepdims=True))
     return shifted - shifted.exp().sum(axis=axis, keepdims=True).log()
 
 
@@ -323,7 +350,7 @@ def logsumexp(x, axis=None, keepdims=False):
     `+inf`, and NaN propagates. The gradient is `softmax(x)`."""
     x = _array(x)
     axes = None if axis is None else _axes(axis, len(x.shape))
-    peak = x.max(axis=axes, keepdims=True)
+    peak = stop_gradient(x.max(axis=axes, keepdims=True))
     shift = _where(peak.isfinite(), peak, 0.0)
     result = (x - shift).exp().sum(axis=axes, keepdims=True).log() + shift
     return result if keepdims else squeeze(result, axes)

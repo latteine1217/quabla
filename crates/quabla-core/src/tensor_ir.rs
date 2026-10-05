@@ -706,6 +706,39 @@ enum TensorOp {
     Log1p {
         input: TensorNodeId,
     },
+    /// Elementwise `exp(x) - 1`, accurate for small `|x|`, with IEEE
+    /// semantics. Its derivative is `exp(x)`.
+    Expm1 {
+        input: TensorNodeId,
+    },
+    /// Elementwise error function (the f64 musl `erf` of the `libm` crate on
+    /// the CPU). Its derivative is `2 / sqrt(pi) * exp(-x^2)`.
+    Erf {
+        input: TensorNodeId,
+    },
+    /// Elementwise four-quadrant `atan2(y, x)` with `f64::atan2` semantics and
+    /// broadcasting. The partials `x / (x^2 + y^2)` and `-y / (x^2 + y^2)`
+    /// are formed after scaling by `|x| + |y|`, so they neither overflow nor
+    /// underflow, and are defined as `0` where `|x| + |y|` is `0` or
+    /// infinite; see `atan2_derivatives`.
+    Atan2 {
+        y: TensorNodeId,
+        x: TensorNodeId,
+    },
+    /// The identity on values whose derivative is zero in every AD mode: its
+    /// JVP tangent is zero and its VJP sends no cotangent to `input`.
+    /// Backends execute it as the identity.
+    StopGradient {
+        input: TensorNodeId,
+    },
+    /// Inclusive prefix sum along `axis`, from the last entry when
+    /// `reverse`. Each running sum rounds to the node dtype, so a float32
+    /// scan is the sequential chain of rounded float32 adds.
+    CumSum {
+        input: TensorNodeId,
+        axis: usize,
+        reverse: bool,
+    },
     Concat {
         inputs: Vec<TensorNodeId>,
         axis: usize,
@@ -2321,6 +2354,53 @@ impl DynamicTensor {
         )
     }
 
+    fn map_f64(&self, f: impl Fn(f64) -> f64) -> Result<Self, String> {
+        Self::new(self.shape.clone(), self.data.iter().map(f).collect())
+    }
+
+    /// `y.atan2(x)` with `self` as `y`, broadcasting like the binary ops.
+    fn atan2(&self, x: &Self) -> Result<Self, String> {
+        self.elementwise(x, f64::atan2)
+    }
+
+    /// Entry `index` of [`atan2_derivatives`] of `self` (as `y`) and `x`.
+    fn atan2_derivative(&self, x: &Self, index: usize) -> Result<Self, String> {
+        self.elementwise(x, |y, x| atan2_derivatives(y, x)[index])
+    }
+
+    /// Inclusive prefix sums along `axis` (from the last entry when
+    /// `reverse`), rounding every running sum to `rounding` (`F64` for
+    /// derivative arithmetic); see [`TensorOp::CumSum`].
+    fn cumsum_axis(
+        &self,
+        axis: usize,
+        reverse: bool,
+        rounding: TensorDType,
+    ) -> Result<Self, String> {
+        let extent = *self
+            .shape
+            .get(axis)
+            .ok_or_else(|| format!("cumsum axis {axis} is out of bounds for {:?}", self.shape))?;
+        let outer = element_count(&self.shape[..axis])?;
+        let inner = element_count(&self.shape[axis + 1..])?;
+        let mut data = self.data.to_vec();
+        for outer_index in 0..outer {
+            for lane in 0..inner {
+                let position = |step: usize| {
+                    let row = if reverse { extent - 1 - step } else { step };
+                    (outer_index * extent + row) * inner + lane
+                };
+                let mut running = rounding.round(data[position(0)]);
+                data[position(0)] = running;
+                for step in 1..extent {
+                    running = rounding.round(running + data[position(step)]);
+                    data[position(step)] = running;
+                }
+            }
+        }
+        Self::new(self.shape.clone(), data)
+    }
+
     fn tanh_derivative_from_output(&self) -> Result<Self, String> {
         Self::new(
             self.shape.clone(),
@@ -2997,6 +3077,9 @@ impl TensorIr {
             | TensorOp::Powi { .. }
             | TensorOp::Log { .. }
             | TensorOp::Log1p { .. }
+            | TensorOp::Expm1 { .. }
+            | TensorOp::Erf { .. }
+            | TensorOp::StopGradient { .. }
             | TensorOp::Triangular { .. }
             | TensorOp::Reshape { .. } => remap_tensor_op(&node.op, &|id| remap.get(&id).copied())?,
             TensorOp::Add { .. }
@@ -3006,6 +3089,7 @@ impl TensorIr {
             | TensorOp::Greater { .. }
             | TensorOp::Compare { .. }
             | TensorOp::Pow { .. }
+            | TensorOp::Atan2 { .. }
             | TensorOp::Where { .. }
             | TensorOp::Matmul { .. }
             | TensorOp::Broadcast { .. } => {
@@ -3050,6 +3134,15 @@ impl TensorIr {
             TensorOp::MeanAxis { input, axis } => TensorOp::MeanAxis {
                 input: target(*input)?,
                 axis: axis + 1,
+            },
+            TensorOp::CumSum {
+                input,
+                axis,
+                reverse,
+            } => TensorOp::CumSum {
+                input: target(*input)?,
+                axis: axis + 1,
+                reverse: *reverse,
             },
             TensorOp::Transpose { input, axes } => TensorOp::Transpose {
                 input: target(*input)?,
@@ -3673,6 +3766,54 @@ impl TensorIr {
                         transformed.div(input_tangent, shifted)?,
                     )
                 }
+                TensorOp::Expm1 { input } => {
+                    let (input_value, input_tangent) = pairs[*input];
+                    let derivative = transformed.exp(input_value)?;
+                    (
+                        transformed.expm1(input_value)?,
+                        transformed.mul(input_tangent, derivative)?,
+                    )
+                }
+                TensorOp::Erf { input } => {
+                    let (input_value, input_tangent) = pairs[*input];
+                    let derivative = transformed.erf_derivative(input_value)?;
+                    (
+                        transformed.erf(input_value)?,
+                        transformed.mul(input_tangent, derivative)?,
+                    )
+                }
+                TensorOp::Atan2 { y, x } => {
+                    let (y_value, y_tangent) = pairs[*y];
+                    let (x_value, x_tangent) = pairs[*x];
+                    let (y_partial, x_partial) = transformed.atan2_partials(y_value, x_value)?;
+                    let y_term = transformed.mul(y_tangent, y_partial)?;
+                    let x_term = transformed.mul(x_tangent, x_partial)?;
+                    (
+                        transformed.atan2(y_value, x_value)?,
+                        transformed.add(y_term, x_term)?,
+                    )
+                }
+                TensorOp::StopGradient { input } => {
+                    let (input_value, _) = pairs[*input];
+                    let value = transformed.stop_gradient(input_value)?;
+                    let tangent = if node.dtype == TensorDType::Bool {
+                        symbolic_zero_tangent(&mut transformed, &node.shape)?
+                    } else {
+                        symbolic_zero_like(&mut transformed, value)?
+                    };
+                    (value, tangent)
+                }
+                TensorOp::CumSum {
+                    input,
+                    axis,
+                    reverse,
+                } => {
+                    let (input_value, input_tangent) = pairs[*input];
+                    (
+                        transformed.cumsum(input_value, *axis as isize, *reverse)?,
+                        transformed.cumsum(input_tangent, *axis as isize, *reverse)?,
+                    )
+                }
                 TensorOp::Matmul { lhs, rhs } => {
                     let (lhs_value, lhs_tangent) = pairs[*lhs];
                     let (rhs_value, rhs_tangent) = pairs[*rhs];
@@ -4119,6 +4260,15 @@ impl TensorIr {
                 )?,
                 TensorOp::Log { input } => transformed.log(values[*input])?,
                 TensorOp::Log1p { input } => transformed.log1p(values[*input])?,
+                TensorOp::Expm1 { input } => transformed.expm1(values[*input])?,
+                TensorOp::Erf { input } => transformed.erf(values[*input])?,
+                TensorOp::Atan2 { y, x } => transformed.atan2(values[*y], values[*x])?,
+                TensorOp::StopGradient { input } => transformed.stop_gradient(values[*input])?,
+                TensorOp::CumSum {
+                    input,
+                    axis,
+                    reverse,
+                } => transformed.cumsum(values[*input], *axis as isize, *reverse)?,
                 TensorOp::Concat { inputs, axis } => transformed.concat(
                     inputs.iter().map(|input| values[*input]).collect(),
                     *axis as isize,
@@ -4762,6 +4912,56 @@ impl TensorIr {
                         &node.shape,
                         &self.node(*input)?.shape,
                     )?;
+                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
+                }
+                TensorOp::Expm1 { input } | TensorOp::Erf { input } => {
+                    let derivative = match &node.op {
+                        TensorOp::Expm1 { .. } => transformed.exp(values[*input])?,
+                        _ => transformed.erf_derivative(values[*input])?,
+                    };
+                    let contribution = transformed.mul(upstream, derivative)?;
+                    let contribution = symbolic_reduce_to_shape(
+                        &mut transformed,
+                        contribution,
+                        &node.shape,
+                        &self.node(*input)?.shape,
+                    )?;
+                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
+                }
+                // A scalar constant operand receives no cotangent, so its
+                // partial is not emitted.
+                TensorOp::Atan2 { y, x } => {
+                    let (y_partial, x_partial) =
+                        transformed.atan2_partials(values[*y], values[*x])?;
+                    for (operand, partial) in [(*y, y_partial), (*x, x_partial)] {
+                        if self.scalar_constant_value(operand).is_some() {
+                            continue;
+                        }
+                        let contribution = transformed.mul(upstream, partial)?;
+                        let contribution = symbolic_reduce_to_shape(
+                            &mut transformed,
+                            contribution,
+                            &node.shape,
+                            &self.node(operand)?.shape,
+                        )?;
+                        symbolic_accumulate(
+                            &mut transformed,
+                            &mut cotangents,
+                            operand,
+                            contribution,
+                        )?;
+                    }
+                }
+                // The value passes through, but no cotangent does.
+                TensorOp::StopGradient { .. } => {}
+                // The transpose of an inclusive prefix sum is the inclusive
+                // prefix sum in the opposite direction.
+                TensorOp::CumSum {
+                    input,
+                    axis,
+                    reverse,
+                } => {
+                    let contribution = transformed.cumsum(upstream, *axis as isize, !*reverse)?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
                 }
                 TensorOp::Concat { inputs, axis } => {
@@ -6241,6 +6441,117 @@ impl TensorIr {
         self.push_derived(TensorOp::Log1p { input }, shape)
     }
 
+    /// Elementwise `exp(x) - 1`; see [`TensorOp::Expm1`].
+    pub fn expm1(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        let shape = self.node(input)?.shape.clone();
+        self.push_derived(TensorOp::Expm1 { input }, shape)
+    }
+
+    /// Elementwise error function; see [`TensorOp::Erf`].
+    pub fn erf(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        let shape = self.node(input)?.shape.clone();
+        self.push_derived(TensorOp::Erf { input }, shape)
+    }
+
+    /// Elementwise `atan2(y, x)`; operands broadcast and promote like
+    /// arithmetic operands, and `Bool` operands are rejected. See
+    /// [`TensorOp::Atan2`].
+    pub fn atan2(&mut self, y: TensorNodeId, x: TensorNodeId) -> Result<TensorNodeId, String> {
+        for operand in [y, x] {
+            if self.node(operand)?.dtype == TensorDType::Bool {
+                return Err(
+                    "atan2 is not defined for bool tensors; use logical_and/logical_or/logical_not \
+                     (& | ~) or convert explicitly with astype"
+                        .to_string(),
+                );
+            }
+        }
+        self.binary("atan2", y, x, |y, x| TensorOp::Atan2 { y, x })
+    }
+
+    /// `input` with a zero derivative; see [`TensorOp::StopGradient`]. `Bool`
+    /// inputs are accepted, as for other data movement.
+    pub fn stop_gradient(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        let shape = self.node(input)?.shape.clone();
+        self.push_derived(TensorOp::StopGradient { input }, shape)
+    }
+
+    /// Inclusive prefix sum along `axis` (negative axes count from the end);
+    /// see [`TensorOp::CumSum`].
+    pub fn cumsum(
+        &mut self,
+        input: TensorNodeId,
+        axis: isize,
+        reverse: bool,
+    ) -> Result<TensorNodeId, String> {
+        let shape = self.node(input)?.shape.clone();
+        let axis = normalize_axis(axis, shape.len())?;
+        self.push_derived(
+            TensorOp::CumSum {
+                input,
+                axis,
+                reverse,
+            },
+            shape,
+        )
+    }
+
+    /// Symbolic `erf'(x) = 2 / sqrt(pi) * exp(-(x * x))`.
+    fn erf_derivative(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        let squared = self.mul(input, input)?;
+        let zero = self.scalar_constant(0.0);
+        let negated = self.sub(zero, squared)?;
+        let decay = self.exp(negated)?;
+        let scale = self.scalar_constant(std::f64::consts::FRAC_2_SQRT_PI);
+        self.mul(scale, decay)
+    }
+
+    /// Symbolic `(d atan2(y, x) / dy, d atan2(y, x) / dx)` with the scaling
+    /// and conventions of the free function `atan2_derivatives`. Where
+    /// `s = |x| + |y|` is `0` or infinite, the operands, `s` and `q` are
+    /// replaced by the constants `0`, `1` and `1`, so both partials are
+    /// exactly `0` there, every unselected branch stays finite, and the
+    /// derivatives of the partials are `0` as well.
+    fn atan2_partials(
+        &mut self,
+        y: TensorNodeId,
+        x: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), String> {
+        let zero = self.scalar_constant(0.0);
+        let one = self.scalar_constant(1.0);
+        let magnitude = |graph: &mut Self, value: TensorNodeId| {
+            let negative = graph.compare(value, zero, TensorComparison::Less)?;
+            let negated = graph.sub(zero, value)?;
+            graph.where_select(negative, negated, value)
+        };
+        let x_magnitude = magnitude(self, x)?;
+        let y_magnitude = magnitude(self, y)?;
+        let scale = self.add(x_magnitude, y_magnitude)?;
+        // `s == inf` as "not finite and not NaN", without an infinite
+        // constant, which device programs cannot bind.
+        let at_origin = self.compare(scale, zero, TensorComparison::Equal)?;
+        let finite = self.isfinite(scale)?;
+        let infinite_or_nan = self.logical_not(finite)?;
+        let number = self.compare(scale, scale, TensorComparison::Equal)?;
+        let unbounded = self.logical_and(infinite_or_nan, number)?;
+        let degenerate = self.logical_or(at_origin, unbounded)?;
+        let safe_scale = self.where_select(degenerate, one, scale)?;
+        let safe_x = self.where_select(degenerate, zero, x)?;
+        let safe_y = self.where_select(degenerate, zero, y)?;
+        let scaled_x = self.div(safe_x, safe_scale)?;
+        let scaled_y = self.div(safe_y, safe_scale)?;
+        let x_squared = self.mul(scaled_x, scaled_x)?;
+        let y_squared = self.mul(scaled_y, scaled_y)?;
+        let q = self.add(x_squared, y_squared)?;
+        let safe_q = self.where_select(degenerate, one, q)?;
+        let y_partial = self.div(scaled_x, safe_q)?;
+        let y_partial = self.div(y_partial, safe_scale)?;
+        let negated_y = self.sub(zero, scaled_y)?;
+        let x_partial = self.div(negated_y, safe_q)?;
+        let x_partial = self.div(x_partial, safe_scale)?;
+        Ok((y_partial, x_partial))
+    }
+
     pub fn concat(
         &mut self,
         inputs: Vec<TensorNodeId>,
@@ -7186,6 +7497,49 @@ impl TensorIr {
                         .reduce_to_shape(&self.node(*input)?.shape)?;
                     accumulate(&mut cotangents[*input], contribution)?;
                 }
+                TensorOp::Expm1 { input } | TensorOp::Erf { input } => {
+                    let input_value = values
+                        .get(*input)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let derivative = match &self.nodes[node_id].op {
+                        TensorOp::Expm1 { .. } => input_value.exp()?,
+                        _ => input_value.map_f64(erf_derivative)?,
+                    };
+                    let contribution = cotangent
+                        .mul(&derivative)?
+                        .reduce_to_shape(&self.node(*input)?.shape)?;
+                    accumulate(&mut cotangents[*input], contribution)?;
+                }
+                TensorOp::Atan2 { y, x } => {
+                    let y_value = values
+                        .get(*y)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| format!("node {y} has no evaluated value"))?;
+                    let x_value = values
+                        .get(*x)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| format!("node {x} has no evaluated value"))?;
+                    // Constant operands are skipped, as in the symbolic rule.
+                    for (operand, index) in [(*y, 0), (*x, 1)] {
+                        if self.scalar_constant_value(operand).is_some() {
+                            continue;
+                        }
+                        let contribution = cotangent
+                            .mul(&y_value.atan2_derivative(x_value, index)?)?
+                            .reduce_to_shape(&self.node(operand)?.shape)?;
+                        accumulate(&mut cotangents[operand], contribution)?;
+                    }
+                }
+                TensorOp::StopGradient { .. } => {}
+                TensorOp::CumSum {
+                    input,
+                    axis,
+                    reverse,
+                } => accumulate(
+                    &mut cotangents[*input],
+                    cotangent.cumsum_axis(*axis, !*reverse, TensorDType::F64)?,
+                )?,
                 TensorOp::Concat { inputs, axis } => {
                     let mut start = 0;
                     for input in inputs {
@@ -7771,6 +8125,50 @@ impl TensorIr {
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?;
                     input_tangent.mul(&input_value.log1p_derivative()?)?
                 }
+                TensorOp::Expm1 { input } | TensorOp::Erf { input } => {
+                    let input_tangent = tangents
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated tangent"))?;
+                    let input_value = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let derivative = match &node.op {
+                        TensorOp::Expm1 { .. } => input_value.exp()?,
+                        _ => input_value.map_f64(erf_derivative)?,
+                    };
+                    input_tangent.mul(&derivative)?
+                }
+                TensorOp::Atan2 { y, x } => {
+                    let y_value = values
+                        .get(*y)
+                        .ok_or_else(|| format!("node {y} has no evaluated value"))?;
+                    let x_value = values
+                        .get(*x)
+                        .ok_or_else(|| format!("node {x} has no evaluated value"))?;
+                    // Constant operands are skipped, as in the symbolic rule.
+                    let mut tangent = DynamicTensor::filled(node.shape.clone(), 0.0)?;
+                    for (operand, index) in [(*y, 0), (*x, 1)] {
+                        if self.scalar_constant_value(operand).is_some() {
+                            continue;
+                        }
+                        let operand_tangent = tangents
+                            .get(operand)
+                            .ok_or_else(|| format!("node {operand} has no evaluated tangent"))?;
+                        tangent = tangent.add(
+                            &operand_tangent.mul(&y_value.atan2_derivative(x_value, index)?)?,
+                        )?;
+                    }
+                    tangent
+                }
+                TensorOp::StopGradient { .. } => DynamicTensor::filled(node.shape.clone(), 0.0)?,
+                TensorOp::CumSum {
+                    input,
+                    axis,
+                    reverse,
+                } => tangents
+                    .get(*input)
+                    .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
+                    .cumsum_axis(*axis, *reverse, TensorDType::F64)?,
                 TensorOp::Concat { inputs, axis } => DynamicTensor::concat(
                     &inputs
                         .iter()
@@ -8391,6 +8789,28 @@ impl TensorIr {
                 TensorOp::Log1p { input } => {
                     format!("%{id} = log1p(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
                 }
+                TensorOp::Expm1 { input } => {
+                    format!("%{id} = expm1(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
+                }
+                TensorOp::Erf { input } => {
+                    format!("%{id} = erf(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
+                }
+                TensorOp::Atan2 { y, x } => format!(
+                    "%{id} = atan2(%{y}, %{x}) : {}",
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
+                TensorOp::StopGradient { input } => format!(
+                    "%{id} = stop_gradient(%{input}) : {}",
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
+                TensorOp::CumSum {
+                    input,
+                    axis,
+                    reverse,
+                } => format!(
+                    "%{id} = cumsum(%{input}, axis={axis}, reverse={reverse}) : {}",
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
                 TensorOp::Concat { inputs, axis } => format!(
                     "%{id} = concat({}) axis={axis} : {}",
                     inputs
@@ -8655,6 +9075,7 @@ impl TensorIr {
                     | TensorOp::Slice { .. }
                     | TensorOp::PadSlice { .. }
                     | TensorOp::Gather { .. }
+                    | TensorOp::StopGradient { .. }
                     | TensorOp::Broadcast { .. }
             )
         {
@@ -9254,6 +9675,40 @@ impl TensorIr {
                     .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .log1p()?,
+                TensorOp::Expm1 { input } => values
+                    .get(*input)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .map_f64(f64::exp_m1)?,
+                TensorOp::Erf { input } => values
+                    .get(*input)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .map_f64(libm::erf)?,
+                TensorOp::Atan2 { y, x } => values
+                    .get(*y)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| format!("node {y} has no evaluated value"))?
+                    .atan2(
+                        values
+                            .get(*x)
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| format!("node {x} has no evaluated value"))?,
+                    )?,
+                TensorOp::StopGradient { input } => values
+                    .get(*input)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .clone(),
+                TensorOp::CumSum {
+                    input,
+                    axis,
+                    reverse,
+                } => values
+                    .get(*input)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .cumsum_axis(*axis, *reverse, node.dtype)?,
                 TensorOp::Concat { inputs, axis } => DynamicTensor::concat(
                     &inputs
                         .iter()
@@ -9441,6 +9896,107 @@ impl TensorIr {
                             .mixed
                             .mul(&derivative)?
                             .sub(&input.first.mul(&input.second)?.mul(&derivative_squared)?)?,
+                    }
+                }
+                TensorOp::Expm1 { input } | TensorOp::Erf { input } => {
+                    let input = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let (value, derivative, second_derivative) = match &node.op {
+                        TensorOp::Expm1 { .. } => {
+                            let exp = input.value.exp()?;
+                            (input.value.map_f64(f64::exp_m1)?, exp.clone(), exp)
+                        }
+                        _ => (
+                            input.value.map_f64(libm::erf)?,
+                            input.value.map_f64(erf_derivative)?,
+                            input.value.map_f64(erf_second_derivative)?,
+                        ),
+                    };
+                    MixedTangent {
+                        value,
+                        first: input.first.mul(&derivative)?,
+                        second: input.second.mul(&derivative)?,
+                        mixed: input.mixed.mul(&derivative)?.add(
+                            &input
+                                .first
+                                .mul(&input.second)?
+                                .mul(&second_derivative)?,
+                        )?,
+                    }
+                }
+                // `first`, `second` and `mixed` use the partials of the
+                // non-constant operands, as the symbolic rule does.
+                TensorOp::Atan2 { y, x } => {
+                    let y_tangent = values
+                        .get(*y)
+                        .ok_or_else(|| format!("node {y} has no evaluated value"))?;
+                    let x_tangent = values
+                        .get(*x)
+                        .ok_or_else(|| format!("node {x} has no evaluated value"))?;
+                    let (y_value, x_value) = (&y_tangent.value, &x_tangent.value);
+                    let partial = |index| y_value.atan2_derivative(x_value, index);
+                    let operands = [
+                        (y_tangent, self.scalar_constant_value(*y).is_none()),
+                        (x_tangent, self.scalar_constant_value(*x).is_none()),
+                    ];
+                    let mut first = DynamicTensor::filled(node.shape.clone(), 0.0)?;
+                    let mut second = first.clone();
+                    let mut mixed = first.clone();
+                    for (index, (operand, varies)) in operands.iter().enumerate() {
+                        if !varies {
+                            continue;
+                        }
+                        let derivative = partial(index)?;
+                        first = first.add(&operand.first.mul(&derivative)?)?;
+                        second = second.add(&operand.second.mul(&derivative)?)?;
+                        mixed = mixed.add(&operand.mixed.mul(&derivative)?)?;
+                        for (other_index, (other, other_varies)) in operands.iter().enumerate() {
+                            if !other_varies {
+                                continue;
+                            }
+                            // Entries 2, 3 and 4 hold d/dy d/dy, the mixed
+                            // partial and d/dx d/dx.
+                            let second_partial = partial(2 + index + other_index)?;
+                            mixed = mixed
+                                .add(&operand.first.mul(&other.second)?.mul(&second_partial)?)?;
+                        }
+                    }
+                    MixedTangent {
+                        value: y_value.atan2(x_value)?,
+                        first,
+                        second,
+                        mixed,
+                    }
+                }
+                TensorOp::StopGradient { input } => {
+                    let input = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let zero = DynamicTensor::filled(node.shape.clone(), 0.0)?;
+                    MixedTangent {
+                        value: input.value.clone(),
+                        first: zero.clone(),
+                        second: zero.clone(),
+                        mixed: zero,
+                    }
+                }
+                TensorOp::CumSum {
+                    input,
+                    axis,
+                    reverse,
+                } => {
+                    let input = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let scan = |tensor: &DynamicTensor, rounding| {
+                        tensor.cumsum_axis(*axis, *reverse, rounding)
+                    };
+                    MixedTangent {
+                        value: scan(&input.value, node.dtype)?,
+                        first: scan(&input.first, TensorDType::F64)?,
+                        second: scan(&input.second, TensorDType::F64)?,
+                        mixed: scan(&input.mixed, TensorDType::F64)?,
                     }
                 }
                 TensorOp::Reshape { input } => {
@@ -13769,6 +14325,15 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                 )?,
                 TensorOp::Log { input } => specialized.log(mapped(*input)?)?,
                 TensorOp::Log1p { input } => specialized.log1p(mapped(*input)?)?,
+                TensorOp::Expm1 { input } => specialized.expm1(mapped(*input)?)?,
+                TensorOp::Erf { input } => specialized.erf(mapped(*input)?)?,
+                TensorOp::Atan2 { y, x } => specialized.atan2(mapped(*y)?, mapped(*x)?)?,
+                TensorOp::StopGradient { input } => specialized.stop_gradient(mapped(*input)?)?,
+                TensorOp::CumSum {
+                    input,
+                    axis,
+                    reverse,
+                } => specialized.cumsum(mapped(*input)?, *axis as isize, *reverse)?,
                 TensorOp::Concat { inputs, axis } => specialized.concat(
                     inputs
                         .iter()
@@ -13983,10 +14548,15 @@ fn cuda_scalar_expression(
             Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
         }
         TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
+        TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
+        TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
+        TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
+        TensorOp::StopGradient { input } => child(*input),
         TensorOp::Div { .. } | TensorOp::Log { .. } => {
             Err("CUDA loop-body lowering does not yet support div or log".to_string())
         }
         TensorOp::Sum { .. }
+        | TensorOp::CumSum { .. }
         | TensorOp::SumAxis { .. }
         | TensorOp::Matmul { .. }
         | TensorOp::Solve { .. }
@@ -14252,6 +14822,10 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         | TensorOp::Transpose { input, .. }
         | TensorOp::Log { input }
         | TensorOp::Log1p { input }
+        | TensorOp::Expm1 { input }
+        | TensorOp::Erf { input }
+        | TensorOp::StopGradient { input }
+        | TensorOp::CumSum { input, .. }
         | TensorOp::Slice { input, .. }
         | TensorOp::PadSlice { input, .. }
         | TensorOp::Gather { input, .. }
@@ -14259,6 +14833,7 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         | TensorOp::Cast { input } => {
             vec![*input]
         }
+        TensorOp::Atan2 { y, x } => vec![*y, *x],
         TensorOp::ScatterAdd { base, updates, .. } => vec![*base, *updates],
         TensorOp::Concat { inputs, .. } => inputs.clone(),
     }
@@ -14370,7 +14945,9 @@ fn reuse_forward_unary(
         TensorOp::Tanh { input } => (input, Some(f64::tanh)),
         TensorOp::Exp { input } => (input, Some(f64::exp)),
         TensorOp::Log1p { input } => (input, Some(f64::ln_1p)),
-        TensorOp::Reshape { input } => (input, None),
+        TensorOp::Expm1 { input } => (input, Some(f64::exp_m1)),
+        TensorOp::Erf { input } => (input, Some(libm::erf)),
+        TensorOp::Reshape { input } | TensorOp::StopGradient { input } => (input, None),
         _ => return Ok(None),
     };
     if last_uses.remaining.get(input) != Some(&1) || last_uses.retained.get(input) != Some(&false) {
@@ -14700,6 +15277,7 @@ fn infer_tensor_placement(
         | TensorOp::Greater { lhs, rhs }
         | TensorOp::Compare { lhs, rhs, .. } => merge(&[*lhs, *rhs]),
         TensorOp::Pow { base, exponent } => merge(&[*base, *exponent]),
+        TensorOp::Atan2 { y, x } => merge(&[*y, *x]),
         TensorOp::Where {
             condition,
             on_true,
@@ -14725,7 +15303,19 @@ fn infer_tensor_placement(
         | TensorOp::Powi { input, .. }
         | TensorOp::Log { input }
         | TensorOp::Log1p { input }
+        | TensorOp::Expm1 { input }
+        | TensorOp::Erf { input }
+        | TensorOp::StopGradient { input }
         | TensorOp::Cast { input } => unary(*input),
+        TensorOp::CumSum { input, axis, .. } => {
+            let placement = unary(*input)?;
+            if sharded_tensor_axis(&placement) == Some(*axis) {
+                return Err(format!(
+                    "kernel node {node_id} scans along a sharded axis; explicit redistribution is required"
+                ));
+            }
+            Ok(placement)
+        }
         TensorOp::Sum { input } => {
             let placement = unary(*input)?;
             plan_full_reduction_placement(
@@ -15162,6 +15752,11 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Transpose { .. } => "transpose",
         TensorOp::Log { .. } => "log",
         TensorOp::Log1p { .. } => "log1p",
+        TensorOp::Expm1 { .. } => "expm1",
+        TensorOp::Erf { .. } => "erf",
+        TensorOp::Atan2 { .. } => "atan2",
+        TensorOp::StopGradient { .. } => "stop_gradient",
+        TensorOp::CumSum { .. } => "cumsum",
         TensorOp::Concat { .. } => "concat",
         TensorOp::Slice { .. } => "slice",
         TensorOp::PadSlice { .. } => "pad_slice",
@@ -15215,6 +15810,9 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
             (value > 0.0).then(|| value.ln())
         }
         TensorOp::Log1p { input } => Some(scalar(*input)?.ln_1p()),
+        TensorOp::Expm1 { input } => Some(scalar(*input)?.exp_m1()),
+        TensorOp::Erf { input } => Some(libm::erf(scalar(*input)?)),
+        TensorOp::Atan2 { y, x } => Some(scalar(*y)?.atan2(scalar(*x)?)),
         _ => None,
     }
 }
@@ -15269,6 +15867,9 @@ fn fold_tensor_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<Dynami
         TensorOp::Pow { base, exponent } => constant(*base)?.pow(&*constant(*exponent)?).ok(),
         TensorOp::Log { input } => constant(*input)?.log().ok(),
         TensorOp::Log1p { input } => constant(*input)?.log1p().ok(),
+        TensorOp::Expm1 { input } => constant(*input)?.map_f64(f64::exp_m1).ok(),
+        TensorOp::Erf { input } => constant(*input)?.map_f64(libm::erf).ok(),
+        TensorOp::Atan2 { y, x } => constant(*y)?.atan2(&*constant(*x)?).ok(),
         _ => None,
     }
 }
@@ -15432,6 +16033,8 @@ fn tensor_reverse_retained_primals(
                     | TensorOp::PadSlice { .. }
                     | TensorOp::Gather { .. }
                     | TensorOp::ScatterAdd { .. }
+                    | TensorOp::StopGradient { .. }
+                    | TensorOp::CumSum { .. }
                     | TensorOp::Broadcast { .. }
             )
         {
@@ -15637,7 +16240,8 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         | TensorOp::Pow {
             base: lhs,
             exponent: rhs,
-        } => {
+        }
+        | TensorOp::Atan2 { y: lhs, x: rhs } => {
             arguments[0] = *lhs as u64;
             arguments[1] = *rhs as u64;
         }
@@ -15666,8 +16270,20 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         | TensorOp::Cos { input }
         | TensorOp::Log { input }
         | TensorOp::Log1p { input }
+        | TensorOp::Expm1 { input }
+        | TensorOp::Erf { input }
+        | TensorOp::StopGradient { input }
         | TensorOp::Broadcast { input }
         | TensorOp::Cholesky { input } => arguments[0] = *input as u64,
+        TensorOp::CumSum {
+            input,
+            axis,
+            reverse,
+        } => {
+            arguments[0] = *input as u64;
+            arguments[1] = *axis as u64;
+            arguments[2] = u64::from(*reverse);
+        }
         TensorOp::SumAxis { input, axis } | TensorOp::MeanAxis { input, axis } => {
             arguments[0] = *input as u64;
             arguments[1] = *axis as u64;
@@ -15731,7 +16347,8 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         TensorOp::Compare { .. }
         | TensorOp::Where { .. }
         | TensorOp::PadSlice { .. }
-        | TensorOp::ScatterAdd { .. } => 3,
+        | TensorOp::ScatterAdd { .. }
+        | TensorOp::CumSum { .. } => 3,
         TensorOp::Gather { .. }
         | TensorOp::Add { .. }
         | TensorOp::Sub { .. }
@@ -15743,6 +16360,7 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         | TensorOp::Cholesky { .. }
         | TensorOp::CholeskyAd { .. }
         | TensorOp::Pow { .. }
+        | TensorOp::Atan2 { .. }
         | TensorOp::SumAxis { .. }
         | TensorOp::MeanAxis { .. }
         | TensorOp::Triangular { .. }
@@ -16101,6 +16719,28 @@ fn remap_tensor_op(
         TensorOp::Log1p { input } => Ok(TensorOp::Log1p {
             input: remap_node(*input)?,
         }),
+        TensorOp::Expm1 { input } => Ok(TensorOp::Expm1 {
+            input: remap_node(*input)?,
+        }),
+        TensorOp::Erf { input } => Ok(TensorOp::Erf {
+            input: remap_node(*input)?,
+        }),
+        TensorOp::Atan2 { y, x } => Ok(TensorOp::Atan2 {
+            y: remap_node(*y)?,
+            x: remap_node(*x)?,
+        }),
+        TensorOp::StopGradient { input } => Ok(TensorOp::StopGradient {
+            input: remap_node(*input)?,
+        }),
+        TensorOp::CumSum {
+            input,
+            axis,
+            reverse,
+        } => Ok(TensorOp::CumSum {
+            input: remap_node(*input)?,
+            axis: *axis,
+            reverse: *reverse,
+        }),
         TensorOp::Concat { inputs, axis } => Ok(TensorOp::Concat {
             inputs: inputs
                 .iter()
@@ -16262,6 +16902,54 @@ fn pow_second_derivatives(base: f64, exponent: f64) -> [f64; 4] {
         )
     };
     [base_base, base_exponent, exponent_base, exponent_exponent]
+}
+
+/// `d erf(x) / dx = 2 / sqrt(pi) * exp(-x^2)`, which underflows to `0` for
+/// large `|x|` instead of overflowing.
+fn erf_derivative(value: f64) -> f64 {
+    std::f64::consts::FRAC_2_SQRT_PI * (-(value * value)).exp()
+}
+
+/// `d^2 erf(x) / dx^2 = -2x * erf'(x)`, the product the symbolic rule forms
+/// by differentiating `erf'`; like it, this is NaN at `x = +-inf`.
+fn erf_second_derivative(value: f64) -> f64 {
+    -2.0 * value * erf_derivative(value)
+}
+
+/// First and second partials of `atan2(y, x)`:
+/// `[d/dy, d/dx, d/dy d/dy, d/dx d/dy, d/dx d/dx]`, that is `x / r^2`,
+/// `-y / r^2`, `-2xy / r^4`, `(y^2 - x^2) / r^4` and `2xy / r^4` with
+/// `r^2 = x^2 + y^2`.
+///
+/// Both operands are first divided by `s = |x| + |y|`, so `q = (x/s)^2 +
+/// (y/s)^2` lies in `[1/2, 1]` and each `1 / r^2` factor is applied as
+/// `/ q / s`: no square of an input is formed, so nothing overflows or
+/// underflows before the true result does. The function is singular at the
+/// origin, where every partial is defined as `0` (JAX's `x / (x^2 + y^2)`
+/// is NaN there and also for tiny nonzero inputs whose squares underflow).
+/// Where `s` is infinite the partials tend to `0` (or have no limit when
+/// both operands are infinite) and are defined as `0`; a NaN operand gives
+/// NaN. The symbolic rule (`TensorIr::atan2_partials`) builds the same
+/// expression from IR ops.
+fn atan2_derivatives(y: f64, x: f64) -> [f64; 5] {
+    let scale = x.abs() + y.abs();
+    if scale.is_nan() {
+        return [f64::NAN; 5];
+    }
+    if scale == 0.0 || scale.is_infinite() {
+        return [0.0; 5];
+    }
+    let (x, y) = (x / scale, y / scale);
+    let q = x * x + y * y;
+    let first = |numerator: f64| numerator / q / scale;
+    let second = |numerator: f64| first(numerator) / q / scale;
+    [
+        first(x),
+        first(-y),
+        second(-2.0 * x * y),
+        second(y * y - x * x),
+        second(2.0 * x * y),
+    ]
 }
 
 /// The `order`-th derivative of `sqrt` (order 0 is `sqrt` itself), the CPU

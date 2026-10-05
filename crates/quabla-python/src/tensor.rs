@@ -1594,6 +1594,62 @@ impl PyTensor {
         self.try_unary("log1p", f64::ln_1p)
     }
 
+    pub fn try_expm1(&self) -> Result<Self, String> {
+        self.try_unary("expm1", f64::exp_m1)
+    }
+
+    /// The f64 musl `erf` of the `libm` crate, as the CPU Tensor IR uses.
+    pub fn try_erf(&self) -> Result<Self, String> {
+        self.try_unary("erf", libm::erf)
+    }
+
+    /// Elementwise `atan2(self, x)` with broadcasting and the dtype promotion
+    /// of the other binary ops; `bool` operands are rejected.
+    pub fn try_atan2(&self, x: &Self) -> Result<Self, String> {
+        self.ensure_not_bool("atan2")?;
+        x.ensure_not_bool("atan2")?;
+        self.try_elementwise(x, "atan2", |y, x| Ok(y.atan2(x)))
+    }
+
+    /// `atan2(self, x)` for a Python number `x`, a weak scalar rounded to the
+    /// tensor dtype.
+    pub fn try_atan2_scalar(&self, x: f64) -> Result<Self, String> {
+        self.ensure_not_bool("atan2")?;
+        let x = self.dtype.round(x);
+        self.try_map(|y| y.atan2(x))
+    }
+
+    /// Inclusive prefix sums along `axis` (over the flattened tensor when
+    /// `None`, like NumPy), from the last entry when `reverse`. Every running
+    /// sum rounds to the dtype, as the CPU Tensor IR `cumsum` does.
+    pub fn try_cumsum(&self, axis: Option<isize>, reverse: bool) -> Result<Self, String> {
+        self.ensure_not_bool("cumsum")?;
+        let (shape, axis) = match axis {
+            Some(axis) => (self.shape.clone(), normalize_axis(axis, self.shape.len())?),
+            None => (vec![self.data.len()], 0),
+        };
+        let extent = shape[axis];
+        let inner = shape[axis + 1..].iter().product::<usize>();
+        let outer = shape[..axis].iter().product::<usize>();
+        let mut data = self.data.iter().collect::<Vec<_>>();
+        for outer_index in 0..outer {
+            for lane in 0..inner {
+                let position = |step: usize| {
+                    let row = if reverse { extent - 1 - step } else { step };
+                    (outer_index * extent + row) * inner + lane
+                };
+                let mut running = data[position(0)];
+                for step in 1..extent {
+                    running = self.dtype.round(running + data[position(step)]);
+                    data[position(step)] = running;
+                }
+            }
+        }
+        let mut output = Self::from_shape_data_typed(shape, data, self.dtype)?;
+        output.weak = self.weak;
+        Ok(output)
+    }
+
     pub fn try_sqrt(&self) -> Result<Self, String> {
         self.try_unary("sqrt", f64::sqrt)
     }
@@ -2469,6 +2525,42 @@ impl PyTensor {
 
     fn log1p(&self) -> PyResult<Self> {
         self.try_log1p().map_err(PyValueError::new_err)
+    }
+
+    fn expm1(&self) -> PyResult<Self> {
+        self.try_expm1().map_err(PyValueError::new_err)
+    }
+
+    fn erf(&self) -> PyResult<Self> {
+        self.try_erf().map_err(PyValueError::new_err)
+    }
+
+    /// `atan2(self, x)` of a tensor or Python number `x`.
+    fn atan2(&self, x: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, x, TracedBinary::Arithmetic("atan2"), true) {
+            return result;
+        }
+        if let Ok(x) = x.extract::<PyRef<'_, PyTensor>>() {
+            return eager(self.try_atan2(&x));
+        }
+        if let Ok(x) = x.extract::<f64>() {
+            return eager(self.try_atan2_scalar(x));
+        }
+        Err(PyTypeError::new_err(
+            "expected Tensor or numeric scalar operand",
+        ))
+    }
+
+    /// The value itself: outside a transform nothing is differentiated.
+    /// Traced code records a `stop_gradient` node with a zero derivative.
+    fn stop_gradient(&self) -> Self {
+        self.clone()
+    }
+
+    #[pyo3(signature = (axis = None, reverse = false))]
+    fn cumsum(&self, axis: Option<isize>, reverse: bool) -> PyResult<Self> {
+        self.try_cumsum(axis, reverse)
+            .map_err(PyValueError::new_err)
     }
 
     fn sqrt(&self) -> PyResult<Self> {

@@ -244,6 +244,72 @@ def test_device_compositions_and_shape_helpers_match_cpu():
         print("SKIP device compositions: GPU gates unset")
 
 
+def close_relative(a, b, tolerance):
+    assert a.shape == b.shape, (a.shape, b.shape)
+    for x, y in zip(a.to_flat_list(), b.to_flat_list()):
+        assert abs(x - y) <= tolerance * max(1.0, abs(y)), (x, y, a.tolist(), b.tolist())
+
+
+def test_device_expm1_erf_atan2_stop_gradient_and_cumsum_match_cpu():
+    ran = False
+    for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
+        if os.environ.get(gate) != "1":
+            continue
+        assert device in qb.devices(), f"{gate} requested but target not built"
+        ran = True
+        x = qb.array([-6.0, -1.0, -1e-4, 0.0, 0.3, 1.7, 4.0], dtype=qb.float32)
+        y = qb.array([2.0, -0.5, 0.0, 0.0, -3.0, 0.25, 1e-3], dtype=qb.float32)
+        functions = {
+            "expm1": lambda t, u: qb.expm1(t),
+            "erf": lambda t, u: qb.erf(t),
+            "atan2": lambda t, u: qb.atan2(t, u),
+            "stop_gradient": lambda t, u: t * qb.stop_gradient(t * u) - qb.stop_gradient(t),
+            "cumsum": lambda t, u: qb.cumsum(t * u),
+            "cumsum_reverse": lambda t, u: qb.cumsum(qb.sin(t) * u, reverse=True),
+        }
+        for name, function in functions.items():
+            value = qb.jit(function, device=device)(x, y)
+            expected = qb.jit(function)(x, y)
+            # erff, expm1f and atan2f are within a few float32 ulp of the
+            # correctly rounded CPU values.
+            close_relative(value, expected, 4e-6)
+            gradient = qb.grad(lambda t, u: qb.sum(function(t, u)), argnums=(0, 1))
+            for actual, reference in zip(
+                qb.jit(gradient, device=device)(x, y), qb.jit(gradient)(x, y)
+            ):
+                close_relative(actual, reference, 4e-6)
+        point = qb.array([0.8, -1.5], dtype=qb.float32)
+        for function in [
+            lambda p: qb.atan2(p[0], p[1]),
+            lambda p: qb.sum(qb.erf(p) * qb.expm1(p)),
+        ]:
+            close_relative(
+                qb.jit(qb.hessian(function), device=device)(point),
+                qb.jit(qb.hessian(function))(point),
+                4e-6,
+            )
+        # A long float32 scan: CUDA scans each line sequentially with
+        # __fadd_rn and matches the CPU bitwise; MLX scans in parallel.
+        long = qb.array(
+            [[((i * 7919 % 1000) - 500) * 1.37e-3 + 1.0 / (1 + i) for i in range(300)]] * 2,
+            dtype=qb.float32,
+        )
+        for axis, reverse in [(1, False), (1, True), (0, True)]:
+            def scan(t, a=axis, r=reverse):
+                return qb.cumsum(t, a, r)
+
+            value = qb.jit(scan, device=device)(long)
+            expected = qb.jit(scan)(long)
+            if device == "cuda":
+                assert value.tolist() == expected.tolist(), (axis, reverse)
+            else:
+                close_relative(value, expected, 1e-5)
+        batched = qb.jit(qb.vmap(lambda t: qb.cumsum(t, reverse=True)), device=device)(long)
+        close_relative(batched, qb.jit(qb.vmap(lambda t: qb.cumsum(t, reverse=True)))(long), 1e-5)
+    if not ran:
+        print("SKIP device new-op parity: GPU gates unset")
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_"):

@@ -20,5 +20,6 @@ cuda-nccl = ["cuda", "quabla-core/cuda-nccl"]
 mlx = ["quabla-core/mlx"]
 
 [dependencies]
+libm = "0.2"
 pyo3 = "0.29"
 quabla-core = { path = "../quabla-core" }

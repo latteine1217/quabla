@@ -2737,6 +2737,10 @@ fn execute_cuda_device_program(
             | TensorOp::Pow { .. }
             | TensorOp::Log { .. }
             | TensorOp::Log1p { .. }
+            | TensorOp::Expm1 { .. }
+            | TensorOp::Erf { .. }
+            | TensorOp::Atan2 { .. }
+            | TensorOp::CumSum { .. }
             | TensorOp::Triangular { .. }
             | TensorOp::Matmul { .. }
             | TensorOp::Sum { .. }
@@ -2789,9 +2793,11 @@ fn execute_cuda_device_program(
                 )?;
                 continue;
             }
-            // Like reshape, cast only copies the float buffer: both sides share the same execution
-            // dtype.
-            TensorOp::Reshape { input } | TensorOp::Cast { input } => {
+            // Like reshape, cast and stop_gradient only copy the float buffer: both sides share
+            // the same execution dtype, and AD has already run on the IR.
+            TensorOp::Reshape { input }
+            | TensorOp::Cast { input }
+            | TensorOp::StopGradient { input } => {
                 let (before, current_and_after) = values.split_at_mut(node_id);
                 let input = cuda_value(before, *input)?;
                 let slot = current_and_after
@@ -3344,7 +3350,8 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
         | TensorOp::Pow {
             base: lhs,
             exponent: rhs,
-        } => {
+        }
+        | TensorOp::Atan2 { y: lhs, x: rhs } => {
             launch.arg(cuda_value(values, *lhs)?);
             launch.arg(cuda_value(values, *rhs)?);
             launch.arg(output);
@@ -3371,6 +3378,9 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
         | TensorOp::Powi { input, .. }
         | TensorOp::Log { input }
         | TensorOp::Log1p { input }
+        | TensorOp::Expm1 { input }
+        | TensorOp::Erf { input }
+        | TensorOp::CumSum { input, .. }
         | TensorOp::Transpose { input, .. }
         | TensorOp::Triangular { input, .. } => {
             launch.arg(cuda_value(values, *input)?);
@@ -4386,6 +4396,10 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
             | TensorOp::Pow { .. }
             | TensorOp::Log { .. }
             | TensorOp::Log1p { .. }
+            | TensorOp::Expm1 { .. }
+            | TensorOp::Erf { .. }
+            | TensorOp::Atan2 { .. }
+            | TensorOp::StopGradient { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
             TensorOp::Reshape { input } if body.nodes[*input].shape == node.shape => {}
@@ -4479,6 +4493,10 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
             | TensorOp::Pow { .. }
             | TensorOp::Log { .. }
             | TensorOp::Log1p { .. }
+            | TensorOp::Expm1 { .. }
+            | TensorOp::Erf { .. }
+            | TensorOp::Atan2 { .. }
+            | TensorOp::StopGradient { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
             TensorOp::Reshape { input }
@@ -4711,10 +4729,15 @@ fn cuda_fori_body_expression_inner(
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
         TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
-        // Cast source and target both execute as float, so the cast is the identity.
-        TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
-            child(*input)
-        }
+        TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
+        TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
+        TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
+        // Cast source and target both execute as float, so the cast is the identity; AD has
+        // already run, so stop_gradient is the identity too.
+        TensorOp::Broadcast { input }
+        | TensorOp::Reshape { input }
+        | TensorOp::Cast { input }
+        | TensorOp::StopGradient { input } => child(*input),
         _ => Err(format!(
             "CUDA Fori body {} is not elementwise-lowerable",
             cuda_op_name(&node.op)
@@ -4872,10 +4895,15 @@ fn cuda_scan_body_expression_in_half_inner(
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
         TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
-        // Cast source and target both execute as float, so the cast is the identity.
-        TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
-            child(*input)
-        }
+        TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
+        TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
+        TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
+        // Cast source and target both execute as float, so the cast is the identity; AD has
+        // already run, so stop_gradient is the identity too.
+        TensorOp::Broadcast { input }
+        | TensorOp::Reshape { input }
+        | TensorOp::Cast { input }
+        | TensorOp::StopGradient { input } => child(*input),
         // The lowerability check restricts slices to one packed half of a
         // carry-shaped value, so the slice reads that half at the same lane.
         TensorOp::Slice { input, start, .. } => {
@@ -5023,10 +5051,15 @@ fn cuda_elementwise_plan_expression_with_index_inner(
         }
         TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
         TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
-        // Cast source and target both execute as float, so the cast is the identity.
-        TensorOp::Broadcast { input } | TensorOp::Reshape { input } | TensorOp::Cast { input } => {
-            child(*input)
-        }
+        TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
+        TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
+        TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
+        // Cast source and target both execute as float, so the cast is the identity; AD has
+        // already run, so stop_gradient is the identity too.
+        TensorOp::Broadcast { input }
+        | TensorOp::Reshape { input }
+        | TensorOp::Cast { input }
+        | TensorOp::StopGradient { input } => child(*input),
         _ => Err(format!(
             "CUDA Fori VJP body uses unsupported {} operation",
             cuda_op_name(&node.op)
@@ -7238,7 +7271,8 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
             TensorOp::Input { .. }
             | TensorOp::Constant { .. }
             | TensorOp::Reshape { .. }
-            | TensorOp::Cast { .. } => continue,
+            | TensorOp::Cast { .. }
+            | TensorOp::StopGradient { .. } => continue,
             TensorOp::ScalarConstant { value } if value.is_finite() => format!(
                 "extern \"C\" __global__ void {function}(float* out, unsigned long long count) {{\n\
                     unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
@@ -7268,7 +7302,8 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
             | TensorOp::Pow {
                 base: lhs,
                 exponent: rhs,
-            } => {
+            }
+            | TensorOp::Atan2 { y: lhs, x: rhs } => {
                 let lhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*lhs].shape);
                 let rhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*rhs].shape);
                 let expression = match &node.op {
@@ -7284,6 +7319,9 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                         kind.operator()
                     ),
                     TensorOp::Pow { .. } => format!("powf(lhs[{lhs_offset}], rhs[{rhs_offset}])"),
+                    TensorOp::Atan2 { .. } => {
+                        format!("atan2f(lhs[{lhs_offset}], rhs[{rhs_offset}])")
+                    }
                     _ => unreachable!(),
                 };
                 format!(
@@ -7310,7 +7348,9 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
             | TensorOp::Cos { input }
             | TensorOp::Powi { input, .. }
             | TensorOp::Log { input }
-            | TensorOp::Log1p { input } => {
+            | TensorOp::Log1p { input }
+            | TensorOp::Expm1 { input }
+            | TensorOp::Erf { input } => {
                 let expression = match &node.op {
                     TensorOp::Tanh { .. } => "tanhf(input[index])".to_string(),
                     TensorOp::Exp { .. } => "expf(input[index])".to_string(),
@@ -7325,6 +7365,8 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                     }
                     TensorOp::Log { .. } => "logf(input[index])".to_string(),
                     TensorOp::Log1p { .. } => "log1pf(input[index])".to_string(),
+                    TensorOp::Expm1 { .. } => "expm1f(input[index])".to_string(),
+                    TensorOp::Erf { .. } => "erff(input[index])".to_string(),
                     _ => unreachable!(),
                 };
                 let input_count = element_count(&plan.nodes[*input].shape)?;
@@ -7458,6 +7500,33 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                             __syncthreads();\n\
                         }}\n\
                         if (thread == 0U) atomicAdd(out, partial[0]{scale});\n}}\n"
+                )
+            }
+            // One thread scans one line along `axis` with `__fadd_rn`, so each running sum
+            // is the rounded float add of the CPU reference, in the same order.
+            TensorOp::CumSum {
+                input,
+                axis,
+                reverse,
+            } => {
+                if plan.nodes[*input].shape != node.shape || *axis >= node.shape.len() {
+                    return Err(format!("CUDA cumsum node {node_id} has an invalid shape or axis"));
+                }
+                let extent = node.shape[*axis];
+                let inner = element_count(&node.shape[*axis + 1..])?;
+                let (first, step) = if *reverse {
+                    (format!("{}ULL * {inner}ULL", extent - 1), format!("-{inner}LL"))
+                } else {
+                    ("0ULL".to_string(), format!("{inner}LL"))
+                };
+                format!(
+                    "extern \"C\" __global__ void {function}(const float* input, float* out, unsigned long long count) {{\n\
+                        unsigned long long line = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
+                        if (line >= count / {extent}ULL) return;\n\
+                        long long position = (long long)((line / {inner}ULL) * {extent}ULL * {inner}ULL + line % {inner}ULL + {first});\n\
+                        float running = input[position];\n\
+                        out[position] = running;\n\
+                        for (unsigned long long k = 1ULL; k < {extent}ULL; ++k) {{ position += {step}; running = __fadd_rn(running, input[position]); out[position] = running; }}\n}}\n"
                 )
             }
             TensorOp::SumAxis { input, axis } | TensorOp::MeanAxis { input, axis } => {
@@ -7881,6 +7950,11 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Transpose { .. } => "transpose",
         TensorOp::Log { .. } => "log",
         TensorOp::Log1p { .. } => "log1p",
+        TensorOp::Expm1 { .. } => "expm1",
+        TensorOp::Erf { .. } => "erf",
+        TensorOp::Atan2 { .. } => "atan2",
+        TensorOp::StopGradient { .. } => "stop_gradient",
+        TensorOp::CumSum { .. } => "cumsum",
         TensorOp::Concat { .. } => "concat",
         TensorOp::Slice { .. } => "slice",
         TensorOp::PadSlice { .. } => "pad_slice",
