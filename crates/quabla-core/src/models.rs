@@ -71,7 +71,7 @@ pub fn finite_difference_parameter_gradient(
 }
 
 pub fn lotka_volterra_loss_gradient_alpha(params: [f64; 4], problem: LotkaVolterraProblem) -> f64 {
-    lotka_volterra_loss_gradient(params, problem)[0]
+    lotka_volterra_loss_parameter_gradient(params, 0, problem)
 }
 
 pub fn lotka_volterra_loss_gradient(params: [f64; 4], problem: LotkaVolterraProblem) -> [f64; 4] {

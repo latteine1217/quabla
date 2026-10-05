@@ -24,9 +24,14 @@ where
 
     trajectory.push(state.clone());
 
+    if steps == 0 {
+        return trajectory;
+    }
+    let mut workspace = Rk4Workspace::new(&state);
+
     for step in 0..steps {
         let t = t0 + step as f64 * dt;
-        state = rk4_step(&state, t, dt, &mut rhs);
+        workspace.step(&mut state, t, dt, &mut rhs);
         trajectory.push(state.clone());
     }
 
@@ -45,51 +50,65 @@ where
     F: FnMut(f64, &[T], &mut [T]),
 {
     let mut state = initial_state.to_vec();
+    if steps == 0 {
+        return state;
+    }
+    let mut workspace = Rk4Workspace::new(&state);
 
     for step in 0..steps {
         let t = t0 + step as f64 * dt;
-        state = rk4_step(&state, t, dt, &mut rhs);
+        workspace.step(&mut state, t, dt, &mut rhs);
     }
 
     state
 }
 
-fn rk4_step<T, F>(state: &[T], t: f64, dt: f64, rhs: &mut F) -> Vec<T>
-where
-    T: StateScalar,
-    F: FnMut(f64, &[T], &mut [T]),
-{
-    let dimension = state.len();
-    let k1 = derivative(dimension, t, state, rhs);
-    let y2 = add_scaled(state, &k1, 0.5 * dt);
-    let k2 = derivative(dimension, t + 0.5 * dt, &y2, rhs);
-    let y3 = add_scaled(state, &k2, 0.5 * dt);
-    let k3 = derivative(dimension, t + 0.5 * dt, &y3, rhs);
-    let y4 = add_scaled(state, &k3, dt);
-    let k4 = derivative(dimension, t + dt, &y4, rhs);
-
-    (0..dimension)
-        .map(|i| state[i] + (k1[i] + k2[i] * 2.0 + k3[i] * 2.0 + k4[i]) * (dt / 6.0))
-        .collect()
+// Reuse the four derivative buffers and one intermediate state for every step.
+// Each RHS call still receives a freshly zeroed derivative buffer, including
+// callbacks that only write some components.
+struct Rk4Workspace<T> {
+    k1: Vec<T>,
+    k2: Vec<T>,
+    k3: Vec<T>,
+    k4: Vec<T>,
+    intermediate: Vec<T>,
 }
 
-fn derivative<T, F>(dimension: usize, t: f64, state: &[T], rhs: &mut F) -> Vec<T>
-where
-    T: StateScalar,
-    F: FnMut(f64, &[T], &mut [T]),
-{
-    let mut output = vec![T::from(0.0); dimension];
-    rhs(t, state, &mut output);
-    output
-}
+impl<T: StateScalar> Rk4Workspace<T> {
+    fn new(state: &[T]) -> Self {
+        Self {
+            k1: state.to_vec(),
+            k2: state.to_vec(),
+            k3: state.to_vec(),
+            k4: state.to_vec(),
+            intermediate: state.to_vec(),
+        }
+    }
 
-fn add_scaled<T>(state: &[T], derivative: &[T], scale: f64) -> Vec<T>
-where
-    T: StateScalar,
-{
-    state
-        .iter()
-        .zip(derivative)
-        .map(|(value, derivative)| *value + *derivative * scale)
-        .collect()
+    fn step<F>(&mut self, state: &mut [T], t: f64, dt: f64, rhs: &mut F)
+    where
+        F: FnMut(f64, &[T], &mut [T]),
+    {
+        self.k1.fill(T::from(0.0));
+        rhs(t, state, &mut self.k1);
+        for (i, value) in state.iter().enumerate() {
+            self.intermediate[i] = *value + self.k1[i] * (0.5 * dt);
+        }
+        self.k2.fill(T::from(0.0));
+        rhs(t + 0.5 * dt, &self.intermediate, &mut self.k2);
+        for (i, value) in state.iter().enumerate() {
+            self.intermediate[i] = *value + self.k2[i] * (0.5 * dt);
+        }
+        self.k3.fill(T::from(0.0));
+        rhs(t + 0.5 * dt, &self.intermediate, &mut self.k3);
+        for (i, value) in state.iter().enumerate() {
+            self.intermediate[i] = *value + self.k3[i] * dt;
+        }
+        self.k4.fill(T::from(0.0));
+        rhs(t + dt, &self.intermediate, &mut self.k4);
+        for (i, value) in state.iter_mut().enumerate() {
+            *value = *value
+                + (self.k1[i] + self.k2[i] * 2.0 + self.k3[i] * 2.0 + self.k4[i]) * (dt / 6.0);
+        }
+    }
 }
