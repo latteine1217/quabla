@@ -1317,12 +1317,14 @@ impl CudaExecutionPlan {
         beta2: f32,
         epsilon: f32,
     ) -> Result<(), String> {
-        if !(learning_rate.is_finite() && learning_rate > 0.0)
+        // A zero learning rate is valid: learning-rate schedules start or end
+        // at zero, and a zero step still advances the moments.
+        if !(learning_rate.is_finite() && learning_rate >= 0.0)
             || !(beta1.is_finite() && (0.0..1.0).contains(&beta1))
             || !(beta2.is_finite() && (0.0..1.0).contains(&beta2))
             || !(epsilon.is_finite() && epsilon > 0.0)
         {
-            return Err("CUDA Adam requires positive finite learning_rate and epsilon, plus beta1/beta2 in [0, 1)".to_string());
+            return Err("CUDA Adam requires a finite nonnegative learning_rate, a positive finite epsilon, and beta1/beta2 in [0, 1)".to_string());
         }
         let parameter_node_id = input_node_id(&self.plan, parameter_name)?;
         if parameter_node_id >= gradient_node_id {

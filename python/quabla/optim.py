@@ -14,8 +14,28 @@ from ._quabla import float64 as _float64
 from ._transforms import _leaf_names, _trace
 from ._transforms import jit as _jit
 from ._transforms import value_and_grad as _value_and_grad
+from ._lbfgs import LBFGS
+from ._schedules import (
+    constant,
+    cosine_decay,
+    exponential_decay,
+    piecewise_constant,
+    warmup_cosine_decay,
+)
 
-__all__ = ["Adam", "SGD", "Trainer"]
+__all__ = [
+    "Adam",
+    "AdamW",
+    "LBFGS",
+    "SGD",
+    "Trainer",
+    "clip_by_global_norm",
+    "constant",
+    "cosine_decay",
+    "exponential_decay",
+    "piecewise_constant",
+    "warmup_cosine_decay",
+]
 
 
 def _positive(value, name):
@@ -23,6 +43,61 @@ def _positive(value, name):
     if not _math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be positive and finite")
     return value
+
+
+def _learning_rate(value):
+    """A positive constant rate, or a schedule called with the step count."""
+    return value if callable(value) else _positive(value, "learning_rate")
+
+
+def _rate_at(learning_rate, step):
+    if not callable(learning_rate):
+        return learning_rate
+    value = float(learning_rate(step))
+    if not _math.isfinite(value) or value < 0:
+        raise ValueError(
+            f"learning-rate schedule returned {value!r} at step {step}; "
+            "rates must be finite and nonnegative"
+        )
+    return value
+
+
+def _clip_norm(value):
+    return None if value is None else _positive(value, "clip_norm")
+
+
+def clip_by_global_norm(grads, max_norm):
+    """Scale a gradient pytree so its global L2 norm is at most ``max_norm``.
+
+    Returns ``(clipped_grads, global_norm)``. The norm over all leaves is
+    computed in float64 as ``m * sqrt(sum((g / m) ** 2))`` with ``m`` the
+    largest ``|g|``, so it neither overflows nor underflows for extreme
+    magnitudes. Leaves are multiplied by ``min(1, max_norm / global_norm)``
+    and rounded once to their dtype; below the bound the input leaves are
+    returned unchanged. A NaN or infinite global norm returns all-NaN leaves
+    instead of finite values, so the following update exposes the bad step;
+    test ``math.isfinite(global_norm)`` to skip such a step instead.
+    """
+    max_norm = _positive(max_norm, "max_norm")
+    leaves, definition = _tree.flatten(grads)
+    for leaf in leaves:
+        if not isinstance(leaf, _Tensor) or leaf.dtype.name not in (
+            "float32",
+            "float64",
+        ):
+            raise TypeError("gradient leaves must be floating-point Tensors")
+    wide = [leaf.astype(_float64) for leaf in leaves if _math.prod(leaf.shape)]
+    peaks = [float(value.abs().max()) for value in wide]
+    # Python's max() is order-dependent with NaN, so propagate it explicitly.
+    peak = _math.nan if any(_math.isnan(p) for p in peaks) else max(peaks, default=0)
+    scale = peak if _math.isfinite(peak) and peak > 0 else 1.0
+    total = sum(float(((value / scale) * (value / scale)).sum()) for value in wide)
+    norm = scale * _math.sqrt(total)
+    if norm <= max_norm:
+        return grads, norm
+    factor = max_norm / norm if _math.isfinite(norm) else _math.nan
+    clipped = [(leaf.astype(_float64) * factor).astype(leaf.dtype) for leaf in leaves]
+    return _tree.unflatten(definition, clipped), norm
 
 
 def _parameters(params):
@@ -57,31 +132,23 @@ def _matching_values(leaves, definition, other, name):
     return values
 
 
-class Adam:
-    """Adam configuration with pure updates and the v0.1 stateful ``step``.
+class _AdamBase:
+    """Pure Adam state and update shared by Adam and AdamW.
 
-    ``beta1``, ``beta2``, and ``epsilon`` remain accepted constructor aliases.
-    Pure state stores float64 moments, independently of stateful legacy steps.
+    State stores float64 moments and the completed-update count, which is
+    both the bias-correction exponent and the learning-rate schedule step.
     """
 
-    def __init__(
-        self,
-        learning_rate=1e-3,
-        b1=0.9,
-        b2=0.999,
-        eps=1e-8,
-        *,
-        beta1=None,
-        beta2=None,
-        epsilon=None,
-    ):
-        self.learning_rate = _positive(learning_rate, "learning_rate")
-        self.b1 = float(b1 if beta1 is None else beta1)
-        self.b2 = float(b2 if beta2 is None else beta2)
-        self.eps = _positive(eps if epsilon is None else epsilon, "epsilon")
+    weight_decay = 0.0
+
+    def _configure(self, learning_rate, b1, b2, eps, clip_norm):
+        self.learning_rate = _learning_rate(learning_rate)
+        self.b1 = float(b1)
+        self.b2 = float(b2)
+        self.eps = _positive(eps, "epsilon")
         if not (0 <= self.b1 < 1 and 0 <= self.b2 < 1):
             raise ValueError("Adam betas must be in [0, 1)")
-        self._legacy = _quabla.Adam(self.learning_rate, self.b1, self.b2, self.eps)
+        self.clip_norm = _clip_norm(clip_norm)
 
     def init(self, params):
         """Create independent zero moments for ``params``."""
@@ -105,10 +172,12 @@ class Adam:
             raise ValueError("Adam state step must be a nonnegative integer")
         first = _matching_values(parameters, definition, state["m"], "first moment")
         second = _matching_values(parameters, definition, state["v"], "second moment")
+        if self.clip_norm is not None:
+            gradients, _ = clip_by_global_norm(gradients, self.clip_norm)
         step = state["step"] + 1
         moments, variances, updated = [], [], []
         hyperparameters = (
-            self.learning_rate,
+            _rate_at(self.learning_rate, state["step"]),
             self.b1,
             self.b2,
             self.eps,
@@ -116,7 +185,9 @@ class Adam:
             1 - self.b2**step,
         )
         for parameter, gradient, m, v in zip(parameters, gradients, first, second):
-            parameter, m, v = parameter._adam_update(gradient, m, v, hyperparameters)
+            parameter, m, v = parameter._adam_update(
+                gradient, m, v, hyperparameters, self.weight_decay
+            )
             updated.append(parameter)
             moments.append(m)
             variances.append(v)
@@ -126,29 +197,112 @@ class Adam:
             "v": _tree.unflatten(definition, variances),
         }
 
+
+class Adam(_AdamBase):
+    """Adam configuration with pure updates and the v0.1 stateful ``step``.
+
+    ``learning_rate`` is a positive float or a schedule ``f(step) -> float``
+    called with the completed-update count. ``clip_norm`` clips each update's
+    gradients with ``clip_by_global_norm`` first. ``beta1``, ``beta2``, and
+    ``epsilon`` remain accepted constructor aliases. Pure state stores float64
+    moments, independently of stateful legacy steps.
+    """
+
+    def __init__(
+        self,
+        learning_rate=1e-3,
+        b1=0.9,
+        b2=0.999,
+        eps=1e-8,
+        *,
+        beta1=None,
+        beta2=None,
+        epsilon=None,
+        clip_norm=None,
+    ):
+        self._configure(
+            learning_rate,
+            b1 if beta1 is None else beta1,
+            b2 if beta2 is None else beta2,
+            eps if epsilon is None else epsilon,
+            clip_norm,
+        )
+        # The native v0.1 optimizer has a fixed rate and no clipping.
+        self._legacy = None
+        if not callable(self.learning_rate) and self.clip_norm is None:
+            self._legacy = _quabla.Adam(self.learning_rate, self.b1, self.b2, self.eps)
+
     def step(self, parameters, gradients):
         """Apply a stateful v0.1 dictionary update with native compatibility."""
+        if self._legacy is None:
+            raise TypeError(
+                "legacy Adam.step needs a constant learning_rate and no "
+                "clip_norm; use init/update"
+            )
         return self._legacy.step(parameters, gradients)
 
 
-class SGD:
-    """Plain stochastic gradient descent with pure pytree updates."""
+class AdamW(_AdamBase):
+    """Adam with decoupled weight decay (Loshchilov and Hutter, 2019).
 
-    def __init__(self, learning_rate=1e-2):
-        self.learning_rate = _positive(learning_rate, "learning_rate")
+    Each update is ``p - lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * p)``
+    with the pre-update ``p``, as optax's ``adamw``; the decay is not part of
+    the gradient, so it does not enter the moments. State, precision, schedule,
+    and ``clip_norm`` rules are those of ``Adam``.
+    """
+
+    def __init__(
+        self,
+        learning_rate=1e-3,
+        b1=0.9,
+        b2=0.999,
+        eps=1e-8,
+        weight_decay=1e-4,
+        *,
+        clip_norm=None,
+    ):
+        self._configure(learning_rate, b1, b2, eps, clip_norm)
+        self.weight_decay = float(weight_decay)
+        if not _math.isfinite(self.weight_decay) or self.weight_decay < 0:
+            raise ValueError("weight_decay must be finite and nonnegative")
+
+
+class SGD:
+    """Plain stochastic gradient descent with pure pytree updates.
+
+    With a constant ``learning_rate`` the state is ``None``; a schedule keeps
+    ``{"step": n}``, the completed-update count it is evaluated at.
+    ``clip_norm`` clips each update's gradients with ``clip_by_global_norm``.
+    """
+
+    def __init__(self, learning_rate=1e-2, *, clip_norm=None):
+        self.learning_rate = _learning_rate(learning_rate)
+        self.clip_norm = _clip_norm(clip_norm)
 
     def init(self, params):
         _parameters(params)
-        return None
+        return {"step": 0} if callable(self.learning_rate) else None
 
     def update(self, params, grads, state):
         parameters, gradients, definition = _matching(params, grads, "gradient")
-        if state is not None:
+        if callable(self.learning_rate):
+            if (
+                type(state) is not dict
+                or set(state) != {"step"}
+                or type(state["step"]) is not int
+                or state["step"] < 0
+            ):
+                raise ValueError("scheduled SGD state must be {'step': int >= 0}")
+            rate = _rate_at(self.learning_rate, state["step"])
+            state = {"step": state["step"] + 1}
+        elif state is not None:
             raise ValueError("SGD state must be None")
-        updated = [
-            p._sgd_update(g, self.learning_rate) for p, g in zip(parameters, gradients)
-        ]
-        return _tree.unflatten(definition, updated), None
+        else:
+            rate = self.learning_rate
+        if self.clip_norm is not None:
+            gradients, _ = clip_by_global_norm(gradients, self.clip_norm)
+        updated = [p._sgd_update(g, rate) for p, g in zip(parameters, gradients)]
+        return _tree.unflatten(definition, updated), state
 
 
 class Trainer:
@@ -158,6 +312,8 @@ class Trainer:
     ``step(*batch)`` replaces those arguments in the declared order. An empty
     call reuses the latest batch; ``loss()`` evaluates the current parameters.
     Device plans keep parameter and moment buffers on the device until readback.
+    The CPU accepts Adam, AdamW, and SGD; devices accept Adam without
+    ``clip_norm``, and a schedule sets the native rate before every step.
     """
 
     def __init__(self, loss, params, optimizer, *data, device="cpu", batch_argnums=()):
@@ -165,8 +321,8 @@ class Trainer:
 
         if not callable(loss):
             raise TypeError("loss must be callable")
-        if not isinstance(optimizer, (Adam, SGD)):
-            raise TypeError("optimizer must be Adam or SGD")
+        if not isinstance(optimizer, (Adam, AdamW, SGD)):
+            raise TypeError("optimizer must be Adam, AdamW, or SGD")
         target, ordinal = parse_device(device)
         parameters, self._param_def = _parameters(params)
         if isinstance(batch_argnums, int):
@@ -192,8 +348,17 @@ class Trainer:
             self._evaluate_loss = _jit(loss, device="cpu")
             return
         if not isinstance(optimizer, Adam):
+            # AdamW's decay and SGD have no device-resident kernels.
             raise _UnsupportedOperationError(
                 "device Trainer supports Adam only", op="Trainer", device=device
+            )
+        if optimizer.clip_norm is not None:
+            # Clipping needs the global norm of all gradients between the
+            # gradient and update kernels, which the device plans fuse.
+            raise _UnsupportedOperationError(
+                "device Trainer does not support clip_norm",
+                op="Trainer",
+                device=device,
             )
         require_device(device, "Trainer")
         arguments = (params, *self._data)
@@ -230,13 +395,23 @@ class Trainer:
             staged.outputs[0],
             self._parameter_names,
             dict(zip(names, leaves)),
-            optimizer.learning_rate,
+            _rate_at(optimizer.learning_rate, 0),
             retained,
             optimizer.b1,
             optimizer.b2,
             optimizer.eps,
             **kwargs,
         )
+        # Completed device steps, at which a host schedule is evaluated.
+        self._device_steps = 0
+
+    def _device_step(self, *inputs):
+        schedule = self._optimizer.learning_rate
+        if callable(schedule):
+            self._executor.learning_rate = _rate_at(schedule, self._device_steps)
+        result = self._executor.step(*inputs)
+        self._device_steps += 1
+        return result
 
     @property
     def params(self):
@@ -251,7 +426,7 @@ class Trainer:
     def step(self, *batch):
         """Advance one optimizer step, optionally replacing dynamic data."""
         if self._executor is not None and not batch:
-            return self._executor.step()
+            return self._device_step()
         inputs = {}
         pending_data = self._data
         if batch:
@@ -276,7 +451,7 @@ class Trainer:
                     inputs.update(zip(self._batch_names[index], leaves))
             pending_data = tuple(data)
         if self._executor is not None:
-            result = self._executor.step(inputs)
+            result = self._device_step(inputs)
             self._data = pending_data
             return result
         _, gradients = self._value_and_grad(self._params, *pending_data)

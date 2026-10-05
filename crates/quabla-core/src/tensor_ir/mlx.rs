@@ -172,8 +172,10 @@ impl MlxAdamPlan {
         if gradient_node_ids.is_empty() {
             return Err("MLX Adam requires at least one parameter gradient".to_string());
         }
+        // A zero learning rate is valid: learning-rate schedules start or end
+        // at zero, and a zero step still advances the moments.
         if !(learning_rate.is_finite()
-            && learning_rate > 0.0
+            && learning_rate >= 0.0
             && epsilon.is_finite()
             && epsilon > 0.0
             && beta1.is_finite()
@@ -182,7 +184,7 @@ impl MlxAdamPlan {
             && (0.0..1.0).contains(&beta2))
         {
             return Err(
-                "MLX Adam requires positive finite learning_rate and epsilon, plus beta1/beta2 in [0, 1)"
+                "MLX Adam requires a finite nonnegative learning_rate, a positive finite epsilon, and beta1/beta2 in [0, 1)"
                     .to_string(),
             );
         }
@@ -223,6 +225,21 @@ impl MlxAdamPlan {
             beta2,
             epsilon,
         })
+    }
+
+    pub fn learning_rate(&self) -> f32 {
+        self.learning_rate
+    }
+
+    /// Replace the learning rate used by later steps, as a host schedule does
+    /// between steps. Zero is accepted because schedules such as warmup and
+    /// cosine decay reach it; moments and bias corrections are unaffected.
+    pub fn set_learning_rate(&mut self, learning_rate: f32) -> Result<(), String> {
+        if !(learning_rate.is_finite() && learning_rate >= 0.0) {
+            return Err("MLX Adam learning_rate must be finite and nonnegative".to_string());
+        }
+        self.learning_rate = learning_rate;
+        Ok(())
     }
 
     pub fn step(&mut self, inputs: &BTreeMap<String, DynamicTensor>) -> Result<(), String> {
@@ -2141,6 +2158,33 @@ mod retained_loss_tests {
         }
         let forward = optimizer.forward_loss_plan.get().unwrap().as_ref().unwrap();
         assert!(forward.node_count() < optimizer.plan.node_count());
+        Ok(())
+    }
+
+    #[test]
+    fn learning_rate_setter_applies_to_later_steps_only() -> Result<(), String> {
+        let (mut optimizer, inputs) = fixture()?;
+        assert_eq!(optimizer.learning_rate(), 0.01);
+        for invalid in [-0.1, f32::NAN, f32::INFINITY] {
+            assert!(optimizer.set_learning_rate(invalid).is_err());
+        }
+        assert_eq!(optimizer.learning_rate(), 0.01);
+        // A zero rate still advances the moments and the bias-correction
+        // counter, but leaves the parameter unchanged.
+        optimizer.set_learning_rate(0.0)?;
+        let initial = optimizer.parameter("parameter")?;
+        optimizer.step(&inputs)?;
+        assert_eq!(optimizer.adam["parameter"].step, 1);
+        assert_eq!(
+            optimizer.parameter("parameter")?.storage(),
+            initial.storage()
+        );
+        optimizer.set_learning_rate(0.01)?;
+        optimizer.step(&inputs)?;
+        assert_ne!(
+            optimizer.parameter("parameter")?.storage(),
+            initial.storage()
+        );
         Ok(())
     }
 

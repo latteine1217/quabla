@@ -250,9 +250,58 @@ its single-output Tensor contract.
 Adam also preserves the old dictionary `step` and the keyword aliases
 `beta1`, `beta2`, `epsilon`. Pure host moments use float64 as the old host
 Adam does, and parameters keep their dtype.
+`qb.optim.AdamW(learning_rate=1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=1e-4)`
+applies decoupled weight decay as optax's `adamw` does:
+`p - lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * p)` with the
+pre-update `p`; its state and precision rules are Adam's, and it has no
+legacy `step`.
+
+Every `learning_rate` also accepts a schedule, a callable `f(step) -> float`
+evaluated on the host at the number of completed updates (0 for the first
+update, as in optax). Adam and AdamW keep that count in `state["step"]`; a
+scheduled SGD's state is `{"step": n}` instead of `None`. The schedules follow
+optax's formulas and argument order: `constant(value)`,
+`exponential_decay(init_value, transition_steps, decay_rate,
+transition_begin=0, staircase=False, end_value=None)`,
+`cosine_decay(init_value, decay_steps, alpha=0.0)`,
+`warmup_cosine_decay(init_value, peak_value, warmup_steps, decay_steps,
+end_value=0.0)` (where `decay_steps` includes the warmup), and
+`piecewise_constant(boundaries, values)`, which returns `values[i]` from step
+`boundaries[i - 1]` on. Invalid configurations raise `ValueError` where optax
+warns, and a schedule value that is negative or not finite raises when used.
+
+`qb.optim.clip_by_global_norm(grads, max_norm)` returns
+`(clipped_grads, global_norm)`. The norm over all leaves is computed in
+float64 as `m * sqrt(sum((g / m) ** 2))` with `m = max |g|`, so it neither
+overflows nor underflows; leaves are scaled by `min(1, max_norm / norm)` and
+keep their dtype. A NaN or infinite norm returns all-NaN gradients rather
+than finite values; test `math.isfinite(global_norm)` to skip such steps.
+The keyword `clip_norm=` on `Adam`, `AdamW`, and `SGD` applies the same
+clipping to every `update`.
+
+`qb.optim.LBFGS(history=10, max_iterations=500, max_evaluations=None,
+tolerance_grad=1e-7, tolerance_change=1e-9, line_search="strong_wolfe")`
+is a host-side full-batch minimizer for the "Adam, then L-BFGS" stage of PINN
+training. `minimize(fun, params, *args)` jits `value_and_grad(fun)` on the CPU
+once, iterates over one float64 vector of all parameter leaves (float32 leaves
+are evaluated, and their iterate stored, at float32 precision), and returns
+`(params, info)`. It uses the two-loop recursion with `H0 = (s'y / y'y) I`,
+skips curvature pairs with `s'y <= 1e-10 ||s|| ||y||`, and a strong Wolfe line
+search (`c1=1e-4`, `c2=0.9`, safeguarded cubic interpolation, at most 25
+evaluations) that backtracks from non-finite losses. A failed line search
+restarts once from steepest descent. `info` holds `iterations`,
+`evaluations`, `loss`, `grad_norm` (infinity norm), `converged`, and `reason`:
+`gradient_tolerance`, `change_tolerance`
+(`|f_k - f_k+1| <= tol * max(|f_k|, |f_k+1|)`, scipy's `ftol` test without
+its floor of 1, so small PINN losses are not stopped early), `max_iterations`,
+`max_evaluations`, or `line_search_failed` (usual at the float32 resolution
+limit).
 
 `qb.optim.Trainer(loss, params, optimizer, *data, device="cpu", batch_argnums=())`
-traces `loss(params, *data)`. CPU supports Adam/SGD; devices support Adam.
+traces `loss(params, *data)`. CPU supports Adam, AdamW, and SGD, with
+schedules and `clip_norm`. Devices support Adam with a constant rate or a
+schedule, which sets the native optimizer's `learning_rate` before each step;
+AdamW and `clip_norm` raise `UnsupportedOperationError` on devices.
 `batch_argnums` indexes data positions, excluding params. `step(*batch)`
 replaces them in the declared order, with unchanged pytree/shapes/dtypes;
 `step()` reuses data without Python flattening on devices. Device parameters
