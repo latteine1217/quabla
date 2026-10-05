@@ -878,13 +878,9 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - MLX rejects `solve` (and `solve_triangular`, which composes it), and
   `vmap` HVP has no MLX lowering. Triangular-solve kernels are not
   implemented on devices.
-- Native CUDA and Metal Cholesky derivative kernels process each matrix
-  sequentially in one GPU thread, so their cost grows as O(n^3) without
-  parallelism: one `float64` Cholesky gradient took 0.3 s at n = 256 and
-  2.6 s at n = 512 on a GTX 1660 SUPER, and 0.7 s and 5.4 s on Apple
-  silicon. `float32` Cholesky derivatives and third or higher orders use a
-  scalar expansion whose graph grows as O(n^3) and is impractical beyond
-  small matrices.
+- `float32` Cholesky derivatives and third or higher orders use a scalar
+  expansion whose graph grows as O(n^3) and is impractical beyond small
+  matrices; `float64` first and second orders use the native kernels.
 - Data parallelism is single-node CUDA + NCCL only: equal axis-zero batch
   shards, replicated parameter gradients, and an optimizer on the host. There
   is no multi-node transport, tensor parallelism, or sharded matmul.

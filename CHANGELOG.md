@@ -9,6 +9,23 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-06
+
+### Changed
+
+- Native Cholesky derivative kernels on CUDA, and the Metal primal and
+  derivative kernels, run one block or threadgroup of 256 threads per matrix
+  instead of one thread. Results are bitwise identical to v0.2.0. A
+  `float64` Cholesky gradient at n = 512 takes 0.08 s instead of 2.6 s on a
+  GTX 1660 SUPER, and 0.09 s instead of 5.4 s on Apple silicon.
+
+### Fixed
+
+- `from quabla import *` binds deprecated and legacy names without emitting
+  a `DeprecationWarning` for each, so it no longer fails under
+  `-W error::DeprecationWarning` or uses up the once-per-name warning that
+  explicit access emits.
+
 ## [0.2.0] - 2026-10-06
 
 The JAX-style Python API described in `docs/api_v0_2_design.md` (slices S0
@@ -173,6 +190,7 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/latteine1217/quabla/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/latteine1217/quabla/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/latteine1217/quabla/releases/tag/v0.1.0
