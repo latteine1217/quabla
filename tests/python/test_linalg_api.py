@@ -9,7 +9,10 @@ central difference with step 1e-6 to ~1e-8.
 
 import os
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:  # NumPy is an optional dependency; the suite needs it.
+    np = None
 
 import quabla as qb
 
@@ -361,6 +364,9 @@ def test_optional_device_parity():
 
 
 if __name__ == "__main__":
+    if np is None:
+        print("skipped test_linalg_api: numpy is not installed")
+        raise SystemExit(0)
     for name, test in list(globals().items()):
         if name.startswith("test_") and callable(test):
             test()
