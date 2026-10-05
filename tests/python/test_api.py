@@ -2688,6 +2688,235 @@ def test_jit_gather_and_scatter_add_are_constant_size_and_match_eager():
             )
 
 
+SPECIAL_POINTS = [
+    -math.inf,
+    -750.0,
+    -20.0,
+    -1.0,
+    -1e-10,
+    -0.0,
+    0.0,
+    5e-324,
+    1e-300,
+    1e-8,
+    0.5,
+    3.0,
+    6.0,
+    30.0,
+    709.0,
+    710.0,
+    math.inf,
+    math.nan,
+]
+
+
+def assert_relative(actual, expected, tolerance):
+    """Each float of `actual` is within `tolerance` of `expected` relative to
+    the expected magnitude; NaN must match NaN and infinities must be equal."""
+    assert len(actual) == len(expected), (actual, expected)
+    for lhs, rhs in zip(actual, expected):
+        if math.isnan(rhs):
+            assert math.isnan(lhs), (lhs, rhs)
+        elif math.isinf(rhs) or rhs == 0.0:
+            assert lhs == rhs, (lhs, rhs)
+        else:
+            assert abs(lhs - rhs) <= tolerance * abs(rhs), (lhs, rhs, actual, expected)
+
+
+def float32_round(value):
+    # Values from 2**128 - 2**103 up round to infinity, which struct rejects.
+    if abs(value) >= 2.0**128 - 2.0**103:
+        return math.copysign(math.inf, value)
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def test_expm1_erf_and_atan2_values_match_math_eagerly_and_traced():
+    pairs = [(y, x) for y in SPECIAL_POINTS for x in SPECIAL_POINTS]
+    for dtype in [qb.float64, qb.float32]:
+        x = qb.array(SPECIAL_POINTS, dtype=dtype)
+        ys = qb.array([y for y, _ in pairs], dtype=dtype)
+        xs = qb.array([x for _, x in pairs], dtype=dtype)
+        inputs = x.tolist()
+        y_inputs, x_inputs = ys.tolist(), xs.tolist()
+        cases = [
+            (qb.expm1, (x,), [math.inf if p >= 710.0 else math.expm1(p) for p in inputs]),
+            (qb.erf, (x,), [math.erf(p) for p in inputs]),
+            (qb.atan2, (ys, xs), [math.atan2(*p) for p in zip(y_inputs, x_inputs)]),
+        ]
+        for function, arguments, reference in cases:
+            eager = function(*arguments)
+            jitted = qb.jit(function)(*arguments)
+            assert eager.dtype == jitted.dtype == dtype
+            assert float_bits(eager.tolist()) == float_bits(jitted.tolist())
+            if dtype == qb.float32:
+                reference = [float32_round(value) for value in reference]
+                # One float32 rounding of the f64 result, which may differ from
+                # the platform libm's f64 by an ulp only below float32 resolution.
+                assert_relative(eager.tolist(), reference, 1.2e-7)
+            else:
+                # math.erf is the platform libm; quabla uses the musl port.
+                assert_relative(eager.tolist(), reference, 4.5e-16)
+    # expm1 keeps the small-argument precision that exp(x) - 1 loses.
+    tiny = qb.array([1e-10], dtype=qb.float32)
+    assert qb.jit(qb.expm1)(tiny).item() == tiny.item()
+    # atan2 broadcasts and keeps a Python number weak in either position.
+    y = qb.array([[1.0], [-2.0]], dtype=qb.float32)
+    x = qb.array([0.5, -3.0, 0.0], dtype=qb.float32)
+    for result in [qb.atan2(y, x), qb.jit(qb.atan2)(y, x)]:
+        assert result.shape == [2, 3] and result.dtype == qb.float32
+    assert qb.atan2(x, 1.0).dtype == qb.float32
+    assert qb.atan2(1.0, x).dtype == qb.float32
+    assert_close(qb.atan2(1.0, x), [math.atan2(1.0, p) for p in x.tolist()], 1e-7)
+    assert_close(qb.jit(lambda t: qb.atan2(t, 2.0))(x), qb.atan2(x, 2.0), 0)
+    assert_raises(ValueError, qb.erf, qb.array([True]), match="bool")
+    for name in ["expm1", "erf", "atan2", "cumsum", "stop_gradient"]:
+        assert name in qb.__all__ and getattr(qb, name).__name__ == name
+
+
+def test_expm1_erf_and_atan2_gradients_and_hessians_match_closed_forms():
+    coefficient = 2.0 / math.sqrt(math.pi)
+    points = [-3.0, -1e-6, 0.0, 0.5, 2.0]
+    x = qb.array(points)
+    for function, derivative in [
+        (qb.expm1, math.exp),
+        (qb.erf, lambda p: coefficient * math.exp(-p * p)),
+    ]:
+        reference = [derivative(p) for p in points]
+        for transform in [qb.grad, lambda f: qb.jit(qb.grad(f))]:
+            gradient = transform(lambda t, f=function: qb.sum(f(t)))(x)
+            assert_relative(gradient.tolist(), reference, 1e-15)
+        _, tangent = qb.jvp(function, (x,), (qb.ones([5]),))
+        assert_relative(tangent.tolist(), reference, 1e-15)
+    hessian = qb.hessian(lambda t: qb.sum(qb.erf(t)))(x).tolist()
+    for row, point in enumerate(points):
+        expected = -2.0 * point * coefficient * math.exp(-point * point)
+        assert_relative([hessian[row][row]], [expected], 1e-15)
+
+    # atan2: (x, -y) / (x^2 + y^2) without overflow or underflow, zero at the
+    # origin, and a Hessian that matches the closed form and finite differences.
+    ys = [1.0, -2.0, 1e200, 1e-200, 0.0]
+    xs = [1.0, 0.5, 1e200, -1e-200, 0.0]
+    expected_y = [0.5, 0.5 / 4.25, 5e-201, -5e199, 0.0]
+    expected_x = [-0.5, 2.0 / 4.25, -5e-201, -5e199, 0.0]
+    gradient = qb.jit(qb.grad(lambda a, b: qb.sum(qb.atan2(a, b)), argnums=(0, 1)))
+    for actual, expected in zip(gradient(qb.array(ys), qb.array(xs)), [expected_y, expected_x]):
+        assert_relative(actual.tolist(), expected, 4e-15)
+
+    def angle(p):
+        return qb.atan2(p[0], p[1])
+
+    for y, x in [(0.8, -1.5), (-0.3, 0.2), (1e150, 2e150)]:
+        r4 = (x * x + y * y) ** 2 if abs(x) < 1e100 else None
+        hessian = qb.hessian(angle)(qb.array([y, x])).tolist()
+        if r4 is None:
+            expected = [[-1.6e-301, -1.2e-301], [-1.2e-301, 1.6e-301]]
+        else:
+            mixed = (y * y - x * x) / r4
+            expected = [[-2 * x * y / r4, mixed], [mixed, 2 * x * y / r4]]
+        for row in range(2):
+            assert_relative(hessian[row], expected[row], 1e-13)
+        if r4 is not None:
+            # Central differences of the gradient, O(h^2) accurate.
+            step = 1e-5
+            for column in range(2):
+                shift = [0.0, 0.0]
+                shift[column] = step
+                plus = qb.grad(angle)(qb.array([y + shift[0], x + shift[1]])).tolist()
+                minus = qb.grad(angle)(qb.array([y - shift[0], x - shift[1]])).tolist()
+                for row in range(2):
+                    difference = (plus[row] - minus[row]) / (2 * step)
+                    assert abs(difference - hessian[row][column]) <= 1e-8, (
+                        difference,
+                        hessian,
+                    )
+    assert qb.hessian(angle)(qb.array([0.0, 0.0])).tolist() == [[0.0, 0.0], [0.0, 0.0]]
+
+
+def test_stop_gradient_keeps_values_and_zeroes_every_derivative():
+    x = qb.array([0.5, -2.0, 3.0])
+    assert_tensor(qb.stop_gradient(x), x.tolist(), qb.float64)
+    assert_tensor(qb.jit(qb.stop_gradient)(x), x.tolist(), qb.float64)
+    assert qb.grad(lambda t: qb.sum(qb.sin(qb.stop_gradient(t))))(x).tolist() == [0.0] * 3
+    # The straight-through pattern: the value of f, the gradient of x.
+    def pattern(t):
+        return qb.sum(t - qb.stop_gradient(t) + qb.stop_gradient(t**2))
+
+    assert pattern(x).item() == 0.25 + 4.0 + 9.0
+    assert qb.jit(qb.grad(pattern))(x).tolist() == [1.0] * 3
+    value, tangent = qb.jvp(lambda t: qb.stop_gradient(t) * t, (x,), (qb.ones([3]),))
+    assert value.tolist() == [0.25, 4.0, 9.0] and tangent.tolist() == x.tolist()
+    assert qb.hessian(lambda t: qb.sum(t * qb.stop_gradient(t)))(x).tolist() == [
+        [0.0] * 3
+    ] * 3
+    assert qb.vmap(qb.grad(lambda t: qb.stop_gradient(t) * t))(x).tolist() == x.tolist()
+    mask = qb.array([True, False])
+    assert qb.jit(qb.stop_gradient)(mask).tolist() == [True, False]
+
+
+def test_cumsum_matches_numpy_and_differentiates_by_reversal():
+    data = [[1.0, -2.0, 3.5, 0.25], [4.0, 0.5, -1.0, 2.0], [0.0, 7.0, -3.0, 1.0]]
+    x = qb.array(data)
+
+    def reference(rows, axis, reverse):
+        if axis is None:
+            flat = [value for row in rows for value in row]
+            order = flat[::-1] if reverse else flat
+            sums, running = [], 0.0
+            for value in order:
+                running += value
+                sums.append(running)
+            return sums[::-1] if reverse else sums
+        if axis in (1, -1):
+            return [reference([row], None, reverse) for row in rows]
+        columns = [list(column) for column in zip(*rows)]
+        return [list(row) for row in zip(*[reference([c], None, reverse) for c in columns])]
+
+    for axis in [None, 0, 1, -1]:
+        for reverse in [False, True]:
+            expected = reference(data, axis, reverse)
+            results = [
+                qb.cumsum(x, axis=axis, reverse=reverse),
+                x.cumsum(axis, reverse),
+                qb.jit(lambda t, a=axis, r=reverse: qb.cumsum(t, a, r))(x),
+            ]
+            for result in results:
+                assert result.tolist() == expected, (axis, reverse, result.tolist())
+            if np is not None and not reverse:
+                assert result.tolist() == np.cumsum(np.array(data), axis=axis).tolist()
+    # float32 rounds every running sum: 3e-8 increments never move 1.0.
+    small = qb.array([1.0, 3e-8, 3e-8, 3e-8], dtype=qb.float32)
+    for result in [small.cumsum(), qb.jit(qb.cumsum)(small)]:
+        assert result.dtype == qb.float32 and result.tolist()[-1] == 1.0
+    if np is not None:
+        sequential = np.array([1.0, 3e-8, 3e-8, 3e-8], dtype=np.float32)
+        running = [sequential[0]]
+        for value in sequential[1:]:
+            running.append(np.float32(running[-1] + value))
+        assert small.cumsum().tolist() == [float(value) for value in running]
+    # The gradient of sum(cumsum(x) * w) is the opposite-direction cumsum of w.
+    w = qb.array([[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 0.25, 2.0], [3.0, 1.0, -2.0, 1.0]])
+    for axis in [0, 1]:
+        for reverse in [False, True]:
+            def loss(t, a=axis, r=reverse):
+                return qb.sum(qb.cumsum(t, a, r) * w)
+
+            gradient = qb.jit(qb.grad(loss))(x)
+            assert gradient.tolist() == w.cumsum(axis, not reverse).tolist()
+            _, tangent = qb.jvp(lambda t, a=axis, r=reverse: qb.cumsum(t, a, r), (x,), (w,))
+            assert tangent.tolist() == w.cumsum(axis, reverse).tolist()
+    flat_gradient = qb.grad(lambda t: qb.sum(qb.cumsum(t) * qb.cumsum(t)))(x)
+    assert flat_gradient.shape == [3, 4]
+    # vmap shifts the axis past the batch axis; axis=None flattens each example.
+    for axis in [None, 0, -1]:
+        mapped = qb.jit(qb.vmap(lambda t, a=axis: qb.cumsum(t, a, True)))(x)
+        expected = [qb.array(row).cumsum(axis if axis is None else 0, True).tolist() for row in data]
+        assert mapped.tolist() == expected
+    batched = qb.stack([x, x * 2.0])
+    assert qb.vmap(lambda t: t.cumsum(1))(batched).tolist() == batched.cumsum(2).tolist()
+    assert_raises(ValueError, qb.cumsum, qb.array([True, False]), match="bool")
+    assert_raises(ValueError, x.cumsum, 2)
+
+
 def test_narrow_buffer_import_regressions():
     if np is None:
         return

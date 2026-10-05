@@ -21,6 +21,7 @@ mlx = ["dep:mlx-rs", "dep:mlx-sys"]
 mlx-metal = ["mlx", "mlx-rs/metal", "mlx-rs/accelerate"]
 
 [dependencies]
+libm = "0.2"
 quabla-macros = { path = "../quabla-macros" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

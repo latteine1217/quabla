@@ -21,10 +21,14 @@ from ._quabla import Tensor, TraceTensor
 
 __all__ = [
     "astype",
+    "atan2",
     "broadcast_to",
     "cholesky",
     "cos",
+    "cumsum",
+    "erf",
     "exp",
+    "expm1",
     "log",
     "log1p",
     "matmul",
@@ -40,6 +44,7 @@ __all__ = [
     "softplus",
     "solve",
     "sqrt",
+    "stop_gradient",
     "tanh",
     "transpose",
     "tril",
@@ -88,6 +93,8 @@ def _symmetric_binary(name):
 abs = _unary("abs")
 cos = _unary("cos")
 exp = _unary("exp")
+expm1 = _unary("expm1")
+erf = _unary("erf")
 log = _unary("log")
 log1p = _unary("log1p")
 relu = _unary("relu")
@@ -96,6 +103,7 @@ sin = _unary("sin")
 softplus = _unary("softplus")
 sqrt = _unary("sqrt")
 tanh = _unary("tanh")
+stop_gradient = _unary("stop_gradient")
 cholesky = _unary("cholesky")
 tril = _unary("tril")
 triu = _unary("triu")
@@ -127,6 +135,28 @@ def power(x1, x2):
         # Called directly: `x1 ** x2` would let a NumPy scalar base take over.
         return _array(x2).__rpow__(x1)
     return _array(x1) ** (x2 if isinstance(x2, numbers.Number) else _array(x2))
+
+
+def atan2(x1, x2):
+    """Elementwise four-quadrant `atan2(x1, x2)`, the angle of the point
+    `(x2, x1)`; `quabla.atan2(y, x)` is `y.atan2(x)`.
+
+    Either operand may be a Python number, which adopts the dtype of the
+    array operand. Values follow `f64::atan2`. The derivative is
+    `(x2, -x1) / (x1^2 + x2^2)`, evaluated without overflow, and is defined as
+    zero at the origin (see `docs/api.md`).
+    """
+    if isinstance(x1, numbers.Number) and not isinstance(x2, numbers.Number):
+        x2 = _array(x2)
+        return asarray(x1, dtype=x2.dtype).atan2(x2)
+    return _array(x1).atan2(x2 if isinstance(x2, numbers.Number) else _array(x2))
+
+
+def cumsum(x, axis=None, reverse=False):
+    """Inclusive prefix sums along `axis`, over the flattened array when
+    `axis` is `None` (as in NumPy), from the last entry when `reverse`;
+    `quabla.cumsum(x, axis)` is `x.cumsum(axis)`."""
+    return _array(x).cumsum(axis=axis, reverse=reverse)
 
 
 def matmul(x1, x2):

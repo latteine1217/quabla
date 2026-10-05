@@ -10747,3 +10747,733 @@ fn cuda_gather_and_scatter_add_match_cpu_bits_with_repeated_indices() {
         assert_eq!(cuda.data().as_ref(), cpu.data().as_ref(), "output {output}");
     }
 }
+
+/// Inputs from `(name, shape, values)` triples.
+fn shaped_inputs(
+    entries: &[(&str, Vec<usize>, Vec<f64>)],
+) -> Result<BTreeMap<String, DynamicTensor>, String> {
+    entries
+        .iter()
+        .map(|(name, shape, values)| {
+            Ok((
+                name.to_string(),
+                DynamicTensor::new(shape.clone(), values.clone())?,
+            ))
+        })
+        .collect()
+}
+
+/// `actual` equals `expected` within `tolerance` relative to each expected
+/// entry; an expected zero must be matched exactly and an expected NaN by a NaN.
+fn assert_relative(actual: &[f64], expected: &[f64], tolerance: f64) {
+    assert_eq!(actual.len(), expected.len(), "{actual:?} vs {expected:?}");
+    for (actual, expected) in actual.iter().zip(expected) {
+        if expected.is_nan() {
+            assert!(actual.is_nan(), "{actual} differs from NaN");
+        } else {
+            assert!(
+                actual == expected || (actual - expected).abs() <= tolerance * expected.abs(),
+                "{actual} differs from {expected} (relative tolerance {tolerance})"
+            );
+        }
+    }
+}
+
+fn assert_same_bits(actual: &[f64], expected: &[f64]) {
+    assert_eq!(actual.len(), expected.len());
+    for (actual, expected) in actual.iter().zip(expected) {
+        assert!(
+            actual.to_bits() == expected.to_bits() || (actual.is_nan() && expected.is_nan()),
+            "{actual} is not bitwise {expected}"
+        );
+    }
+}
+
+/// Checks `d output / d input` of the scalar `output` against `expected` (one
+/// flat gradient per input name) through the runtime VJP and JVP and the
+/// symbolic VJP and JVP; forward mode runs one unit direction per entry.
+fn assert_gradient_routes(
+    graph: &TensorIr,
+    output: TensorNodeId,
+    inputs: &BTreeMap<String, DynamicTensor>,
+    expected: &[(&str, Vec<f64>)],
+    tolerance: f64,
+) {
+    let one = must!(DynamicTensor::filled(vec![], 1.0));
+    let runtime = must!(graph.vjp(output, inputs, one.clone()));
+    let reverse = must!(graph.symbolic_vjp(output, "cotangent"));
+    let mut reverse_inputs = inputs.clone();
+    reverse_inputs.insert("cotangent".to_string(), one);
+    for (name, gradient) in expected {
+        assert_relative(&runtime[*name].data(), gradient, tolerance);
+        let symbolic = must!(reverse
+            .graph
+            .evaluate(reverse.gradients[*name], &reverse_inputs));
+        assert_relative(&symbolic.data(), gradient, tolerance);
+        let forward = must!(graph.symbolic_jvp_with_tangent_inputs(
+            output,
+            &BTreeMap::from([(name.to_string(), "direction".to_string())]),
+        ));
+        let shape = inputs[*name].shape().to_vec();
+        for (index, entry) in gradient.iter().enumerate() {
+            let mut unit = vec![0.0; gradient.len()];
+            unit[index] = 1.0;
+            let direction = must!(DynamicTensor::new(shape.clone(), unit));
+            let mut tangents = BTreeMap::new();
+            for (other, value) in inputs {
+                let zeros = must!(DynamicTensor::filled(value.shape().to_vec(), 0.0));
+                tangents.insert(other.clone(), zeros);
+            }
+            tangents.insert(name.to_string(), direction.clone());
+            let (_, tangent) = must!(graph.jvp(output, inputs, &tangents));
+            assert_relative(&tangent.data(), &[*entry], tolerance);
+            let mut forward_inputs = inputs.clone();
+            forward_inputs.insert("direction".to_string(), direction);
+            let symbolic = must!(forward.graph.evaluate(forward.tangent, &forward_inputs));
+            assert_relative(&symbolic.data(), &[*entry], tolerance);
+        }
+    }
+}
+
+/// Checks the Hessian of the scalar `output` in `name` against `expected`
+/// (row-major) on the runtime mixed route and by symbolic forward-over-reverse.
+fn assert_hessian_routes(
+    graph: &TensorIr,
+    output: TensorNodeId,
+    name: &str,
+    inputs: &BTreeMap<String, DynamicTensor>,
+    expected: &[f64],
+    tolerance: f64,
+) {
+    let runtime = must!(graph.hessian_scalar(output, name, inputs));
+    let flat = runtime.concat();
+    assert_relative(&flat, expected, tolerance);
+    let reverse = must!(graph.symbolic_vjp(output, "cotangent"));
+    let forward = must!(reverse.graph.symbolic_jvp_with_tangent_inputs(
+        reverse.gradients[name],
+        &BTreeMap::from([(name.to_string(), "direction".to_string())]),
+    ));
+    let shape = inputs[name].shape().to_vec();
+    let count = runtime.len();
+    for column in 0..count {
+        let mut unit = vec![0.0; count];
+        unit[column] = 1.0;
+        let mut forward_inputs = inputs.clone();
+        forward_inputs.insert(
+            "cotangent".to_string(),
+            must!(DynamicTensor::filled(vec![], 1.0)),
+        );
+        forward_inputs.insert(
+            "direction".to_string(),
+            must!(DynamicTensor::new(shape.clone(), unit)),
+        );
+        let values = must!(forward.graph.evaluate(forward.tangent, &forward_inputs));
+        let expected_column = (0..count)
+            .map(|row| expected[row * count + column])
+            .collect::<Vec<_>>();
+        assert_relative(&values.data(), &expected_column, tolerance);
+    }
+}
+
+const SPECIAL_POINTS: [f64; 18] = [
+    f64::NEG_INFINITY,
+    -750.0,
+    -20.0,
+    -1.0,
+    -1e-10,
+    -0.0,
+    0.0,
+    5e-324,
+    1e-300,
+    1e-8,
+    0.5,
+    3.0,
+    6.0,
+    30.0,
+    709.0,
+    710.0,
+    f64::INFINITY,
+    f64::NAN,
+];
+
+#[test]
+fn expm1_erf_and_atan2_values_follow_the_f64_reference() {
+    let count = SPECIAL_POINTS.len();
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![count]));
+    let expm1 = must!(graph.expm1(x));
+    let erf = must!(graph.erf(x));
+    // Every ordered pair of special points, so signed zeros, infinities and
+    // NaN meet in both operand positions.
+    let pairs = count * count;
+    let y_points = must!(graph.input("ys", vec![pairs]));
+    let x_points = must!(graph.input("xs", vec![pairs]));
+    let atan2 = must!(graph.atan2(y_points, x_points));
+    let inputs = must!(shaped_inputs(&[
+        ("x", vec![count], SPECIAL_POINTS.to_vec()),
+        (
+            "ys",
+            vec![pairs],
+            (0..pairs)
+                .map(|index| SPECIAL_POINTS[index / count])
+                .collect(),
+        ),
+        (
+            "xs",
+            vec![pairs],
+            (0..pairs)
+                .map(|index| SPECIAL_POINTS[index % count])
+                .collect(),
+        ),
+    ]));
+    let expected_atan2 = (0..pairs)
+        .map(|index| SPECIAL_POINTS[index / count].atan2(SPECIAL_POINTS[index % count]))
+        .collect::<Vec<_>>();
+    for (output, expected) in [
+        (expm1, SPECIAL_POINTS.map(f64::exp_m1).to_vec()),
+        (erf, SPECIAL_POINTS.map(libm::erf).to_vec()),
+        (atan2, expected_atan2),
+    ] {
+        assert_same_bits(&must!(graph.evaluate(output, &inputs)).data(), &expected);
+        let plan = must!(graph.compile_cpu(output));
+        assert_same_bits(&must!(plan.evaluate(&inputs)).data(), &expected);
+    }
+    let text = graph.lower_text();
+    for name in ["expm1(%", "erf(%", "atan2(%"] {
+        assert!(text.contains(name), "{name} is missing from {text}");
+    }
+
+    // atan2 broadcasts like the other binary ops, and float32 rounds the f64
+    // result once.
+    let mut broadcast = TensorIr::new();
+    let y = must!(broadcast.input_typed("y", vec![3, 1], TensorDType::F32));
+    let x = must!(broadcast.input_typed("x", vec![4], TensorDType::F32));
+    let angle = must!(broadcast.atan2(y, x));
+    let ys = [1.0, -0.0, -3.5];
+    let xs = [2.0, -1.0, 0.0, 1e-30];
+    let inputs = BTreeMap::from([
+        (
+            "y".to_string(),
+            must!(DynamicTensor::with_dtype(
+                vec![3, 1],
+                ys.to_vec(),
+                TensorDType::F32
+            )),
+        ),
+        (
+            "x".to_string(),
+            must!(DynamicTensor::with_dtype(
+                vec![4],
+                xs.to_vec(),
+                TensorDType::F32
+            )),
+        ),
+    ]);
+    let value = must!(broadcast.evaluate(angle, &inputs));
+    assert_eq!(value.shape(), &[3, 4]);
+    assert_eq!(value.dtype(), TensorDType::F32);
+    let round = |value: f64| f64::from(value as f32);
+    let expected = ys
+        .iter()
+        .flat_map(|y| xs.iter().map(move |x| round(round(*y).atan2(round(*x)))))
+        .collect::<Vec<_>>();
+    assert_same_bits(&value.data(), &expected);
+
+    // Scalar constants fold through the same kernels.
+    let mut folded = TensorIr::new();
+    let tiny = folded.scalar_constant(1e-10);
+    let output = must!(folded.expm1(tiny));
+    let value = must!(must!(folded.compile_cpu(output)).evaluate(&BTreeMap::new()));
+    assert_eq!(value.data()[0], 1e-10_f64.exp_m1());
+
+    // Bool operands are rejected like the other math ops.
+    let mut rejected = TensorIr::new();
+    let mask = must!(rejected.input_typed("mask", vec![2], TensorDType::Bool));
+    assert!(rejected.erf(mask).is_err());
+    assert!(rejected.atan2(mask, mask).is_err());
+    assert!(rejected.cumsum(mask, 0, false).is_err());
+}
+
+#[test]
+fn expm1_and_erf_derivatives_agree_across_routes() {
+    let points = vec![-3.0, -1e-6, 0.0, 0.5, 2.0];
+    let inputs = must!(shaped_inputs(&[("x", vec![points.len()], points.clone())]));
+    let coefficient = std::f64::consts::FRAC_2_SQRT_PI;
+    for erf in [false, true] {
+        let mut graph = TensorIr::new();
+        let x = must!(graph.input("x", vec![points.len()]));
+        let output = if erf {
+            must!(graph.erf(x))
+        } else {
+            must!(graph.expm1(x))
+        };
+        let total = must!(graph.sum(output));
+        let expected = points
+            .iter()
+            .map(|point| {
+                if erf {
+                    coefficient * (-point * point).exp()
+                } else {
+                    point.exp()
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_gradient_routes(&graph, total, &inputs, &[("x", expected)], 1e-15);
+    }
+
+    // Second derivatives: exp(x) and -2x * erf'(x).
+    for (point, erf) in [(0.3_f64, false), (0.7, true), (-1.3, true)] {
+        let mut graph = TensorIr::new();
+        let x = must!(graph.input("x", vec![]));
+        let output = if erf {
+            must!(graph.erf(x))
+        } else {
+            must!(graph.expm1(x))
+        };
+        let inputs = must!(shaped_inputs(&[("x", vec![], vec![point])]));
+        let expected = if erf {
+            -2.0 * point * coefficient * (-point * point).exp()
+        } else {
+            point.exp()
+        };
+        assert_hessian_routes(&graph, output, "x", &inputs, &[expected], 1e-14);
+    }
+}
+
+/// `atan2(p[0], p[1])` of a two-entry input `p`, so a Hessian in `p` holds
+/// every second partial.
+fn atan2_of_pair() -> Result<(TensorIr, TensorNodeId), String> {
+    let mut graph = TensorIr::new();
+    let p = graph.input("p", vec![2])?;
+    let y = graph.slice_axis(p, 0, 0, 1)?;
+    let x = graph.slice_axis(p, 0, 1, 2)?;
+    let y = graph.reshape(y, vec![])?;
+    let x = graph.reshape(x, vec![])?;
+    let angle = graph.atan2(y, x)?;
+    Ok((graph, angle))
+}
+
+#[test]
+fn atan2_derivatives_avoid_overflow_and_vanish_at_the_origin() {
+    // (y, x, d/dy, d/dx): the derivatives are x / r^2 and -y / r^2, written
+    // out exactly where r^2 overflows or underflows in f64.
+    let cases = [
+        (1.0, 1.0, 0.5, -0.5),
+        (-2.0, 0.5, 0.5 / 4.25, 2.0 / 4.25),
+        (0.0, -3.0, -1.0 / 3.0, 0.0),
+        (3.0, 0.0, 0.0, -1.0 / 3.0),
+        (1e200, 1e200, 5e-201, -5e-201),
+        (1e-200, -1e-200, -5e199, -5e199),
+        (0.0, 0.0, 0.0, 0.0),
+        (-0.0, -0.0, 0.0, 0.0),
+        (f64::INFINITY, 1.0, 0.0, 0.0),
+    ];
+    let mut graph = TensorIr::new();
+    let y = must!(graph.input("y", vec![cases.len()]));
+    let x = must!(graph.input("x", vec![cases.len()]));
+    let angle = must!(graph.atan2(y, x));
+    let total = must!(graph.sum(angle));
+    let inputs = must!(shaped_inputs(&[
+        (
+            "y",
+            vec![cases.len()],
+            cases.iter().map(|case| case.0).collect()
+        ),
+        (
+            "x",
+            vec![cases.len()],
+            cases.iter().map(|case| case.1).collect()
+        ),
+    ]));
+    assert_gradient_routes(
+        &graph,
+        total,
+        &inputs,
+        &[
+            ("y", cases.iter().map(|case| case.2).collect()),
+            ("x", cases.iter().map(|case| case.3).collect()),
+        ],
+        1e-14,
+    );
+
+    // A NaN operand gives a NaN derivative.
+    let nan_inputs = must!(shaped_inputs(&[
+        ("y", vec![cases.len()], vec![f64::NAN; cases.len()]),
+        ("x", vec![cases.len()], vec![1.0; cases.len()]),
+    ]));
+    let one = must!(DynamicTensor::filled(vec![], 1.0));
+    let gradient = must!(graph.vjp(total, &nan_inputs, one));
+    assert!(gradient["x"].data().iter().all(|value| value.is_nan()));
+
+    // Hessian [[-2xy, y^2 - x^2], [y^2 - x^2, 2xy]] / r^4, also where r^4
+    // overflows, and zero at the origin.
+    let (pair, angle) = must!(atan2_of_pair());
+    for (y, x, expected) in [
+        (0.8_f64, -1.5_f64, None),
+        (
+            1e150,
+            2e150,
+            Some([-1.6e-301, -1.2e-301, -1.2e-301, 1.6e-301]),
+        ),
+        (0.0, 0.0, Some([0.0; 4])),
+    ] {
+        let expected = expected.unwrap_or_else(|| {
+            let r4 = (x * x + y * y).powi(2);
+            let mixed = (y * y - x * x) / r4;
+            [-2.0 * x * y / r4, mixed, mixed, 2.0 * x * y / r4]
+        });
+        let inputs = must!(shaped_inputs(&[("p", vec![2], vec![y, x])]));
+        assert_hessian_routes(&pair, angle, "p", &inputs, &expected, 1e-13);
+    }
+}
+
+#[test]
+fn stop_gradient_passes_values_and_blocks_every_derivative() {
+    let points = vec![0.5, -2.0, 3.0];
+    let inputs = must!(shaped_inputs(&[("x", vec![3], points.clone())]));
+    // sum(x * stop_gradient(x)) has gradient x and a zero Hessian.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3]));
+    let stopped = must!(graph.stop_gradient(x));
+    let product = must!(graph.mul(x, stopped));
+    let total = must!(graph.sum(product));
+    let value = must!(graph.evaluate(total, &inputs));
+    assert_eq!(value.data()[0], 0.25 + 4.0 + 9.0);
+    assert_gradient_routes(&graph, total, &inputs, &[("x", points.clone())], 0.0);
+    assert_hessian_routes(&graph, total, "x", &inputs, &[0.0; 9], 0.0);
+    assert!(graph.lower_text().contains("stop_gradient(%"));
+
+    // x - stop_gradient(x) is zero with gradient one.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![3]));
+    let stopped = must!(graph.stop_gradient(x));
+    let difference = must!(graph.sub(x, stopped));
+    let total = must!(graph.sum(difference));
+    assert_eq!(must!(graph.evaluate(total, &inputs)).data()[0], 0.0);
+    assert_gradient_routes(&graph, total, &inputs, &[("x", vec![1.0; 3])], 0.0);
+
+    // Bool values pass through as data movement.
+    let mut masks = TensorIr::new();
+    let mask = must!(masks.input_typed("mask", vec![2], TensorDType::Bool));
+    let stopped = must!(masks.stop_gradient(mask));
+    let value = must!(masks.evaluate(
+        stopped,
+        &BTreeMap::from([(
+            "mask".to_string(),
+            must!(DynamicTensor::with_dtype(
+                vec![2],
+                vec![1.0, 0.0],
+                TensorDType::Bool
+            )),
+        )]),
+    ));
+    assert_eq!(value.dtype(), TensorDType::Bool);
+    assert_eq!(value.data().as_ref(), &[1.0, 0.0]);
+}
+
+#[test]
+fn cumsum_rounds_every_running_sum_and_differentiates_by_reversal() {
+    // float32: each running sum rounds, so 3e-8 increments never move 1.0,
+    // while a single rounding of the exact sum would.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input_typed("x", vec![2, 4], TensorDType::F32));
+    let forward = must!(graph.cumsum(x, 1, false));
+    let backward = must!(graph.cumsum(x, -1, true));
+    let down = must!(graph.cumsum(x, 0, false));
+    let values = vec![1.0, 3e-8, 3e-8, 3e-8, 3e-8, 3e-8, 3e-8, 1.0];
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::with_dtype(
+            vec![2, 4],
+            values.clone(),
+            TensorDType::F32
+        )),
+    )]);
+    let f32_values = values.iter().map(|value| *value as f32).collect::<Vec<_>>();
+    let scan = |order: &[usize]| {
+        let mut data = vec![0.0_f64; 8];
+        for row in 0..2 {
+            let mut running = 0.0_f32;
+            for (step, column) in order.iter().enumerate() {
+                let entry = f32_values[row * 4 + column];
+                running = if step == 0 { entry } else { running + entry };
+                data[row * 4 + column] = f64::from(running);
+            }
+        }
+        data
+    };
+    let expected_forward = scan(&[0, 1, 2, 3]);
+    let expected_backward = scan(&[3, 2, 1, 0]);
+    assert_eq!(expected_forward[3], 1.0);
+    let expected_down = (0..8)
+        .map(|index| {
+            if index < 4 {
+                f64::from(f32_values[index])
+            } else {
+                f64::from(f32_values[index - 4] + f32_values[index])
+            }
+        })
+        .collect::<Vec<_>>();
+    for (output, expected) in [
+        (forward, expected_forward),
+        (backward, expected_backward),
+        (down, expected_down),
+    ] {
+        assert_same_bits(&must!(graph.evaluate(output, &inputs)).data(), &expected);
+        let plan = must!(graph.compile_cpu(output));
+        assert_same_bits(&must!(plan.evaluate(&inputs)).data(), &expected);
+    }
+    assert!(graph
+        .lower_text()
+        .contains("cumsum(%0, axis=1, reverse=true)"));
+
+    // d sum(cumsum(x) * w) / dx is the opposite-direction cumsum of w.
+    let weights = vec![1.0, 2.0, 3.0, 4.0, -1.0, 0.5, 0.25, 2.0];
+    for (axis, reverse) in [(1, false), (1, true), (0, false), (0, true)] {
+        let mut graph = TensorIr::new();
+        let x = must!(graph.input("x", vec![2, 4]));
+        let w = must!(graph.input("w", vec![2, 4]));
+        let scanned = must!(graph.cumsum(x, axis, reverse));
+        let weighted = must!(graph.mul(scanned, w));
+        let total = must!(graph.sum(weighted));
+        let inputs = must!(shaped_inputs(&[
+            (
+                "x",
+                vec![2, 4],
+                (0..8).map(|index| 0.3 * index as f64 - 1.0).collect()
+            ),
+            ("w", vec![2, 4], weights.clone()),
+        ]));
+        let expected = (0..8)
+            .map(|index| {
+                let (row, column) = (index / 4, index % 4);
+                let (position, extent) = if axis == 1 { (column, 4) } else { (row, 2) };
+                // Entry `index` reaches every output at or after it in scan order.
+                (0..extent)
+                    .filter(|other| {
+                        if reverse {
+                            *other <= position
+                        } else {
+                            *other >= position
+                        }
+                    })
+                    .map(|other| {
+                        if axis == 1 {
+                            weights[row * 4 + other]
+                        } else {
+                            weights[other * 4 + column]
+                        }
+                    })
+                    .sum::<f64>()
+            })
+            .collect::<Vec<_>>();
+        assert_gradient_routes(&graph, total, &inputs, &[("x", expected)], 1e-15);
+    }
+
+    // sum(cumsum(x)^2) has Hessian 2 L^T L, with L the lower (forward) or
+    // upper (reverse) triangle of ones.
+    for (reverse, expected) in [
+        (false, [6.0, 4.0, 2.0, 4.0, 4.0, 2.0, 2.0, 2.0, 2.0]),
+        (true, [2.0, 2.0, 2.0, 2.0, 4.0, 4.0, 2.0, 4.0, 6.0]),
+    ] {
+        let mut graph = TensorIr::new();
+        let x = must!(graph.input("x", vec![3]));
+        let scanned = must!(graph.cumsum(x, 0, reverse));
+        let squared = must!(graph.powi(scanned, 2));
+        let total = must!(graph.sum(squared));
+        let inputs = must!(shaped_inputs(&[("x", vec![3], vec![0.5, -1.0, 2.0])]));
+        assert_hessian_routes(&graph, total, "x", &inputs, &expected, 0.0);
+    }
+}
+
+/// A callee over the [`batching_inputs`] example shapes that uses every new
+/// op with mapped operands, including an `atan2` of a mapped and an
+/// unmapped operand of different ranks.
+fn new_op_batching_fixture() -> Result<(TensorIr, Vec<TensorNodeId>, TensorNodeId), String> {
+    let mut callee = TensorIr::new();
+    let x = callee.input("x", vec![])?;
+    let v = callee.input("v", vec![3])?;
+    let w = callee.input("w", vec![3])?;
+    callee.input("m", vec![3, 2])?;
+    let a = callee.input("a", vec![2, 2])?;
+    let grown = callee.expm1(v)?;
+    let smoothed = callee.erf(v)?;
+    let angle = callee.atan2(v, w)?;
+    let scalar_angle = callee.atan2(x, w)?;
+    let stopped = callee.stop_gradient(a)?;
+    let rows = callee.cumsum(a, 1, true)?;
+    let columns = callee.cumsum(a, 0, false)?;
+    let product = callee.mul(stopped, a)?;
+    let sums = [grown, smoothed, angle, scalar_angle, rows, columns, product]
+        .into_iter()
+        .map(|output| callee.sum(output))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut total = sums[0];
+    for sum in &sums[1..] {
+        total = callee.add(total, *sum)?;
+    }
+    let outputs = vec![grown, smoothed, angle, scalar_angle, stopped, rows, columns];
+    Ok((callee, outputs, total))
+}
+
+#[test]
+fn inline_batched_maps_the_new_ops_and_their_gradients() {
+    let (callee, outputs, total) = must!(new_op_batching_fixture());
+    assert_batched_matches_examples(&callee, &outputs, &[true; 7]);
+    let vjp = must!(callee.symbolic_vjp_many(&[(total, SymbolicCotangent::Ones)]));
+    let names = ["x", "v", "w", "a"];
+    let outputs = names
+        .iter()
+        .map(|name| vjp.gradients[*name])
+        .collect::<Vec<_>>();
+    assert_batched_matches_examples(&vjp.graph, &outputs, &[true; 4]);
+}
+
+/// Device plans for the new ops: the gradient of a loss that uses all of
+/// them (per-node kernels), their forward values, and a Fori whose body
+/// applies the elementwise ones (loop-body lowering).
+#[cfg(any(
+    all(feature = "cuda", target_os = "linux"),
+    all(feature = "mlx", target_os = "macos")
+))]
+fn new_op_device_plans() -> Result<Vec<PlanWithInputs>, String> {
+    let points = vec![-2.5, -0.5, -1e-4, 0.0, 0.3, 1.7, 4.0];
+    let weights = vec![1.0, -0.5, 2.0, 0.0, -3.0, 0.25, 1e-3];
+    let count = points.len();
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![count])?;
+    let w = graph.input("w", vec![count])?;
+    let grown = graph.expm1(x)?;
+    let smoothed = graph.erf(x)?;
+    let angle = graph.atan2(x, w)?;
+    let stopped = graph.stop_gradient(x)?;
+    let scaled = graph.mul(x, stopped)?;
+    let scanned = graph.cumsum(scaled, 0, true)?;
+    let mut total = graph.mul(grown, x)?;
+    for term in [smoothed, angle, scanned] {
+        total = graph.add(total, term)?;
+    }
+    let loss = graph.sum(total)?;
+    let reverse = graph.symbolic_vjp(loss, "cotangent")?;
+    let gradient_inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            DynamicTensor::new(vec![count], points.clone())?,
+        ),
+        (
+            "w".to_string(),
+            DynamicTensor::new(vec![count], weights.clone())?,
+        ),
+        ("cotangent".to_string(), DynamicTensor::filled(vec![], 1.0)?),
+    ]);
+    let mut plans = vec![
+        (
+            reverse.graph.compile_cpu(reverse.gradients["x"])?,
+            gradient_inputs.clone(),
+        ),
+        (
+            reverse.graph.compile_cpu(reverse.gradients["w"])?,
+            gradient_inputs.clone(),
+        ),
+    ];
+    for output in [grown, smoothed, angle, scanned] {
+        plans.push((graph.compile_cpu(output)?, gradient_inputs.clone()));
+    }
+
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![count])?;
+    let index = body.input("index", vec![])?;
+    let grown = body.expm1(carry)?;
+    let smoothed = body.erf(grown)?;
+    let stopped = body.stop_gradient(smoothed)?;
+    let angle = body.atan2(stopped, index)?;
+    let loop_plan = TensorForiExecutionPlan::new(1, 4, body.compile_cpu(angle)?, "carry", "index")?;
+    let mut looped = TensorIr::new();
+    let initial = looped.input("x", vec![count])?;
+    let output = looped.fori(initial, loop_plan, vec![])?;
+    let loop_inputs = BTreeMap::from([("x".to_string(), DynamicTensor::new(vec![count], points)?)]);
+    plans.push((looped.compile_cpu(output)?, loop_inputs));
+    Ok(plans)
+}
+
+/// A float32 `cumsum` long enough that its rounding order matters, along
+/// both axes and directions.
+#[cfg(any(
+    all(feature = "cuda", target_os = "linux"),
+    all(feature = "mlx", target_os = "macos")
+))]
+fn cumsum_device_plans() -> Result<Vec<PlanWithInputs>, String> {
+    let shape = vec![3, 300];
+    let values = (0..900)
+        .map(|index| ((index * 7919 % 1000) as f64 - 500.0) * 1.37e-3 + 1.0 / (1 + index) as f64)
+        .collect::<Vec<_>>();
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        DynamicTensor::with_dtype(shape.clone(), values, TensorDType::F32)?,
+    )]);
+    let mut plans = Vec::new();
+    for (axis, reverse) in [(1, false), (1, true), (0, false), (0, true)] {
+        let mut graph = TensorIr::new();
+        let x = graph.input_typed("x", shape.clone(), TensorDType::F32)?;
+        let scanned = graph.cumsum(x, axis, reverse)?;
+        plans.push((graph.compile_cpu(scanned)?, inputs.clone()));
+    }
+    Ok(plans)
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_new_ops_match_cpu_values_and_gradients() {
+    if std::env::var_os("QUABLA_MLX_TEST").is_none() {
+        return;
+    }
+    for (plan, inputs) in must!(new_op_device_plans()) {
+        let cpu = must!(plan.evaluate(&inputs));
+        let mlx = must!(MlxBackend.execute(&plan, &inputs));
+        assert_eq!(mlx.shape(), cpu.shape());
+        for (device, host) in mlx.data().iter().zip(cpu.data().iter()) {
+            assert!(
+                (device - host).abs() <= 4e-6 * host.abs().max(1.0),
+                "{device} vs {host}"
+            );
+        }
+    }
+    // MLX scans in parallel, so float32 prefix sums agree only to rounding.
+    for (plan, inputs) in must!(cumsum_device_plans()) {
+        let cpu = must!(plan.evaluate(&inputs));
+        let mlx = must!(MlxBackend.execute(&plan, &inputs));
+        assert_eq!(mlx.shape(), cpu.shape());
+        for (device, host) in mlx.data().iter().zip(cpu.data().iter()) {
+            assert!(
+                (device - host).abs() <= 1e-5 * host.abs().max(1.0),
+                "{device} vs {host}"
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_new_ops_match_cpu_values_and_gradients() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    for (plan, inputs) in must!(new_op_device_plans()) {
+        let cpu = must!(plan.evaluate(&inputs));
+        let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+        assert_eq!(cuda.shape(), cpu.shape());
+        for (device, host) in cuda.data().iter().zip(cpu.data().iter()) {
+            assert!(
+                (device - host).abs() <= 4e-6 * host.abs().max(1.0),
+                "{device} vs {host}"
+            );
+        }
+    }
+    // One thread scans each line with __fadd_rn: bitwise the CPU reference.
+    for (plan, inputs) in must!(cumsum_device_plans()) {
+        let cpu = must!(plan.evaluate(&inputs));
+        let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+        assert_eq!(cuda.shape(), cpu.shape());
+        assert_eq!(cuda.data().as_ref(), cpu.data().as_ref());
+    }
+}

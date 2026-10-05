@@ -1392,6 +1392,7 @@ impl TraceTensor {
             "mul" => ir.mul(self.node_id, rhs.node_id)?,
             "greater" => ir.greater(self.node_id, rhs.node_id)?,
             "pow" => ir.pow(self.node_id, rhs.node_id)?,
+            "atan2" => ir.atan2(self.node_id, rhs.node_id)?,
             _ => return Err(format!("unsupported trace tensor binary op {op}")),
         };
         let shape = ir.node_shape(node_id)?;
@@ -1417,6 +1418,7 @@ impl TraceTensor {
             "mul" => ir.mul(self.node_id, scalar)?,
             "greater" => ir.greater(self.node_id, scalar)?,
             "pow" => ir.pow(self.node_id, scalar)?,
+            "atan2" => ir.atan2(self.node_id, scalar)?,
             _ => return Err(format!("unsupported trace tensor scalar op {op}")),
         };
         let shape = ir.node_shape(node_id)?;
@@ -2255,6 +2257,33 @@ impl TraceTensor {
 
     fn log1p_tensor(&self) -> Result<Self, String> {
         self.apply(&[], |ir| ir.log1p(self.node_id))
+    }
+
+    fn expm1_tensor(&self) -> Result<Self, String> {
+        self.apply(&[], |ir| ir.expm1(self.node_id))
+    }
+
+    fn erf_tensor(&self) -> Result<Self, String> {
+        self.apply(&[], |ir| ir.erf(self.node_id))
+    }
+
+    fn stop_gradient_tensor(&self) -> Result<Self, String> {
+        self.apply(&[], |ir| ir.stop_gradient(self.node_id))
+    }
+
+    /// Inclusive prefix sums along the example `axis`, or over the flattened
+    /// example when `axis` is `None` (NumPy's convention).
+    fn cumsum_tensor(&self, axis: Option<isize>, reverse: bool) -> Result<Self, String> {
+        self.ensure_not_bool("cumsum")?;
+        let source = match axis {
+            Some(_) => self.clone(),
+            None => {
+                let example = &self.shape[usize::from(self.batch_axis.is_some())..];
+                self.reshape_tensor(vec![example.iter().product()])?
+            }
+        };
+        let axis = source.example_axis(axis.unwrap_or(0))?;
+        source.apply(&[], |ir| ir.cumsum(source.node_id, axis, reverse))
     }
 
     fn sqrt_tensor(&self) -> Result<Self, String> {
@@ -3277,6 +3306,42 @@ impl TraceTensor {
 
     fn log1p(&self) -> PyResult<Self> {
         self.log1p_tensor().map_err(PyValueError::new_err)
+    }
+
+    fn expm1(&self) -> PyResult<Self> {
+        self.expm1_tensor().map_err(PyValueError::new_err)
+    }
+
+    fn erf(&self) -> PyResult<Self> {
+        self.erf_tensor().map_err(PyValueError::new_err)
+    }
+
+    /// `atan2(self, x)` of an array or Python number `x`.
+    fn atan2(&self, x: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Some(x) = self.traced_operand(x) {
+            return self.binary(&x?, "atan2").map_err(PyValueError::new_err);
+        }
+        if let Some(x) = extract_scalar(x) {
+            self.ensure_not_bool("atan2")
+                .map_err(PyValueError::new_err)?;
+            return self
+                .scalar_binary(x, "atan2")
+                .map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected a TraceTensor, Tensor, or numeric scalar operand",
+        ))
+    }
+
+    /// The value with a zero derivative in every transform.
+    fn stop_gradient(&self) -> PyResult<Self> {
+        self.stop_gradient_tensor().map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None, reverse = false))]
+    fn cumsum(&self, axis: Option<isize>, reverse: bool) -> PyResult<Self> {
+        self.cumsum_tensor(axis, reverse)
+            .map_err(PyValueError::new_err)
     }
 
     fn sqrt(&self) -> PyResult<Self> {

@@ -975,6 +975,63 @@ impl MlxBackend {
                 TensorOp::Log1p { input } => mlx_value(&values, *input)?
                     .log1p_device(&stream)
                     .map_err(|error| error.to_string()),
+                // MLX's own expm1 is off by up to several hundred float32 ulp, and
+                // exp(x) - 1 cancels near zero. Kahan's (u - 1) * x / log(u) with
+                // u = exp(x) keeps both within a few ulp: it is used for |x| < 0.5,
+                // where exp(x) - 1 loses precision, and returns x where u rounds to
+                // 1. Elsewhere exp(x) - 1 is accurate and handles +-inf, overflow
+                // and NaN.
+                TensorOp::Expm1 { input } => {
+                    let input = mlx_value(&values, *input)?;
+                    let fail = |error: mlx_rs::error::Exception| error.to_string();
+                    let one = Array::from_f32(1.0);
+                    let half = Array::from_f32(0.5);
+                    let two = Array::from_f32(2.0);
+                    let zero = Array::from_f32(0.0);
+                    let exp = input.exp_device(&stream).map_err(fail)?;
+                    let shifted = exp.subtract_device(&one, &stream).map_err(fail)?;
+                    let small = input
+                        .abs_device(&stream)
+                        .and_then(|magnitude| magnitude.lt_device(&half, &stream))
+                        .map_err(fail)?;
+                    let exact = shifted.eq_device(&zero, &stream).map_err(fail)?;
+                    let log = ops::r#where_device(&small, &exp, &two, &stream)
+                        .and_then(|base| base.log_device(&stream))
+                        .map_err(fail)?;
+                    let safe_log =
+                        ops::r#where_device(&exact, &one, &log, &stream).map_err(fail)?;
+                    let kahan = shifted
+                        .multiply_device(input, &stream)
+                        .and_then(|product| product.divide_device(&safe_log, &stream))
+                        .map_err(fail)?;
+                    let near_zero =
+                        ops::r#where_device(&exact, input, &kahan, &stream).map_err(fail)?;
+                    ops::r#where_device(&small, &near_zero, &shifted, &stream).map_err(fail)
+                }
+                TensorOp::Erf { input } => ops::erf_device(mlx_value(&values, *input)?, &stream)
+                    .map_err(|error| error.to_string()),
+                TensorOp::Atan2 { y, x } => {
+                    ops::atan2_device(mlx_value(&values, *y)?, mlx_value(&values, *x)?, &stream)
+                        .map_err(|error| error.to_string())
+                }
+                // AD happens on the IR before lowering, so the value is all
+                // that remains of a stop_gradient.
+                TensorOp::StopGradient { input } => Ok(mlx_value(&values, *input)?.clone()),
+                // MLX scans in parallel, so float32 prefix sums may differ
+                // from the CPU's sequential rounded adds in the last bits.
+                TensorOp::CumSum {
+                    input,
+                    axis,
+                    reverse,
+                } => mlx_value(&values, *input)?
+                    .cumsum_device(
+                        i32::try_from(*axis)
+                            .map_err(|_| "MLX cumsum axis exceeds i32".to_string())?,
+                        *reverse,
+                        true,
+                        &stream,
+                    )
+                    .map_err(|error| error.to_string()),
                 TensorOp::Powi { input, exponent } => {
                     let exponent = Array::from_f32(*exponent as f32);
                     mlx_value(&values, *input)?
@@ -2054,6 +2111,11 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Transpose { .. } => "transpose",
         TensorOp::Log { .. } => "log",
         TensorOp::Log1p { .. } => "log1p",
+        TensorOp::Expm1 { .. } => "expm1",
+        TensorOp::Erf { .. } => "erf",
+        TensorOp::Atan2 { .. } => "atan2",
+        TensorOp::StopGradient { .. } => "stop_gradient",
+        TensorOp::CumSum { .. } => "cumsum",
         TensorOp::Concat { .. } => "concat",
         TensorOp::Slice { .. } => "slice",
         TensorOp::PadSlice { .. } => "pad_slice",
