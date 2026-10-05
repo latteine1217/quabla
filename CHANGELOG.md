@@ -9,6 +9,29 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Added
+
+- `quabla.log1p`, `Tensor.log1p`, and `TraceTensor.log1p`: a native
+  elementwise `ln(1 + x)` with derivative `1 / (1 + x)` that follows IEEE
+  semantics instead of raising (`log1p(-1)` is `-inf`, `x < -1` gives
+  `NaN`). It lowers to `log1pf` on CUDA and `log1p` on MLX.
+
+### Fixed
+
+- Traced `softplus` adds `log1p(exp(-|x|))` instead of `log(1 + exp(-|x|))`,
+  which rounded the correction away in `float32`: `jit(softplus)(-20)` now
+  returns 2.06e-9 instead of 0. Eager `softplus` evaluates the same per-op
+  rounded expression, so eager and CPU `jit` agree bitwise.
+- `sigmoid` is `where(x > 0, 1 / (1 + z), z / (1 + z))` with
+  `z = exp(-|x|)`. The textbook form overflowed `exp(-x)` for large negative
+  `x`, so its `float32` gradient was `NaN` there on CPU and MLX. Results
+  where the old form was finite change by at most one ulp; eager and CPU
+  `jit` agree bitwise.
+- `maximum`, `minimum`, `relu`, and the `max`/`min` reductions propagate
+  `NaN` from any operand or position, like NumPy and JAX, eagerly and under
+  `jit`; they used to drop it depending on the operand order. Results and
+  gradient routing for `NaN`-free inputs, ties included, are unchanged.
+
 ## [0.2.2] - 2026-10-06
 
 ### Changed

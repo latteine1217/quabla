@@ -691,6 +691,12 @@ enum TensorOp {
     Log {
         input: TensorNodeId,
     },
+    /// Elementwise `ln(1 + x)`, accurate for small `|x|`. Unlike `Log`, it
+    /// follows IEEE semantics on every backend and never raises: `-1` maps to
+    /// `-inf` and `x < -1` to `NaN`. Its derivative is `1 / (1 + x)`.
+    Log1p {
+        input: TensorNodeId,
+    },
     Concat {
         inputs: Vec<TensorNodeId>,
         axis: usize,
@@ -2202,6 +2208,23 @@ impl DynamicTensor {
         )
     }
 
+    /// `ln(1 + x)` with IEEE semantics: `-1` gives `-inf` and `x < -1` gives
+    /// `NaN`, so it never fails.
+    fn log1p(&self) -> Result<Self, String> {
+        Self::new(
+            self.shape.clone(),
+            self.data.iter().map(f64::ln_1p).collect(),
+        )
+    }
+
+    /// `d log1p(x) / dx = 1 / (1 + x)` with IEEE semantics (`+inf` at `-1`).
+    fn log1p_derivative(&self) -> Result<Self, String> {
+        Self::new(
+            self.shape.clone(),
+            self.data.iter().map(|value| 1.0 / (1.0 + value)).collect(),
+        )
+    }
+
     fn tanh_derivative_from_output(&self) -> Result<Self, String> {
         Self::new(
             self.shape.clone(),
@@ -2877,6 +2900,7 @@ impl TensorIr {
             | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
             | TensorOp::Log { .. }
+            | TensorOp::Log1p { .. }
             | TensorOp::Triangular { .. }
             | TensorOp::Reshape { .. } => remap_tensor_op(&node.op, &|id| remap.get(&id).copied())?,
             TensorOp::Add { .. }
@@ -3505,6 +3529,15 @@ impl TensorIr {
                         transformed.div(input_tangent, input_value)?,
                     )
                 }
+                TensorOp::Log1p { input } => {
+                    let (input_value, input_tangent) = pairs[*input];
+                    let one = transformed.scalar_constant(1.0);
+                    let shifted = transformed.add(one, input_value)?;
+                    (
+                        transformed.log1p(input_value)?,
+                        transformed.div(input_tangent, shifted)?,
+                    )
+                }
                 TensorOp::Matmul { lhs, rhs } => {
                     let (lhs_value, lhs_tangent) = pairs[*lhs];
                     let (rhs_value, rhs_tangent) = pairs[*rhs];
@@ -3916,6 +3949,7 @@ impl TensorIr {
                     Some(axes.iter().map(|axis| *axis as isize).collect()),
                 )?,
                 TensorOp::Log { input } => transformed.log(values[*input])?,
+                TensorOp::Log1p { input } => transformed.log1p(values[*input])?,
                 TensorOp::Concat { inputs, axis } => transformed.concat(
                     inputs.iter().map(|input| values[*input]).collect(),
                     *axis as isize,
@@ -4525,6 +4559,18 @@ impl TensorIr {
                 }
                 TensorOp::Log { input } => {
                     let contribution = transformed.div(upstream, values[*input])?;
+                    let contribution = symbolic_reduce_to_shape(
+                        &mut transformed,
+                        contribution,
+                        &node.shape,
+                        &self.node(*input)?.shape,
+                    )?;
+                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
+                }
+                TensorOp::Log1p { input } => {
+                    let one = transformed.scalar_constant(1.0);
+                    let shifted = transformed.add(one, values[*input])?;
+                    let contribution = transformed.div(upstream, shifted)?;
                     let contribution = symbolic_reduce_to_shape(
                         &mut transformed,
                         contribution,
@@ -5977,6 +6023,13 @@ impl TensorIr {
         self.push_derived(TensorOp::Log { input }, shape)
     }
 
+    /// Elementwise `ln(1 + x)`; see [`TensorOp::Log1p`] for its IEEE
+    /// semantics at and below `-1`.
+    pub fn log1p(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        let shape = self.node(input)?.shape.clone();
+        self.push_derived(TensorOp::Log1p { input }, shape)
+    }
+
     pub fn concat(
         &mut self,
         inputs: Vec<TensorNodeId>,
@@ -6814,6 +6867,16 @@ impl TensorIr {
                         .reduce_to_shape(&self.node(*input)?.shape)?;
                     accumulate(&mut cotangents[*input], contribution)?;
                 }
+                TensorOp::Log1p { input } => {
+                    let input_value = values
+                        .get(*input)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let contribution = cotangent
+                        .mul(&input_value.log1p_derivative()?)?
+                        .reduce_to_shape(&self.node(*input)?.shape)?;
+                    accumulate(&mut cotangents[*input], contribution)?;
+                }
                 TensorOp::Concat { inputs, axis } => {
                     let mut start = 0;
                     for input in inputs {
@@ -7358,6 +7421,15 @@ impl TensorIr {
                         .get(*input)
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?;
                     input_tangent.mul(&input_value.reciprocal()?)?
+                }
+                TensorOp::Log1p { input } => {
+                    let input_tangent = tangents
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated tangent"))?;
+                    let input_value = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    input_tangent.mul(&input_value.log1p_derivative()?)?
                 }
                 TensorOp::Concat { inputs, axis } => DynamicTensor::concat(
                     &inputs
@@ -7950,6 +8022,9 @@ impl TensorIr {
                 ),
                 TensorOp::Log { input } => {
                     format!("%{id} = log(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
+                }
+                TensorOp::Log1p { input } => {
+                    format!("%{id} = log1p(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
                 }
                 TensorOp::Concat { inputs, axis } => format!(
                     "%{id} = concat({}) axis={axis} : {}",
@@ -8789,6 +8864,11 @@ impl TensorIr {
                     .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .log()?,
+                TensorOp::Log1p { input } => values
+                    .get(*input)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .log1p()?,
                 TensorOp::Concat { inputs, axis } => DynamicTensor::concat(
                     &inputs
                         .iter()
@@ -8932,6 +9012,22 @@ impl TensorIr {
                             .mixed
                             .mul(&reciprocal)?
                             .sub(&input.first.mul(&input.second)?.mul(&reciprocal_squared)?)?,
+                    }
+                }
+                TensorOp::Log1p { input } => {
+                    let input = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let derivative = input.value.log1p_derivative()?;
+                    let derivative_squared = derivative.mul(&derivative)?;
+                    MixedTangent {
+                        value: input.value.log1p()?,
+                        first: input.first.mul(&derivative)?,
+                        second: input.second.mul(&derivative)?,
+                        mixed: input
+                            .mixed
+                            .mul(&derivative)?
+                            .sub(&input.first.mul(&input.second)?.mul(&derivative_squared)?)?,
                     }
                 }
                 TensorOp::Reshape { input } => {
@@ -13220,6 +13316,7 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                     Some(axes.iter().map(|axis| *axis as isize).collect()),
                 )?,
                 TensorOp::Log { input } => specialized.log(mapped(*input)?)?,
+                TensorOp::Log1p { input } => specialized.log1p(mapped(*input)?)?,
                 TensorOp::Concat { inputs, axis } => specialized.concat(
                     inputs
                         .iter()
@@ -13417,6 +13514,7 @@ fn cuda_scalar_expression(
         TensorOp::Pow { base, exponent } => {
             Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
         }
+        TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
         TensorOp::Div { .. } | TensorOp::Log { .. } => {
             Err("CUDA loop-body lowering does not yet support div or log".to_string())
         }
@@ -13683,6 +13781,7 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         | TensorOp::Powi { input, .. }
         | TensorOp::Transpose { input, .. }
         | TensorOp::Log { input }
+        | TensorOp::Log1p { input }
         | TensorOp::Slice { input, .. }
         | TensorOp::PadSlice { input, .. }
         | TensorOp::Broadcast { input }
@@ -13798,6 +13897,7 @@ fn reuse_forward_unary(
         TensorOp::Cos { input } => (input, Some(f64::cos)),
         TensorOp::Tanh { input } => (input, Some(f64::tanh)),
         TensorOp::Exp { input } => (input, Some(f64::exp)),
+        TensorOp::Log1p { input } => (input, Some(f64::ln_1p)),
         TensorOp::Reshape { input } => (input, None),
         _ => return Ok(None),
     };
@@ -14152,6 +14252,7 @@ fn infer_tensor_placement(
         | TensorOp::Cos { input }
         | TensorOp::Powi { input, .. }
         | TensorOp::Log { input }
+        | TensorOp::Log1p { input }
         | TensorOp::Cast { input } => unary(*input),
         TensorOp::Sum { input } => {
             let placement = unary(*input)?;
@@ -14572,6 +14673,7 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Pow { .. } => "pow",
         TensorOp::Transpose { .. } => "transpose",
         TensorOp::Log { .. } => "log",
+        TensorOp::Log1p { .. } => "log1p",
         TensorOp::Concat { .. } => "concat",
         TensorOp::Slice { .. } => "slice",
         TensorOp::PadSlice { .. } => "pad_slice",
@@ -14622,6 +14724,7 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
             let value = scalar(*input)?;
             (value > 0.0).then(|| value.ln())
         }
+        TensorOp::Log1p { input } => Some(scalar(*input)?.ln_1p()),
         _ => None,
     }
 }
@@ -14675,6 +14778,7 @@ fn fold_tensor_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<Dynami
         TensorOp::Powi { input, exponent } => constant(*input)?.powi(*exponent).ok(),
         TensorOp::Pow { base, exponent } => constant(*base)?.pow(&*constant(*exponent)?).ok(),
         TensorOp::Log { input } => constant(*input)?.log().ok(),
+        TensorOp::Log1p { input } => constant(*input)?.log1p().ok(),
         _ => None,
     }
 }
@@ -15069,6 +15173,7 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         | TensorOp::Sin { input }
         | TensorOp::Cos { input }
         | TensorOp::Log { input }
+        | TensorOp::Log1p { input }
         | TensorOp::Broadcast { input }
         | TensorOp::Cholesky { input } => arguments[0] = *input as u64,
         TensorOp::SumAxis { input, axis } | TensorOp::MeanAxis { input, axis } => {
@@ -15475,6 +15580,9 @@ fn remap_tensor_op(
             axes: axes.clone(),
         }),
         TensorOp::Log { input } => Ok(TensorOp::Log {
+            input: remap_node(*input)?,
+        }),
+        TensorOp::Log1p { input } => Ok(TensorOp::Log1p {
             input: remap_node(*input)?,
         }),
         TensorOp::Concat { inputs, axis } => Ok(TensorOp::Concat {

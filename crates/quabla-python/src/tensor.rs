@@ -194,6 +194,17 @@ pub(crate) fn extract_scalar(value: &Bound<'_, PyAny>) -> Option<f64> {
     value.extract::<f64>().ok()
 }
 
+/// Whether a max/min reduction replaces its running `current` with the later
+/// `value`. It mirrors the traced pairwise `maximum(current, value)`: ties
+/// take the later element, and a NaN is kept once seen and taken when it
+/// arrives, so NaN propagates from any position like NumPy.
+fn extrema_replaces(maximum: bool, current: f64, value: f64) -> bool {
+    if current.is_nan() {
+        return false;
+    }
+    value.is_nan() || (maximum && value >= current) || (!maximum && value <= current)
+}
+
 fn element_count(shape: &[usize]) -> Result<usize, String> {
     if shape.contains(&0) {
         return Err("tensor extents must be greater than zero".to_string());
@@ -878,26 +889,34 @@ impl PyTensor {
         base.try_map(|lhs| if lhs > rhs { 1.0 } else { 0.0 })
     }
 
+    /// `where(isnan(x) | (x > y), x, y)` like the traced form: ties select
+    /// `y`, and NaN in either operand propagates (a NaN `y` fails `>`).
     pub fn try_maximum(&self, rhs: &Self) -> Result<Self, String> {
-        let mask = self.try_gt(rhs)?;
+        let mask = self.try_elementwise(rhs, "gt", |lhs, rhs| {
+            Ok(f64::from(lhs.is_nan() || lhs > rhs))
+        })?;
         Self::try_where(&mask, self, rhs)
     }
 
     pub fn try_maximum_scalar(&self, rhs: f64) -> Result<Self, String> {
         let base = self.arithmetic_base();
         let rhs = base.dtype.round(rhs);
-        base.try_map(|lhs| if lhs > rhs { lhs } else { rhs })
+        base.try_map(|lhs| if lhs.is_nan() || lhs > rhs { lhs } else { rhs })
     }
 
+    /// `where(isnan(x) | (y > x), x, y)` like the traced form: ties select
+    /// `y`, and NaN in either operand propagates.
     pub fn try_minimum(&self, rhs: &Self) -> Result<Self, String> {
-        let mask = rhs.try_gt(self)?;
+        let mask = rhs.try_elementwise(self, "gt", |rhs, lhs| {
+            Ok(f64::from(lhs.is_nan() || rhs > lhs))
+        })?;
         Self::try_where(&mask, self, rhs)
     }
 
     pub fn try_minimum_scalar(&self, rhs: f64) -> Result<Self, String> {
         let base = self.arithmetic_base();
         let rhs = base.dtype.round(rhs);
-        base.try_map(|lhs| if rhs > lhs { lhs } else { rhs })
+        base.try_map(|lhs| if lhs.is_nan() || rhs > lhs { lhs } else { rhs })
     }
 
     pub fn try_where(mask: &Self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
@@ -1394,7 +1413,7 @@ impl PyTensor {
         }
         let Some(axis) = axis else {
             let value = self.data.iter().fold(self.data.get(0), |current, value| {
-                if (maximum && value >= current) || (!maximum && value <= current) {
+                if extrema_replaces(maximum, current, value) {
                     value
                 } else {
                     current
@@ -1427,8 +1446,7 @@ impl PyTensor {
                 }
             }
             match data[output_index] {
-                Some(current)
-                    if !((maximum && value >= current) || (!maximum && value <= current)) => {}
+                Some(current) if !extrema_replaces(maximum, current, value) => {}
                 _ => data[output_index] = Some(value),
             }
         }
@@ -1452,6 +1470,10 @@ impl PyTensor {
 
     pub fn try_log(&self) -> Result<Self, String> {
         self.try_unary("log", f64::ln)
+    }
+
+    pub fn try_log1p(&self) -> Result<Self, String> {
+        self.try_unary("log1p", f64::ln_1p)
     }
 
     pub fn try_sqrt(&self) -> Result<Self, String> {
@@ -1497,13 +1519,33 @@ impl PyTensor {
         })
     }
 
+    /// The traced `sigmoid` expression `where(x > 0, 1 / (1 + z), z / (1 + z))`
+    /// with `z = exp(-|x|)`, rounded to the dtype after every op exactly as
+    /// per-node CPU execution does, so eager and CPU `jit` agree bitwise.
     pub fn try_sigmoid(&self) -> Result<Self, String> {
-        self.try_unary("sigmoid", |value| 1.0 / (1.0 + (-value).exp()))
+        let round = |value: f64| self.dtype.round(value);
+        self.try_unary("sigmoid", |value| {
+            let decay = round((-value.abs()).exp());
+            let denominator = round(decay + 1.0);
+            if value > 0.0 {
+                1.0 / denominator
+            } else {
+                decay / denominator
+            }
+        })
     }
 
+    /// The traced `softplus` expression `maximum(x, 0) + log1p(exp(-|x|))`,
+    /// rounded to the dtype after every op like `try_sigmoid`.
     pub fn try_softplus(&self) -> Result<Self, String> {
+        let round = |value: f64| self.dtype.round(value);
         self.try_unary("softplus", |value| {
-            value.max(0.0) + (-value.abs()).exp().ln_1p()
+            let linear = if value.is_nan() || value > 0.0 {
+                value
+            } else {
+                0.0
+            };
+            linear + round(round((-value.abs()).exp()).ln_1p())
         })
     }
 
@@ -2214,6 +2256,10 @@ impl PyTensor {
 
     fn log(&self) -> PyResult<Self> {
         self.try_log().map_err(PyValueError::new_err)
+    }
+
+    fn log1p(&self) -> PyResult<Self> {
+        self.try_log1p().map_err(PyValueError::new_err)
     }
 
     fn sqrt(&self) -> PyResult<Self> {

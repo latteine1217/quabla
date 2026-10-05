@@ -1735,24 +1735,53 @@ impl TraceTensor {
         counts.compare_scalar(0.0, kind)
     }
 
+    /// `isnan(self) | ordered`, the `maximum`/`minimum` mask for a float
+    /// `self`: a NaN `self` selects itself, and a NaN right operand fails the
+    /// ordered comparison and is selected, so NaN propagates from either side
+    /// like NumPy and JAX. A `bool` left operand cannot be NaN; it keeps the
+    /// legacy `greater` mask so its promotion and errors stay unchanged.
+    fn nan_or(&self, ordered: Self) -> Result<Self, String> {
+        self.classify_tensor(true)?.logical_tensor(&ordered, false)
+    }
+
+    /// `where(isnan(x) | (x > y), x, y)`: ties select `y`, and NaN in either
+    /// operand propagates.
     fn maximum_tensor(&self, rhs: &Self) -> Result<Self, String> {
-        let mask = self.binary(rhs, "greater")?;
+        if !self.dtype()?.is_floating() {
+            let mask = self.binary(rhs, "greater")?;
+            return mask.where_tensor(self, rhs);
+        }
+        let mask = self.nan_or(self.compare_tensor(rhs, TensorComparison::Greater)?)?;
         mask.where_tensor(self, rhs)
     }
 
     fn maximum_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let mask = self.scalar_binary(rhs, "greater")?;
+        let mask = if self.dtype()?.is_floating() {
+            self.nan_or(self.compare_scalar(rhs, TensorComparison::Greater)?)?
+        } else {
+            self.scalar_binary(rhs, "greater")?
+        };
         let rhs = self.scalar_tensor(rhs)?;
         mask.where_tensor(self, &rhs)
     }
 
+    /// `where(isnan(x) | (y > x), x, y)`: ties select `y`, and NaN in either
+    /// operand propagates.
     fn minimum_tensor(&self, rhs: &Self) -> Result<Self, String> {
-        let mask = rhs.binary(self, "greater")?;
+        if !self.dtype()?.is_floating() {
+            let mask = rhs.binary(self, "greater")?;
+            return mask.where_tensor(self, rhs);
+        }
+        let mask = self.nan_or(rhs.compare_tensor(self, TensorComparison::Greater)?)?;
         mask.where_tensor(self, rhs)
     }
 
     fn minimum_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let mask = self.scalar_left_binary(rhs, "greater")?;
+        let mask = if self.dtype()?.is_floating() {
+            self.nan_or(self.compare_scalar(rhs, TensorComparison::Less)?)?
+        } else {
+            self.scalar_left_binary(rhs, "greater")?
+        };
         let rhs = self.scalar_tensor(rhs)?;
         mask.where_tensor(self, &rhs)
     }
@@ -1785,23 +1814,35 @@ impl TraceTensor {
         mask.where_tensor(self, &negative)
     }
 
-    fn sigmoid_tensor(&self) -> Result<Self, String> {
-        self.ensure_not_bool("sigmoid")?;
-        self.scalar_binary(-1.0, "mul")?
-            .exp_tensor()?
-            .scalar_binary(1.0, "add")?
-            .scalar_left_binary(1.0, "div")
+    /// `exp(-|x|)`, which never overflows. `abs` takes its `0 - x` branch at
+    /// zero, so the derivative there is that of `exp(x)`.
+    fn exp_negative_abs(&self) -> Result<Self, String> {
+        self.abs_tensor()?.scalar_binary(-1.0, "mul")?.exp_tensor()
     }
 
+    /// `where(x > 0, 1 / (1 + z), z / (1 + z))` with `z = exp(-|x|)`. Both
+    /// branches stay finite for every finite `x`, so the unselected branch
+    /// cannot form `0 * inf` in the gradient (the textbook
+    /// `1 / (1 + exp(-x))` overflows `exp` for large negative `x`). Zero
+    /// takes the `z / (1 + z)` branch, which matches the branch `abs` takes.
+    /// `PyTensor::try_sigmoid` evaluates the same per-op rounded expression.
+    fn sigmoid_tensor(&self) -> Result<Self, String> {
+        self.ensure_not_bool("sigmoid")?;
+        let decay = self.exp_negative_abs()?;
+        let denominator = decay.scalar_binary(1.0, "add")?;
+        let positive = denominator.scalar_left_binary(1.0, "div")?;
+        let negative = decay.binary(&denominator, "div")?;
+        self.compare_scalar(0.0, TensorComparison::Greater)?
+            .where_tensor(&positive, &negative)
+    }
+
+    /// `maximum(x, 0) + log1p(exp(-|x|))`; `log1p` keeps the correction
+    /// accurate where `exp(-|x|)` is below the dtype epsilon.
+    /// `PyTensor::try_softplus` evaluates the same per-op rounded expression.
     fn softplus_tensor(&self) -> Result<Self, String> {
         self.ensure_not_bool("softplus")?;
         let linear = self.maximum_scalar(0.0)?;
-        let correction = self
-            .abs_tensor()?
-            .scalar_binary(-1.0, "mul")?
-            .exp_tensor()?
-            .scalar_binary(1.0, "add")?
-            .log_tensor()?;
+        let correction = self.exp_negative_abs()?.log1p_tensor()?;
         linear.binary(&correction, "add")
     }
 
@@ -2224,6 +2265,10 @@ impl TraceTensor {
             shape,
             self.batch_axis,
         ))
+    }
+
+    fn log1p_tensor(&self) -> Result<Self, String> {
+        self.apply(&[], |ir| ir.log1p(self.node_id))
     }
 
     fn sqrt_tensor(&self) -> Result<Self, String> {
@@ -3242,6 +3287,10 @@ impl TraceTensor {
 
     fn log(&self) -> PyResult<Self> {
         self.log_tensor().map_err(PyValueError::new_err)
+    }
+
+    fn log1p(&self) -> PyResult<Self> {
+        self.log1p_tensor().map_err(PyValueError::new_err)
     }
 
     fn sqrt(&self) -> PyResult<Self> {
