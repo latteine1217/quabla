@@ -593,6 +593,13 @@ enum TensorOp {
         target: TensorForiVjpTarget,
         group: usize,
     },
+    /// A data-dependent loop: the body runs while the predicate region
+    /// returns true. Only the final carry is produced.
+    While {
+        carry: TensorNodeId,
+        loop_plan: TensorWhileExecutionPlan,
+        captures: Vec<(String, TensorNodeId)>,
+    },
     /// One selected result of a shared fixed-bound `Scan` execution.
     Scan {
         carry: TensorNodeId,
@@ -944,6 +951,10 @@ impl std::fmt::Display for BatchingError {
                 "vmap cannot batch solve: it takes rank-2 operands only, so an operand that \
                  depends on a mapped argument has no batching rule",
             ),
+            Self::Unsupported { op: "while" } => formatter.write_str(
+                "vmap cannot batch a while_loop: its trip count could differ per batch \
+                 element; use a bounded fori_loop whose body masks finished elements with where",
+            ),
             Self::Unsupported { op } => write!(
                 formatter,
                 "vmap cannot batch a {op} region node: a cond, fori, or scan region whose \
@@ -1019,6 +1030,23 @@ pub struct TensorForiExecutionPlan {
     external_captures: BTreeMap<String, Vec<usize>>,
     #[cfg(feature = "mlx")]
     mlx_vjp: Option<TensorMlxVjpPlan>,
+}
+
+/// A loop with a traced termination predicate (`while_loop`).
+///
+/// Both regions read the same named inputs: the carry plus the external
+/// captures. The predicate region returns a scalar `Bool`; the body region
+/// returns the next carry. Every backend evaluates the predicate, reads it
+/// back to the host, and runs the body only while it is true, so the trip
+/// count is data dependent and no fixed-length tape exists. Reverse-mode
+/// differentiation is therefore rejected; forward mode runs the same loop
+/// over a packed `(primal, tangent)` carry.
+#[derive(Clone, Debug)]
+pub struct TensorWhileExecutionPlan {
+    predicate: TensorRegion,
+    body: TensorRegion,
+    carry_name: String,
+    external_captures: BTreeMap<String, Vec<usize>>,
 }
 
 /// Precompiled body reverse plan used by device backends that execute fixed
@@ -3252,6 +3280,7 @@ impl TensorIr {
             }
             TensorOp::Solve { .. }
             | TensorOp::Cond { .. }
+            | TensorOp::While { .. }
             | TensorOp::Fori { .. }
             | TensorOp::ForiJvp { .. }
             | TensorOp::ForiVjp { .. }
@@ -3622,6 +3651,18 @@ impl TensorIr {
                     captures,
                     &pairs,
                     &format!("__quabla_fori_jvp_{node_index}"),
+                )?,
+                TensorOp::While {
+                    carry,
+                    loop_plan,
+                    captures,
+                } => symbolic_jvp_while(
+                    &mut transformed,
+                    loop_plan,
+                    *carry,
+                    captures,
+                    &pairs,
+                    &format!("__quabla_while_jvp_{node_index}"),
                 )?,
                 TensorOp::ForiJvp { .. } => {
                     return Err(
@@ -4158,6 +4199,11 @@ impl TensorIr {
                     loop_plan,
                     captures,
                 } => symbolic_clone_fori(&mut transformed, *carry, loop_plan, captures, &values)?,
+                TensorOp::While {
+                    carry,
+                    loop_plan,
+                    captures,
+                } => symbolic_clone_while(&mut transformed, *carry, loop_plan, captures, &values)?,
                 TensorOp::ForiVjp { .. } => {
                     return Err(
                         "symbolic VJP through a Fori VJP result is not implemented".to_string()
@@ -4396,6 +4442,9 @@ impl TensorIr {
                     &mut cotangents,
                     node_id,
                 )?,
+                TensorOp::While { .. } => {
+                    return Err(WHILE_LOOP_REVERSE_MODE_ERROR.to_string());
+                }
                 TensorOp::ForiVjp { .. } => {
                     return Err(
                         "symbolic VJP through a Fori VJP result is not implemented".to_string()
@@ -5486,6 +5535,72 @@ impl TensorIr {
         let dtype = loop_plan.body.plan.input_dtype(&loop_plan.carry_name)?;
         Ok(self.push_node(
             TensorOp::Fori {
+                carry,
+                loop_plan,
+                captures,
+            },
+            carry_shape,
+            dtype,
+            false,
+        ))
+    }
+
+    /// Adds a data-dependent loop whose predicate and body regions share the
+    /// carry and external captures. External captures bind to parent nodes.
+    pub fn while_loop(
+        &mut self,
+        carry: TensorNodeId,
+        loop_plan: TensorWhileExecutionPlan,
+        captures: Vec<(String, TensorNodeId)>,
+    ) -> Result<TensorNodeId, String> {
+        let carry_shape = self.node(carry)?.shape.clone();
+        if carry_shape != loop_plan.carry_shape()? {
+            return Err(format!(
+                "while loop carry shape {:?} does not match loop body carry shape {:?}",
+                carry_shape,
+                loop_plan.carry_shape()?
+            ));
+        }
+        if captures.len() != loop_plan.external_captures().len() {
+            return Err(
+                "while loop captures must bind every external region capture exactly once"
+                    .to_string(),
+            );
+        }
+        let mut seen = BTreeSet::new();
+        for (name, capture) in &captures {
+            if !seen.insert(name.as_str()) {
+                return Err(format!(
+                    "while loop capture {name:?} is bound more than once"
+                ));
+            }
+            let expected_shape = loop_plan
+                .external_captures()
+                .get(name)
+                .ok_or_else(|| format!("while loop binds unknown external capture {name:?}"))?;
+            if self.node(*capture)?.shape != *expected_shape {
+                return Err(format!(
+                    "while loop capture {name:?} has shape {:?}, expected {:?}",
+                    self.node(*capture)?.shape,
+                    expected_shape
+                ));
+            }
+            self.check_region_binding_dtype(
+                "while loop",
+                name,
+                *capture,
+                loop_plan.region_of(name),
+            )?;
+        }
+        self.check_region_binding_dtype(
+            "while loop",
+            &loop_plan.carry_name,
+            carry,
+            &loop_plan.body.plan,
+        )?;
+        let dtype = loop_plan.body.plan.input_dtype(&loop_plan.carry_name)?;
+        Ok(self.push_node(
+            TensorOp::While {
                 carry,
                 loop_plan,
                 captures,
@@ -7160,6 +7275,9 @@ impl TensorIr {
                         accumulate(&mut cotangents[*capture], gradient)?;
                     }
                 }
+                TensorOp::While { .. } => {
+                    return Err(WHILE_LOOP_REVERSE_MODE_ERROR.to_string());
+                }
                 TensorOp::ForiVjp { .. } => {
                     return Err(
                         "direct VJP through a Fori VJP result is not implemented".to_string()
@@ -7850,6 +7968,28 @@ impl TensorIr {
                     branches.jvp(predicate, &branch_inputs, &branch_tangents)?.1
                 }
                 TensorOp::Fori {
+                    carry,
+                    loop_plan,
+                    captures,
+                } => {
+                    let external_inputs = tensor_fori_capture_values(captures, &values)?;
+                    let external_tangents = tensor_fori_capture_values(captures, &tangents)?;
+                    loop_plan
+                        .jvp(
+                            values
+                                .get(*carry)
+                                .cloned()
+                                .ok_or_else(|| format!("node {carry} has no evaluated value"))?,
+                            tangents
+                                .get(*carry)
+                                .cloned()
+                                .ok_or_else(|| format!("node {carry} has no evaluated tangent"))?,
+                            &external_inputs,
+                            &external_tangents,
+                        )?
+                        .1
+                }
+                TensorOp::While {
                     carry,
                     loop_plan,
                     captures,
@@ -8646,6 +8786,16 @@ impl TensorIr {
                     branches.false_node_count(),
                     format_tensor_type(&node.shape, node.dtype)
                 ),
+                TensorOp::While {
+                    carry,
+                    loop_plan,
+                    captures,
+                } => format!(
+                    "%{id} = while(carry=%{carry}, captures={captures:?}, predicate_nodes={}, body_nodes={}) : {}",
+                    loop_plan.predicate.plan.node_count(),
+                    loop_plan.body.plan.node_count(),
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
                 TensorOp::Fori {
                     carry,
                     loop_plan,
@@ -9251,6 +9401,21 @@ impl TensorIr {
                     )?;
                     let branch_inputs = tensor_forward_capture_values(captures, &values)?;
                     branches.evaluate(predicate, &branch_inputs)?
+                }
+                TensorOp::While {
+                    carry,
+                    loop_plan,
+                    captures,
+                } => {
+                    let external_inputs = tensor_forward_capture_values(captures, &values)?;
+                    loop_plan.evaluate(
+                        values
+                            .get(*carry)
+                            .and_then(Option::as_ref)
+                            .cloned()
+                            .ok_or_else(|| format!("node {carry} has no evaluated value"))?,
+                        &external_inputs,
+                    )?
                 }
                 TensorOp::Fori {
                     carry,
@@ -10372,6 +10537,7 @@ impl TensorIr {
                             .where_select(&on_true.mixed, &on_false.mixed)?,
                     }
                 }
+                TensorOp::While { .. } => return Err(WHILE_LOOP_REVERSE_MODE_ERROR.to_string()),
                 TensorOp::Cond { .. } => return Err(
                     "mixed second-order differentiation through Cond regions is not implemented"
                         .to_string(),
@@ -10753,6 +10919,155 @@ fn symbolic_jvp_fori(
     Ok((value, tangent))
 }
 
+/// Forward mode through a while loop is another while loop over the packed
+/// `[primal, tangent]` carry: the predicate reads only the primal half, so the
+/// tangent follows exactly the primal iterations (as in JAX).
+fn symbolic_jvp_while(
+    transformed: &mut TensorIr,
+    loop_plan: &TensorWhileExecutionPlan,
+    carry: TensorNodeId,
+    captures: &[(String, TensorNodeId)],
+    parent_pairs: &[(TensorNodeId, TensorNodeId)],
+    namespace: &str,
+) -> Result<(TensorNodeId, TensorNodeId), String> {
+    let carry_shape = loop_plan.carry_shape()?;
+    let (augmented_plan, tangent_names) = symbolic_jvp_while_plan(loop_plan, namespace)?;
+    let (initial_value, initial_tangent) = *parent_pairs
+        .get(carry)
+        .ok_or_else(|| format!("while carry node {carry} has no symbolic JVP pair"))?;
+    let packed_initial =
+        symbolic_pack_tensor_pair(transformed, initial_value, initial_tangent, &carry_shape)?;
+    let parent_captures = captures.iter().cloned().collect::<BTreeMap<_, _>>();
+    let augmented_captures = augmented_plan
+        .external_captures()
+        .keys()
+        .map(|name| {
+            if let Some(parent) = parent_captures.get(name) {
+                return parent_pairs
+                    .get(*parent)
+                    .map(|pair| (name.clone(), pair.0))
+                    .ok_or_else(|| {
+                        format!("while capture node {parent} has no symbolic JVP value")
+                    });
+            }
+            let source = tangent_names
+                .iter()
+                .find_map(|(source, tangent)| (tangent == name).then_some(source))
+                .ok_or_else(|| format!("symbolic While JVP has unknown capture {name:?}"))?;
+            let parent = parent_captures.get(source).ok_or_else(|| {
+                format!("symbolic While JVP tangent capture {source:?} has no parent binding")
+            })?;
+            parent_pairs
+                .get(*parent)
+                .map(|pair| (name.clone(), pair.1))
+                .ok_or_else(|| format!("while capture node {parent} has no symbolic JVP tangent"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let packed = transformed.while_loop(packed_initial, augmented_plan, augmented_captures)?;
+    symbolic_unpack_tensor_pair(transformed, packed, &carry_shape)
+}
+
+fn symbolic_jvp_while_plan(
+    loop_plan: &TensorWhileExecutionPlan,
+    namespace: &str,
+) -> Result<(TensorWhileExecutionPlan, BTreeMap<String, String>), String> {
+    let body_plan = &loop_plan.body.plan;
+    let predicate_plan = &loop_plan.predicate.plan;
+    let mut captures = loop_plan.external_captures.clone();
+    captures.insert(loop_plan.carry_name.clone(), loop_plan.carry_shape()?);
+    let input_dtype = |name: &str| {
+        body_plan
+            .input_dtype(name)
+            .or_else(|_| predicate_plan.input_dtype(name))
+    };
+    let mut tangent_names = BTreeMap::new();
+    for (index, name) in captures.keys().enumerate() {
+        let mut tangent_name = format!("{namespace}_tangent_{index}");
+        while captures.contains_key(&tangent_name)
+            || tangent_names
+                .values()
+                .any(|candidate| candidate == &tangent_name)
+        {
+            tangent_name.push('_');
+        }
+        tangent_names.insert(name.clone(), tangent_name);
+    }
+    let body = body_plan.as_ir();
+    let body_transform =
+        body.symbolic_jvp_with_seed(body_plan.output_node_id, |graph, name, value, shape| {
+            tangent_names
+                .get(name)
+                .map(|tangent_name| {
+                    let dtype = graph.node_dtype(value)?;
+                    graph.input_typed(tangent_name.clone(), shape.to_vec(), dtype)
+                })
+                .transpose()
+        })?;
+
+    let carry_shape = loop_plan.carry_shape()?;
+    let mut packed_carry_shape = vec![2];
+    packed_carry_shape.extend_from_slice(&carry_shape);
+    let packed_name = format!("{namespace}_carry");
+    let mut augmented = TensorIr::new();
+    let packed_carry = augmented.input_typed(
+        packed_name.clone(),
+        packed_carry_shape,
+        input_dtype(&loop_plan.carry_name)?,
+    )?;
+    let (primal_carry, tangent_carry) =
+        symbolic_unpack_tensor_pair(&mut augmented, packed_carry, &carry_shape)?;
+    let mut replacements = BTreeMap::new();
+    for (name, shape) in &captures {
+        let replacement = if name == &loop_plan.carry_name {
+            primal_carry
+        } else {
+            augmented.input_typed(name.clone(), shape.clone(), input_dtype(name)?)?
+        };
+        replacements.insert(name.clone(), replacement);
+    }
+    for (source, tangent_name) in &tangent_names {
+        let replacement = if source == &loop_plan.carry_name {
+            tangent_carry
+        } else {
+            augmented.input_typed(
+                tangent_name.clone(),
+                captures[source].clone(),
+                input_dtype(source)?,
+            )?
+        };
+        replacements.insert(tangent_name.clone(), replacement);
+    }
+    let next_value = symbolic_clone_with_input_replacements(
+        &mut augmented,
+        &body_transform.graph,
+        body_transform.value,
+        &replacements,
+    )?;
+    let next_tangent = symbolic_clone_with_input_replacements(
+        &mut augmented,
+        &body_transform.graph,
+        body_transform.tangent,
+        &replacements,
+    )?;
+    let next_packed =
+        symbolic_pack_tensor_pair(&mut augmented, next_value, next_tangent, &carry_shape)?;
+    let predicate_ir = predicate_plan.as_ir();
+    let keep_going = symbolic_clone_with_input_replacements(
+        &mut augmented,
+        &predicate_ir,
+        predicate_plan.output_node_id,
+        &replacements,
+    )?;
+    Ok((
+        TensorWhileExecutionPlan::new(
+            augmented.compile_cpu(keep_going)?,
+            augmented.compile_cpu(next_packed)?,
+            packed_name,
+        )?,
+        tangent_names,
+    ))
+}
+
 fn symbolic_jvp_scan(
     transformed: &mut TensorIr,
     scan_plan: &TensorScanExecutionPlan,
@@ -11085,6 +11400,29 @@ fn symbolic_clone_cond(
         })
         .collect::<Result<Vec<_>, _>>()?;
     transformed.cond_with_captures(predicate, branches.clone(), captures)
+}
+
+fn symbolic_clone_while(
+    transformed: &mut TensorIr,
+    carry: TensorNodeId,
+    loop_plan: &TensorWhileExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+    values: &[TensorNodeId],
+) -> Result<TensorNodeId, String> {
+    let carry = values
+        .get(carry)
+        .copied()
+        .ok_or_else(|| format!("while carry node {carry} has no symbolic value"))?;
+    let captures = captures
+        .iter()
+        .map(|(name, node_id)| {
+            values
+                .get(*node_id)
+                .map(|value| (name.clone(), *value))
+                .ok_or_else(|| format!("while capture node {node_id} has no symbolic value"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    transformed.while_loop(carry, loop_plan.clone(), captures)
 }
 
 fn symbolic_clone_fori(
@@ -12224,6 +12562,189 @@ impl TensorForiExecutionPlan {
         Ok(tangents)
     }
 }
+
+impl TensorWhileExecutionPlan {
+    /// Builds a while loop from a predicate region and a body region over the
+    /// same named inputs. Either region may ignore an input the other reads,
+    /// so the external captures are the union of both regions' inputs.
+    pub fn new(
+        predicate: TensorExecutionPlan,
+        body: TensorExecutionPlan,
+        carry_name: impl Into<String>,
+    ) -> Result<Self, String> {
+        let carry_name = carry_name.into();
+        let predicate = TensorRegion::new(predicate);
+        let body = TensorRegion::new(body);
+        let carry_shape = body
+            .captures
+            .get(&carry_name)
+            .ok_or_else(|| format!("while loop body does not capture carry {carry_name:?}"))?;
+        if body.output_shape()? != *carry_shape {
+            return Err(format!(
+                "while loop body output shape {:?} does not match carry shape {:?}",
+                body.output_shape()?,
+                carry_shape
+            ));
+        }
+        check_loop_region_inputs(&body.plan, "while loop")?;
+        check_loop_region_inputs(&predicate.plan, "while loop predicate")?;
+        check_region_output_dtype(
+            &body.plan,
+            body.plan.output_node_id,
+            &carry_name,
+            "while loop",
+        )?;
+        if !predicate.output_shape()?.is_empty()
+            || predicate.plan.output_dtype()? != TensorDType::Bool
+        {
+            return Err(format!(
+                "while loop predicate must return a scalar bool, got shape {:?} and dtype {}",
+                predicate.output_shape()?,
+                predicate.plan.output_dtype()?
+            ));
+        }
+        let mut external_captures = BTreeMap::new();
+        for region in [&body, &predicate] {
+            for (name, shape) in &region.captures {
+                if let Some(other) = body.captures.get(name) {
+                    if other != shape
+                        || body.plan.input_dtype(name)? != region.plan.input_dtype(name)?
+                    {
+                        return Err(format!(
+                            "while loop predicate and body capture {name:?} with different \
+                             shapes or dtypes"
+                        ));
+                    }
+                }
+                if name != &carry_name {
+                    external_captures.insert(name.clone(), shape.clone());
+                }
+            }
+        }
+        Ok(Self {
+            predicate,
+            body,
+            carry_name,
+            external_captures,
+        })
+    }
+
+    pub fn carry_shape(&self) -> Result<Vec<usize>, String> {
+        self.body
+            .captures
+            .get(&self.carry_name)
+            .cloned()
+            .ok_or_else(|| "while loop carry capture is missing".to_string())
+    }
+
+    pub fn carry_name(&self) -> &str {
+        &self.carry_name
+    }
+
+    pub fn external_captures(&self) -> &BTreeMap<String, Vec<usize>> {
+        &self.external_captures
+    }
+
+    /// The region that declares `name`; the body wins when both read it.
+    fn region_of(&self, name: &str) -> &TensorExecutionPlan {
+        if self.body.captures.contains_key(name) {
+            &self.body.plan
+        } else {
+            &self.predicate.plan
+        }
+    }
+
+    pub fn predicate_plan(&self) -> &TensorExecutionPlan {
+        &self.predicate.plan
+    }
+
+    pub fn body_plan(&self) -> &TensorExecutionPlan {
+        &self.body.plan
+    }
+
+    fn region_inputs(
+        &self,
+        carry: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<BTreeMap<String, DynamicTensor>, String> {
+        for (name, shape) in &self.external_captures {
+            let value = external_inputs
+                .get(name)
+                .ok_or_else(|| format!("missing while loop external capture {name:?}"))?;
+            if value.shape != *shape {
+                return Err(format!(
+                    "while loop external capture {name:?} has shape {:?}, expected {:?}",
+                    value.shape, shape
+                ));
+            }
+        }
+        if carry.shape != self.carry_shape()? {
+            return Err(format!(
+                "while loop carry shape {:?} does not match {:?}",
+                carry.shape,
+                self.carry_shape()?
+            ));
+        }
+        let mut inputs = external_inputs.clone();
+        inputs.insert(self.carry_name.clone(), carry);
+        Ok(inputs)
+    }
+
+    fn keep_going(&self, inputs: &BTreeMap<String, DynamicTensor>) -> Result<bool, String> {
+        tensor_scalar_predicate(&self.predicate.plan.evaluate(inputs)?)
+    }
+
+    pub fn evaluate(
+        &self,
+        initial_carry: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<DynamicTensor, String> {
+        let mut inputs = self.region_inputs(initial_carry, external_inputs)?;
+        while self.keep_going(&inputs)? {
+            let next = self.body.plan.evaluate(&inputs)?;
+            inputs.insert(self.carry_name.clone(), next);
+        }
+        inputs
+            .remove(&self.carry_name)
+            .ok_or_else(|| "while loop carry is missing".to_string())
+    }
+
+    /// Forward-mode derivative: the predicate only reads primal values, so
+    /// the tangent follows the same iterations as the primal carry.
+    pub fn jvp(
+        &self,
+        initial_carry: DynamicTensor,
+        initial_tangent: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+        external_tangents: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<(DynamicTensor, DynamicTensor), String> {
+        if initial_tangent.shape != initial_carry.shape {
+            return Err("while loop carry tangent shape does not match the carry".to_string());
+        }
+        let mut inputs = self.region_inputs(initial_carry, external_inputs)?;
+        let mut tangents = external_tangents.clone();
+        tangents.insert(self.carry_name.clone(), initial_tangent);
+        while self.keep_going(&inputs)? {
+            let (next, next_tangent) = self.body.plan.jvp(&inputs, &tangents)?;
+            inputs.insert(self.carry_name.clone(), next);
+            tangents.insert(self.carry_name.clone(), next_tangent);
+        }
+        let value = inputs
+            .remove(&self.carry_name)
+            .ok_or_else(|| "while loop carry is missing".to_string())?;
+        let tangent = tangents
+            .remove(&self.carry_name)
+            .ok_or_else(|| "while loop carry tangent is missing".to_string())?;
+        Ok((value, tangent))
+    }
+}
+
+/// Reverse mode needs the per-iteration carries of a fixed trip count; a
+/// traced predicate gives neither, matching JAX's `while_loop` restriction.
+const WHILE_LOOP_REVERSE_MODE_ERROR: &str =
+    "reverse-mode differentiation through while_loop is not supported because its trip count is \
+     data dependent; use forward mode (jvp) or rewrite it as a bounded fori_loop whose \
+     body masks finished iterations with where";
 
 impl TensorForiVjpJvpExecutionPlan {
     pub fn new(loop_plan: TensorForiExecutionPlan, namespace: &str) -> Result<Self, String> {
@@ -13467,6 +13988,10 @@ impl TensorExecutionPlan {
                     branches.on_true.plan.validate_mlx()?;
                     branches.on_false.plan.validate_mlx()?;
                 }
+                TensorOp::While { loop_plan, .. } => {
+                    loop_plan.predicate.plan.validate_mlx()?;
+                    loop_plan.body.plan.validate_mlx()?;
+                }
                 TensorOp::Fori { loop_plan, .. }
                 | TensorOp::ForiJvp { loop_plan, .. }
                 | TensorOp::ForiVjp { loop_plan, .. } => loop_plan.body.plan.validate_mlx()?,
@@ -14374,6 +14899,11 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                         "batch specialization does not yet transform Cond regions".to_string()
                     )
                 }
+                TensorOp::While { .. } => {
+                    return Err(
+                        "batch specialization does not yet transform While regions".to_string()
+                    )
+                }
                 TensorOp::Fori { .. } => {
                     return Err(
                         "batch specialization does not yet transform Fori regions".to_string()
@@ -14574,6 +15104,7 @@ fn cuda_scalar_expression(
         | TensorOp::ScatterAdd { .. }
         | TensorOp::Broadcast { .. }
         | TensorOp::Cond { .. }
+        | TensorOp::While { .. }
         | TensorOp::Fori { .. }
         | TensorOp::ForiJvp { .. }
         | TensorOp::ForiVjp { .. }
@@ -14730,6 +15261,11 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
             captures,
             ..
         } => std::iter::once(*predicate)
+            .chain(captures.iter().map(|(_, node_id)| *node_id))
+            .collect(),
+        TensorOp::While {
+            carry, captures, ..
+        } => std::iter::once(*carry)
             .chain(captures.iter().map(|(_, node_id)| *node_id))
             .collect(),
         TensorOp::Fori {
@@ -15284,6 +15820,7 @@ fn infer_tensor_placement(
             on_false,
         } => merge(&[*condition, *on_true, *on_false]),
         TensorOp::Cond { .. }
+        | TensorOp::While { .. }
         | TensorOp::Fori { .. }
         | TensorOp::ForiJvp { .. }
         | TensorOp::ForiVjp { .. }
@@ -15725,6 +16262,7 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Where { .. } => "where",
         TensorOp::Cond { .. } => "cond",
         TensorOp::Fori { .. } => "fori",
+        TensorOp::While { .. } => "while",
         TensorOp::ForiJvp { .. } => "fori_jvp",
         TensorOp::ForiVjp { .. } => "fori_vjp",
         TensorOp::ForiVjpJvp { .. } => "fori_vjp_jvp",
@@ -16222,6 +16760,7 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         | TensorOp::Constant { .. }
         | TensorOp::CholeskyAd { .. }
         | TensorOp::Cond { .. }
+        | TensorOp::While { .. }
         | TensorOp::Fori { .. }
         | TensorOp::ForiJvp { .. }
         | TensorOp::ForiVjp { .. }
@@ -16600,6 +17139,18 @@ fn remap_tensor_op(
             loop_plan,
             captures,
         } => Ok(TensorOp::Fori {
+            carry: remap_node(*carry)?,
+            loop_plan: loop_plan.clone(),
+            captures: captures
+                .iter()
+                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
+                .collect::<Result<Vec<_>, String>>()?,
+        }),
+        TensorOp::While {
+            carry,
+            loop_plan,
+            captures,
+        } => Ok(TensorOp::While {
             carry: remap_node(*carry)?,
             loop_plan: loop_plan.clone(),
             captures: captures

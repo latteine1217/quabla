@@ -486,6 +486,18 @@ branches and bodies may ignore operands, and `cond` branches may return
 constants of the other branch's dtype. Unsupported implicit capture raises
 `TracerError` naming `operands=`.
 
+`qb.while_loop(cond_fun, body_fun, init, operands=())` repeats
+`carry = body_fun(carry, *operands)` while `cond_fun(carry, *operands)`, a
+scalar bool, is true. A traced carry or operand forms one region; CPU and
+MLX evaluate the predicate, read it back to the host once per iteration, and
+then run the body, so the trip count may depend on traced values. CUDA
+raises `UnsupportedOperationError` for now. Forward mode (`jvp`) runs the
+same loop over a packed primal/tangent carry. Reverse mode (`grad`, `vjp`,
+and the reverse-mode `jacobian`/`hessian`) raises an error naming
+`fori_loop`, as in JAX: a data-dependent trip count leaves no fixed tape, so
+write a bounded `fori_loop` whose body masks finished iterations with
+`where` instead. `vmap` over a while loop is rejected for the same reason.
+
 `qb.ode.odeint(f, y0, (t0, t1), steps=n, method="rk4", args=(), save=False)`
 integrates `dy/dt = f(y, t, *args)` with `n` equal steps of classical RK4,
 Heun's method (`"heun"`), or forward Euler (`"euler"`), at times
@@ -520,9 +532,10 @@ The v0.1 entrypoints below keep their original spec/dictionary call forms:
 | Data parallelism (`cuda-nccl`) | `tensor_value_and_grad_data_parallel_cuda_fn` | not available |
 
 The core control-flow wrappers reuse the region builders `tensor_cond`,
-`tensor_fori_loop_region`, and `tensor_scan_region`, with their existing
-backend limits. `Compiler.capabilities()` reports which targets the build
-contains; it is not a hardware probe. The PINN examples in
+`tensor_fori_loop_region`, `tensor_scan_region`, and
+`tensor_while_loop_region`, with their existing backend limits.
+`Compiler.capabilities()` reports which targets the build contains; it is
+not a hardware probe. The PINN examples in
 `examples/pinn_poisson_{mlx,cuda}.py` and `examples/pinn_mlp_{mlx,cuda}.py`
 train on each device with these helpers. Their behaviour and limits are
 described under [Compiler Facade](#compiler-facade) and

@@ -632,6 +632,35 @@ impl MlxBackend {
                         .collect::<Result<BTreeMap<_, _>, _>>()?;
                     mlx_execute_plan_output(self, branches.selected(predicate), &branch_inputs)
                 }
+                TensorOp::While {
+                    carry,
+                    loop_plan,
+                    captures,
+                } => {
+                    // Host synchronization point per iteration: the scalar predicate is read back
+                    // (like `Cond`) and decides whether the body region is dispatched again.
+                    let mut region_inputs = captures
+                        .iter()
+                        .map(|(name, node_id)| {
+                            mlx_value(&values, *node_id).map(|value| (name.clone(), value.clone()))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, _>>()?;
+                    let carry_name = loop_plan.carry_name().to_string();
+                    region_inputs.insert(carry_name.clone(), mlx_value(&values, *carry)?.clone());
+                    loop {
+                        let predicate =
+                            mlx_execute_plan_output(self, loop_plan.predicate_plan(), &region_inputs)?;
+                        if !mlx_scalar_predicate(&predicate)? {
+                            break;
+                        }
+                        let next =
+                            mlx_execute_plan_output(self, loop_plan.body_plan(), &region_inputs)?;
+                        region_inputs.insert(carry_name.clone(), next);
+                    }
+                    region_inputs
+                        .remove(&carry_name)
+                        .ok_or_else(|| "MLX While carry is missing".to_string())
+                }
                 TensorOp::Fori { .. } => {
                     let TensorOp::Fori {
                         carry,
@@ -2100,6 +2129,7 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Compare { kind, .. } => kind.name(),
         TensorOp::Where { .. } => "where",
         TensorOp::Cond { .. } => "cond",
+        TensorOp::While { .. } => "while",
         TensorOp::Fori { .. } => "fori",
         TensorOp::ForiJvp { .. } => "fori_jvp",
         TensorOp::ForiVjp { .. } => "fori_vjp",

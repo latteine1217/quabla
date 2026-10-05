@@ -11,7 +11,7 @@ use quabla_core::tensor_ir::{
     CudaExecutionPlan, DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs,
     SymbolicCotangent, TensorBackend, TensorComparison, TensorCondExecutionPlan, TensorDType,
     TensorExecutionPlan, TensorForiExecutionPlan, TensorIr, TensorNodeId, TensorRegion,
-    TensorReplicaReduction, TensorScanExecutionPlan,
+    TensorReplicaReduction, TensorScanExecutionPlan, TensorWhileExecutionPlan,
 };
 use quabla_core::{
     QuablaCompiler, QuablaExecutable, QuablaMultiOutputExecutable, QuablaMultiOutputProgram,
@@ -6012,6 +6012,121 @@ pub fn tensor_fori_loop_region(
         shape,
         init.batch_axis,
     ))
+}
+
+/// Traces one `while_loop` region over the carry and operand inputs.
+fn trace_while_region(
+    py: Python<'_>,
+    function: &Bound<'_, PyAny>,
+    init: &TraceTensor,
+    operands: &[TraceTensor],
+    label: &str,
+) -> PyResult<(TensorTraceGraph, TraceTensor)> {
+    let graph = TensorTraceGraph::new();
+    let mut arguments = vec![graph
+        .add_input(
+            "__quabla_while_carry",
+            init.shape.clone(),
+            init.dtype().map_err(PyValueError::new_err)?,
+        )
+        .map_err(PyValueError::new_err)?];
+    for (index, operand) in operands.iter().enumerate() {
+        arguments.push(
+            graph
+                .add_input(
+                    &format!("__quabla_while_capture_{index}"),
+                    operand.shape.clone(),
+                    operand.dtype().map_err(PyValueError::new_err)?,
+                )
+                .map_err(PyValueError::new_err)?,
+        );
+    }
+    let output: TraceTensor = function
+        .call1(PyTuple::new(py, arguments)?)?
+        .extract()
+        .map_err(|_| {
+            PyTypeError::new_err(format!(
+                "tensor_while_loop_region {label} must return a TraceTensor"
+            ))
+        })?;
+    if !Arc::ptr_eq(&graph.ir, &output.graph.ir) {
+        return Err(PyValueError::new_err(format!(
+            "tensor_while_loop_region {label} returned a TraceTensor from a different graph"
+        )));
+    }
+    Ok((graph, output))
+}
+
+/// Traces a data-dependent loop into one runtime Tensor IR region.
+///
+/// `cond` and `body` both receive `(carry, *operands)`; `cond` returns a
+/// scalar bool and `body` the next carry. All external values must be
+/// provided as explicit operands; either region may ignore some of them.
+#[pyfunction]
+pub fn tensor_while_loop_region(
+    py: Python<'_>,
+    cond: &Bound<'_, PyAny>,
+    body: &Bound<'_, PyAny>,
+    init: TraceTensor,
+    operands: Vec<TraceTensor>,
+) -> PyResult<TraceTensor> {
+    if init.batch_axis.is_some() || operands.iter().any(|operand| operand.batch_axis.is_some()) {
+        return Err(PyValueError::new_err(
+            "while_loop cannot be vmapped: the trip count would differ per batch element; \
+             use a bounded fori_loop whose body masks finished elements with where",
+        ));
+    }
+    for operand in &operands {
+        init.same_graph(operand).map_err(PyValueError::new_err)?;
+    }
+    let (predicate_graph, predicate) = trace_while_region(py, cond, &init, &operands, "cond_fun")?;
+    if !predicate.shape.is_empty()
+        || predicate.dtype().map_err(PyValueError::new_err)? != TensorDType::Bool
+    {
+        return Err(PyTypeError::new_err(format!(
+            "while_loop cond_fun must return a scalar bool, got shape {:?} and dtype {}",
+            predicate.shape,
+            predicate.dtype().map_err(PyValueError::new_err)?
+        )));
+    }
+    let (body_graph, output) = trace_while_region(py, body, &init, &operands, "body_fun")?;
+    if output.shape != init.shape {
+        return Err(PyValueError::new_err(format!(
+            "tensor_while_loop_region body changed carry shape from {:?} to {:?}",
+            init.shape, output.shape
+        )));
+    }
+    let loop_plan = TensorWhileExecutionPlan::new(
+        predicate_graph
+            .compile_cpu_plan(predicate.node_id)
+            .map_err(PyValueError::new_err)?
+            .plan,
+        body_graph
+            .compile_cpu_plan(output.node_id)
+            .map_err(PyValueError::new_err)?
+            .plan,
+        "__quabla_while_carry",
+    )
+    .map_err(PyValueError::new_err)?;
+    // Compiled regions drop operands they never read; bind only the captures
+    // that at least one region still declares.
+    let captures = operands
+        .iter()
+        .enumerate()
+        .map(|(index, operand)| (format!("__quabla_while_capture_{index}"), operand.node_id))
+        .filter(|(name, _)| loop_plan.external_captures().contains_key(name))
+        .collect();
+    let parent_graph = init.graph.clone();
+    let mut ir = parent_graph
+        .ir
+        .lock()
+        .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?;
+    let node_id = ir
+        .while_loop(init.node_id, loop_plan, captures)
+        .map_err(PyValueError::new_err)?;
+    let shape = ir.node_shape(node_id).map_err(PyValueError::new_err)?;
+    drop(ir);
+    Ok(TraceTensor::from_node(parent_graph, node_id, shape, None))
 }
 
 /// Traces a fixed-bounds carry/output scan body once into a runtime Tensor IR

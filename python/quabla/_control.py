@@ -1,7 +1,8 @@
-"""Fixed-bounds control flow with explicit region operands (design 3.9).
+"""Control flow with explicit region operands (design 3.9).
 
 Loops carry one array. Region bodies see a scalar array index; unrolled
 and eager bodies see a Python integer. Scan outputs stack on axis zero.
+`while_loop` is the one loop with a traced trip count.
 """
 
 import operator
@@ -11,7 +12,7 @@ from ._array import asarray
 from ._errors import TracerError
 from ._quabla import TensorTraceGraph, TraceTensor
 
-__all__ = ["cond", "fori_loop", "scan"]
+__all__ = ["cond", "fori_loop", "scan", "while_loop"]
 
 _FOREIGN_OUTPUT_ERRORS = {
     f"{name} body returned a TraceTensor from a different graph"
@@ -20,6 +21,7 @@ _FOREIGN_OUTPUT_ERRORS = {
         "tensor_fori_loop_region",
         "tensor_scan",
         "tensor_scan_region",
+        "tensor_while_loop_region",
     )
 } | {"trace_tensor function returned a tensor from a different graph"}
 
@@ -151,6 +153,50 @@ def fori_loop(lower, upper, body_fun, init_val, *, operands=(), unroll=False):
     for index in range(lower, upper):
         carry = body(index, carry, *captures)
     return carry
+
+
+def while_loop(cond_fun, body_fun, init_val, *, operands=()):
+    """Apply `carry = body_fun(carry, *operands)` while `cond_fun(carry, *operands)`.
+
+    `cond_fun` returns a scalar bool. A traced carry or operand forms one
+    runtime region that reads the predicate back once per iteration; an
+    eager loop runs in Python. The carry is a single array. Forward-mode
+    derivatives (`jvp`, `jacfwd`) pass through the loop; reverse mode is
+    rejected because the trip count is data dependent, as in JAX: use a
+    bounded `fori_loop` whose body masks finished iterations with `where`.
+    """
+    if not callable(cond_fun) or not callable(body_fun):
+        raise TypeError("while_loop requires callable cond_fun and body_fun")
+    initial, *captures = _bindings((_carry(init_val), *operands))
+
+    def body(carry, *values):
+        return _same_carry(initial, body_fun(carry, *values))
+
+    if isinstance(initial, TraceTensor):
+
+        def predicate(carry, *values):
+            result = cond_fun(carry, *values)
+            if isinstance(result, TraceTensor):
+                return result
+            # A constant predicate binds to the region through its carry.
+            return _bindings((carry, result))[1]
+
+        return _region_call(
+            _quabla.tensor_while_loop_region, predicate, body, initial, captures
+        )
+    carry = initial
+    while _eager_predicate(cond_fun(carry, *captures)):
+        carry = body(carry, *captures)
+    return carry
+
+
+def _eager_predicate(value):
+    value = asarray(value)
+    if len(value.shape) != 0:
+        raise TypeError(
+            f"while_loop cond_fun must return a scalar bool, got shape {value.shape}"
+        )
+    return bool(value)
 
 
 def scan(f, init, *, length, operands=(), unroll=False):

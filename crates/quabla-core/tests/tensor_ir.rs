@@ -11477,3 +11477,109 @@ fn cuda_new_ops_match_cpu_values_and_gradients() {
         assert_eq!(cuda.data().as_ref(), cpu.data().as_ref());
     }
 }
+
+// ---- While: traced-predicate loop regions ----
+
+type WhileGraph = (TensorIr, TensorNodeId, BTreeMap<String, DynamicTensor>);
+
+/// `carry * scale` while `carry < limit`; from 1 with scale 2 and limit 10
+/// the body runs four times and returns 16.
+fn doubling_while_graph() -> Result<WhileGraph, String> {
+    let mut predicate = TensorIr::new();
+    let carry = predicate.input("carry", vec![])?;
+    let limit = predicate.input("limit", vec![])?;
+    let keep_going = predicate.compare(carry, limit, TensorComparison::Less)?;
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![])?;
+    let scale = body.input("scale", vec![])?;
+    let next = body.mul(carry, scale)?;
+    let loop_plan = quabla_core::tensor_ir::TensorWhileExecutionPlan::new(
+        predicate.compile_cpu(keep_going)?,
+        body.compile_cpu(next)?,
+        "carry",
+    )?;
+    // The body ignores `limit` and the predicate ignores `scale`; both bind.
+    assert_eq!(loop_plan.external_captures().len(), 2);
+
+    let mut graph = TensorIr::new();
+    let initial = graph.input("initial", vec![])?;
+    let scale = graph.input("scale", vec![])?;
+    let limit = graph.input("limit", vec![])?;
+    let output = graph.while_loop(
+        initial,
+        loop_plan,
+        vec![("scale".to_string(), scale), ("limit".to_string(), limit)],
+    )?;
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            DynamicTensor::new(vec![], vec![1.0])?,
+        ),
+        ("scale".to_string(), DynamicTensor::new(vec![], vec![2.0])?),
+        ("limit".to_string(), DynamicTensor::new(vec![], vec![10.0])?),
+    ]);
+    Ok((graph, output, inputs))
+}
+
+#[test]
+fn while_region_evaluates_forward_mode_and_rejects_reverse_mode() {
+    let (graph, output, inputs) = must!(doubling_while_graph());
+    assert!(graph.lower_text().contains("while(carry="));
+    assert_eq!(
+        must!(graph.evaluate(output, &inputs)).data().as_ref(),
+        &[16.0]
+    );
+    assert_eq!(
+        must!(must!(graph.compile_cpu(output)).evaluate(&inputs))
+            .data()
+            .as_ref(),
+        &[16.0]
+    );
+    // d(c0 * s^4) = s^4 dc0 + 4 c0 s^3 ds.
+    let scalar = |value: f64| DynamicTensor::new(vec![], vec![value]);
+    let (_, tangent) = must!(graph.jvp(
+        output,
+        &inputs,
+        &BTreeMap::from([
+            ("initial".to_string(), must!(scalar(1.0))),
+            ("scale".to_string(), must!(scalar(1.0))),
+            ("limit".to_string(), must!(scalar(0.0))),
+        ]),
+    ));
+    assert_eq!(tangent.data().as_ref(), &[48.0]);
+
+    let symbolic = must!(graph.symbolic_jvp(output, "scale"));
+    assert!(symbolic.graph.lower_text().contains("while(carry="));
+    let tangent = must!(symbolic
+        .graph
+        .compile_cpu(symbolic.tangent)
+        .and_then(|plan| plan.evaluate(&inputs)));
+    assert_eq!(tangent.data().as_ref(), &[32.0]);
+
+    let reverse = graph
+        .value_and_vjp(output, &inputs, must!(scalar(1.0)))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(reverse.contains("fori_loop"), "{reverse}");
+    let symbolic = graph
+        .symbolic_vjp(output, "cotangent")
+        .map(|_| ())
+        .unwrap_err();
+    assert!(symbolic.contains("while_loop"), "{symbolic}");
+}
+
+#[test]
+fn while_region_requires_a_scalar_bool_predicate() {
+    let mut predicate = TensorIr::new();
+    let carry = must!(predicate.input("carry", vec![]));
+    let mut body = TensorIr::new();
+    let body_carry = must!(body.input("carry", vec![]));
+    let error = quabla_core::tensor_ir::TensorWhileExecutionPlan::new(
+        must!(predicate.compile_cpu(carry)),
+        must!(body.compile_cpu(body_carry)),
+        "carry",
+    )
+    .map(|_| ())
+    .unwrap_err();
+    assert!(error.contains("scalar bool"), "{error}");
+}

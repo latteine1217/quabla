@@ -485,6 +485,7 @@ fn quabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_fori_loop, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_fori_loop_region, m)?)?;
+    m.add_function(wrap_pyfunction!(tensor_trace::tensor_while_loop_region, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_scan_region, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_scan, m)?)?;
     m.add_class::<TensorVmapFunction>()?;

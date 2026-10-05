@@ -3,7 +3,7 @@
 import os
 
 import quabla as qb
-from quabla._control import cond, fori_loop, scan
+from quabla._control import cond, fori_loop, scan, while_loop
 
 
 def assert_close(actual, expected, tolerance=1e-10):
@@ -377,6 +377,133 @@ def test_optional_device_loop_vjp_and_hvp_parity():
                 actual_leaves, _ = qb.tree.flatten(actual)
                 for value, expected in zip(actual_leaves, cpu_leaves):
                     assert_close(value, expected, 1e-4)
+
+
+def collatz_like(carry, limit, scale):
+    # Grows the carry until its first entry reaches `limit`; the trip count
+    # depends on traced values.
+    return while_loop(
+        lambda c, limit, scale: c[0] < limit,
+        lambda c, limit, scale: c * scale + 1.0,
+        carry,
+        operands=(limit, scale),
+    )
+
+
+def test_while_loop_eager_and_traced_agree():
+    carry, limit, scale = qb.array([1.0, -2.0]), qb.array(100.0), qb.array(1.5)
+    eager = collatz_like(carry, limit, scale)
+    expected = [1.0, -2.0]
+    while expected[0] < 100.0:
+        expected = [value * 1.5 + 1.0 for value in expected]
+    assert_close(eager, expected, 1e-12)
+    assert_close(qb.jit(collatz_like)(carry, limit, scale), expected, 1e-12)
+    # The trip count follows the traced bound, not the traced example.
+    staged = qb.jit(collatz_like)
+    assert_close(staged(carry, qb.array(1.0), scale), [1.0, -2.0], 0.0)
+    assert_close(staged(carry, qb.array(1.5), scale), [2.5, -2.0], 0.0)
+    # A predicate that is false at entry returns the initial carry eagerly.
+    assert while_loop(lambda c: c < 0.0, lambda c: c + 1.0, 3.0).item() == 3.0
+
+
+def test_while_loop_operands_may_be_ignored_and_closures_rejected():
+    x = qb.array(1.0)
+
+    def ignores_operand(x, unused):
+        return while_loop(lambda c, u: c < 5.0, lambda c, u: c + 2.0, x, operands=(unused,))
+
+    assert qb.jit(ignores_operand)(x, qb.array(7.0)).item() == 5.0
+
+    def only_predicate_reads(x, bound):
+        return while_loop(lambda c, b: c < b, lambda c, b: c * 2.0, x, operands=(bound,))
+
+    assert qb.jit(only_predicate_reads)(x, qb.array(9.0)).item() == 16.0
+
+    def closes_over(x, bound):
+        return while_loop(lambda c: c < bound, lambda c: c * 2.0, x)
+
+    assert_raises(qb.TracerError, qb.jit(closes_over), x, qb.array(9.0), match="operands=")
+    assert_raises(
+        TypeError,
+        qb.jit(lambda x: while_loop(lambda c: c, lambda c: c + 1.0, x)),
+        x,
+        match="scalar bool",
+    )
+    assert_raises(
+        ValueError,
+        qb.jit(lambda x: while_loop(lambda c: c[0] < 1.0, lambda c: c[0:1], x)),
+        qb.array([0.0, 1.0]),
+        match="carry shape",
+    )
+
+
+def test_while_loop_forward_mode_matches_the_analytic_derivative():
+    # c <- c * s while c < 50: from 1 with s = 2 the body runs six times, so
+    # the result is s^6 and d/ds = 6 s^5 at a fixed trip count.
+    def power(scale):
+        return while_loop(
+            lambda c, s: c < 50.0, lambda c, s: c * s, qb.array(1.0), operands=(scale,)
+        )
+
+    scale = qb.array(2.0)
+    value, tangent = qb.jvp(power, (scale,), (qb.array(1.0),))
+    assert value.item() == 64.0
+    assert tangent.item() == 6.0 * 2.0**5
+    staged = qb.jit(lambda s: qb.jvp(power, (s,), (qb.array(1.0),)))(scale)
+    assert staged[0].item() == 64.0 and staged[1].item() == 192.0
+    # The tangent of the carry follows the primal iterations.
+    def scaled(initial):
+        return while_loop(lambda c: c < 50.0, lambda c: c * 3.0, initial)
+
+    assert qb.jvp(scaled, (qb.array(1.0),), (qb.array(1.0),))[1].item() == 81.0
+
+
+def test_while_loop_reverse_mode_and_vmap_are_rejected_clearly():
+    def power(scale):
+        return while_loop(
+            lambda c, s: c < 50.0, lambda c, s: c * s, qb.array(1.0), operands=(scale,)
+        )
+
+    for transform in (qb.grad, lambda f: qb.jit(qb.grad(f))):
+        error = assert_raises(Exception, transform(power), qb.array(2.0))
+        assert "while_loop" in str(error) and "fori_loop" in str(error), str(error)
+    for transform in (qb.vmap, lambda f: qb.jit(qb.vmap(f))):
+        assert_raises(
+            qb.UnsupportedOperationError,
+            transform(power),
+            qb.array([2.0, 3.0]),
+            match="vmap cannot batch a while_loop",
+        )
+
+
+def test_optional_device_while_loop_parity():
+    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
+        if os.environ.get(flag) != "1":
+            continue
+        carry = qb.array([1.0, -2.0], dtype=qb.float32)
+        limit, scale = qb.array(100.0, dtype=qb.float32), qb.array(1.5, dtype=qb.float32)
+        expected = qb.jit(collatz_like)(carry, limit, scale)
+
+        def forward(scale):
+            return qb.jvp(
+                lambda s: collatz_like(carry, limit, s), (scale,), (qb.ones([], qb.float32),)
+            )
+
+        if device == "cuda":
+            assert_raises(
+                qb.UnsupportedOperationError,
+                qb.jit(collatz_like, device=device),
+                carry,
+                limit,
+                scale,
+                match="while_loop",
+            )
+            continue
+        assert_close(qb.jit(collatz_like, device=device)(carry, limit, scale), expected, 1e-4)
+        cpu_value, cpu_tangent = qb.jit(forward)(scale)
+        value, tangent = qb.jit(forward, device=device)(scale)
+        assert_close(value, cpu_value, 1e-4)
+        assert_close(tangent, cpu_tangent, 1e-3 * abs(cpu_tangent.to_flat_list()[0]))
 
 
 if __name__ == "__main__":
