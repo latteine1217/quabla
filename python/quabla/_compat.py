@@ -1,5 +1,6 @@
 """Once-per-name migration warnings from the accepted v0.2 name mapping."""
 
+import dis
 import warnings
 
 REPLACEMENTS = {
@@ -105,6 +106,28 @@ REPLACEMENTS = {
     "vjp_fn": "quabla.legacy.vjp_fn",
 }
 _WARNED = set()
+
+
+def is_star_import(frame):
+    """Whether `frame` is resolving a name for `from quabla import *`.
+
+    A package star import reaches the module `__getattr__` twice per name:
+    first from importlib's `_handle_fromlist`, which probes `__all__` with
+    `recursive=True`, then from the importing frame while it sits on
+    IMPORT_STAR (3.10, 3.11) or on CALL_INTRINSIC_1 with
+    INTRINSIC_IMPORT_STAR (3.12+).
+    """
+    if frame.f_code.co_name == "_handle_fromlist" and frame.f_globals.get(
+        "__name__"
+    ) in ("importlib._bootstrap", "_frozen_importlib"):
+        return bool(frame.f_locals.get("recursive"))
+    for instruction in dis.get_instructions(frame.f_code):
+        if instruction.offset == frame.f_lasti:
+            return (
+                instruction.opname == "IMPORT_STAR"
+                or instruction.argrepr == "INTRINSIC_IMPORT_STAR"
+            )
+    return False
 
 
 def warn(name):

@@ -626,7 +626,10 @@ legacy-only. (b) Rename the new functions. (c) Break the legacy forms.
 | legacy | moved to `quabla.legacy.<name>` (no warning there); top-level access warns | top-level removed; `quabla.legacy` kept pending Q9 |
 
 Old names reach the same Rust functions, so results, error types, and
-messages are unchanged. Result types warn only on explicit top-level access.
+messages are unchanged. Result types warn only on explicit top-level access,
+and `from quabla import *` binds every deprecated and legacy name without a
+warning, so a star import neither fails under `-W error` nor spends the
+once-per-name warning.
 
 ### 5.2 Migration rules
 

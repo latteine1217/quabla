@@ -72,7 +72,11 @@ for _name in _compat.REPLACEMENTS:
 
 def __getattr__(name):
     if name in _compat.REPLACEMENTS:
-        _compat.warn(name)
+        # `from quabla import *` resolves every name in `__all__`; it binds the
+        # v0.1 names silently so that only explicit access warns (design 5.1)
+        # and a star import does not spend the once-per-name warnings.
+        if not _compat.is_star_import(_sys._getframe(1)):
+            _compat.warn(name)
         return (
             optim.Adam
             if name == "Adam"

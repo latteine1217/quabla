@@ -47,6 +47,26 @@ def test_all_covers_v0_1_star_import_and_resolves():
         getattr(quabla, name)
 
 
+def test_star_import_binds_deprecated_names_without_warning():
+    # A fresh interpreter keeps the once-per-name warning state clean. The star
+    # import must neither warn (so it survives -W error) nor spend the warning
+    # that explicit access still emits.
+    script = """
+import warnings
+from quabla import *
+assert Adam is not None and tensor_jit_fn is not None and Matrix is not None
+import quabla
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    quabla.Adam
+    from quabla import Matrix
+assert [str(w.message).split(" is")[0] for w in caught] == ["quabla.Adam", "quabla.Matrix"]
+"""
+    subprocess.run(
+        [sys.executable, "-W", "error::DeprecationWarning", "-c", script], check=True
+    )
+
+
 def test_private_extension_module():
     native = quabla._quabla
     assert native.__name__ == "quabla._quabla"
@@ -1136,9 +1156,7 @@ def test_jit_matches_tensor_jit_fn_with_pytrees_and_static_argnums():
     signed = qb.jit(lambda x, z: x * math.copysign(1.0, z[0]), static_argnums=1)
     assert_close(signed(x, (0.0,)), QX)
     assert_close(signed(x, (-0.0,)), [-v for v in QX])
-    assert_raises(
-        ValueError, by_type.lower(x, 3).compile(), x, 3.0, match="statics"
-    )
+    assert_raises(ValueError, by_type.lower(x, 3).compile(), x, 3.0, match="statics")
     # A NaN static value matches itself instead of retracing on every call.
     nan_traces = []
     nan_static = qb.jit(lambda x, n: nan_traces.append(n) or x, static_argnums=1)

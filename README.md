@@ -80,7 +80,8 @@ regions. `quabla.distributed.value_and_grad` is experimental, single-node
 CUDA/NCCL data parallelism.
 
 All v0.1 call forms keep working. Migrated top-level names emit a
-`DeprecationWarning` once per name; the 2D API is available without warnings
+`DeprecationWarning` once per name on explicit access (`from quabla import *`
+binds them silently); the 2D API is available without warnings
 in `quabla.legacy`, and `quabla.Adam` aliases `quabla.optim.Adam` while
 preserving its stateful dictionary `step`.
 The 0.x API may still change between releases through additions and
