@@ -18,6 +18,7 @@ from . import optim as optim
 from . import distributed as distributed
 from . import legacy as legacy
 from . import ode as ode
+from . import linalg as linalg
 from . import _compat
 from ._control import *  # noqa: F403
 from ._devices import ShapeDtype as ShapeDtype
@@ -57,6 +58,7 @@ __all__ = list(
             "distributed",
             "legacy",
             "ode",
+            "linalg",
             "cond",
             "fori_loop",
             "scan",

@@ -2255,17 +2255,14 @@ def test_vmap_rejects_invalid_axes_and_unbatchable_ops():
     )
     assert_raises(ValueError, qb.vmap(lambda a: a, out_axes=3), x, match="out of range")
     assert_raises(TypeError, qb.vmap, qb.sum, in_axes="0")
-    # Ops without a batching rule raise UnsupportedOperationError (D16).
+    # A mapped solve batches over the leading axis (an unmapped operand is
+    # broadcast); ops without a batching rule raise UnsupportedOperationError (D16).
     matrix = qb.array([[2.0, 0.0], [1.0, 3.0]])
     rhs = qb.array([[[1.0], [2.0]], [[3.0], [4.0]]])
-    error = assert_raises(
-        qb.UnsupportedOperationError,
-        qb.vmap(lambda m, b: qb.solve(m, b), in_axes=(None, 0)),
-        matrix,
-        rhs,
-        match="vmap cannot batch solve",
+    assert_close(
+        qb.vmap(lambda m, b: qb.solve(m, b), in_axes=(None, 0))(matrix, rhs),
+        [[[0.5], [0.5]], [[1.5], [5.0 / 6.0]]],
     )
-    assert error.op == "solve"
     # An unmapped solve is fine.
     unmapped_solve = qb.vmap(
         lambda m, b, k: qb.solve(m, b) * k, in_axes=(None, None, 0)

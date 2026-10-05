@@ -6,6 +6,8 @@ mod cholesky;
 #[cfg(test)]
 mod cholesky_tests;
 pub use cholesky::CholeskyAdKind;
+mod linalg;
+pub use linalg::{evaluate_eager as evaluate_linalg, LinalgKind};
 mod host_storage;
 pub use host_storage::HostTensorStorage;
 
@@ -653,6 +655,14 @@ enum TensorOp {
         input: TensorNodeId,
         lower: bool,
     },
+    /// One output of a dense decomposition of every square matrix of the
+    /// leading batch axes; see [`LinalgKind`]. The derivative rules are
+    /// written with IR ops (`solve`, `matmul`, and the `Linalg` outputs
+    /// themselves), so every derivative order is again an ordinary graph.
+    Linalg {
+        input: TensorNodeId,
+        kind: LinalgKind,
+    },
     Tanh {
         input: TensorNodeId,
     },
@@ -931,7 +941,7 @@ pub struct SymbolicVjpMany {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BatchingError {
     /// A node that depends on a mapped input has no batching rule; `op` is
-    /// its IR op name (`solve`, or a `cond`/`fori`/`scan` region node).
+    /// its IR op name (a `cond`/`fori`/`scan` region node).
     Unsupported { op: &'static str },
     /// Invalid bindings, outputs, or batch size.
     Invalid(String),
@@ -940,10 +950,6 @@ pub enum BatchingError {
 impl std::fmt::Display for BatchingError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unsupported { op: "solve" } => formatter.write_str(
-                "vmap cannot batch solve: it takes rank-2 operands only, so an operand that \
-                 depends on a mapped argument has no batching rule",
-            ),
             Self::Unsupported { op } => write!(
                 formatter,
                 "vmap cannot batch a {op} region node: a cond, fori, or scan region whose \
@@ -1699,6 +1705,10 @@ struct SolveReplayPlan {
 
 impl SolveReplayPlan {
     fn for_finite_dense(matrix: &DynamicTensor) -> Option<Self> {
+        // Batched stacks take the general per-matrix path.
+        if matrix.shape.len() != 2 {
+            return None;
+        }
         let n = matrix.shape[0];
         if matrix.data.iter().any(|value| !value.is_finite()) {
             return None;
@@ -2502,8 +2512,34 @@ impl DynamicTensor {
         Self::new(shape, data)
     }
 
+    /// Solves `self @ x == rhs` for every matrix of the leading batch axes
+    /// (see [`solve_shape`]); each matrix is solved independently, so one
+    /// batch element's pivots never affect another's.
     fn solve(&self, rhs: &Self) -> Result<Self, String> {
         solve_shape(&self.shape, &rhs.shape)?;
+        if self.shape.len() == 2 {
+            return self.solve_matrix(rhs);
+        }
+        let rank = self.shape.len();
+        let (n, columns) = (self.shape[rank - 1], rhs.shape[rank - 1]);
+        let batch = element_count(&self.shape[..rank - 2])?;
+        let (matrices, rhs_data) = (self.data(), rhs.data());
+        let mut output = Vec::with_capacity(rhs_data.len());
+        for index in 0..batch {
+            let matrix = Self::new(
+                vec![n, n],
+                matrices[index * n * n..(index + 1) * n * n].to_vec(),
+            )?;
+            let block = Self::new(
+                vec![n, columns],
+                rhs_data[index * n * columns..(index + 1) * n * columns].to_vec(),
+            )?;
+            output.extend(matrix.solve_matrix(&block)?.data().iter());
+        }
+        Self::new(rhs.shape.clone(), output)
+    }
+
+    fn solve_matrix(&self, rhs: &Self) -> Result<Self, String> {
         if let Some(result) = self.finite_triangular_solution(rhs) {
             return Self::new(rhs.shape.clone(), result);
         }
@@ -2943,7 +2979,8 @@ impl TensorIr {
     /// operand; ops with an axis shift it by one; full reductions reduce the
     /// flattened example axes; `concat` broadcasts its unmapped operands over
     /// the batch. The result is an ordinary graph, so it can be batched again
-    /// (nested `vmap`), differentiated, and inlined. A mapped `solve` or
+    /// (nested `vmap`), differentiated, and inlined. `solve` broadcasts an
+    /// unmapped operand over the batch like `concat`. A mapped
     /// region node (`cond`, `fori`, `scan`, and their derivative nodes) is
     /// [`BatchingError::Unsupported`]; unmapped ones are copied unchanged.
     pub fn inline_batched(
@@ -3081,6 +3118,7 @@ impl TensorIr {
             | TensorOp::Erf { .. }
             | TensorOp::StopGradient { .. }
             | TensorOp::Triangular { .. }
+            | TensorOp::Linalg { .. }
             | TensorOp::Reshape { .. } => remap_tensor_op(&node.op, &|id| remap.get(&id).copied())?,
             TensorOp::Add { .. }
             | TensorOp::Sub { .. }
@@ -3250,8 +3288,31 @@ impl TensorIr {
                     kind: *kind,
                 }
             }
-            TensorOp::Solve { .. }
-            | TensorOp::Cond { .. }
+            TensorOp::Solve { matrix, rhs } => {
+                // `Solve` batches over equal leading axes; an unmapped
+                // operand is the same system or right-hand side for every
+                // example.
+                let mut operands = [*matrix, *rhs];
+                for operand in &mut operands {
+                    let spliced = target(*operand)?;
+                    *operand = if mapped[*operand] {
+                        spliced
+                    } else {
+                        let source = self.node(spliced)?;
+                        let (shape, dtype, weak) = (
+                            batched_shape(batch_size, &source.shape),
+                            source.dtype,
+                            source.weak,
+                        );
+                        self.push_node(TensorOp::Broadcast { input: spliced }, shape, dtype, weak)
+                    };
+                }
+                TensorOp::Solve {
+                    matrix: operands[0],
+                    rhs: operands[1],
+                }
+            }
+            TensorOp::Cond { .. }
             | TensorOp::Fori { .. }
             | TensorOp::ForiJvp { .. }
             | TensorOp::ForiVjp { .. }
@@ -3862,6 +3923,12 @@ impl TensorIr {
                         transformed.triangular(tangent, *lower)?,
                     )
                 }
+                TensorOp::Linalg { input, kind } => {
+                    let (matrix, tangent) = pairs[*input];
+                    let value = transformed.linalg(matrix, *kind)?;
+                    let tangent = transformed.linalg_jvp(matrix, value, tangent, *kind)?;
+                    (value, tangent)
+                }
                 TensorOp::Sum { input } => {
                     let (value, tangent) = pairs[*input];
                     (transformed.sum(value)?, transformed.sum(tangent)?)
@@ -4230,6 +4297,7 @@ impl TensorIr {
                 TensorOp::Solve { matrix, rhs } => {
                     transformed.solve(values[*matrix], values[*rhs])?
                 }
+                TensorOp::Linalg { input, kind } => transformed.linalg(values[*input], *kind)?,
                 TensorOp::Triangular { input, lower } => {
                     transformed.triangular(values[*input], *lower)?
                 }
@@ -4729,6 +4797,18 @@ impl TensorIr {
                 TensorOp::Triangular { input, lower } => {
                     let contribution = transformed.triangular(upstream, *lower)?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
+                }
+                TensorOp::Linalg { input, kind } => {
+                    if let Some(contribution) =
+                        transformed.linalg_vjp(values[*input], values[node_id], upstream, *kind)?
+                    {
+                        symbolic_accumulate(
+                            &mut transformed,
+                            &mut cotangents,
+                            *input,
+                            contribution,
+                        )?;
+                    }
                 }
                 TensorOp::Tanh { input } => {
                     let one = transformed.scalar_constant(1.0);
@@ -6003,6 +6083,165 @@ impl TensorIr {
         let shape = solve_shape(&self.node(matrix)?.shape, &self.node(rhs)?.shape)?;
         let [matrix, rhs] = self.coerce_operands("solve", [matrix, rhs])?;
         self.push_derived(TensorOp::Solve { matrix, rhs }, shape)
+    }
+
+    /// One output of a dense decomposition of each matrix of `input`
+    /// (`[..., n, n]`, floating point); see [`LinalgKind`].
+    pub fn linalg(
+        &mut self,
+        input: TensorNodeId,
+        kind: LinalgKind,
+    ) -> Result<TensorNodeId, String> {
+        let source = self.node(input)?;
+        if !source.dtype.is_floating() {
+            return Err(format!("{} requires a floating-point tensor", kind.name()));
+        }
+        let shape = kind.output_shape(&source.shape)?;
+        self.push_derived(TensorOp::Linalg { input, kind }, shape)
+    }
+
+    /// `x` with its last two axes swapped.
+    fn matrix_transpose(&mut self, x: TensorNodeId) -> Result<TensorNodeId, String> {
+        let rank = self.node(x)?.shape.len();
+        let mut axes = (0..rank as isize).collect::<Vec<_>>();
+        axes.swap(rank - 2, rank - 1);
+        self.transpose(x, Some(axes))
+    }
+
+    /// `(x + x^T) / 2` over the last two axes.
+    fn symmetric_part(&mut self, x: TensorNodeId) -> Result<TensorNodeId, String> {
+        let transposed = self.matrix_transpose(x)?;
+        let sum = self.add(x, transposed)?;
+        let half = self.scalar_constant(0.5);
+        self.mul(sum, half)
+    }
+
+    /// The diagonals `[..., n]` of a square stack `[..., n, n]`: the two
+    /// triangular projections keep only the diagonal, so the row sums are it.
+    fn matrix_diagonal(&mut self, x: TensorNodeId) -> Result<TensorNodeId, String> {
+        let lower = self.triangular(x, true)?;
+        let diagonal = self.triangular(lower, false)?;
+        self.sum_axis(diagonal, -1)
+    }
+
+    /// An `n x n` identity constant with `like`'s dtype.
+    fn identity_like(&mut self, n: usize, like: TensorNodeId) -> Result<TensorNodeId, String> {
+        let dtype = self.node(like)?.dtype;
+        let mut data = vec![0.0; n * n];
+        for index in 0..n {
+            data[index * n + index] = 1.0;
+        }
+        let identity = DynamicTensor::with_dtype(vec![n, n], data, dtype)?;
+        Ok(self.constant(identity, false))
+    }
+
+    /// `F` of the eigenvector derivative: `F_ij = 1 / (w_j - w_i)` for
+    /// `i != j` and `0` on the diagonal, for eigenvalues `w` (`[..., n]`).
+    /// Adding the identity before the reciprocal keeps the diagonal finite;
+    /// a repeated eigenvalue makes an off-diagonal entry infinite, so the
+    /// eigenvector derivative is then inf or NaN, as in JAX.
+    fn eigh_gap_reciprocals(&mut self, values: TensorNodeId) -> Result<TensorNodeId, String> {
+        let shape = self.node(values)?.shape.clone();
+        let n = *shape.last().ok_or("eigenvalues have rank at least one")?;
+        let batch = &shape[..shape.len() - 1];
+        let row = self.reshape(values, [batch, &[1, n]].concat())?;
+        let column = self.reshape(values, [batch, &[n, 1]].concat())?;
+        let gaps = self.sub(row, column)?;
+        let identity = self.identity_like(n, values)?;
+        let shifted = self.add(gaps, identity)?;
+        let one = self.scalar_constant(1.0);
+        let reciprocals = self.div(one, shifted)?;
+        self.sub(reciprocals, identity)
+    }
+
+    /// The tangent of `linalg(matrix, kind)` (whose value is `value`) along
+    /// `tangent`:
+    ///
+    /// - `log|det|`: `tr(A^-1 dA)`, the diagonal sum of `solve(A, dA)`; no
+    ///   inverse is formed.
+    /// - eigenvalues: `diag(V^T dS V)`; eigenvectors: `V (F o (V^T dS V))`,
+    ///   with `dS` the symmetric part of `dA` (the decomposition reads the
+    ///   symmetric part of its input) and `F` from [`Self::eigh_gap_reciprocals`].
+    /// - the determinant sign is piecewise constant: zero.
+    fn linalg_jvp(
+        &mut self,
+        matrix: TensorNodeId,
+        value: TensorNodeId,
+        tangent: TensorNodeId,
+        kind: LinalgKind,
+    ) -> Result<TensorNodeId, String> {
+        match kind {
+            LinalgKind::DetSign => symbolic_zero_like(self, value),
+            LinalgKind::LogAbsDet => {
+                let solved = self.solve(matrix, tangent)?;
+                let diagonal = self.matrix_diagonal(solved)?;
+                self.sum_axis(diagonal, -1)
+            }
+            LinalgKind::EighValues | LinalgKind::EighVectors => {
+                let vectors = if kind == LinalgKind::EighVectors {
+                    value
+                } else {
+                    self.linalg(matrix, LinalgKind::EighVectors)?
+                };
+                let symmetric = self.symmetric_part(tangent)?;
+                let transposed = self.matrix_transpose(vectors)?;
+                let rotated = self.matmul(transposed, symmetric)?;
+                let rotated = self.matmul(rotated, vectors)?;
+                if kind == LinalgKind::EighValues {
+                    return self.matrix_diagonal(rotated);
+                }
+                let values = self.linalg(matrix, LinalgKind::EighValues)?;
+                let gaps = self.eigh_gap_reciprocals(values)?;
+                let scaled = self.mul(gaps, rotated)?;
+                self.matmul(vectors, scaled)
+            }
+        }
+    }
+
+    /// The cotangent of `matrix` for `linalg(matrix, kind)` (value `value`)
+    /// receiving `cotangent`, the transpose of [`Self::linalg_jvp`]:
+    ///
+    /// - `log|det|`: `g A^-T`, computed as `solve(A^T, g I)`.
+    /// - eigenvalues: `V diag(g) V^T`; eigenvectors: the symmetric part of
+    ///   `V (F o (V^T G)) V^T`.
+    /// - the determinant sign: no contribution (`None`).
+    fn linalg_vjp(
+        &mut self,
+        matrix: TensorNodeId,
+        value: TensorNodeId,
+        cotangent: TensorNodeId,
+        kind: LinalgKind,
+    ) -> Result<Option<TensorNodeId>, String> {
+        let shape = self.node(matrix)?.shape.clone();
+        let n = shape[shape.len() - 1];
+        let batch = &shape[..shape.len() - 2];
+        Ok(Some(match kind {
+            LinalgKind::DetSign => return Ok(None),
+            LinalgKind::LogAbsDet => {
+                let identity = self.identity_like(n, matrix)?;
+                let scale = self.reshape(cotangent, [batch, &[1, 1]].concat())?;
+                let scaled = self.mul(identity, scale)?;
+                let transposed = self.matrix_transpose(matrix)?;
+                self.solve(transposed, scaled)?
+            }
+            LinalgKind::EighValues => {
+                let vectors = self.linalg(matrix, LinalgKind::EighVectors)?;
+                let scale = self.reshape(cotangent, [batch, &[1, n]].concat())?;
+                let scaled = self.mul(vectors, scale)?;
+                let transposed = self.matrix_transpose(vectors)?;
+                self.matmul(scaled, transposed)?
+            }
+            LinalgKind::EighVectors => {
+                let values = self.linalg(matrix, LinalgKind::EighValues)?;
+                let gaps = self.eigh_gap_reciprocals(values)?;
+                let transposed = self.matrix_transpose(value)?;
+                let rotated = self.matmul(transposed, cotangent)?;
+                let scaled = self.mul(gaps, rotated)?;
+                let product = self.matmul(value, scaled)?;
+                let product = self.matmul(product, transposed)?;
+                self.symmetric_part(product)?
+            }
+        }))
     }
 
     /// Compact staged lower-triangle factorization. Validation follows the
@@ -7353,6 +7592,18 @@ impl TensorIr {
                 TensorOp::Triangular { input, lower } => {
                     accumulate(&mut cotangents[*input], cotangent.triangular(*lower)?)?;
                 }
+                TensorOp::Linalg { input, kind } => {
+                    let matrix = values
+                        .get(*input)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let contribution = evaluate_linalg_derivative(
+                        *kind,
+                        LinalgDerivative::Vjp,
+                        &[matrix, &cotangent],
+                    )?;
+                    accumulate(&mut cotangents[*input], contribution)?;
+                }
                 TensorOp::Tanh { input } => {
                     let output_value = values
                         .get(node_id)
@@ -7987,6 +8238,11 @@ impl TensorIr {
                         .ok_or_else(|| format!("node {node_id} has no evaluated value"))?;
                     matrix_value.solve(&rhs_tangent.sub(&matrix_tangent.matmul(output_value)?)?)?
                 }
+                TensorOp::Linalg { input, kind } => evaluate_linalg_derivative(
+                    *kind,
+                    LinalgDerivative::Jvp,
+                    &[&values[*input], &tangents[*input]],
+                )?,
                 TensorOp::Triangular { input, lower } => tangents
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
@@ -8735,6 +8991,11 @@ impl TensorIr {
                 TensorOp::Cholesky { input } => format!("%{id} = cholesky(%{input}) : {}", format_tensor_type(&node.shape, node.dtype)),
                 TensorOp::Solve { matrix, rhs } => format!(
                     "%{id} = solve(%{matrix}, %{rhs}) : {}",
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
+                TensorOp::Linalg { input, kind } => format!(
+                    "%{id} = {}(%{input}) : {}",
+                    kind.name(),
                     format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Triangular { input, lower } => format!(
@@ -9600,6 +9861,13 @@ impl TensorIr {
                     .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .triangular(*lower)?,
+                TensorOp::Linalg { input, kind } => linalg::evaluate(
+                    *kind,
+                    values
+                        .get(*input)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?,
+                )?,
                 TensorOp::Tanh { input } => values
                     .get(*input)
                     .and_then(Option::as_ref)
@@ -10536,6 +10804,28 @@ impl TensorIr {
                         }
                     }
                 }
+                TensorOp::Linalg { input, kind } => {
+                    let input = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let jvp = |direction: &DynamicTensor| {
+                        evaluate_linalg_derivative(
+                            *kind,
+                            LinalgDerivative::Jvp,
+                            &[&input.value, direction],
+                        )
+                    };
+                    MixedTangent {
+                        value: linalg::evaluate(*kind, &input.value)?,
+                        first: jvp(&input.first)?,
+                        second: jvp(&input.second)?,
+                        mixed: evaluate_linalg_derivative(
+                            *kind,
+                            LinalgDerivative::Mixed,
+                            &[&input.value, &input.first, &input.second, &input.mixed],
+                        )?,
+                    }
+                }
                 TensorOp::Triangular { input, lower } => {
                     let input = values
                         .get(*input)
@@ -10680,6 +10970,67 @@ impl TensorIr {
             .get(id)
             .ok_or_else(|| format!("node {id} does not exist"))
     }
+}
+
+/// A derivative of a `Linalg` node for the numeric evaluators.
+#[derive(Clone, Copy)]
+enum LinalgDerivative {
+    /// Operands `[matrix, direction]`.
+    Jvp,
+    /// Operands `[matrix, cotangent]`.
+    Vjp,
+    /// Operands `[matrix, first, second, mixed]`: the second-order term of
+    /// a jet, `D^2 f[first, second] + D f[mixed]`.
+    Mixed,
+}
+
+/// Evaluates a derivative of `linalg(matrix, kind)` by building the symbolic
+/// rule of [`TensorIr::linalg_jvp`] or [`TensorIr::linalg_vjp`] on a small
+/// reference graph, so the numeric and symbolic transforms share one rule.
+fn evaluate_linalg_derivative(
+    kind: LinalgKind,
+    derivative: LinalgDerivative,
+    operands: &[&DynamicTensor],
+) -> Result<DynamicTensor, String> {
+    let matrix = operands[0];
+    let dtype = matrix.dtype;
+    let mut reference = TensorIr::new();
+    let argument = reference.input_typed("matrix", matrix.shape.clone(), dtype)?;
+    let output = reference.linalg(argument, kind)?;
+    let mut inputs = BTreeMap::from([("matrix".to_string(), matrix.clone())]);
+    let mut bind = |name: &str, operand: &DynamicTensor| {
+        inputs.insert(name.to_string(), operand.astype(dtype));
+    };
+    let (graph, result) = match derivative {
+        LinalgDerivative::Vjp => {
+            let reverse = reference.symbolic_vjp(output, "cotangent")?;
+            bind("cotangent", operands[1]);
+            let gradient = reverse.gradients["matrix"];
+            (reverse.graph, gradient)
+        }
+        LinalgDerivative::Jvp | LinalgDerivative::Mixed => {
+            let first = reference.symbolic_jvp_with_tangent_inputs(
+                output,
+                &BTreeMap::from([("matrix".into(), "direction".into())]),
+            )?;
+            bind("direction", operands[1]);
+            if matches!(derivative, LinalgDerivative::Jvp) {
+                (first.graph, first.tangent)
+            } else {
+                let mixed = first.graph.symbolic_jvp_with_tangent_inputs(
+                    first.tangent,
+                    &BTreeMap::from([
+                        ("matrix".into(), "second".into()),
+                        ("direction".into(), "mixed".into()),
+                    ]),
+                )?;
+                bind("second", operands[2]);
+                bind("mixed", operands[3]);
+                (mixed.graph, mixed.tangent)
+            }
+        }
+    };
+    graph.evaluate(result, &inputs)
 }
 
 fn symbolic_accumulate(
@@ -13461,6 +13812,9 @@ impl TensorExecutionPlan {
             match &node.op {
                 TensorOp::Solve { .. } => return Err(("solve".into(),
                     "MLX GPU backend does not yet support solve: MLX linalg::solve only accepts a CPU stream".into())),
+                TensorOp::Linalg { kind, .. } => return Err((kind.name().into(), format!(
+                    "MLX GPU backend does not support {}: MLX's LU and eigh factorizations only \
+                     accept a CPU stream", kind.name()))),
                 TensorOp::ScalarConstant { value } if !value.is_finite() => return Err((
                     "constant".into(), "MLX backend does not support non-finite constants".into())),
                 TensorOp::Cond { branches, .. } => {
@@ -14295,6 +14649,7 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                 TensorOp::Solve { matrix, rhs } => {
                     specialized.solve(mapped(*matrix)?, mapped(*rhs)?)?
                 }
+                TensorOp::Linalg { input, kind } => specialized.linalg(mapped(*input)?, *kind)?,
                 TensorOp::Triangular { input, lower } => {
                     specialized.triangular(mapped(*input)?, *lower)?
                 }
@@ -14560,6 +14915,7 @@ fn cuda_scalar_expression(
         | TensorOp::SumAxis { .. }
         | TensorOp::Matmul { .. }
         | TensorOp::Solve { .. }
+        | TensorOp::Linalg { .. }
         | TensorOp::Cholesky { .. }
         | TensorOp::CholeskyAd { .. }
         | TensorOp::Triangular { .. }
@@ -14719,7 +15075,9 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         TensorOp::Pow { base, exponent } => vec![*base, *exponent],
         TensorOp::Solve { matrix, rhs } => vec![*matrix, *rhs],
         TensorOp::CholeskyAd { inputs, .. } => inputs.clone(),
-        TensorOp::Cholesky { input } | TensorOp::Triangular { input, .. } => vec![*input],
+        TensorOp::Cholesky { input }
+        | TensorOp::Triangular { input, .. }
+        | TensorOp::Linalg { input, .. } => vec![*input],
         TensorOp::Where {
             condition,
             on_true,
@@ -15369,6 +15727,11 @@ fn infer_tensor_placement(
             reject_sharded_placement(node_id, &placement, "triangular lowering")?;
             Ok(placement)
         }
+        TensorOp::Linalg { input, .. } => {
+            let placement = unary(*input)?;
+            reject_sharded_placement(node_id, &placement, "linalg lowering")?;
+            Ok(placement)
+        }
         TensorOp::Reshape { input } => {
             let placement = unary(*input)?;
             if is_sharded_placement(&placement) && input_node(*input)?.shape != node.shape {
@@ -15735,6 +16098,7 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::Matmul { .. } => "matmul",
         TensorOp::Solve { .. } => "solve",
+        TensorOp::Linalg { kind, .. } => kind.name(),
         TensorOp::Cholesky { .. } => "cholesky",
         TensorOp::CholeskyAd { .. } => "cholesky_ad",
         TensorOp::Triangular { .. } => "triangular",
@@ -16292,6 +16656,10 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
             arguments[0] = *input as u64;
             arguments[1] = u64::from(*lower);
         }
+        TensorOp::Linalg { input, kind } => {
+            arguments[0] = *input as u64;
+            arguments[1] = *kind as u64;
+        }
         TensorOp::SqrtDerivative { input, order }
         | TensorOp::Powi {
             input,
@@ -16364,6 +16732,7 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         | TensorOp::SumAxis { .. }
         | TensorOp::MeanAxis { .. }
         | TensorOp::Triangular { .. }
+        | TensorOp::Linalg { .. }
         | TensorOp::SqrtDerivative { .. }
         | TensorOp::Powi { .. } => 2,
         _ => 1,
@@ -16657,6 +17026,10 @@ fn remap_tensor_op(
         TensorOp::Solve { matrix, rhs } => Ok(TensorOp::Solve {
             matrix: remap_node(*matrix)?,
             rhs: remap_node(*rhs)?,
+        }),
+        TensorOp::Linalg { input, kind } => Ok(TensorOp::Linalg {
+            input: remap_node(*input)?,
+            kind: *kind,
         }),
         TensorOp::Cholesky { input } => Ok(TensorOp::Cholesky {
             input: remap_node(*input)?,
@@ -17157,22 +17530,36 @@ fn matmul_shape(lhs: &[usize], rhs: &[usize]) -> Result<Vec<usize>, String> {
     Ok(shape)
 }
 
+/// The result shape of `Solve`: a coefficient stack `[..., n, n]` and a
+/// right-hand-side stack `[..., n, k]` with the same leading batch axes give
+/// `[..., n, k]`. Batch axes do not broadcast in the IR, so every backend and
+/// derivative rule sees one matrix per right-hand-side block; front ends
+/// broadcast explicitly with `broadcast`, whose VJP sums the expanded axes.
 fn solve_shape(matrix: &[usize], rhs: &[usize]) -> Result<Vec<usize>, String> {
-    if matrix.len() != 2 || rhs.len() != 2 {
+    let rank = matrix.len();
+    if rank < 2 || rhs.len() != rank {
         return Err(format!(
-            "solve requires rank-2 matrix and right-hand side tensors, got {:?} and {:?}",
+            "solve requires matrix and right-hand side tensors of the same rank, at least two, \
+             got {:?} and {:?}",
             matrix, rhs
         ));
     }
-    if matrix[0] != matrix[1] {
+    if matrix[rank - 2] != matrix[rank - 1] {
         return Err(format!(
-            "solve requires a square coefficient matrix, got {:?}",
+            "solve requires square coefficient matrices, got {:?}",
             matrix
         ));
     }
-    if matrix[0] != rhs[0] {
+    if matrix[rank - 2] != rhs[rank - 2] {
         return Err(format!(
             "solve requires matrix shape {:?} and right-hand side shape {:?} to agree on rows",
+            matrix, rhs
+        ));
+    }
+    if matrix[..rank - 2] != rhs[..rank - 2] {
+        return Err(format!(
+            "solve requires matrix shape {:?} and right-hand side shape {:?} to have the same \
+             batch axes",
             matrix, rhs
         ));
     }

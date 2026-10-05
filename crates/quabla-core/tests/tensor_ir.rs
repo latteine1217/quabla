@@ -10187,7 +10187,7 @@ fn inline_batched_graphs_batch_again_for_nested_vmap() {
 }
 
 #[test]
-fn inline_batched_rejects_unbatchable_ops_and_invalid_bindings() {
+fn inline_batched_batches_solve_and_rejects_regions_and_invalid_bindings() {
     use quabla_core::tensor_ir::BatchingError;
     let mut callee = TensorIr::new();
     let matrix = must!(callee.input("matrix", vec![2, 2]));
@@ -10197,18 +10197,35 @@ fn inline_batched_rejects_unbatchable_ops_and_invalid_bindings() {
     let mut graph = TensorIr::new();
     let matrix_node = must!(graph.input("matrix", vec![2, 2]));
     let rhs_node = must!(graph.input("rhs", vec![3, 2, 1]));
-    let error = graph
-        .inline_batched(
-            &callee,
-            &BTreeMap::from([
-                ("matrix".to_string(), (matrix_node, false)),
-                ("rhs".to_string(), (rhs_node, true)),
-            ]),
-            3,
-            &[solved],
-        )
-        .expect_err("a mapped solve has no batching rule");
-    assert_eq!(error, BatchingError::Unsupported { op: "solve" });
+    // A mapped solve broadcasts its unmapped matrix over the batch.
+    let batched = must!(graph.inline_batched(
+        &callee,
+        &BTreeMap::from([
+            ("matrix".to_string(), (matrix_node, false)),
+            ("rhs".to_string(), (rhs_node, true)),
+        ]),
+        3,
+        &[solved],
+    ));
+    assert!(batched[0].1);
+    assert_eq!(must!(graph.node_shape(batched[0].0)), vec![3, 2, 1]);
+    let value = must!(graph.evaluate(
+        batched[0].0,
+        &BTreeMap::from([
+            (
+                "matrix".to_string(),
+                must!(DynamicTensor::new(vec![2, 2], vec![2.0, 0.0, 1.0, 4.0])),
+            ),
+            (
+                "rhs".to_string(),
+                must!(DynamicTensor::new(
+                    vec![3, 2, 1],
+                    vec![2.0, 5.0, 4.0, 2.0, 0.0, 8.0]
+                )),
+            ),
+        ]),
+    ));
+    assert_eq!(value.data().as_ref(), &[1.0, 1.0, 2.0, 0.0, 0.0, 2.0]);
     // An unmapped solve is copied as is.
     let rhs_single = must!(graph.input("rhs_single", vec![2, 1]));
     let copied = must!(graph.inline_batched(

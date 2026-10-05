@@ -21,10 +21,11 @@ use cudarc::nccl::{group_end, group_start, Comm as NcclComm, ReduceOp as NcclRed
 
 use super::{
     contiguous_strides, cuda_sqrt_derivative_expression, element_count, tensor_op_inputs,
-    DynamicTensor, TensorBackend, TensorDType, TensorDeviceBackend, TensorExecutionPlan,
-    TensorForiExecutionPlan, TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget,
-    TensorFusionRegion, TensorNodeId, TensorOp, TensorReplicaReduction, TensorScanExecutionPlan,
-    TensorScanTarget, TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget, TensorShardingPlan,
+    DynamicTensor, LinalgKind, TensorBackend, TensorDType, TensorDeviceBackend,
+    TensorExecutionPlan, TensorForiExecutionPlan, TensorForiVjpJvpExecutionPlan,
+    TensorForiVjpTarget, TensorFusionRegion, TensorNodeId, TensorOp, TensorReplicaReduction,
+    TensorScanExecutionPlan, TensorScanTarget, TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget,
+    TensorShardingPlan,
 };
 
 #[cfg(test)]
@@ -1912,6 +1913,36 @@ fn execute_cuda_device_program(
                 }
                 continue;
             }
+            TensorOp::Linalg { input, kind } => {
+                let (before, current_and_after) = values.split_at_mut(node_id);
+                let slot = current_and_after
+                    .first_mut()
+                    .ok_or_else(|| format!("CUDA node {node_id} is missing its buffer"))?;
+                if slot.is_none() {
+                    *slot = Some(take_cuda_buffer(stream, free_buffers, count, node_id)?);
+                }
+                let output = slot
+                    .as_mut()
+                    .ok_or_else(|| format!("CUDA node {node_id} buffer was not allocated"))?;
+                let solver = solver.ok_or_else(|| {
+                    format!(
+                        "CUDA {} requires CUSOLVER, but libcusolver could not be loaded",
+                        kind.name()
+                    )
+                })?;
+                let input_shape = &plan.nodes[*input].shape;
+                let rank = input_shape.len();
+                launch_cusolver_linalg(
+                    stream,
+                    module,
+                    solver,
+                    *kind,
+                    cuda_value(before, *input)?,
+                    output,
+                    element_count(&input_shape[..rank - 2])?,
+                    input_shape[rank - 1],
+                )?;
+            }
             TensorOp::Solve { matrix, rhs } => {
                 let (before, current_and_after) = values.split_at_mut(node_id);
                 let slot = current_and_after
@@ -1926,15 +1957,18 @@ fn execute_cuda_device_program(
                 let solver = solver.ok_or_else(|| {
                     "CUDA solve requires CUSOLVER, but libcusolver could not be loaded".to_string()
                 })?;
-                launch_cusolver_rank_two_solve(
+                let rhs_shape = &plan.nodes[*rhs].shape;
+                let rank = rhs_shape.len();
+                launch_cusolver_solve(
                     stream,
                     module,
                     solver,
                     cuda_value(before, *matrix)?,
                     cuda_value(before, *rhs)?,
                     output,
-                    plan.nodes[*matrix].shape[0],
-                    plan.nodes[*rhs].shape[1],
+                    element_count(&rhs_shape[..rank - 2])?,
+                    rhs_shape[rank - 2],
+                    rhs_shape[rank - 1],
                 )?;
             }
             TensorOp::Cond {
@@ -3951,7 +3985,8 @@ fn cuda_blas(stream: Arc<CudaStream>) -> Result<Option<Arc<Mutex<CudaBlas>>>, St
 #[derive(Debug)]
 struct CudaSolver {
     handle: DnHandle,
-    workspaces: BTreeMap<(usize, usize), CudaSolveWorkspace>,
+    /// Keyed by `(batch, n, rhs_columns)`.
+    workspaces: BTreeMap<(usize, usize, usize), CudaSolveWorkspace>,
 }
 
 #[derive(Debug)]
@@ -3991,19 +4026,23 @@ fn cuda_library_available(name: &str) -> bool {
     .any(|candidate| unsafe { libloading::Library::new(candidate).is_ok() })
 }
 
+/// Transposes each of `batch` contiguous row-major `rows x columns` matrices.
 fn launch_cuda_transpose_copy(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
     input: &CudaSlice<f32>,
     output: &mut CudaSlice<f32>,
+    batch: usize,
     rows: usize,
     columns: usize,
 ) -> Result<(), String> {
     let count = rows
         .checked_mul(columns)
+        .and_then(|count| count.checked_mul(batch))
         .ok_or_else(|| "CUDA transpose element count overflows usize".to_string())?;
     let count =
         u32::try_from(count).map_err(|_| "CUDA transpose element count exceeds u32".to_string())?;
+    let batch = u64::try_from(batch).map_err(|_| "CUDA transpose batch exceeds u64".to_string())?;
     let rows = u64::try_from(rows).map_err(|_| "CUDA transpose rows exceed u64".to_string())?;
     let columns =
         u64::try_from(columns).map_err(|_| "CUDA transpose columns exceed u64".to_string())?;
@@ -4013,12 +4052,12 @@ fn launch_cuda_transpose_copy(
     let mut launch = stream.launch_builder(&kernel);
     launch.arg(input);
     launch.arg(output);
+    launch.arg(&batch);
     launch.arg(&rows);
     launch.arg(&columns);
-    // SAFETY: the arguments match
-    // `quabla_transpose_copy(const float*, float*, unsigned long long, unsigned long long)`;
-    // callers pass `input` and `output` buffers of `rows * columns` elements, and the kernel guards
-    // `index < rows * columns`.
+    // SAFETY: the arguments match `quabla_transpose_copy(const float*, float*, unsigned long long,
+    // unsigned long long, unsigned long long)`; callers pass `input` and `output` buffers of
+    // `batch * rows * columns` elements, and the kernel guards `index < batch * rows * columns`.
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(count))
@@ -4027,37 +4066,54 @@ fn launch_cuda_transpose_copy(
     Ok(())
 }
 
+/// Solves `batch` row-major systems `A_b X_b = B_b` (`A_b` is `n x n`, `B_b`
+/// is `n x rhs_columns`, both contiguous per batch element) with one LU
+/// factorization (`getrf`, partial pivoting) and one `getrs` per element.
+/// cuSOLVER's dense API has no strided-batched LU, and the cuBLAS batched
+/// LU targets many tiny matrices through pointer arrays; issuing the
+/// per-element calls on one stream keeps a single code path for every `n`
+/// while the transposes into column-major order stay one launch each.
 #[allow(clippy::too_many_arguments)]
-fn launch_cusolver_rank_two_solve(
+fn launch_cusolver_solve(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
     solver: &Arc<Mutex<CudaSolver>>,
     matrix: &CudaSlice<f32>,
     rhs: &CudaSlice<f32>,
     output: &mut CudaSlice<f32>,
+    batch: usize,
     n: usize,
     rhs_columns: usize,
 ) -> Result<(), String> {
     let n_i32 = i32::try_from(n).map_err(|_| "CUSOLVER solve dimension exceeds i32".to_string())?;
     let rhs_columns_i32 = i32::try_from(rhs_columns)
         .map_err(|_| "CUSOLVER solve right-hand-side columns exceed i32".to_string())?;
+    let factor_count = n
+        .checked_mul(n)
+        .and_then(|count| count.checked_mul(batch))
+        .ok_or_else(|| "CUSOLVER solve factor size overflows usize".to_string())?;
+    let rhs_count = n
+        .checked_mul(rhs_columns)
+        .and_then(|count| count.checked_mul(batch))
+        .ok_or_else(|| "CUSOLVER solve right-hand-side size overflows usize".to_string())?;
     let mut solver = solver
         .lock()
         .map_err(|_| "CUSOLVER handle lock is poisoned".to_string())?;
     let CudaSolver { handle, workspaces } = &mut *solver;
+    let key = (batch, n, rhs_columns);
     // A plan may visit many Solve shapes; retaining each factorization workspace
     // accumulates their device storage. Keep only the current shape for reuse.
-    if !workspaces.contains_key(&(n, rhs_columns)) {
+    if !workspaces.contains_key(&key) {
         workspaces.clear();
     }
-    if let std::collections::btree_map::Entry::Vacant(entry) = workspaces.entry((n, rhs_columns)) {
+    if let std::collections::btree_map::Entry::Vacant(entry) = workspaces.entry(key) {
         let mut factor = stream
-            .alloc_zeros::<f32>(n * n)
+            .alloc_zeros::<f32>(factor_count)
             .map_err(|error| format!("failed to allocate CUSOLVER factor buffer: {error:?}"))?;
         let mut workspace_elements = 0_i32;
         {
             let (factor_ptr, _factor_read) = factor.device_ptr_mut(stream);
-            // SAFETY: the live handle owns this stream, factor holds n*n floats,
+            // SAFETY: the live handle owns this stream, factor holds at least n*n floats,
             // and workspace_elements is a valid host output location.
             unsafe {
                 cusolver_sys::cusolverDnSgetrf_bufferSize(
@@ -4076,16 +4132,14 @@ fn launch_cusolver_rank_two_solve(
             .map_err(|_| "CUSOLVER returned a negative workspace size".to_string())?;
         entry.insert(CudaSolveWorkspace {
             factor,
-            column_rhs: stream
-                .alloc_zeros::<f32>(n * rhs_columns)
-                .map_err(|error| {
-                    format!("failed to allocate CUSOLVER right-hand-side buffer: {error:?}")
-                })?,
+            column_rhs: stream.alloc_zeros::<f32>(rhs_count).map_err(|error| {
+                format!("failed to allocate CUSOLVER right-hand-side buffer: {error:?}")
+            })?,
             pivots: stream
-                .alloc_zeros::<i32>(n)
+                .alloc_zeros::<i32>(n * batch)
                 .map_err(|error| format!("failed to allocate CUSOLVER pivot buffer: {error:?}"))?,
             info: stream
-                .alloc_zeros::<i32>(1)
+                .alloc_zeros::<i32>(batch)
                 .map_err(|error| format!("failed to allocate CUSOLVER status buffer: {error:?}"))?,
             scratch: stream
                 .alloc_zeros::<f32>(workspace_elements)
@@ -4099,12 +4153,12 @@ fn launch_cusolver_rank_two_solve(
         info,
         scratch,
     } = workspaces
-        .get_mut(&(n, rhs_columns))
+        .get_mut(&key)
         .expect("solver workspace was initialized above");
-    launch_cuda_transpose_copy(stream, module, matrix, factor, n, n)?;
-    launch_cuda_transpose_copy(stream, module, rhs, column_rhs, n, rhs_columns)?;
+    launch_cuda_transpose_copy(stream, module, matrix, factor, batch, n, n)?;
+    launch_cuda_transpose_copy(stream, module, rhs, column_rhs, batch, n, rhs_columns)?;
     stream
-        .memcpy_htod(&[0_i32], info)
+        .memcpy_htod(&vec![0_i32; batch], info)
         .map_err(|error| format!("failed to reset CUSOLVER status: {error:?}"))?;
     {
         let (factor_ptr, _factor_read) = factor.device_ptr_mut(stream);
@@ -4112,51 +4166,345 @@ fn launch_cusolver_rank_two_solve(
         let (pivot_ptr, _pivot_read) = pivots.device_ptr_mut(stream);
         let (info_ptr, _info_read) = info.device_ptr_mut(stream);
         let (workspace_ptr, _workspace_read) = scratch.device_ptr_mut(stream);
-        // SAFETY: all device pointers come from buffers of the sizes CUSOLVER expects (factor
-        // `n * n` with `lda = n`, right-hand side `n * rhs_columns` column-major with `ldb = n`,
-        // `n` pivots, one info word, and the queried workspace) whose `device_ptr_mut` guards stay
-        // alive across both calls; the handle is bound to the context's default stream, the same
-        // stream that ordered the transpose copies, so the inputs are written before they are read.
-        unsafe {
-            cusolver_sys::cusolverDnSgetrf(
-                handle.cu(),
-                n_i32,
-                n_i32,
-                factor_ptr as *mut f32,
-                n_i32,
-                workspace_ptr as *mut f32,
-                pivot_ptr as *mut i32,
-                info_ptr as *mut i32,
-            )
-            .result()
-            .map_err(|error| format!("CUSOLVER Sgetrf failed: {error:?}"))?;
-            cusolver_sys::cusolverDnSgetrs(
-                handle.cu(),
-                cusolver_sys::cublasOperation_t::CUBLAS_OP_N,
-                n_i32,
-                rhs_columns_i32,
-                factor_ptr as *const f32,
-                n_i32,
-                pivot_ptr as *const i32,
-                rhs_ptr as *mut f32,
-                n_i32,
-                info_ptr as *mut i32,
-            )
-            .result()
-            .map_err(|error| format!("CUSOLVER Sgetrs failed: {error:?}"))?;
+        let float = std::mem::size_of::<f32>() as u64;
+        let int = std::mem::size_of::<i32>() as u64;
+        for index in 0..batch as u64 {
+            let factor_ptr = factor_ptr + index * (n * n) as u64 * float;
+            let rhs_ptr = rhs_ptr + index * (n * rhs_columns) as u64 * float;
+            let pivot_ptr = pivot_ptr + index * n as u64 * int;
+            let info_ptr = info_ptr + index * int;
+            // SAFETY: every pointer is offset by whole batch elements inside a buffer of `batch`
+            // such elements (factor `n * n` column-major with `lda = n`, right-hand side
+            // `n * rhs_columns` column-major with `ldb = n`, `n` pivots, one info word), the
+            // workspace holds the queried size and is reused sequentially on one stream, and the
+            // `device_ptr_mut` guards stay alive across the loop. The handle is bound to the
+            // context's default stream, the same stream that ordered the transpose copies, so the
+            // inputs are written before they are read.
+            unsafe {
+                cusolver_sys::cusolverDnSgetrf(
+                    handle.cu(),
+                    n_i32,
+                    n_i32,
+                    factor_ptr as *mut f32,
+                    n_i32,
+                    workspace_ptr as *mut f32,
+                    pivot_ptr as *mut i32,
+                    info_ptr as *mut i32,
+                )
+                .result()
+                .map_err(|error| format!("CUSOLVER Sgetrf failed: {error:?}"))?;
+                cusolver_sys::cusolverDnSgetrs(
+                    handle.cu(),
+                    cusolver_sys::cublasOperation_t::CUBLAS_OP_N,
+                    n_i32,
+                    rhs_columns_i32,
+                    factor_ptr as *const f32,
+                    n_i32,
+                    pivot_ptr as *const i32,
+                    rhs_ptr as *mut f32,
+                    n_i32,
+                    info_ptr as *mut i32,
+                )
+                .result()
+                .map_err(|error| format!("CUSOLVER Sgetrs failed: {error:?}"))?;
+            }
         }
     }
-    let mut host_info = [0_i32; 1];
+    let mut host_info = vec![0_i32; batch];
     stream
         .memcpy_dtoh(info, &mut host_info)
         .map_err(|error| format!("failed to read CUSOLVER status: {error:?}"))?;
-    if host_info[0] != 0 {
+    if let Some((index, status)) = host_info
+        .iter()
+        .enumerate()
+        .find(|(_, status)| **status != 0)
+    {
+        return Err(if batch == 1 {
+            format!("CUSOLVER solve failed with devInfo={status}")
+        } else {
+            format!("CUSOLVER solve failed with devInfo={status} for batch element {index}")
+        });
+    }
+    launch_cuda_transpose_copy(stream, module, column_rhs, output, batch, rhs_columns, n)
+}
+
+/// Device kernels of the `Linalg` lowering (see [`launch_cusolver_linalg`]).
+/// `quabla_lu_slogdet` reads one LU factor per thread: `det = (-1)^swaps *
+/// prod(u_ii)`, with the log-magnitude summed in double precision; a zero
+/// pivot gives `(0, -inf)` and a non-finite one `(NaN, NaN)`, as on the CPU.
+/// `quabla_symmetric_part` forms `(A + A^T) / 2`. `quabla_eigenvector_signs`
+/// flips each eigenvector column so its largest-magnitude component (the
+/// lowest index on ties) is positive, the CPU convention.
+const CUDA_LINALG_SOURCE: &str = r#"
+extern "C" __global__ void quabla_lu_slogdet(const float* factor, const int* pivots, float* out, unsigned long long batch, unsigned long long n, int want_sign) {
+    unsigned long long b = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) return;
+    const float* lu = factor + b * n * n;
+    double sign = 1.0;
+    double log_abs = 0.0;
+    int singular = 0;
+    int invalid = 0;
+    for (unsigned long long i = 0; i < n; ++i) {
+        float u = lu[i * n + i];
+        if (!isfinite(u)) invalid = 1;
+        else if (u == 0.0f) singular = 1;
+        else { if (u < 0.0f) sign = -sign; log_abs += log(fabs((double)u)); }
+        if (pivots[b * n + i] != (int)(i + 1)) sign = -sign;
+    }
+    float result;
+    if (invalid) result = __int_as_float(0x7fc00000);
+    else if (singular) result = want_sign ? 0.0f : -__int_as_float(0x7f800000);
+    else result = want_sign ? (float)sign : (float)log_abs;
+    out[b] = result;
+}
+
+extern "C" __global__ void quabla_symmetric_part(const float* input, float* output, unsigned long long batch, unsigned long long n) {
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long size = n * n;
+    if (index >= batch * size) return;
+    unsigned long long base = index - index % size;
+    unsigned long long row = (index % size) / n;
+    unsigned long long column = index % n;
+    output[index] = 0.5f * (input[index] + input[base + column * n + row]);
+}
+
+extern "C" __global__ void quabla_eigenvector_signs(float* vectors, unsigned long long batch, unsigned long long n) {
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= batch * n) return;
+    float* matrix = vectors + (index / n) * n * n;
+    unsigned long long column = index % n;
+    unsigned long long largest = 0;
+    for (unsigned long long row = 1; row < n; ++row) {
+        if (fabsf(matrix[row * n + column]) > fabsf(matrix[largest * n + column])) largest = row;
+    }
+    if (matrix[largest * n + column] < 0.0f) {
+        for (unsigned long long row = 0; row < n; ++row) matrix[row * n + column] = -matrix[row * n + column];
+    }
+}
+"#;
+
+/// Loads a `CUDA_LINALG_SOURCE` kernel of `module`.
+fn linalg_kernel(module: &Arc<CudaModule>, name: &str) -> Result<CudaFunction, String> {
+    module
+        .load_function(name)
+        .map_err(|error| format!("failed to load CUDA kernel {name}: {error:?}"))
+}
+
+/// A one-dimensional launch over `count` independent elements.
+fn linalg_launch_config(count: usize) -> Result<LaunchConfig, String> {
+    let count =
+        u32::try_from(count).map_err(|_| "CUDA linalg thread count exceeds u32".to_string())?;
+    Ok(LaunchConfig::for_num_elems(count.max(1)))
+}
+
+/// Evaluates one [`LinalgKind`] output for `batch` row-major `n x n`
+/// matrices with cuSOLVER, one call per batch element on the handle's stream
+/// (as in [`launch_cusolver_solve`]).
+///
+/// The determinant kinds factor each matrix with `getrf` (partial
+/// pivoting). Because `det(A^T) = det(A)`, the row-major buffer is factored
+/// as is, without a transpose; `getrf` reports an exactly singular factor
+/// through `info > 0` and still completes it, so a zero pivot reaches
+/// `quabla_lu_slogdet` as `(0, -inf)` instead of an error.
+///
+/// The eigen kinds symmetrize the input, then call `syevd` (divide and
+/// conquer, eigenvalues ascending). The symmetric row-major matrix equals its
+/// column-major self, and the column-major eigenvector matrix transposed is
+/// the row-major matrix whose columns are the eigenvectors.
+#[allow(clippy::too_many_arguments)]
+fn launch_cusolver_linalg(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    solver: &Arc<Mutex<CudaSolver>>,
+    kind: LinalgKind,
+    matrix: &CudaSlice<f32>,
+    output: &mut CudaSlice<f32>,
+    batch: usize,
+    n: usize,
+) -> Result<(), String> {
+    let name = kind.name();
+    let n_i32 = i32::try_from(n).map_err(|_| format!("CUSOLVER {name} dimension exceeds i32"))?;
+    let matrix_count = n
+        .checked_mul(n)
+        .and_then(|count| count.checked_mul(batch))
+        .ok_or_else(|| format!("CUSOLVER {name} matrix size overflows usize"))?;
+    let solver = solver
+        .lock()
+        .map_err(|_| "CUSOLVER handle lock is poisoned".to_string())?;
+    let handle = &solver.handle;
+    let alloc_f32 = |count: usize| {
+        stream
+            .alloc_zeros::<f32>(count)
+            .map_err(|error| format!("failed to allocate CUSOLVER {name} buffer: {error:?}"))
+    };
+    let alloc_i32 = |count: usize| {
+        stream
+            .alloc_zeros::<i32>(count)
+            .map_err(|error| format!("failed to allocate CUSOLVER {name} buffer: {error:?}"))
+    };
+    let mut factor = alloc_f32(matrix_count)?;
+    let mut info = alloc_i32(batch)?;
+    let float = std::mem::size_of::<f32>() as u64;
+    let int = std::mem::size_of::<i32>() as u64;
+    let (batch_u64, n_u64) = (batch as u64, n as u64);
+    let lu = matches!(kind, LinalgKind::DetSign | LinalgKind::LogAbsDet);
+    let mut pivots = alloc_i32(if lu { batch * n } else { 1 })?;
+    let mut values = alloc_f32(if lu { 1 } else { batch * n })?;
+    if lu {
+        stream
+            .memcpy_dtod(matrix, &mut factor)
+            .map_err(|error| format!("failed to copy CUDA {name} input: {error:?}"))?;
+    } else {
+        let kernel = linalg_kernel(module, "quabla_symmetric_part")?;
+        let mut launch = stream.launch_builder(&kernel);
+        launch.arg(matrix);
+        launch.arg(&mut factor);
+        launch.arg(&batch_u64);
+        launch.arg(&n_u64);
+        // SAFETY: the arguments match `quabla_symmetric_part(const float*, float*, unsigned long
+        // long, unsigned long long)`; `matrix` and `factor` hold `batch * n * n` floats and the
+        // kernel guards its index against that count.
+        unsafe { launch.launch(linalg_launch_config(matrix_count)?) }
+            .map_err(|error| format!("failed to launch CUDA symmetrization: {error:?}"))?;
+    }
+    let mut workspace_elements = 0_i32;
+    {
+        let (factor_ptr, _factor_guard) = factor.device_ptr_mut(stream);
+        let (values_ptr, _values_guard) = values.device_ptr_mut(stream);
+        // SAFETY: the live handle owns this stream, `factor` holds at least one `n x n`
+        // column-major matrix with `lda = n`, `values` at least `n` floats for `syevd`, and
+        // `workspace_elements` is a valid host output location.
+        unsafe {
+            if lu {
+                cusolver_sys::cusolverDnSgetrf_bufferSize(
+                    handle.cu(),
+                    n_i32,
+                    n_i32,
+                    factor_ptr as *mut f32,
+                    n_i32,
+                    &mut workspace_elements,
+                )
+            } else {
+                cusolver_sys::cusolverDnSsyevd_bufferSize(
+                    handle.cu(),
+                    cusolver_sys::cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR,
+                    cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+                    n_i32,
+                    factor_ptr as *const f32,
+                    n_i32,
+                    values_ptr as *const f32,
+                    &mut workspace_elements,
+                )
+            }
+            .result()
+            .map_err(|error| format!("CUSOLVER {name} workspace query failed: {error:?}"))?;
+        }
+    }
+    let workspace_elements = usize::try_from(workspace_elements)
+        .map_err(|_| "CUSOLVER returned a negative workspace size".to_string())?;
+    let mut scratch = alloc_f32(workspace_elements.max(1))?;
+    {
+        let (factor_ptr, _factor_guard) = factor.device_ptr_mut(stream);
+        let (values_ptr, _values_guard) = values.device_ptr_mut(stream);
+        let (pivot_ptr, _pivot_guard) = pivots.device_ptr_mut(stream);
+        let (info_ptr, _info_guard) = info.device_ptr_mut(stream);
+        let (scratch_ptr, _scratch_guard) = scratch.device_ptr_mut(stream);
+        let workspace_i32 = i32::try_from(workspace_elements)
+            .map_err(|_| "CUSOLVER workspace size exceeds i32".to_string())?;
+        for index in 0..batch as u64 {
+            let factor_ptr = factor_ptr + index * (n * n) as u64 * float;
+            let info_ptr = info_ptr + index * int;
+            // SAFETY: each pointer is offset by whole batch elements inside a buffer of `batch`
+            // elements (an `n x n` matrix with `lda = n`, `n` pivots or eigenvalues, one info
+            // word); the workspace holds the queried size and is reused sequentially on the
+            // handle's stream, which also ordered the copy or symmetrization that wrote `factor`;
+            // the `device_ptr_mut` guards outlive the loop.
+            unsafe {
+                if lu {
+                    cusolver_sys::cusolverDnSgetrf(
+                        handle.cu(),
+                        n_i32,
+                        n_i32,
+                        factor_ptr as *mut f32,
+                        n_i32,
+                        scratch_ptr as *mut f32,
+                        (pivot_ptr + index * n as u64 * int) as *mut i32,
+                        info_ptr as *mut i32,
+                    )
+                } else {
+                    cusolver_sys::cusolverDnSsyevd(
+                        handle.cu(),
+                        cusolver_sys::cusolverEigMode_t::CUSOLVER_EIG_MODE_VECTOR,
+                        cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+                        n_i32,
+                        factor_ptr as *mut f32,
+                        n_i32,
+                        (values_ptr + index * n as u64 * float) as *mut f32,
+                        scratch_ptr as *mut f32,
+                        workspace_i32,
+                        info_ptr as *mut i32,
+                    )
+                }
+                .result()
+                .map_err(|error| format!("CUSOLVER {name} failed: {error:?}"))?;
+            }
+        }
+    }
+    let mut host_info = vec![0_i32; batch];
+    stream
+        .memcpy_dtoh(&info, &mut host_info)
+        .map_err(|error| format!("failed to read CUSOLVER {name} status: {error:?}"))?;
+    // `getrf` reports a zero pivot with `info > 0`, which the slogdet kernel
+    // handles; any negative `info` is an invalid argument, and a positive
+    // `syevd` `info` means the eigensolver did not converge.
+    if let Some((index, status)) = host_info
+        .iter()
+        .enumerate()
+        .find(|(_, status)| **status < 0 || (!lu && **status > 0))
+    {
         return Err(format!(
-            "CUSOLVER solve failed with devInfo={}",
-            host_info[0]
+            "CUSOLVER {name} failed with devInfo={status} for batch element {index}"
         ));
     }
-    launch_cuda_transpose_copy(stream, module, column_rhs, output, rhs_columns, n)
+    match kind {
+        LinalgKind::DetSign | LinalgKind::LogAbsDet => {
+            let want_sign = i32::from(kind == LinalgKind::DetSign);
+            let kernel = linalg_kernel(module, "quabla_lu_slogdet")?;
+            let mut launch = stream.launch_builder(&kernel);
+            launch.arg(&factor);
+            launch.arg(&pivots);
+            launch.arg(output);
+            launch.arg(&batch_u64);
+            launch.arg(&n_u64);
+            launch.arg(&want_sign);
+            // SAFETY: the arguments match `quabla_lu_slogdet(const float*, const int*, float*,
+            // unsigned long long, unsigned long long, int)`; `factor` holds `batch` LU factors of
+            // `n * n` floats, `pivots` `batch * n` ints, `output` `batch` floats, and the kernel
+            // guards its index against `batch`.
+            unsafe { launch.launch(linalg_launch_config(batch)?) }
+                .map(|_| ())
+                .map_err(|error| format!("failed to launch CUDA slogdet kernel: {error:?}"))
+        }
+        LinalgKind::EighValues => stream
+            .memcpy_dtod(&values, output)
+            .map_err(|error| format!("failed to copy CUDA eigenvalues: {error:?}")),
+        LinalgKind::EighVectors => {
+            launch_cuda_transpose_copy(stream, module, &factor, output, batch, n, n)?;
+            let kernel = linalg_kernel(module, "quabla_eigenvector_signs")?;
+            let mut launch = stream.launch_builder(&kernel);
+            launch.arg(output);
+            launch.arg(&batch_u64);
+            launch.arg(&n_u64);
+            // SAFETY: the arguments match `quabla_eigenvector_signs(float*, unsigned long long,
+            // unsigned long long)`; `output` holds `batch` row-major `n x n` matrices, and each
+            // thread (guarded against `batch * n`) touches only its own column.
+            unsafe { launch.launch(linalg_launch_config(batch * n)?) }
+                .map(|_| ())
+                .map_err(|error| {
+                    format!("failed to launch CUDA eigenvector sign kernel: {error:?}")
+                })
+        }
+    }
 }
 
 fn launch_cublas_rank_two_matmul(
@@ -7259,11 +7607,12 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
     );
     source.push_str(CUDA_OPTIMIZER_SOURCE);
     source.push_str(
-        "extern \"C\" __global__ void quabla_transpose_copy(const float* input, float* output, unsigned long long rows, unsigned long long columns) {\n\\
+        "extern \"C\" __global__ void quabla_transpose_copy(const float* input, float* output, unsigned long long batch, unsigned long long rows, unsigned long long columns) {\n\\
     unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
-    unsigned long long count = rows * columns;\n\\
-    if (index < count) { unsigned long long row = index / columns; unsigned long long column = index % columns; output[column * rows + row] = input[index]; }\n}\n",
+    unsigned long long size = rows * columns;\n\\
+    if (index < batch * size) { unsigned long long base = index - index % size; unsigned long long local = index % size; unsigned long long row = local / columns; unsigned long long column = local % columns; output[base + column * rows + row] = input[index]; }\n}\n",
     );
+    source.push_str(CUDA_LINALG_SOURCE);
     for (node_id, node) in plan.nodes.iter().enumerate() {
         let function = cuda_node_function_name(node_id);
         let count = element_count(&node.shape)?;
@@ -7406,7 +7755,9 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
             }
             TensorOp::Cholesky { .. } => cholesky_backend::primal_source(&function, *node.shape.last().expect("matrix shape")),
             TensorOp::CholeskyAd { kind, .. } => cholesky_backend::ad_source(&function, *node.shape.last().expect("matrix shape"), *kind),
-            TensorOp::Solve { .. } | TensorOp::Cond { .. } => String::new(),
+            TensorOp::Solve { .. } | TensorOp::Linalg { .. } | TensorOp::Cond { .. } => {
+                String::new()
+            }
             TensorOp::Fori {
                 loop_plan,
                 captures,
@@ -7933,6 +8284,7 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::Matmul { .. } => "matmul",
         TensorOp::Solve { .. } => "solve",
+        TensorOp::Linalg { kind, .. } => kind.name(),
         TensorOp::Cholesky { .. } => "cholesky",
         TensorOp::CholeskyAd { .. } => "cholesky_ad",
         TensorOp::Triangular { .. } => "triangular",
@@ -8288,13 +8640,14 @@ mod solver_workspace_profile_tests {
                 .alloc_zeros::<f32>(n * columns)
                 .map_err(|error| format!("failed to allocate test output: {error:?}"))?;
             let start = Instant::now();
-            launch_cusolver_rank_two_solve(
+            launch_cusolver_solve(
                 &stream,
                 &plan.module,
                 solver,
                 &matrix,
                 &rhs,
                 &mut output,
+                1,
                 n,
                 columns,
             )?;
@@ -8319,7 +8672,7 @@ mod solver_workspace_profile_tests {
             };
             let current = solver
                 .workspaces
-                .get(&(n, columns))
+                .get(&(1, n, columns))
                 .ok_or("current solver workspace is missing")?;
             current_bytes.push(bytes(current));
             entries.push(solver.workspaces.len());

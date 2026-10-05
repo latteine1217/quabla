@@ -1573,17 +1573,40 @@ impl TraceTensor {
         if let Some(lifted) = Self::lifted_to_common_graph(&[self, rhs])? {
             return lifted[0].solve_tensor(&lifted[1]);
         }
-        if self.batch_axis.is_some() || rhs.batch_axis.is_some() {
-            return Err("solve does not yet support vmap-batched tensors".to_string());
-        }
+        let batch_axis = Self::merged_batch_axis(&[self, rhs])?;
         let mut ir = self
             .graph
             .ir
             .lock()
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
-        let node_id = ir.solve(self.node_id, rhs.node_id)?;
+        // The batch axis leads; `Solve` batches over equal leading axes, so an
+        // unbatched operand is broadcast to the batch.
+        let mut operands = [
+            (self.node_id, self.batch_axis),
+            (rhs.node_id, rhs.batch_axis),
+        ];
+        if let Some(axis) = batch_axis {
+            let size = if self.batch_axis.is_some() {
+                self.shape[axis]
+            } else {
+                rhs.shape[axis]
+            };
+            for (node_id, operand_axis) in &mut operands {
+                if operand_axis.is_none() {
+                    let mut shape = vec![size];
+                    shape.extend(ir.node_shape(*node_id)?);
+                    *node_id = ir.broadcast_to(*node_id, shape)?;
+                }
+            }
+        }
+        let node_id = ir.solve(operands[0].0, operands[1].0)?;
         let shape = ir.node_shape(node_id)?;
-        Ok(Self::from_node(self.graph.clone(), node_id, shape, None))
+        Ok(Self::from_node(
+            self.graph.clone(),
+            node_id,
+            shape,
+            batch_axis,
+        ))
     }
 
     pub fn try_solve(&self, rhs: &Self) -> Result<Self, String> {
@@ -1598,7 +1621,11 @@ impl TraceTensor {
     ) -> Result<Self, String> {
         let matrix = self.triangular_tensor(lower)?;
         let matrix = if transpose {
-            matrix.transpose_tensor(None)?
+            // Swap only the matrix axes; leading batch axes stay in place.
+            let rank = matrix.shape.len() - usize::from(matrix.batch_axis.is_some());
+            let mut axes = (0..rank as isize).collect::<Vec<_>>();
+            axes.swap(rank - 2, rank - 1);
+            matrix.transpose_tensor(Some(axes))?
         } else {
             matrix
         };
@@ -1606,13 +1633,21 @@ impl TraceTensor {
     }
 
     fn cholesky_tensor(&self) -> Result<Self, String> {
-        if self.batch_axis.is_some() || self.shape.len() != 2 || self.shape[0] != self.shape[1] {
+        // The IR factors every matrix of the leading axes, including a
+        // leading vmap batch axis.
+        let rank = self.shape.len();
+        if rank < 2 || self.shape[rank - 2] != self.shape[rank - 1] {
             return Err(format!(
-                "cholesky reference tracing requires a square unbatched rank-2 tensor, got {:?}",
+                "cholesky requires a stack of square matrices [..., n, n], got {:?}",
                 self.shape
             ));
         }
         self.apply(&[], |ir| ir.cholesky(self.node_id))
+    }
+
+    fn linalg_tensor(&self, kind: &str) -> Result<Self, String> {
+        let kind = quabla_core::tensor_ir::LinalgKind::from_name(kind)?;
+        self.apply(&[], |ir| ir.linalg(self.node_id, kind))
     }
 
     pub fn where_tensor(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
@@ -3049,6 +3084,12 @@ impl TraceTensor {
 
     fn cholesky(&self) -> PyResult<Self> {
         self.cholesky_tensor().map_err(PyValueError::new_err)
+    }
+
+    /// One output of a dense decomposition of each matrix (`kind` is a
+    /// `quabla_core` `LinalgKind` name); the backing op of `quabla.linalg`.
+    fn _linalg(&self, kind: &str) -> PyResult<Self> {
+        self.linalg_tensor(kind).map_err(PyValueError::new_err)
     }
 
     fn gt(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
