@@ -174,8 +174,7 @@ fn inline_batched_splices_a_per_example_graph_over_the_batch() -> Result<(), Str
 }
 
 #[test]
-fn inline_batched_reports_unbatchable_ops_as_unsupported() -> Result<(), String> {
-    use quabla_core::tensor_ir::BatchingError;
+fn inline_batched_batches_solve_and_rejects_foreign_bindings() -> Result<(), String> {
     let callee = TensorTraceGraph::new();
     let matrix_input = callee.add_input("matrix", vec![2, 2], TensorDType::F64)?;
     let rhs = callee.add_input("rhs", vec![2, 1], TensorDType::F64)?;
@@ -183,7 +182,8 @@ fn inline_batched_reports_unbatchable_ops_as_unsupported() -> Result<(), String>
     let graph = TensorTraceGraph::new();
     let matrices = graph.add_input("matrices", vec![4, 2, 2], TensorDType::F64)?;
     let rhs_node = graph.add_input("rhs", vec![2, 1], TensorDType::F64)?;
-    let error = callee
+    // A mapped solve broadcasts the unmapped right-hand side over the batch.
+    let batched = callee
         .inline_batched_into(
             &["matrix".to_string(), "rhs".to_string()],
             &[matrices, rhs_node.clone()],
@@ -191,9 +191,8 @@ fn inline_batched_reports_unbatchable_ops_as_unsupported() -> Result<(), String>
             4,
             std::slice::from_ref(&solved),
         )
-        .map(|_| ())
-        .expect_err("a mapped solve must be rejected");
-    assert_eq!(error, BatchingError::Unsupported { op: "solve" });
+        .map_err(|error| error.to_string())?;
+    assert!(batched[0].1);
     let other = TensorTraceGraph::new();
     let stray = other.add_input("matrix", vec![2, 2], TensorDType::F64)?;
     let error = callee

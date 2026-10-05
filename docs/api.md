@@ -68,7 +68,7 @@ qb.eye(n, m=None, dtype=None)
   `sqrt`, `relu`, `sigmoid`, `softplus`, `stop_gradient`, `sum`, `mean`,
   `max`, `min`, `any`, `all`, `norm`, `cumsum`, `matmul`, `transpose`,
   `reshape`, `broadcast_to`, `astype`, `maximum`, `minimum`, `atan2`,
-  `power`, `solve`, `cholesky`, `tril`, and `triu`, next to the v0.1
+  `power`, `solve` (see `qb.linalg` below), `cholesky`, `tril`, and `triu`, next to the v0.1
   functions `where`, `concat`, `stack`, `einsum`, and the comparison and
   logical functions. Other operands (numbers, lists, NumPy arrays) go
   through `asarray`; a Python number stays a weak scalar. `abs`, `sum`,
@@ -201,9 +201,10 @@ decorator: `@qb.jit(device="mlx", static_argnums=1)`, `@qb.grad(argnums=1)`.
   `vmap(vmap(f))`. `vmap(grad(f, argnums=1), in_axes=(0, None))` returns
   one gradient per example, `[B, *w.shape]`, as in JAX, while
   `vjp(vmap(f, in_axes=(0, None)), x, w)` sums the unmapped gradient over
-  the batch, as reverse mode must. A mapped `solve`, `cond`, `fori`, or
-  `scan` raises `quabla.UnsupportedOperationError` (the v0.1
-  `tensor_vmap_*` helpers batch `fori`/`scan` bodies).
+  the batch, as reverse mode must. A mapped `solve` broadcasts an unmapped
+  operand over the batch. A mapped `cond`, `fori`, or `scan` raises
+  `quabla.UnsupportedOperationError` (the v0.1 `tensor_vmap_*` helpers batch
+  `fori`/`scan` bodies).
 - Closures and constants: an eager array (`Tensor` or `TensorView`,
   including a result such as `qb.sin(math.pi * 0.3)`) that meets a traced
   value becomes a constant of the graph. This covers arithmetic in either
@@ -498,6 +499,48 @@ and the reverse-mode `jacobian`/`hessian`) raises an error naming
 write a bounded `fori_loop` whose body masks finished iterations with
 `where` instead. `vmap` over a while loop is rejected for the same reason.
 
+`qb.linalg` holds dense linear algebra over the last two axes, batched over
+leading axes that broadcast like NumPy's. Every function takes eager or
+traced arrays and differentiates to every order, because each derivative rule
+is written with `solve`, `matmul`, and the decompositions themselves:
+
+- `solve(a, b)` solves `a @ x == b` per matrix by LU with partial pivoting
+  (`quabla.solve` is the same function). `b` is a vector `[n]` only when it
+  has rank one (NumPy 2 semantics), otherwise a stack `[..., n, k]`. A
+  singular matrix raises. `vmap` batches it, broadcasting an unmapped
+  operand over the batch.
+- `solve_triangular(a, b, trans=0, lower=False)` reads one triangle of `a`;
+  `trans=1` (or `"T"`) solves `a^T x = b`. `cholesky(a)` returns the lower
+  factor, and `cho_solve(c, b, lower=True)` solves `a x = b` from a Cholesky
+  factor with two triangular solves.
+- `slogdet(a)` returns `SlogdetResult(sign, logabsdet)` from the LU factor:
+  `log|det|` is a sum of `log|u_ii|`, so it does not overflow where `det`
+  does. An exactly singular matrix gives `(0, -inf)` and a non-finite one
+  `(nan, nan)`, as in NumPy. `det(a)` is `sign * exp(logabsdet)` (exactly 0
+  when singular). The sign has a zero derivative; the gradient of
+  `logabsdet` is `solve(a^T, g I)` and its tangent `trace(solve(a, da))`, so
+  no explicit inverse is formed.
+- `inv(a)` is `solve(a, I)`; `solve(a, b)` is faster and more accurate than
+  `inv(a) @ b`.
+- `eigh(a)` returns `EighResult(eigenvalues, eigenvectors)` of the symmetric
+  part `(a + a^T) / 2`: eigenvalues ascending, eigenvectors as columns, each
+  with its largest-magnitude component (the first on ties) positive. The CPU
+  uses cyclic Jacobi rotations in float64 that stop once the off-diagonal
+  norm is at most `eps * ||a||_F`, so eigenvalues are accurate to about
+  `eps * ||a||_F`; CUDA uses cuSOLVER `syevd` in float32. Derivatives use
+  `dw = diag(V^T dS V)` and `dV = V (F o (V^T dS V))` with `dS` the symmetric
+  part of `da` and `F_ij = 1 / (w_j - w_i)` off the diagonal (VJPs are the
+  transposes).
+
+Derivatives at exactly singular matrices are undefined: the derivatives of
+`slogdet`, `det`, and `inv` call `solve`, which raises on the CPU and reports
+the singular factor on CUDA (JAX returns non-finite values). A repeated
+eigenvalue makes `F` infinite, so the eigenvector derivative is inf or NaN,
+as in JAX, while the eigenvalue derivative stays defined. MLX rejects
+`solve`, `slogdet`, `det`, `inv`, and `eigh` with
+`UnsupportedOperationError`, because MLX's LU and eigh factorizations only
+run on its CPU stream.
+
 `qb.ode.odeint(f, y0, (t0, t1), steps=n, method="rk4", args=(), save=False)`
 integrates `dy/dt = f(y, t, *args)` with `n` equal steps of classical RK4,
 Heun's method (`"heun"`), or forward Euler (`"euler"`), at times
@@ -681,11 +724,13 @@ name keeps working through 0.x.
   operation returns a new contiguous allocation.
 - Neural and linear-algebra primitives on eager and traced tensors: `relu`
   (zero subgradient at zero), `abs`, `sigmoid`, `softplus`, rank-N
-  `tril`/`triu` over the last two axes, and rank-2 `solve(rhs)`
-  (partial-pivot LU), `solve_triangular(rhs, lower=True, transpose=False)`,
-  and `cholesky()`, each with JVP/VJP rules. `solve`
-  rejects non-square, rank-mismatched, and singular inputs; on CUDA it lowers
-  to cuSOLVER `Sgetrf`/`Sgetrs`, while MLX rejects it. `sigmoid` is
+  `tril`/`triu` over the last two axes, and `solve(rhs)` (partial-pivot LU
+  per matrix of the leading batch axes, which must match),
+  `solve_triangular(rhs, lower=True, transpose=False)`, and `cholesky()`,
+  each with JVP/VJP rules and batched over leading axes. `solve` rejects
+  non-square, rank-mismatched, batch-mismatched, and singular inputs; on
+  CUDA it lowers to cuSOLVER `Sgetrf`/`Sgetrs` per batch element, while MLX
+  rejects it. `sigmoid` is
   `where(x > 0, 1 / (1 + z), z / (1 + z))` with `z = exp(-|x|)`, so neither
   branch overflows and its gradient stays finite for every finite `x`;
   `softplus` is `maximum(x, 0) + log1p(exp(-|x|))`. Eager `Tensor` evaluates
@@ -1153,7 +1198,8 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
   results and loop-region inputs must be floating, not `bool`.
 - Derivatives beyond forward-over-reverse of `fori`/`scan` regions are
   explicit errors. Vmapped `cond` predicates are rejected at trace time.
-- MLX rejects `solve` (and `solve_triangular`, which composes it), and
+- MLX rejects `solve` (and `solve_triangular`, which composes it),
+  `slogdet`/`det`/`inv`, and `eigh`, and
   `vmap` HVP has no MLX lowering. Triangular-solve kernels are not
   implemented on devices.
 - Third or higher Cholesky derivatives use a scalar expansion whose graph
@@ -1165,7 +1211,11 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - StableHLO export (`stablehlo_text`) covers only a small inspection subset
   and is not an execution path.
 - The legacy 2D `Matrix`/`TraceGraph` API is not migrated to the facade.
-- `quabla.vmap` cannot batch `solve` or `cond`/`fori`/`scan` regions over a
-  mapped argument.
+- `quabla.vmap` cannot batch `cond`/`fori`/`scan` regions over a mapped
+  argument.
+- `qb.linalg` has no `svd`, `qr`, `eig` (non-symmetric), `lstsq`, or
+  `pinv`. Batched CUDA solves and decompositions issue one cuSOLVER call per
+  batch element. Derivatives at exactly singular matrices raise instead of
+  returning non-finite values.
   `jacobian` and `hessian` are dense: their basis constant and result grow
   quadratically with the number of input elements.

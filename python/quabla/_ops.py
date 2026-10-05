@@ -24,6 +24,7 @@ import math
 import numbers
 import operator
 
+from . import linalg as _linalg
 from ._array import _shape, asarray, full
 from ._quabla import Tensor, TraceTensor
 from ._quabla import where as _where
@@ -210,8 +211,9 @@ def matmul(x1, x2):
 
 
 def solve(a, b):
-    """Solves `a @ x == b` for `x`; `quabla.solve(a, b)` is `a.solve(b)`."""
-    return _array(a).solve(_array(b))
+    """Solves `a @ x == b` for `x`; `quabla.solve` is `quabla.linalg.solve`
+    (batched over leading axes, `b` a vector `[n]` or a stack `[..., n, k]`)."""
+    return _linalg.solve(a, b)
 
 
 def reshape(x, shape):

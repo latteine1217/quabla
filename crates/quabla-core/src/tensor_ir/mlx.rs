@@ -1103,6 +1103,13 @@ impl MlxBackend {
                             .to_string(),
                     )
                 }
+                TensorOp::Linalg { kind, .. } => {
+                    return Err(format!(
+                        "MLX GPU backend does not support {}: MLX's LU and eigh factorizations \
+                         only accept a CPU stream",
+                        kind.name()
+                    ))
+                }
                 TensorOp::Triangular { input, lower } => {
                     let input = mlx_value(&values, *input)?;
                     if *lower {
@@ -2141,6 +2148,7 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::Matmul { .. } => "matmul",
         TensorOp::Solve { .. } => "solve",
+        TensorOp::Linalg { kind, .. } => kind.name(),
         TensorOp::Cholesky { .. } => "cholesky",
         TensorOp::CholeskyAd { .. } => "cholesky_ad",
         TensorOp::Triangular { .. } => "triangular",

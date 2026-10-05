@@ -1149,19 +1149,44 @@ impl PyTensor {
             return lhs.try_solve(&rhs);
         }
         let dtype = self.result_dtype(rhs, "solve")?;
-        if self.shape.len() != 2 || rhs.shape.len() != 2 {
+        let rank = self.shape.len();
+        if rank < 2 || rhs.shape.len() != rank {
             return Err(format!(
-                "solve requires rank-2 matrix and right-hand side tensors, got {:?} and {:?}",
+                "solve requires matrix and right-hand side tensors of the same rank, at least \
+                 two, got {:?} and {:?}",
                 self.shape, rhs.shape
             ));
         }
-        let n = self.shape[0];
-        if n != self.shape[1] || n != rhs.shape[0] {
+        let n = self.shape[rank - 1];
+        if n != self.shape[rank - 2]
+            || n != rhs.shape[rank - 2]
+            || self.shape[..rank - 2] != rhs.shape[..rank - 2]
+        {
             return Err(format!(
-                "solve requires coefficient shape {:?} and right-hand side shape {:?} to have compatible rows",
+                "solve requires coefficient shape {:?} and right-hand side shape {:?} to have \
+                 square matrices, compatible rows, and the same batch axes",
                 self.shape, rhs.shape
             ));
         }
+        if rank == 2 {
+            return self.solve_matrix(rhs, dtype);
+        }
+        // Each matrix of the leading batch axes is solved independently.
+        let columns = rhs.shape[rank - 1];
+        let (matrices, blocks) = (self.data.to_f64(), rhs.data.to_f64());
+        let mut output = Vec::with_capacity(blocks.len());
+        for (matrix, block) in matrices
+            .chunks_exact(n * n)
+            .zip(blocks.chunks_exact(n * columns))
+        {
+            let matrix = Self::from_shape_data_typed(vec![n, n], matrix.to_vec(), dtype)?;
+            let block = Self::from_shape_data_typed(vec![n, columns], block.to_vec(), dtype)?;
+            output.extend(matrix.solve_matrix(&block, dtype)?.data.to_f64().iter());
+        }
+        Self::from_shape_data_typed(rhs.shape.clone(), output, dtype)
+    }
+
+    fn solve_matrix(&self, rhs: &Self, dtype: TensorDType) -> Result<Self, String> {
         if let Some(result) = self.finite_triangular_solution(rhs) {
             return Self::from_shape_data_typed(rhs.shape.clone(), result, dtype);
         }
@@ -1274,20 +1299,44 @@ impl PyTensor {
     ) -> Result<Self, String> {
         let matrix = self.try_triangular(lower)?;
         let matrix = if transpose {
-            matrix.try_transpose(None)?
+            // Swap only the matrix axes; leading batch axes stay in place.
+            let rank = matrix.shape.len() as isize;
+            let mut axes = (0..rank).collect::<Vec<_>>();
+            axes.swap((rank - 2) as usize, (rank - 1) as usize);
+            matrix.try_transpose(Some(axes))?
         } else {
             matrix
         };
         matrix.try_solve(rhs)
     }
 
+    pub fn try_linalg(&self, kind: &str) -> Result<Self, String> {
+        let kind = quabla_core::tensor_ir::LinalgKind::from_name(kind)?;
+        Self::from_dynamic_tensor(quabla_core::tensor_ir::evaluate_linalg(
+            kind,
+            &self.to_dynamic_tensor()?,
+        )?)
+    }
+
     pub fn try_cholesky(&self) -> Result<Self, String> {
         self.ensure_not_bool("cholesky")?;
-        if self.shape.len() != 2 || self.shape[0] != self.shape[1] {
+        let rank = self.shape.len();
+        if rank < 2 || self.shape[rank - 2] != self.shape[rank - 1] {
             return Err(format!(
-                "cholesky requires a square rank-2 tensor, got {:?}",
+                "cholesky requires a stack of square matrices [..., n, n], got {:?}",
                 self.shape
             ));
+        }
+        if rank > 2 {
+            // Each matrix of the leading batch axes is factored independently.
+            let n = self.shape[rank - 1];
+            let values = self.data.to_f64();
+            let mut output = Vec::with_capacity(values.len());
+            for matrix in values.chunks_exact(n * n) {
+                let matrix = Self::from_shape_data_typed(vec![n, n], matrix.to_vec(), self.dtype)?;
+                output.extend(matrix.try_cholesky()?.data.to_f64().iter());
+            }
+            return Self::from_shape_data_typed(self.shape.clone(), output, self.dtype);
         }
         let n = self.shape[0];
         let mut factor = vec![0.0; n * n];
@@ -2999,6 +3048,12 @@ impl PyTensor {
         self.try_cholesky().map_err(PyValueError::new_err)
     }
 
+    /// One output of a dense decomposition of each matrix (`kind` is a
+    /// `quabla_core` `LinalgKind` name); the backing op of `quabla.linalg`.
+    fn _linalg(&self, kind: &str) -> PyResult<Self> {
+        self.try_linalg(kind).map_err(PyValueError::new_err)
+    }
+
     fn __repr__(&self) -> String {
         match self.dtype {
             TensorDType::F64 => format!("Tensor(shape={:?})", self.shape),
@@ -3381,7 +3436,7 @@ mod triangular_solve_tests {
         assert!(matrix
             .try_solve_triangular(&vector, true, false)
             .unwrap_err()
-            .contains("rank-2"));
+            .contains("same rank"));
         Ok(())
     }
 }
