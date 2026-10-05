@@ -12909,9 +12909,6 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
         &self,
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<Vec<DynamicTensor>, String> {
-        if self.fused_elementwise_output {
-            return self.evaluate(inputs).map(|value| vec![value]);
-        }
         let mut values = TensorIr::evaluate_tensor_nodes_with_outputs(
             &self.nodes,
             inputs,
@@ -12942,9 +12939,9 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
         &self,
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<DynamicTensor, String> {
-        if self.fused_elementwise_output {
-            return evaluate_fused_elementwise(&self.nodes, self.output_node_id, inputs);
-        }
+        // The CPU runs every plan node by node, including elementwise plans
+        // that CUDA fuses: whole-buffer kernels round each `float32` operation
+        // to `f32` and avoid a per-element graph walk.
         TensorIr::evaluate_tensor_nodes_with_outputs(
             &self.nodes,
             inputs,
@@ -13589,161 +13586,6 @@ fn is_fusable_elementwise_compute_op(op: &TensorOp) -> bool {
             | TensorOp::Pow { .. }
             | TensorOp::Cast { .. }
     )
-}
-
-fn evaluate_fused_elementwise(
-    nodes: &[TensorNode],
-    output_node_id: TensorNodeId,
-    inputs: &BTreeMap<String, DynamicTensor>,
-) -> Result<DynamicTensor, String> {
-    let output = nodes
-        .get(output_node_id)
-        .ok_or_else(|| format!("output node {output_node_id} does not exist"))?;
-    for node in nodes {
-        if let TensorOp::Input { name } = &node.op {
-            let input = inputs
-                .get(name)
-                .ok_or_else(|| format!("missing input {name:?}"))?;
-            if input.shape != node.shape {
-                return Err(format!(
-                    "input {name:?} has shape {:?}, expected {:?}",
-                    input.shape, node.shape
-                ));
-            }
-        }
-    }
-
-    let count = element_count(&output.shape)?;
-    let mut data = Vec::with_capacity(count);
-    let mut memo = vec![None; nodes.len()];
-    for index in 0..count {
-        memo.fill(None);
-        data.push(evaluate_fused_element(
-            nodes,
-            output_node_id,
-            index,
-            &output.shape,
-            inputs,
-            &mut memo,
-        )?);
-    }
-    DynamicTensor::new(output.shape.clone(), data).map(|value| value.into_dtype(output.dtype))
-}
-
-fn evaluate_fused_element(
-    nodes: &[TensorNode],
-    node_id: TensorNodeId,
-    output_index: usize,
-    output_shape: &[usize],
-    inputs: &BTreeMap<String, DynamicTensor>,
-    memo: &mut [Option<f64>],
-) -> Result<f64, String> {
-    if let Some(value) = memo.get(node_id).copied().flatten() {
-        return Ok(value);
-    }
-    let node = nodes
-        .get(node_id)
-        .ok_or_else(|| format!("node {node_id} does not exist"))?;
-    let mut child = |child_id| {
-        evaluate_fused_element(nodes, child_id, output_index, output_shape, inputs, memo)
-    };
-    let value = match &node.op {
-        TensorOp::Input { name } => {
-            let input = inputs
-                .get(name)
-                .ok_or_else(|| format!("missing input {name:?}"))?;
-            let strides = contiguous_strides(&node.shape);
-            Ok(input.data.get(broadcast_offset(
-                output_index,
-                output_shape,
-                &node.shape,
-                &strides,
-            )))
-        }
-        TensorOp::ScalarConstant { value } => Ok(*value),
-        TensorOp::Constant { .. } => {
-            Err("the fused elementwise evaluator does not read array constants".to_string())
-        }
-        TensorOp::Cast { input } => child(*input),
-        TensorOp::Add { lhs, rhs } => Ok(child(*lhs)? + child(*rhs)?),
-        TensorOp::Sub { lhs, rhs } => Ok(child(*lhs)? - child(*rhs)?),
-        TensorOp::Div { lhs, rhs } => {
-            let denominator = child(*rhs)?;
-            if denominator == 0.0 {
-                return Err("division by zero is not supported".to_string());
-            }
-            Ok(child(*lhs)? / denominator)
-        }
-        TensorOp::Mul { lhs, rhs } => Ok(child(*lhs)? * child(*rhs)?),
-        TensorOp::Greater { lhs, rhs } => Ok(f64::from(child(*lhs)? > child(*rhs)?)),
-        TensorOp::Compare { lhs, rhs, kind } => {
-            Ok(f64::from(kind.evaluate(child(*lhs)?, child(*rhs)?)))
-        }
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => {
-            if child(*condition)? != 0.0 {
-                child(*on_true)
-            } else {
-                child(*on_false)
-            }
-        }
-        TensorOp::Tanh { input } => Ok(child(*input)?.tanh()),
-        TensorOp::Exp { input } => Ok(child(*input)?.exp()),
-        TensorOp::Sqrt { input } => {
-            let value = child(*input)?;
-            Ok(value.sqrt())
-        }
-        TensorOp::SqrtDerivative { input, order } => {
-            Ok(sqrt_derivative_value(child(*input)?, *order))
-        }
-        TensorOp::Sin { input } => Ok(child(*input)?.sin()),
-        TensorOp::Cos { input } => Ok(child(*input)?.cos()),
-        TensorOp::Powi { input, exponent } => {
-            let exponent = i32::try_from(*exponent)
-                .map_err(|_| "powi exponent must fit in a signed 32-bit integer".to_string())?;
-            Ok(child(*input)?.powi(exponent))
-        }
-        TensorOp::Pow { base, exponent } => Ok(child(*base)?.powf(child(*exponent)?)),
-        TensorOp::Log { input } => {
-            let value = child(*input)?;
-            if value <= 0.0 {
-                return Err("log requires strictly positive tensor values".to_string());
-            }
-            Ok(value.ln())
-        }
-        TensorOp::Sum { .. }
-        | TensorOp::SumAxis { .. }
-        | TensorOp::Matmul { .. }
-        | TensorOp::Solve { .. }
-        | TensorOp::Cholesky { .. }
-        | TensorOp::CholeskyAd { .. }
-        | TensorOp::Triangular { .. }
-        | TensorOp::Reshape { .. }
-        | TensorOp::Mean { .. }
-        | TensorOp::MeanAxis { .. }
-        | TensorOp::Transpose { .. }
-        | TensorOp::Concat { .. }
-        | TensorOp::Slice { .. }
-        | TensorOp::PadSlice { .. }
-        | TensorOp::Broadcast { .. }
-        | TensorOp::Cond { .. }
-        | TensorOp::Fori { .. }
-        | TensorOp::ForiJvp { .. }
-        | TensorOp::ForiVjp { .. }
-        | TensorOp::ForiVjpJvp { .. }
-        | TensorOp::Scan { .. }
-        | TensorOp::ScanVjp { .. }
-        | TensorOp::ScanVjpJvp { .. } => Err(format!(
-            "node {node_id} is not supported by the fused elementwise evaluator"
-        )),
-    };
-    // Same as the per-node interpreter: every fused node rounds to its own dtype.
-    let value = node.dtype.round(value?);
-    memo[node_id] = Some(value);
-    Ok(value)
 }
 
 fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
@@ -16189,7 +16031,7 @@ mod cpu_memory_regressions {
     use super::*;
 
     #[test]
-    fn shared_fused_dag_evaluates_each_node_once_per_element() -> Result<(), String> {
+    fn shared_elementwise_dag_evaluates_each_node_once() -> Result<(), String> {
         let mut graph = TensorIr::new();
         let x = graph.input("x", vec![2])?;
         let mut output = x;
@@ -16200,48 +16042,9 @@ mod cpu_memory_regressions {
         let plan = graph.compile_cpu(output)?;
         assert!(plan.uses_fused_elementwise_kernel());
         let inputs = BTreeMap::from([("x".into(), DynamicTensor::new(vec![2], vec![1.0, -2.0])?)]);
-        let mut memo = vec![None; plan.nodes.len()];
-        let result = evaluate_fused_element(
-            &plan.nodes,
-            plan.output_node_id,
-            0,
-            &[2],
-            &inputs,
-            &mut memo,
-        )?;
-        assert_eq!(result, 2.0f64.powi(40));
-        assert_eq!(memo.iter().flatten().count(), plan.node_count());
         assert_eq!(
             plan.evaluate(&inputs)?.data().as_ref(),
             &[2.0f64.powi(40), -2.0f64.powi(41)]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn fused_memo_skips_errors_in_an_inactive_where_branch() -> Result<(), String> {
-        let mut graph = TensorIr::new();
-        let x = graph.input("x", vec![2])?;
-        let mask = graph.input("mask", vec![2])?;
-        let invalid = graph.powi(x, 2)?;
-        let output = graph.where_select(mask, x, invalid)?;
-        let mut plan = graph.compile_cpu(output)?;
-        // Public construction rejects this exponent. Inject it into the private evaluator
-        // fixture so evaluating an inactive branch has an observable failure.
-        for node in Arc::make_mut(&mut plan.nodes).iter_mut() {
-            if let TensorOp::Powi { exponent, .. } = &mut node.op {
-                *exponent = u32::MAX;
-            }
-        }
-        let mut inputs = BTreeMap::from([
-            ("x".into(), DynamicTensor::new(vec![2], vec![-2.0, 3.0])?),
-            ("mask".into(), DynamicTensor::filled(vec![2], 1.0)?),
-        ]);
-        assert_eq!(plan.evaluate(&inputs)?, inputs["x"]);
-        inputs.insert("mask".into(), DynamicTensor::new(vec![2], vec![1.0, 0.0])?);
-        assert_eq!(
-            plan.evaluate(&inputs).unwrap_err(),
-            "powi exponent must fit in a signed 32-bit integer"
         );
         Ok(())
     }
