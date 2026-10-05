@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use quabla_core::compiler::QuablaCompileError;
 use quabla_core::tensor_ir::{
     CpuBackend, DynamicTensor, SymbolicCotangent, TensorBackend, TensorBufferSlot,
     TensorCondExecutionPlan, TensorCustomRule, TensorDType, TensorDeviceBackend, TensorDeviceId,
@@ -7,7 +8,7 @@ use quabla_core::tensor_ir::{
     TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr, TensorNodeId, TensorPartitionSpec,
     TensorPlacement, TensorReplicaReduction, TensorScanExecutionPlan, TensorShardingPlan,
 };
-use quabla_core::{QuablaCompiler, QuablaMultiOutputProgram, QuablaTarget};
+use quabla_core::{QuablaCompiler, QuablaMultiOutputProgram, QuablaPrecision, QuablaTarget};
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 use quabla_core::tensor_ir::CudaBackend;
@@ -153,6 +154,36 @@ fn compiler_facade_rejects_unbuilt_targets_up_front() {
             format!("{} target is unavailable in this build", target.name())
         );
     }
+}
+
+#[test]
+fn compiler_float64_precision_is_a_cpu_no_op_and_an_mlx_error() {
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let tenth = graph.scalar_constant(0.1);
+    let scaled = must!(graph.mul(x, tenth));
+    let program = must!(QuablaMultiOutputProgram::new(graph, vec![scaled]));
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![2], vec![1.0, 3.0])),
+    )]);
+    let compiler = QuablaCompiler;
+
+    let cpu = must!(compiler
+        .compile_many_checked_with_precision(&program, QuablaTarget::Cpu, QuablaPrecision::Float64)
+        .map_err(|error| format!("{error:?}")));
+    assert_eq!(
+        must!(cpu.execute(&inputs))[0].data().to_vec(),
+        vec![0.1, 0.30000000000000004]
+    );
+    // MLX has no f64 arithmetic, whether or not this build includes it.
+    let error = compiler
+        .compile_many_checked_with_precision(&program, QuablaTarget::Mlx, QuablaPrecision::Float64)
+        .expect_err("MLX must reject float64 precision");
+    assert!(
+        matches!(&error, QuablaCompileError::Unsupported { op, .. } if op == "float64"),
+        "{error:?}"
+    );
 }
 
 #[test]

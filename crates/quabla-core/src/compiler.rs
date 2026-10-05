@@ -50,6 +50,21 @@ impl QuablaTarget {
     }
 }
 
+/// Device precision of logical `float64` nodes, chosen per compilation.
+///
+/// CUDA and MLX execute `float64` programs in `f32` by default: consumer GPUs
+/// run `f64` arithmetic at a small fraction of their `f32` rate, so native
+/// double precision is opt-in rather than the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum QuablaPrecision {
+    /// `float64` nodes run natively on the CPU and as `f32` on CUDA and MLX.
+    #[default]
+    Default,
+    /// `float64` nodes run natively in `f64` on CUDA (a no-op on the CPU).
+    /// MLX has no `f64` arithmetic and rejects it.
+    Float64,
+}
+
 /// Static compiler capability information for one target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QuablaCapability {
@@ -218,6 +233,9 @@ impl QuablaVjpProgram {
 pub enum QuablaExecutable {
     Cpu(TensorExecutionPlan),
     Cuda(CudaExecutionPlan),
+    /// A CUDA plan compiled with [`QuablaPrecision::Float64`]: `f64` device
+    /// buffers for every floating node.
+    CudaFloat64(CudaExecutionPlan<f64>),
     Mlx(TensorExecutionPlan),
 }
 
@@ -228,6 +246,9 @@ impl QuablaExecutable {
             Self::Cuda(plan) => QuablaTarget::Cuda {
                 device_ordinal: plan.device_ordinal(),
             },
+            Self::CudaFloat64(plan) => QuablaTarget::Cuda {
+                device_ordinal: plan.device_ordinal(),
+            },
             Self::Mlx(_) => QuablaTarget::Mlx,
         }
     }
@@ -236,6 +257,7 @@ impl QuablaExecutable {
         match self {
             Self::Cpu(plan) | Self::Mlx(plan) => plan,
             Self::Cuda(plan) => plan.plan(),
+            Self::CudaFloat64(plan) => plan.plan(),
         }
     }
 
@@ -246,6 +268,7 @@ impl QuablaExecutable {
         match self {
             Self::Cpu(plan) => plan.evaluate(inputs),
             Self::Cuda(plan) => plan.execute(inputs),
+            Self::CudaFloat64(plan) => plan.execute(inputs),
             Self::Mlx(plan) => MlxBackend.execute(plan, inputs),
         }
     }
@@ -283,6 +306,7 @@ impl QuablaMultiOutputExecutable {
         match &self.executable {
             QuablaExecutable::Cpu(plan) => plan.evaluate_many(inputs),
             QuablaExecutable::Cuda(plan) => plan.execute_many(inputs),
+            QuablaExecutable::CudaFloat64(plan) => plan.execute_many(inputs),
             QuablaExecutable::Mlx(plan) => {
                 MlxBackend.execute_many(plan, plan.output_node_ids(), inputs)
             }
@@ -319,6 +343,30 @@ impl QuablaCompiler {
         program: &QuablaMultiOutputProgram,
         target: QuablaTarget,
     ) -> Result<QuablaMultiOutputExecutable, QuablaCompileError> {
+        self.compile_many_checked_with_precision(program, target, QuablaPrecision::Default)
+    }
+
+    /// [`Self::compile_many_checked`] with an explicit `float64` precision.
+    ///
+    /// [`QuablaPrecision::Float64`] lowers a CUDA program that has `float64`
+    /// nodes with `f64` device buffers; such a program must not also contain
+    /// `float32` nodes (one plan has one floating element type). A program
+    /// without `float64` nodes compiles exactly as with the default. The CPU
+    /// already runs `float64` natively, and MLX rejects the request.
+    pub fn compile_many_checked_with_precision(
+        &self,
+        program: &QuablaMultiOutputProgram,
+        target: QuablaTarget,
+        precision: QuablaPrecision,
+    ) -> Result<QuablaMultiOutputExecutable, QuablaCompileError> {
+        if target == QuablaTarget::Mlx && precision == QuablaPrecision::Float64 {
+            return Err(QuablaCompileError::Unsupported {
+                op: "float64".into(),
+                message: "MLX has no float64 arithmetic; precision=\"float64\" is supported on \
+                          the CPU and CUDA"
+                    .into(),
+            });
+        }
         ensure_built(target).map_err(QuablaCompileError::Unavailable)?;
         let plan = program
             .freeze()
@@ -327,9 +375,25 @@ impl QuablaCompiler {
             plan.validate_mlx()
                 .map_err(|(op, message)| QuablaCompileError::Unsupported { op, message })?;
         }
+        let float64 = matches!(target, QuablaTarget::Cuda { .. })
+            && precision == QuablaPrecision::Float64
+            && plan.has_float64_nodes();
         if matches!(target, QuablaTarget::Cuda { .. }) {
             plan.validate_cuda()
                 .map_err(|(op, message)| QuablaCompileError::Unsupported { op, message })?;
+        }
+        if float64 {
+            plan.validate_cuda_float64()
+                .map_err(|(op, message)| QuablaCompileError::Unsupported { op, message })?;
+            let QuablaTarget::Cuda { device_ordinal } = target else {
+                unreachable!("float64 lowering is selected only for CUDA targets");
+            };
+            return CudaBackend::new(device_ordinal)
+                .compile_float64(plan)
+                .map(|plan| QuablaMultiOutputExecutable {
+                    executable: QuablaExecutable::CudaFloat64(plan),
+                })
+                .map_err(QuablaCompileError::Backend);
         }
         lower(plan, target)
             .map(|executable| QuablaMultiOutputExecutable { executable })
