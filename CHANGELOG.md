@@ -9,6 +9,13 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-06
+
+The JAX-ecosystem gaps of the v0.3 plan in `docs/jax_like_roadmap.md`:
+optimizers, linear algebra, ODE integration, custom derivatives, pytrees,
+random numbers, numerically stable compositions, packaging, and CUDA loop and
+`float64` support. All v0.2 call forms keep working.
+
 ### Changed
 
 - A transformed function that needs more than `max_traces` traces (8 by
@@ -33,6 +40,11 @@ deprecated names keep working until 1.0 (see
   `TraceTensor` repr adds its dtype.
 - The package version has one source, `crates/quabla-python/Cargo.toml`;
   `pyproject.toml` reads it dynamically.
+- CUDA runs `fori_loop` and `scan` bodies that are not purely elementwise
+  (slices, concatenations, `cond`, array constants, broadcast operands in the
+  VJP) as host-driven loops over per-node device programs instead of
+  rejecting them, so adaptive `odeint` and reverse-mode `odeint` run on CUDA.
+  Such loops cost a kernel launch sequence per iteration.
 
 ### Added
 
@@ -68,13 +80,22 @@ deprecated names keep working until 1.0 (see
   `rtol`, `atol`, `max_steps`) with PI step-size control run as a bounded
   loop, all differentiable with respect to the initial state, time span,
   and parameters.
-- `quabla.while_loop` with a traced predicate on the CPU and MLX, with
-  forward-mode derivatives; reverse mode and `vmap` raise and point to a
+- `quabla.while_loop` with a traced predicate on the CPU, CUDA, and MLX,
+  with forward-mode derivatives; reverse mode and `vmap` raise and point to a
   bounded `fori_loop`, as in JAX.
 - `quabla.linalg`: `solve`, `solve_triangular`, `cholesky`, `cho_solve`,
-  `slogdet`, `det`, `inv`, and `eigh` (cyclic Jacobi on the CPU, cuSOLVER
-  `syevd` on CUDA), with derivatives of every order written without
-  explicit inverses.
+  `slogdet`, `det`, `inv`, `eigh` (cyclic Jacobi on the CPU, cuSOLVER
+  `syevd` on CUDA), `qr` (Householder; cuSOLVER `geqrf`/`orgqr`), `svd`
+  (one-sided Jacobi; cuSOLVER `gesvdj`), and `lstsq` (through `qr`), with
+  derivatives of every order written without explicit inverses.
+- `prod`, exact with zeros and differentiated without division, and a
+  native `erfc`; exact `gelu` uses `erfc` so its negative tail keeps
+  relative accuracy.
+- `jit(..., device="cuda", precision="float64")` runs `float64` programs as
+  native double on CUDA (cuBLAS `dgemm`, double cuSOLVER and NVRTC kernels),
+  matching the CPU `float64` reference to about `1e-14`. The default keeps
+  `float32` execution because consumer GPUs run `float64` much slower (an
+  MLP step is about 9x slower on a GTX 1660 SUPER).
 - `quabla.custom_vjp`, `quabla.custom_jvp`, and `quabla.checkpoint`
   (`remat`) with JAX's interfaces, under `jit`, `vmap`, and on every device.
 - `quabla.__version__`, `quabla.save`/`quabla.load` for pytrees of arrays in
@@ -332,7 +353,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/latteine1217/quabla/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/latteine1217/quabla/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/latteine1217/quabla/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/latteine1217/quabla/compare/v0.2.0...v0.2.1

@@ -14,21 +14,21 @@ with a native `log1p`, NaN-propagating `max`/`maximum`/`relu`, native
 | # | Item | Status |
 | --- | --- | --- |
 | 1 | Optimizers: L-BFGS, AdamW, schedules, global-norm clipping, device `Trainer` schedules | Done; AdamW and clipping are CPU-only in `Trainer` |
-| 2 | Elementwise ops and reductions | Done: native `expm1`, `erf`, `atan2`, `cumsum`; compositions `softmax`, `logsumexp`, `var`/`std`, `silu`, `gelu`, `clip`, `sign`; `prod` and `erfc` remain |
+| 2 | Elementwise ops and reductions | Done: native `expm1`, `erf`, `erfc`, `atan2`, `cumsum`; `prod`; compositions `softmax`, `logsumexp`, `var`/`std`, `silu`, `gelu`, `clip`, `sign` |
 | 3 | `stop_gradient` | Done |
 | 4 | Shape ergonomics | Done |
 | 5 | Pytrees: NamedTuple, dataclasses, registration | Done |
 | 6 | `qb.random` | Done |
-| 7 | `while_loop`, ODE solvers | Done on the CPU and MLX: `while_loop` (forward mode), fixed-step and adaptive `dopri5` `odeint`; CUDA rejects `while_loop` and `dopri5` |
-| 8 | Linear algebra | Done: batched `solve`, `qb.linalg` with `slogdet`/`det`/`inv`/`cho_solve`/`eigh`; `svd`, `qr`, `lstsq` remain |
+| 7 | `while_loop`, ODE solvers | Done on the CPU, CUDA, and MLX: `while_loop` (forward mode), fixed-step and adaptive `dopri5` `odeint` |
+| 8 | Linear algebra | Done: batched `solve`, `qb.linalg` with `slogdet`/`det`/`inv`/`cho_solve`/`eigh`/`qr`/`svd`/`lstsq` (CPU and CUDA; MLX rejects them) |
 | 9 | `custom_vjp`/`custom_jvp`, `checkpoint`, `jit` keywords | Done; custom rules cannot run inside control-flow bodies |
-| 10 | Native `float64` on CUDA | Open |
+| 10 | Native `float64` on CUDA | Done as opt-in `jit(..., precision="float64")`; `Trainer` and NCCL stay `float32` |
 | 11 | Packaging and tooling | Done except publishing: `__version__`, value `repr`, `save`/`load`, type stubs, wheel workflow (never run on GitHub yet; no PyPI) |
 
-Open CUDA work: loop VJPs require operands of the carry's shape (so
-reverse-mode `odeint` and loops with broadcast operands differentiate on the
-CPU and MLX only), the fused loop kernels reject slices (so `dopri5` cannot
-run), and there is no host-driven `while_loop` executor.
+All items shipped in v0.3.0. Open follow-ups: publishing wheels to PyPI
+(the wheel workflow builds artifacts only), a CUDA HVP fallback for Scan
+bodies that are not elementwise, caching to cut the per-iteration cost of
+host-driven CUDA loops, and `float64` for the device `Trainer`.
 
 Decisions taken by the owner on 2026-10-06 and implemented:
 
