@@ -26,6 +26,13 @@ deprecated names keep working until 1.0 (see
   rejected); dict entries are visited in sorted key order.
 - Indexing accepts `None`, `...`, and strided slices such as `x[::2]` and
   `x[::-1]`, which used to be rejected.
+- `solve` accepts stacks of matrices with leading batch axes on the CPU and
+  CUDA, and `vmap` batches it (it used to reject a mapped `solve`).
+- The `repr` of an eager `Tensor` shows its values NumPy-style and always
+  names the dtype, for example `Tensor([1., 2.], dtype=float32)`; a
+  `TraceTensor` repr adds its dtype.
+- The package version has one source, `crates/quabla-python/Cargo.toml`;
+  `pyproject.toml` reads it dynamically.
 
 ### Added
 
@@ -57,8 +64,23 @@ deprecated names keep working until 1.0 (see
 - `jit(static_argnames=...)`, keyword arguments to jitted functions, and
   keyword-only decorator forms of `jit`, `grad`, and `value_and_grad`.
 - `quabla.ode.odeint`: fixed-step RK4, Heun, and Euler integration over a
-  single loop region, differentiable with respect to the initial state,
-  time span, and parameters.
+  single loop region, and adaptive Dormand-Prince 5(4) (`method="dopri5"`,
+  `rtol`, `atol`, `max_steps`) with PI step-size control run as a bounded
+  loop, all differentiable with respect to the initial state, time span,
+  and parameters.
+- `quabla.while_loop` with a traced predicate on the CPU and MLX, with
+  forward-mode derivatives; reverse mode and `vmap` raise and point to a
+  bounded `fori_loop`, as in JAX.
+- `quabla.linalg`: `solve`, `solve_triangular`, `cholesky`, `cho_solve`,
+  `slogdet`, `det`, `inv`, and `eigh` (cyclic Jacobi on the CPU, cuSOLVER
+  `syevd` on CUDA), with derivatives of every order written without
+  explicit inverses.
+- `quabla.custom_vjp`, `quabla.custom_jvp`, and `quabla.checkpoint`
+  (`remat`) with JAX's interfaces, under `jit`, `vmap`, and on every device.
+- `quabla.__version__`, `quabla.save`/`quabla.load` for pytrees of arrays in
+  a versioned format that is never unpickled, a `_quabla.pyi` type stub with
+  `py.typed`, and a wheel workflow that builds CPU (Linux) and MLX (macOS)
+  wheels as artifacts without publishing them.
 
 ## [0.2.3] - 2026-10-06
 

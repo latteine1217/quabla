@@ -9,21 +9,26 @@ confirmed were fixed in v0.2.3 (division derivatives without squared
 denominators, IEEE log and division on the CPU, stable sigmoid and softplus
 with a native `log1p`, NaN-propagating `max`/`maximum`/`relu`, native
 `Gather`/`ScatterAdd`, node-by-node CPU elementwise execution, and MLX
-`Trainer` parameters the loss ignores). Work items, in priority order:
+`Trainer` parameters the loss ignores). Status of the work items:
 
-| # | Item | Layer | Size |
-| --- | --- | --- | --- |
-| 1 | Optimizers: L-BFGS (host loop over `jit(value_and_grad)`), AdamW, learning-rate schedules, global-norm gradient clipping; `Trainer` schedules on devices | Python; bridge for device schedules | M |
-| 2 | Elementwise and reductions: `expm1`, `erf`, `atan2`, `clip`, `sign`, `silu`, `gelu`, `softmax`, `logsumexp`, `var`, `std`, `cumsum`, `prod` | Python compositions; core IR ops for `expm1`, `erf`, `atan2` | S-M |
-| 3 | `stop_gradient` | core IR (identity value, zero derivative) | S |
-| 4 | Shape ergonomics: `reshape(-1)` and varargs, `.T`, `x[None]`, `squeeze`, `expand_dims`, `split`, `meshgrid`, `zeros_like`/`ones_like`, 1-D `matmul` | Python | S |
-| 5 | Pytrees: NamedTuple, dataclasses, user registration, `tree.leaves` | Python (`tree.py`, transforms) | M |
-| 6 | `qb.random`: keyed uniform and normal sampling, exposing the existing host uniform sampler | bridge | S |
-| 7 | `while_loop` with a traced predicate, and fixed-step ODE solvers (Euler, RK4) over `fori_loop`; adaptive solvers depend on `while_loop` AD | core IR, Python | M-L |
-| 8 | Linear algebra: `det`/`slogdet` and `cho_solve` from Cholesky, batched `solve`, then `eigh`/`svd`/`qr` | Python for compositions; core and backends for decompositions | M-L |
-| 9 | Transform features: `custom_vjp`/`custom_jvp`, `checkpoint`, `jacfwd`/`jacrev`, `jit` `static_argnames` and decorator keyword use | Python and core inline | M |
-| 10 | Native `float64` on CUDA (MLX hardware has no f64) | CUDA codegen | L |
-| 11 | Packaging and tooling: wheels and PyPI, type stubs, `__version__`, parameter save/load, value-showing `repr`, `debug.print` inside `jit` | CI, Python | M |
+| # | Item | Status |
+| --- | --- | --- |
+| 1 | Optimizers: L-BFGS, AdamW, schedules, global-norm clipping, device `Trainer` schedules | Done; AdamW and clipping are CPU-only in `Trainer` |
+| 2 | Elementwise ops and reductions | Done: native `expm1`, `erf`, `atan2`, `cumsum`; compositions `softmax`, `logsumexp`, `var`/`std`, `silu`, `gelu`, `clip`, `sign`; `prod` and `erfc` remain |
+| 3 | `stop_gradient` | Done |
+| 4 | Shape ergonomics | Done |
+| 5 | Pytrees: NamedTuple, dataclasses, registration | Done |
+| 6 | `qb.random` | Done |
+| 7 | `while_loop`, ODE solvers | Done on the CPU and MLX: `while_loop` (forward mode), fixed-step and adaptive `dopri5` `odeint`; CUDA rejects `while_loop` and `dopri5` |
+| 8 | Linear algebra | Done: batched `solve`, `qb.linalg` with `slogdet`/`det`/`inv`/`cho_solve`/`eigh`; `svd`, `qr`, `lstsq` remain |
+| 9 | `custom_vjp`/`custom_jvp`, `checkpoint`, `jit` keywords | Done; custom rules cannot run inside control-flow bodies |
+| 10 | Native `float64` on CUDA | Open |
+| 11 | Packaging and tooling | Done except publishing: `__version__`, value `repr`, `save`/`load`, type stubs, wheel workflow (never run on GitHub yet; no PyPI) |
+
+Open CUDA work: loop VJPs require operands of the carry's shape (so
+reverse-mode `odeint` and loops with broadcast operands differentiate on the
+CPU and MLX only), the fused loop kernels reject slices (so `dopri5` cannot
+run), and there is no host-driven `while_loop` executor.
 
 Decisions taken by the owner on 2026-10-06 and implemented:
 
@@ -33,21 +38,6 @@ Decisions taken by the owner on 2026-10-06 and implemented:
   every epoch keeps running.
 - `norm` scales by `max|x|`, so it no longer overflows for float32
   magnitudes above about 1e19; results change in the last bits.
-
-Implemented on 2026-10-06 (see [api.md](api.md)): item 5 (NamedTuples as
-automatic pytree nodes, `quabla.tree.register_dataclass` and `register`
-with node classes and aux data in trace cache keys, sortable non-string
-dict keys, `tree.leaves`/`structure`/`flatten_with_path`); item 6
-(`quabla.random` over the SplitMix64 host generator, with
-`Tensor.random_uniform` and `Tensor.fold_in_key` added to the bridge); and
-from item 9, `jit` `static_argnames`, keyword arguments of jitted
-functions, and the keyword decorator forms of `jit`, `grad`, and
-`value_and_grad`.
-
-CUDA loop VJPs require every loop operand to have the carry's shape, so
-reverse-mode differentiation of `ode.odeint` (whose time operands are
-scalars) and of loops with broadcast operands runs on the CPU and MLX only;
-lifting that restriction in the CUDA loop lowering is open v0.3 work.
 
 Smaller observations kept for later: `abs` has gradient -1 at 0 (JAX uses
 +1), `max` gives the whole gradient of a tie to the last element (JAX
