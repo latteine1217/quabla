@@ -143,6 +143,7 @@ fn bits(value: &Array) -> Result<Vec<u32>, String> {
 
 #[test]
 fn checkpoint_matches_original_metal_loops_and_higher_order_bits() -> Result<(), String> {
+    let _guard = mlx_execution_guard();
     let backend = MlxBackend;
     for steps in [1, 8, 17, 64] {
         let (fori, scan) = fixture(4, steps)?;
@@ -248,6 +249,7 @@ fn checkpoint_matches_original_metal_loops_and_higher_order_bits() -> Result<(),
 #[test]
 #[ignore = "isolated complete Metal loop VJP timing and active-memory probe"]
 fn profile_checkpoint_metal_vjp() -> Result<(), String> {
+    let _guard = mlx_execution_guard();
     let backend = MlxBackend;
     let cases = if let Ok(steps) = std::env::var("QUABLA_CHECKPOINT_PROFILE_STEPS") {
         vec![steps.parse::<usize>().map_err(|error| error.to_string())?]

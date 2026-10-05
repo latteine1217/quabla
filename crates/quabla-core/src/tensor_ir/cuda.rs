@@ -3481,8 +3481,12 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
     // `cuda_program_source` for this node, and the launch shape matches the emitted variant: the
     // 16x16 tiled grid only when `use_tiled_rank_two_matmul` also selected the tiled kernel,
     // `CUDA_REDUCTION_BLOCK` (256) threads for each reduction block (one block per
-    // output for long-axis reductions), and a flat grid otherwise. Operands are node buffers sized by their node shapes, the output holds `count`
-    // elements, and every kernel bounds its index by the count or dimensions it receives.
+    // output for long-axis reductions), one block per matrix for Cholesky, and a flat grid
+    // otherwise. Operands are node buffers sized by their node shapes, the output holds `count`
+    // elements, and every kernel bounds its index by the count or dimensions it receives, except
+    // the Cholesky kernel: it replaces `count` with the per-matrix size and offsets both buffers
+    // by `blockIdx.x` matrices, which stays in bounds because the grid above launches exactly
+    // one block per matrix of the batch.
     unsafe {
         launch.launch(config).map_err(|error| {
             format!("failed to launch CUDA node {}: {error:?}", cuda_op_name(op))
