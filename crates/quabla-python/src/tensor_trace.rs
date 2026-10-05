@@ -16,7 +16,7 @@ use quabla_core::tensor_ir::{
 };
 use quabla_core::{
     QuablaCompiler, QuablaExecutable, QuablaMultiOutputExecutable, QuablaMultiOutputProgram,
-    QuablaTarget,
+    QuablaPrecision, QuablaTarget,
 };
 
 use crate::dtype::PyDType;
@@ -2706,7 +2706,12 @@ impl TensorTraceGraph {
     }
 
     /// Compiles the ordered v0.2 output program for an explicitly selected backend.
-    #[pyo3(name = "_compile", signature = (outputs, input_names, target = "cpu", device_ordinal = 0))]
+    /// `precision="float64"` runs `float64` nodes natively on CUDA (see
+    /// `QuablaPrecision`); `None` keeps the backend default.
+    #[pyo3(
+        name = "_compile",
+        signature = (outputs, input_names, target = "cpu", device_ordinal = 0, precision = None)
+    )]
     fn py_compile_target(
         &self,
         py: Python<'_>,
@@ -2714,6 +2719,7 @@ impl TensorTraceGraph {
         input_names: Vec<String>,
         target: &str,
         device_ordinal: usize,
+        precision: Option<&str>,
     ) -> PyResult<StagedExecutable> {
         self.ensure_owns(&outputs.iter().collect::<Vec<_>>())
             .map_err(PyValueError::new_err)?;
@@ -2723,13 +2729,22 @@ impl TensorTraceGraph {
             "mlx" => QuablaTarget::Mlx,
             _ => return Err(PyValueError::new_err("unknown compilation target")),
         };
+        let precision = match precision {
+            None => QuablaPrecision::Default,
+            Some("float64") => QuablaPrecision::Float64,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "precision must be None or \"float64\", got {other:?}"
+                )))
+            }
+        };
         let program = self
             .clone()
             .into_multi_output_program(outputs.iter().map(|output| output.node_id).collect())
             .map_err(PyValueError::new_err)?;
         Ok(StagedExecutable {
             executable: QuablaCompiler
-                .compile_many_checked(&program, target)
+                .compile_many_checked_with_precision(&program, target, precision)
                 .map_err(|error| {
                     use quabla_core::compiler::QuablaCompileError;
                     match error {

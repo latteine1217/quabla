@@ -59,7 +59,8 @@ pub(super) fn ad_source(function: &str, n: usize, kind: CholeskyAdKind) -> Strin
     } else {
         1
     };
-    let mut source = format!("namespace {prefix} {{\nstruct Jet {{ {fields} }};\nstatic_assert(sizeof(Jet)=={}U, \"Jet layout\");\n",lanes*4);
+    // `sizeof(float)` rather than 4: a `precision="float64"` plan retypes the Jet to `double`.
+    let mut source = format!("namespace {prefix} {{\nstruct Jet {{ {fields} }};\nstatic_assert(sizeof(Jet)=={lanes}U*sizeof(float), \"Jet layout\");\n");
     source.push_str("__device__ float addf(float a,float b){return __fadd_rn(a,b);}\n__device__ float mulf(float a,float b){return __fmul_rn(a,b);}\n__device__ float subf(float a,float b){return __fsub_rn(a,b);}\n__device__ float divf(float a,float b){return __fdiv_rn(a,b);}\n");
     source.push_str("__device__ Jet add(Jet a,Jet b){Jet c;c.v=addf(a.v,b.v);");
     if first {

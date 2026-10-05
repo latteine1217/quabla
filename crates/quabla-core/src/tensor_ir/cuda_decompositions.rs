@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use cudarc::cusolver::sys as cusolver_sys;
 use cudarc::driver::{CudaModule, CudaSlice, CudaStream, DevicePtrMut, PushKernelArg};
 
-use super::{launch_cuda_transpose_copy, linalg_kernel, linalg_launch_config, CudaSolver};
+use super::{
+    launch_cuda_transpose_copy, linalg_kernel, linalg_launch_config, CudaReal, CudaSolver,
+};
 use crate::tensor_ir::LinalgKind;
 
 /// Device kernels of this lowering. `quabla_column_major_load` copies each
@@ -110,15 +112,15 @@ fn as_u64(value: usize) -> u64 {
 
 /// Copies the row-major matrices of `matrix` into column-major slots of
 /// `stride` floats of a new buffer.
-fn load_column_major(
+fn load_column_major<T: CudaReal>(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
-    matrix: &CudaSlice<f32>,
+    matrix: &CudaSlice<T>,
     stack: MatrixStack,
     stride: usize,
-) -> Result<CudaSlice<f32>, String> {
+) -> Result<CudaSlice<T>, String> {
     let mut factor = stream
-        .alloc_zeros::<f32>((stack.batch * stride).max(1))
+        .alloc_zeros::<T>((stack.batch * stride).max(1))
         .map_err(|error| format!("failed to allocate CUSOLVER factor buffer: {error:?}"))?;
     let kernel = linalg_kernel(module, "quabla_column_major_load")?;
     let mut launch = stream.launch_builder(&kernel);
@@ -165,13 +167,13 @@ fn check_info(
 
 /// Evaluates one QR or SVD [`LinalgKind`] output for the row-major matrix
 /// stack `matrix` into `output`.
-pub(super) fn launch(
+pub(super) fn launch<T: CudaReal>(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
-    solver: &Arc<Mutex<CudaSolver>>,
+    solver: &Arc<Mutex<CudaSolver<T>>>,
     kind: LinalgKind,
-    matrix: &CudaSlice<f32>,
-    output: &mut CudaSlice<f32>,
+    matrix: &CudaSlice<T>,
+    output: &mut CudaSlice<T>,
     stack: MatrixStack,
 ) -> Result<(), String> {
     match kind {
@@ -185,13 +187,13 @@ pub(super) fn launch(
 /// QR by `geqrf` and, for `Q`, `orgqr` on a column-major copy whose slots
 /// hold `max(n, q_columns)` columns, so `orgqr` can expand the `k`
 /// reflectors to all `m` columns of a complete `Q` in place.
-fn launch_qr(
+fn launch_qr<T: CudaReal>(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
-    solver: &Arc<Mutex<CudaSolver>>,
+    solver: &Arc<Mutex<CudaSolver<T>>>,
     kind: LinalgKind,
-    matrix: &CudaSlice<f32>,
-    output: &mut CudaSlice<f32>,
+    matrix: &CudaSlice<T>,
+    output: &mut CudaSlice<T>,
     stack: MatrixStack,
 ) -> Result<(), String> {
     let name = kind.name();
@@ -204,13 +206,13 @@ fn launch_qr(
     };
     let stride = m * n.max(q_columns);
     let mut factor = load_column_major(stream, module, matrix, stack, stride)?;
-    let alloc_f32 = |count: usize| {
+    let alloc_real = |count: usize| {
         stream
-            .alloc_zeros::<f32>(count.max(1))
+            .alloc_zeros::<T>(count.max(1))
             .map_err(|error| format!("failed to allocate CUSOLVER {name} buffer: {error:?}"))
     };
-    let mut taus = alloc_f32(batch * k)?;
-    let mut signs = alloc_f32(batch * k)?;
+    let mut taus = alloc_real(batch * k)?;
+    let mut signs = alloc_real(batch * k)?;
     let mut info = stream
         .alloc_zeros::<i32>(batch.max(1))
         .map_err(|error| format!("failed to allocate CUSOLVER {name} status: {error:?}"))?;
@@ -225,7 +227,7 @@ fn launch_qr(
         .lock()
         .map_err(|_| "CUSOLVER handle lock is poisoned".to_string())?;
     let handle = &solver.handle;
-    let float = std::mem::size_of::<f32>() as u64;
+    let element = std::mem::size_of::<T>() as u64;
     let int = std::mem::size_of::<i32>() as u64;
     let mut workspace = [0_i32; 2];
     {
@@ -235,25 +237,25 @@ fn launch_qr(
         // `m x max(n, q_columns)` matrix with `lda = m`, `taus` at least `k` floats, and the
         // workspace sizes are written to valid host locations.
         unsafe {
-            cusolver_sys::cusolverDnSgeqrf_bufferSize(
+            (T::GEQRF_BUFFER_SIZE)(
                 handle.cu(),
                 m_i32,
                 n_i32,
-                factor_ptr as *mut f32,
+                factor_ptr as *mut T,
                 m_i32,
                 &mut workspace[0],
             )
             .result()
             .map_err(|error| format!("CUSOLVER geqrf workspace query failed: {error:?}"))?;
             if want_q {
-                cusolver_sys::cusolverDnSorgqr_bufferSize(
+                (T::ORGQR_BUFFER_SIZE)(
                     handle.cu(),
                     m_i32,
                     q_i32,
                     k_i32,
-                    factor_ptr as *const f32,
+                    factor_ptr as *const T,
                     m_i32,
-                    tau_ptr as *const f32,
+                    tau_ptr as *const T,
                     &mut workspace[1],
                 )
                 .result()
@@ -264,7 +266,7 @@ fn launch_qr(
     let workspace = usize::try_from(workspace[0].max(workspace[1]))
         .map_err(|_| "CUSOLVER returned a negative workspace size".to_string())?;
     let workspace_i32 = as_i32(workspace, "workspace size")?;
-    let mut scratch = alloc_f32(workspace)?;
+    let mut scratch = alloc_real(workspace)?;
     {
         let (factor_ptr, _factor_guard) = factor.device_ptr_mut(stream);
         let (tau_ptr, _tau_guard) = taus.device_ptr_mut(stream);
@@ -276,14 +278,14 @@ fn launch_qr(
             // queried size and is reused sequentially on the handle's stream, which also ordered
             // the load kernel that wrote `factor`; the guards outlive the loop.
             unsafe {
-                cusolver_sys::cusolverDnSgeqrf(
+                (T::GEQRF)(
                     handle.cu(),
                     m_i32,
                     n_i32,
-                    (factor_ptr + index * stride as u64 * float) as *mut f32,
+                    (factor_ptr + index * stride as u64 * element) as *mut T,
                     m_i32,
-                    (tau_ptr + index * k as u64 * float) as *mut f32,
-                    scratch_ptr as *mut f32,
+                    (tau_ptr + index * k as u64 * element) as *mut T,
+                    scratch_ptr as *mut T,
                     workspace_i32,
                     (info_ptr + index * int) as *mut i32,
                 )
@@ -345,15 +347,15 @@ fn launch_qr(
             // `orgqr` may overwrite all `q_columns` columns in place, and the sign kernel that
             // read the diagonal of `R` was ordered before this call on the same stream.
             unsafe {
-                cusolver_sys::cusolverDnSorgqr(
+                (T::ORGQR)(
                     handle.cu(),
                     m_i32,
                     q_i32,
                     k_i32,
-                    (factor_ptr + index * stride as u64 * float) as *mut f32,
+                    (factor_ptr + index * stride as u64 * element) as *mut T,
                     m_i32,
-                    (tau_ptr + index * k as u64 * float) as *const f32,
-                    scratch_ptr as *mut f32,
+                    (tau_ptr + index * k as u64 * element) as *const T,
+                    scratch_ptr as *mut T,
                     workspace_i32,
                     (info_ptr + index * int) as *mut i32,
                 )
@@ -384,13 +386,13 @@ fn launch_qr(
 
 /// The SVD by `gesvdj` (two-sided Jacobi, singular values sorted
 /// descending), economical unless a full basis is requested.
-fn launch_svd(
+fn launch_svd<T: CudaReal>(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
-    solver: &Arc<Mutex<CudaSolver>>,
+    solver: &Arc<Mutex<CudaSolver<T>>>,
     kind: LinalgKind,
-    matrix: &CudaSlice<f32>,
-    output: &mut CudaSlice<f32>,
+    matrix: &CudaSlice<T>,
+    output: &mut CudaSlice<T>,
     stack: MatrixStack,
 ) -> Result<(), String> {
     let name = kind.name();
@@ -399,14 +401,14 @@ fn launch_svd(
     let full = matches!(kind, LinalgKind::SvdUFull | LinalgKind::SvdVhFull);
     let (u_columns, vh_rows) = if full { (m, n) } else { (k, k) };
     let mut factor = load_column_major(stream, module, matrix, stack, m * n)?;
-    let alloc_f32 = |count: usize| {
+    let alloc_real = |count: usize| {
         stream
-            .alloc_zeros::<f32>(count.max(1))
+            .alloc_zeros::<T>(count.max(1))
             .map_err(|error| format!("failed to allocate CUSOLVER {name} buffer: {error:?}"))
     };
-    let mut values = alloc_f32(batch * k)?;
-    let mut left = alloc_f32(batch * m * u_columns)?;
-    let mut right = alloc_f32(batch * n * vh_rows)?;
+    let mut values = alloc_real(batch * k)?;
+    let mut left = alloc_real(batch * m * u_columns)?;
+    let mut right = alloc_real(batch * n * vh_rows)?;
     let mut info = stream
         .alloc_zeros::<i32>(batch.max(1))
         .map_err(|error| format!("failed to allocate CUSOLVER {name} status: {error:?}"))?;
@@ -428,7 +430,7 @@ fn launch_svd(
         unsafe { cusolver_sys::cusolverDnXgesvdjSetSortEig(params, 1) }
             .result()
             .map_err(|error| format!("CUSOLVER gesvdj sort setting failed: {error:?}"))?;
-        let float = std::mem::size_of::<f32>() as u64;
+        let element = std::mem::size_of::<T>() as u64;
         let int = std::mem::size_of::<i32>() as u64;
         let mut workspace = 0_i32;
         let (factor_ptr, _factor_guard) = factor.device_ptr_mut(stream);
@@ -440,18 +442,18 @@ fn launch_svd(
         // `m x n` input (`lda = m`), `k` values, an `m x u_columns` `U` (`ldu = m`), and an
         // `n x vh_rows` `V` (`ldv = n`); `workspace` is a valid host output location.
         unsafe {
-            cusolver_sys::cusolverDnSgesvdj_bufferSize(
+            (T::GESVDJ_BUFFER_SIZE)(
                 handle.cu(),
                 jobz,
                 economy,
                 m_i32,
                 n_i32,
-                factor_ptr as *const f32,
+                factor_ptr as *const T,
                 m_i32,
-                values_ptr as *const f32,
-                left_ptr as *const f32,
+                values_ptr as *const T,
+                left_ptr as *const T,
                 m_i32,
-                right_ptr as *const f32,
+                right_ptr as *const T,
                 n_i32,
                 &mut workspace,
                 params,
@@ -461,7 +463,7 @@ fn launch_svd(
         .map_err(|error| format!("CUSOLVER gesvdj workspace query failed: {error:?}"))?;
         let workspace_len = usize::try_from(workspace)
             .map_err(|_| "CUSOLVER returned a negative workspace size".to_string())?;
-        let mut scratch = alloc_f32(workspace_len)?;
+        let mut scratch = alloc_real(workspace_len)?;
         let (scratch_ptr, _scratch_guard) = scratch.device_ptr_mut(stream);
         for index in 0..batch as u64 {
             // SAFETY: each pointer is offset by whole batch elements inside its buffer (sizes as
@@ -469,20 +471,20 @@ fn launch_svd(
             // sequentially on the handle's stream, which also ordered the load kernel; the
             // guards outlive the loop.
             unsafe {
-                cusolver_sys::cusolverDnSgesvdj(
+                (T::GESVDJ)(
                     handle.cu(),
                     jobz,
                     economy,
                     m_i32,
                     n_i32,
-                    (factor_ptr + index * (m * n) as u64 * float) as *mut f32,
+                    (factor_ptr + index * (m * n) as u64 * element) as *mut T,
                     m_i32,
-                    (values_ptr + index * k as u64 * float) as *mut f32,
-                    (left_ptr + index * (m * u_columns) as u64 * float) as *mut f32,
+                    (values_ptr + index * k as u64 * element) as *mut T,
+                    (left_ptr + index * (m * u_columns) as u64 * element) as *mut T,
                     m_i32,
-                    (right_ptr + index * (n * vh_rows) as u64 * float) as *mut f32,
+                    (right_ptr + index * (n * vh_rows) as u64 * element) as *mut T,
                     n_i32,
-                    scratch_ptr as *mut f32,
+                    scratch_ptr as *mut T,
                     workspace,
                     (info_ptr + index * int) as *mut i32,
                     params,
@@ -506,7 +508,7 @@ fn launch_svd(
     }
     // `gesvdj` returns `V` column-major, which is `Vh` row-major; `U` is
     // column-major and is transposed into place.
-    let mut u = alloc_f32(batch * m * u_columns)?;
+    let mut u = alloc_real(batch * m * u_columns)?;
     launch_cuda_transpose_copy(stream, module, &left, &mut u, batch, u_columns, m)?;
     let kernel = linalg_kernel(module, "quabla_svd_signs")?;
     let mut launch = stream.launch_builder(&kernel);

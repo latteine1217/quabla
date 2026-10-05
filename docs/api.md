@@ -169,7 +169,8 @@ qb.vjp(fun, *primals, has_aux=False)              # -> (out, vjp_fun[, aux])
 qb.jacobian(fun, argnums=0)                       # blocks [*out.shape, *in.shape]
 qb.hessian(fun, argnums=0)                        # blocks [*in.shape, *in.shape]
 qb.vmap(fun, in_axes=0, out_axes=0)               # -> batched fun
-qb.jit(fun, device=None, static_argnums=(), max_traces=8, static_argnames=())
+qb.jit(fun, device=None, static_argnums=(), max_traces=8, static_argnames=(),
+       precision=None)
 ```
 
 `jit`, `grad`, and `value_and_grad` called with keywords only return a
@@ -560,6 +561,26 @@ are `ValueError`. Eager array operations remain on the host. Device calls
 upload inputs and return host output pytrees; logical float64 device programs
 emit one `UserWarning` per compiled function because execution is float32.
 `qb.devices()` lists built targets, not physical GPU ordinals.
+
+`qb.jit(fun, device="cuda", precision="float64")` executes float64 programs
+natively in double precision on CUDA, without the warning. Consumer GPUs run
+f64 arithmetic at a small fraction of their f32 rate (a matmul-heavy
+value-and-gradient step takes about 9x longer on a GTX 1660 SUPER), so
+float32 execution stays the default. Under `precision="float64"`
+every operation the CUDA backend lowers runs in double: the NVRTC kernels
+(elementwise, reductions, `cumsum`, Cholesky and its derivatives, fused and
+host-driven `fori`/`scan`/`while`/`cond` regions) and cuBLAS `dgemm` and
+cuSOLVER `getrf`/`getrs`/`syevd`/`geqrf`/`orgqr`/`gesvdj`; results match
+the CPU float64 reference to about `1e-13` relative. One compiled program
+has one floating element type, so a program that also contains float32
+values raises `UnsupportedOperationError` with `.op == "float32"`; cast them
+to float64 or use the default precision. A program without float64 values
+compiles as with the default. The argument is a no-op on the CPU, which
+already runs float64 natively, raises `UnsupportedOperationError` on MLX,
+which has no float64 arithmetic, and is part of the trace-cache
+configuration, so the two precisions never share a compiled program. Other
+values than `None` and `"float64"` are `ValueError`. `qb.optim.Trainer` and
+the NCCL data-parallel paths keep float32 device execution.
 
 `qb.jit(fun).lower(*args)` accepts arrays or `qb.ShapeDtype(shape, dtype)`
 inside pytrees and traces without execution. The lowered object exposes
@@ -1418,8 +1439,9 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
   specialization (`tensor_jit_batch_fn` and its variants); there are no
   symbolic dimensions.
 - Dtypes are `float32`, `float64`, and `bool`. `float16`/`bfloat16`, integer
-  tensors, native device `f64`, and mixed-precision training are not
-  implemented. Host storage is physically typed F64/F32/Bool; narrow
+  tensors, and mixed-precision training are not implemented. Native device
+  `f64` is opt-in on CUDA through `jit(precision="float64")` and unavailable
+  on MLX and in `Trainer`. Host storage is physically typed F64/F32/Bool; narrow
   storage widens transiently only when an F64 view is requested.
 - `gather`/`scatter_add` take static Python integer indices; dynamic index
   tensors, boolean-mask indexing, and empty slices are unsupported.

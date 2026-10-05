@@ -523,10 +523,14 @@ class _Program:
 
     __slots__ = ("executable", "template", "out_node")
 
-    def __init__(self, graph, input_names, outputs, out_node, target="cpu", ordinal=0):
+    def __init__(
+        self, graph, input_names, outputs, out_node, target="cpu", ordinal=0, precision=None
+    ):
         traced = [output for output in outputs if _is_traced(output)]
         self.executable = (
-            graph._compile(traced, input_names, target, ordinal) if traced else None
+            graph._compile(traced, input_names, target, ordinal, precision)
+            if traced
+            else None
         )
         self.template = []
         index = 0
@@ -936,9 +940,21 @@ def _keyword_parameters(fun):
 
 
 class _Jit(_Transform):
-    def __init__(self, fun, device, static_argnums, max_traces, static_argnames=()):
+    def __init__(
+        self, fun, device, static_argnums, max_traces, static_argnames=(), precision=None
+    ):
         self._target, self._ordinal = require_device(device, "jit")
         self._device = device or "cpu"
+        if precision not in (None, "float64"):
+            raise ValueError(f'precision must be None or "float64", got {precision!r}')
+        if precision == "float64" and self._target == "mlx":
+            raise UnsupportedOperationError(
+                'MLX has no float64 arithmetic; precision="float64" is supported on '
+                "the CPU and CUDA",
+                op="float64",
+                device=self._device,
+            )
+        self._precision = precision
         self._warned_precision = False
         if isinstance(static_argnums, int):
             static_argnums = (static_argnums,)
@@ -964,6 +980,7 @@ class _Jit(_Transform):
                 static_argnums,
                 max_traces,
                 static_argnames,
+                precision,
             ),
         )
         self._static_argnums = static_argnums
@@ -1008,8 +1025,13 @@ class _Jit(_Transform):
             staged.out_node,
             self._target,
             self._ordinal,
+            self._precision,
         )
-        if self._target != "cpu" and not self._warned_precision:
+        if (
+            self._target != "cpu"
+            and self._precision is None
+            and not self._warned_precision
+        ):
             if any(
                 _is_traced(output) and output.dtype == float64
                 for output in staged.outputs
@@ -1989,8 +2011,9 @@ def _new_jit(
     static_argnums=(),
     max_traces=_DEFAULT_MAX_TRACES,
     static_argnames=(),
+    precision=None,
 ):
-    return _Jit(fun, device, static_argnums, max_traces, static_argnames)
+    return _Jit(fun, device, static_argnums, max_traces, static_argnames, precision)
 
 
 def _decorator(transform, kwargs):
@@ -2034,7 +2057,7 @@ def grad(*args, **kwargs):
 
 def jit(*args, **kwargs):
     """`jit(fun, device=None, static_argnums=(), max_traces=8,
-    static_argnames=())`: `fun` traced and compiled on its first call per
+    static_argnames=(), precision=None)`: `fun` traced and compiled on its first call per
     argument signature, then run from the cache. `device=None` means
     `"cpu"`; device targets are explicit. Arguments at `static_argnums`, or
     named in `static_argnames`, are static as a whole and must be hashable;
@@ -2044,6 +2067,11 @@ def jit(*args, **kwargs):
     arguments must be static. A signature beyond `max_traces` evicts the
     least recently used trace with a `RetraceWarning`. Called with keywords
     only (`@jit(device="mlx", static_argnums=1)`), returns a decorator.
+
+    CUDA executes `float64` programs as `float32` by default (with a
+    `UserWarning`). `precision="float64"` runs them natively in double on
+    CUDA instead; such a program must not also contain `float32` values.
+    It is a no-op on the CPU and raises `UnsupportedOperationError` on MLX.
 
     The v0.1 decorator form `jit(input_specs)` of the 2D `Matrix` API still
     works unchanged: it is recognized by its non-callable spec list (D17).

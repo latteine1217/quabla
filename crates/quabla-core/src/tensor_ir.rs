@@ -22,7 +22,7 @@ mod mlx;
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 pub use cuda::{
     CudaBackend, CudaDataParallelExecutionPlan, CudaDataParallelResult, CudaDataParallelTiming,
-    CudaExecutionPlan,
+    CudaExecutionPlan, CudaReal,
 };
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
@@ -157,10 +157,13 @@ pub struct CudaBackend {
 }
 
 #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+/// `T` is the device element type of the CUDA build's plan (`f32`, or `f64`
+/// for the `precision="float64"` lowering); this build never constructs one.
 #[derive(Clone, Debug)]
-pub struct CudaExecutionPlan {
+pub struct CudaExecutionPlan<T = f32> {
     plan: TensorExecutionPlan,
     device_ordinal: usize,
+    element: std::marker::PhantomData<T>,
 }
 
 #[cfg(not(all(feature = "cuda", target_os = "linux")))]
@@ -189,6 +192,17 @@ impl CudaBackend {
     }
 
     pub fn compile(&self, plan: TensorExecutionPlan) -> Result<CudaExecutionPlan, String> {
+        let _ = plan;
+        Err(format!(
+            "CUDA backend is unavailable for device {}: build Quabla on Linux with --features cuda",
+            self.device_ordinal
+        ))
+    }
+
+    pub fn compile_float64(
+        &self,
+        plan: TensorExecutionPlan,
+    ) -> Result<CudaExecutionPlan<f64>, String> {
         let _ = plan;
         Err(format!(
             "CUDA backend is unavailable for device {}: build Quabla on Linux with --features cuda",
@@ -251,7 +265,7 @@ impl CudaDataParallelExecutionPlan {
 }
 
 #[cfg(not(all(feature = "cuda", target_os = "linux")))]
-impl CudaExecutionPlan {
+impl<T> CudaExecutionPlan<T> {
     pub fn plan(&self) -> &TensorExecutionPlan {
         &self.plan
     }
@@ -15088,6 +15102,27 @@ impl TensorExecutionPlan {
         }
     }
 
+    /// Checks the `precision="float64"` CUDA lowering, which gives the plan
+    /// `f64` device buffers: no node, nested regions included, may be `float32`.
+    pub fn validate_cuda_float64(&self) -> Result<(), (String, String)> {
+        #[cfg(all(feature = "cuda", target_os = "linux"))]
+        {
+            cuda::validate_cuda_float64_plan(self)
+        }
+        #[cfg(not(all(feature = "cuda", target_os = "linux")))]
+        {
+            Err((
+                "cuda".into(),
+                "CUDA target is unavailable in this build".into(),
+            ))
+        }
+    }
+
+    /// Whether any node of this plan (outside nested regions) is `float64`.
+    pub fn has_float64_nodes(&self) -> bool {
+        self.nodes.iter().any(|node| node.dtype == TensorDType::F64)
+    }
+
     /// Checks lazy MLX lowering without allocating arrays or executing a branch.
     /// The compatibility helpers keep their historical execution-time errors.
     pub fn validate_mlx(&self) -> Result<(), (String, String)> {
@@ -16320,12 +16355,17 @@ fn cuda_broadcast_offset_function_named(
     )
 }
 
+/// A CUDA `float` literal that rounds `value` like `value as f32`, spelled
+/// with the shortest round-trip `f64` digits: a value exact in `f32` keeps an
+/// `f` suffix, any other is cast to `float`. A program retyped to `double` for
+/// `precision="float64"` drops the suffix and the cast and so keeps every bit
+/// of the `f64` constant (the shortest `f32` digits would not: `2^-12` would
+/// become `0.00024414062`).
 fn cuda_scalar_literal(value: f64) -> String {
-    let value = value as f32;
-    if value.fract() == 0.0 {
-        format!("{value:.1}f")
-    } else {
+    if f64::from(value as f32) == value {
         format!("{value:?}f")
+    } else {
+        format!("((float){value:?})")
     }
 }
 

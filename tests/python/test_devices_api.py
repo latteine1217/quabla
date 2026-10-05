@@ -315,6 +315,167 @@ def test_device_expm1_erf_erfc_atan2_stop_gradient_cumsum_and_prod_match_cpu():
         print("SKIP device new-op parity: GPU gates unset")
 
 
+def test_jit_precision_argument():
+    raises(ValueError, qb.jit, lambda x: x, precision="float16")
+    raises(ValueError, qb.jit, lambda x: x, device="cpu", precision="float32")
+    # The CPU already runs float64 natively: the argument changes nothing.
+    x = qb.array([0.1, 1.0 / 3.0, 2.5])
+    value = qb.jit(lambda t: qb.exp(t) * qb.erf(t), precision="float64")(x)
+    assert value.tolist() == qb.jit(lambda t: qb.exp(t) * qb.erf(t))(x).tolist()
+    if "mlx" in qb.devices():
+        error = raises(
+            qb.UnsupportedOperationError, qb.jit, lambda t: t, device="mlx", precision="float64"
+        )
+        assert (error.op, error.device) == ("float64", "mlx")
+
+
+def close_normwise(actual, expected, tolerance):
+    """`max|actual - expected| <= tolerance * max|expected|` per output."""
+    assert actual.shape == expected.shape, (actual.shape, expected.shape)
+    got, want = actual.to_flat_list(), expected.to_flat_list()
+    scale = max((abs(y) for y in want), default=0.0)
+    error = max((abs(x - y) for x, y in zip(got, want)), default=0.0)
+    assert error <= tolerance * max(scale, 1e-300), (error, scale)
+    return error / max(scale, 1e-300)
+
+
+def test_cuda_float64_precision_matches_cpu():
+    if os.environ.get("QUABLA_CUDA_TEST") != "1":
+        print("SKIP CUDA float64 precision: QUABLA_CUDA_TEST unset")
+        return
+    assert "cuda" in qb.devices(), "QUABLA_CUDA_TEST requested but target not built"
+
+    def series(count, scale=1.0, shift=0.0):
+        return [scale * math.sin(1.37 * i + 0.4) + shift for i in range(count)]
+
+    def full_rank(rows, columns, seed):
+        return qb.array(
+            [[math.sin((i + 1) * (j + 2) * 0.731 + seed) for j in range(columns)]
+             for i in range(rows)]
+        )
+
+    def compare(name, function, *args):
+        expected = qb.jit(function)(*args)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            actual = qb.jit(function, device="cuda", precision="float64")(*args)
+        assert not caught, (name, [str(warning.message) for warning in caught])
+        for got, want in zip(qb.tree.leaves(actual), qb.tree.leaves(expected), strict=True):
+            assert got.dtype == qb.float64, (name, got.dtype)
+            # Device and CPU differ only in libm rounding and summation order.
+            close_normwise(got, want, 1e-12)
+
+    x = qb.array(series(1000, 0.9, 1.0))
+    y = qb.array(series(1000, 2.0))
+    compare(
+        "elementwise",
+        lambda a, b: qb.exp(a) + qb.log(a) * qb.erf(b) + qb.erfc(b) + qb.log1p(a)
+        + qb.expm1(b) + qb.tanh(b) * qb.sin(a) + a**b + qb.atan2(b, a) + qb.sqrt(a),
+        x,
+        y,
+    )
+    # A float32 sum of 1e6 values loses about six digits; float64 keeps them.
+    many = qb.array([1.0 + 1e-9 * i for i in range(1_000_000)])
+    compare("sum", lambda a: (qb.sum(a), qb.mean(a)), many)
+    # The mean's VJP scale 1/4096 is exact in float32 but its shortest float32
+    # digits are not exact in float64; the double kernels must keep 2^-12.
+    compare("mean gradient", qb.grad(lambda a: qb.mean(a * a)), qb.array(series(4096)))
+    matrix = qb.array([series(400, 1.0, 0.1 * row) for row in range(300)])
+    compare("axis sums", lambda a: (qb.sum(a, axis=0), qb.mean(a, axis=1)), matrix)
+    lhs = qb.array([series(96, 1.0, 0.01 * row) for row in range(64)])
+    rhs = qb.array([series(48, 1.0, -0.02 * row) for row in range(96)])
+    compare("matmul", lambda a, b: (a @ b, qb.reshape(a, [4, 16, 96]) @ b), lhs, rhs)
+    spd = qb.jit(lambda a: a @ a.T + 5.0 * qb.eye(5))(full_rank(5, 5, 0.2))
+    compare(
+        "linalg",
+        lambda a, b: (
+            qb.linalg.solve(a, b),
+            qb.linalg.cholesky(a),
+            *qb.linalg.eigh(a),
+            *qb.linalg.slogdet(a),
+            *qb.linalg.qr(b),
+            qb.linalg.svd(b, compute_uv=False),
+        ),
+        spd,
+        full_rank(5, 3, 1.1),
+    )
+    compare(
+        "cholesky gradient",
+        qb.grad(lambda a: qb.sum(qb.linalg.cholesky(a) * qb.linalg.cholesky(a))),
+        spd,
+    )
+
+    # A PINN residual u'' + sin(pi x) on a tanh network, differentiated
+    # with respect to the parameters.
+    def network(params, point):
+        hidden = qb.tanh(point * params["w1"] + params["b1"])
+        return qb.sum(hidden * params["w2"])
+
+    def pinn_loss(params, points):
+        second = qb.vmap(qb.grad(qb.grad(network, argnums=1), argnums=1), in_axes=(None, 0))
+        residual = second(params, points) + qb.sin(math.pi * points)
+        return qb.mean(residual * residual)
+
+    params = {
+        "w1": qb.array(series(16, 1.5)),
+        "b1": qb.array(series(16, 0.5, 0.1)),
+        "w2": qb.array(series(16, 0.8, -0.05)),
+    }
+    points = qb.array([i / 63.0 for i in range(64)])
+    compare("pinn value_and_grad", qb.value_and_grad(pinn_loss), params, points)
+
+    def oscillator(state, t):
+        return qb.stack([state[1], -state[0] - 0.1 * state[1]])
+
+    compare(
+        "dopri5",
+        lambda y0: qb.ode.odeint(
+            oscillator, y0, (0.0, 5.0), method="dopri5", rtol=1e-10, atol=1e-12,
+            max_steps=4000,
+        ),
+        qb.array([1.0, 0.0]),
+    )
+    compare(
+        "control flow",
+        lambda v: (
+            qb.fori_loop(0, 20, lambda i, c: 0.9 * c + 0.1 * qb.sin(c), v),
+            qb.scan(lambda c, i: (c * 1.01 + 0.001, qb.sum(c)), v, length=8)[1],
+            qb.while_loop(lambda c: qb.sum(c) < 1e4, lambda c: c * 1.5 + 1.0, v),
+            qb.cond(qb.sum(v) > 0.0, lambda u: qb.exp(u), lambda u: -u, v),
+        ),
+        qb.array(series(8, 0.5, 0.6)),
+    )
+    compare(
+        "loop gradients",
+        qb.grad(
+            lambda v: qb.sum(
+                qb.fori_loop(0, 6, lambda i, c, w: qb.tanh(c) * c + w, v, operands=(v,))
+            )
+            + qb.sum(qb.scan(lambda c, i: (qb.sin(c), c * c), v, length=4)[1])
+        ),
+        qb.array(series(8, 0.5)),
+    )
+
+    # The default lowering still warns and computes in float32.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        default = qb.jit(lambda a: qb.sum(a), device="cuda")(many)
+    assert any("float32" in str(warning.message) for warning in caught)
+    assert abs(default.item() - qb.jit(lambda a: qb.sum(a))(many).item()) > 1e-9
+
+    # One plan has one floating element type: float32 values are rejected.
+    mixed = qb.jit(lambda a, b: a + b.astype(qb.float64), device="cuda", precision="float64")
+    error = raises(
+        qb.UnsupportedOperationError, mixed, qb.array([1.0]), qb.array([2.0], dtype=qb.float32)
+    )
+    assert error.op == "float32", error.op
+    # A program without float64 values compiles as with the default.
+    single = qb.array([0.5, 1.5], dtype=qb.float32)
+    value = qb.jit(lambda a: qb.exp(a), device="cuda", precision="float64")(single)
+    assert value.dtype == qb.float32
+    assert value.tolist() == qb.jit(lambda a: qb.exp(a), device="cuda")(single).tolist()
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_"):

@@ -39,15 +39,15 @@ use super::{
     cuda_fori_vjp_jvp_is_lowerable, cuda_fori_vjp_plan, cuda_scalar_predicate,
     cuda_scan_body_is_lowerable, cuda_scan_vjp_plans, cuda_value, execute_cuda_device_program,
     recycle_cuda_computed_values, CudaBackend, CudaBufferPool, CudaExecutionPlan,
-    CudaExecutionState, CudaProgramRuntime,
+    CudaExecutionState, CudaProgramRuntime, CudaReal,
 };
 
 /// One loop node compiled for host-driven execution.
 #[derive(Clone, Debug)]
-pub(super) struct CudaHostLoop {
+pub(super) struct CudaHostLoop<T: CudaReal> {
     kind: HostLoopKind,
     /// Device programs in the order `HostLoopKind` documents for its variant.
-    regions: Vec<CudaExecutionPlan>,
+    regions: Vec<CudaExecutionPlan<T>>,
 }
 
 /// Static bounds and capture names of one fixed-bound loop.
@@ -451,7 +451,7 @@ pub(super) fn validate_cuda_host_loop(op: &TensorOp) -> Result<(), (String, Stri
     Ok(())
 }
 
-impl CudaHostLoop {
+impl<T: CudaReal> CudaHostLoop<T> {
     pub(super) fn compile(
         backend: &CudaBackend,
         context: &Arc<CudaContext>,
@@ -477,9 +477,9 @@ impl CudaHostLoop {
         &self,
         plan: &TensorExecutionPlan,
         node_id: TensorNodeId,
-        values: &[Option<CudaSlice<f32>>],
+        values: &[Option<CudaSlice<T>>],
         stream: &Arc<CudaStream>,
-    ) -> Result<Vec<(TensorNodeId, CudaSlice<f32>)>, String> {
+    ) -> Result<Vec<(TensorNodeId, CudaSlice<T>)>, String> {
         let mut host = HostRun {
             stream: stream.clone(),
             // Loop working sets are bounded by the carry tape, so a private
@@ -578,11 +578,11 @@ impl CudaHostLoop {
                 };
                 let mut index = LoopIndex::new(&mut host, names)?;
                 let body = &self.regions[0];
-                let mut step = |host: &mut HostRun,
-                                index: &mut LoopIndex,
+                let mut step = |host: &mut HostRun<T>,
+                                index: &mut LoopIndex<T>,
                                 offset: usize,
-                                state: &[CudaSlice<f32>]|
-                 -> Result<Vec<CudaSlice<f32>>, String> {
+                                state: &[CudaSlice<T>]|
+                 -> Result<Vec<CudaSlice<T>>, String> {
                     index.set(&host.stream, offset)?;
                     let mut bindings = captures.clone();
                     bindings.insert(names.carry.clone(), &state[0]);
@@ -640,11 +640,11 @@ impl CudaHostLoop {
                 let tangent_values = named_values(tangent_captures, values)?;
                 let mut index = LoopIndex::new(&mut host, names)?;
                 let forward = &self.regions[0];
-                let mut step = |host: &mut HostRun,
-                                index: &mut LoopIndex,
+                let mut step = |host: &mut HostRun<T>,
+                                index: &mut LoopIndex<T>,
                                 offset: usize,
-                                state: &[CudaSlice<f32>]|
-                 -> Result<Vec<CudaSlice<f32>>, String> {
+                                state: &[CudaSlice<T>]|
+                 -> Result<Vec<CudaSlice<T>>, String> {
                     forward_jvp_step(
                         host,
                         index,
@@ -770,11 +770,11 @@ impl CudaHostLoop {
                 let output_cotangents = cuda_value(values, *output_cotangents)?;
                 let mut index = LoopIndex::new(&mut host, names)?;
                 let body = &self.regions[0];
-                let mut step = |host: &mut HostRun,
-                                index: &mut LoopIndex,
+                let mut step = |host: &mut HostRun<T>,
+                                index: &mut LoopIndex<T>,
                                 offset: usize,
-                                state: &[CudaSlice<f32>]|
-                 -> Result<Vec<CudaSlice<f32>>, String> {
+                                state: &[CudaSlice<T>]|
+                 -> Result<Vec<CudaSlice<T>>, String> {
                     index.set(&host.stream, offset)?;
                     let mut bindings = captures.clone();
                     bindings.insert(names.carry.clone(), &state[0]);
@@ -843,10 +843,10 @@ fn mismatch(node_id: TensorNodeId) -> String {
     format!("CUDA host-driven loop node {node_id} does not match its compiled regions")
 }
 
-fn loop_captures<'a>(
+fn loop_captures<'a, T: CudaReal>(
     op: &TensorOp,
-    values: &'a [Option<CudaSlice<f32>>],
-) -> Result<BTreeMap<String, &'a CudaSlice<f32>>, String> {
+    values: &'a [Option<CudaSlice<T>>],
+) -> Result<BTreeMap<String, &'a CudaSlice<T>>, String> {
     let captures = match op {
         TensorOp::While { captures, .. }
         | TensorOp::Fori { captures, .. }
@@ -860,10 +860,10 @@ fn loop_captures<'a>(
     named_values(captures, values)
 }
 
-fn named_values<'a>(
+fn named_values<'a, T: CudaReal>(
     bindings: &[(String, TensorNodeId)],
-    values: &'a [Option<CudaSlice<f32>>],
-) -> Result<BTreeMap<String, &'a CudaSlice<f32>>, String> {
+    values: &'a [Option<CudaSlice<T>>],
+) -> Result<BTreeMap<String, &'a CudaSlice<T>>, String> {
     bindings
         .iter()
         .map(|(name, node)| cuda_value(values, *node).map(|value| (name.clone(), value)))
@@ -879,13 +879,13 @@ fn scan_output_count(op: &TensorOp) -> Result<usize, String> {
 
 /// Moves one named gradient to a group member, or zeros when the body does
 /// not depend on that capture.
-fn take_gradient(
-    host: &mut HostRun,
-    gradients: &mut BTreeMap<String, CudaSlice<f32>>,
+fn take_gradient<T: CudaReal>(
+    host: &mut HostRun<T>,
+    gradients: &mut BTreeMap<String, CudaSlice<T>>,
     plan: &TensorExecutionPlan,
     member: TensorNodeId,
     name: &str,
-) -> Result<(TensorNodeId, CudaSlice<f32>), String> {
+) -> Result<(TensorNodeId, CudaSlice<T>), String> {
     match gradients.remove(name) {
         Some(gradient) => Ok((member, gradient)),
         None => {
@@ -895,13 +895,13 @@ fn take_gradient(
     }
 }
 
-fn fori_vjp_results(
-    host: &mut HostRun,
+fn fori_vjp_results<T: CudaReal>(
+    host: &mut HostRun<T>,
     plan: &TensorExecutionPlan,
     members: &[TensorNodeId],
     carry: &str,
-    mut gradients: BTreeMap<String, CudaSlice<f32>>,
-) -> Result<Vec<(TensorNodeId, CudaSlice<f32>)>, String> {
+    mut gradients: BTreeMap<String, CudaSlice<T>>,
+) -> Result<Vec<(TensorNodeId, CudaSlice<T>)>, String> {
     members
         .iter()
         .map(|member| {
@@ -920,17 +920,17 @@ fn fori_vjp_results(
 
 /// One forward-mode body step over a `(carry, tangent)` state.
 #[allow(clippy::too_many_arguments)]
-fn forward_jvp_step(
-    host: &mut HostRun,
-    index: &mut LoopIndex,
-    region: &CudaExecutionPlan,
+fn forward_jvp_step<T: CudaReal>(
+    host: &mut HostRun<T>,
+    index: &mut LoopIndex<T>,
+    region: &CudaExecutionPlan<T>,
     names: &LoopNames,
     tangents: &BTreeMap<String, String>,
-    captures: &BTreeMap<String, &CudaSlice<f32>>,
-    tangent_values: &BTreeMap<String, &CudaSlice<f32>>,
+    captures: &BTreeMap<String, &CudaSlice<T>>,
+    tangent_values: &BTreeMap<String, &CudaSlice<T>>,
     offset: usize,
-    state: &[CudaSlice<f32>],
-) -> Result<Vec<CudaSlice<f32>>, String> {
+    state: &[CudaSlice<T>],
+) -> Result<Vec<CudaSlice<T>>, String> {
     index.set(&host.stream, offset)?;
     let mut bindings = captures.clone();
     bindings.insert(names.carry.clone(), &state[0]);
@@ -949,17 +949,17 @@ fn forward_jvp_step(
 }
 
 /// Device stream plus the loop's private buffer pool.
-struct HostRun {
+struct HostRun<T: CudaReal> {
     stream: Arc<CudaStream>,
-    pool: CudaBufferPool,
+    pool: CudaBufferPool<T>,
 }
 
-impl HostRun {
-    fn take(&mut self, count: usize) -> Result<CudaSlice<f32>, String> {
+impl<T: CudaReal> HostRun<T> {
+    fn take(&mut self, count: usize) -> Result<CudaSlice<T>, String> {
         super::take_cuda_buffer(&self.stream, &mut self.pool, count, usize::MAX)
     }
 
-    fn copy(&mut self, source: &CudaSlice<f32>) -> Result<CudaSlice<f32>, String> {
+    fn copy(&mut self, source: &CudaSlice<T>) -> Result<CudaSlice<T>, String> {
         let mut buffer = self.take(source.len())?;
         self.stream
             .memcpy_dtod(source, &mut buffer)
@@ -967,7 +967,7 @@ impl HostRun {
         Ok(buffer)
     }
 
-    fn zeros(&mut self, count: usize) -> Result<CudaSlice<f32>, String> {
+    fn zeros(&mut self, count: usize) -> Result<CudaSlice<T>, String> {
         let mut buffer = self.take(count)?;
         self.stream
             .memset_zeros(&mut buffer)
@@ -975,7 +975,7 @@ impl HostRun {
         Ok(buffer)
     }
 
-    fn recycle_all(&mut self, buffers: Vec<CudaSlice<f32>>) {
+    fn recycle_all(&mut self, buffers: Vec<CudaSlice<T>>) {
         for buffer in buffers {
             self.pool.recycle(buffer);
         }
@@ -986,9 +986,9 @@ impl HostRun {
     /// table between iterations, so steady-state iterations allocate nothing.
     fn run(
         &mut self,
-        region: &CudaExecutionPlan,
-        bindings: &BTreeMap<String, &CudaSlice<f32>>,
-    ) -> Result<Vec<CudaSlice<f32>>, String> {
+        region: &CudaExecutionPlan<T>,
+        bindings: &BTreeMap<String, &CudaSlice<T>>,
+    ) -> Result<Vec<CudaSlice<T>>, String> {
         let mut state = region
             .state
             .lock()
@@ -1041,9 +1041,9 @@ impl HostRun {
 
     fn run_one(
         &mut self,
-        region: &CudaExecutionPlan,
-        bindings: &BTreeMap<String, &CudaSlice<f32>>,
-    ) -> Result<CudaSlice<f32>, String> {
+        region: &CudaExecutionPlan<T>,
+        bindings: &BTreeMap<String, &CudaSlice<T>>,
+    ) -> Result<CudaSlice<T>, String> {
         let mut outputs = self.run(region, bindings)?;
         let output = outputs
             .pop()
@@ -1052,7 +1052,7 @@ impl HostRun {
         Ok(output)
     }
 
-    fn zero_accumulators(&mut self, layout: &ReverseLayout) -> Result<Vec<CudaSlice<f32>>, String> {
+    fn zero_accumulators(&mut self, layout: &ReverseLayout) -> Result<Vec<CudaSlice<T>>, String> {
         layout
             .accumulators
             .iter()
@@ -1063,11 +1063,11 @@ impl HostRun {
     /// Binds the accumulators and runs one reverse iteration.
     fn reverse_step<'a>(
         &mut self,
-        region: &CudaExecutionPlan,
-        mut bindings: BTreeMap<String, &'a CudaSlice<f32>>,
+        region: &CudaExecutionPlan<T>,
+        mut bindings: BTreeMap<String, &'a CudaSlice<T>>,
         layout: &ReverseLayout,
-        accumulators: &'a [CudaSlice<f32>],
-    ) -> Result<Vec<CudaSlice<f32>>, String> {
+        accumulators: &'a [CudaSlice<T>],
+    ) -> Result<Vec<CudaSlice<T>>, String> {
         for ((_, name, _), accumulator) in layout.accumulators.iter().zip(accumulators) {
             bindings.insert(name.clone(), accumulator);
         }
@@ -1078,12 +1078,12 @@ impl HostRun {
     /// buffers, or zeros when the body ignores its carry) and accumulators.
     fn advance_reverse(
         &mut self,
-        mut outputs: Vec<CudaSlice<f32>>,
+        mut outputs: Vec<CudaSlice<T>>,
         layout: &ReverseLayout,
         width: usize,
-        cotangent: Vec<CudaSlice<f32>>,
-        accumulators: Vec<CudaSlice<f32>>,
-    ) -> Result<(DeviceState, DeviceState), String> {
+        cotangent: Vec<CudaSlice<T>>,
+        accumulators: Vec<CudaSlice<T>>,
+    ) -> Result<(DeviceState<T>, DeviceState<T>), String> {
         self.recycle_all(accumulators);
         let next_accumulators = outputs.split_off(if layout.carry_gradient { width } else { 0 });
         let next_cotangent = if layout.carry_gradient {
@@ -1103,8 +1103,8 @@ impl HostRun {
     fn gradient_results(
         &mut self,
         layout: &ReverseLayout,
-        accumulators: Vec<CudaSlice<f32>>,
-    ) -> Result<BTreeMap<String, CudaSlice<f32>>, String> {
+        accumulators: Vec<CudaSlice<T>>,
+    ) -> Result<BTreeMap<String, CudaSlice<T>>, String> {
         Ok(layout
             .accumulators
             .iter()
@@ -1116,17 +1116,17 @@ impl HostRun {
 
 /// Device copy of the loop indices; `current` is bound as the scalar index
 /// capture and refreshed by a device-to-device copy per iteration.
-struct LoopIndex {
-    indices: CudaSlice<f32>,
-    current: CudaSlice<f32>,
+struct LoopIndex<T: CudaReal> {
+    indices: CudaSlice<T>,
+    current: CudaSlice<T>,
 }
 
-impl LoopIndex {
-    fn new(host: &mut HostRun, names: &LoopNames) -> Result<Self, String> {
+impl<T: CudaReal> LoopIndex<T> {
+    fn new(host: &mut HostRun<T>, names: &LoopNames) -> Result<Self, String> {
         // Loop indices are exact in float32 up to 2^24, like the fused kernels'
         // `(float)step`.
         let indices = (names.lower..names.upper)
-            .map(|index| index as f32)
+            .map(|index| T::from_f64(index as f64))
             .collect::<Vec<_>>();
         let indices = if indices.is_empty() {
             host.zeros(1)?
@@ -1150,39 +1150,42 @@ impl LoopIndex {
 
 /// The device buffers of one loop state: a carry, or a carry and its tangent,
 /// or the carry-cotangent pair of a reverse pass.
-type DeviceState = Vec<CudaSlice<f32>>;
+type DeviceState<T> = Vec<CudaSlice<T>>;
 
-type StepFn<'a> = dyn FnMut(
-        &mut HostRun,
-        &mut LoopIndex,
+/// The first step index of one replayed tape block and the state before each of its steps.
+type ReplayBlock<T> = (usize, Vec<DeviceState<T>>);
+
+type StepFn<'a, T> = dyn FnMut(
+        &mut HostRun<T>,
+        &mut LoopIndex<T>,
         usize,
-        &[CudaSlice<f32>],
-    ) -> Result<Vec<CudaSlice<f32>>, String>
+        &[CudaSlice<T>],
+    ) -> Result<Vec<CudaSlice<T>>, String>
     + 'a;
 
 /// Device carry tape for reverse passes, using the CPU checkpoint scheme:
 /// `TensorCarryCheckpoints::block_size` decides between keeping every state
 /// and keeping one state per block, replayed per block in reverse.
-struct DeviceTape {
+struct DeviceTape<T: CudaReal> {
     /// Full tape (`block == None`): the state before every step. Otherwise
     /// the state at the start of every block.
-    states: Vec<Vec<CudaSlice<f32>>>,
+    states: Vec<Vec<CudaSlice<T>>>,
     block: Option<usize>,
     steps: usize,
 }
 
-impl DeviceTape {
+impl<T: CudaReal> DeviceTape<T> {
     fn record(
-        host: &mut HostRun,
-        index: &mut LoopIndex,
+        host: &mut HostRun<T>,
+        index: &mut LoopIndex<T>,
         steps: usize,
-        initial: Vec<CudaSlice<f32>>,
-        step: &mut StepFn<'_>,
+        initial: Vec<CudaSlice<T>>,
+        step: &mut StepFn<'_, T>,
     ) -> Result<Self, String> {
         let block = TensorCarryCheckpoints::<DynamicTensor>::block_size(steps);
         let mut states = vec![initial];
         // The latest state when it is not itself a stored checkpoint.
-        let mut current: Option<Vec<CudaSlice<f32>>> = None;
+        let mut current: Option<Vec<CudaSlice<T>>> = None;
         // The final state is not needed by the reverse pass.
         for offset in 0..steps.saturating_sub(1) {
             let source = match &current {
@@ -1212,10 +1215,10 @@ impl DeviceTape {
 
     fn pop_block(
         &mut self,
-        host: &mut HostRun,
-        index: &mut LoopIndex,
-        step: &mut StepFn<'_>,
-    ) -> Result<Option<(usize, Vec<DeviceState>)>, String> {
+        host: &mut HostRun<T>,
+        index: &mut LoopIndex<T>,
+        step: &mut StepFn<'_, T>,
+    ) -> Result<Option<ReplayBlock<T>>, String> {
         let Some(block) = self.block else {
             if self.states.is_empty() || self.steps == 0 {
                 return Ok(None);
