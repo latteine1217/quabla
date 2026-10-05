@@ -1,5 +1,10 @@
 // The caller holds MLX_EXECUTION_LOCK throughout graph construction and evaluation.
 // Custom kernels keep the recurrence and its bounded jet workspace on Metal.
+// One threadgroup owns each matrix: the forward sweep runs column by column
+// (diagonal, then the rows below it in parallel) and the reverse sweep runs
+// columns in descending order, so every accumulator receives its updates in
+// the same order as the sequential row-major recurrence and results stay
+// bitwise identical to a single-thread sweep.
 use std::ffi::CString;
 
 use mlx_rs::{Array, Dtype, StreamOrDevice};
@@ -52,10 +57,17 @@ pub(super) fn evaluate(
     let (mut body, header) = if let Some(kind) = kind {
         ad_source(n, kind)
     } else {
-        (format!("const ulong n={n};\nfor(ulong i=0;i<n*n;++i)out[i]=0.0f;\nfor(ulong row=0;row<n;++row){{for(ulong col=0;col<=row;++col){{float reduced=input[row*n+col];for(ulong k=0;k<col;++k){{float product=out[row*n+k]*out[col*n+k];reduced=reduced-product;}}out[row*n+col]=row==col?metal::precise::sqrt(reduced):reduced/out[col*n+col];}}}}"), String::new())
+        let entry = "float reduced=input[row*n+col];for(ulong k=0;k<col;++k){float product=out[row*n+k]*out[col*n+k];reduced=reduced-product;}out[row*n+col]=row==col?metal::precise::sqrt(reduced):reduced/out[col*n+col];";
+        (
+            format!(
+                "const ulong n={n};\nfor(ulong i=tid;i<n*n;i+=T)out[i]=0.0f;\n{BARRIER}\nfor(ulong col=0;col<n;++col){{{}}}",
+                column_sweep(entry)
+            ),
+            String::new(),
+        )
     };
     let mut prefix = format!(
-        "const ulong batch=thread_position_in_grid.x;\nconst ulong offset=batch*{n}*{n};\n"
+        "const ulong batch=threadgroup_position_in_grid.x;\nconst ulong tid=thread_position_in_threadgroup.x,T=threads_per_threadgroup.x;\nconst ulong offset=batch*{n}*{n};\n"
     );
     for name in ["input", "other", "third", "fourth"]
         .iter()
@@ -88,7 +100,10 @@ pub(super) fn evaluate(
         .iter()
         .map(|extent| i32::try_from(*extent).map_err(|_| "Cholesky matrix exceeds MLX dimensions"))
         .collect::<Result<Vec<_>, _>>()?;
-    let batches = i32::try_from(batches).map_err(|_| "Cholesky batches exceed MLX dimensions")?;
+    let threads = batches
+        .checked_mul(THREADGROUP)
+        .and_then(|threads| i32::try_from(threads).ok())
+        .ok_or("Cholesky batches exceed MLX dimensions")?;
     // SAFETY: all pointers reference live, correctly sized buffers. MLX copies
     // the names/input handles. RAII frees handles on every error path, and the
     // extracted output is separately owned before its vector is dropped.
@@ -145,11 +160,11 @@ pub(super) fn evaluate(
             )?;
         }
         check(
-            mlx_fast_metal_kernel_config_set_grid(config.0, batches, 1, 1),
+            mlx_fast_metal_kernel_config_set_grid(config.0, threads, 1, 1),
             "grid",
         )?;
         check(
-            mlx_fast_metal_kernel_config_set_thread_group(config.0, 1, 1, 1),
+            mlx_fast_metal_kernel_config_set_thread_group(config.0, THREADGROUP as i32, 1, 1),
             "thread group",
         )?;
         let inputs = Arrays(mlx_vector_array_new_data(handles.as_ptr(), handles.len()));
@@ -175,6 +190,21 @@ pub(super) fn evaluate(
         }
         Ok(Array::from_ptr(output))
     }
+}
+
+// Threads cooperating on one matrix. MLX grids count threads (dispatchThreads),
+// so the grid spans batches*THREADGROUP threads and each threadgroup is a batch.
+const THREADGROUP: usize = 256;
+// All shared state lives in device buffers, so phases synchronize device memory.
+const BARRIER: &str = "threadgroup_barrier(metal::mem_flags::mem_device);";
+
+// One forward column step: the diagonal entry first, then the entries below it
+// in parallel. Every entry reads only columns finished in earlier steps plus
+// this column's diagonal, so its arithmetic matches the sequential sweep.
+fn column_sweep(entry: &str) -> String {
+    format!(
+        "if(tid==0){{ulong row=col;{entry}}}\n{BARRIER}\nfor(ulong row=col+1+tid;row<n;row+=T){{{entry}}}\n{BARRIER}\n"
+    )
 }
 
 pub(super) fn scratch_lanes(kind: CholeskyAdKind) -> usize {
@@ -247,15 +277,15 @@ fn ad_source(n: usize, kind: CholeskyAdKind) -> (String, String) {
     let header = std::mem::take(&mut source);
     source.push_str(&format!("using namespace {prefix};\nconst ulong n={n},count=n*n;\ndevice Jet* values=(device Jet*)scratch;\n"));
     if reverse {
-        // Descending traversal consumes each cotangent before writing its
-        // gradient; subsequent updates target earlier, unconsumed elements.
+        // Descending column traversal consumes each cotangent before writing
+        // its gradient; subsequent updates target earlier, unconsumed elements.
         source.push_str(if kind == CholeskyAdKind::Vjp {
             "device Jet* residuals=values+count;device Jet* cotangents=(device Jet*)out;\n"
         } else {
             "device Jet* residuals=values+count;device Jet* cotangents=residuals+count;\n"
         });
     }
-    source.push_str("for(ulong i=0;i<count;++i){values[i]=Jet{};out[i]=0.0f;");
+    source.push_str("for(ulong i=tid;i<count;i+=T){values[i]=Jet{};out[i]=0.0f;");
     if reverse {
         let upstream = if kind == CholeskyAdKind::Vjp {
             "i/n>=i%n?other[i]:0.0f"
@@ -269,36 +299,42 @@ fn ad_source(n: usize, kind: CholeskyAdKind) -> (String, String) {
             source.push_str("cotangents[i].d=fourth[i];");
         }
     }
-    source.push_str("}\nfor(ulong row=0;row<n;++row){for(ulong col=0;col<=row;++col){ulong i=row*n+col;Jet reduced{};reduced.v=input[i];");
+    source.push_str(&format!("}}\n{BARRIER}\n"));
+    let mut entry = String::from("ulong i=row*n+col;Jet reduced{};reduced.v=input[i];");
     if first {
-        source.push_str("reduced.d=other[i];");
+        entry.push_str("reduced.d=other[i];");
     }
     if mixed {
-        source.push_str("reduced.e=third[i];reduced.h=fourth[i];");
+        entry.push_str("reduced.e=third[i];reduced.h=fourth[i];");
     }
-    source.push_str(
+    entry.push_str(
         "for(ulong k=0;k<col;++k)reduced=sub(reduced,mul(values[row*n+k],values[col*n+k]));",
     );
     if reverse {
-        source.push_str("residuals[i]=reduced;");
+        entry.push_str("residuals[i]=reduced;");
     }
-    source.push_str("values[i]=row==col?root(reduced,0):divide(reduced,values[col*n+col]);");
+    entry.push_str("values[i]=row==col?root(reduced,0):divide(reduced,values[col*n+col]);");
     if !reverse {
-        source.push_str(if mixed {
+        entry.push_str(if mixed {
             "out[i]=values[i].h;"
         } else {
             "out[i]=values[i].d;"
         });
     }
-    source.push_str("}}\n");
+    source.push_str(&format!(
+        "for(ulong col=0;col<n;++col){{{}}}\n",
+        column_sweep(&entry)
+    ));
     if reverse {
-        source.push_str("for(ulong r=n;r>0;--r){ulong row=r-1;for(ulong c=row+1;c>0;--c){ulong col=c-1,i=row*n+col;Jet upstream=cotangents[i],reduced;if(row==col){reduced=mul(upstream,root(residuals[i],1));}else{ulong diagonal=col*n+col;Jet contribution=neg(divide(mul(upstream,residuals[i]),mul(values[diagonal],values[diagonal])));cotangents[diagonal]=add(cotangents[diagonal],contribution);reduced=divide(upstream,values[diagonal]);}");
-        source.push_str(if first {
-            "out[i]=reduced.d;"
-        } else {
-            "out[i]=reduced.v;"
-        });
-        source.push_str("for(ulong k=col;k>0;--k){ulong inner=k-1,left=row*n+inner,right=col*n+inner;Jet product=neg(reduced);cotangents[left]=add(cotangents[left],mul(product,values[right]));cotangents[right]=add(cotangents[right],mul(product,values[left]));}}}\n");
+        let lane = if first { "d" } else { "v" };
+        // Column j of the sequential sweep, regrouped by accumulator:
+        // phase A finishes the entries below the diagonal and applies their
+        // updates to their own rows; phase B applies their updates to row j
+        // and the diagonal in descending row order; phase C finishes the
+        // diagonal and applies its two updates per entry of row j. Each
+        // accumulator therefore sees the same sequence of additions as in
+        // the sequential descending row-major traversal.
+        source.push_str(&format!("threadgroup Jet diagonal_reduced;\nfor(ulong c=n;c>0;--c){{ulong j=c-1,diagonal=j*n+j;\nfor(ulong r=j+1+tid;r<n;r+=T){{ulong i=r*n+j;Jet upstream=cotangents[i];Jet contribution=neg(divide(mul(upstream,residuals[i]),mul(values[diagonal],values[diagonal])));Jet reduced=divide(upstream,values[diagonal]);out[i]=reduced.{lane};for(ulong k=j;k>0;--k){{ulong inner=k-1,left=r*n+inner,right=j*n+inner;Jet product=neg(reduced);cotangents[left]=add(cotangents[left],mul(product,values[right]));}}cotangents[i]=reduced;residuals[i]=contribution;}}\n{BARRIER}\nfor(ulong t=tid;t<=j;t+=T){{if(t<j){{ulong right=j*n+t;Jet accumulated=cotangents[right];for(ulong r=n-1;r>j;--r){{Jet product=neg(cotangents[r*n+j]);accumulated=add(accumulated,mul(product,values[r*n+t]));}}cotangents[right]=accumulated;}}else{{Jet accumulated=cotangents[diagonal];for(ulong r=n-1;r>j;--r)accumulated=add(accumulated,residuals[r*n+j]);cotangents[diagonal]=accumulated;}}}}\n{BARRIER}\nif(tid==0){{Jet reduced=mul(cotangents[diagonal],root(residuals[diagonal],1));out[diagonal]=reduced.{lane};diagonal_reduced=reduced;}}\nthreadgroup_barrier(metal::mem_flags::mem_threadgroup);\nfor(ulong k=tid;k<j;k+=T){{ulong left=j*n+k;Jet product=neg(diagonal_reduced);cotangents[left]=add(cotangents[left],mul(product,values[left]));cotangents[left]=add(cotangents[left],mul(product,values[left]));}}\n{BARRIER}\n}}\n"));
     }
     (source, header)
 }

@@ -104,7 +104,7 @@ pub(super) fn ad_source(function: &str, n: usize, kind: CholeskyAdKind) -> Strin
     } else {
         "const float* input,const float* other,const float* third,const float* fourth"
     };
-    source.push_str(&format!("extern \"C\" __global__ void {function}({parameters},float* out,float* scratch){{\nusing namespace {prefix};\nif(threadIdx.x!=0U)return;\nconst unsigned long long n={n}ULL,count=n*n;\nJet* values=(Jet*)scratch;\n"));
+    source.push_str(&format!("extern \"C\" __global__ void {function}({parameters},float* out,float* scratch){{\nusing namespace {prefix};\nconst unsigned long long n={n}ULL,count=n*n,tid=threadIdx.x,stride=blockDim.x;\nJet* values=(Jet*)scratch;\n"));
     // Every block owns one independent leading-batch matrix and its Jet tape.
     source.push_str(&format!("unsigned long long batch_offset=(unsigned long long)blockIdx.x*count;input+=batch_offset;other+=batch_offset;out+=batch_offset;values+=(unsigned long long)blockIdx.x*count*{};\n", match kind { CholeskyAdKind::Vjp => 2, CholeskyAdKind::VjpJvp => 3, _ => 1 }));
     if !matches!(kind, CholeskyAdKind::Jvp | CholeskyAdKind::Vjp) {
@@ -120,7 +120,8 @@ pub(super) fn ad_source(function: &str, n: usize, kind: CholeskyAdKind) -> Strin
             "Jet* cotangents=residuals+count;\n"
         });
     }
-    source.push_str("for(unsigned long long i=0;i<count;++i){values[i]=Jet{};out[i]=0.0f;");
+    // Same-index init keeps the F32 VJP's aliased out/cotangent writes ordered.
+    source.push_str("for(unsigned long long i=tid;i<count;i+=stride){values[i]=Jet{};out[i]=0.0f;");
     if reverse {
         let upstream = if kind == CholeskyAdKind::Vjp {
             "(i%n<=i/n?other[i]:0.0f)"
@@ -134,34 +135,52 @@ pub(super) fn ad_source(function: &str, n: usize, kind: CholeskyAdKind) -> Strin
             source.push_str("cotangents[i].d=fourth[i];");
         }
     }
-    source.push_str("}\nfor(unsigned long long row=0;row<n;++row){for(unsigned long long col=0;col<=row;++col){unsigned long long i=row*n+col;Jet reduced{};reduced.v=input[i];");
+    source.push_str("}\n__syncthreads();\n");
+    // Column-parallel forward sweep, as in the primal kernel: every entry keeps
+    // the sequential k-ascending reduction, so each Jet is bitwise unchanged.
+    let mut entry = String::from("Jet reduced{};reduced.v=input[i];");
     if first {
-        source.push_str("reduced.d=other[i];");
+        entry.push_str("reduced.d=other[i];");
     }
     if mixed {
-        source.push_str("reduced.e=third[i];reduced.h=fourth[i];");
+        entry.push_str("reduced.e=third[i];reduced.h=fourth[i];");
     }
-    source.push_str("for(unsigned long long k=0;k<col;++k)reduced=sub(reduced,mul(values[row*n+k],values[col*n+k]));");
+    entry.push_str("for(unsigned long long k=0;k<col;++k)reduced=sub(reduced,mul(values[row*n+k],values[col*n+k]));");
     if reverse {
-        source.push_str("residuals[i]=reduced;");
+        entry.push_str("residuals[i]=reduced;");
     }
-    source.push_str("values[i]=row==col?root(reduced,0):divide(reduced,values[col*n+col]);");
-    if !reverse {
-        source.push_str(if mixed {
-            "out[i]=values[i].h;"
-        } else {
-            "out[i]=values[i].d;"
-        });
-    }
-    source.push_str("}}\n");
+    let store = if reverse {
+        ""
+    } else if mixed {
+        "out[i]=values[i].h;"
+    } else {
+        "out[i]=values[i].d;"
+    };
+    source.push_str(&format!("for(unsigned long long col=0;col<n;++col){{\nif(tid==0U){{unsigned long long row=col,i=row*n+col;{entry}values[i]=root(reduced,0);{store}}}\n__syncthreads();\nfor(unsigned long long row=col+1+tid;row<n;row+=stride){{unsigned long long i=row*n+col;{entry}values[i]=divide(reduced,values[col*n+col]);{store}}}\n__syncthreads();\n}}\n"));
     if reverse {
-        source.push_str("for(unsigned long long r=n;r>0;--r){unsigned long long row=r-1;for(unsigned long long c=row+1;c>0;--c){unsigned long long col=c-1,i=row*n+col;Jet upstream=cotangents[i],reduced;if(row==col){reduced=mul(upstream,root(residuals[i],1));}else{unsigned long long diagonal=col*n+col;Jet contribution=neg(divide(mul(upstream,residuals[i]),mul(values[diagonal],values[diagonal])));cotangents[diagonal]=add(cotangents[diagonal],contribution);reduced=divide(upstream,values[diagonal]);}");
-        source.push_str(if first {
+        let output = if first {
             "out[i]=reduced.d;"
         } else {
             "out[i]=reduced.v;"
-        });
-        source.push_str("for(unsigned long long k=col;k>0;--k){unsigned long long inner=k-1,left=row*n+inner,right=col*n+inner;Jet product=neg(reduced);cotangents[left]=add(cotangents[left],mul(product,values[right]));cotangents[right]=add(cotangents[right],mul(product,values[left]));}}}\n");
+        };
+        // Column-descending reverse sweep. Accumulator cot[a,b] receives, in
+        // the sequential row-descending traversal, the right adds of entries
+        // (r,a) for r descending, the diagonal's two adds, then the left adds
+        // of entries (a,c) for c descending; phases B and C at column a and
+        // phase A at the later columns c reproduce exactly that add order.
+        source.push_str("__shared__ Jet shared_reduced;\nfor(unsigned long long jj=n;jj>0;--jj){\nconst unsigned long long j=jj-1,diagonal=j*n+j;\n");
+        // Phase A: below-diagonal entries of column j are independent rows.
+        // Stash reduced and the diagonal contribution for phase B.
+        source.push_str(&format!("for(unsigned long long r=j+1+tid;r<n;r+=stride){{unsigned long long i=r*n+j;Jet upstream=cotangents[i];Jet contribution=neg(divide(mul(upstream,residuals[i]),mul(values[diagonal],values[diagonal])));Jet reduced=divide(upstream,values[diagonal]);{output}for(unsigned long long k=j;k>0;--k){{unsigned long long inner=k-1;cotangents[r*n+inner]=add(cotangents[r*n+inner],mul(neg(reduced),values[j*n+inner]));}}cotangents[i]=reduced;residuals[i]=contribution;}}\n__syncthreads();\n"));
+        // Phase B: row j gathers the right adds and the diagonal contributions.
+        source.push_str("for(unsigned long long t=tid;t<=j;t+=stride){if(t<j){Jet acc=cotangents[j*n+t];for(unsigned long long r=n-1;r>j;--r)acc=add(acc,mul(neg(cotangents[r*n+j]),values[r*n+t]));cotangents[j*n+t]=acc;}else{Jet acc=cotangents[diagonal];for(unsigned long long r=n-1;r>j;--r)acc=add(acc,residuals[r*n+j]);cotangents[diagonal]=acc;}}\n__syncthreads();\n");
+        // Phase C: the diagonal entry, then its left and right adds into row j.
+        let diagonal_output = if first {
+            "out[diagonal]=reduced.d;"
+        } else {
+            "out[diagonal]=reduced.v;"
+        };
+        source.push_str(&format!("if(tid==0U){{Jet reduced=mul(cotangents[diagonal],root(residuals[diagonal],1));{diagonal_output}shared_reduced=reduced;}}\n__syncthreads();\nfor(unsigned long long k=tid;k<j;k+=stride){{Jet product=neg(shared_reduced);cotangents[j*n+k]=add(cotangents[j*n+k],mul(product,values[j*n+k]));cotangents[j*n+k]=add(cotangents[j*n+k],mul(product,values[j*n+k]));}}\n__syncthreads();\n}}\n"));
     }
     source.push_str("}\n");
     source

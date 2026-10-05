@@ -2686,7 +2686,8 @@ fn execute_cuda_device_program(
                 launch.arg(&mut scratch);
                 // SAFETY: generated derivative kernels accept the ordered operand pointers,
                 // n*n output lanes, and the exact checked Jet workspace allocation above.
-                // One block owns the complete factorization and sequential reverse traversal.
+                // One block owns each matrix's factorization and column-ordered reverse
+                // traversal, synchronizing its threads between dependent phases.
                 unsafe {
                     launch.launch(LaunchConfig {
                         grid_dim: (
