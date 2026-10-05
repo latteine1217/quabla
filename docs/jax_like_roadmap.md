@@ -1,5 +1,47 @@
 # Rust SciML Runtime Roadmap
 
+## v0.3 Plan (2026-10-06)
+
+v0.3 closes the gaps a PINN or scientific-ML user meets when moving from
+JAX. The list comes from an audit of v0.2.2 against jax.numpy, jax.lax,
+optax, equinox and diffrax; the numerical and performance defects that audit
+confirmed were fixed in v0.2.3 (division derivatives without squared
+denominators, IEEE log and division on the CPU, stable sigmoid and softplus
+with a native `log1p`, NaN-propagating `max`/`maximum`/`relu`, native
+`Gather`/`ScatterAdd`, node-by-node CPU elementwise execution, and MLX
+`Trainer` parameters the loss ignores). Work items, in priority order:
+
+| # | Item | Layer | Size |
+| --- | --- | --- | --- |
+| 1 | Optimizers: L-BFGS (host loop over `jit(value_and_grad)`), AdamW, learning-rate schedules, global-norm gradient clipping; `Trainer` schedules on devices | Python; bridge for device schedules | M |
+| 2 | Elementwise and reductions: `expm1`, `erf`, `atan2`, `clip`, `sign`, `silu`, `gelu`, `softmax`, `logsumexp`, `var`, `std`, `cumsum`, `prod` | Python compositions; core IR ops for `expm1`, `erf`, `atan2` | S-M |
+| 3 | `stop_gradient` | core IR (identity value, zero derivative) | S |
+| 4 | Shape ergonomics: `reshape(-1)` and varargs, `.T`, `x[None]`, `squeeze`, `expand_dims`, `split`, `meshgrid`, `zeros_like`/`ones_like`, 1-D `matmul` | Python | S |
+| 5 | Pytrees: NamedTuple, dataclasses, user registration, `tree.leaves` | Python (`tree.py`, transforms) | M |
+| 6 | `qb.random`: keyed uniform and normal sampling, exposing the existing host uniform sampler | bridge | S |
+| 7 | `while_loop` with a traced predicate, and fixed-step ODE solvers (Euler, RK4) over `fori_loop`; adaptive solvers depend on `while_loop` AD | core IR, Python | M-L |
+| 8 | Linear algebra: `det`/`slogdet` and `cho_solve` from Cholesky, batched `solve`, then `eigh`/`svd`/`qr` | Python for compositions; core and backends for decompositions | M-L |
+| 9 | Transform features: `custom_vjp`/`custom_jvp`, `checkpoint`, `jacfwd`/`jacrev`, `jit` `static_argnames` and decorator keyword use | Python and core inline | M |
+| 10 | Native `float64` on CUDA (MLX hardware has no f64) | CUDA codegen | L |
+| 11 | Packaging and tooling: wheels and PyPI, type stubs, `__version__`, parameter save/load, value-showing `repr`, `debug.print` inside `jit` | CI, Python | M |
+
+Decisions for the owner before v0.3 work starts:
+
+- `max_traces` (default 8) raises `RetraceLimitError` for every transform,
+  and the trace cache is keyed by the root function across transform
+  objects, so a training loop whose collocation count changes every epoch
+  hits the limit. Options: least-recently-used eviction with a warning,
+  per-object caches, or keeping the hard limit.
+- `norm` computes `sqrt(sum(x*x))` without scaling, as numpy and JAX do; it
+  overflows for float32 magnitudes above about 1e19. Scaling by `max|x|`
+  would change results in the last bits.
+
+Smaller observations kept for later: `abs` has gradient -1 at 0 (JAX uses
++1), `max` gives the whole gradient of a tie to the last element (JAX
+splits it), and CPU float32 reductions accumulate in f64, so device
+float32 sums can differ from the CPU reference beyond roundoff for very
+large or cancelling inputs.
+
 ## v0.2 API Increment (2026-10-03)
 
 S5-S9 are implemented on the current working tree: explicit device `jit` and
