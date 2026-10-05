@@ -6789,7 +6789,7 @@ def test_bool_dtype_object_and_eager_comparisons_follow_ieee_semantics():
     mask = quabla.Tensor([4], [0.0, 3.0, NAN, -INF], dtype=quabla.bool_)
     assert mask.dtype == quabla.bool_
     assert mask.to_flat_list() == [0.0, 1.0, 1.0, 1.0]
-    assert "quabla.bool_" in repr(mask)
+    assert repr(mask) == "Tensor([False,  True,  True,  True], dtype=bool)"
 
     x, y = bool_xy()
     for name, operator, expected in COMPARISONS:

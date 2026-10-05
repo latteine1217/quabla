@@ -11,6 +11,7 @@ mod errors;
 mod interop;
 mod matrix;
 mod optim;
+mod repr;
 mod tensor;
 mod tensor_trace;
 mod trace;
@@ -378,6 +379,9 @@ fn py_einsum(
 // and `use quabla::...` paths are unaffected.
 #[pymodule(name = "_quabla")]
 fn quabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Set as a plain attribute: `add` would also append it to `__all__`,
+    // and a star import must not rebind the importer's `__version__`.
+    m.setattr("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<PyQuablaCompiler>()?;
     m.add_class::<PyQuablaProgram>()?;
     m.add_class::<PyQuablaExecutable>()?;

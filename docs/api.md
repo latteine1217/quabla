@@ -29,6 +29,8 @@ the repository root. Per-feature status and validation records are in
   - [Function Transforms](#function-transforms)
   - [Pytrees](#pytrees)
   - [Random Numbers](#random-numbers)
+  - [Saving and Loading](#saving-and-loading)
+  - [Version and Type Stubs](#version-and-type-stubs)
 - [Device Execution](#device-execution)
 - [Compiler Facade](#compiler-facade)
 - [v0.1 API Reference](#v01-api-reference)
@@ -62,6 +64,17 @@ qb.eye(n, m=None, dtype=None)
   working. `qb.Array` is an abstract base class that `Tensor`, `TensorView`,
   and `TraceTensor` are registered with.
 - NumPy is optional: importing `quabla` never imports it.
+- `repr` of an eager `Tensor` shows its values, following NumPy's default
+  print options, and always the dtype:
+  `Tensor([1., 2.], dtype=float32)`, `Tensor([ True, False], dtype=bool)`.
+  Floats print with at most 8 fractional digits and aligned decimal points,
+  and switch to scientific notation when the largest finite magnitude is at
+  least `1e8`, the smallest nonzero one is below `1e-4`, or their ratio
+  exceeds `1e3`; rows wrap at 75 columns. A tensor with more than 1000
+  elements is summarized to the first and last 3 entries of every longer
+  axis around `...`, and only those entries are read. A `TraceTensor` has no
+  values, so its `repr` shows its node, shape, and dtype only:
+  `TraceTensor(node_id=3, shape=[2], dtype=float32)`.
 - Module-level functions call the method of the same name on a `Tensor` or
   `TraceTensor`, so eager and traced code share one spelling (`qb.sin(x)` is
   `x.sin()`): `sin`, `cos`, `tanh`, `exp`, `expm1`, `log`, `log1p`, `erf`,
@@ -386,6 +399,66 @@ step_key = qb.random.fold_in(key, step)
   trace per key), is a constant of the trace, so every call of the compiled
   program sees the same numbers. Draw samples outside and pass them as
   arguments when they must change between calls.
+
+### Saving and Loading
+
+```python
+qb.save("checkpoint.qb", {"params": params, "opt": opt_state})
+restored = qb.load("checkpoint.qb")
+```
+
+`save(file, tree)` writes a pytree to a path or a binary file object, and
+`load(file)` reads it back. Leaves may be quabla arrays (`Tensor` or
+`TensorView`), `None`, and Python `bool`, `int`, `float`, and `str` values;
+containers may be `dict` with string or integer keys, `list`, and `tuple`.
+Arrays load as `Tensor`s with the saved shape and dtype, bit for bit;
+scalars keep their type and value (`float` exactly), dicts their key order,
+and tuples stay tuples, so an optimizer state such as the
+`{"step": 3, "m": ..., "v": ...}` of `optim.Adam` resumes unchanged.
+
+NamedTuples and classes registered with `quabla.tree.register` or
+`register_dataclass` are not serialized, since rebuilding them would mean
+importing classes named by the file; save their fields, for example as a
+dict, and rebuild the objects after loading. Other leaves (NumPy arrays,
+`random.Key` values) and traced values raise `TypeError`.
+
+The format needs neither NumPy nor pickle, so `load` never executes code
+from the file; a malformed or truncated file raises `ValueError`. Version 1
+is laid out as:
+
+| Offset | Size | Content |
+| --- | --- | --- |
+| 0 | 8 | magic bytes `b"\x93QUABLA\n"` |
+| 8 | 8 | header size `N`, unsigned little-endian |
+| 16 | `N` | header: strict UTF-8 JSON |
+| `16 + N` | rest | raw array data, concatenated |
+
+The header is `{"format": "quabla", "version": 1, "tree": NODE}`, where a
+node is `{"type": "none"}`, `{"type": "list" | "tuple", "items": [...]}`,
+`{"type": "dict", "keys": [...], "values": [...]}`,
+`{"type": "bool" | "int" | "str", "value": ...}`,
+`{"type": "float", "value": float.hex(x)}`, or
+`{"type": "array", "dtype": "float64" | "float32" | "bool", "shape": [...],
+"offset": ..., "nbytes": ...}`. Array data is C-ordered and little-endian
+(IEEE binary64 or binary32; one byte, 0 or 1, per bool), at `offset` bytes
+from the start of the data section. A reader rejects any other version.
+
+### Version and Type Stubs
+
+`quabla.__version__` is the installed version string (for example
+`"0.2.3"`). The Cargo manifest of `crates/quabla-python` is its single
+source: maturin derives the package metadata from it, and the extension
+carries the same string for a source tree without installed metadata.
+
+The package ships `py.typed` and a stub, `quabla/_quabla.pyi`, for the
+compiled extension. It types `Tensor`, `TensorView`, `TraceTensor`,
+`dtype` and the dtype objects in detail, including that an operator with a
+traced operand gives a `TraceTensor`; the other extension functions and
+classes (the comparison functions, the v0.1 low-level transform entry
+points, execution plans, and legacy classes) are declared with their
+parameter names but loose (`Any`) types. The
+pure-Python modules (`quabla.optim`, `quabla.tree`, the transforms) are not
+annotated yet, so checkers infer their types.
 
 ## Device Execution
 

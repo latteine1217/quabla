@@ -132,8 +132,9 @@ Prerequisites:
   (`xcodebuild -downloadComponent MetalToolchain`). The Python `mlx` wheel is
   not used. The build writes the compiled Metal library to
   `~/.mlx/lib/<key>/mlx.metallib`, or to `$MLX_RS_METAL_PATH` when that
-  variable is set at build time; the extension loads it from that path at run
-  time, so keep it in place (or rebuild after removing it).
+  variable is set at build time. At run time MLX first looks for an
+  `mlx.metallib` next to the extension module and then at that build path,
+  so keep it in place (or rebuild after removing it).
 - CUDA builds: Linux with an NVIDIA driver. CUDA libraries are loaded at run
   time: `libnvrtc.so` is required, `libcublas` is used for rank-two `f32`
   GEMM when present (otherwise an NVRTC tiled kernel), and `libcusolver` is
@@ -160,8 +161,29 @@ maturin develop --release --features mlx         # macOS, Apple silicon
 maturin develop --release --features cuda        # Linux, CUDA
 maturin develop --release --features cuda-nccl   # Linux, CUDA + NCCL
 
-python -c "import quabla; print(quabla.Compiler().capabilities())"
+python -c "import quabla; print(quabla.__version__, quabla.Compiler().capabilities())"
 ```
+
+### Building Wheels
+
+`maturin build --release` writes a wheel for the active interpreter to
+`target/wheels/` (`--out DIR` changes the directory); pass the same
+`--features` as for `maturin develop`. A wheel contains the `quabla`
+package, the compiled extension, its type stub `_quabla.pyi`, and `py.typed`.
+For an MLX wheel that works on other machines, ship the Metal library next
+to the extension, where MLX looks first:
+
+```sh
+export MLX_RS_METAL_PATH="$PWD/target/mlx-metal"
+cargo build --release -p quabla-core --features mlx   # writes mlx.metallib
+cp "$MLX_RS_METAL_PATH/mlx.metallib" python/quabla/
+MACOSX_DEPLOYMENT_TARGET=14.0 maturin build --release --features mlx
+```
+
+The `Wheels` workflow ([.github/workflows/wheels.yml](.github/workflows/wheels.yml))
+builds CPU wheels for Linux x86_64 (manylinux_2_28) and MLX wheels for
+macOS arm64, for CPython 3.10 to 3.13, on version tags and on demand, and
+keeps them as workflow artifacts. They are not published to PyPI.
 
 ## Quickstart
 

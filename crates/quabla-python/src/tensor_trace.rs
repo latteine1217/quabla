@@ -3434,11 +3434,21 @@ impl TraceTensor {
             .map_err(PyValueError::new_err)
     }
 
+    /// Shape and dtype only: a traced value has no data to show.
     fn __repr__(&self) -> String {
-        format!(
-            "TraceTensor(node_id={}, shape={:?})",
-            self.node_id, self.shape
-        )
+        match self.dtype() {
+            Ok(dtype) => format!(
+                "TraceTensor(node_id={}, shape={:?}, dtype={})",
+                self.node_id,
+                self.shape,
+                PyDType::from(dtype).name()
+            ),
+            // A poisoned graph lock must not make `repr` raise.
+            Err(_) => format!(
+                "TraceTensor(node_id={}, shape={:?})",
+                self.node_id, self.shape
+            ),
+        }
     }
 
     #[pyo3(signature = (device_ordinal = 0))]

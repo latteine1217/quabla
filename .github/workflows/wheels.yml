@@ -1,0 +1,111 @@
+# Wheel builds: CPU wheels for Linux x86_64 (manylinux_2_28) and MLX wheels
+# for macOS arm64, for every supported CPython, uploaded as workflow
+# artifacts. Nothing is published: the workflow has read-only permissions and
+# no PyPI or release upload step. It runs for version tags and on demand.
+#
+# Each job installs its CPython 3.12 wheel into a fresh virtual environment
+# and runs the packaging and core API suites against it. Hosted runners have
+# no usable Metal device, so the MLX backend of the macOS wheel is built and
+# packaged here but only exercised on Apple silicon hosts.
+#
+# No build cache on purpose: release artifacts are built from a clean state.
+name: Wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux:
+    name: linux x86_64 (manylinux_2_28, cpu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Builds inside the official manylinux_2_28 image, which carries every
+      # CPython and in which maturin checks and repairs the platform tag.
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          maturin-version: v1.15.0
+          target: x86_64
+          manylinux: "2_28"
+          args: >-
+            --release --out dist
+            -i python3.10 python3.11 python3.12 python3.13
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Test the cp312 wheel
+        run: |
+          python -m venv .venv-wheel
+          .venv-wheel/bin/python -m pip install dist/*-cp312-*.whl
+          .venv-wheel/bin/python tests/python/test_packaging_api.py
+          .venv-wheel/bin/python tests/python/test_api.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheels-linux-x86_64
+          path: dist/*.whl
+          if-no-files-found: error
+
+  macos:
+    name: macos arm64 (mlx)
+    runs-on: macos-15
+    # A cold build compiles MLX C++ from source through mlx-rs (cmake).
+    timeout-minutes: 90
+    env:
+      # MLX needs macOS 14; the deployment target also sets the wheel's
+      # platform tag, so pip refuses the wheel on older systems.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Pinned to a master commit (the stable branch is not in master's
+      # history and may be garbage-collected); the toolchain input then
+      # selects stable.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      # The last version listed becomes the default `python`.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: |
+            3.10
+            3.11
+            3.13
+            3.12
+      # MLX loads its Metal kernels from an `mlx.metallib` next to the binary
+      # that links it, before its compiled-in build path, which does not exist
+      # on users' machines. The first build makes mlx-sys write the metallib
+      # to MLX_RS_METAL_PATH; copying it into the package before the wheel
+      # build ships it beside the extension module.
+      - name: Build wheels
+        run: |
+          export MLX_RS_METAL_PATH="$RUNNER_TEMP/mlx-metal"
+          cargo build --release -p quabla-core --features mlx
+          cp "$MLX_RS_METAL_PATH/mlx.metallib" python/quabla/
+          python -m pip install 'maturin==1.15.0'
+          python -m maturin build --release --features mlx --out dist \
+            -i python3.10 python3.11 python3.12 python3.13
+      - name: Test the cp312 wheel
+        run: |
+          python -m venv .venv-wheel
+          .venv-wheel/bin/python -m pip install dist/*-cp312-*.whl
+          .venv-wheel/bin/python -c "import pathlib, quabla; assert (pathlib.Path(quabla.__file__).parent / 'mlx.metallib').is_file()"
+          .venv-wheel/bin/python tests/python/test_packaging_api.py
+          .venv-wheel/bin/python tests/python/test_api.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheels-macos-arm64
+          path: dist/*.whl
+          if-no-files-found: error
