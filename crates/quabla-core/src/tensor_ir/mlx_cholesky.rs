@@ -257,14 +257,14 @@ fn ad_source(n: usize, kind: CholeskyAdKind) -> (String, String) {
     if mixed {
         source.push_str("c.e=addf(mulf(a.e,b.v),mulf(a.v,b.e));c.h=addf(addf(addf(mulf(a.h,b.v),mulf(a.d,b.e)),mulf(a.e,b.d)),mulf(a.v,b.h));");
     }
-    source.push_str("return c;}\nJet divide(Jet a,Jet b){Jet c;c.v=divf(a.v,b.v);float denominator=mulf(b.v,b.v);\n");
+    // The IR's division rules: each tangent is a residual over the pivot,
+    // so no power of the pivot can overflow or underflow.
+    source.push_str("return c;}\nJet divide(Jet a,Jet b){Jet c;c.v=divf(a.v,b.v);");
     if first {
-        source.push_str(
-            "float numerator=subf(mulf(a.d,b.v),mulf(a.v,b.d));c.d=divf(numerator,denominator);",
-        );
+        source.push_str("c.d=divf(subf(a.d,mulf(c.v,b.d)),b.v);");
     }
     if mixed {
-        source.push_str("c.e=divf(subf(mulf(a.e,b.v),mulf(a.v,b.e)),denominator);float numerator_direction=subf(addf(mulf(a.h,b.v),mulf(a.d,b.e)),addf(mulf(a.e,b.d),mulf(a.v,b.h)));float denominator_direction=addf(mulf(b.e,b.v),mulf(b.v,b.e));c.h=divf(subf(mulf(numerator_direction,denominator),mulf(numerator,denominator_direction)),mulf(denominator,denominator));");
+        source.push_str("c.e=divf(subf(a.e,mulf(c.v,b.e)),b.v);c.h=divf(subf(subf(subf(a.h,mulf(c.d,b.e)),mulf(c.e,b.d)),mulf(c.v,b.h)),b.v);");
     }
     source.push_str("return c;}\nfloat derivative(float x,int order){if(x==0.0f)return 0.0f;if(x<0.0f)return NAN;float coefficient=1.0f;for(int i=0;i<order;++i)coefficient=mulf(coefficient,0.5f-(float)i);return mulf(coefficient,metal::precise::pow(x,0.5f-(float)order));}\nJet root(Jet a,int order){Jet c;c.v=order==0?metal::precise::sqrt(a.v):derivative(a.v,order);");
     if first {
@@ -334,7 +334,7 @@ fn ad_source(n: usize, kind: CholeskyAdKind) -> (String, String) {
         // diagonal and applies its two updates per entry of row j. Each
         // accumulator therefore sees the same sequence of additions as in
         // the sequential descending row-major traversal.
-        source.push_str(&format!("threadgroup Jet diagonal_reduced;\nfor(ulong c=n;c>0;--c){{ulong j=c-1,diagonal=j*n+j;\nfor(ulong r=j+1+tid;r<n;r+=T){{ulong i=r*n+j;Jet upstream=cotangents[i];Jet contribution=neg(divide(mul(upstream,residuals[i]),mul(values[diagonal],values[diagonal])));Jet reduced=divide(upstream,values[diagonal]);out[i]=reduced.{lane};for(ulong k=j;k>0;--k){{ulong inner=k-1,left=r*n+inner,right=j*n+inner;Jet product=neg(reduced);cotangents[left]=add(cotangents[left],mul(product,values[right]));}}cotangents[i]=reduced;residuals[i]=contribution;}}\n{BARRIER}\nfor(ulong t=tid;t<=j;t+=T){{if(t<j){{ulong right=j*n+t;Jet accumulated=cotangents[right];for(ulong r=n-1;r>j;--r){{Jet product=neg(cotangents[r*n+j]);accumulated=add(accumulated,mul(product,values[r*n+t]));}}cotangents[right]=accumulated;}}else{{Jet accumulated=cotangents[diagonal];for(ulong r=n-1;r>j;--r)accumulated=add(accumulated,residuals[r*n+j]);cotangents[diagonal]=accumulated;}}}}\n{BARRIER}\nif(tid==0){{Jet reduced=mul(cotangents[diagonal],root(residuals[diagonal],1));out[diagonal]=reduced.{lane};diagonal_reduced=reduced;}}\nthreadgroup_barrier(metal::mem_flags::mem_threadgroup);\nfor(ulong k=tid;k<j;k+=T){{ulong left=j*n+k;Jet product=neg(diagonal_reduced);cotangents[left]=add(cotangents[left],mul(product,values[left]));cotangents[left]=add(cotangents[left],mul(product,values[left]));}}\n{BARRIER}\n}}\n"));
+        source.push_str(&format!("threadgroup Jet diagonal_reduced;\nfor(ulong c=n;c>0;--c){{ulong j=c-1,diagonal=j*n+j;\nfor(ulong r=j+1+tid;r<n;r+=T){{ulong i=r*n+j;Jet upstream=cotangents[i];Jet reduced=divide(upstream,values[diagonal]);Jet contribution=neg(mul(reduced,divide(residuals[i],values[diagonal])));out[i]=reduced.{lane};for(ulong k=j;k>0;--k){{ulong inner=k-1,left=r*n+inner,right=j*n+inner;Jet product=neg(reduced);cotangents[left]=add(cotangents[left],mul(product,values[right]));}}cotangents[i]=reduced;residuals[i]=contribution;}}\n{BARRIER}\nfor(ulong t=tid;t<=j;t+=T){{if(t<j){{ulong right=j*n+t;Jet accumulated=cotangents[right];for(ulong r=n-1;r>j;--r){{Jet product=neg(cotangents[r*n+j]);accumulated=add(accumulated,mul(product,values[r*n+t]));}}cotangents[right]=accumulated;}}else{{Jet accumulated=cotangents[diagonal];for(ulong r=n-1;r>j;--r)accumulated=add(accumulated,residuals[r*n+j]);cotangents[diagonal]=accumulated;}}}}\n{BARRIER}\nif(tid==0){{Jet reduced=mul(cotangents[diagonal],root(residuals[diagonal],1));out[diagonal]=reduced.{lane};diagonal_reduced=reduced;}}\nthreadgroup_barrier(metal::mem_flags::mem_threadgroup);\nfor(ulong k=tid;k<j;k+=T){{ulong left=j*n+k;Jet product=neg(diagonal_reduced);cotangents[left]=add(cotangents[left],mul(product,values[left]));cotangents[left]=add(cotangents[left],mul(product,values[left]));}}\n{BARRIER}\n}}\n"));
     }
     (source, header)
 }

@@ -3296,16 +3296,15 @@ impl TensorIr {
                     )
                 }
                 TensorOp::Div { lhs, rhs } => {
+                    // d(l/r) = (dl - q dr) / r with q = l/r; unlike the quotient
+                    // rule over r*r, it cannot overflow or underflow when |r|
+                    // is outside the square root of the dtype's range.
                     let (lhs_value, lhs_tangent) = pairs[*lhs];
                     let (rhs_value, rhs_tangent) = pairs[*rhs];
-                    let left_term = transformed.mul(lhs_tangent, rhs_value)?;
-                    let right_term = transformed.mul(lhs_value, rhs_tangent)?;
-                    let numerator = transformed.sub(left_term, right_term)?;
-                    let denominator = transformed.mul(rhs_value, rhs_value)?;
-                    (
-                        transformed.div(lhs_value, rhs_value)?,
-                        transformed.div(numerator, denominator)?,
-                    )
+                    let quotient = transformed.div(lhs_value, rhs_value)?;
+                    let scaled = transformed.mul(quotient, rhs_tangent)?;
+                    let numerator = transformed.sub(lhs_tangent, scaled)?;
+                    (quotient, transformed.div(numerator, rhs_value)?)
                 }
                 TensorOp::Mul { lhs, rhs } => {
                     let (lhs_value, lhs_tangent) = pairs[*lhs];
@@ -4162,12 +4161,13 @@ impl TensorIr {
                 TensorOp::Div { lhs, rhs } => {
                     let lhs_value = values[*lhs];
                     let rhs_value = values[*rhs];
+                    // d/dr (l/r) = -(1/r)(l/r): no r*r term that could
+                    // overflow or underflow.
                     let lhs_contribution = transformed.div(upstream, rhs_value)?;
-                    let rhs_squared = transformed.mul(rhs_value, rhs_value)?;
-                    let numerator = transformed.mul(upstream, lhs_value)?;
-                    let quotient = transformed.div(numerator, rhs_squared)?;
+                    let quotient = transformed.div(lhs_value, rhs_value)?;
+                    let product = transformed.mul(lhs_contribution, quotient)?;
                     let zero = transformed.scalar_constant(0.0);
-                    let rhs_contribution = transformed.sub(zero, quotient)?;
+                    let rhs_contribution = transformed.sub(zero, product)?;
                     let lhs_contribution = symbolic_reduce_to_shape(
                         &mut transformed,
                         lhs_contribution,
@@ -6389,16 +6389,13 @@ impl TensorIr {
                         .get(*rhs)
                         .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {rhs} has no evaluated value"))?;
-                    let reciprocal = rhs_value.reciprocal()?;
-                    let reciprocal_squared = reciprocal.mul(&reciprocal)?;
-                    let lhs_contribution = cotangent
-                        .mul(&reciprocal)?
-                        .reduce_to_shape(&lhs_value.shape)?;
-                    let rhs_contribution = cotangent
-                        .mul(lhs_value)?
-                        .mul(&reciprocal_squared)?
+                    // As in the symbolic rule: g/r and -(g/r)(l/r), no r*r.
+                    let scaled = cotangent.div(rhs_value)?;
+                    let rhs_contribution = scaled
+                        .mul(&lhs_value.div(rhs_value)?)?
                         .neg()?
                         .reduce_to_shape(&rhs_value.shape)?;
+                    let lhs_contribution = scaled.reduce_to_shape(&lhs_value.shape)?;
                     accumulate(&mut cotangents[*lhs], lhs_contribution)?;
                     accumulate(&mut cotangents[*rhs], rhs_contribution)?;
                 }
@@ -7042,12 +7039,9 @@ impl TensorIr {
                     let rhs_value = values
                         .get(*rhs)
                         .ok_or_else(|| format!("node {rhs} has no evaluated value"))?;
-                    let reciprocal = rhs_value.reciprocal()?;
-                    lhs_tangent.mul(&reciprocal)?.sub(
-                        &lhs_value
-                            .mul(rhs_tangent)?
-                            .mul(&reciprocal.mul(&reciprocal)?)?,
-                    )?
+                    lhs_tangent
+                        .sub(&lhs_value.div(rhs_value)?.mul(rhs_tangent)?)?
+                        .div(rhs_value)?
                 }
                 TensorOp::Mul { lhs, rhs } => {
                     let lhs_tangent = tangents
@@ -9163,34 +9157,30 @@ impl TensorIr {
                     let rhs = values
                         .get(*rhs)
                         .ok_or_else(|| format!("node {rhs} has no evaluated value"))?;
-                    let reciprocal = rhs.value.reciprocal()?;
-                    let reciprocal_squared = reciprocal.mul(&reciprocal)?;
-                    let reciprocal_cubed = reciprocal_squared.mul(&reciprocal)?;
+                    // Differentiating q r = l twice gives every tangent as a
+                    // residual divided by r, with no powers of r.
+                    let quotient = lhs.value.div(&rhs.value)?;
+                    let first = lhs
+                        .first
+                        .sub(&quotient.mul(&rhs.first)?)?
+                        .div(&rhs.value)?;
+                    let second = lhs
+                        .second
+                        .sub(&quotient.mul(&rhs.second)?)?
+                        .div(&rhs.value)?;
+                    let mixed = lhs
+                        .mixed
+                        .sub(&first.mul(&rhs.second)?)?
+                        .sub(&second.mul(&rhs.first)?)?
+                        .sub(&quotient.mul(&rhs.mixed)?)?
+                        .div(&rhs.value)?;
                     MixedTangent {
-                        value: lhs.value.mul(&reciprocal)?,
-                        first: lhs
-                            .first
-                            .mul(&reciprocal)?
-                            .sub(&lhs.value.mul(&rhs.first)?.mul(&reciprocal_squared)?)?,
-                        second: lhs
-                            .second
-                            .mul(&reciprocal)?
-                            .sub(&lhs.value.mul(&rhs.second)?.mul(&reciprocal_squared)?)?,
-                        mixed: lhs
-                            .mixed
-                            .mul(&reciprocal)?
-                            .sub(&lhs.first.mul(&rhs.second)?.mul(&reciprocal_squared)?)?
-                            .sub(&lhs.second.mul(&rhs.first)?.mul(&reciprocal_squared)?)?
-                            .sub(&lhs.value.mul(&rhs.mixed)?.mul(&reciprocal_squared)?)?
-                            .add(
-                                &lhs.value
-                                    .mul(&rhs.first)?
-                                    .mul(&rhs.second)?
-                                    .mul(&reciprocal_cubed)?
-                                    .scale(2.0)?,
-                            )?,
-                        }
+                        value: quotient,
+                        first,
+                        second,
+                        mixed,
                     }
+                }
                 TensorOp::Mul { lhs, rhs } => {
                     let lhs = values
                         .get(*lhs)

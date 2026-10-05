@@ -53,50 +53,22 @@ impl Jet {
                 + r(self.value * rhs.mixed)),
         }
     }
-    fn reciprocal(self, t: TensorDType) -> Result<Self, String> {
+    // The IR's division rules: differentiating q r = l gives each tangent as a
+    // residual over r, so no power of the pivot can overflow or underflow.
+    fn div(self, rhs: Self, t: TensorDType) -> Self {
         let r = |value: f64| t.round(value);
-        if self.value == 0.0 {
-            return Err("division by zero is not supported".into());
-        }
-        let value = r(1.0 / self.value);
-        let squared = r(value * value);
-        Ok(Self {
+        let value = r(self.value / rhs.value);
+        let first = r(r(self.first - r(value * rhs.first)) / rhs.value);
+        let second = r(r(self.second - r(value * rhs.second)) / rhs.value);
+        Self {
             value,
-            first: -r(self.first * squared),
-            second: -r(self.second * squared),
-            mixed: r(-r(self.mixed * squared)
-                + r(r(r(r(2.0 * self.first) * self.second) * squared) * value)),
-        })
-    }
-    fn div(self, rhs: Self, symbolic: bool, t: TensorDType) -> Result<Self, String> {
-        let r = |value: f64| t.round(value);
-        let reciprocal = rhs.reciprocal(t)?;
-        let squared = r(reciprocal.value * reciprocal.value);
-        // Follow the existing JVP rule, including the reciprocal's arithmetic
-        // order; the primal recurrence uses direct division.
-        Ok(Self {
-            value: r(self.value / rhs.value),
-            first: if symbolic {
-                r(r(r(self.first * rhs.value) - r(self.value * rhs.first))
-                    / r(rhs.value * rhs.value))
-            } else {
-                r(r(self.first * reciprocal.value) - r(r(self.value * rhs.first) * squared))
-            },
-            second: if symbolic {
-                r(r(r(self.second * rhs.value) - r(self.value * rhs.second))
-                    / r(rhs.value * rhs.value))
-            } else {
-                r(r(self.second * reciprocal.value) - r(r(self.value * rhs.second) * squared))
-            },
-            mixed: r(r(r(r(
-                r(self.mixed * reciprocal.value) - r(r(self.first * rhs.second) * squared)
-            ) - r(r(self.second * rhs.first) * squared))
-                - r(r(self.value * rhs.mixed) * squared))
-                + r(
-                    r(r(r(self.value * rhs.first) * rhs.second) * r(squared * reciprocal.value))
-                        * 2.0,
-                )),
-        })
+            first,
+            second,
+            mixed: r(r(
+                r(r(self.mixed - r(first * rhs.second)) - r(second * rhs.first))
+                    - r(value * rhs.mixed),
+            ) / rhs.value),
+        }
     }
     fn sqrt_derivative(self, order: u32, t: TensorDType) -> Self {
         let r = |value: f64| t.round(value);
@@ -111,12 +83,7 @@ impl Jet {
     }
 }
 
-fn factor(
-    input: &[Jet],
-    n: usize,
-    symbolic: bool,
-    t: TensorDType,
-) -> Result<(Vec<Jet>, Vec<Jet>), String> {
+fn factor(input: &[Jet], n: usize, t: TensorDType) -> (Vec<Jet>, Vec<Jet>) {
     let mut values = vec![Jet::default(); n * n];
     let mut residuals = vec![Jet::default(); n * n];
     for row in 0..n {
@@ -133,11 +100,11 @@ fn factor(
             values[offset] = if row == column {
                 reduced.sqrt_derivative(0, t)
             } else {
-                reduced.div(values[column * n + column], symbolic, t)?
+                reduced.div(values[column * n + column], t)
             };
         }
     }
-    Ok((values, residuals))
+    (values, residuals)
 }
 
 fn reverse(
@@ -145,9 +112,8 @@ fn reverse(
     residuals: &[Jet],
     mut cotangents: Vec<Jet>,
     n: usize,
-    symbolic: bool,
     t: TensorDType,
-) -> Result<Vec<Jet>, String> {
+) -> Vec<Jet> {
     let mut gradient = vec![Jet::default(); n * n];
     for row in (0..n).rev() {
         for column in (0..=row).rev() {
@@ -157,25 +123,11 @@ fn reverse(
                 upstream.mul(residuals[offset].sqrt_derivative(1, t), t)
             } else {
                 let diagonal = column * n + column;
-                let (left, right) = if symbolic {
-                    (
-                        upstream.div(values[diagonal], true, t)?,
-                        upstream.mul(residuals[offset], t).neg().div(
-                            values[diagonal].mul(values[diagonal], t),
-                            true,
-                            t,
-                        )?,
-                    )
-                } else {
-                    let reciprocal = values[diagonal].reciprocal(t)?;
-                    (
-                        upstream.mul(reciprocal, t),
-                        upstream
-                            .mul(residuals[offset], t)
-                            .mul(reciprocal.mul(reciprocal, t), t)
-                            .neg(),
-                    )
-                };
+                // The IR's VJP of l/r: g/r for l and -(g/r)(l/r) for r.
+                let left = upstream.div(values[diagonal], t);
+                let right = left
+                    .mul(residuals[offset].div(values[diagonal], t), t)
+                    .neg();
                 cotangents[diagonal] = cotangents[diagonal].add(right, t);
                 left
             };
@@ -190,7 +142,7 @@ fn reverse(
             }
         }
     }
-    Ok(gradient)
+    gradient
 }
 
 pub(super) fn evaluate(
@@ -288,18 +240,9 @@ fn evaluate_with_rules(
             },
         })
         .collect::<Vec<_>>();
-    let (values, residuals) = factor(&jets, n, symbolic, t)?;
-    // Squared denominators outside the normal exponent range can change
-    // quotient-rule exceptional behavior. Retain the scalar reference there.
-    if symbolic
-        && (values.iter().any(|jet| !jet.value.is_finite())
-            || (0..n).any(|i| {
-                let diagonal = values[i * n + i].value;
-                let squared = t.round(diagonal * diagonal);
-                let fourth = t.round(squared * squared);
-                fourth == 0.0 || !fourth.is_finite()
-            }))
-    {
+    let (values, residuals) = factor(&jets, n, t);
+    // A non-finite factor keeps the scalar reference's exceptional values.
+    if symbolic && values.iter().any(|jet| !jet.value.is_finite()) {
         return reference(kind, inputs);
     }
     let result = match kind {
@@ -318,7 +261,7 @@ fn evaluate_with_rules(
                     ..Jet::default()
                 })
                 .collect();
-            reverse(&values, &residuals, cotangents, n, symbolic, t)?
+            reverse(&values, &residuals, cotangents, n, t)
                 .iter()
                 .map(|jet| {
                     if kind == CholeskyAdKind::Vjp {

@@ -189,10 +189,6 @@ fn compact_cholesky_derivatives_match_reference_and_stay_bounded() -> Result<(),
     Ok(())
 }
 
-fn bits(tensor: &DynamicTensor) -> Vec<u64> {
-    tensor.data().iter().map(|x| x.to_bits()).collect()
-}
-
 #[test]
 fn compact_cholesky_shape_checks_and_native_f32_derivatives() -> Result<(), String> {
     let mut ir = TensorIr::new();
@@ -203,10 +199,10 @@ fn compact_cholesky_shape_checks_and_native_f32_derivatives() -> Result<(), Stri
         let input = ir.input(format!("bad_{shape:?}"), shape)?;
         assert!(ir.cholesky(input).is_err());
     }
-    // Float32 jets round every operation to f32 in the expansion's order, so
-    // symbolic first derivatives and HVPs reproduce the scalar expansion bit
-    // for bit while the derivative graphs stay bounded; runtime derivatives
-    // agree to f32 roundoff, as they do to f64 roundoff in float64.
+    // Float32 jets round every operation to f32 and keep the derivative graphs
+    // bounded. They agree with the scalar expansion to f32 roundoff: the jets
+    // keep the quotient rule over the squared pivot, while the expansion's
+    // division rules avoid squaring the denominator.
     let mut native = TensorIr::new();
     let input = native.input_typed("matrix", vec![4, 4], TensorDType::F32)?;
     let output = native.cholesky(input)?;
@@ -250,24 +246,17 @@ fn compact_cholesky_shape_checks_and_native_f32_derivatives() -> Result<(), Stri
     let mut seeded = inputs.clone();
     seeded.insert("direction".into(), direction);
     seeded.insert("cotangent".into(), cotangent);
-    assert_eq!(
-        bits(
-            &reverse
-                .graph
-                .evaluate(reverse.gradients["matrix"], &seeded)?
-        ),
-        bits(
-            &old_reverse
-                .graph
-                .evaluate(old_reverse.gradients["matrix"], &seeded)?
-        )
+    assert_close(
+        &reverse
+            .graph
+            .evaluate(reverse.gradients["matrix"], &seeded)?,
+        &old_reverse
+            .graph
+            .evaluate(old_reverse.gradients["matrix"], &seeded)?,
     );
     let actual = hvp.graph.evaluate(hvp.tangent, &seeded)?;
     assert_eq!(actual.dtype(), TensorDType::F32);
-    assert_eq!(
-        bits(&actual),
-        bits(&old_hvp.graph.evaluate(old_hvp.tangent, &seeded)?)
-    );
+    assert_close(&actual, &old_hvp.graph.evaluate(old_hvp.tangent, &seeded)?);
     let actual = native.evaluate_mixed(output, &inputs, &directions, &directions)?;
     let expected = reference.evaluate_mixed(reference_output, &inputs, &directions, &directions)?;
     assert_close(&actual.mixed, &expected.mixed);

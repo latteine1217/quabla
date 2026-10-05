@@ -82,14 +82,14 @@ pub(super) fn ad_source(function: &str, n: usize, kind: CholeskyAdKind) -> Strin
     if mixed {
         source.push_str("c.e=addf(mulf(a.e,b.v),mulf(a.v,b.e));c.h=addf(addf(mulf(a.h,b.v),mulf(a.d,b.e)),addf(mulf(a.e,b.d),mulf(a.v,b.h)));");
     }
-    source.push_str("return c;}\n__device__ Jet divide(Jet a,Jet b){Jet c;c.v=divf(a.v,b.v);float denominator=mulf(b.v,b.v);\n");
+    // The IR's division rules: each tangent is a residual over the pivot,
+    // so no power of the pivot can overflow or underflow.
+    source.push_str("return c;}\n__device__ Jet divide(Jet a,Jet b){Jet c;c.v=divf(a.v,b.v);");
     if first {
-        source.push_str(
-            "float numerator=subf(mulf(a.d,b.v),mulf(a.v,b.d));c.d=divf(numerator,denominator);",
-        );
+        source.push_str("c.d=divf(subf(a.d,mulf(c.v,b.d)),b.v);");
     }
     if mixed {
-        source.push_str("c.e=divf(subf(mulf(a.e,b.v),mulf(a.v,b.e)),denominator);float numerator_second=subf(addf(mulf(a.h,b.v),mulf(a.d,b.e)),addf(mulf(a.e,b.d),mulf(a.v,b.h)));float denominator_second=addf(mulf(b.e,b.v),mulf(b.v,b.e));c.h=divf(subf(mulf(numerator_second,denominator),mulf(numerator,denominator_second)),mulf(denominator,denominator));");
+        source.push_str("c.e=divf(subf(a.e,mulf(c.v,b.e)),b.v);c.h=divf(subf(subf(subf(a.h,mulf(c.d,b.e)),mulf(c.e,b.d)),mulf(c.v,b.h)),b.v);");
     }
     source.push_str("return c;}\n__device__ float derivative(float x,int order){if(x==0.0f)return 0.0f;if(x<0.0f)return __int_as_float(0x7fc00000);float coefficient=1.0f;for(int i=0;i<order;++i)coefficient=mulf(coefficient,0.5f-(float)i);return mulf(coefficient,powf(x,0.5f-(float)order));}\n__device__ Jet root(Jet a,int order){Jet c;c.v=order==0?sqrtf(a.v):derivative(a.v,order);");
     if first {
@@ -171,7 +171,7 @@ pub(super) fn ad_source(function: &str, n: usize, kind: CholeskyAdKind) -> Strin
         source.push_str("__shared__ Jet shared_reduced;\nfor(unsigned long long jj=n;jj>0;--jj){\nconst unsigned long long j=jj-1,diagonal=j*n+j;\n");
         // Phase A: below-diagonal entries of column j are independent rows.
         // Stash reduced and the diagonal contribution for phase B.
-        source.push_str(&format!("for(unsigned long long r=j+1+tid;r<n;r+=stride){{unsigned long long i=r*n+j;Jet upstream=cotangents[i];Jet contribution=neg(divide(mul(upstream,residuals[i]),mul(values[diagonal],values[diagonal])));Jet reduced=divide(upstream,values[diagonal]);{output}for(unsigned long long k=j;k>0;--k){{unsigned long long inner=k-1;cotangents[r*n+inner]=add(cotangents[r*n+inner],mul(neg(reduced),values[j*n+inner]));}}cotangents[i]=reduced;residuals[i]=contribution;}}\n__syncthreads();\n"));
+        source.push_str(&format!("for(unsigned long long r=j+1+tid;r<n;r+=stride){{unsigned long long i=r*n+j;Jet upstream=cotangents[i];Jet reduced=divide(upstream,values[diagonal]);Jet contribution=neg(mul(reduced,divide(residuals[i],values[diagonal])));{output}for(unsigned long long k=j;k>0;--k){{unsigned long long inner=k-1;cotangents[r*n+inner]=add(cotangents[r*n+inner],mul(neg(reduced),values[j*n+inner]));}}cotangents[i]=reduced;residuals[i]=contribution;}}\n__syncthreads();\n"));
         // Phase B: row j gathers the right adds and the diagonal contributions.
         source.push_str("for(unsigned long long t=tid;t<=j;t+=stride){if(t<j){Jet acc=cotangents[j*n+t];for(unsigned long long r=n-1;r>j;--r)acc=add(acc,mul(neg(cotangents[r*n+j]),values[r*n+t]));cotangents[j*n+t]=acc;}else{Jet acc=cotangents[diagonal];for(unsigned long long r=n-1;r>j;--r)acc=add(acc,residuals[r*n+j]);cotangents[diagonal]=acc;}}\n__syncthreads();\n");
         // Phase C: the diagonal entry, then its left and right adds into row j.
