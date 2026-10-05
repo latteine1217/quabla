@@ -1,6 +1,7 @@
 //! Batched `solve` and the `Linalg` decompositions (determinant sign and
-//! log-magnitude, symmetric eigendecomposition): CPU values, the numeric and
-//! symbolic derivative paths, vmap batching, and backend validation.
+//! log-magnitude, symmetric eigendecomposition, QR, SVD) and the `prod`
+//! tree: CPU values, the numeric and symbolic derivative paths, vmap
+//! batching, and backend validation.
 
 use std::collections::BTreeMap;
 
@@ -336,5 +337,175 @@ fn mlx_validation_rejects_linalg() -> Result<(), String> {
             Err(kind.name().to_string())
         );
     }
+    Ok(())
+}
+
+/// A tall 4x3 matrix with well-separated singular values and a tangent.
+fn tall_matrix() -> (DynamicTensor, DynamicTensor) {
+    (
+        tensor(
+            &[4, 3],
+            &[
+                3.0, 1.0, -0.5, 0.4, 2.0, 0.3, -0.2, 0.5, 1.0, 1.0, -0.3, 0.2,
+            ],
+        ),
+        tensor(
+            &[4, 3],
+            &[
+                0.3, -0.1, 0.2, -0.1, 0.5, -0.4, 0.2, -0.4, -0.3, 0.1, 0.2, -0.2,
+            ],
+        ),
+    )
+}
+
+/// The tall test matrix (and tangent), transposed for `shape == [3, 4]`.
+fn oriented(shape: [usize; 2]) -> Result<(DynamicTensor, DynamicTensor), String> {
+    let (matrix, direction) = tall_matrix();
+    if shape == [4, 3] {
+        return Ok((matrix, direction));
+    }
+    let transpose = |t: &DynamicTensor| {
+        let (rows, columns) = (t.shape()[0], t.shape()[1]);
+        let data = (0..rows * columns)
+            .map(|index| t.data()[(index % rows) * columns + index / rows])
+            .collect::<Vec<_>>();
+        tensor(&[columns, rows], &data)
+    };
+    Ok((transpose(&matrix), transpose(&direction)))
+}
+
+#[test]
+fn qr_and_svd_kinds_reconstruct_their_input() -> Result<(), String> {
+    for shape in [[4, 3], [3, 4]] {
+        let (data, _) = oriented(shape)?;
+        let mut graph = TensorIr::new();
+        let a = graph.input("a", shape.to_vec())?;
+        let q = graph.linalg(a, LinalgKind::QrQ)?;
+        let r = graph.linalg(a, LinalgKind::QrR)?;
+        let product = graph.matmul(q, r)?;
+        let u = graph.linalg(a, LinalgKind::SvdU)?;
+        let s = graph.linalg(a, LinalgKind::SvdS)?;
+        let vh = graph.linalg(a, LinalgKind::SvdVh)?;
+        let k = shape[0].min(shape[1]);
+        let row = graph.reshape(s, vec![1, k])?;
+        let scaled = graph.mul(u, row)?;
+        let rebuilt = graph.matmul(scaled, vh)?;
+        let inputs = [("a", &data)];
+        for output in [product, rebuilt] {
+            let value = evaluate(&graph, output, &inputs)?;
+            assert_close(value.data().as_ref(), data.data().as_ref(), 1e-14);
+        }
+        let factor = evaluate(&graph, r, &inputs)?;
+        for row in 0..k {
+            assert!(factor.data()[row * shape[1] + row] >= 0.0);
+            for column in 0..row {
+                assert_eq!(factor.data()[row * shape[1] + column], 0.0);
+            }
+        }
+        let values = evaluate(&graph, s, &inputs)?;
+        assert!(values.data().windows(2).all(|pair| pair[0] >= pair[1]));
+    }
+    Ok(())
+}
+
+#[test]
+fn numeric_and_symbolic_qr_and_svd_derivatives_agree() -> Result<(), String> {
+    for shape in [[4, 3], [3, 4]] {
+        let (matrix, direction) = oriented(shape)?;
+        for kind in [
+            LinalgKind::QrQ,
+            LinalgKind::QrR,
+            LinalgKind::SvdU,
+            LinalgKind::SvdS,
+            LinalgKind::SvdVh,
+        ] {
+            let mut graph = TensorIr::new();
+            let a = graph.input("a", shape.to_vec())?;
+            let decomposed = graph.linalg(a, kind)?;
+            let cubed = graph.powi(decomposed, 3)?;
+            let loss = graph.sum(cubed)?;
+            let inputs = BTreeMap::from([("a".to_string(), matrix.clone())]);
+            let numeric = graph.vjp(loss, &inputs, tensor(&[], &[1.0]))?;
+            let symbolic = graph.symbolic_vjp(loss, "seed")?;
+            let mut symbolic_inputs = inputs.clone();
+            symbolic_inputs.insert("seed".into(), tensor(&[], &[1.0]));
+            let gradient = symbolic
+                .graph
+                .evaluate(symbolic.gradients["a"], &symbolic_inputs)?;
+            assert_close(
+                gradient.data().as_ref(),
+                numeric["a"].data().as_ref(),
+                1e-12,
+            );
+            let (_, tangent) = graph.jvp(
+                loss,
+                &inputs,
+                &BTreeMap::from([("a".to_string(), direction.clone())]),
+            )?;
+            let projected = gradient
+                .data()
+                .iter()
+                .zip(direction.data().iter())
+                .map(|(g, d)| g * d)
+                .sum::<f64>();
+            assert_close(tangent.data().as_ref(), &[projected], 1e-11);
+            // The directional derivative against a central difference.
+            let step = 1e-6;
+            let shifted = |sign: f64| -> Result<f64, String> {
+                let data = matrix
+                    .data()
+                    .iter()
+                    .zip(direction.data().iter())
+                    .map(|(m, d)| m + sign * step * d)
+                    .collect::<Vec<_>>();
+                let shifted = tensor(&shape, &data);
+                Ok(evaluate(&graph, loss, &[("a", &shifted)])?.data()[0])
+            };
+            let difference = (shifted(1.0)? - shifted(-1.0)?) / (2.0 * step);
+            assert_close(&[projected], &[difference], 1e-7 * projected.abs().max(1.0));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn complete_qr_and_full_svd_complements_are_not_differentiable() -> Result<(), String> {
+    for (kind, shape) in [
+        (LinalgKind::QrQComplete, vec![4, 3]),
+        (LinalgKind::SvdUFull, vec![4, 3]),
+        (LinalgKind::SvdVhFull, vec![3, 4]),
+    ] {
+        let mut graph = TensorIr::new();
+        let a = graph.input("a", shape)?;
+        let decomposed = graph.linalg(a, kind)?;
+        let loss = graph.sum(decomposed)?;
+        let error = graph
+            .symbolic_vjp(loss, "seed")
+            .expect_err("the complement has no derivative");
+        assert!(error.contains("not differentiable"), "{error}");
+    }
+    Ok(())
+}
+
+#[test]
+fn prod_axis_is_a_division_free_product_tree() -> Result<(), String> {
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![2, 5])?;
+    let product = graph.prod_axis(x, 1)?;
+    let loss = graph.sum(product)?;
+    let data = tensor(
+        &[2, 5],
+        &[2.0, 0.0, -3.0, 7.0, 5.0, 1.5, -2.0, 0.5, 4.0, 3.0],
+    );
+    let value = evaluate(&graph, product, &[("x", &data)])?;
+    assert_eq!(value.data().as_ref(), &[0.0, -18.0]);
+    let inputs = BTreeMap::from([("x".to_string(), data)]);
+    let gradient = graph.vjp(loss, &inputs, tensor(&[], &[1.0]))?;
+    assert_eq!(
+        gradient["x"].data().as_ref(),
+        &[0.0, -210.0, 0.0, 0.0, 0.0, -12.0, 9.0, -36.0, -4.5, -6.0]
+    );
+    let flags = graph.input_typed("flags", vec![3], TensorDType::Bool)?;
+    assert!(graph.prod_axis(flags, 0).is_err());
     Ok(())
 }

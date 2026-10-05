@@ -38,6 +38,7 @@ __all__ = [
     "cos",
     "cumsum",
     "erf",
+    "erfc",
     "exp",
     "expand_dims",
     "expm1",
@@ -55,6 +56,7 @@ __all__ = [
     "norm",
     "ones_like",
     "power",
+    "prod",
     "reciprocal",
     "relu",
     "reshape",
@@ -123,6 +125,7 @@ cos = _unary("cos")
 exp = _unary("exp")
 expm1 = _unary("expm1")
 erf = _unary("erf")
+erfc = _unary("erfc")
 log = _unary("log")
 log1p = _unary("log1p")
 relu = _unary("relu")
@@ -140,6 +143,7 @@ sum = _reduction("sum")
 mean = _reduction("mean")
 max = _reduction("max")
 min = _reduction("min")
+prod = _reduction("prod")
 norm = _reduction("norm")
 any = _reduction("any")
 all = _reduction("all")
@@ -309,12 +313,12 @@ def gelu(x, approximate=True):
     identity `0.5 (1 + tanh(u)) == sigmoid(2u)`: the stable `sigmoid` keeps
     full relative accuracy in the negative tail, where `1 + tanh(u)` would
     cancel to zero. `approximate=False` gives the exact
-    `0.5 x (1 + erf(x / sqrt(2)))`; without `erfc`, its relative accuracy in
-    the far negative tail (x below about -4 in `float32`) is limited by the
-    cancellation of `1 + erf`."""
+    `0.5 x (1 + erf(x / sqrt(2)))`, evaluated as `0.5 x erfc(-x / sqrt(2))`:
+    `erfc` keeps full relative accuracy in the negative tail, where
+    `1 + erf` would cancel to zero."""
     x = _array(x)
     if not approximate:
-        return x * 0.5 * (erf(x * _SQRT_HALF) + 1.0)
+        return x * 0.5 * erfc(x * -_SQRT_HALF)
     return x * (x * (x * x * 0.044715 + 1.0) * _GELU_SCALE).sigmoid()
 
 

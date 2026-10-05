@@ -40,6 +40,8 @@ const CUDA_REDUCTION_BLOCK: u32 = 256;
 
 #[path = "cuda_cholesky.rs"]
 mod cholesky_backend;
+#[path = "cuda_decompositions.rs"]
+mod decompositions;
 
 /// NVIDIA CUDA backend for fused rank-N elementwise and rank-two matmul plans.
 ///
@@ -1944,16 +1946,27 @@ fn execute_cuda_device_program(
                 })?;
                 let input_shape = &plan.nodes[*input].shape;
                 let rank = input_shape.len();
-                launch_cusolver_linalg(
-                    stream,
-                    module,
-                    solver,
-                    *kind,
-                    cuda_value(before, *input)?,
-                    output,
-                    element_count(&input_shape[..rank - 2])?,
-                    input_shape[rank - 1],
-                )?;
+                let batch = element_count(&input_shape[..rank - 2])?;
+                if decompositions::is_decomposition(*kind) {
+                    let stack = decompositions::MatrixStack {
+                        batch,
+                        m: input_shape[rank - 2],
+                        n: input_shape[rank - 1],
+                    };
+                    let matrix = cuda_value(before, *input)?;
+                    decompositions::launch(stream, module, solver, *kind, matrix, output, stack)?;
+                } else {
+                    launch_cusolver_linalg(
+                        stream,
+                        module,
+                        solver,
+                        *kind,
+                        cuda_value(before, *input)?,
+                        output,
+                        batch,
+                        input_shape[rank - 1],
+                    )?;
+                }
             }
             TensorOp::Solve { matrix, rhs } => {
                 let (before, current_and_after) = values.split_at_mut(node_id);
@@ -2791,6 +2804,7 @@ fn execute_cuda_device_program(
             | TensorOp::Log1p { .. }
             | TensorOp::Expm1 { .. }
             | TensorOp::Erf { .. }
+            | TensorOp::Erfc { .. }
             | TensorOp::Atan2 { .. }
             | TensorOp::CumSum { .. }
             | TensorOp::Triangular { .. }
@@ -3434,6 +3448,7 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
         | TensorOp::Log1p { input }
         | TensorOp::Expm1 { input }
         | TensorOp::Erf { input }
+        | TensorOp::Erfc { input }
         | TensorOp::CumSum { input, .. }
         | TensorOp::Transpose { input, .. }
         | TensorOp::Triangular { input, .. } => {
@@ -4524,6 +4539,9 @@ fn launch_cusolver_linalg(
                     format!("failed to launch CUDA eigenvector sign kernel: {error:?}")
                 })
         }
+        _ => Err(format!(
+            "{name} is lowered by the CUDA QR and SVD path, not the LU and eigen path"
+        )),
     }
 }
 
@@ -7633,6 +7651,7 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
     if (index < batch * size) { unsigned long long base = index - index % size; unsigned long long local = index % size; unsigned long long row = local / columns; unsigned long long column = local % columns; output[base + column * rows + row] = input[index]; }\n}\n",
     );
     source.push_str(CUDA_LINALG_SOURCE);
+    source.push_str(decompositions::CUDA_DECOMPOSITION_SOURCE);
     for (node_id, node) in plan.nodes.iter().enumerate() {
         let function = cuda_node_function_name(node_id);
         let count = element_count(&node.shape)?;
@@ -7720,7 +7739,8 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
             | TensorOp::Log { input }
             | TensorOp::Log1p { input }
             | TensorOp::Expm1 { input }
-            | TensorOp::Erf { input } => {
+            | TensorOp::Erf { input }
+            | TensorOp::Erfc { input } => {
                 let expression = match &node.op {
                     TensorOp::Tanh { .. } => "tanhf(input[index])".to_string(),
                     TensorOp::Exp { .. } => "expf(input[index])".to_string(),
@@ -7737,6 +7757,7 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                     TensorOp::Log1p { .. } => "log1pf(input[index])".to_string(),
                     TensorOp::Expm1 { .. } => "expm1f(input[index])".to_string(),
                     TensorOp::Erf { .. } => "erff(input[index])".to_string(),
+                    TensorOp::Erfc { .. } => "erfcf(input[index])".to_string(),
                     _ => unreachable!(),
                 };
                 let input_count = element_count(&plan.nodes[*input].shape)?;
@@ -8329,6 +8350,7 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Log1p { .. } => "log1p",
         TensorOp::Expm1 { .. } => "expm1",
         TensorOp::Erf { .. } => "erf",
+        TensorOp::Erfc { .. } => "erfc",
         TensorOp::Atan2 { .. } => "atan2",
         TensorOp::StopGradient { .. } => "stop_gradient",
         TensorOp::Custom { .. } => "custom",

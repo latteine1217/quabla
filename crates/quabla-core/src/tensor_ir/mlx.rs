@@ -1056,6 +1056,9 @@ impl MlxBackend {
                 }
                 TensorOp::Erf { input } => ops::erf_device(mlx_value(&values, *input)?, &stream)
                     .map_err(|error| error.to_string()),
+                TensorOp::Erfc { input } => {
+                    mlx_erfc(mlx_value(&values, *input)?, &stream).map_err(|error| error.to_string())
+                }
                 TensorOp::Atan2 { y, x } => {
                     ops::atan2_device(mlx_value(&values, *y)?, mlx_value(&values, *x)?, &stream)
                         .map_err(|error| error.to_string())
@@ -1108,8 +1111,8 @@ impl MlxBackend {
                 }
                 TensorOp::Linalg { kind, .. } => {
                     return Err(format!(
-                        "MLX GPU backend does not support {}: MLX's LU and eigh factorizations \
-                         only accept a CPU stream",
+                        "MLX GPU backend does not support {}: MLX's LU, eigh, QR, and SVD \
+                         factorizations only accept a CPU stream",
                         kind.name()
                     ))
                 }
@@ -2119,6 +2122,70 @@ fn mlx_scalar_predicate(predicate: &Array) -> Result<bool, String> {
     Ok(value != 0.0)
 }
 
+/// Coefficients `c0..c9` of the Chebyshev-fitted `erfc` approximation of
+/// Press et al., Numerical Recipes (2nd ed., section 6.2):
+/// `erfc(z) ~= t exp(-z^2 + c0 + t (c1 + t (c2 + ... + t c9)))` with
+/// `t = 1 / (1 + z / 2)` for `z >= 0`, relative error below `1.2e-7` for
+/// every `z`.
+const MLX_ERFC_COEFFICIENTS: [f32; 10] = [
+    -1.265_512_2,
+    1.000_023_7,
+    0.374_091_96,
+    0.096_784_18,
+    -0.186_288_06,
+    0.278_868_07,
+    -1.135_204,
+    1.488_515_9,
+    -0.822_152_23,
+    0.170_872_77,
+];
+
+/// `erfc(x)` on MLX, which has no `erfc` of its own; `1 - erf(x)` would lose
+/// all relative accuracy for large `x`. Evaluates the approximation of
+/// [`MLX_ERFC_COEFFICIENTS`] at `z = min(|x|, 16)` (`erfc(16)` underflows
+/// `f32`, and the clamp keeps `inf` out of the arithmetic) and reflects
+/// `erfc(x) = 2 - erfc(-x)` for negative `x`. The Gaussian factor is split
+/// as `exp(-h^2) exp(-(z - h)(z + h))` with `h = floor(16 z) / 16`, whose
+/// square is exact in `f32`, so the rounding of `z^2` (relative error
+/// `eps z^2`) does not reach the result.
+fn mlx_erfc(input: &Array, stream: &StreamOrDevice) -> Result<Array, mlx_rs::error::Exception> {
+    let scalar = Array::from_f32;
+    let z = ops::minimum_device(input.abs_device(stream)?, scalar(16.0), stream)?;
+    let t = z
+        .multiply_device(scalar(0.5), stream)?
+        .add_device(scalar(1.0), stream)?
+        .reciprocal_device(stream)?;
+    let (&last, rest) = MLX_ERFC_COEFFICIENTS
+        .split_last()
+        .expect("the coefficient table is non-empty");
+    let mut polynomial = scalar(last);
+    for &coefficient in rest.iter().rev() {
+        polynomial = polynomial
+            .multiply_device(&t, stream)?
+            .add_device(scalar(coefficient), stream)?;
+    }
+    let head = z
+        .multiply_device(scalar(16.0), stream)?
+        .floor_device(stream)?
+        .multiply_device(scalar(0.0625), stream)?;
+    let head_decay = head
+        .square_device(stream)?
+        .negative_device(stream)?
+        .exp_device(stream)?;
+    let tail = z
+        .subtract_device(&head, stream)?
+        .multiply_device(z.add_device(&head, stream)?, stream)?;
+    let tail_decay = polynomial
+        .subtract_device(&tail, stream)?
+        .exp_device(stream)?;
+    let positive = t
+        .multiply_device(&head_decay, stream)?
+        .multiply_device(&tail_decay, stream)?;
+    let reflected = scalar(2.0).subtract_device(&positive, stream)?;
+    let negative = input.lt_device(scalar(0.0), stream)?;
+    ops::r#where_device(&negative, &reflected, &positive, stream)
+}
+
 fn mlx_value(values: &[Array], node_id: usize) -> Result<&Array, String> {
     values
         .get(node_id)
@@ -2171,6 +2238,7 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Log1p { .. } => "log1p",
         TensorOp::Expm1 { .. } => "expm1",
         TensorOp::Erf { .. } => "erf",
+        TensorOp::Erfc { .. } => "erfc",
         TensorOp::Atan2 { .. } => "atan2",
         TensorOp::StopGradient { .. } => "stop_gradient",
         TensorOp::Custom { .. } => "custom",

@@ -20,6 +20,13 @@ against each other as in NumPy.
   slower and less accurate.
 - `eigh(a)`: eigenvalues (ascending) and eigenvectors of the symmetric part
   `(a + a^T) / 2`.
+- `qr(a, mode="reduced")`: `a = Q R` by Householder reflections, with the
+  diagonal of `R` non-negative; `a` may be any `[..., m, n]`.
+- `svd(a, full_matrices=False, compute_uv=True)`: `a = U diag(S) Vh` by
+  one-sided Jacobi rotations, singular values descending.
+- `lstsq(a, b)`: the least-squares solution of `a @ x ~= b` for a tall `a`
+  of full column rank (the minimum-norm solution for a wide `a` of full row
+  rank), from `qr`.
 
 No derivative forms an explicit inverse: the gradient of `logabsdet` is
 `solve(a^T, g I)` and its tangent `trace(solve(a, da))`. The derivatives of
@@ -28,35 +35,52 @@ No derivative forms an explicit inverse: the gradient of `logabsdet` is
 raises on the CPU (and reports the singular factor on CUDA), where JAX
 returns non-finite values. The eigenvector derivative divides by eigenvalue
 gaps, so it is infinite or NaN for a repeated eigenvalue, as in JAX; the
-eigenvalue derivative stays defined.
+eigenvalue derivative stays defined. The `qr` derivative needs a matrix of
+full column rank (for a wide `a`, its leading square block of full rank)
+and applies `R^-1` with `solve`; the `svd` derivatives follow JAX's rule and
+are exact for distinct nonzero singular values (see `svd`). The extra
+columns of `mode="complete"` and `full_matrices=True` are not unique, so
+differentiating them raises.
 
-Devices: CPU and CUDA (cuSOLVER `getrf`/`getrs` and `syevd`, `float32`).
-MLX rejects `solve`, `slogdet`, and `eigh`, because MLX's LU and eigh
-factorizations only run on its CPU stream.
+Devices: CPU and CUDA (cuSOLVER `getrf`/`getrs`, `syevd`, `geqrf`/`orgqr`,
+and `gesvdj`, `float32`). MLX rejects `solve`, `slogdet`, `eigh`, `qr`, and
+`svd`, because MLX's factorizations only run on its CPU stream.
 """
 
 import collections
 
-from ._array import asarray, eye
-from ._quabla import Tensor, TraceTensor
+from ._array import asarray, eye, zeros
+from ._quabla import Tensor, TraceTensor, concat
 
 __all__ = [
     "EighResult",
+    "LstsqResult",
+    "QRResult",
+    "SVDResult",
     "SlogdetResult",
     "cho_solve",
     "cholesky",
     "det",
     "eigh",
     "inv",
+    "lstsq",
+    "qr",
     "slogdet",
     "solve",
     "solve_triangular",
+    "svd",
 ]
 
 SlogdetResult = collections.namedtuple("SlogdetResult", ["sign", "logabsdet"])
 SlogdetResult.__doc__ = "`(sign, logabsdet)` of `slogdet`; a pytree like any namedtuple."
 EighResult = collections.namedtuple("EighResult", ["eigenvalues", "eigenvectors"])
 EighResult.__doc__ = "`(eigenvalues, eigenvectors)` of `eigh`; a pytree like any namedtuple."
+QRResult = collections.namedtuple("QRResult", ["Q", "R"])
+QRResult.__doc__ = "`(Q, R)` of `qr`; a pytree like any namedtuple."
+SVDResult = collections.namedtuple("SVDResult", ["U", "S", "Vh"])
+SVDResult.__doc__ = "`(U, S, Vh)` of `svd`; a pytree like any namedtuple."
+LstsqResult = collections.namedtuple("LstsqResult", ["solution", "residuals"])
+LstsqResult.__doc__ = "`(solution, residuals)` of `lstsq`; a pytree like any namedtuple."
 
 
 def _array(x):
@@ -69,6 +93,19 @@ def _square(a, name):
     if len(shape) < 2 or shape[-1] != shape[-2]:
         raise ValueError(f"{name} requires a stack of square matrices [..., n, n], got {list(shape)}")
     return a
+
+
+def _matrix(a, name):
+    a = _array(a)
+    if len(a.shape) < 2:
+        raise ValueError(f"{name} requires a stack of matrices [..., m, n], got {list(a.shape)}")
+    return a
+
+
+def _matrix_transpose(x):
+    axes = list(range(len(x.shape)))
+    axes[-2], axes[-1] = axes[-1], axes[-2]
+    return x.transpose(axes)
 
 
 def _broadcast_batch(*shapes):
@@ -191,3 +228,115 @@ def eigh(a):
     cuSOLVER `syevd` in float32."""
     a = _square(a, "eigh")
     return EighResult(a._linalg("eigh_values"), a._linalg("eigh_vectors"))
+
+
+def qr(a, mode="reduced"):
+    """The QR factorization `a = Q @ R` of each matrix of the leading axes
+    (`[..., m, n]`, any `m` and `n`), by Householder reflections in float64
+    on the CPU, as `QRResult(Q, R)`.
+
+    With `k = min(m, n)`, `mode="reduced"` gives `Q` `[..., m, k]` with
+    orthonormal columns and an upper-triangular `R` `[..., k, n]`;
+    `mode="complete"` gives an orthogonal `Q` `[..., m, m]` and `R`
+    `[..., m, n]` (zero rows below the first `k`); `mode="r"` returns `R`
+    alone. The diagonal of `R` is non-negative, with the matching columns of
+    `Q` signed alike, which makes the factorization unique for full column
+    rank (LAPACK, and so NumPy and JAX, leave those signs to the
+    reflectors). Derivatives exist for `Q` and `R` of the reduced
+    factorization when `a` has full column rank, or for a wide `a` when its
+    leading `m x m` block has full rank; the extra columns of a complete `Q`
+    are not unique and have none."""
+    if mode not in ("reduced", "complete", "r"):
+        raise ValueError(f'mode must be "reduced", "complete", or "r", got {mode!r}')
+    a = _matrix(a, "qr")
+    m, n = a.shape[-2], a.shape[-1]
+    complete = mode == "complete" and m > n
+    r = a._linalg("qr_r")
+    if complete:
+        padding = zeros(list(a.shape[:-2]) + [m - n, n], dtype=r.dtype)
+        r = concat([r, padding], len(a.shape) - 2)
+    if mode == "r":
+        return r
+    return QRResult(a._linalg("qr_q_complete" if complete else "qr_q"), r)
+
+
+def svd(a, full_matrices=False, compute_uv=True):
+    """The singular value decomposition `a = U @ diag(S) @ Vh` of each
+    matrix of the leading axes (`[..., m, n]`), as `SVDResult(U, S, Vh)`,
+    or the singular values `S` alone when `compute_uv` is false.
+
+    With `k = min(m, n)`, `S` is `[..., k]` in descending order, `U`
+    `[..., m, k]`, and `Vh` `[..., k, n]`; `full_matrices=True` extends `U`
+    to `[..., m, m]` and `Vh` to `[..., n, n]` with orthonormal complements.
+    Unlike NumPy and JAX, `full_matrices` defaults to false, the economical
+    form that has derivatives. Each column of `U` has its largest-magnitude
+    component (the first on ties) positive, with the matching row of `Vh`
+    signed alike. The CPU uses one-sided (Hestenes) Jacobi rotations in
+    float64, which determine even the small singular values to high relative
+    accuracy; CUDA uses cuSOLVER `gesvdj` in float32.
+
+    The derivative of `S` is `U^T dA V` on the diagonal, defined wherever
+    the singular values are distinct. The derivatives of `U` and `Vh`
+    follow JAX: they are exact for distinct nonzero singular values; for
+    repeated ones the vectors are not unique and the rule masks the infinite
+    `1 / (s_j^2 - s_i^2)` terms to zero, giving finite values that are not
+    derivatives, and a zero singular value of a non-square `a` makes them
+    infinite or NaN. The extra columns of `full_matrices=True` have no
+    derivative unless `a` is square."""
+    a = _matrix(a, "svd")
+    s = a._linalg("svd_s")
+    if not compute_uv:
+        return s
+    m, n = a.shape[-2], a.shape[-1]
+    u = a._linalg("svd_u_full" if full_matrices and m > n else "svd_u")
+    vh = a._linalg("svd_vh_full" if full_matrices and m < n else "svd_vh")
+    return SVDResult(u, s, vh)
+
+
+def lstsq(a, b, return_residuals=False):
+    """The least-squares solution `x` of `a @ x ~= b` for every matrix of the
+    leading axes, from `qr` (leading batch axes broadcast as in `solve`).
+
+    For a tall or square `a` (`[..., m, n]`, `m >= n`) of full column rank,
+    `x = solve_triangular(R, Q^T b)` minimizes `||a x - b||`; for a wide `a`
+    of full row rank, `x = Q solve_triangular(R, b, trans=1)` from `qr(a^T)`
+    is the solution of minimum norm. `b` is `[..., m, k]`, or a vector `[m]`
+    (rank one), giving `x` of shape `[..., n, k]` or `[n]`. Unlike NumPy's
+    SVD-based `lstsq`, a rank-deficient `a` is not supported: `R` is then
+    singular and the solution is non-finite or meaningless, without an
+    error; use `svd` to handle one.
+
+    With `return_residuals`, returns `LstsqResult(solution, residuals)`, the
+    residuals being the squared norms `sum((b - a @ x)**2)` of each column
+    (`[..., k]`, or a scalar for a vector `b`), formed from the residual
+    itself rather than by cancellation. Derivatives come from those of `qr`
+    and the triangular solves."""
+    a = _matrix(a, "lstsq")
+    b = _array(b)
+    vector = len(b.shape) == 1
+    if vector:
+        b = b.reshape([b.shape[0], 1])
+    elif len(b.shape) < 2:
+        raise ValueError(f"lstsq requires a right-hand side of rank one or more, got {list(b.shape)}")
+    if b.shape[-2] != a.shape[-2]:
+        raise ValueError(
+            f"lstsq requires matrix shape {list(a.shape)} and right-hand side shape "
+            f"{list(b.shape)} to agree on rows"
+        )
+    batch = _broadcast_batch(tuple(a.shape[:-2]), tuple(b.shape[:-2]))
+    a, b = _to_batch(a, batch), _to_batch(b, batch)
+    m, n = a.shape[-2], a.shape[-1]
+    if m >= n:
+        q, r = qr(a)
+        x = solve_triangular(r, _matrix_transpose(q) @ b)
+    else:
+        q, r = qr(_matrix_transpose(a))
+        x = q @ solve_triangular(r, b, trans=1)
+    solution = _restore_vector(x, vector)
+    if not return_residuals:
+        return solution
+    residual = b - a @ x
+    residuals = (residual * residual).sum(axis=-2)
+    if vector:
+        residuals = residuals.reshape(list(residuals.shape[:-1]))
+    return LstsqResult(solution, residuals)

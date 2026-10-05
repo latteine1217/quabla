@@ -735,6 +735,13 @@ enum TensorOp {
     Erf {
         input: TensorNodeId,
     },
+    /// Elementwise complementary error function `1 - erf(x)` (the f64 musl
+    /// `erfc` of the `libm` crate on the CPU), which keeps full relative
+    /// accuracy where `erf(x)` is close to one. Its derivative is
+    /// `-2 / sqrt(pi) * exp(-x^2)`.
+    Erfc {
+        input: TensorNodeId,
+    },
     /// Elementwise four-quadrant `atan2(y, x)` with `f64::atan2` semantics and
     /// broadcasting. The partials `x / (x^2 + y^2)` and `-y / (x^2 + y^2)`
     /// are formed after scaling by `|x| + |y|`, so they neither overflow nor
@@ -3171,6 +3178,7 @@ impl TensorIr {
             | TensorOp::Log1p { .. }
             | TensorOp::Expm1 { .. }
             | TensorOp::Erf { .. }
+            | TensorOp::Erfc { .. }
             | TensorOp::StopGradient { .. }
             | TensorOp::Triangular { .. }
             | TensorOp::Linalg { .. }
@@ -3965,6 +3973,14 @@ impl TensorIr {
                         transformed.mul(input_tangent, derivative)?,
                     )
                 }
+                TensorOp::Erfc { input } => {
+                    let (input_value, input_tangent) = pairs[*input];
+                    let derivative = transformed.erfc_derivative(input_value)?;
+                    (
+                        transformed.erfc(input_value)?,
+                        transformed.mul(input_tangent, derivative)?,
+                    )
+                }
                 TensorOp::Atan2 { y, x } => {
                     let (y_value, y_tangent) = pairs[*y];
                     let (x_value, x_tangent) = pairs[*x];
@@ -4520,6 +4536,7 @@ impl TensorIr {
                 TensorOp::Log1p { input } => transformed.log1p(values[*input])?,
                 TensorOp::Expm1 { input } => transformed.expm1(values[*input])?,
                 TensorOp::Erf { input } => transformed.erf(values[*input])?,
+                TensorOp::Erfc { input } => transformed.erfc(values[*input])?,
                 TensorOp::Atan2 { y, x } => transformed.atan2(values[*y], values[*x])?,
                 TensorOp::StopGradient { input } => transformed.stop_gradient(values[*input])?,
                 TensorOp::CumSum {
@@ -5208,10 +5225,11 @@ impl TensorIr {
                     )?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
                 }
-                TensorOp::Expm1 { input } | TensorOp::Erf { input } => {
+                TensorOp::Expm1 { input } | TensorOp::Erf { input } | TensorOp::Erfc { input } => {
                     let derivative = match &node.op {
                         TensorOp::Expm1 { .. } => transformed.exp(values[*input])?,
-                        _ => transformed.erf_derivative(values[*input])?,
+                        TensorOp::Erf { .. } => transformed.erf_derivative(values[*input])?,
+                        _ => transformed.erfc_derivative(values[*input])?,
                     };
                     let contribution = transformed.mul(upstream, derivative)?;
                     let contribution = symbolic_reduce_to_shape(
@@ -6522,6 +6540,14 @@ impl TensorIr {
                 let scaled = self.mul(gaps, rotated)?;
                 self.matmul(vectors, scaled)
             }
+            LinalgKind::QrQ | LinalgKind::QrR | LinalgKind::QrQComplete => {
+                self.qr_jvp(matrix, tangent, kind)
+            }
+            LinalgKind::SvdU
+            | LinalgKind::SvdS
+            | LinalgKind::SvdVh
+            | LinalgKind::SvdUFull
+            | LinalgKind::SvdVhFull => self.svd_jvp(matrix, tangent, kind),
         }
     }
 
@@ -6568,7 +6594,424 @@ impl TensorIr {
                 let product = self.matmul(product, transposed)?;
                 self.symmetric_part(product)?
             }
+            LinalgKind::QrQ | LinalgKind::QrR | LinalgKind::QrQComplete => {
+                self.qr_vjp(matrix, cotangent, kind)?
+            }
+            LinalgKind::SvdU
+            | LinalgKind::SvdS
+            | LinalgKind::SvdVh
+            | LinalgKind::SvdUFull
+            | LinalgKind::SvdVhFull => self.svd_vjp(matrix, cotangent, kind)?,
         }))
+    }
+
+    /// `(m, n)` of the matrix stack `x` (`[..., m, n]`).
+    fn matrix_extents(&self, x: TensorNodeId) -> Result<(usize, usize), String> {
+        let shape = &self.node(x)?.shape;
+        let rank = shape.len();
+        if rank < 2 {
+            return Err(format!("expected a stack of matrices, got shape {shape:?}"));
+        }
+        Ok((shape[rank - 2], shape[rank - 1]))
+    }
+
+    /// Columns `start..start + length` of the matrix stack `x`.
+    fn matrix_columns(
+        &mut self,
+        x: TensorNodeId,
+        start: usize,
+        length: usize,
+    ) -> Result<TensorNodeId, String> {
+        let rank = self.node(x)?.shape.len();
+        self.slice(x, rank - 1, start, length)
+    }
+
+    /// `x` with everything on and above the diagonal set to zero.
+    fn strictly_lower(&mut self, x: TensorNodeId) -> Result<TensorNodeId, String> {
+        let upper = self.triangular(x, false)?;
+        self.sub(x, upper)
+    }
+
+    /// `x R^-1` for an upper-triangular `R`, as `solve(R^T, x^T)^T`.
+    fn solve_right_upper(
+        &mut self,
+        x: TensorNodeId,
+        r: TensorNodeId,
+    ) -> Result<TensorNodeId, String> {
+        let r_transposed = self.matrix_transpose(r)?;
+        let x_transposed = self.matrix_transpose(x)?;
+        let solved = self.solve(r_transposed, x_transposed)?;
+        self.matrix_transpose(solved)
+    }
+
+    /// `x R^-T` for an upper-triangular `R`, as `solve(R, x^T)^T`.
+    fn solve_right_upper_transposed(
+        &mut self,
+        x: TensorNodeId,
+        r: TensorNodeId,
+    ) -> Result<TensorNodeId, String> {
+        let x_transposed = self.matrix_transpose(x)?;
+        let solved = self.solve(r, x_transposed)?;
+        self.matrix_transpose(solved)
+    }
+
+    /// Zeros of `shape` with `like`'s dtype.
+    fn zeros_like_dtype(
+        &mut self,
+        shape: Vec<usize>,
+        like: TensorNodeId,
+    ) -> Result<TensorNodeId, String> {
+        let dtype = self.node(like)?.dtype;
+        let zero = self.constant_like(0.0, dtype, false);
+        self.broadcast_to(zero, shape)
+    }
+
+    /// The error of a derivative through the basis completion of a complete
+    /// QR or full SVD, which is not unique.
+    fn completion_derivative_error(kind: LinalgKind) -> String {
+        format!(
+            "{} is not differentiable: the extra orthonormal columns that complete the basis are \
+             not unique; use the reduced decomposition",
+            kind.name()
+        )
+    }
+
+    /// The tangents `(dQ, dR)` of the QR factorization `A = Q R` of a
+    /// matrix stack with at least as many rows as columns and full column
+    /// rank, along `dA` (Walter, Lehmann & Lamour 2012; the rule of JAX's
+    /// `qr_jvp_rule`): with `B = dA R^-1`, `C = Q^T B`, and the
+    /// skew-symmetric `W = L - L^T` from the strictly lower triangle `L` of
+    /// `C`, `dQ = Q (W - C) + B` and `dR = (C - W) R`. `R^-1` is applied
+    /// with `solve`, never formed.
+    fn qr_tall_jvp(
+        &mut self,
+        q: TensorNodeId,
+        r: TensorNodeId,
+        direction: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), String> {
+        let b = self.solve_right_upper(direction, r)?;
+        let q_transposed = self.matrix_transpose(q)?;
+        let c = self.matmul(q_transposed, b)?;
+        let lower = self.strictly_lower(c)?;
+        let lower_transposed = self.matrix_transpose(lower)?;
+        let skew = self.sub(lower, lower_transposed)?;
+        let skew_minus_c = self.sub(skew, c)?;
+        let rotated = self.matmul(q, skew_minus_c)?;
+        let dq = self.add(rotated, b)?;
+        let c_minus_skew = self.sub(c, skew)?;
+        let dr = self.matmul(c_minus_skew, r)?;
+        Ok((dq, dr))
+    }
+
+    /// The tangent of one QR output. A wide `A = [X | Y]` (`m < n`) has
+    /// `Q R_X = X` and `R = [R_X | Q^T Y]`, so `X` takes the tall rule and
+    /// `dR_Y = dQ^T Y + Q^T dY`; `X` must then have full rank.
+    fn qr_jvp(
+        &mut self,
+        matrix: TensorNodeId,
+        tangent: TensorNodeId,
+        kind: LinalgKind,
+    ) -> Result<TensorNodeId, String> {
+        let (m, n) = self.matrix_extents(matrix)?;
+        if kind == LinalgKind::QrQComplete && m > n {
+            return Err(Self::completion_derivative_error(kind));
+        }
+        let q = self.linalg(matrix, LinalgKind::QrQ)?;
+        let r = self.linalg(matrix, LinalgKind::QrR)?;
+        if m >= n {
+            let (dq, dr) = self.qr_tall_jvp(q, r, tangent)?;
+            return Ok(if kind == LinalgKind::QrR { dr } else { dq });
+        }
+        let r_square = self.matrix_columns(r, 0, m)?;
+        let tangent_square = self.matrix_columns(tangent, 0, m)?;
+        let (dq, dr_square) = self.qr_tall_jvp(q, r_square, tangent_square)?;
+        if kind != LinalgKind::QrR {
+            return Ok(dq);
+        }
+        let rest = self.matrix_columns(matrix, m, n - m)?;
+        let tangent_rest = self.matrix_columns(tangent, m, n - m)?;
+        let dq_transposed = self.matrix_transpose(dq)?;
+        let q_transposed = self.matrix_transpose(q)?;
+        let moved = self.matmul(dq_transposed, rest)?;
+        let direct = self.matmul(q_transposed, tangent_rest)?;
+        let dr_rest = self.add(moved, direct)?;
+        let rank = self.node(matrix)?.shape.len();
+        self.concat(vec![dr_square, dr_rest], rank as isize - 1)
+    }
+
+    /// The cotangent of a tall full-rank `A` for cotangents `G_Q` and `G_R`
+    /// of its QR factors, the transpose of [`Self::qr_tall_jvp`]: with
+    /// `M = Q^T G_Q - G_R R^T` and `N = L(M - M^T) - M` (`L` the strictly
+    /// lower triangle), `G_A = (G_Q + Q N) R^-T`.
+    fn qr_tall_vjp(
+        &mut self,
+        q: TensorNodeId,
+        r: TensorNodeId,
+        q_cotangent: Option<TensorNodeId>,
+        r_cotangent: Option<TensorNodeId>,
+    ) -> Result<TensorNodeId, String> {
+        let q_transposed = self.matrix_transpose(q)?;
+        let from_q = match q_cotangent {
+            Some(cotangent) => Some(self.matmul(q_transposed, cotangent)?),
+            None => None,
+        };
+        let from_r = match r_cotangent {
+            Some(cotangent) => {
+                let r_transposed = self.matrix_transpose(r)?;
+                Some(self.matmul(cotangent, r_transposed)?)
+            }
+            None => None,
+        };
+        let mixed = match (from_q, from_r) {
+            (Some(from_q), Some(from_r)) => self.sub(from_q, from_r)?,
+            (Some(from_q), None) => from_q,
+            (None, Some(from_r)) => {
+                let zero = self.scalar_constant(0.0);
+                self.sub(zero, from_r)?
+            }
+            (None, None) => return Err("QR cotangent requires at least one output".into()),
+        };
+        let mixed_transposed = self.matrix_transpose(mixed)?;
+        let skew = self.sub(mixed, mixed_transposed)?;
+        let lower = self.strictly_lower(skew)?;
+        let correction = self.sub(lower, mixed)?;
+        let rotated = self.matmul(q, correction)?;
+        let total = match q_cotangent {
+            Some(cotangent) => self.add(cotangent, rotated)?,
+            None => rotated,
+        };
+        self.solve_right_upper_transposed(total, r)
+    }
+
+    /// The cotangent of `A` for one QR output, the transpose of
+    /// [`Self::qr_jvp`]. For a wide `A = [X | Y]`, a cotangent `[G_X | G_Y]`
+    /// of `R` sends `Q G_Y` to `Y` and `Y G_Y^T` to `Q`.
+    fn qr_vjp(
+        &mut self,
+        matrix: TensorNodeId,
+        cotangent: TensorNodeId,
+        kind: LinalgKind,
+    ) -> Result<TensorNodeId, String> {
+        let (m, n) = self.matrix_extents(matrix)?;
+        if kind == LinalgKind::QrQComplete && m > n {
+            return Err(Self::completion_derivative_error(kind));
+        }
+        let q = self.linalg(matrix, LinalgKind::QrQ)?;
+        let r = self.linalg(matrix, LinalgKind::QrR)?;
+        let is_r = kind == LinalgKind::QrR;
+        if m >= n {
+            return if is_r {
+                self.qr_tall_vjp(q, r, None, Some(cotangent))
+            } else {
+                self.qr_tall_vjp(q, r, Some(cotangent), None)
+            };
+        }
+        let rank = self.node(matrix)?.shape.len();
+        let r_square = self.matrix_columns(r, 0, m)?;
+        let (square, rest) = if is_r {
+            let square_cotangent = self.matrix_columns(cotangent, 0, m)?;
+            let rest_cotangent = self.matrix_columns(cotangent, m, n - m)?;
+            let rest = self.matrix_columns(matrix, m, n - m)?;
+            let rest_cotangent_transposed = self.matrix_transpose(rest_cotangent)?;
+            let q_cotangent = self.matmul(rest, rest_cotangent_transposed)?;
+            let square =
+                self.qr_tall_vjp(q, r_square, Some(q_cotangent), Some(square_cotangent))?;
+            (square, self.matmul(q, rest_cotangent)?)
+        } else {
+            let square = self.qr_tall_vjp(q, r_square, Some(cotangent), None)?;
+            let mut shape = self.node(matrix)?.shape.clone();
+            shape[rank - 1] = n - m;
+            (square, self.zeros_like_dtype(shape, matrix)?)
+        };
+        self.concat(vec![square, rest], rank as isize - 1)
+    }
+
+    /// `F` of the singular vector derivatives: `F_ij = 1 / (s_j^2 - s_i^2)`,
+    /// and `0` where `s_i == s_j` (the diagonal, and repeated singular
+    /// values), as JAX's `svd_jvp_rule` masks it.
+    fn svd_gap_reciprocals(&mut self, values: TensorNodeId) -> Result<TensorNodeId, String> {
+        let shape = self.node(values)?.shape.clone();
+        let k = *shape
+            .last()
+            .ok_or("singular values have rank at least one")?;
+        let batch = &shape[..shape.len() - 1];
+        let row = self.reshape(values, [batch, &[1, k]].concat())?;
+        let column = self.reshape(values, [batch, &[k, 1]].concat())?;
+        let sum = self.add(row, column)?;
+        let difference = self.sub(row, column)?;
+        let gaps = self.mul(sum, difference)?;
+        let zero = self.scalar_constant(0.0);
+        let equal = self.compare(gaps, zero, TensorComparison::Equal)?;
+        let dtype = self.node(values)?.dtype;
+        let mask = self.cast(equal, dtype)?;
+        let shifted = self.add(gaps, mask)?;
+        let one = self.scalar_constant(1.0);
+        let reciprocals = self.div(one, shifted)?;
+        self.sub(reciprocals, mask)
+    }
+
+    /// The reduced SVD factors `(U, s, Vh)` of `matrix` as `Linalg` nodes.
+    fn svd_factors(
+        &mut self,
+        matrix: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), String> {
+        Ok((
+            self.linalg(matrix, LinalgKind::SvdU)?,
+            self.linalg(matrix, LinalgKind::SvdS)?,
+            self.linalg(matrix, LinalgKind::SvdVh)?,
+        ))
+    }
+
+    /// `s` (`[..., k]`) as a row `[..., 1, k]` and a column `[..., k, 1]`.
+    fn row_and_column(
+        &mut self,
+        values: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), String> {
+        let shape = self.node(values)?.shape.clone();
+        let k = shape[shape.len() - 1];
+        let batch = &shape[..shape.len() - 1];
+        Ok((
+            self.reshape(values, [batch, &[1, k]].concat())?,
+            self.reshape(values, [batch, &[k, 1]].concat())?,
+        ))
+    }
+
+    /// The tangent of one SVD output along `dA`, JAX's `svd_jvp_rule` for
+    /// real matrices: with `dS = U^T dA V` and `S = diag(s)`,
+    ///
+    /// - `ds = diag(dS)`;
+    /// - `dU = U (F o (dS S + S dS^T)) + (I - U U^T) dA V S^-1`, the last
+    ///   term only for `m > n`;
+    /// - `dV = V (F o (S dS + dS^T S)) + (I - V V^T) dA^T U S^-1`, the last
+    ///   term only for `m < n`, and `dVh = dV^T`;
+    ///
+    /// with `F` from [`Self::svd_gap_reciprocals`]. The singular vector
+    /// tangents are exact for distinct nonzero singular values; a repeated
+    /// value gets the masked `F` (finite but not a derivative) and a zero
+    /// value makes the `S^-1` term infinite or NaN, as in JAX.
+    fn svd_jvp(
+        &mut self,
+        matrix: TensorNodeId,
+        tangent: TensorNodeId,
+        kind: LinalgKind,
+    ) -> Result<TensorNodeId, String> {
+        let (m, n) = self.matrix_extents(matrix)?;
+        let kind = match kind {
+            LinalgKind::SvdUFull if m <= n => LinalgKind::SvdU,
+            LinalgKind::SvdVhFull if n <= m => LinalgKind::SvdVh,
+            LinalgKind::SvdUFull | LinalgKind::SvdVhFull => {
+                return Err(Self::completion_derivative_error(kind))
+            }
+            kind => kind,
+        };
+        let (u, s, vh) = self.svd_factors(matrix)?;
+        let v = self.matrix_transpose(vh)?;
+        let u_transposed = self.matrix_transpose(u)?;
+        let projected = self.matmul(u_transposed, tangent)?;
+        let rotated = self.matmul(projected, v)?;
+        if kind == LinalgKind::SvdS {
+            return self.matrix_diagonal(rotated);
+        }
+        let gaps = self.svd_gap_reciprocals(s)?;
+        let (row, column) = self.row_and_column(s)?;
+        if kind == LinalgKind::SvdU {
+            let scaled = self.mul(rotated, row)?;
+            let scaled_transposed = self.matrix_transpose(scaled)?;
+            let symmetric = self.add(scaled, scaled_transposed)?;
+            let inner = self.mul(gaps, symmetric)?;
+            let du = self.matmul(u, inner)?;
+            if m <= n {
+                return Ok(du);
+            }
+            let applied = self.matmul(tangent, v)?;
+            let inside = self.matmul(u_transposed, applied)?;
+            let inside = self.matmul(u, inside)?;
+            let outside = self.sub(applied, inside)?;
+            let outside = self.div(outside, row)?;
+            return self.add(du, outside);
+        }
+        let scaled = self.mul(column, rotated)?;
+        let scaled_transposed = self.matrix_transpose(scaled)?;
+        let symmetric = self.add(scaled, scaled_transposed)?;
+        let inner = self.mul(gaps, symmetric)?;
+        let mut dv = self.matmul(v, inner)?;
+        if m < n {
+            let tangent_transposed = self.matrix_transpose(tangent)?;
+            let applied = self.matmul(tangent_transposed, u)?;
+            let inside = self.matmul(vh, applied)?;
+            let inside = self.matmul(v, inside)?;
+            let outside = self.sub(applied, inside)?;
+            let outside = self.div(outside, row)?;
+            dv = self.add(dv, outside)?;
+        }
+        self.matrix_transpose(dv)
+    }
+
+    /// The cotangent of `A` for one SVD output, the transpose of
+    /// [`Self::svd_jvp`]:
+    ///
+    /// - `s`: `U diag(g) Vh`;
+    /// - `U`: with `J = F o (U^T G)`, `U (J + J^T) S Vh`, plus
+    ///   `(I - U U^T) G S^-1 Vh` for `m > n`;
+    /// - `Vh`: with `G_V = G^T` and `K = F o (V^T G_V)`, `U S (K + K^T) Vh`,
+    ///   plus `U S^-1 G_V^T (I - V V^T)` for `m < n`.
+    fn svd_vjp(
+        &mut self,
+        matrix: TensorNodeId,
+        cotangent: TensorNodeId,
+        kind: LinalgKind,
+    ) -> Result<TensorNodeId, String> {
+        let (m, n) = self.matrix_extents(matrix)?;
+        let kind = match kind {
+            LinalgKind::SvdUFull if m <= n => LinalgKind::SvdU,
+            LinalgKind::SvdVhFull if n <= m => LinalgKind::SvdVh,
+            LinalgKind::SvdUFull | LinalgKind::SvdVhFull => {
+                return Err(Self::completion_derivative_error(kind))
+            }
+            kind => kind,
+        };
+        let (u, s, vh) = self.svd_factors(matrix)?;
+        if kind == LinalgKind::SvdS {
+            let (row, _) = self.row_and_column(cotangent)?;
+            let scaled = self.mul(u, row)?;
+            return self.matmul(scaled, vh);
+        }
+        let gaps = self.svd_gap_reciprocals(s)?;
+        let (row, column) = self.row_and_column(s)?;
+        if kind == LinalgKind::SvdU {
+            let u_transposed = self.matrix_transpose(u)?;
+            let projected = self.matmul(u_transposed, cotangent)?;
+            let inner = self.mul(gaps, projected)?;
+            let inner_transposed = self.matrix_transpose(inner)?;
+            let symmetric = self.add(inner, inner_transposed)?;
+            let scaled = self.mul(symmetric, row)?;
+            let mut core = self.matmul(u, scaled)?;
+            if m > n {
+                let inside = self.matmul(u, projected)?;
+                let outside = self.sub(cotangent, inside)?;
+                let outside = self.div(outside, row)?;
+                core = self.add(core, outside)?;
+            }
+            return self.matmul(core, vh);
+        }
+        let v = self.matrix_transpose(vh)?;
+        let v_cotangent = self.matrix_transpose(cotangent)?;
+        let projected = self.matmul(vh, v_cotangent)?;
+        let inner = self.mul(gaps, projected)?;
+        let inner_transposed = self.matrix_transpose(inner)?;
+        let symmetric = self.add(inner, inner_transposed)?;
+        let scaled = self.mul(column, symmetric)?;
+        let scaled = self.matmul(scaled, vh)?;
+        let mut gradient = self.matmul(u, scaled)?;
+        if m < n {
+            let inside = self.matmul(v, projected)?;
+            let outside = self.sub(v_cotangent, inside)?;
+            let outside = self.matrix_transpose(outside)?;
+            let scaled_u = self.div(u, row)?;
+            let outside = self.matmul(scaled_u, outside)?;
+            gradient = self.add(gradient, outside)?;
+        }
+        Ok(gradient)
     }
 
     /// Compact staged lower-triangle factorization. Validation follows the
@@ -7019,6 +7462,12 @@ impl TensorIr {
         self.push_derived(TensorOp::Erf { input }, shape)
     }
 
+    /// Elementwise complementary error function; see [`TensorOp::Erfc`].
+    pub fn erfc(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        let shape = self.node(input)?.shape.clone();
+        self.push_derived(TensorOp::Erfc { input }, shape)
+    }
+
     /// Elementwise `atan2(y, x)`; operands broadcast and promote like
     /// arithmetic operands, and `Bool` operands are rejected. See
     /// [`TensorOp::Atan2`].
@@ -7062,6 +7511,49 @@ impl TensorIr {
         )
     }
 
+    /// The product of the entries of `input` along `axis` (negative axes
+    /// count from the end), which is removed from the shape.
+    ///
+    /// The product is a pairwise tree of ordinary `mul` nodes: each level
+    /// multiplies entry `k` with entry `k + h` of the `2h` leading entries and
+    /// carries an odd last entry over unchanged, so an extent `n` takes
+    /// `ceil(log2 n)` levels and every result is rounded at most that many
+    /// times. No division and no logarithm is involved, so the derivatives
+    /// are those of the multiplications: `d prod / d x_i` is the product of
+    /// the other entries, exactly zero away from a single zero entry and zero
+    /// everywhere for two or more zeros, and every derivative order is again
+    /// a graph of `mul`, `slice`, and `concat` nodes on every backend. This
+    /// is also the shape of JAX's `reduce_prod` derivative rule.
+    pub fn prod_axis(&mut self, input: TensorNodeId, axis: isize) -> Result<TensorNodeId, String> {
+        let source = self.node(input)?;
+        if source.dtype == TensorDType::Bool {
+            return Err(
+                "prod is not defined for bool tensors; convert explicitly with astype".to_string(),
+            );
+        }
+        let mut shape = source.shape.clone();
+        let axis = normalize_axis(axis, shape.len())?;
+        let mut extent = shape[axis];
+        if extent == 0 {
+            return Err("prod requires a non-empty reduced axis".to_string());
+        }
+        let mut current = input;
+        while extent > 1 {
+            let half = extent / 2;
+            let lower = self.slice(current, axis, 0, half)?;
+            let upper = self.slice(current, axis, half, half)?;
+            let mut next = self.mul(lower, upper)?;
+            if extent % 2 == 1 {
+                let carried = self.slice(current, axis, 2 * half, 1)?;
+                next = self.concat(vec![next, carried], axis as isize)?;
+            }
+            current = next;
+            extent = half + extent % 2;
+        }
+        shape.remove(axis);
+        self.reshape(current, shape)
+    }
+
     /// Symbolic `erf'(x) = 2 / sqrt(pi) * exp(-(x * x))`.
     fn erf_derivative(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
         let squared = self.mul(input, input)?;
@@ -7069,6 +7561,16 @@ impl TensorIr {
         let negated = self.sub(zero, squared)?;
         let decay = self.exp(negated)?;
         let scale = self.scalar_constant(std::f64::consts::FRAC_2_SQRT_PI);
+        self.mul(scale, decay)
+    }
+
+    /// Symbolic `erfc'(x) = -2 / sqrt(pi) * exp(-(x * x))`.
+    fn erfc_derivative(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        let squared = self.mul(input, input)?;
+        let zero = self.scalar_constant(0.0);
+        let negated = self.sub(zero, squared)?;
+        let decay = self.exp(negated)?;
+        let scale = self.scalar_constant(-std::f64::consts::FRAC_2_SQRT_PI);
         self.mul(scale, decay)
     }
 
@@ -8078,14 +8580,15 @@ impl TensorIr {
                         .reduce_to_shape(&self.node(*input)?.shape)?;
                     accumulate(&mut cotangents[*input], contribution)?;
                 }
-                TensorOp::Expm1 { input } | TensorOp::Erf { input } => {
+                TensorOp::Expm1 { input } | TensorOp::Erf { input } | TensorOp::Erfc { input } => {
                     let input_value = values
                         .get(*input)
                         .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?;
                     let derivative = match &self.nodes[node_id].op {
                         TensorOp::Expm1 { .. } => input_value.exp()?,
-                        _ => input_value.map_f64(erf_derivative)?,
+                        TensorOp::Erf { .. } => input_value.map_f64(erf_derivative)?,
+                        _ => input_value.map_f64(|x| -erf_derivative(x))?,
                     };
                     let contribution = cotangent
                         .mul(&derivative)?
@@ -8736,7 +9239,7 @@ impl TensorIr {
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?;
                     input_tangent.mul(&input_value.log1p_derivative()?)?
                 }
-                TensorOp::Expm1 { input } | TensorOp::Erf { input } => {
+                TensorOp::Expm1 { input } | TensorOp::Erf { input } | TensorOp::Erfc { input } => {
                     let input_tangent = tangents
                         .get(*input)
                         .ok_or_else(|| format!("node {input} has no evaluated tangent"))?;
@@ -8745,7 +9248,8 @@ impl TensorIr {
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?;
                     let derivative = match &node.op {
                         TensorOp::Expm1 { .. } => input_value.exp()?,
-                        _ => input_value.map_f64(erf_derivative)?,
+                        TensorOp::Erf { .. } => input_value.map_f64(erf_derivative)?,
+                        _ => input_value.map_f64(|x| -erf_derivative(x))?,
                     };
                     input_tangent.mul(&derivative)?
                 }
@@ -9423,6 +9927,9 @@ impl TensorIr {
                 }
                 TensorOp::Erf { input } => {
                     format!("%{id} = erf(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
+                }
+                TensorOp::Erfc { input } => {
+                    format!("%{id} = erfc(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
                 }
                 TensorOp::Atan2 { y, x } => format!(
                     "%{id} = atan2(%{y}, %{x}) : {}",
@@ -10354,6 +10861,11 @@ impl TensorIr {
                     .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .map_f64(libm::erf)?,
+                TensorOp::Erfc { input } => values
+                    .get(*input)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .map_f64(libm::erfc)?,
                 TensorOp::Atan2 { y, x } => values
                     .get(*y)
                     .and_then(Option::as_ref)
@@ -10567,7 +11079,7 @@ impl TensorIr {
                             .sub(&input.first.mul(&input.second)?.mul(&derivative_squared)?)?,
                     }
                 }
-                TensorOp::Expm1 { input } | TensorOp::Erf { input } => {
+                TensorOp::Expm1 { input } | TensorOp::Erf { input } | TensorOp::Erfc { input } => {
                     let input = values
                         .get(*input)
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?;
@@ -10576,6 +11088,11 @@ impl TensorIr {
                             let exp = input.value.exp()?;
                             (input.value.map_f64(f64::exp_m1)?, exp.clone(), exp)
                         }
+                        TensorOp::Erfc { .. } => (
+                            input.value.map_f64(libm::erfc)?,
+                            input.value.map_f64(|x| -erf_derivative(x))?,
+                            input.value.map_f64(|x| -erf_second_derivative(x))?,
+                        ),
                         _ => (
                             input.value.map_f64(libm::erf)?,
                             input.value.map_f64(erf_derivative)?,
@@ -11375,6 +11892,19 @@ impl TensorIr {
             .get(id)
             .ok_or_else(|| format!("node {id} does not exist"))
     }
+}
+
+/// The product of an eager tensor along `axis`, evaluated through the graph
+/// of [`TensorIr::prod_axis`], so eager arrays and traced CPU programs round
+/// the product identically.
+pub fn evaluate_prod_axis(input: &DynamicTensor, axis: isize) -> Result<DynamicTensor, String> {
+    let mut graph = TensorIr::new();
+    let argument = graph.input_typed("input", input.shape.clone(), input.dtype)?;
+    let output = graph.prod_axis(argument, axis)?;
+    graph.evaluate(
+        output,
+        &BTreeMap::from([("input".to_string(), input.clone())]),
+    )
 }
 
 /// A derivative of a `Linalg` node for the numeric evaluators.
@@ -14573,8 +15103,8 @@ impl TensorExecutionPlan {
                 TensorOp::Solve { .. } => return Err(("solve".into(),
                     "MLX GPU backend does not yet support solve: MLX linalg::solve only accepts a CPU stream".into())),
                 TensorOp::Linalg { kind, .. } => return Err((kind.name().into(), format!(
-                    "MLX GPU backend does not support {}: MLX's LU and eigh factorizations only \
-                     accept a CPU stream", kind.name()))),
+                    "MLX GPU backend does not support {}: MLX's LU, eigh, QR, and SVD \
+                     factorizations only accept a CPU stream", kind.name()))),
                 TensorOp::ScalarConstant { value } if !value.is_finite() => return Err((
                     "constant".into(), "MLX backend does not support non-finite constants".into())),
                 TensorOp::Cond { branches, .. } => {
@@ -15446,6 +15976,7 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                 TensorOp::Log1p { input } => specialized.log1p(mapped(*input)?)?,
                 TensorOp::Expm1 { input } => specialized.expm1(mapped(*input)?)?,
                 TensorOp::Erf { input } => specialized.erf(mapped(*input)?)?,
+                TensorOp::Erfc { input } => specialized.erfc(mapped(*input)?)?,
                 TensorOp::Atan2 { y, x } => specialized.atan2(mapped(*y)?, mapped(*x)?)?,
                 TensorOp::StopGradient { input } => specialized.stop_gradient(mapped(*input)?)?,
                 TensorOp::CumSum {
@@ -15681,6 +16212,7 @@ fn cuda_scalar_expression(
         TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
         TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
         TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
+        TensorOp::Erfc { input } => Ok(format!("erfcf({})", child(*input)?)),
         TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
         TensorOp::StopGradient { input } => child(*input),
         TensorOp::Div { .. } | TensorOp::Log { .. } => {
@@ -15976,6 +16508,7 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         | TensorOp::Log1p { input }
         | TensorOp::Expm1 { input }
         | TensorOp::Erf { input }
+        | TensorOp::Erfc { input }
         | TensorOp::StopGradient { input }
         | TensorOp::CumSum { input, .. }
         | TensorOp::Slice { input, .. }
@@ -16107,6 +16640,7 @@ fn reuse_forward_unary(
         TensorOp::Log1p { input } => (input, Some(f64::ln_1p)),
         TensorOp::Expm1 { input } => (input, Some(f64::exp_m1)),
         TensorOp::Erf { input } => (input, Some(libm::erf)),
+        TensorOp::Erfc { input } => (input, Some(libm::erfc)),
         TensorOp::Reshape { input } | TensorOp::StopGradient { input } => (input, None),
         _ => return Ok(None),
     };
@@ -16467,6 +17001,7 @@ fn infer_tensor_placement(
         | TensorOp::Log1p { input }
         | TensorOp::Expm1 { input }
         | TensorOp::Erf { input }
+        | TensorOp::Erfc { input }
         | TensorOp::StopGradient { input }
         | TensorOp::Cast { input } => unary(*input),
         TensorOp::CumSum { input, axis, .. } => {
@@ -16923,6 +17458,7 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Log1p { .. } => "log1p",
         TensorOp::Expm1 { .. } => "expm1",
         TensorOp::Erf { .. } => "erf",
+        TensorOp::Erfc { .. } => "erfc",
         TensorOp::Atan2 { .. } => "atan2",
         TensorOp::StopGradient { .. } => "stop_gradient",
         TensorOp::CumSum { .. } => "cumsum",
@@ -16982,6 +17518,7 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
         TensorOp::Log1p { input } => Some(scalar(*input)?.ln_1p()),
         TensorOp::Expm1 { input } => Some(scalar(*input)?.exp_m1()),
         TensorOp::Erf { input } => Some(libm::erf(scalar(*input)?)),
+        TensorOp::Erfc { input } => Some(libm::erfc(scalar(*input)?)),
         TensorOp::Atan2 { y, x } => Some(scalar(*y)?.atan2(scalar(*x)?)),
         _ => None,
     }
@@ -17039,6 +17576,7 @@ fn fold_tensor_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<Dynami
         TensorOp::Log1p { input } => constant(*input)?.log1p().ok(),
         TensorOp::Expm1 { input } => constant(*input)?.map_f64(f64::exp_m1).ok(),
         TensorOp::Erf { input } => constant(*input)?.map_f64(libm::erf).ok(),
+        TensorOp::Erfc { input } => constant(*input)?.map_f64(libm::erfc).ok(),
         TensorOp::Atan2 { y, x } => constant(*y)?.atan2(&*constant(*x)?).ok(),
         _ => None,
     }
@@ -17446,6 +17984,7 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         | TensorOp::Log1p { input }
         | TensorOp::Expm1 { input }
         | TensorOp::Erf { input }
+        | TensorOp::Erfc { input }
         | TensorOp::StopGradient { input }
         | TensorOp::Broadcast { input }
         | TensorOp::Cholesky { input } => arguments[0] = *input as u64,
@@ -17919,6 +18458,9 @@ fn remap_tensor_op(
             input: remap_node(*input)?,
         }),
         TensorOp::Erf { input } => Ok(TensorOp::Erf {
+            input: remap_node(*input)?,
+        }),
+        TensorOp::Erfc { input } => Ok(TensorOp::Erfc {
             input: remap_node(*input)?,
         }),
         TensorOp::Atan2 { y, x } => Ok(TensorOp::Atan2 {

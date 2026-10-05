@@ -79,8 +79,9 @@ qb.eye(n, m=None, dtype=None)
 - Module-level functions call the method of the same name on a `Tensor` or
   `TraceTensor`, so eager and traced code share one spelling (`qb.sin(x)` is
   `x.sin()`): `sin`, `cos`, `tanh`, `exp`, `expm1`, `log`, `log1p`, `erf`,
-  `sqrt`, `relu`, `sigmoid`, `softplus`, `stop_gradient`, `sum`, `mean`,
-  `max`, `min`, `any`, `all`, `norm`, `cumsum`, `matmul`, `transpose`,
+  `erfc`, `sqrt`, `relu`, `sigmoid`, `softplus`, `stop_gradient`, `sum`,
+  `mean`, `prod`, `max`, `min`, `any`, `all`, `norm`, `cumsum`, `matmul`,
+  `transpose`,
   `reshape`, `broadcast_to`, `astype`, `maximum`, `minimum`, `atan2`,
   `power`, `solve` (see `qb.linalg` below), `cholesky`, `tril`, and `triu`, next to the v0.1
   functions `where`, `concat`, `stack`, `einsum`, and the comparison and
@@ -88,6 +89,18 @@ qb.eye(n, m=None, dtype=None)
   through `asarray`; a Python number stays a weak scalar. `abs`, `sum`,
   `max`, `min`, `any`, and `all` are attributes of `quabla` but not in
   `__all__`, so `from quabla import *` leaves the builtins alone.
+- `prod(x, axis=None, keepdims=False)` multiplies the entries over `axis`
+  (an int, a sequence of ints, or every axis) as a pairwise tree of
+  multiplications, each rounded to the dtype: an extent `n` rounds each
+  result at most `ceil(log2 n)` times, and the eager value and the traced
+  value on every backend agree bitwise. Nothing is divided, so the
+  derivative is exact with zeros: `d prod / d x_i` is the product of the
+  other entries, which is nonzero only at the zero entry when there is
+  exactly one zero and zero everywhere with two or more, and the Hessian
+  and every higher derivative are again products of the remaining entries
+  (JAX's `reduce_prod` derivative uses the same tree). Intermediate
+  products can overflow or underflow in an order that differs from NumPy's
+  sequential product. `bool` arrays are rejected.
 - Numerically stable compositions, built from the methods above, so they
   work eagerly, under `jit`/`grad`/`vmap`, and on every device:
   - `softmax(x, axis=-1)` and `log_softmax(x, axis=-1)` subtract the maximum
@@ -107,9 +120,11 @@ qb.eye(n, m=None, dtype=None)
   - `silu(x)` is `x * sigmoid(x)`; `gelu(x, approximate=True)` is the tanh
     approximation `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`,
     evaluated as `x * sigmoid(2u)` so the negative tail keeps its relative
-    accuracy. `approximate=False` is the exact `0.5 x (1 + erf(x / sqrt(2)))`;
-    without `erfc` its relative accuracy in the far negative tail (below
-    about -4 in `float32`) is limited by the cancellation of `1 + erf`.
+    accuracy. `approximate=False` is the exact `0.5 x (1 + erf(x / sqrt(2)))`,
+    evaluated as `0.5 x erfc(-x / sqrt(2))`, so the negative tail keeps its
+    relative accuracy where `1 + erf` would cancel to zero; what remains is
+    the conditioning of the tail itself (in `float32`, a relative error of
+    about `x^2 eps` from the rounding of `x`).
   - `clip(x, lo=None, hi=None)` is `minimum(maximum(x, lo), hi)`: NaN
     propagates, and at a bound the derivative goes to the bound, so `x`
     gets zero there. `sign(x)` is -1, 0, or +1 (NaN for NaN) with derivative
@@ -678,15 +693,64 @@ is written with `solve`, `matmul`, and the decompositions themselves:
   `dw = diag(V^T dS V)` and `dV = V (F o (V^T dS V))` with `dS` the symmetric
   part of `da` and `F_ij = 1 / (w_j - w_i)` off the diagonal (VJPs are the
   transposes).
+- `qr(a, mode="reduced")` returns `QRResult(Q, R)` with `a = Q R` for any
+  `[..., m, n]`: with `k = min(m, n)`, `"reduced"` gives `Q` `[..., m, k]`
+  and `R` `[..., k, n]`, `"complete"` an orthogonal `Q` `[..., m, m]` and `R`
+  `[..., m, n]`, and `"r"` returns `R` alone. The CPU uses Householder
+  reflections in float64 and forms `Q` from the reflectors, so `Q` is
+  orthonormal to working precision even for a rank-deficient `a`; CUDA uses
+  cuSOLVER `geqrf` and `orgqr` in float32. The diagonal of `R` is made
+  non-negative (with the matching columns of `Q`), so the factorization is
+  unique for full column rank and matches NumPy's up to those signs.
+  Derivatives follow JAX's rule: with `B = da R^-1`, `C = Q^T B`, and
+  `W = L - L^T` for the strictly lower triangle `L` of `C`,
+  `dQ = Q (W - C) + B` and `dR = (C - W) R`, with `R^-1` applied by `solve`.
+  They need full column rank; for a wide `a = [X | Y]` (`m < n`), `X` takes
+  this rule and `dR_Y = dQ^T Y + Q^T dY`, so `X` must have full rank. The
+  extra columns of a complete `Q` are not unique, and differentiating them
+  raises.
+- `svd(a, full_matrices=False, compute_uv=True)` returns
+  `SVDResult(U, S, Vh)` with `a = U diag(S) Vh`, `S` descending, `U`
+  `[..., m, k]` and `Vh` `[..., k, n]` (`[..., m, m]` and `[..., n, n]` with
+  `full_matrices=True`), or `S` alone with `compute_uv=False`. Unlike NumPy
+  and JAX, `full_matrices` defaults to false. Each column of `U` has its
+  largest-magnitude component (the first on ties) positive, with the
+  matching row of `Vh` signed alike. The CPU uses one-sided (Hestenes)
+  Jacobi rotations in float64 on `a` (or `a^T` when wide) until every pair
+  of columns is orthogonal to `m * eps`, which gives each singular value to
+  high relative accuracy when `a` is well conditioned up to a column
+  scaling; columns for zero singular values and the complements of the full
+  form come from a Householder completion. CUDA uses cuSOLVER `gesvdj`
+  (Jacobi, sorted) in float32. The derivatives follow JAX's `svd_jvp_rule`:
+  `dS = diag(U^T da V)`, defined wherever the singular values are distinct;
+  `dU = U (F o (dP S + S dP^T)) + (I - U U^T) da V S^-1` (last term for
+  `m > n`) and `dV = V (F o (S dP + dP^T S)) + (I - V V^T) da^T U S^-1`
+  (last term for `m < n`), with `dP = U^T da V` and
+  `F_ij = 1 / (s_j^2 - s_i^2)`. As in JAX, `F` is set to zero where
+  `s_i == s_j`, so for repeated singular values the vector derivatives are
+  finite but not derivatives (the vectors are not unique), and a zero
+  singular value of a non-square `a` makes them infinite or NaN. The
+  complements of the full form have no derivative unless `a` is square.
+- `lstsq(a, b, return_residuals=False)` solves `a x ~= b` from `qr`: for a
+  tall or square `a` of full column rank, the least-squares solution
+  `solve_triangular(R, Q^T b)`; for a wide `a` of full row rank, the
+  minimum-norm solution `Q solve_triangular(R, b, trans=1)` from `qr(a^T)`.
+  Shapes and broadcasting follow `solve` (`b` `[..., m, k]` or a vector
+  `[m]`). With `return_residuals`, it returns `LstsqResult(solution,
+  residuals)`, the residuals being `sum((b - a x)**2)` per column, formed
+  from the residual itself. Unlike NumPy's SVD-based `lstsq`, a
+  rank-deficient `a` is not supported: `R` is singular and the result is
+  non-finite or meaningless, without an error. Derivatives come from those
+  of `qr` and the triangular solves.
 
 Derivatives at exactly singular matrices are undefined: the derivatives of
 `slogdet`, `det`, and `inv` call `solve`, which raises on the CPU and reports
 the singular factor on CUDA (JAX returns non-finite values). A repeated
 eigenvalue makes `F` infinite, so the eigenvector derivative is inf or NaN,
 as in JAX, while the eigenvalue derivative stays defined. MLX rejects
-`solve`, `slogdet`, `det`, `inv`, and `eigh` with
-`UnsupportedOperationError`, because MLX's LU and eigh factorizations only
-run on its CPU stream.
+`solve`, `slogdet`, `det`, `inv`, `eigh`, `qr`, `svd`, and `lstsq` with
+`UnsupportedOperationError`, because MLX's factorizations only run on its
+CPU stream.
 
 `qb.ode.odeint(f, y0, (t0, t1), steps=n, method="rk4", args=(), save=False)`
 integrates `dy/dt = f(y, t, *args)` with `n` equal steps of classical RK4,
@@ -937,7 +1001,7 @@ name keeps working through 0.x.
 - `tensor_jacobian_fn(fn, input_specs, input_name)` freezes one rank-N trace
   and returns an output-flat by input-flat dense Jacobian for the selected input.
   Its `TraceTensor` values currently support broadcasted add/subtract/multiply/divide,
-  batched `matmul`, rank-N `concat`, `stack([...], axis=...)`, `slice(axis, start, stop)`, `broadcast_to(shape)`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `pow` (`x ** y` and `quabla.power`), `log`, `log1p`, reshape, global or single-axis `sum`/`mean`/L2 `norm`, `maximum`/`minimum`, `gt`/`where` masks, and the bool comparison, logical, `isfinite`/`isnan`, and `any`/`all` operations. `stack` is composed from reshape plus concat, so it inherits the same direct and symbolic CPU/CUDA AD rules. `concat` is linear: direct and symbolic VJP split the upstream cotangent with internal slice nodes, while its JVP and mixed second-direction transform concatenate the corresponding tangents. `slice` supports normalized negative axes and uses a zero-padded internal reverse node, keeping direct and symbolic gradients on the selected original coordinates. `broadcast_to` is a dedicated shape node whose VJP reduces repeated axes back to the input shape. `sqrt` is a native IR primitive: negative values, `-inf` included, follow IEEE floating-point `NaN` semantics for the value and every derivative order, while every derivative order at zero is defined as zero, avoiding `log(0)` during higher-order AD; CPU, CUDA, and MLX agree on these points. A `TraceTensor` `x ** y` lowers a non-negative Python int `y` to the exact `powi` and every other exponent (floats, negative ints, traced tensors, and `c ** x`) to the elementwise `pow` op, which follows `f64::powf` (NaN for a negative base with a non-integer exponent, `0 ** 0 == 1`) and differentiates in both operands: `d/dx = y x^(y-1)`, defined as zero where `x == 0` and `y < 1` (the `sqrt` convention; `y >= 1` keeps the finite limit, so `x ** 2.0` has second derivative 2 at zero), and `d/dy = x^y ln x`, defined as zero for every `x <= 0` (JAX returns `NaN` for `x < 0`). The rules mask these points out of the inner power too, so second derivatives stay finite there wherever the value is finite; at `x <= 0` the two mixed second partials follow the conventions and need not be equal. `pow` lowers to NVRTC `powf` on CUDA, including fused elementwise kernels and elementwise loop bodies, and to `power` on MLX. Comparisons are explicitly non-differentiable; `where` routes VJP/JVP contributions only through the selected data branch. `maximum` and `minimum` are composed from those primitives as `where(isnan(x) | (x > y), x, y)` and `where(isnan(x) | (x < y), x, y)`: they route equality subgradients to their right operand and propagate `NaN` from either operand like NumPy, and so do `relu` and the `max`/`min` reductions, whatever the position of the `NaN`. `log1p` is a native IR primitive, `ln(1 + x)` with derivative `1 / (1 + x)`, that follows IEEE semantics on every backend instead of raising: `log1p(-1)` is `-inf` and `log1p(x)` is `NaN` for `x < -1`; it lowers to `log1pf` on CUDA and to `log1p` on MLX. `expm1` (`exp(x) - 1`, accurate for small `|x|`, derivative `exp(x)`), `erf` (the f64 musl `erf` of the `libm` crate on the CPU, derivative `2 / sqrt(pi) * exp(-x^2)`), and the broadcasting binary `atan2(y, x)` (`f64::atan2`) are native IR primitives that lower to `expm1f`, `erff` and `atan2f` on CUDA (per-node kernels and elementwise loop bodies) and to `erf` and `arctan2` on MLX, where `expm1` is Kahan's `(u - 1) * x / log(u)` with `u = exp(x)` for `|x| < 0.5` and `exp(x) - 1` elsewhere, because MLX's own `expm1` is off by hundreds of float32 ulp; device float32 results differ from the correctly rounded CPU values by a few ulp (MLX `erf` by up to about 13). The `atan2` partials `x / (x^2 + y^2)` and `-y / (x^2 + y^2)` are evaluated after dividing both operands by `s = |x| + |y|`, so they neither overflow nor underflow before the true value does, and every derivative order is defined as zero where `s` is zero or infinite (JAX's rule gives NaN at the origin and for tiny inputs whose squares underflow); a NaN operand gives a NaN derivative. `stop_gradient(x)` is the identity on values with a zero derivative in every mode (zero JVP tangent, no VJP contribution, zero Hessian blocks), so `x - stop_gradient(x) + stop_gradient(f(x))` has the value of `f(x)` and the gradient of `x`; backends execute it as a copy, and an eager `Tensor.stop_gradient()` returns the value. `cumsum(x, axis=None, reverse=False)` is a native inclusive prefix sum (`axis=None` flattens like NumPy, `reverse` scans from the last entry) whose CPU evaluation rounds every running sum to the dtype; its JVP is the cumsum of the tangent, its VJP the opposite-direction cumsum of the cotangent, and `vmap` shifts its axis. CUDA scans each line in one thread with `__fadd_rn`, matching the CPU float32 result bitwise; MLX uses its parallel `cumsum`, whose float32 rounding can differ from the sequential CPU sums. `TensorTraceGraph.evaluate_vjp(...)` and
+  batched `matmul`, rank-N `concat`, `stack([...], axis=...)`, `slice(axis, start, stop)`, `broadcast_to(shape)`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `pow` (`x ** y` and `quabla.power`), `log`, `log1p`, reshape, global or single-axis `sum`/`mean`/L2 `norm`, `maximum`/`minimum`, `gt`/`where` masks, and the bool comparison, logical, `isfinite`/`isnan`, and `any`/`all` operations. `stack` is composed from reshape plus concat, so it inherits the same direct and symbolic CPU/CUDA AD rules. `concat` is linear: direct and symbolic VJP split the upstream cotangent with internal slice nodes, while its JVP and mixed second-direction transform concatenate the corresponding tangents. `slice` supports normalized negative axes and uses a zero-padded internal reverse node, keeping direct and symbolic gradients on the selected original coordinates. `broadcast_to` is a dedicated shape node whose VJP reduces repeated axes back to the input shape. `sqrt` is a native IR primitive: negative values, `-inf` included, follow IEEE floating-point `NaN` semantics for the value and every derivative order, while every derivative order at zero is defined as zero, avoiding `log(0)` during higher-order AD; CPU, CUDA, and MLX agree on these points. A `TraceTensor` `x ** y` lowers a non-negative Python int `y` to the exact `powi` and every other exponent (floats, negative ints, traced tensors, and `c ** x`) to the elementwise `pow` op, which follows `f64::powf` (NaN for a negative base with a non-integer exponent, `0 ** 0 == 1`) and differentiates in both operands: `d/dx = y x^(y-1)`, defined as zero where `x == 0` and `y < 1` (the `sqrt` convention; `y >= 1` keeps the finite limit, so `x ** 2.0` has second derivative 2 at zero), and `d/dy = x^y ln x`, defined as zero for every `x <= 0` (JAX returns `NaN` for `x < 0`). The rules mask these points out of the inner power too, so second derivatives stay finite there wherever the value is finite; at `x <= 0` the two mixed second partials follow the conventions and need not be equal. `pow` lowers to NVRTC `powf` on CUDA, including fused elementwise kernels and elementwise loop bodies, and to `power` on MLX. Comparisons are explicitly non-differentiable; `where` routes VJP/JVP contributions only through the selected data branch. `maximum` and `minimum` are composed from those primitives as `where(isnan(x) | (x > y), x, y)` and `where(isnan(x) | (x < y), x, y)`: they route equality subgradients to their right operand and propagate `NaN` from either operand like NumPy, and so do `relu` and the `max`/`min` reductions, whatever the position of the `NaN`. `log1p` is a native IR primitive, `ln(1 + x)` with derivative `1 / (1 + x)`, that follows IEEE semantics on every backend instead of raising: `log1p(-1)` is `-inf` and `log1p(x)` is `NaN` for `x < -1`; it lowers to `log1pf` on CUDA and to `log1p` on MLX. `expm1` (`exp(x) - 1`, accurate for small `|x|`, derivative `exp(x)`), `erf` (the f64 musl `erf` of the `libm` crate on the CPU, derivative `2 / sqrt(pi) * exp(-x^2)`), `erfc` (`1 - erf(x)` without cancellation: the musl `erfc` on the CPU and `erfcf` on CUDA, derivative `-2 / sqrt(pi) * exp(-x^2)`; MLX has no `erfc`, so it evaluates the Numerical Recipes Chebyshev fit `t exp(-z^2 + P(t))`, `t = 1 / (1 + z / 2)`, relative error below `1.2e-7`, with `exp(-z^2)` split as `exp(-h^2) exp(-(z - h)(z + h))` for `h = floor(16 z) / 16` and the reflection `2 - erfc(-x)` for negative `x`, within about 8 float32 ulp of the correctly rounded value; CUDA loop bodies do not lower `erfc` yet), and the broadcasting binary `atan2(y, x)` (`f64::atan2`) are native IR primitives that lower to `expm1f`, `erff` and `atan2f` on CUDA (per-node kernels and elementwise loop bodies) and to `erf` and `arctan2` on MLX, where `expm1` is Kahan's `(u - 1) * x / log(u)` with `u = exp(x)` for `|x| < 0.5` and `exp(x) - 1` elsewhere, because MLX's own `expm1` is off by hundreds of float32 ulp; device float32 results differ from the correctly rounded CPU values by a few ulp (MLX `erf` by up to about 13). The `atan2` partials `x / (x^2 + y^2)` and `-y / (x^2 + y^2)` are evaluated after dividing both operands by `s = |x| + |y|`, so they neither overflow nor underflow before the true value does, and every derivative order is defined as zero where `s` is zero or infinite (JAX's rule gives NaN at the origin and for tiny inputs whose squares underflow); a NaN operand gives a NaN derivative. `stop_gradient(x)` is the identity on values with a zero derivative in every mode (zero JVP tangent, no VJP contribution, zero Hessian blocks), so `x - stop_gradient(x) + stop_gradient(f(x))` has the value of `f(x)` and the gradient of `x`; backends execute it as a copy, and an eager `Tensor.stop_gradient()` returns the value. `cumsum(x, axis=None, reverse=False)` is a native inclusive prefix sum (`axis=None` flattens like NumPy, `reverse` scans from the last entry) whose CPU evaluation rounds every running sum to the dtype; its JVP is the cumsum of the tangent, its VJP the opposite-direction cumsum of the cotangent, and `vmap` shifts its axis. CUDA scans each line in one thread with `__fadd_rn`, matching the CPU float32 result bitwise; MLX uses its parallel `cumsum`, whose float32 rounding can differ from the sequential CPU sums. `TensorTraceGraph.evaluate_vjp(...)` and
   `TensorTraceGraph.evaluate_jvp(...)` execute the corresponding rank-N CPU
   reverse and forward transforms. `TensorTraceGraph.hessian_scalar(...)`
   computes an exact dense Hessian for one named input and a scalar output using
