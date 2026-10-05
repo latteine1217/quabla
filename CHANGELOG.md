@@ -9,6 +9,8 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-06
+
 ### Changed
 
 - The CPU executor and eager tensors return IEEE 754 values for `log` of a
@@ -257,7 +259,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/latteine1217/quabla/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/latteine1217/quabla/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/latteine1217/quabla/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/latteine1217/quabla/compare/v0.1.0...v0.2.0

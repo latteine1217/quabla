@@ -7,7 +7,7 @@ traced program on CPU, CUDA, and Apple silicon.**
 [![CI](https://github.com/latteine1217/quabla/actions/workflows/ci.yml/badge.svg)](https://github.com/latteine1217/quabla/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation-from-source)
-[![Release v0.2.2](https://img.shields.io/badge/release-v0.2.2-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.2.2)
+[![Release v0.2.3](https://img.shields.io/badge/release-v0.2.3-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.2.3)
 
 ![A tanh MLP trained with Quabla matches the exact solution of a 1D Poisson problem; its training loss falls from about 50 to 2.5e-4.](docs/assets/pinn_poisson.png)
 
@@ -66,7 +66,7 @@ running on CUDA or MLX.
 
 ## Status
 
-The latest release is **v0.2.2**, a research-grade, source-only pre-release
+The latest release is **v0.2.3**, a research-grade, source-only pre-release
 (a git tag and GitHub Release without prebuilt wheels). The v0.2 series adds
 the JAX-style API ([CHANGELOG](CHANGELOG.md#020---2026-10-06),
 [design](docs/api_v0_2_design.md)): the transforms `grad`, `value_and_grad`,
