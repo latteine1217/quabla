@@ -78,6 +78,43 @@ def test_cond_dynamic_predicate_is_lazy_and_differentiable():
     assert_close(second(qb.array(True), qb.array(-2.0)), 2.0)
 
 
+def ignoring_cond(x, a):
+    # As in JAX, a branch may ignore an operand the other branch reads (the
+    # first cond) or return a constant (the second cond).
+    return cond(
+        x.sum() > 0.0,
+        lambda t, s: (t * s).sum(),
+        lambda t, s: (t * t).sum(),
+        x,
+        a,
+    ) + cond(x.sum() > 0.0, lambda t: qb.ones([], t.dtype), lambda t: t.sum(), x)
+
+
+def test_traced_cond_branches_may_ignore_operands_or_return_constants():
+    x, a = qb.array([1.0, 2.0]), qb.array([0.5, -1.0])
+    for point, value, grad_x, grad_a in [
+        (x, -0.5, [0.5, -1.0], [1.0, 2.0]),
+        (-x, 2.0, [-1.0, -3.0], [0.0, 0.0]),
+    ]:
+        assert_close(qb.jit(ignoring_cond)(point, a), value)
+        gradients = qb.grad(ignoring_cond, argnums=(0, 1))(point, a)
+        assert_close(gradients[0], grad_x)
+        assert_close(gradients[1], grad_a)
+    # An ignored operand is referenced without being read, so NaN and inf
+    # in it reach neither the value nor the gradients.
+    poisoned = qb.array([float("nan"), float("inf")])
+    assert_close(qb.jit(ignoring_cond)(-x, poisoned), 2.0)
+    assert_close(qb.grad(ignoring_cond, argnums=1)(-x, poisoned), [0.0, 0.0])
+    # Without operands both branches may return constants.
+    constant = qb.jit(
+        lambda t: cond(
+            t.sum() > 0.0, lambda: qb.array([1.0, 2.0]), lambda: 3.0 * qb.ones([2])
+        )
+    )
+    assert_close(constant(x), [1.0, 2.0])
+    assert_close(constant(-x), [3.0, 3.0])
+
+
 def test_eager_loop_and_scan_argument_order_and_bounds():
     initial, scale = qb.array(1.0), qb.array(2.0)
     assert_close(loop_loss(initial, scale), 12.0)
@@ -137,6 +174,35 @@ def test_region_and_unrolled_scan_differentiate_carry_and_outputs():
             (qb.array(0.0), qb.array(1.0)),
         )
         assert_close(hvp, 26.0)
+
+
+def test_loop_and_scan_bodies_may_ignore_operands():
+    initial, unused, scale = qb.array([1.0, 2.0]), qb.array([0.5, -1.0]), qb.array(3.0)
+    for unroll in (False, True):
+
+        def loop(x, u, s):
+            return fori_loop(
+                0, 2, lambda i, c, u_, s_: c * s_, x, operands=(u, s), unroll=unroll
+            ).sum()
+
+        def scanned(x, u, s):
+            return scan(
+                lambda c, i, u_, s_: (c * s_, c),
+                x,
+                length=2,
+                operands=(u, s),
+                unroll=unroll,
+            )[1].sum()
+
+        for function, value, grad_x, grad_s in [
+            (loop, 27.0, [9.0, 9.0], 18.0),
+            (scanned, 12.0, [4.0, 4.0], 3.0),
+        ]:
+            assert_close(qb.jit(function)(initial, unused, scale), value)
+            gradients = qb.grad(function, argnums=(0, 1, 2))(initial, unused, scale)
+            assert_close(gradients[0], grad_x)
+            assert_close(gradients[1], [0.0, 0.0])
+            assert_close(gradients[2], grad_s)
 
 
 def test_wrappers_match_existing_regions_and_trace_once():
@@ -297,13 +363,20 @@ def test_optional_device_loop_vjp_and_hvp_parity():
                 (qb.zeros([2], qb.float32), qb.ones([2], qb.float32)),
             )[1]
 
-        for operation in (qb.value_and_grad(loop_loss, argnums=(0, 1)), hvp):
-            cpu = qb.jit(operation)(initial, scale)
-            actual = qb.jit(operation, device=device)(initial, scale)
-            cpu_leaves, _ = qb.tree.flatten(cpu)
-            actual_leaves, _ = qb.tree.flatten(actual)
-            for value, expected in zip(actual_leaves, cpu_leaves):
-                assert_close(value, expected, 1e-4)
+        operations = (
+            qb.value_and_grad(loop_loss, argnums=(0, 1)),
+            hvp,
+            qb.value_and_grad(ignoring_cond, argnums=(0, 1)),
+        )
+        for operation in operations:
+            # The negated carry takes the other branch of `ignoring_cond`.
+            for x in (initial, -initial):
+                cpu = qb.jit(operation)(x, scale)
+                actual = qb.jit(operation, device=device)(x, scale)
+                cpu_leaves, _ = qb.tree.flatten(cpu)
+                actual_leaves, _ = qb.tree.flatten(actual)
+                for value, expected in zip(actual_leaves, cpu_leaves):
+                    assert_close(value, expected, 1e-4)
 
 
 if __name__ == "__main__":

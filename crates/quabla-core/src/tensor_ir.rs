@@ -6121,6 +6121,17 @@ impl TensorIr {
             .ok_or_else(|| format!("input {name:?} does not exist"))
     }
 
+    /// Returns `output` plus a zero term that references each named input
+    /// without reading its values, so compiling the result keeps those inputs
+    /// live. Region builders use it to give branches one capture interface.
+    pub fn retain_inputs(
+        &mut self,
+        input_names: &[String],
+        output: TensorNodeId,
+    ) -> Result<TensorNodeId, String> {
+        symbolic_retain_region_inputs(self, input_names, output)
+    }
+
     pub fn compile_cpu(&self, output: TensorNodeId) -> Result<TensorExecutionPlan, String> {
         let (plan, _) = self.compile_cpu_many(&[output])?;
         Ok(plan)

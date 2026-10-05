@@ -75,7 +75,28 @@ def cond(pred, true_fun, false_fun, *operands):
     if not isinstance(pred, TraceTensor):
         return (true_fun if bool(pred) else false_fun)(*operands)
     predicate, *captures = _bindings((pred, *operands))
-    return _region_call(_quabla.tensor_cond, predicate, true_fun, false_fun, captures)
+    # Constant branch results bind to the region through one of its inputs; a
+    # cond without operands passes the predicate as that hidden input.
+    hidden = not captures
+    if hidden:
+        captures = [predicate]
+    return _region_call(
+        _quabla.tensor_cond,
+        predicate,
+        _branch(true_fun, hidden),
+        _branch(false_fun, hidden),
+        captures,
+    )
+
+
+def _branch(function, hidden):
+    def traced(*values):
+        result = function(*values[1:]) if hidden else function(*values)
+        if isinstance(result, TraceTensor):
+            return result
+        return _bindings((values[0], result))[1]
+
+    return traced
 
 
 def _bound(value, name):

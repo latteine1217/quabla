@@ -10,8 +10,8 @@ use quabla_core::tensor_ir::{
     BatchingError, CudaBackend, CudaDataParallelExecutionPlan, CudaDataParallelTiming,
     CudaExecutionPlan, DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs,
     SymbolicCotangent, TensorBackend, TensorComparison, TensorCondExecutionPlan, TensorDType,
-    TensorExecutionPlan, TensorForiExecutionPlan, TensorIr, TensorNodeId, TensorReplicaReduction,
-    TensorScanExecutionPlan,
+    TensorExecutionPlan, TensorForiExecutionPlan, TensorIr, TensorNodeId, TensorRegion,
+    TensorReplicaReduction, TensorScanExecutionPlan,
 };
 use quabla_core::{
     QuablaCompiler, QuablaExecutable, QuablaMultiOutputExecutable, QuablaMultiOutputProgram,
@@ -5437,6 +5437,42 @@ pub fn trace_tensor_python_function(
     Ok(TensorTraceResult::new(graph, output))
 }
 
+/// Compiles a traced region, keeping the trace for `retain_region_inputs`.
+fn compile_cpu_region(
+    traced: &TensorTraceResult,
+) -> Result<(&TensorTraceResult, TensorExecutionPlan), String> {
+    Ok((
+        traced,
+        traced.graph.compile_cpu_plan(traced.output.node_id)?.plan,
+    ))
+}
+
+fn region_input_names(plan: &TensorExecutionPlan) -> Vec<String> {
+    TensorRegion::new(plan.clone())
+        .captures()
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// Recompiles a region whose output also references `names`, or returns the
+/// compiled plan unchanged when nothing is missing.
+fn retain_region_inputs(
+    (traced, plan): (&TensorTraceResult, TensorExecutionPlan),
+    names: &[String],
+) -> Result<TensorExecutionPlan, String> {
+    if names.is_empty() {
+        return Ok(plan);
+    }
+    let output = traced
+        .graph
+        .ir
+        .lock()
+        .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+        .retain_inputs(names, traced.output.node_id)?;
+    Ok(traced.graph.compile_cpu_plan(output)?.plan)
+}
+
 /// Traces a lazy scalar conditional into the parent Tensor IR.
 ///
 /// Branches are separate region traces. They can only depend on the explicit
@@ -5480,17 +5516,21 @@ pub fn tensor_cond(
         .collect::<PyResult<Vec<_>>>()?;
     let on_true = trace_tensor_python_function(py, on_true, input_specs.clone())?;
     let on_false = trace_tensor_python_function(py, on_false, input_specs)?;
+    let on_true = compile_cpu_region(&on_true).map_err(PyValueError::new_err)?;
+    let on_false = compile_cpu_region(&on_false).map_err(PyValueError::new_err)?;
+    // A branch may ignore an operand the other branch reads; retaining it
+    // gives both regions the same capture interface without reading it.
+    let missing_from = |plan: &TensorExecutionPlan, other: &TensorExecutionPlan| {
+        region_input_names(other)
+            .into_iter()
+            .filter(|name| plan.input_shape(name).is_err())
+            .collect::<Vec<_>>()
+    };
+    let true_missing = missing_from(&on_true.1, &on_false.1);
+    let false_missing = missing_from(&on_false.1, &on_true.1);
     let branches = TensorCondExecutionPlan::new(
-        on_true
-            .graph
-            .compile_cpu_plan(on_true.output.node_id)
-            .map_err(PyValueError::new_err)?
-            .plan,
-        on_false
-            .graph
-            .compile_cpu_plan(on_false.output.node_id)
-            .map_err(PyValueError::new_err)?
-            .plan,
+        retain_region_inputs(on_true, &true_missing).map_err(PyValueError::new_err)?,
+        retain_region_inputs(on_false, &false_missing).map_err(PyValueError::new_err)?,
     )
     .map_err(PyValueError::new_err)?;
     let captures = branches
@@ -5797,10 +5837,13 @@ pub fn tensor_fori_loop_region(
     )
     .map_err(PyValueError::new_err)?;
     let parent_graph = init.graph.clone();
+    // The compiled body drops operands it never reads, so bind only the
+    // captures the body still declares; an ignored operand is legal.
     let captures = operands
         .iter()
         .enumerate()
         .map(|(index, operand)| (format!("__quabla_fori_capture_{index}"), operand.node_id))
+        .filter(|(name, _)| loop_plan.external_captures().contains_key(name))
         .collect();
     let mut ir = parent_graph
         .ir
@@ -5950,10 +5993,13 @@ pub fn tensor_scan_region(
     )
     .map_err(PyValueError::new_err)?;
     let parent_graph = init.graph.clone();
+    // The compiled body drops operands it never reads, so bind only the
+    // captures the body still declares; an ignored operand is legal.
     let captures = operands
         .iter()
         .enumerate()
         .map(|(index, operand)| (format!("__quabla_scan_capture_{index}"), operand.node_id))
+        .filter(|(name, _)| scan_plan.external_captures().contains_key(name))
         .collect();
     let mut ir = parent_graph
         .ir
