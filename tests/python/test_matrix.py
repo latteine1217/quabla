@@ -2533,6 +2533,11 @@ def test_tensor_cpu_plan_data_parallel_value_and_grad_matches_single_plan():
 
 
 def test_tensor_cuda_data_parallel_constructor_rejects_unavailable_collective_runtime():
+    # The rejection only happens where the collective runtime is missing (no
+    # cuda-nccl build, fewer than two GPUs, or no loadable NCCL). Hosts that
+    # opt into the two-GPU suite have that runtime, so construction succeeds.
+    if os.environ.get("QUABLA_CUDA_NCCL_TEST") is not None:
+        return
     try:
         quabla.tensor_value_and_grad_data_parallel_cuda_fn(
             lambda x, weight: ((x * weight).powi(2)).mean(),
