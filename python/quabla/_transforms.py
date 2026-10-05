@@ -4,7 +4,8 @@ sections 3.3-3.5 and 3.11, decisions D5-D8 and D16-D17; slices S2-S4b).
 Every transform is staged, as `jit` is: the first call with a new argument
 signature traces the function into a Tensor IR graph, applies the symbolic
 transform (reverse mode for `grad`/`value_and_grad`/`vjp`, forward mode for
-`jvp`/`jacobian`), compiles one multi-output CPU program, and caches it.
+`jvp`, eligible smaller input/output basis for `jacobian`), compiles one
+multi-output CPU program, and caches it.
 Later calls with the same signature only flatten the arguments and run the
 program. The signature is the pytree structure of the positional arguments
 plus the shape and dtype of every array leaf and the value of every static
@@ -31,8 +32,8 @@ inputs bind to the tracers, so a derivative can be used inside a loss that
 is differentiated again. `jit` of a plain Python function traces through it
 instead, which is exact. `vmap` stages its function for one example and
 splices that graph batched into its own (`TensorIr::inline_batched`, slice
-S4), so it composes the same way; `jacobian` and `hessian` are forward mode
-vectorized with it over the input elements, so they compose as well.
+S4), so it composes the same way; dense `jacobian` and `hessian` splice
+bounded derivative basis batches, so they compose as well.
 
 A function staged inside another trace may close over that trace's tracers
 (`grad(lambda x: net(params, x))` with traced `params`, slice S4b). Each
@@ -51,9 +52,9 @@ import inspect
 import weakref
 
 from . import _quabla
-from ._array import asarray, eye, zeros
+from ._array import arange, asarray, zeros
 from ._errors import RetraceLimitError, UnsupportedOperationError
-from ._quabla import Tensor, TensorTraceGraph, TraceTensor, bool_
+from ._quabla import Tensor, TensorTraceGraph, TraceTensor, bool_, float32, float64
 from .tree import _LEAF, _describe, _flatten, _leaf_count, _leaf_paths, _unflatten
 
 __all__ = ["grad", "hessian", "jacobian", "jit", "jvp", "value_and_grad", "vjp", "vmap"]
@@ -80,6 +81,10 @@ _DEFAULT_MAX_TRACES = 8
 # Graph input names starting with `__quabla_` are reserved (design 3.11).
 _TANGENT_PREFIX = "__quabla_tangent/"
 _COTANGENT_PREFIX = "__quabla_cotangent/"
+# Bounds each dense Jacobian JVP batch without changing the public transform.
+_JACOBIAN_CHUNK_SIZE = 64
+# Coordinate digits stay exact on backends that execute float64 as float32.
+_JACOBIAN_INDEX_RADIX = 1 << 24
 
 # -- argument signatures -------------------------------------------------------
 
@@ -1332,12 +1337,43 @@ def _graft(node, block_node):
     return (node[0], tuple(_graft(child, block_node) for child in node[1]))
 
 
+def _jacobian_basis_indices(graph, total):
+    """Exact radix digits of flattened indices, using only linear storage.
+
+    Every digit is below 2**24, so backend float32 execution preserves it.
+    Broadcasting digits avoids Python lists and quadratic identity constants.
+    Each padded coordinate vector has fewer than twice `total` elements.
+    """
+    radix = _JACOBIAN_INDEX_RADIX
+    if total <= radix:
+        return [graph._constant(arange(total, dtype=float64))]
+    groups = (total + radix - 1) // radix
+    padded = groups * radix
+    low = (
+        graph._constant(arange(radix, dtype=float64))
+        .reshape([1, radix])
+        .broadcast_to([groups, radix])
+        .reshape([padded])
+        .slice(0, 0, total)
+    )
+    high = [
+        digit.reshape([groups, 1])
+        .broadcast_to([groups, radix])
+        .reshape([padded])
+        .slice(0, 0, total)
+        for digit in _jacobian_basis_indices(graph, groups)
+    ]
+    return [low] + high
+
+
 class _Jacobian(_Transform):
-    """Dense Jacobian by forward mode vectorized over the basis (design 3.3,
-    as `jax.jacfwd`): one JVP graph, with one tangent input per selected
-    leaf, is spliced with `vmap` batching over the rows of the identity of
-    all selected elements together, so the result is a single staged graph
-    that composes, inlines, and differentiates like every other transform."""
+    """Dense Jacobian using the smaller eligible input/output basis.
+
+    Floating outputs use reverse mode when Q < P and the graph does not
+    narrow gradients before F64 output blocks; otherwise the transform
+    keeps forward mode. Bounded basis batches avoid a quadratic identity
+    constant. The result stays one graph that inlines and differentiates
+    normally, preserving pytree blocks and output dtypes."""
 
     def __init__(self, fun, argnums, kind="jacobian"):
         argnums = _argnums_config(argnums)
@@ -1374,49 +1410,163 @@ class _Jacobian(_Transform):
                 primals[name] = graph.input(name, leaf.shape, leaf.dtype)
         for name, source in zip(_capture_names(staged), staged.captures):
             primals[name] = graph.input(name, source.shape, source.dtype)
-        # The basis: row r of the identity over all selected elements, split
-        # into one mapped tangent per selected leaf.
         sizes = [_size(leaves[position].shape) for position in selected]
         total = sum(sizes)
         offsets = []
-        tangents = []
         offset = 0
-        for position, size in zip(selected, sizes):
-            leaf = leaves[position]
-            basis = eye(total, dtype=leaf.dtype).slice(1, offset, size).to_tensor()
-            tangents.append(graph._constant(basis.reshape([total] + list(leaf.shape))))
+        for size in sizes:
             offsets.append(offset)
             offset += size
         traced = [output for output in staged.outputs if _is_traced(output)]
-        if traced:
+        pieces = [[[] for _ in selected] for _ in traced]
+        output_sizes = [_size(output.shape) for output in traced]
+        output_total = sum(output_sizes)
+        reverse = (
+            0 < output_total < total
+            and all(output.dtype != bool_ for output in traced)
+            and (
+                all(output.dtype == float32 for output in traced)
+                or not staged.graph._has_f32_nodes
+            )
+        )
+        if reverse:
+            cotangent_names = []
+            occupied = set(staged.input_names)
+            for index in range(len(traced)):
+                name = f"{_COTANGENT_PREFIX}jacobian/{index}"
+                while name in occupied:
+                    name += "_"
+                occupied.add(name)
+                cotangent_names.append(name)
+            reverse_graph, _, gradients = staged.graph._symbolic_vjp(
+                traced, cotangent_names, []
+            )
+            indices = _jacobian_basis_indices(graph, output_total)
+            output_offsets = []
+            offset = 0
+            for size in output_sizes:
+                output_offsets.append(offset)
+                offset += size
+            output_indices = [
+                [
+                    digit.slice(0, offset, offset + size).reshape([1, size])
+                    for digit in indices
+                ]
+                for offset, size in zip(output_offsets, output_sizes)
+            ]
+            for start in range(0, output_total, _JACOBIAN_CHUNK_SIZE):
+                stop = min(start + _JACOBIAN_CHUNK_SIZE, output_total)
+                batch = stop - start
+                rows = [
+                    digit.slice(0, start, stop).reshape([batch, 1]) for digit in indices
+                ]
+                cotangents = []
+                for output, columns in zip(traced, output_indices):
+                    basis = rows[0].equal(columns[0])
+                    for row, column in zip(rows[1:], columns[1:]):
+                        basis = basis.logical_and(row.equal(column))
+                    cotangents.append(
+                        basis.astype(output.dtype).reshape([batch] + list(output.shape))
+                    )
+                spliced = reverse_graph._inline_batched(
+                    staged.input_names + cotangent_names,
+                    [primals[name] for name in staged.input_names] + cotangents,
+                    [False] * len(staged.input_names) + [True] * len(cotangents),
+                    batch,
+                    [gradients[names[position]] for position in selected],
+                )
+                for index, (position, (columns, mapped)) in enumerate(
+                    zip(selected, spliced)
+                ):
+                    if not mapped:
+                        columns = columns.broadcast_to(
+                            [batch] + list(leaves[position].shape)
+                        )
+                    for output, output_pieces, offset, size in zip(
+                        traced, pieces, output_offsets, output_sizes
+                    ):
+                        lower, upper = max(start, offset), min(stop, offset + size)
+                        if lower < upper:
+                            output_pieces[index].append(
+                                columns.slice(0, lower - start, upper - start).astype(
+                                    output.dtype
+                                )
+                            )
+        elif traced and total:
             tangent_names = {names[p]: _TANGENT_PREFIX + names[p] for p in selected}
-            jvp_graph, _, jvp_tangents = staged.graph._symbolic_jvp(traced, tangent_names)
-            spliced = iter(
-                jvp_graph._inline_batched(
+            jvp_graph, _, jvp_tangents = staged.graph._symbolic_jvp(
+                traced, tangent_names
+            )
+            indices = _jacobian_basis_indices(graph, total)
+            leaf_indices = [
+                [
+                    digit.slice(0, offset, offset + size).reshape([1, size])
+                    for digit in indices
+                ]
+                for offset, size in zip(offsets, sizes)
+            ]
+            for start in range(0, total, _JACOBIAN_CHUNK_SIZE):
+                stop = min(start + _JACOBIAN_CHUNK_SIZE, total)
+                batch = stop - start
+                rows = [
+                    digit.slice(0, start, stop).reshape([batch, 1]) for digit in indices
+                ]
+                tangents = []
+                for position, columns in zip(selected, leaf_indices):
+                    basis = rows[0].equal(columns[0])
+                    for row, column in zip(rows[1:], columns[1:]):
+                        basis = basis.logical_and(row.equal(column))
+                    tangents.append(
+                        basis.astype(leaves[position].dtype).reshape(
+                            [batch] + list(leaves[position].shape)
+                        )
+                    )
+                spliced = jvp_graph._inline_batched(
                     staged.input_names + [tangent_names[names[p]] for p in selected],
                     [primals[name] for name in staged.input_names] + tangents,
                     [False] * len(staged.input_names) + [True] * len(selected),
-                    total,
+                    batch,
                     jvp_tangents,
                 )
-            )
+                for output, output_pieces, (columns, mapped) in zip(
+                    traced, pieces, spliced
+                ):
+                    if not mapped:
+                        columns = columns.broadcast_to([batch] + list(output.shape))
+                    for leaf_pieces, offset, size in zip(output_pieces, offsets, sizes):
+                        lower, upper = max(start, offset), min(stop, offset + size)
+                        if lower < upper:
+                            leaf_pieces.append(
+                                columns.slice(0, lower - start, upper - start)
+                            )
+        pieces = iter(pieces)
         blocks = []
         for output in staged.outputs:
             if _is_traced(output):
-                columns, mapped = next(spliced)
-                if not mapped:
-                    columns = columns.broadcast_to([total] + list(output.shape))
+                output_pieces = next(pieces)
             by_position = {}
-            for position, offset, size in zip(selected, offsets, sizes):
+            for index, (position, size) in enumerate(zip(selected, sizes)):
                 leaf = leaves[position]
-                if not _is_traced(output):
-                    shape = list(output.shape) if isinstance(output, Tensor) else []
-                    dtype = output.dtype if isinstance(output, Tensor) else leaf.dtype
+                if not _is_traced(output) or not size:
+                    shape = (
+                        list(output.shape)
+                        if isinstance(output, (Tensor, TraceTensor))
+                        else []
+                    )
+                    dtype = (
+                        output.dtype
+                        if isinstance(output, (Tensor, TraceTensor))
+                        else leaf.dtype
+                    )
                     by_position[position] = zeros(shape + list(leaf.shape), dtype)
                     continue
-                block = columns.slice(0, offset, offset + size)
-                block = _move_batch_axis(block, len(output.shape))
-                by_position[position] = block.reshape(list(output.shape) + list(leaf.shape))
+                chunks = output_pieces[index]
+                block = chunks[0] if len(chunks) == 1 else _quabla.concat(chunks, 0)
+                if not reverse:
+                    block = _move_batch_axis(block, len(output.shape))
+                by_position[position] = block.reshape(
+                    list(output.shape) + list(leaf.shape)
+                )
             for argnum in argnums:
                 blocks.extend(by_position.get(position) for position in ranges[argnum])
         if len(argnums) == 1 and not isinstance(self._argnums, _Tuple):
@@ -1528,9 +1678,12 @@ def vjp(fun, *primals, has_aux=False):
 def jacobian(fun, argnums=0):
     """`fun` transformed to return its dense Jacobian: for each output leaf,
     blocks of shape `[*out.shape, *in.shape]` with the pytree structure of
-    the arguments selected by `argnums`. Forward mode, vectorized over the
-    input elements with `vmap` (as `jax.jacfwd`), so it is staged like the
-    other transforms and composes with them."""
+    the arguments selected by `argnums`. Uses reverse mode when floating
+    output elements are fewer than selected input elements, forward mode
+    otherwise. Graphs containing F32 nodes retain forward mode for F64
+    output blocks to preserve their precision. Both directions use bounded basis batches and compose with
+    other staged transforms. Direction selection can change last-bit
+    rounding; it preserves shape, dtype, and pytree structure."""
     return _Jacobian(fun, argnums)
 
 
