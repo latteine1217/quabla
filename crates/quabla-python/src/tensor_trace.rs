@@ -2170,6 +2170,40 @@ impl TraceTensor {
         Ok(reduced)
     }
 
+    /// The product over the example `axes` (every example axis when `None`)
+    /// as the pairwise `mul` tree of `TensorIr::prod_axis`.
+    fn prod_axes_tensor(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        self.ensure_not_bool("prod")?;
+        let batch_offset = usize::from(self.batch_axis.is_some());
+        let example_rank = self.shape.len() - batch_offset;
+        let product_along = |source: &Self, axis: isize| {
+            let axis = source.example_axis(axis)?;
+            source.apply(&[], |ir| ir.prod_axis(source.node_id, axis))
+        };
+        let Some(axes) = axes else {
+            let flat = self.reshape_tensor(vec![self.shape[batch_offset..].iter().product()])?;
+            let product = product_along(&flat, 0)?;
+            return if keepdims {
+                product.reshape_tensor(vec![1; example_rank])
+            } else {
+                Ok(product)
+            };
+        };
+        let mut axes = normalize_reduction_axes(axes, example_rank)?;
+        axes.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+        let mut reduced = self.clone();
+        for axis in axes {
+            reduced = product_along(&reduced, axis as isize)?;
+            if keepdims {
+                let batch_offset = usize::from(reduced.batch_axis.is_some());
+                let mut shape = reduced.shape[batch_offset..].to_vec();
+                shape.insert(axis, 1);
+                reduced = reduced.reshape_tensor(shape)?;
+            }
+        }
+        Ok(reduced)
+    }
+
     // `max|x| * sqrt(sum((x / max|x|)^2))`: scaling keeps the sum of squares
     // from overflowing or underflowing when |x| is outside the square root of
     // the dtype's range. A zero, infinite or NaN scale falls back to 1, which
@@ -2357,6 +2391,10 @@ impl TraceTensor {
 
     fn erf_tensor(&self) -> Result<Self, String> {
         self.apply(&[], |ir| ir.erf(self.node_id))
+    }
+
+    fn erfc_tensor(&self) -> Result<Self, String> {
+        self.apply(&[], |ir| ir.erfc(self.node_id))
     }
 
     fn stop_gradient_tensor(&self) -> Result<Self, String> {
@@ -3214,6 +3252,12 @@ impl TraceTensor {
             .map_err(PyValueError::new_err)
     }
 
+    #[pyo3(signature = (axis = None, keepdims = false))]
+    fn prod(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.prod_axes_tensor(extract_reduction_axes(axis)?, keepdims)
+            .map_err(PyValueError::new_err)
+    }
+
     fn __matmul__(&self, rhs: &Bound<'_, PyAny>) -> PyResult<Self> {
         let rhs = self.traced_operand(rhs).ok_or_else(|| {
             PyTypeError::new_err("expected a TraceTensor or Tensor matmul operand")
@@ -3563,6 +3607,10 @@ impl TraceTensor {
 
     fn erf(&self) -> PyResult<Self> {
         self.erf_tensor().map_err(PyValueError::new_err)
+    }
+
+    fn erfc(&self) -> PyResult<Self> {
+        self.erfc_tensor().map_err(PyValueError::new_err)
     }
 
     /// `atan2(self, x)` of an array or Python number `x`.

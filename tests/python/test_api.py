@@ -3042,6 +3042,7 @@ def test_expm1_erf_and_atan2_values_match_math_eagerly_and_traced():
         cases = [
             (qb.expm1, (x,), [math.inf if p >= 710.0 else math.expm1(p) for p in inputs]),
             (qb.erf, (x,), [math.erf(p) for p in inputs]),
+            (qb.erfc, (x,), [math.erfc(p) for p in inputs]),
             (qb.atan2, (ys, xs), [math.atan2(*p) for p in zip(y_inputs, x_inputs)]),
         ]
         for function, arguments, reference in cases:
@@ -3054,6 +3055,11 @@ def test_expm1_erf_and_atan2_values_match_math_eagerly_and_traced():
                 # One float32 rounding of the f64 result, which may differ from
                 # the platform libm's f64 by an ulp only below float32 resolution.
                 assert_relative(eager.tolist(), reference, 1.2e-7)
+            elif function is qb.erfc:
+                # Both are within about an ulp of the true erfc, which loses
+                # relative resolution only where the result is subnormal.
+                normal = [(v, r) for v, r in zip(eager.tolist(), reference) if abs(r) > 1e-300]
+                assert_relative([v for v, _ in normal], [r for _, r in normal], 1e-15)
             else:
                 # math.erf is the platform libm; quabla uses the musl port.
                 assert_relative(eager.tolist(), reference, 4.5e-16)
@@ -3070,7 +3076,12 @@ def test_expm1_erf_and_atan2_values_match_math_eagerly_and_traced():
     assert_close(qb.atan2(1.0, x), [math.atan2(1.0, p) for p in x.tolist()], 1e-7)
     assert_close(qb.jit(lambda t: qb.atan2(t, 2.0))(x), qb.atan2(x, 2.0), 0)
     assert_raises(ValueError, qb.erf, qb.array([True]), match="bool")
-    for name in ["expm1", "erf", "atan2", "cumsum", "stop_gradient"]:
+    # erfc keeps full relative accuracy where 1 - erf(x) cancels.
+    tail = qb.array([5.0, 10.0, 26.0])
+    assert_relative(qb.erfc(tail).tolist(), [math.erfc(p) for p in tail.tolist()], 2e-16)
+    assert qb.erfc(tail).tolist()[-1] > 0.0
+    assert_raises(ValueError, qb.erfc, qb.array([True]), match="bool")
+    for name in ["expm1", "erf", "erfc", "atan2", "cumsum", "stop_gradient", "prod"]:
         assert name in qb.__all__ and getattr(qb, name).__name__ == name
 
 
@@ -3081,6 +3092,7 @@ def test_expm1_erf_and_atan2_gradients_and_hessians_match_closed_forms():
     for function, derivative in [
         (qb.expm1, math.exp),
         (qb.erf, lambda p: coefficient * math.exp(-p * p)),
+        (qb.erfc, lambda p: -coefficient * math.exp(-p * p)),
     ]:
         reference = [derivative(p) for p in points]
         for transform in [qb.grad, lambda f: qb.jit(qb.grad(f))]:
@@ -3089,9 +3101,11 @@ def test_expm1_erf_and_atan2_gradients_and_hessians_match_closed_forms():
         _, tangent = qb.jvp(function, (x,), (qb.ones([5]),))
         assert_relative(tangent.tolist(), reference, 1e-15)
     hessian = qb.hessian(lambda t: qb.sum(qb.erf(t)))(x).tolist()
+    complementary = qb.hessian(lambda t: qb.sum(qb.erfc(t)))(x).tolist()
     for row, point in enumerate(points):
         expected = -2.0 * point * coefficient * math.exp(-point * point)
         assert_relative([hessian[row][row]], [expected], 1e-15)
+        assert_relative([complementary[row][row]], [-expected], 1e-15)
 
     # atan2: (x, -y) / (x^2 + y^2) without overflow or underflow, zero at the
     # origin, and a Hessian that matches the closed form and finite differences.
@@ -3402,6 +3416,13 @@ def test_silu_gelu_clip_sign_square_and_reciprocal():
     assert qb.gelu(qb.array([-1e4], dtype=qb.float32)).item() == 0.0
     exact = [0.5 * v * (1.0 + math.erf(v / math.sqrt(2.0))) for v in (-1.0, 0.25, 2.0)]
     assert_close(qb.gelu(qb.array([-1.0, 0.25, 2.0]), approximate=False), exact, 1e-15)
+    # Through erfc, the exact form keeps its relative accuracy in the far
+    # negative tail, where 1 + erf(x / sqrt(2)) cancels to zero.
+    tail = [-38.0, -20.0, -8.0]
+    reference = [0.5 * v * math.erfc(-v / math.sqrt(2.0)) for v in tail]
+    assert_relative(qb.gelu(qb.array(tail), approximate=False).tolist(), reference, 1e-13)
+    tail32 = qb.gelu(qb.array([-12.0, -8.0], dtype=qb.float32), approximate=False).tolist()
+    assert_relative(tail32, [0.5 * v * math.erfc(-v / math.sqrt(2.0)) for v in (-12.0, -8.0)], 1e-5)
     assert_matches_finite_differences(
         lambda t: qb.gelu(t, approximate=False).sum(), qb.array([-3.0, -0.75, 0.0, 0.5, 2.5])
     )
@@ -3602,6 +3623,66 @@ def test_matmul_follows_numpy_rules_for_vectors():
     assert gm.tolist() == [[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]]
     assert_tensor(qb.vmap(qb.matmul, in_axes=(0, None))(m, v), [8.0, 26.0], qb.float64)
     assert_raises(ValueError, qb.matmul, v, qb.ones([2]))
+
+
+def test_prod_is_exact_with_zeros_and_differentiates_without_division():
+    import numpy as np
+
+    rng = np.random.default_rng(3)
+    data = rng.uniform(-2.0, 2.0, size=(3, 5, 4))
+    for axis in [None, 0, 1, -1, (0, 2), (2, 0, 1)]:
+        for keepdims in [False, True]:
+            expected = np.prod(data, axis=axis, keepdims=keepdims)
+            value = qb.prod(data, axis=axis, keepdims=keepdims)
+            assert value.shape == list(np.shape(expected))
+            assert_close(value, expected.tolist(), 1e-15)
+            assert_close(qb.asarray(data).prod(axis, keepdims), expected.tolist(), 1e-15)
+            jitted = qb.jit(lambda t, a=axis, k=keepdims: qb.prod(t, axis=a, keepdims=k))(data)
+            assert jitted.tolist() == value.tolist()
+    # Eager float32 values round exactly like the traced graph.
+    data32 = qb.asarray(rng.uniform(0.5, 1.5, size=(4, 37)), dtype=qb.float32)
+    for axis in [None, 1]:
+        eager = qb.prod(data32, axis=axis)
+        assert eager.dtype == qb.float32
+        jitted = qb.jit(lambda t, a=axis: qb.prod(t, a))(data32)
+        assert float_bits(np.ravel(eager.tolist()).tolist()) == float_bits(np.ravel(jitted.tolist()).tolist())
+        reference = np.prod(np.asarray(data32, dtype=np.float64), axis=axis)
+        assert_relative(np.ravel(eager.tolist()).tolist(), np.ravel(reference).tolist(), 1e-6)
+    # Gradients are the products of the other entries: with one zero only
+    # that entry has a nonzero gradient; with two zeros every entry is zero.
+    one_zero = qb.array([2.0, 0.0, -3.0, 7.0, 5.0])
+    assert qb.grad(qb.prod)(one_zero).tolist() == [0.0, -210.0, 0.0, 0.0, 0.0]
+    two_zeros = qb.array([2.0, 0.0, -3.0, 0.0, 5.0])
+    assert qb.grad(qb.prod)(two_zeros).tolist() == [0.0] * 5
+    no_zero = qb.array([2.0, -0.5, 3.0, 4.0])
+    assert qb.grad(qb.prod)(no_zero).tolist() == [-6.0, 24.0, -4.0, -3.0]
+    _, tangent = qb.jvp(qb.prod, (one_zero,), (qb.ones([5]),))
+    assert tangent.item() == -210.0
+    # The Hessian holds the products of all entries but two, zero on the
+    # diagonal, and stays exact with a zero entry.
+    hessian = qb.hessian(qb.prod)(one_zero).tolist()
+    values = one_zero.tolist()
+    for i in range(5):
+        for j in range(5):
+            expected = 0.0 if i == j else math.prod(v for k, v in enumerate(values) if k not in (i, j))
+            assert hessian[i][j] == expected, (i, j, hessian[i][j], expected)
+    hessian = qb.hessian(qb.prod)(two_zeros).tolist()
+    assert hessian[1][3] == hessian[3][1] == -30.0
+    assert sum(abs(v) for row in hessian for v in row) == 60.0
+    # Batched rows and gradients under vmap and jit.
+    rows = qb.array([[1.0, 2.0, 0.0], [3.0, -1.0, 2.0]])
+    assert qb.vmap(qb.prod)(rows).tolist() == [0.0, -6.0]
+    assert qb.jit(qb.grad(lambda t: qb.prod(t, axis=1).sum()))(rows).tolist() == [
+        [0.0, 0.0, 2.0],
+        [-2.0, 6.0, -3.0],
+    ]
+    # Large values: the pairwise tree keeps 1e30 * 1e30 * 1e-30 * 1e-30 finite
+    # in float32, and a product past the range is inf.
+    big = qb.array([1e30, 1e30, 1e-30, 1e-30], dtype=qb.float32)
+    assert qb.prod(big).item() == 1.0
+    assert qb.prod(qb.array([1e200, 1e200])).item() == math.inf
+    assert qb.prod(qb.array([-1e200, 1e200])).item() == -math.inf
+    assert_raises(ValueError, qb.prod, qb.array([True, False]), match="bool")
 
 
 if __name__ == "__main__":

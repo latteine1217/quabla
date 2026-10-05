@@ -250,7 +250,7 @@ def close_relative(a, b, tolerance):
         assert abs(x - y) <= tolerance * max(1.0, abs(y)), (x, y, a.tolist(), b.tolist())
 
 
-def test_device_expm1_erf_atan2_stop_gradient_and_cumsum_match_cpu():
+def test_device_expm1_erf_erfc_atan2_stop_gradient_cumsum_and_prod_match_cpu():
     ran = False
     for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
         if os.environ.get(gate) != "1":
@@ -262,6 +262,9 @@ def test_device_expm1_erf_atan2_stop_gradient_and_cumsum_match_cpu():
         functions = {
             "expm1": lambda t, u: qb.expm1(t),
             "erf": lambda t, u: qb.erf(t),
+            "erfc": lambda t, u: qb.erfc(t),
+            "gelu_exact": lambda t, u: qb.gelu(t, approximate=False),
+            "prod": lambda t, u: qb.prod(qb.reshape(t * u + 1.0, [7, 1]), axis=0),
             "atan2": lambda t, u: qb.atan2(t, u),
             "stop_gradient": lambda t, u: t * qb.stop_gradient(t * u) - qb.stop_gradient(t),
             "cumsum": lambda t, u: qb.cumsum(t * u),
@@ -270,8 +273,9 @@ def test_device_expm1_erf_atan2_stop_gradient_and_cumsum_match_cpu():
         for name, function in functions.items():
             value = qb.jit(function, device=device)(x, y)
             expected = qb.jit(function)(x, y)
-            # erff, expm1f and atan2f are within a few float32 ulp of the
-            # correctly rounded CPU values.
+            # erff, erfcf, expm1f and atan2f (and the MLX erfc fit) are
+            # within a few float32 ulp of the correctly rounded CPU values;
+            # prod is the same tree of rounded multiplications everywhere.
             close_relative(value, expected, 4e-6)
             gradient = qb.grad(lambda t, u: qb.sum(function(t, u)), argnums=(0, 1))
             for actual, reference in zip(
@@ -282,6 +286,7 @@ def test_device_expm1_erf_atan2_stop_gradient_and_cumsum_match_cpu():
         for function in [
             lambda p: qb.atan2(p[0], p[1]),
             lambda p: qb.sum(qb.erf(p) * qb.expm1(p)),
+            lambda p: qb.sum(qb.erfc(p)) * qb.prod(p),
         ]:
             close_relative(
                 qb.jit(qb.hessian(function), device=device)(point),

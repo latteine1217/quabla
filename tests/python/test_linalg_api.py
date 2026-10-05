@@ -1,4 +1,5 @@
-"""quabla.linalg: batched solves, determinants, and the symmetric eigensolver.
+"""quabla.linalg: batched solves, determinants, the symmetric eigensolver,
+QR, SVD, and least squares.
 
 Values are compared with NumPy, and derivatives with central differences of
 NumPy references. Tolerances scale with the condition of each test matrix:
@@ -331,12 +332,249 @@ def test_eigh_derivatives_match_finite_differences():
     assert_close(qb.grad(lambda m: qb.linalg.eigh(m).eigenvalues.sum())(repeated), np.eye(3), 1e-15)
 
 
+def signed_qr(a):
+    """NumPy's reduced QR with the diagonal of R made non-negative."""
+    q, r = np.linalg.qr(a)
+    signs = np.where(np.diagonal(r, axis1=-2, axis2=-1) < 0, -1.0, 1.0)
+    return q * signs[..., None, :], r * signs[..., :, None]
+
+
+def signed_svd(a):
+    """NumPy's reduced SVD with each column of U signed so its
+    largest-magnitude component is positive (quabla's convention)."""
+    u, s, vh = np.linalg.svd(a, full_matrices=False)
+    largest = np.take_along_axis(u, np.argmax(np.abs(u), axis=-2)[..., None, :], axis=-2)
+    signs = np.where(largest < 0, -1.0, 1.0)
+    return u * signs, s, vh * np.swapaxes(signs, -1, -2)
+
+
+def transposed(x):
+    return np.swapaxes(x, -1, -2)
+
+
+def directional_difference(function, x, direction, step=1e-6):
+    """The central difference of a NumPy `function` of `x` along `direction`."""
+    return (function(x + step * direction) - function(x - step * direction)) / (2 * step)
+
+
+def test_qr_matches_numpy_and_is_orthonormal():
+    rng = np.random.default_rng(10)
+    for shape in ((5, 3), (4, 4), (3, 5), (2, 6, 4), (7, 1), (1, 7)):
+        a = rng.normal(size=shape)
+        m, n = shape[-2:]
+        k = min(m, n)
+        expected_q, expected_r = signed_qr(a)
+        for dtype, tolerance in ((qb.float64, 1e-13), (qb.float32, 5e-6)):
+            q, r = qb.linalg.qr(qb.asarray(a, dtype=dtype))
+            assert q.dtype == dtype and r.dtype == dtype
+            q, r = np.asarray(q, dtype=np.float64), np.asarray(r, dtype=np.float64)
+            assert_close(q @ r, a, tolerance)
+            assert_close(transposed(q) @ q, np.broadcast_to(np.eye(k), shape[:-2] + (k, k)), tolerance)
+            assert np.all(np.tril(r, -1) == 0.0)
+            assert np.all(np.diagonal(r, axis1=-2, axis2=-1) >= 0.0)
+            # Full column rank makes the factorization unique.
+            assert_close(r, expected_r, 10 * tolerance)
+            assert_close(q, expected_q, 10 * tolerance)
+        q, r = qb.linalg.qr(a, mode="complete")
+        assert tuple(q.shape) == shape[:-2] + (m, m) and tuple(r.shape) == shape
+        q, r = np.asarray(q), np.asarray(r)
+        assert_close(q @ r, a, 1e-13)
+        assert_close(transposed(q) @ q, np.broadcast_to(np.eye(m), shape[:-2] + (m, m)), 1e-13)
+        assert_close(qb.linalg.qr(a, mode="r"), expected_r, 1e-12)
+        jitted = qb.jit(lambda x: tuple(qb.linalg.qr(x)))(a)
+        assert_close(jitted[0], expected_q, 1e-12)
+        assert_close(jitted[1], expected_r, 1e-12)
+    # A rank-deficient matrix still gets an orthonormal Q and A = Q R.
+    deficient = rng.normal(size=(6, 2)) @ rng.normal(size=(2, 4))
+    q, r = (np.asarray(t) for t in qb.linalg.qr(deficient))
+    assert_close(q @ r, deficient, 1e-13)
+    assert_close(q.T @ q, np.eye(4), 1e-13)
+    assert all(np.isnan(np.asarray(t)).all() for t in qb.linalg.qr(np.array([[np.nan, 1.0], [0.0, 1.0]])))
+    raises(ValueError, qb.linalg.qr, np.ones(3), match="stack of matrices")
+    raises(ValueError, qb.linalg.qr, np.ones((2, 2)), mode="full", match="mode")
+
+
+def test_qr_derivatives_match_central_differences():
+    rng = np.random.default_rng(11)
+    for shape in ((5, 3), (3, 3), (3, 5), (2, 4, 3)):
+        a = rng.normal(size=shape)
+        direction = rng.normal(size=shape)
+        for index, name in ((0, "Q"), (1, "R")):
+            weights = rng.normal(size=signed_qr(a)[index].shape)
+
+            def reference(x, index=index, weights=weights):
+                return np.sum(signed_qr(x)[index] * weights)
+
+            gradient = qb.grad(lambda x, i=index, w=weights: (qb.linalg.qr(x)[i] * qb.asarray(w)).sum())(a)
+            assert_close(gradient, central_difference(reference, a), 1e-7)
+            _, tangent = qb.jvp(lambda x, i=index: qb.linalg.qr(x)[i], (a,), (direction,))
+            expected = directional_difference(lambda x, i=index: signed_qr(x)[i], a, direction)
+            assert_close(tangent, expected, 1e-7)
+    # Second derivatives: the Hessian is the derivative of the gradient.
+    a = rng.normal(size=(4, 3))
+
+    def gradient_of(x):
+        return np.asarray(qb.grad(lambda t: (qb.linalg.qr(t).R ** 3).sum())(x))
+
+    hessian = np.asarray(qb.hessian(lambda t: (qb.linalg.qr(t).R ** 3).sum())(a))
+    direction = rng.normal(size=a.shape)
+    assert_close(
+        np.tensordot(hessian, direction, axes=2),
+        directional_difference(gradient_of, a, direction),
+        1e-7,
+    )
+    # The complement columns of a complete tall Q are not unique.
+    raises(Exception, qb.grad(lambda x: qb.linalg.qr(x, mode="complete").Q.sum()), a, match="not differentiable")
+    assert_close(
+        qb.grad(lambda x: qb.linalg.qr(x, mode="complete").R.sum())(a),
+        qb.grad(lambda x: qb.linalg.qr(x).R.sum())(a),
+        1e-15,
+    )
+
+
+def test_svd_matches_numpy_and_is_orthonormal():
+    rng = np.random.default_rng(12)
+    for shape in ((5, 3), (4, 4), (3, 5), (2, 6, 4), (7, 1), (1, 7)):
+        a = rng.normal(size=shape)
+        m, n = shape[-2:]
+        k = min(m, n)
+        expected_u, expected_s, expected_vh = signed_svd(a)
+        for dtype, tolerance in ((qb.float64, 1e-13), (qb.float32, 5e-6)):
+            u, s, vh = qb.linalg.svd(qb.asarray(a, dtype=dtype))
+            assert u.dtype == s.dtype == vh.dtype == dtype
+            u, s, vh = (np.asarray(t, dtype=np.float64) for t in (u, s, vh))
+            # Relative accuracy of every singular value, the smallest included.
+            assert np.max(np.abs(s - expected_s) / expected_s) <= 10 * tolerance
+            assert np.all(np.diff(s, axis=-1) <= 0)
+            assert_close((u * s[..., None, :]) @ vh, a, tolerance)
+            eye = np.broadcast_to(np.eye(k), shape[:-2] + (k, k))
+            assert_close(transposed(u) @ u, eye, tolerance)
+            assert_close(vh @ transposed(vh), eye, tolerance)
+            # Distinct singular values make the signed vectors unique.
+            assert_close(u, expected_u, 100 * tolerance)
+            assert_close(vh, expected_vh, 100 * tolerance)
+        assert_close(qb.linalg.svd(a, compute_uv=False), expected_s, 1e-13)
+        u, s, vh = qb.linalg.svd(a, full_matrices=True)
+        assert tuple(u.shape) == shape[:-2] + (m, m) and tuple(vh.shape) == shape[:-2] + (n, n)
+        u, vh = np.asarray(u), np.asarray(vh)
+        assert_close(transposed(u) @ u, np.broadcast_to(np.eye(m), shape[:-2] + (m, m)), 1e-13)
+        assert_close(vh @ transposed(vh), np.broadcast_to(np.eye(n), shape[:-2] + (n, n)), 1e-13)
+        assert_close((u[..., :k] * np.asarray(s)[..., None, :]) @ vh[..., :k, :], a, 1e-13)
+        assert_close(qb.jit(lambda x: qb.linalg.svd(x, compute_uv=False))(a), expected_s, 1e-13)
+    # A matrix with widely spread singular values: one-sided Jacobi keeps
+    # each one to high relative accuracy when the columns are scaled.
+    scales = np.logspace(0, -9, 5)
+    graded = rng.normal(size=(7, 5)) * scales
+    exact = np.linalg.svd(graded / scales, compute_uv=False)
+    values = np.asarray(qb.linalg.svd(graded, compute_uv=False))
+    assert values[-1] < 1e-8 * values[0] and np.all(values > 0)
+    np.testing.assert_allclose(np.prod(values), np.prod(exact) * np.prod(scales), rtol=1e-12)
+    # Rank deficiency: zero singular values and a completed orthonormal U.
+    deficient = rng.normal(size=(6, 2)) @ rng.normal(size=(2, 4))
+    u, s, vh = (np.asarray(t) for t in qb.linalg.svd(deficient))
+    assert np.all(s[2:] < 1e-14 * s[0])
+    assert_close((u * s) @ vh, deficient, 1e-13)
+    assert_close(u.T @ u, np.eye(4), 1e-13)
+    u, s, vh = (np.asarray(t) for t in qb.linalg.svd(np.zeros((3, 2))))
+    assert np.all(s == 0.0)
+    assert_close(u.T @ u, np.eye(2), 0.0)
+    assert all(np.isnan(np.asarray(t)).all() for t in qb.linalg.svd(np.array([[np.inf, 1.0]])))
+
+
+def test_svd_derivatives_match_central_differences():
+    rng = np.random.default_rng(13)
+    for shape in ((5, 3), (3, 3), (3, 5), (2, 4, 3)):
+        a = rng.normal(size=shape)
+        direction = rng.normal(size=shape)
+        for index in range(3):
+            weights = rng.normal(size=signed_svd(a)[index].shape)
+
+            def reference(x, index=index, weights=weights):
+                return np.sum(signed_svd(x)[index] * weights)
+
+            gradient = qb.grad(lambda x, i=index, w=weights: (qb.linalg.svd(x)[i] * qb.asarray(w)).sum())(a)
+            assert_close(gradient, central_difference(reference, a), 1e-7)
+            _, tangent = qb.jvp(lambda x, i=index: qb.linalg.svd(x)[i], (a,), (direction,))
+            expected = directional_difference(lambda x, i=index: signed_svd(x)[i], a, direction)
+            assert_close(tangent, expected, 1e-7)
+    a = rng.normal(size=(4, 3))
+    # The singular values alone: the gradient of their sum is U Vh.
+    u, _, vh = signed_svd(a)
+    assert_close(qb.grad(lambda x: qb.linalg.svd(x, compute_uv=False).sum())(a), u @ vh, 1e-13)
+
+    def gradient_of(x):
+        return np.asarray(qb.grad(lambda t: (qb.linalg.svd(t, compute_uv=False) ** 3).sum())(x))
+
+    hessian = np.asarray(qb.hessian(lambda t: (qb.linalg.svd(t, compute_uv=False) ** 3).sum())(a))
+    direction = rng.normal(size=a.shape)
+    assert_close(
+        np.tensordot(hessian, direction, axes=2),
+        directional_difference(gradient_of, a, direction),
+        1e-7,
+    )
+    raises(Exception, qb.grad(lambda x: qb.linalg.svd(x, full_matrices=True).U.sum()), a, match="not differentiable")
+    square = rng.normal(size=(3, 3))
+    assert_close(
+        qb.grad(lambda x: qb.linalg.svd(x, full_matrices=True).U.sum())(square),
+        qb.grad(lambda x: qb.linalg.svd(x).U.sum())(square),
+        1e-15,
+    )
+
+
+def test_lstsq_matches_numpy():
+    rng = np.random.default_rng(14)
+    a = rng.normal(size=(8, 3))
+    for b in (rng.normal(size=8), rng.normal(size=(8, 2))):
+        x, residuals = qb.linalg.lstsq(a, b, return_residuals=True)
+        expected, expected_residuals, _, _ = np.linalg.lstsq(a, b, rcond=None)
+        assert_close(x, expected, 1e-13)
+        assert_close(residuals, expected_residuals.reshape(np.shape(residuals)), 1e-12)
+        assert_close(qb.linalg.lstsq(qb.asarray(a, dtype=qb.float32), qb.asarray(b, dtype=qb.float32)), expected, 1e-5)
+    # Leading batch axes broadcast; a wide matrix gets the minimum-norm solution.
+    batched = rng.normal(size=(2, 7, 4))
+    b = rng.normal(size=(7, 3))
+    expected = np.stack([np.linalg.lstsq(matrix, b, rcond=None)[0] for matrix in batched])
+    assert_close(qb.linalg.lstsq(batched, b), expected, 1e-13)
+    assert_close(qb.jit(qb.linalg.lstsq)(batched, b), expected, 1e-13)
+    wide = rng.normal(size=(3, 6))
+    rhs = rng.normal(size=3)
+    assert_close(qb.linalg.lstsq(wide, rhs), np.linalg.lstsq(wide, rhs, rcond=None)[0], 1e-13)
+    for matrix, vector in ((a, rng.normal(size=8)), (wide, rhs)):
+        gradient = qb.grad(lambda m, v=vector: (qb.linalg.lstsq(m, v) ** 2).sum())(matrix)
+        expected = central_difference(
+            lambda m, v=vector: np.sum(np.linalg.lstsq(m, v, rcond=None)[0] ** 2), matrix
+        )
+        assert_close(gradient, expected, 1e-7)
+    raises(ValueError, qb.linalg.lstsq, a, rng.normal(size=7), match="agree on rows")
+
+def _gram(x):
+    """`x^T x` over the last two axes of a rank-3 traced array."""
+    return x.transpose([0, 2, 1]) @ x
+
+
 def test_optional_device_parity():
     rng = np.random.default_rng(8)
     a = well_conditioned(rng, (2, 3, 3)).astype(np.float32)
     b = rng.normal(size=(2, 3, 2)).astype(np.float32)
     symmetric = symmetric_with_gaps(rng, (2,), 3).astype(np.float32)
+    # Singular values 3, 2, 1 (and 3, 2 for the wide matrix): well separated.
+    left, _ = np.linalg.qr(rng.normal(size=(2, 5, 3)))
+    right, _ = np.linalg.qr(rng.normal(size=(2, 3, 3)))
+    tall = ((left * np.array([3.0, 2.0, 1.0])) @ transposed(right)).astype(np.float32)
+    wide = transposed(tall[..., :2, :]).copy()
+    rhs = rng.normal(size=(2, 5, 2)).astype(np.float32)
     functions = (
+        (lambda m: tuple(qb.linalg.qr(m)), (tall,)),
+        # The complement columns are not unique: compare their orthogonality.
+        (lambda m: (lambda q, r: (_gram(q), r))(*qb.linalg.qr(m, mode="complete")), (tall,)),
+        (lambda m: tuple(qb.linalg.qr(m)), (wide,)),
+        (qb.grad(lambda m: (qb.linalg.qr(m).Q ** 3).sum() + (qb.linalg.qr(m).R ** 3).sum()), (tall,)),
+        (lambda m: tuple(qb.linalg.svd(m)), (tall,)),
+        (lambda m: tuple(qb.linalg.svd(m)), (wide,)),
+        (lambda m: (lambda u, s, vh: (_gram(u), s, vh))(*qb.linalg.svd(m, full_matrices=True)), (tall,)),
+        (lambda m: (lambda u, s, vh: (u, s, _gram(vh.transpose([0, 2, 1]))))(*qb.linalg.svd(m, full_matrices=True)), (wide,)),
+        (qb.grad(lambda m: (qb.linalg.svd(m).U ** 3).sum() + (qb.linalg.svd(m).Vh ** 3).sum()), (tall,)),
+        (qb.linalg.lstsq, (tall, rhs)),
         (qb.linalg.solve, (a, b)),
         (qb.grad(lambda m, r: (qb.linalg.solve(m, r) ** 2).sum()), (a, b)),
         (lambda m: tuple(qb.linalg.slogdet(m)), (a,)),

@@ -1500,6 +1500,43 @@ impl PyTensor {
         reduced.try_mul(&scale.try_reshape(reduced.shape.clone())?)
     }
 
+    /// The product over `axes` (every axis when `None`), evaluated through
+    /// the traced `prod` graph so eager and jit results round identically;
+    /// see `quabla_core::tensor_ir::TensorIr::prod_axis`.
+    pub fn try_prod_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        self.ensure_not_bool("prod")?;
+        let rank = self.shape.len();
+        let product_along = |tensor: &Self, axis: usize| {
+            let product = quabla_core::tensor_ir::evaluate_prod_axis(
+                &tensor.to_dynamic_tensor()?,
+                axis as isize,
+            )?;
+            let mut product = Self::from_dynamic_tensor(product)?;
+            product.weak = self.weak;
+            Ok::<_, String>(product)
+        };
+        let Some(axes) = axes else {
+            let product = product_along(&self.try_reshape(vec![self.data.len()])?, 0)?;
+            return if keepdims {
+                product.try_reshape(vec![1; rank])
+            } else {
+                Ok(product)
+            };
+        };
+        let mut axes = normalize_reduction_axes(axes, rank)?;
+        axes.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+        let mut reduced = self.clone();
+        for axis in axes {
+            reduced = product_along(&reduced, axis)?;
+            if keepdims {
+                let mut shape = reduced.shape.clone();
+                shape.insert(axis, 1);
+                reduced = reduced.try_reshape(shape)?;
+            }
+        }
+        Ok(reduced)
+    }
+
     pub fn try_max_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
         self.ensure_not_bool("max")?;
         self.try_extrema_axes(axes, keepdims, true)
@@ -1650,6 +1687,11 @@ impl PyTensor {
     /// The f64 musl `erf` of the `libm` crate, as the CPU Tensor IR uses.
     pub fn try_erf(&self) -> Result<Self, String> {
         self.try_unary("erf", libm::erf)
+    }
+
+    /// The f64 musl `erfc` of the `libm` crate, as the CPU Tensor IR uses.
+    pub fn try_erfc(&self) -> Result<Self, String> {
+        self.try_unary("erfc", libm::erfc)
     }
 
     /// Elementwise `atan2(self, x)` with broadcasting and the dtype promotion
@@ -2528,6 +2570,12 @@ impl PyTensor {
     }
 
     #[pyo3(signature = (axis = None, keepdims = false))]
+    fn prod(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+        self.try_prod_axes(extract_reduction_axes(axis)?, keepdims)
+            .map_err(PyValueError::new_err)
+    }
+
+    #[pyo3(signature = (axis = None, keepdims = false))]
     fn max(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
         self.try_max_axes(extract_reduction_axes(axis)?, keepdims)
             .map_err(PyValueError::new_err)
@@ -2582,6 +2630,10 @@ impl PyTensor {
 
     fn erf(&self) -> PyResult<Self> {
         self.try_erf().map_err(PyValueError::new_err)
+    }
+
+    fn erfc(&self) -> PyResult<Self> {
+        self.try_erfc().map_err(PyValueError::new_err)
     }
 
     /// `atan2(self, x)` of a tensor or Python number `x`.
