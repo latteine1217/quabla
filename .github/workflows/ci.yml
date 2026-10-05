@@ -76,3 +76,13 @@ jobs:
       # The script's __main__ runner executes every test_*; exit 0 == pass.
       - run: .venv-ci/bin/python tests/python/test_matrix.py
       - run: .venv-ci/bin/python tests/python/test_api.py
+      - run: .venv-ci/bin/python tests/python/test_devices_api.py
+      - run: .venv-ci/bin/python tests/python/test_lower_program.py
+      - run: .venv-ci/bin/python tests/python/test_optim_api.py
+      - run: .venv-ci/bin/python tests/python/test_control_api.py
+      - run: .venv-ci/bin/python tests/python/test_distributed_api.py
+      - run: .venv-ci/bin/python tests/python/test_adam_fused.py
+      - run: .venv-ci/bin/python tests/python/test_jacobian_chunks.py
+      - run: .venv-ci/bin/python tests/python/test_cholesky_native.py
+      - run: .venv-ci/bin/python tests/python/test_buffer_narrow_import.py
+      - run: .venv-ci/bin/python tests/python/test_legacy_jacobian_direction.py

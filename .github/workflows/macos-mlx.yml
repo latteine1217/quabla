@@ -11,7 +11,7 @@ name: macOS MLX check
 on:
   pull_request:
     paths:
-      - crates/quabla-core/src/tensor_ir/mlx.rs
+      - "crates/quabla-core/src/tensor_ir/mlx*.rs"
       - "crates/**/Cargo.toml"
       - Cargo.toml
       - Cargo.lock
@@ -62,3 +62,13 @@ jobs:
           VIRTUAL_ENV="$PWD/.venv-ci" .venv-ci/bin/maturin develop
       - run: .venv-ci/bin/python tests/python/test_matrix.py
       - run: .venv-ci/bin/python tests/python/test_api.py
+      - run: .venv-ci/bin/python tests/python/test_devices_api.py
+      - run: .venv-ci/bin/python tests/python/test_lower_program.py
+      - run: .venv-ci/bin/python tests/python/test_optim_api.py
+      - run: .venv-ci/bin/python tests/python/test_control_api.py
+      - run: .venv-ci/bin/python tests/python/test_distributed_api.py
+      - run: .venv-ci/bin/python tests/python/test_adam_fused.py
+      - run: .venv-ci/bin/python tests/python/test_jacobian_chunks.py
+      - run: .venv-ci/bin/python tests/python/test_cholesky_native.py
+      - run: .venv-ci/bin/python tests/python/test_buffer_narrow_import.py
+      - run: .venv-ci/bin/python tests/python/test_legacy_jacobian_direction.py

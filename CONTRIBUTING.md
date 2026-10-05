@@ -51,6 +51,16 @@ cargo test --workspace
 maturin develop --release              # add --features mlx or --features cuda
 python tests/python/test_matrix.py
 python tests/python/test_api.py
+python tests/python/test_devices_api.py
+python tests/python/test_lower_program.py
+python tests/python/test_optim_api.py
+python tests/python/test_control_api.py
+python tests/python/test_distributed_api.py
+python tests/python/test_adam_fused.py
+python tests/python/test_jacobian_chunks.py
+python tests/python/test_cholesky_native.py
+python tests/python/test_buffer_narrow_import.py
+python tests/python/test_legacy_jacobian_direction.py
 ```
 
 The `quabla` package is a mixed Rust/Python project: the pure-Python
