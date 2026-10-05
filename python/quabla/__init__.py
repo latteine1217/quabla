@@ -13,6 +13,8 @@ from . import _array, _errors, _ops, _quabla, _transforms
 from . import tree as tree
 from . import optim as optim
 from . import distributed as distributed
+from . import legacy as legacy
+from . import _compat
 from ._control import *  # noqa: F403
 from ._devices import ShapeDtype as ShapeDtype
 from ._devices import devices as devices
@@ -49,6 +51,7 @@ __all__ = list(
             "devices",
             "optim",
             "distributed",
+            "legacy",
             "cond",
             "fori_loop",
             "scan",
@@ -59,5 +62,26 @@ __all__ = list(
 # v0.1 compatibility alias for the native module. Registering it in
 # sys.modules keeps `import quabla.quabla` and `from quabla.quabla import X`
 # working, not only attribute access.
-quabla = _quabla
 _sys.modules[__name__ + ".quabla"] = _quabla
+
+# Resolve migrated names lazily so a package import does not warn on behalf
+# of an application. Internal code imports the extension directly.
+for _name in _compat.REPLACEMENTS:
+    globals().pop(_name, None)
+
+
+def __getattr__(name):
+    if name in _compat.REPLACEMENTS:
+        _compat.warn(name)
+        return (
+            optim.Adam
+            if name == "Adam"
+            else _quabla
+            if name == "quabla"
+            else getattr(_quabla, name)
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_compat.REPLACEMENTS))

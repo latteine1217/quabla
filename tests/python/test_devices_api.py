@@ -1,4 +1,4 @@
-"""Device jit and ahead-of-time signatures."""
+"""Device jit, ahead-of-time signatures and migration compatibility."""
 
 import os
 import warnings
@@ -57,6 +57,27 @@ def test_lower_has_no_evaluation_and_keeps_pytrees_and_statics():
     raises(ValueError, compiled, {"x": x}, 3)
     raises(ValueError, compiled, {"x": qb.array([1.0, 3.0])}, 2)
     assert qb.jit(lambda: (None, 3)).lower().compile()() == (None, 3)
+
+
+def test_deprecated_names_warn_once_and_preserve_objects():
+    from quabla import _compat
+
+    for name in ("Matrix", "trace_tensor", "Adam"):
+        _compat._WARNED.discard(name)
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always", DeprecationWarning)
+            first = getattr(qb, name)
+            assert first is getattr(qb, name)
+        assert len(seen) == 1 and seen[0].category is DeprecationWarning
+        assert "0.x" in str(seen[0].message)
+    assert qb.Adam is qb.optim.Adam
+    assert qb.legacy.Matrix is qb._quabla.Matrix
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always", DeprecationWarning)
+        assert qb.legacy.grad is qb._quabla.grad
+        assert qb.legacy.jit is qb._quabla.jit
+        qb.grad(lambda x: x * x)(qb.array(2.0))
+    assert not seen
 
 
 def test_device_jit_matches_cpu_for_nested_transforms_and_pytrees():

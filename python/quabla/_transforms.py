@@ -1787,6 +1787,9 @@ def grad(*args, **kwargs):
     spec list (design D17).
     """
     if _is_legacy_grad_call(args, kwargs):
+        from ._compat import warn
+
+        warn("grad")
         return _quabla.grad(*args, **kwargs)
     return _new_grad(*args, **kwargs)
 
@@ -1802,6 +1805,9 @@ def jit(*args, **kwargs):
     works unchanged: it is recognized by its non-callable spec list (D17).
     """
     if _is_legacy_jit_call(args, kwargs):
+        from ._compat import warn
+
+        warn("jit")
         return _quabla.jit(*args, **kwargs)
     return _new_jit(*args, **kwargs)
 
