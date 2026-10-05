@@ -44,6 +44,11 @@ from item 9, `jit` `static_argnames`, keyword arguments of jitted
 functions, and the keyword decorator forms of `jit`, `grad`, and
 `value_and_grad`.
 
+CUDA loop VJPs require every loop operand to have the carry's shape, so
+reverse-mode differentiation of `ode.odeint` (whose time operands are
+scalars) and of loops with broadcast operands runs on the CPU and MLX only;
+lifting that restriction in the CUDA loop lowering is open v0.3 work.
+
 Smaller observations kept for later: `abs` has gradient -1 at 0 (JAX uses
 +1), `max` gives the whole gradient of a tie to the last element (JAX
 splits it), and CPU float32 reductions accumulate in f64, so device
