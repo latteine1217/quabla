@@ -99,6 +99,10 @@ pub struct MlxAdamPlan {
     loss_node_id: usize,
     forward_loss_plan: OnceLock<Result<TensorExecutionPlan, String>>,
     gradient_node_ids: BTreeMap<String, usize>,
+    // Parameter shape and dtype from the initial values. A parameter the loss
+    // does not depend on is pruned from the plan, so its layout cannot be
+    // read from the plan's input nodes.
+    parameter_layouts: BTreeMap<String, (Vec<usize>, TensorDType)>,
     retained_inputs: MlxRetainedInputs,
     adam: BTreeMap<String, MlxAdamState>,
     learning_rate: f32,
@@ -185,29 +189,31 @@ impl MlxAdamPlan {
         names.sort();
         names.dedup();
         let retained_inputs = MlxRetainedInputs::upload(inputs, names)?;
+        let mut parameter_layouts = BTreeMap::new();
         for parameter_name in gradient_node_ids.keys() {
-            let node = plan
-                .nodes
-                .iter()
-                .find(|node| matches!(&node.op, TensorOp::Input { name } if name == parameter_name))
-                .ok_or_else(|| {
-                    format!("MLX Adam parameter {parameter_name:?} is not a plan input")
-                })?;
+            let initial = inputs.get(parameter_name).ok_or_else(|| {
+                format!("MLX Adam parameter {parameter_name:?} has no initial value")
+            })?;
             let parameter = retained_inputs
                 .values
                 .get(parameter_name)
                 .ok_or_else(|| format!("MLX Adam did not retain parameter {parameter_name:?}"))?;
-            if parameter.shape() != mlx_shape(&node.shape)?.as_slice() {
+            if parameter.shape() != mlx_shape(initial.shape())?.as_slice() {
                 return Err(format!(
                     "MLX Adam parameter {parameter_name:?} has an unexpected retained shape"
                 ));
             }
+            parameter_layouts.insert(
+                parameter_name.clone(),
+                (initial.shape().to_vec(), initial.dtype()),
+            );
         }
         Ok(Self {
             plan,
             loss_node_id,
             forward_loss_plan: OnceLock::new(),
             gradient_node_ids,
+            parameter_layouts,
             retained_inputs,
             adam: BTreeMap::new(),
             learning_rate,
@@ -356,12 +362,10 @@ impl MlxAdamPlan {
 
     pub fn parameter(&self, name: &str) -> Result<DynamicTensor, String> {
         let _guard = mlx_execution_guard();
-        let node = self
-            .plan
-            .nodes
-            .iter()
-            .find(|node| matches!(&node.op, TensorOp::Input { name: input_name } if input_name == name))
-            .ok_or_else(|| format!("MLX Adam parameter {name:?} is not a plan input"))?;
+        let (shape, dtype) = self
+            .parameter_layouts
+            .get(name)
+            .ok_or_else(|| format!("MLX Adam parameter {name:?} is not a parameter"))?;
         let parameter = self
             .retained_inputs
             .values
@@ -369,11 +373,11 @@ impl MlxAdamPlan {
             .ok_or_else(|| format!("MLX Adam parameter {name:?} is not retained"))?;
         let parameter = mlx_row_major(parameter, &StreamOrDevice::gpu())?;
         DynamicTensor::from_storage(
-            node.shape.clone(),
+            shape.clone(),
             super::HostTensorStorage::from_f32(
                 mlx_host_values(&parameter)
                     .map_err(|error| format!("MLX Adam parameter {name:?} {error}"))?,
-                node.dtype,
+                *dtype,
             ),
         )
     }

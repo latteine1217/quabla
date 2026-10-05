@@ -286,6 +286,39 @@ def test_cuda_trainer_convergence():
         train("cuda:0", Adam(0.05))
 
 
+def test_device_trainer_keeps_parameters_the_loss_ignores():
+    # A parameter the loss does not depend on (here, an output bias that the
+    # second derivative removes) is pruned from the compiled gradient plan;
+    # device trainers must still accept it and leave it unchanged, like CPU.
+    def u(params, x):
+        return (qb.tanh(x * params["w1"]) * params["w2"]).sum() + params["b2"]
+
+    def loss(params, xs):
+        second = qb.vmap(lambda x: qb.grad(qb.grad(lambda z: u(params, z)))(x))(xs)
+        return (second**2).sum()
+
+    params = {
+        "w1": qb.array([0.5, -0.3], dtype=qb.float32),
+        "w2": qb.array([1.0, 0.7], dtype=qb.float32),
+        "b2": qb.array(0.2, dtype=qb.float32),
+    }
+    xs = qb.array([0.1, 0.4, 0.9], dtype=qb.float32)
+    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda:0", "QUABLA_CUDA_TEST")):
+        if os.environ.get(flag) != "1":
+            continue
+        expected = Trainer(loss, params, Adam(0.01), xs)
+        actual = Trainer(loss, params, Adam(0.01), xs, device=device)
+        for _ in range(2):
+            expected.step()
+            actual.step()
+        assert actual.params["b2"].tolist() == params["b2"].tolist()
+        for name in ("w1", "w2"):
+            for got, want in zip(
+                actual.params[name].tolist(), expected.params[name].tolist()
+            ):
+                assert math.isclose(got, want, rel_tol=1e-5), (device, name, got, want)
+
+
 def test_trainer_releases_replaced_batch_payload():
     import sys
 
