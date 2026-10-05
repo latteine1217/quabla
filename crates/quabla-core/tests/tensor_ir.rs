@@ -2100,7 +2100,10 @@ fn cuda_backend_reuses_cond_regions_and_rejects_non_finite_predicates_when_enabl
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
-fn cuda_backend_rejects_cond_inside_fused_fori_and_scan_bodies() {
+fn cuda_backend_runs_cond_inside_fori_and_scan_bodies_as_host_driven_loops_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
     let mut on_true = TensorIr::new();
     let true_carry = must!(on_true.input("carry", vec![]));
     let mut on_false = TensorIr::new();
@@ -2113,12 +2116,16 @@ fn cuda_backend_rejects_cond_inside_fused_fori_and_scan_bodies() {
     ));
     let mut body = TensorIr::new();
     let carry = must!(body.input("carry", vec![]));
-    must!(body.input("index", vec![]));
-    let body_output = must!(body.cond(carry, branches));
+    let index = must!(body.input("index", vec![]));
+    let predicate = must!(body.sub(carry, index));
+    let selected = must!(body.cond(predicate, branches));
+    let body_output = must!(body.add(selected, index));
 
+    // The fused per-lane kernel cannot lower `Cond`, so both loops run their
+    // body region (which owns the nested Cond regions) once per iteration.
     let loop_plan = must!(TensorForiExecutionPlan::new(
         0,
-        3,
+        4,
         must!(body.compile_cpu(body_output)),
         "carry",
         "index",
@@ -2126,33 +2133,150 @@ fn cuda_backend_rejects_cond_inside_fused_fori_and_scan_bodies() {
     let mut graph = TensorIr::new();
     let initial = must!(graph.input("initial", vec![]));
     let output = must!(graph.fori(initial, loop_plan, Vec::new()));
-    let error = CudaBackend::new(0)
-        .compile(must!(graph.compile_cpu(output)))
-        .expect_err("CUDA must reject Cond inside a fused Fori body");
-    assert!(
-        error.contains("Fori node") && error.contains("cannot lower to a device loop"),
-        "unexpected error: {error}"
-    );
-    assert!(error.contains("cond"), "unexpected error: {error}");
-
     let scan_plan = must!(TensorScanExecutionPlan::new(
         0,
-        3,
+        4,
         must!(body.compile_cpu_many(&[body_output, body_output])).0,
         "carry",
         "index",
     ));
-    let mut graph = TensorIr::new();
-    let initial = must!(graph.input("initial", vec![]));
-    let (carry, _) = must!(graph.scan(initial, scan_plan, Vec::new()));
-    let error = CudaBackend::new(0)
-        .compile(must!(graph.compile_cpu(carry)))
-        .expect_err("CUDA must reject Cond inside a fused Scan body");
-    assert!(
-        error.contains("Scan node") && error.contains("cannot lower to a device loop"),
-        "unexpected error: {error}"
+    let (scan_carry, scan_outputs) = must!(graph.scan(initial, scan_plan, Vec::new()));
+    let sources = vec![output, scan_carry, scan_outputs];
+    let (plan, output_ids) = must!(graph.compile_cpu_many(&sources));
+    for initial in [1.5, 0.0] {
+        let inputs = BTreeMap::from([(
+            "initial".to_string(),
+            must!(DynamicTensor::new(vec![], vec![initial])),
+        )]);
+        let mut cpu = Vec::new();
+        for source in &sources {
+            cpu.push(must!(must!(graph.compile_cpu(*source)).evaluate(&inputs)));
+        }
+        let cuda = must!(CudaBackend::new(0).execute_many(&plan, &output_ids, &inputs));
+        assert_cuda_outputs_match_cpu("Cond inside loop bodies", &cuda, &cpu, 1e-6);
+    }
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_executes_while_loops_as_host_driven_region_loops_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    let (graph, output, inputs) = must!(doubling_while_graph());
+    let plan = must!(graph.compile_cpu(output));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_eq!(cuda.data().as_ref(), &[16.0]);
+    // Forward mode runs the same While node over a packed (primal, tangent) carry.
+    let transformed = must!(graph.symbolic_jvp_with_tangent_inputs(
+        output,
+        &BTreeMap::from([("scale".to_string(), "scale_tangent".to_string())]),
+    ));
+    let plan = must!(transformed.graph.compile_cpu(transformed.tangent));
+    let mut inputs = inputs;
+    inputs.insert(
+        "scale_tangent".to_string(),
+        must!(DynamicTensor::new(vec![], vec![1.0])),
     );
-    assert!(error.contains("cond"), "unexpected error: {error}");
+    let cpu = must!(plan.evaluate(&inputs));
+    let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+    assert_cuda_outputs_match_cpu("While JVP", &[cuda], &[cpu], 1e-6);
+}
+
+/// `x <- x + (dt * k) * x` plus a slice/concat rotation: the scalar captures'
+/// gradients are reduced inside the body VJP (`dt * sum(...)`), which the fused
+/// kernel cannot express, and the rotation is not elementwise.
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[allow(clippy::type_complexity)]
+fn host_driven_fori_loss(
+    rotate: bool,
+) -> Result<(TensorIr, TensorNodeId, BTreeMap<String, DynamicTensor>), String> {
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![3])?;
+    body.input("index", vec![])?;
+    let rate = body.input("rate", vec![])?;
+    let step = body.input("step", vec![])?;
+    let factor = body.mul(step, rate)?;
+    let increment = body.mul(factor, carry)?;
+    let mut next = body.add(carry, increment)?;
+    if rotate {
+        let head = body.slice_axis(next, 0, 0, 1)?;
+        let tail = body.slice_axis(next, 0, 1, 3)?;
+        next = body.concat(vec![tail, head], 0)?;
+    }
+    let loop_plan = TensorForiExecutionPlan::new(0, 40, body.compile_cpu(next)?, "carry", "index")?;
+    let mut graph = TensorIr::new();
+    let initial = graph.input("initial", vec![3])?;
+    let rate = graph.input("rate", vec![])?;
+    let step = graph.input("step", vec![])?;
+    let output = graph.fori(
+        initial,
+        loop_plan,
+        vec![("rate".to_string(), rate), ("step".to_string(), step)],
+    )?;
+    let squared = graph.mul(output, output)?;
+    let loss = graph.sum(squared)?;
+    let inputs = BTreeMap::from([
+        (
+            "initial".to_string(),
+            DynamicTensor::new(vec![3], vec![0.5, -1.0, 2.0])?,
+        ),
+        ("rate".to_string(), DynamicTensor::new(vec![], vec![-0.7])?),
+        ("step".to_string(), DynamicTensor::new(vec![], vec![0.05])?),
+        ("seed".to_string(), DynamicTensor::new(vec![], vec![1.0])?),
+        (
+            "initial_tangent".to_string(),
+            DynamicTensor::new(vec![3], vec![0.0; 3])?,
+        ),
+        (
+            "rate_tangent".to_string(),
+            DynamicTensor::new(vec![], vec![1.0])?,
+        ),
+        (
+            "step_tangent".to_string(),
+            DynamicTensor::new(vec![], vec![0.0])?,
+        ),
+    ]);
+    Ok((graph, loss, inputs))
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_matches_cpu_for_host_driven_fori_vjp_and_hvp_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    for rotate in [false, true] {
+        let (graph, loss, inputs) = must!(host_driven_fori_loss(rotate));
+        let transformed = must!(graph.symbolic_vjp(loss, "seed"));
+        let gradients = ["initial", "rate", "step"]
+            .iter()
+            .map(|name| transformed.gradients[*name])
+            .collect::<Vec<_>>();
+        let (plan, output_ids) = must!(transformed.graph.compile_cpu_many(&gradients));
+        let mut cpu = Vec::new();
+        for gradient in &gradients {
+            cpu.push(must!(
+                must!(transformed.graph.compile_cpu(*gradient)).evaluate(&inputs)
+            ));
+        }
+        let cuda = must!(CudaBackend::new(0).execute_many(&plan, &output_ids, &inputs));
+        assert_cuda_outputs_match_cpu("host-driven Fori VJP", &cuda, &cpu, 1e-4);
+
+        // Forward-over-reverse: the directional derivative of the rate gradient.
+        let tangents = BTreeMap::from([
+            ("initial".to_string(), "initial_tangent".to_string()),
+            ("rate".to_string(), "rate_tangent".to_string()),
+            ("step".to_string(), "step_tangent".to_string()),
+        ]);
+        let hvp = must!(transformed
+            .graph
+            .symbolic_jvp_with_tangent_inputs(transformed.gradients["rate"], &tangents));
+        let plan = must!(hvp.graph.compile_cpu(hvp.tangent));
+        let cpu = must!(plan.evaluate(&inputs));
+        let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+        assert_cuda_outputs_match_cpu("host-driven Fori HVP", &[cuda], &[cpu], 1e-4);
+    }
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
@@ -9896,7 +10020,9 @@ fn cuda_backend_uploads_array_constants_once_per_plan_when_enabled() {
         );
     }
 
-    // Device loops bind arrays only through captures.
+    // The fused loop kernel reads arrays only through captures, so a body with
+    // an array constant runs as a host-driven region loop whose body program
+    // keeps the constant resident across iterations and executions.
     let mut body = TensorIr::new();
     let carry = must!(body.input("carry", vec![2]));
     let _index = must!(body.input("index", vec![]));
@@ -9912,10 +10038,16 @@ fn cuda_backend_uploads_array_constants_once_per_plan_when_enabled() {
     let mut graph = TensorIr::new();
     let initial = must!(graph.input("initial", vec![2]));
     let output = must!(graph.fori(initial, loop_plan, vec![]));
-    let error = CudaBackend::new(0)
-        .compile(must!(graph.compile_cpu(output)))
-        .expect_err("a device loop body with an array constant must be rejected");
-    assert!(error.contains("array constant"), "{error}");
+    let cpu_plan = must!(graph.compile_cpu(output));
+    let plan = must!(CudaBackend::new(0).compile(cpu_plan.clone()));
+    for start in [0.5, -1.0] {
+        let inputs =
+            BTreeMap::from([("initial".to_string(), must!(vector(&[start, 2.0 * start])))]);
+        assert_eq!(
+            must!(plan.execute(&inputs)).data().as_ref(),
+            must!(cpu_plan.evaluate(&inputs)).data().as_ref()
+        );
+    }
 }
 
 /// The leading-axis slice `index` of a mapped value, as one example.

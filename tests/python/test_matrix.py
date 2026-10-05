@@ -1132,19 +1132,22 @@ def _scan_rejection_program(body, carry_shape, capture_shape, result="outputs"):
     )
 
 
-def test_compiler_facade_cuda_rejects_every_unsupported_scan_lane_form():
+def test_compiler_facade_cuda_runs_non_fused_scan_forms_as_host_driven_loops():
     if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
+    # Each case carries its program with the carry and capture shapes.
     def primal(body, carry_shape, capture_shape):
-        return _scan_rejection_program(body, carry_shape, capture_shape)
+        program = _scan_rejection_program(body, carry_shape, capture_shape)
+        return program, carry_shape, capture_shape
 
     def gradient(body, carry_shape, capture_shape, name):
         program = _scan_rejection_program(body, carry_shape, capture_shape, "loss")
-        return program.vjp("loss_cotangent")[name]
+        return program.vjp("loss_cotangent")[name], carry_shape, capture_shape
 
     def hvp(body, carry_shape, capture_shape):
-        return gradient(body, carry_shape, capture_shape, "capture").jvp("capture")
+        program = gradient(body, carry_shape, capture_shape, "capture")[0]
+        return program.jvp("capture"), carry_shape, capture_shape
 
     def reshaped_capture(index, current, capture):
         return (
@@ -1161,6 +1164,10 @@ def test_compiler_facade_cuda_rejects_every_unsupported_scan_lane_form():
             current * capture + index,
             current * capture + index,
         )
+    # The fused per-lane Scan kernel lowers none of these forms. Primal Scan
+    # and first-order ScanVjp then run as host-driven region loops and must
+    # match the CPU; forward-over-reverse ScanVjpJvp has no such fallback and
+    # keeps its explicit rejection.
     cases = [
         # Primal Scan: lane shapes and capture shapes.
         (
@@ -1236,9 +1243,13 @@ def test_compiler_facade_cuda_rejects_every_unsupported_scan_lane_form():
         ),
         (
             "VJP of a packed-pair Scan JVP",
-            _scan_rejection_program(linear, [3], [3], "loss")
-            .jvp("initial")
-            .vjp("jvp_cotangent")["initial"],
+            (
+                _scan_rejection_program(linear, [3], [3], "loss")
+                .jvp("initial")
+                .vjp("jvp_cotangent")["initial"],
+                [3],
+                [3],
+            ),
             "unsupported pad_slice operation",
         ),
         # Forward-over-reverse ScanVjpJvp.
@@ -1253,13 +1264,29 @@ def test_compiler_facade_cuda_rejects_every_unsupported_scan_lane_form():
             "did not expose an elementwise contribution",
         ),
     ]
-    for label, program, expected in cases:
-        try:
-            program.compile("cuda")
-        except ValueError as error:
-            assert expected in str(error), f"{label}: {error}"
-        else:
-            raise AssertionError(f"CUDA accepted unsupported Scan form: {label}")
+    def tensor(shape, offset):
+        count = math.prod(shape)
+        return quabla.Tensor(shape, [0.3 + offset + 0.1 * k for k in range(count)])
+
+    for label, (program, carry_shape, capture_shape), expected in cases:
+        if label.startswith("HVP"):
+            try:
+                program.compile("cuda")
+            except ValueError as error:
+                assert expected in str(error), f"{label}: {error}"
+            else:
+                raise AssertionError(f"CUDA accepted unsupported Scan form: {label}")
+            continue
+        inputs = {
+            "initial": tensor(carry_shape, 0.0),
+            "capture": tensor(capture_shape, 0.5),
+            "loss_cotangent": quabla.Tensor([], [1.0]),
+            "initial_tangent": tensor(carry_shape, 0.2),
+            "jvp_cotangent": quabla.Tensor([], [1.0]),
+        }
+        cpu = program.compile("cpu")(inputs)
+        cuda = program.compile("cuda")(inputs)
+        assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=1e-4)
 
 
 def test_compiler_facade_rejects_scan_derivatives_beyond_forward_over_reverse():
