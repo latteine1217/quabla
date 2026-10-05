@@ -508,8 +508,27 @@ to `y0`, `t0`, `t1`, and `args` and run under `jit` on every device (CUDA
 supports the forward solve; its loop VJP needs operands of the carry's
 shape, while the solver passes scalar time operands). `y0` is
 a single array, and `f` must receive traced values through `args`, as loop
-bodies do. Adaptive step-size control needs a traced loop condition and is
-not provided.
+bodies do.
+
+`qb.ode.odeint(f, y0, (t0, t1), method="dopri5", rtol=1e-6, atol=1e-9,
+max_steps=512, info=False)` is the adaptive Dormand-Prince 5(4) pair with
+first-same-as-last stages. Steps are accepted when the RMS norm of the
+embedded error estimate scaled by `atol + rtol * max(|y|, |y_new|)` is at
+most one; a PI controller (gains 0.7/5 and 0.4/5, safety 0.9, factor
+clipped to [0.2, 10]) picks the next step, rejected steps fall back to the
+I-controller, and the first step follows Hairer and Wanner's starting-step
+algorithm. The last step lands exactly on `t1`, and integration may run
+backward. The solve is a bounded `fori_loop` whose body stops advancing
+once `t1` is reached, so it is reverse-mode differentiable; a traced solve
+therefore always pays `max_steps` step attempts. It runs on the CPU and
+MLX; the fused CUDA loop kernel cannot lower its carry slicing yet and
+raises `UnsupportedOperationError`. Step sizes are controller
+outputs without gradients (only the final step depends on `t1`), so
+derivatives are those of the discrete scheme on the chosen mesh and are
+piecewise smooth across accept/reject changes. An eager solve stops at
+`t1` and raises `RuntimeError` when `max_steps` attempts do not reach it;
+under `jit` it cannot raise, and `info=True` returns `(y, info)` with
+`t`, `accepted_steps`, `rejected_steps`, and a bool `success`.
 
 `qb.distributed.value_and_grad(fun, devices=["cuda:0", "cuda:1"], shard_argnums=(1,),
 argnums=0, reduction="mean")` is experimental single-node CUDA/NCCL execution.
