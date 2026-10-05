@@ -1,5 +1,6 @@
 import collections
 import ctypes
+import dataclasses
 import gc
 import importlib
 import importlib.machinery
@@ -11,6 +12,7 @@ import pickle
 import struct
 import subprocess
 import sys
+import warnings
 
 import quabla
 import quabla as qb
@@ -990,10 +992,268 @@ def test_tree_flatten_unflatten_and_map():
     assert_raises(
         ValueError, qb.tree.unflatten, treedef, [1.0], match="has 3 leaves, got 1"
     )
-    assert_raises(TypeError, qb.tree.flatten, {1: 2.0}, match="keys must be strings")
-    # Container subclasses are leaves (D6: no NamedTuple support in v0.2).
-    point = collections.namedtuple("Point", "x y")(1.0, 2.0)
-    assert qb.tree.flatten([point])[0] == [point]
+    # Keys of any mutually sortable type are traversed in sorted order.
+    leaves, int_keys = qb.tree.flatten({10: "b", 2: "a"})
+    assert leaves == ["a", "b"] and repr(int_keys) == "TreeDef({2: *, 10: *})"
+    assert qb.tree.unflatten(int_keys, [1, 2]) == {2: 1, 10: 2}
+    assert int_keys != qb.tree.structure({"2": 0, "10": 0})
+    assert_raises(TypeError, qb.tree.flatten, {1: 2.0, "a": 3.0}, match="sortable")
+    # Other container subclasses stay leaves of the tree utilities.
+    ordered = collections.OrderedDict(a=1.0)
+    assert qb.tree.leaves([ordered]) == [ordered]
+
+
+@qb.tree.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class FrozenLayer:
+    w: object
+    b: object
+
+
+@dataclasses.dataclass
+class ScaledLayer:
+    w: object
+    activation: str = "tanh"
+    scale: float = 1.0
+
+
+qb.tree.register_dataclass(ScaledLayer, meta_fields=("activation",))
+
+Point = collections.namedtuple("Point", "x y")
+
+
+class Interval:
+    """A node registered with explicit flatten functions; `closed` is aux data."""
+
+    def __init__(self, low, high, closed=True):
+        self.low, self.high, self.closed = low, high, closed
+
+
+qb.tree.register(
+    Interval,
+    lambda value: ((value.low, value.high), value.closed),
+    lambda closed, children: Interval(*children, closed),
+)
+
+
+def test_tree_namedtuple_dataclass_and_registered_nodes():
+    tree = {"p": Point(1.0, (2.0, None)), "layer": FrozenLayer(3.0, [4.0])}
+    leaves, treedef = qb.tree.flatten(tree)
+    assert leaves == [3.0, 4.0, 1.0, 2.0]
+    assert repr(treedef) == (
+        "TreeDef({'layer': FrozenLayer(w=*, b=[*]), 'p': Point(x=*, y=(*, None))})"
+    )
+    rebuilt = qb.tree.unflatten(treedef, [v * 10 for v in leaves])
+    assert type(rebuilt["p"]) is Point and rebuilt["p"] == Point(10.0, (20.0, None))
+    assert rebuilt["layer"] == FrozenLayer(30.0, [40.0])
+    assert qb.tree.leaves(tree) == leaves and qb.tree.structure(tree) == treedef
+    assert treedef.unflatten(leaves) == tree
+    paths, path_def = qb.tree.flatten_with_path(tree)
+    assert path_def == treedef
+    assert [path for path, _ in paths] == [
+        ("layer", "w"),
+        ("layer", "b", 0),
+        ("p", "x"),
+        ("p", "y", 0),
+    ]
+    # Class and aux data are part of the structure: a NamedTuple differs from
+    # a tuple and from another NamedTuple class with the same fields.
+    assert qb.tree.structure(Point(1, 2)) != qb.tree.structure((1, 2))
+    other_point = collections.namedtuple("Point", "x y")
+    assert qb.tree.structure(Point(1, 2)) != qb.tree.structure(other_point(1, 2))
+    tanh = ScaledLayer(1.0, "tanh", 2.0)
+    assert qb.tree.leaves(tanh) == [1.0, 2.0]
+    assert qb.tree.structure(tanh) != qb.tree.structure(ScaledLayer(1.0, "relu", 2.0))
+    assert repr(qb.tree.structure(tanh)) == "TreeDef(ScaledLayer(w=*, scale=*, aux=('tanh',)))"
+    assert qb.tree.map(lambda a, b: a + b, tanh, tanh) == ScaledLayer(2.0, "tanh", 4.0)
+    interval = qb.tree.map(lambda v: v * 2, Interval(1.0, 2.0, closed=False))
+    assert (interval.low, interval.high, interval.closed) == (2.0, 4.0, False)
+    assert qb.tree.flatten_with_path(Interval(1.0, 2.0))[0] == [((0,), 1.0), ((1,), 2.0)]
+    assert_raises(
+        ValueError,
+        qb.tree.map,
+        lambda a, b: a,
+        Point(1.0, 2.0),
+        (1.0, 2.0),
+        match="structures differ",
+    )
+    # Registration errors.
+    assert_raises(ValueError, qb.tree.register, dict, len, len, match="built-in")
+    assert_raises(ValueError, qb.tree.register_dataclass, FrozenLayer, match="already")
+    assert_raises(TypeError, qb.tree.register_dataclass, Interval, match="dataclass type")
+
+    @dataclasses.dataclass
+    class Partial:
+        a: object
+        b: object
+
+    assert_raises(
+        ValueError,
+        qb.tree.register_dataclass,
+        Partial,
+        data_fields=("a",),
+        meta_fields=(),
+        match="exactly once",
+    )
+
+    class Unhashable:
+        def __init__(self, value):
+            self.value = value
+
+    qb.tree.register(Unhashable, lambda v: ((v.value,), [1]), lambda aux, c: Unhashable(*c))
+    assert_raises(TypeError, qb.tree.flatten, Unhashable(1.0), match="must be hashable")
+
+
+def test_transforms_accept_namedtuple_dataclass_and_registered_nodes():
+    x = qb.array([1.0, 2.0])
+
+    def loss(params, x):
+        return qb.sum((params.w * x + params.b) ** 2)
+
+    params = FrozenLayer(qb.array([0.5, -1.0]), qb.array(0.25))
+    grads = qb.grad(loss)(params, x)
+    assert type(grads) is FrozenLayer
+    residual = [0.5 * 1.0 + 0.25, -1.0 * 2.0 + 0.25]
+    assert_close(grads.w, [2 * residual[0] * 1.0, 2 * residual[1] * 2.0])
+    assert_close(grads.b, 2 * sum(residual))
+    value, point_grads = qb.value_and_grad(lambda p: qb.sum(p.x * p.y))(Point(x, x * 3.0))
+    assert type(point_grads) is Point
+    assert_close(point_grads.x, [3.0, 6.0])
+    assert_close(point_grads.y, [1.0, 2.0])
+    assert_close(value, 15.0)
+    # A meta field is static: each value gets its own trace; leaves of the
+    # same class, values, and shapes reuse one.
+    traces = []
+
+    def apply(layer, x):
+        traces.append(layer.activation)
+        out = layer.w * x * layer.scale
+        return qb.tanh(out) if layer.activation == "tanh" else qb.relu(out)
+
+    jitted = qb.jit(apply)
+    jitted(ScaledLayer(x, "tanh", 2.0), x)
+    jitted(ScaledLayer(x * 2.0, "tanh", 2.0), x)
+    assert_close(jitted(ScaledLayer(x, "relu", 2.0), x), [2.0, 8.0])
+    assert traces == ["tanh", "relu"]
+    # Two classes with the same fields never share a program.
+    other_point = collections.namedtuple("Point", "x y")
+    swap = qb.jit(lambda p: p)
+    assert type(swap(Point(x, x))) is Point
+    assert type(swap(other_point(x, x))) is other_point
+    # Registered nodes with aux data round-trip through jit and grad.
+    width = qb.jit(lambda i: i.high - i.low)(Interval(x, x * 3.0, closed=False))
+    assert_close(width, [2.0, 4.0])
+    interval_grad = qb.grad(lambda i: qb.sum(i.high * i.low))(Interval(x, x * 3.0, False))
+    assert type(interval_grad) is Interval and interval_grad.closed is False
+    assert_close(interval_grad.low, [3.0, 6.0])
+    # vmap: NamedTuple and dataclass in_axes/out_axes prefixes.
+    xs = qb.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    batched = qb.vmap(
+        lambda p: Point(p.x * p.y, qb.sum(p.x)), in_axes=(Point(0, None),), out_axes=Point(0, 0)
+    )(Point(xs, qb.array([10.0, 100.0])))
+    assert type(batched) is Point
+    assert_close(batched.x, [[10.0, 200.0], [30.0, 400.0], [50.0, 600.0]])
+    assert_close(batched.y, [3.0, 7.0, 11.0])
+    layer_out = qb.vmap(apply, in_axes=(ScaledLayer(None, "tanh", None), 0))(
+        ScaledLayer(qb.array([1.0, 1.0]), "tanh", 0.5), xs
+    )
+    assert_close(layer_out, [[math.tanh(0.5 * v) for v in row] for row in xs.tolist()])
+    assert_raises(
+        ValueError,
+        qb.vmap(apply, in_axes=(ScaledLayer(None, "relu", None), 0)),
+        ScaledLayer(qb.array([1.0, 1.0]), "tanh", 0.5),
+        xs,
+        match="does not match the structure",
+    )
+    # jacobian blocks keep the argument structure.
+    jac = qb.jacobian(lambda p: p.x * p.y)(Point(x, x * 2.0))
+    assert type(jac) is Point
+    assert_close(jac.x, [[2.0, 0.0], [0.0, 4.0]])
+    # Unregistered dataclasses and other container subclasses are rejected.
+
+    @dataclasses.dataclass
+    class Plain:
+        w: object
+
+    assert_raises(TypeError, qb.jit(lambda p: p.w), Plain(x), match="register_dataclass")
+    assert_raises(
+        TypeError,
+        qb.jit(lambda p: p["a"]),
+        collections.OrderedDict(a=x),
+        match="not a pytree container",
+    )
+    # dict arguments may have integer keys.
+    assert_close(qb.grad(lambda d: qb.sum(d[0] * d[1]))({1: x, 0: x * 2.0})[1], [2.0, 4.0])
+
+
+def test_jit_static_argnames_and_keyword_arguments():
+    x = qb.array([1.0, 2.0])
+    traces = []
+
+    def power(x, n, *, offset=0.0, scale):
+        traces.append((n, offset, scale))
+        return qb.sum(x**n) * scale + offset
+
+    jitted = qb.jit(power, static_argnames=("n", "scale"))
+    assert_close(jitted(x, 2, scale=1.0), 5.0)
+    # n by keyword binds to its position and reuses the positional trace.
+    assert_close(jitted(x, n=2, scale=1.0), 5.0)
+    assert_close(jitted(x=x, n=2, scale=1.0), 5.0)
+    assert traces == [(2, 0.0, 1.0)]
+    assert_close(jitted(x, 3, scale=2.0), 18.0)
+    assert len(traces) == 2
+    # A keyword-only argument that is not static is rejected with a hint.
+    assert_raises(TypeError, jitted, x, 2, scale=1.0, offset=1.0, match="static_argnames")
+    assert_raises(TypeError, jitted, x, 2, x=x, scale=1.0, match="multiple values")
+    assert_raises(TypeError, jitted, x, 2, scale=[1.0], match="hashable")
+    assert_raises(ValueError, qb.jit, power, static_argnames="missing", match="not parameters")
+    # static_argnums implies the keyword spelling, and vice versa.
+    by_number = qb.jit(power, static_argnums=1, static_argnames="scale")
+    assert_close(by_number(x, n=2, scale=1.0), 5.0)
+    assert_close(by_number(x, 2, scale=1.0), 5.0)
+    # The lowered program checks keyword statics too.
+    compiled = jitted.lower(x, 2, scale=1.0).compile()
+    assert_close(compiled(x, n=2, scale=1.0), 5.0)
+    assert_raises(ValueError, compiled, x, 2, scale=3.0, match="statics")
+    # Static keywords reach a plain function traced inside another transform.
+    assert_close(qb.grad(lambda x: jitted(x, 2, scale=0.5))(x), [1.0, 2.0])
+    # Eviction messages describe keyword statics.
+    small = qb.jit(power, static_argnames=("n", "scale"), max_traces=1)
+    small(x, 2, scale=1.0)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        small(x, 2, scale=2.0)
+    assert "with scale=static 1.0" in str(caught[0].message)
+
+
+def test_transform_decorators_take_keywords_without_the_function():
+    @qb.jit(device="cpu", static_argnums=1)
+    def scaled(x, factor):
+        return x * factor
+
+    assert isinstance(scaled, qb._transforms._Jit)
+    assert_close(scaled(qb.array([1.0, 2.0]), 3), [3.0, 6.0])
+
+    @qb.jit(static_argnames="n")
+    def repeat(x, n):
+        return x * float(n)
+
+    assert_close(repeat(qb.array(2.0), n=4), 8.0)
+
+    @qb.grad(argnums=1)
+    def second(a, b):
+        return qb.sum(a * b * b)
+
+    assert_close(second(qb.array(2.0), qb.array(3.0)), 12.0)
+
+    @qb.value_and_grad(has_aux=True)
+    def with_aux(a):
+        return qb.sum(a * a), qb.sum(a)
+
+    (value, aux), gradient = with_aux(qb.array([1.0, 2.0]))
+    assert_close(value, 5.0)
+    assert_close(aux, 3.0)
+    assert_close(gradient, [2.0, 4.0])
 
 
 def test_error_classes_subclass_the_builtins_raised_before():

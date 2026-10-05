@@ -50,6 +50,7 @@ tracers of this call, which must have the shapes and dtypes it was staged
 with.
 """
 
+import dataclasses
 import inspect
 import os
 import sys
@@ -61,7 +62,18 @@ from ._array import arange, asarray, zeros
 from ._devices import ShapeDtype, require_device
 from ._errors import RetraceWarning, UnsupportedOperationError
 from ._quabla import Tensor, TensorTraceGraph, TraceTensor, bool_, float32, float64
-from .tree import _LEAF, _describe, _flatten, _leaf_count, _leaf_paths, _unflatten
+from .random import Key
+from .tree import (
+    _LEAF,
+    _REGISTRY,
+    _describe,
+    _flatten,
+    _is_namedtuple_class,
+    _leaf_count,
+    _leaf_paths,
+    _sorted_keys,
+    _unflatten,
+)
 
 __all__ = ["grad", "hessian", "jacobian", "jit", "jvp", "value_and_grad", "vjp", "vmap"]
 
@@ -104,13 +116,6 @@ class _Static:
         self.value = value
 
 
-class _Text(str):
-    """A string that reprs without quotes, for rendering signatures."""
-
-    def __repr__(self):
-        return str(self)
-
-
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
 
 
@@ -151,8 +156,20 @@ def _static_value(key):
 def _as_array_leaf(leaf):
     if isinstance(leaf, (tuple, list, dict)):
         raise TypeError(
-            f"{type(leaf).__name__} is not a pytree container: only dict, list, tuple, and "
-            "None are (NamedTuple and container subclasses are not supported in v0.2)"
+            f"{type(leaf).__name__} is not a pytree container: dict, list, tuple, None, "
+            "NamedTuple, and classes registered with quabla.tree.register are; register "
+            "other container subclasses explicitly"
+        )
+    if dataclasses.is_dataclass(leaf):
+        raise TypeError(
+            f"dataclass {type(leaf).__name__} is not a pytree node; register it with "
+            "quabla.tree.register_dataclass"
+        )
+    if type(leaf) is Key:
+        raise TypeError(
+            "a quabla.random key cannot be a traced argument: keys are host values, so "
+            "sample outside the transformed function and pass the arrays, or make the key "
+            "static with static_argnums/static_argnames (one trace per key)"
         )
     try:
         return asarray(leaf)
@@ -284,6 +301,12 @@ def _traced_signature(args, static_argnums, converted_argnums):
 
 
 def _describe_signature(key):
+    if type(key) is _KeywordKey:
+        key, keywords = key
+        rendered = ", ".join(
+            f"{name}=static {_static_value(value)!r}" for name, value in keywords
+        )
+        return f"{_describe_signature(key)} with {rendered}"
     if type(key) is _CaptureKey:
         key, avals = key
         captured = ", ".join(_describe_aval(shape, dtype) for shape, dtype in avals)
@@ -292,12 +315,12 @@ def _describe_signature(key):
     rendered = []
     for part in parts:
         if part[0] is _Static:
-            rendered.append(_Text(f"static {_static_value(part[1])!r}"))
+            rendered.append(f"static {_static_value(part[1])!r}")
         elif isinstance(part[0], tuple):
-            rendered.append(_Text(_describe_aval(part[0], part[1])))
+            rendered.append(_describe_aval(part[0], part[1]))
         else:
-            rendered.append(_Text(repr(_static_value(part))))
-    return repr(_unflatten(in_node, iter(rendered)))
+            rendered.append(repr(_static_value(part)))
+    return _describe(in_node, iter(rendered))
 
 
 def _describe_aval(shape, dtype):
@@ -389,9 +412,10 @@ class _Probe:
     captures. The function is held weakly where possible, since the caches
     holding the probe are keyed weakly on it."""
 
-    __slots__ = ("fun", "in_node", "leaves", "names")
+    __slots__ = ("fun", "in_node", "leaves", "names", "kwargs")
 
-    def __init__(self, fun, in_node, leaves, names):
+    def __init__(self, fun, in_node, leaves, names, kwargs=None):
+        self.kwargs = kwargs
         try:
             self.fun = weakref.ref(fun)
         except TypeError:
@@ -404,10 +428,14 @@ class _Probe:
         self.names = names
 
     def captures(self):
-        return _trace(self.fun(), self.in_node, self.leaves, self.names).captures
+        return _trace(
+            self.fun(), self.in_node, self.leaves, self.names, self.kwargs
+        ).captures
 
 
-def _trace(fun, in_node, leaves, names):
+def _trace(fun, in_node, leaves, names, kwargs=None):
+    """Traces `fun` called on the pytree `in_node` of `leaves`, plus the
+    static keyword arguments `kwargs` of a jitted call, if any."""
     graph = TensorTraceGraph()
     values = []
     input_names = []
@@ -424,7 +452,8 @@ def _trace(fun, in_node, leaves, names):
     # lifted into it as capture inputs (see the module notes).
     graph._begin_trace()
     try:
-        result = fun(*_unflatten(in_node, iter(values)))
+        args = _unflatten(in_node, iter(values))
+        result = fun(*args, **kwargs) if kwargs else fun(*args)
         outputs = []
         out_node = _flatten(result, outputs)
         outputs = [
@@ -440,7 +469,7 @@ def _trace(fun, in_node, leaves, names):
         outputs,
         out_node,
         [source for _, source in captured],
-        _Probe(fun, in_node, leaves, names),
+        _Probe(fun, in_node, leaves, names, kwargs),
     )
 
 
@@ -545,6 +574,11 @@ def _compilable(value):
 
 
 # -- trace caches ----------------------------------------------------------------
+
+
+class _KeywordKey(tuple):
+    """`(signature key, ((name, static key), ...))`: the key of a jitted
+    call with static keyword arguments, sorted by name."""
 
 
 class _CaptureKey(tuple):
@@ -877,14 +911,43 @@ class _ValueAndGrad(_Transform):
         )
 
 
+def _keyword_parameters(fun):
+    """`(positions, names)` of `fun`'s parameters: the index of each
+    positional-or-keyword parameter by name, and the names of every
+    parameter that a keyword can bind (`None` when `fun` takes `**kwargs`
+    or has no inspectable signature, so any name may be valid)."""
+    try:
+        parameters = list(inspect.signature(fun).parameters.values())
+    except (TypeError, ValueError):
+        return {}, None
+    positions = {}
+    names = set()
+    for index, parameter in enumerate(parameters):
+        if parameter.kind is parameter.POSITIONAL_OR_KEYWORD:
+            positions[parameter.name] = index
+        if parameter.kind is parameter.VAR_KEYWORD:
+            names = None
+        elif names is not None and parameter.kind in (
+            parameter.POSITIONAL_OR_KEYWORD,
+            parameter.KEYWORD_ONLY,
+        ):
+            names.add(parameter.name)
+    return positions, names
+
+
 class _Jit(_Transform):
-    def __init__(self, fun, device, static_argnums, max_traces):
+    def __init__(self, fun, device, static_argnums, max_traces, static_argnames=()):
         self._target, self._ordinal = require_device(device, "jit")
         self._device = device or "cpu"
         self._warned_precision = False
         if isinstance(static_argnums, int):
             static_argnums = (static_argnums,)
         static_argnums = tuple(static_argnums)
+        if isinstance(static_argnames, str):
+            static_argnames = (static_argnames,)
+        static_argnames = tuple(static_argnames)
+        if not all(isinstance(name, str) for name in static_argnames):
+            raise TypeError(f"static_argnames must be strings, got {static_argnames!r}")
         if (
             not isinstance(max_traces, int)
             or isinstance(max_traces, bool)
@@ -893,16 +956,48 @@ class _Jit(_Transform):
             raise ValueError(f"max_traces must be a positive int, got {max_traces!r}")
         self._max_traces = max_traces
         super().__init__(
-            fun, ("jit", self._target, self._ordinal, static_argnums, max_traces)
+            fun,
+            (
+                "jit",
+                self._target,
+                self._ordinal,
+                static_argnums,
+                max_traces,
+                static_argnames,
+            ),
         )
         self._static_argnums = static_argnums
         self._static_by_count = {}
+        # As in JAX, static_argnames and static_argnums imply each other
+        # through the signature of the root function, so a static argument
+        # may be passed by position or by keyword.
+        positions, names = _keyword_parameters(self._root)
+        if names is not None:
+            unknown = [name for name in static_argnames if name not in names]
+            if unknown:
+                raise ValueError(
+                    f"static_argnames {tuple(unknown)!r} are not parameters of {self._root!r}"
+                )
+        self._keyword_positions = positions
+        self._position_names = {index: name for name, index in positions.items()}
+        self._named_positions = frozenset(
+            positions[name] for name in static_argnames if name in positions
+        )
+        self._static_names = frozenset(static_argnames) | {
+            self._position_names[index]
+            for index in static_argnums
+            if isinstance(index, int) and index in self._position_names
+        }
 
-    def _stage(self, in_node, leaves, names):
+    def _stage(self, in_node, leaves, names, kwargs=None):
+        if kwargs:
+            return _trace(self._fun, in_node, leaves, names, kwargs)
         return _stage(self._fun, in_node, leaves, names)
 
-    def _compile(self, in_node, leaves):
-        (staged,) = _compilable((self._stage(in_node, leaves, self._names(in_node)),))
+    def _compile(self, in_node, leaves, kwargs=None):
+        (staged,) = _compilable(
+            (self._stage(in_node, leaves, self._names(in_node), kwargs),)
+        )
         return self._compile_staged(staged)
 
     def _compile_staged(self, staged):
@@ -929,8 +1024,63 @@ class _Jit(_Transform):
                 self._warned_precision = True
         return program
 
-    def lower(self, *args):
+    def _bind_keywords(self, args, kwargs):
+        """Canonicalizes a call with keyword arguments: keywords that name
+        the next positional-or-keyword parameters become positional, so both
+        spellings share a trace; the remaining keywords must be static and
+        are returned as a dict passed to the function by keyword."""
+        args = list(args)
+        by_position = {}
+        remaining = {}
+        for name, value in kwargs.items():
+            index = self._keyword_positions.get(name)
+            if index is not None and index < len(args):
+                raise TypeError(f"{self!r} got multiple values for argument {name!r}")
+            if index is None:
+                remaining[name] = value
+            else:
+                by_position[index] = value
+        while len(args) in by_position:
+            args.append(by_position.pop(len(args)))
+        for index, value in by_position.items():
+            remaining[self._position_names[index]] = value
+        for name, value in remaining.items():
+            if name not in self._static_names:
+                raise TypeError(
+                    f"{self!r} got the keyword argument {name!r}, which is not static: "
+                    "pass array arguments positionally (or by keyword in parameter order), "
+                    "or list it in static_argnames"
+                )
+            try:
+                hash(value)
+            except TypeError:
+                raise TypeError(
+                    f"static keyword argument {name!r} must be hashable, got "
+                    f"{type(value).__name__}"
+                ) from None
+        if remaining and isinstance(self._fun, _Transform):
+            raise TypeError(
+                f"{self!r} cannot pass static keyword arguments {tuple(remaining)!r} to a "
+                "transformed function; pass them positionally"
+            )
+        return tuple(args), remaining
+
+    def _keyed(self, key, kwargs):
+        """`key` extended with the static keyword arguments `kwargs`."""
+        if not kwargs:
+            return key
+        return _KeywordKey(
+            (
+                key,
+                tuple(
+                    sorted((name, _static_key(value)) for name, value in kwargs.items())
+                ),
+            )
+        )
+
+    def lower(self, *args, **kwargs):
         """Trace without execution; ShapeDtype leaves need no host storage."""
+        args, kwargs = self._bind_keywords(args, kwargs) if kwargs else (args, None)
         abstract = []
         node = _flatten(args, abstract)
         args = _unflatten(
@@ -944,38 +1094,44 @@ class _Jit(_Transform):
                 ]
             ),
         )
-        statics = self._statics(len(args)) if self._static_argnums else ()
+        statics = self._statics(len(args))
         converted = self._converted_positions(len(args))
         in_node, leaves, _, key, traced = _signature(args, statics, converted)
         if traced:
             raise TypeError(
                 "lower() requires arrays or ShapeDtype, not enclosing tracers"
             )
-        (staged,) = _compilable((self._stage(in_node, leaves, self._names(in_node)),))
-        return _Lowered(self, staged, key, statics, converted)
+        (staged,) = _compilable(
+            (self._stage(in_node, leaves, self._names(in_node), kwargs),)
+        )
+        return _Lowered(self, staged, self._keyed(key, kwargs), statics, converted)
 
     def _statics(self, count):
         statics = self._static_by_count.get(count)
         if statics is None:
             statics = frozenset(
                 _normalize_argnums(self._static_argnums, count, "static_argnums")
-            )
+            ) | {index for index in self._named_positions if index < count}
             self._static_by_count[count] = statics
         return statics
 
-    def __call__(self, *args):
+    def __call__(self, *args, **kwargs):
+        args, kwargs = self._bind_keywords(args, kwargs) if kwargs else (args, None)
         count = len(args)
-        statics = self._statics(count) if self._static_argnums else ()
+        statics = self._statics(count)
         converted = self._converted_positions(count)
         in_node, leaves, arrays, key, traced = _signature(args, statics, converted)
+        key = self._keyed(key, kwargs)
         if not (traced or self._inlines(key)):
-            program = self._compiled(key, lambda: self._compile(in_node, leaves))
+            program = self._compiled(
+                key, lambda: self._compile(in_node, leaves, kwargs)
+            )
             if program is not None:
                 return program.run(arrays)
         if isinstance(self._fun, _Transform):
             return self._call_traced(args, statics, converted)
         # Inside another trace, tracing through a plain function inlines it.
-        return self._fun(*args)
+        return self._fun(*args, **kwargs) if kwargs else self._fun(*args)
 
 
 class _Lowered:
@@ -999,9 +1155,12 @@ class _Lowered:
         if self._compiled_program is None:
             self._compiled_program = self._jit._compile_staged(self._staged)
 
-        def execute(*args):
+        def execute(*args, **kwargs):
+            args, kwargs = (
+                self._jit._bind_keywords(args, kwargs) if kwargs else (args, None)
+            )
             _, _, arrays, key, traced = _signature(args, self._statics, self._converted)
-            if traced or key != self._key:
+            if traced or self._jit._keyed(key, kwargs) != self._key:
                 raise ValueError(
                     "compiled lower() call must match its input structure, shapes, dtypes and statics"
                 )
@@ -1355,20 +1514,25 @@ class _Vjp(_Transform):
 
 def _axes_config(axes, what):
     """`in_axes`/`out_axes` in a hashable form: an int or `None` applies to
-    a whole subtree, and tuples, lists, and dicts of them are pytree
-    prefixes. `None` is a leaf here, unlike in argument pytrees."""
+    a whole subtree, and tuples, lists, dicts, NamedTuples, and registered
+    nodes of them are pytree prefixes. `None` is a leaf here, unlike in
+    argument pytrees."""
     if axes is None or (isinstance(axes, int) and not isinstance(axes, bool)):
         return axes
     kind = type(axes)
     if kind is tuple or kind is list:
         return (tuple, tuple(_axes_config(child, what) for child in axes))
     if kind is dict:
-        if not all(type(key) is str for key in axes):
-            raise TypeError(f"vmap {what} dict keys must be strings, got {axes!r}")
-        keys = tuple(sorted(axes))
+        keys = _sorted_keys(axes)
         return (dict, keys, tuple(_axes_config(axes[key], what) for key in keys))
+    node_type = _REGISTRY.get(kind)
+    if node_type is not None:
+        children, aux = node_type.flatten(axes)
+        return (kind, aux, tuple(_axes_config(child, what) for child in children))
+    if _is_namedtuple_class(kind):
+        return (kind, None, tuple(_axes_config(child, what) for child in axes))
     raise TypeError(
-        f"vmap {what} must be an int, None, or a tuple, list, or dict of them, got {axes!r}"
+        f"vmap {what} must be an int, None, or a pytree of them, got {axes!r}"
     )
 
 
@@ -1385,11 +1549,13 @@ def _leaf_axes(spec, node, axes, what):
                 _leaf_axes(child_spec, child, axes, what)
             return
     elif (
-        spec[0] is dict
+        spec[0] is not tuple
         and type(node) is tuple
-        and node[0] is dict
+        and node[0] is spec[0]
         and spec[1] == node[1]
+        and len(spec[2]) == len(node[2])
     ):
+        # Dicts match by keys; NamedTuples and registered nodes by class and aux.
         for child_spec, child in zip(spec[2], node[2]):
             _leaf_axes(child_spec, child, axes, what)
         return
@@ -1406,7 +1572,11 @@ def _render_axes(spec):
         return spec
     if spec[0] is dict:
         return {key: _render_axes(child) for key, child in zip(spec[1], spec[2])}
-    return tuple(_render_axes(child) for child in spec[1])
+    if spec[0] is tuple:
+        return tuple(_render_axes(child) for child in spec[1])
+    # A NamedTuple or registered node renders as text, without rebuilding it.
+    shape = spec[:-1] + ((_LEAF,) * len(spec[-1]),)
+    return _describe(shape, iter([repr(_render_axes(child)) for child in spec[-1]]))
 
 
 def _move_batch_axis(value, axis):
@@ -1549,9 +1719,7 @@ def _graft(node, block_node):
         return block_node
     if node is None:
         return None
-    if node[0] is dict:
-        return (dict, node[1], tuple(_graft(child, block_node) for child in node[2]))
-    return (node[0], tuple(_graft(child, block_node) for child in node[1]))
+    return node[:-1] + (tuple(_graft(child, block_node) for child in node[-1]),)
 
 
 def _jacobian_basis_indices(graph, total):
@@ -1807,18 +1975,32 @@ def _new_grad(fun, argnums=0, has_aux=False):
     return _ValueAndGrad(fun, argnums, has_aux, "grad")
 
 
-def _new_jit(fun, device=None, static_argnums=(), max_traces=_DEFAULT_MAX_TRACES):
-    return _Jit(fun, device, static_argnums, max_traces)
+def _new_jit(
+    fun,
+    device=None,
+    static_argnums=(),
+    max_traces=_DEFAULT_MAX_TRACES,
+    static_argnames=(),
+):
+    return _Jit(fun, device, static_argnums, max_traces, static_argnames)
 
 
-def value_and_grad(fun, argnums=0, has_aux=False):
+def _decorator(transform, kwargs):
+    """The decorator form `@transform(**kwargs)` of a transform called
+    without its function."""
+    return lambda fun: transform(fun, **kwargs)
+
+
+def value_and_grad(fun=None, argnums=0, has_aux=False):
     """`fun` transformed to return `(value, grads)`, where `grads` has the
     pytree structure of the arguments selected by `argnums` (an int, or a
     tuple giving a tuple of gradients). `fun` must return a scalar array, or
     `(scalar, aux)` with `has_aux=True`, giving `((value, aux), grads)`.
     `bool_` leaves get `None` instead of a gradient. Staged and cached per
     argument signature (see the module notes); wrap it in `jit(device=...)`
-    for device execution."""
+    for device execution. Called without `fun`, returns a decorator."""
+    if fun is None:
+        return _decorator(value_and_grad, {"argnums": argnums, "has_aux": has_aux})
     return _ValueAndGrad(fun, argnums, has_aux, "value_and_grad")
 
 
@@ -1826,6 +2008,7 @@ def grad(*args, **kwargs):
     """`grad(fun, argnums=0, has_aux=False)`: `fun` transformed to return the
     gradient of its scalar output with respect to the arguments selected by
     `argnums`, or `(grads, aux)` with `has_aux=True`; see `value_and_grad`.
+    Called with keywords only (`@grad(argnums=1)`), returns a decorator.
 
     The v0.1 form `grad(function, input_specs, values, output_cotangent)` of
     the 2D `Matrix` API still works unchanged: it is recognized by its input
@@ -1836,16 +2019,23 @@ def grad(*args, **kwargs):
 
         warn("grad")
         return _quabla.grad(*args, **kwargs)
+    if not args and "fun" not in kwargs:
+        return _decorator(_new_grad, kwargs)
     return _new_grad(*args, **kwargs)
 
 
 def jit(*args, **kwargs):
-    """`jit(fun, device=None, static_argnums=(), max_traces=8)`: `fun` traced
-    and compiled on its first call per argument signature, then run from the
-    cache. `device=None` means `"cpu"`; device targets are explicit.
-    Arguments at `static_argnums` are static as a whole and must be hashable;
-    a signature beyond `max_traces` evicts the least recently used trace with
-    a `RetraceWarning`.
+    """`jit(fun, device=None, static_argnums=(), max_traces=8,
+    static_argnames=())`: `fun` traced and compiled on its first call per
+    argument signature, then run from the cache. `device=None` means
+    `"cpu"`; device targets are explicit. Arguments at `static_argnums`, or
+    named in `static_argnames`, are static as a whole and must be hashable;
+    the two imply each other through `fun`'s signature, so a static argument
+    may be passed by position or by keyword. Keyword arguments that name
+    the next positional parameters are bound to them; other keyword
+    arguments must be static. A signature beyond `max_traces` evicts the
+    least recently used trace with a `RetraceWarning`. Called with keywords
+    only (`@jit(device="mlx", static_argnums=1)`), returns a decorator.
 
     The v0.1 decorator form `jit(input_specs)` of the 2D `Matrix` API still
     works unchanged: it is recognized by its non-callable spec list (D17).
@@ -1855,6 +2045,8 @@ def jit(*args, **kwargs):
 
         warn("jit")
         return _quabla.jit(*args, **kwargs)
+    if not args and "fun" not in kwargs:
+        return _decorator(_new_jit, kwargs)
     return _new_jit(*args, **kwargs)
 
 

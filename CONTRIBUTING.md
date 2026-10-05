@@ -52,6 +52,7 @@ python tests/python/test_devices_api.py
 python tests/python/test_lower_program.py
 python tests/python/test_optim_api.py
 python tests/python/test_control_api.py
+python tests/python/test_random_api.py
 python tests/python/test_distributed_api.py
 python tests/python/test_adam_fused.py
 python tests/python/test_jacobian_chunks.py

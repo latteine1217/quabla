@@ -11,6 +11,9 @@ import sys as _sys
 
 from . import _array, _errors, _ops, _quabla, _transforms
 from . import tree as tree
+# Kept out of `__all__`, so a star import does not shadow the standard
+# library module `random`.
+from . import random as random
 from . import optim as optim
 from . import distributed as distributed
 from . import legacy as legacy
