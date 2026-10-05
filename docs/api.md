@@ -3,7 +3,7 @@
 This document is the reference companion to the [README](../README.md). It
 describes the Python API on `main` in two layers:
 
-- The **core API** of the upcoming v0.2 release (unreleased; slices S0-S9 of
+- The **core API** released in v0.2.0 (slices S0-S9 of
   [api_v0_2_design.md](api_v0_2_design.md)): arrays with NumPy interop,
   module-level math, and the JAX-style function transforms `grad`,
   `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `vmap`, and `jit`.
@@ -14,7 +14,7 @@ describes the Python API on `main` in two layers:
   advanced layer for explicit compilation; the `trace_tensor` and `tensor_*_fn`
   helpers with their device variants and device optimizers; the control-flow
   builders; and the legacy 2D `Matrix` API. The design deprecates most
-  `tensor_*_fn` helpers in favour of the core API in v0.2. Migrated top-level
+  `tensor_*_fn` helpers in favour of the core API from v0.2. Migrated top-level
   names warn once, and all old call forms keep working through 0.x.
 
 Paths in code spans (for example `examples/pinn_poisson.py`) are relative to
@@ -263,8 +263,10 @@ step samples separately from trace/compile and diagnostic readback.
 calls `f(carry, i, *operands) -> (carry, output)` and stacks outputs on axis zero.
 Bounds are static non-negative integers, scan length is positive, and carries
 are single arrays. Region indices are scalar arrays; eager/unrolled indices
-are Python integers. Pass every outer tracer used by a region as an operand.
-Unsupported implicit capture raises `TracerError` naming `operands=`.
+are Python integers. Pass every outer tracer used by a region as an operand;
+branches and bodies may ignore operands, and `cond` branches may return
+constants of the other branch's dtype. Unsupported implicit capture raises
+`TracerError` naming `operands=`.
 
 `qb.distributed.value_and_grad(fun, devices=["cuda:0", "cuda:1"], shard_argnums=(1,),
 argnums=0, reduction="mean")` is experimental single-node CUDA/NCCL execution.
@@ -874,8 +876,15 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - Derivatives beyond forward-over-reverse of `fori`/`scan` regions are
   explicit errors. Vmapped `cond` predicates are rejected at trace time.
 - MLX rejects `solve` (and `solve_triangular`, which composes it), and
-  `vmap` HVP has no MLX lowering. Native CUDA/MLX Cholesky and
-  triangular-solve kernels are not implemented.
+  `vmap` HVP has no MLX lowering. Triangular-solve kernels are not
+  implemented on devices.
+- Native CUDA and Metal Cholesky derivative kernels process each matrix
+  sequentially in one GPU thread, so their cost grows as O(n^3) without
+  parallelism: one `float64` Cholesky gradient took 0.3 s at n = 256 and
+  2.6 s at n = 512 on a GTX 1660 SUPER, and 0.7 s and 5.4 s on Apple
+  silicon. `float32` Cholesky derivatives and third or higher orders use a
+  scalar expansion whose graph grows as O(n^3) and is impractical beyond
+  small matrices.
 - Data parallelism is single-node CUDA + NCCL only: equal axis-zero batch
   shards, replicated parameter gradients, and an optimizer on the host. There
   is no multi-node transport, tensor parallelism, or sharded matmul.

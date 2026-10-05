@@ -17,12 +17,9 @@ section 5):
 - From v0.2, names that have a replacement in the new API emit a
   `DeprecationWarning` once per name on first access, and the legacy 2D
   `Matrix` API moves to `quabla.legacy`, with a warning on top-level access.
-  These migration warnings are implemented on `main` for v0.2.
 - Deprecated names and the top-level legacy names are removed at 1.0;
   whether `quabla.legacy` stays is decided then. The new API and the
   `Compiler` facade are kept.
-- The unreleased v0.2 API on `main` may still change before v0.2 is
-  released.
 
 Backends, the tensor IR, execution plans, and the Rust crate APIs are not
 covered by this policy and may change between releases.

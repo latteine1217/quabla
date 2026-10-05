@@ -1,7 +1,7 @@
 # Quabla v0.2 Python API Design
 
 Status: accepted by the owner on 2026-09-29; slices S0 through S9 (plus
-S1b) are implemented on `main` and unreleased. Landed: S0 packaging
+S1b) are implemented and released as v0.2.0 on 2026-10-06. Landed: S0 packaging
 (`89c07ad`), S1 arrays (`894dae4`, `5eaf708`), S1b `Pow` (`92d9e49`,
 `8ec9c57`), S2 CPU transforms (`a2bdf49` through `1ccb4ab`), S3 composition
 (`2dee031`, `6ec57b3`), S3b constants (`44c5c77`, `12d0706`), S4 `vmap`
@@ -9,12 +9,11 @@ S1b) are implemented on `main` and unreleased. Landed: S0 packaging
 each described in its "as landed" note in section 6; S5 devices and errors,
 S6 optim and `Trainer`, S7 control flow, S8 distributed, and S9 deprecation
 and docs follow, described together in "S5-S9 as implemented" in section 6.
-No v0.2 release has been tagged. Scope: slices S0 through S9 (plus S1b)
-ship as v0.2; S10 is deferred. The
-plan made the repository public after these slices land; on 2026-09-29 the
-owner decided to make it public before S9 instead, with `main` documenting
-the landed slices as unreleased work (resolved question 8 is unchanged: no
-0.1.1). Decisions D1-D17 are accepted as recommended, with one change:
+Scope: slices S0 through S9 (plus S1b) shipped as v0.2.0; S10 is deferred.
+The plan made the repository public after these slices land; on 2026-09-29
+the owner decided to make it public before S9 instead, with `main`
+documenting the landed slices as unreleased work until v0.2.0 (resolved
+question 8 is unchanged: no 0.1.1). Decisions D1-D17 are accepted as recommended, with one change:
 traced float exponents get a real `Pow` IR op (section 3.2, slice S1b)
 instead of being rejected. The resolved open
 questions are recorded in section 7. Base: `main` at `471f402`. Citations: `py/` is `crates/quabla-python/src/`, `core/` is

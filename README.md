@@ -7,7 +7,7 @@ traced program on CPU, CUDA, and Apple silicon.**
 [![CI](https://github.com/latteine1217/quabla/actions/workflows/ci.yml/badge.svg)](https://github.com/latteine1217/quabla/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation-from-source)
-[![Release v0.1.0](https://img.shields.io/badge/release-v0.1.0-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.1.0)
+[![Release v0.2.0](https://img.shields.io/badge/release-v0.2.0-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.2.0)
 
 ![A tanh MLP trained with Quabla matches the exact solution of a 1D Poisson problem; its training loss falls from about 50 to 2.5e-4.](docs/assets/pinn_poisson.png)
 
@@ -66,9 +66,9 @@ running on CUDA or MLX.
 
 ## Status
 
-The latest release is **v0.1.0**, a research-grade, source-only pre-release
-(a git tag and GitHub Release without prebuilt wheels). `main` adds the
-unreleased v0.2 JAX-style API ([CHANGELOG](CHANGELOG.md#unreleased),
+The latest release is **v0.2.0**, a research-grade, source-only pre-release
+(a git tag and GitHub Release without prebuilt wheels). It adds the v0.2
+JAX-style API ([CHANGELOG](CHANGELOG.md#020---2026-10-06),
 [design](docs/api_v0_2_design.md)): the transforms `grad`, `value_and_grad`,
 `jvp`, `vjp`, `jacobian`, `hessian`, `vmap`, and `jit` over arrays and
 pytrees, and module-level math such as `quabla.sin`. `jit(device="cpu" |
@@ -272,7 +272,8 @@ and its gradients in one device plan, and `mlx_adam_loss_optimizer` and
 - Indexing takes static Python integers; dynamic index tensors and
   boolean-mask indexing are unsupported.
 - CUDA loop bodies must be pure elementwise. MLX rejects `solve` and has no
-  `vmap` HVP lowering.
+  `vmap` HVP lowering. Device Cholesky derivatives run each matrix in one GPU
+  thread and are slow for large matrices.
 - Data parallelism is single-node CUDA + NCCL only.
 - `quabla.vmap`
   cannot batch `solve` or `cond`/`fori`/`scan` regions over a mapped

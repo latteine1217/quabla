@@ -9,9 +9,11 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
-Work toward the v0.2 JAX-style Python API described in
-`docs/api_v0_2_design.md` (slices S0 through S9). All v0.1 call forms remain
-available; migrated names now warn once as described below.
+## [0.2.0] - 2026-10-06
+
+The JAX-style Python API described in `docs/api_v0_2_design.md` (slices S0
+through S9), released as a source-only pre-release like v0.1.0. All v0.1 call
+forms remain available; migrated names warn once as described below.
 
 ### Added
 
@@ -28,7 +30,12 @@ available; migrated names now warn once as described below.
 - **Migration.** `quabla.legacy` preserves the 2D API without warnings;
   migrated top-level names warn once, legacy `grad`/`jit` forms still
   dispatch, and `quabla.Adam` aliases the new Adam with its old `step`.
-
+- **Memory and kernels.** Host tensors store `float32` and `bool` in 4 and 1
+  bytes per element instead of widening to `f64`; native `Cholesky` on CPU,
+  CUDA, and Metal with first- and second-order AD for logical-`float64`
+  graphs; `fori`/`scan` gradients on CPU and MLX (and eligible CUDA loops)
+  keep about 2*sqrt(T) carries instead of a full tape; dense Jacobians are
+  staged in bounded basis batches.
 - **Packaging.** The Python package is a mixed Rust/Python project: a
   pure-Python `quabla` package over the compiled `quabla._quabla` extension.
 - **Arrays and NumPy.** `quabla.array`/`asarray` from nested lists, scalars,
@@ -47,8 +54,27 @@ available; migrated names now warn once as described below.
   `QuablaError`, `TracerError`, `RetraceLimitError`, and
   `UnsupportedOperationError`.
 
+### Changed
+
+- `solve` with a triangular coefficient matrix uses substitution instead of
+  LU, and the legacy `tensor_hessian_scalar_fn`/`tensor_hvp_scalar_fn` use
+  symbolic forward-over-reverse for finite `float64` graphs. Results can
+  differ from v0.1.0 in the last bits, and such Hessians are not bitwise
+  symmetric.
+- Rust: `DynamicTensor::data()` returns `Cow<'_, [f64]>` instead of
+  `&[f64]`. The Rust crate APIs are not covered by the compatibility policy.
+
 ### Fixed
 
+- `jit(static_argnums=...)` distinguishes static values that compare equal,
+  such as `1`, `True`, and `1.0`, or `0.0` and `-0.0`, instead of reusing a
+  program traced for another value; a NaN static value no longer retraces on
+  every call.
+- Traced `cond`, `fori_loop`, and `scan` bodies may ignore operands, and
+  `cond` branches may return constants, as in eager execution.
+- `grad(f, [0, 1])` treats a list of ints as `argnums` instead of the v0.1
+  input-spec form.
+- The float64-on-device warning points at the caller's line.
 - Square-root derivatives are NaN for negative inputs, including `-inf`, on
   every backend; MLX previously returned 0 and CPU/CUDA returned 0 or inf at
   `-inf`.
@@ -147,5 +173,6 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/latteine1217/quabla/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/latteine1217/quabla/releases/tag/v0.1.0
