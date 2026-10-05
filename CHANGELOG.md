@@ -21,6 +21,44 @@ deprecated names keep working until 1.0 (see
   longer overflows or underflows: the `float32` norm of `[1e20, 1e20]` is
   1.414e20 with gradient 0.707 instead of `inf` with gradient 0. Results and
   gradients can change in the last bits.
+- `quabla.tree.flatten` treats NamedTuples as nodes (they were leaves) and
+  accepts any mutually orderable dict keys, such as ints (they were
+  rejected); dict entries are visited in sorted key order.
+- Indexing accepts `None`, `...`, and strided slices such as `x[::2]` and
+  `x[::-1]`, which used to be rejected.
+
+### Added
+
+- Optimizers: `optim.AdamW` with decoupled weight decay; learning-rate
+  schedules (`constant`, `exponential_decay`, `cosine_decay`,
+  `warmup_cosine_decay`, `piecewise_constant`, or any callable of the step)
+  for Adam, AdamW, SGD, and the CPU and device `Trainer`;
+  `optim.clip_by_global_norm` and a `clip_norm=` option; and `optim.LBFGS`,
+  a full-batch L-BFGS with a strong Wolfe line search for the usual
+  "Adam, then L-BFGS" PINN schedule (Rosenbrock from (-1.2, 1) converges in
+  38 iterations).
+- Native elementwise and scan operations on CPU, CUDA, and MLX with forward,
+  reverse, and second-order derivatives: `expm1`, `erf`, `atan2`,
+  `stop_gradient`, and `cumsum(axis, reverse)`.
+- Numerically stable compositions: `softmax`, `log_softmax`, `logsumexp`
+  (shifted by `stop_gradient(max)`), two-pass `var` and `std`, `silu`,
+  `gelu` (tanh approximation or exact `erf` form), `clip`, `sign`,
+  `square`, and `reciprocal`.
+- Shape helpers: `reshape(-1)` and varargs, `.T`, `squeeze`,
+  `expand_dims`, `split`, `meshgrid`, `zeros_like`, `ones_like`,
+  `full_like`, and NumPy-style 1-D operands for `quabla.matmul`.
+- Pytrees: NamedTuples, dataclasses registered with
+  `tree.register_dataclass`, and custom nodes registered with
+  `tree.register`, in every transform, optimizer, and `Trainer`; plus
+  `tree.leaves`, `tree.structure`, and `tree.flatten_with_path`.
+- `quabla.random`: explicit keys (`key`, `split`, `fold_in`) with
+  `uniform`, `normal`, `bernoulli`, and the `glorot_normal`,
+  `glorot_uniform`, and `he_normal` initializers.
+- `jit(static_argnames=...)`, keyword arguments to jitted functions, and
+  keyword-only decorator forms of `jit`, `grad`, and `value_and_grad`.
+- `quabla.ode.odeint`: fixed-step RK4, Heun, and Euler integration over a
+  single loop region, differentiable with respect to the initial state,
+  time span, and parameters.
 
 ## [0.2.3] - 2026-10-06
 
