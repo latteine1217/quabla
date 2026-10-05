@@ -1910,33 +1910,6 @@ impl TraceTensor {
         ))
     }
 
-    fn pad_slice_tensor(
-        &self,
-        shape: Vec<usize>,
-        axis: isize,
-        start: usize,
-    ) -> Result<Self, String> {
-        let mut ir = self
-            .graph
-            .ir
-            .lock()
-            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
-        let node_id = ir.pad_slice(
-            self.node_id,
-            self.example_shape(shape),
-            usize::try_from(self.example_axis(axis)?)
-                .map_err(|_| "normalized tensor axis is negative".to_string())?,
-            start,
-        )?;
-        let shape = ir.node_shape(node_id)?;
-        Ok(Self::from_node(
-            self.graph.clone(),
-            node_id,
-            shape,
-            self.batch_axis,
-        ))
-    }
-
     fn gather_tensor(&self, indices: &[usize], axis: isize) -> Result<Self, String> {
         let actual_axis = usize::try_from(self.example_axis(axis)?)
             .map_err(|_| "normalized tensor axis is negative".to_string())?;
@@ -1952,14 +1925,19 @@ impl TraceTensor {
                 self.shape[actual_axis]
             ));
         }
-        let gathered = indices
-            .iter()
-            .map(|index| self.slice_tensor(axis, *index, index + 1))
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::try_concat(
-            &gathered,
-            actual_axis - usize::from(self.batch_axis.is_some()),
-        )
+        let mut ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let node_id = ir.gather(self.node_id, indices.into(), actual_axis)?;
+        let shape = ir.node_shape(node_id)?;
+        Ok(Self::from_node(
+            self.graph.clone(),
+            node_id,
+            shape,
+            self.batch_axis,
+        ))
     }
 
     fn scatter_add_tensor(
@@ -1995,15 +1973,19 @@ impl TraceTensor {
                 indices.len()
             ));
         }
-        let batch_offset = usize::from(self.batch_axis.is_some());
-        let mut output = self.clone();
-        for (update_index, destination) in indices.iter().copied().enumerate() {
-            let update = updates.slice_tensor(axis, update_index, update_index + 1)?;
-            let padded =
-                update.pad_slice_tensor(self.shape[batch_offset..].to_vec(), axis, destination)?;
-            output = output.binary(&padded, "add")?;
-        }
-        Ok(output)
+        let mut ir = self
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let node_id = ir.scatter_add(self.node_id, updates.node_id, indices.into(), actual_axis)?;
+        let shape = ir.node_shape(node_id)?;
+        Ok(Self::from_node(
+            self.graph.clone(),
+            node_id,
+            shape,
+            self.batch_axis,
+        ))
     }
 
     fn index_tensor(&self, indices: &[TensorIndex]) -> Result<Self, String> {

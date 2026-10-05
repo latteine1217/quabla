@@ -9991,6 +9991,12 @@ fn batching_fixture() -> Result<(TensorIr, Vec<TensorNodeId>, TensorNodeId), Str
     let total = callee.add(total, tail_total)?;
     let reduced_total = callee.sum(reduced)?;
     let total = callee.add(total, reduced_total)?;
+    // Gather a mapped operand and scatter it into an unmapped base, which
+    // the batching rule broadcasts.
+    let picked = callee.gather(v, vec![2, 0, 2].into(), 0)?;
+    let scattered = callee.scatter_add(w, picked, vec![1, 1, 0].into(), 0)?;
+    let scattered_total = callee.sum(scattered)?;
+    let total = callee.add(total, scattered_total)?;
     // An output that depends on no mapped input stays unmapped.
     let two = callee.scalar_constant(2.0);
     let sin_w = callee.sin(w)?;
@@ -10471,5 +10477,273 @@ fn cuda_log1p_matches_cpu_values_and_gradients() {
                 "{device} vs {host}"
             );
         }
+    }
+}
+
+fn gather_scatter_inputs(dtype: TensorDType) -> BTreeMap<String, DynamicTensor> {
+    let tensor = |shape: Vec<usize>, data: Vec<f64>| {
+        DynamicTensor::with_dtype(shape, data, dtype).expect("valid test tensor")
+    };
+    BTreeMap::from([
+        (
+            "x".to_string(),
+            tensor(vec![4, 2], (0..8).map(|v| 1.0 + v as f64).collect()),
+        ),
+        (
+            "u".to_string(),
+            tensor(
+                vec![5, 2],
+                (0..10).map(|v| 10.0 * (v as f64 - 4.0)).collect(),
+            ),
+        ),
+        (
+            "ct_gather".to_string(),
+            tensor(vec![5, 2], (0..10).map(|v| 0.5 * v as f64 - 1.0).collect()),
+        ),
+        (
+            "ct_scatter".to_string(),
+            tensor(vec![4, 2], (0..8).map(|v| 3.0 - v as f64).collect()),
+        ),
+        (
+            "tx".to_string(),
+            tensor(vec![4, 2], (0..8).map(|v| 0.25 * v as f64).collect()),
+        ),
+        (
+            "tu".to_string(),
+            tensor(vec![5, 2], (0..10).map(|v| 2.0 - v as f64).collect()),
+        ),
+    ])
+}
+
+/// Rows `indices` of the row-major `[rows, 2]` matrix `data`.
+fn take_rows(data: &[f64], indices: &[usize]) -> Vec<f64> {
+    indices
+        .iter()
+        .flat_map(|row| data[2 * row..2 * row + 2].to_vec())
+        .collect()
+}
+
+/// `base` with row `j` of `updates` added to row `indices[j]`, in order.
+fn add_rows(base: &[f64], updates: &[f64], indices: &[usize]) -> Vec<f64> {
+    let mut result = base.to_vec();
+    for (source, row) in indices.iter().enumerate() {
+        for column in 0..2 {
+            result[2 * row + column] += updates[2 * source + column];
+        }
+    }
+    result
+}
+
+#[test]
+fn gather_and_scatter_add_follow_their_forward_and_derivative_rules() {
+    // Row 2 repeats three times, so the gather cotangent takes the reordered
+    // accumulation path; the values are small integers, exact in any order.
+    let indices = [2, 0, 2, 2, 1];
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![4, 2]));
+    let u = must!(graph.input("u", vec![5, 2]));
+    let gathered = must!(graph.gather(x, indices.to_vec().into(), 0));
+    let scattered = must!(graph.scatter_add(x, u, indices.to_vec().into(), 0));
+    let inputs = gather_scatter_inputs(TensorDType::F64);
+    let data = |name: &str| inputs[name].data().to_vec();
+    let (xs, us) = (data("x"), data("u"));
+    let zeros = vec![0.0; 8];
+    let gather_value = take_rows(&xs, &indices);
+    let scatter_value = add_rows(&xs, &us, &indices);
+    assert_eq!(
+        must!(graph.evaluate(gathered, &inputs)).data().as_ref(),
+        gather_value
+    );
+    assert_eq!(
+        must!(graph.evaluate(scattered, &inputs)).data().as_ref(),
+        scatter_value
+    );
+
+    // Reverse mode: gather scatters its cotangent back; scatter_add passes the
+    // cotangent to its base and gathers it for its updates.
+    let gather_x = add_rows(&zeros, &data("ct_gather"), &indices);
+    let scatter_u = take_rows(&data("ct_scatter"), &indices);
+    let runtime = must!(graph.vjp(gathered, &inputs, inputs["ct_gather"].clone()));
+    assert_eq!(runtime["x"].data().as_ref(), gather_x);
+    let runtime = must!(graph.vjp(scattered, &inputs, inputs["ct_scatter"].clone()));
+    assert_eq!(runtime["x"].data().as_ref(), data("ct_scatter"));
+    assert_eq!(runtime["u"].data().as_ref(), scatter_u);
+    for (output, seed, expected_x, expected_u) in [
+        (gathered, "ct_gather", gather_x.clone(), vec![0.0; 10]),
+        (
+            scattered,
+            "ct_scatter",
+            data("ct_scatter"),
+            scatter_u.clone(),
+        ),
+    ] {
+        let vjp = must!(graph.symbolic_vjp(output, seed));
+        let text = vjp.graph.lower_text();
+        assert!(!text.contains("slice"), "{text}");
+        assert_eq!(
+            must!(vjp.graph.evaluate(vjp.gradients["x"], &inputs))
+                .data()
+                .as_ref(),
+            expected_x
+        );
+        assert_eq!(
+            must!(vjp.graph.evaluate(vjp.gradients["u"], &inputs))
+                .data()
+                .as_ref(),
+            expected_u
+        );
+    }
+
+    // Forward mode: gather of the tangent; scatter_add of both tangents.
+    let tangents = BTreeMap::from([
+        ("x".to_string(), inputs["tx"].clone()),
+        ("u".to_string(), inputs["tu"].clone()),
+    ]);
+    let names = BTreeMap::from([
+        ("x".to_string(), "tx".to_string()),
+        ("u".to_string(), "tu".to_string()),
+    ]);
+    for (output, expected) in [
+        (gathered, take_rows(&data("tx"), &indices)),
+        (scattered, add_rows(&data("tx"), &data("tu"), &indices)),
+    ] {
+        let (_, runtime) = must!(graph.jvp(output, &inputs, &tangents));
+        assert_eq!(runtime.data().as_ref(), expected);
+        let jvp = must!(graph.symbolic_jvp_with_tangent_inputs(output, &names));
+        assert_eq!(
+            must!(jvp.graph.evaluate(jvp.tangent, &inputs))
+                .data()
+                .as_ref(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn scatter_add_rounds_duplicates_in_index_order_and_its_reverse_mode_mirrors_it() {
+    // In f32, 1 + 1e8 rounds back to 1e8, so the order of the three
+    // contributions to row 0 decides the result: index order gives 0, and
+    // the gather cotangent accumulates in the reverse order of the per-index
+    // slices it replaces, giving 1.
+    let mut graph = TensorIr::new();
+    let base = must!(graph.input_typed("base", vec![1], TensorDType::F32));
+    let updates = must!(graph.input_typed("updates", vec![3], TensorDType::F32));
+    let scattered = must!(graph.scatter_add(base, updates, vec![0, 0, 0].into(), 0));
+    let gathered = must!(graph.gather(base, vec![0, 0, 0].into(), 0));
+    let zero = graph.scalar_constant(0.0);
+    let shifted = must!(graph.add(base, zero));
+    let f32_tensor = |shape: Vec<usize>, data: Vec<f64>| {
+        DynamicTensor::with_dtype(shape, data, TensorDType::F32).expect("valid test tensor")
+    };
+    let inputs = BTreeMap::from([
+        ("base".to_string(), f32_tensor(vec![1], vec![0.0])),
+        (
+            "updates".to_string(),
+            f32_tensor(vec![3], vec![1.0, 1e8, -1e8]),
+        ),
+        ("ct".to_string(), f32_tensor(vec![3], vec![1.0, 1e8, -1e8])),
+        (
+            "ct_gather".to_string(),
+            f32_tensor(vec![3], vec![1.0, 1.0, -1e8]),
+        ),
+        ("ct_shifted".to_string(), f32_tensor(vec![1], vec![1e8])),
+    ]);
+    assert_eq!(
+        must!(graph.evaluate(scattered, &inputs)).data().as_ref(),
+        [0.0]
+    );
+    let vjp = must!(graph.symbolic_vjp(gathered, "ct"));
+    assert_eq!(
+        must!(vjp.graph.evaluate(vjp.gradients["base"], &inputs))
+            .data()
+            .as_ref(),
+        [1.0]
+    );
+    // The later `shifted` seeds 1e8 first; the gather then adds -1e8, 1, and
+    // 1 into that running sum (giving 2), not their own sum -1e8 (giving 0).
+    let vjp = must!(graph.symbolic_vjp_many(&[
+        (gathered, SymbolicCotangent::Input("ct_gather".to_string())),
+        (shifted, SymbolicCotangent::Input("ct_shifted".to_string())),
+    ]));
+    assert_eq!(
+        must!(vjp.graph.evaluate(vjp.gradients["base"], &inputs))
+            .data()
+            .as_ref(),
+        [2.0]
+    );
+    let runtime = must!(graph.value_and_vjp_many(
+        &[
+            (gathered, inputs["ct_gather"].clone()),
+            (shifted, inputs["ct_shifted"].clone()),
+        ],
+        &inputs,
+    ));
+    assert_eq!(runtime.1["base"].data().as_ref(), [2.0]);
+}
+
+/// Gather and scatter_add along an inner axis with an index repeated three
+/// times and f32 contributions whose sum depends on their order, so device
+/// parity also checks the accumulation order.
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+type GatherScatterCase = (TensorIr, Vec<TensorNodeId>, BTreeMap<String, DynamicTensor>);
+
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn gather_scatter_device_case() -> Result<GatherScatterCase, String> {
+    let indices = vec![1, 3, 1, 1, 0];
+    let mut graph = TensorIr::new();
+    let x = graph.input_typed("x", vec![3, 4], TensorDType::F32)?;
+    let u = graph.input_typed("u", vec![3, 5], TensorDType::F32)?;
+    let gathered = graph.gather(x, indices.clone().into(), 1)?;
+    let scattered = graph.scatter_add(x, u, indices.into(), 1)?;
+    // Positions 0, 2, and 3 of each row land on column 1; every other order
+    // of their three sums rounds to a different f32 result.
+    let updates = vec![
+        1e8, 7.0, -1e8, 1.0, 0.25, //
+        1.0, 5.0, 1e8, -1e8, 2.0, //
+        -1e8, 3.0, 1e8, 0.5, 4.0,
+    ];
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            DynamicTensor::with_dtype(
+                vec![3, 4],
+                (0..12).map(|v| 0.5 * v as f64 - 2.0).collect(),
+                TensorDType::F32,
+            )?,
+        ),
+        (
+            "u".to_string(),
+            DynamicTensor::with_dtype(vec![3, 5], updates, TensorDType::F32)?,
+        ),
+    ]);
+    Ok((graph, vec![gathered, scattered], inputs))
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_gather_and_scatter_add_match_cpu_bits_with_repeated_indices() {
+    let (graph, outputs, inputs) = must!(gather_scatter_device_case());
+    assert_mlx_readback_matches_cpu(&graph, &outputs, &inputs);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_gather_and_scatter_add_match_cpu_bits_with_repeated_indices() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    let (graph, outputs, inputs) = must!(gather_scatter_device_case());
+    for output in outputs {
+        let plan = must!(graph.compile_cpu(output));
+        let cpu = must!(plan.evaluate(&inputs));
+        let cuda = must!(CudaBackend::new(0).execute(&plan, &inputs));
+        assert_eq!(cuda.shape(), cpu.shape());
+        assert_eq!(cuda.data().as_ref(), cpu.data().as_ref(), "output {output}");
     }
 }

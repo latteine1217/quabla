@@ -2745,6 +2745,8 @@ fn execute_cuda_device_program(
             | TensorOp::Concat { .. }
             | TensorOp::Slice { .. }
             | TensorOp::PadSlice { .. }
+            | TensorOp::Gather { .. }
+            | TensorOp::ScatterAdd { .. }
             | TensorOp::Broadcast { .. } => {
                 let (before, current_and_after) = values.split_at_mut(node_id);
                 let slot = current_and_after
@@ -3380,8 +3382,16 @@ fn launch_cuda_node(stream: &Arc<CudaStream>, request: CudaNodeLaunch<'_>) -> Re
             launch.arg(output);
             launch.arg(&count);
         }
-        TensorOp::Slice { input, .. } | TensorOp::PadSlice { input, .. } => {
+        TensorOp::Slice { input, .. }
+        | TensorOp::PadSlice { input, .. }
+        | TensorOp::Gather { input, .. } => {
             launch.arg(cuda_value(values, *input)?);
+            launch.arg(output);
+            launch.arg(&count);
+        }
+        TensorOp::ScatterAdd { base, updates, .. } => {
+            launch.arg(cuda_value(values, *base)?);
+            launch.arg(cuda_value(values, *updates)?);
             launch.arg(output);
             launch.arg(&count);
         }
@@ -7626,6 +7636,51 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
                     inner,
                 )
             }
+            // Index tables are baked into the module as device constants, like
+            // the static offsets of slice and concat kernels.
+            TensorOp::Gather {
+                input,
+                indices,
+                axis,
+            } => {
+                let input_extent = plan.nodes[*input].shape[*axis];
+                let inner = element_count(&node.shape[*axis + 1..])?;
+                format!(
+                    "__device__ const unsigned int {function}_indices[{}] = {{{}}};\n\
+                    extern \"C\" __global__ void {function}(const float* input, float* out, unsigned long long count) {{\n\
+                        unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
+                        if (index < count) {{ unsigned long long outer = index / {}ULL; unsigned long long rem = index % {}ULL; unsigned long long position = rem / {inner}ULL; unsigned long long lane = rem % {inner}ULL; out[index] = input[(outer * {input_extent}ULL + {function}_indices[position]) * {inner}ULL + lane]; }}\n}}\n",
+                    indices.len(),
+                    cuda_index_table(indices)?,
+                    indices.len() * inner,
+                    indices.len() * inner,
+                )
+            }
+            // One thread per output element adds its contributions in update
+            // order (destination-grouped offsets and sources), so duplicates
+            // round exactly like the CPU reference's sequential adds.
+            TensorOp::ScatterAdd { indices, axis, .. } => {
+                let extent = node.shape[*axis];
+                let inner = element_count(&node.shape[*axis + 1..])?;
+                let (offsets, sources) = cuda_scatter_tables(indices, extent);
+                format!(
+                    "__device__ const unsigned int {function}_offsets[{}] = {{{}}};\n\
+                    __device__ const unsigned int {function}_sources[{}] = {{{}}};\n\
+                    extern \"C\" __global__ void {function}(const float* base, const float* updates, float* out, unsigned long long count) {{\n\
+                        unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
+                        if (index >= count) return;\n\
+                        unsigned long long outer = index / {}ULL; unsigned long long row = (index / {inner}ULL) % {extent}ULL; unsigned long long lane = index % {inner}ULL;\n\
+                        float value = base[index];\n\
+                        for (unsigned int k = {function}_offsets[row]; k < {function}_offsets[row + 1ULL]; ++k) value = value + updates[(outer * {}ULL + {function}_sources[k]) * {inner}ULL + lane];\n\
+                        out[index] = value;\n}}\n",
+                    offsets.len(),
+                    cuda_index_table(&offsets)?,
+                    sources.len(),
+                    cuda_index_table(&sources)?,
+                    extent * inner,
+                    indices.len(),
+                )
+            }
             TensorOp::Transpose { input, axes } => {
                 let input_shape = &plan.nodes[*input].shape;
                 if axes.len() != input_shape.len() || node.shape.len() != input_shape.len() {
@@ -7748,6 +7803,40 @@ fn cuda_float_literal(value: f64) -> String {
     }
 }
 
+/// A comma-separated `unsigned int` initializer for a baked index table.
+fn cuda_index_table(values: &[usize]) -> Result<String, String> {
+    let mut table = String::with_capacity(values.len() * 6);
+    for (position, value) in values.iter().enumerate() {
+        let value = u32::try_from(*value)
+            .map_err(|_| format!("CUDA index table entry {value} exceeds u32"))?;
+        if position > 0 {
+            table.push(',');
+        }
+        table.push_str(&value.to_string());
+    }
+    Ok(table)
+}
+
+/// Scatter contributions grouped by destination: `sources[offsets[row]..
+/// offsets[row + 1]]` are the update positions that add into `row`, in
+/// increasing order.
+fn cuda_scatter_tables(indices: &[usize], extent: usize) -> (Vec<usize>, Vec<usize>) {
+    let mut offsets = vec![0; extent + 1];
+    for index in indices {
+        offsets[index + 1] += 1;
+    }
+    for row in 0..extent {
+        offsets[row + 1] += offsets[row];
+    }
+    let mut cursor = offsets[..extent].to_vec();
+    let mut sources = vec![0; indices.len()];
+    for (source, index) in indices.iter().enumerate() {
+        sources[cursor[*index]] = source;
+        cursor[*index] += 1;
+    }
+    (offsets, sources)
+}
+
 fn cuda_op_name(op: &TensorOp) -> &'static str {
     match op {
         TensorOp::Input { .. } => "input",
@@ -7793,6 +7882,8 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Concat { .. } => "concat",
         TensorOp::Slice { .. } => "slice",
         TensorOp::PadSlice { .. } => "pad_slice",
+        TensorOp::Gather { .. } => "gather",
+        TensorOp::ScatterAdd { .. } => "scatter_add",
         TensorOp::Broadcast { .. } => "broadcast",
     }
 }
