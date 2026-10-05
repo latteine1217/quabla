@@ -3626,28 +3626,28 @@ def test_matmul_follows_numpy_rules_for_vectors():
 
 
 def test_prod_is_exact_with_zeros_and_differentiates_without_division():
-    import numpy as np
-
-    rng = np.random.default_rng(3)
-    data = rng.uniform(-2.0, 2.0, size=(3, 5, 4))
-    for axis in [None, 0, 1, -1, (0, 2), (2, 0, 1)]:
-        for keepdims in [False, True]:
-            expected = np.prod(data, axis=axis, keepdims=keepdims)
-            value = qb.prod(data, axis=axis, keepdims=keepdims)
-            assert value.shape == list(np.shape(expected))
-            assert_close(value, expected.tolist(), 1e-15)
-            assert_close(qb.asarray(data).prod(axis, keepdims), expected.tolist(), 1e-15)
-            jitted = qb.jit(lambda t, a=axis, k=keepdims: qb.prod(t, axis=a, keepdims=k))(data)
-            assert jitted.tolist() == value.tolist()
-    # Eager float32 values round exactly like the traced graph.
-    data32 = qb.asarray(rng.uniform(0.5, 1.5, size=(4, 37)), dtype=qb.float32)
-    for axis in [None, 1]:
-        eager = qb.prod(data32, axis=axis)
-        assert eager.dtype == qb.float32
-        jitted = qb.jit(lambda t, a=axis: qb.prod(t, a))(data32)
-        assert float_bits(np.ravel(eager.tolist()).tolist()) == float_bits(np.ravel(jitted.tolist()).tolist())
-        reference = np.prod(np.asarray(data32, dtype=np.float64), axis=axis)
-        assert_relative(np.ravel(eager.tolist()).tolist(), np.ravel(reference).tolist(), 1e-6)
+    # NumPy supplies the reference products; it is an optional dependency.
+    if np is not None:
+        rng = np.random.default_rng(3)
+        data = rng.uniform(-2.0, 2.0, size=(3, 5, 4))
+        for axis in [None, 0, 1, -1, (0, 2), (2, 0, 1)]:
+            for keepdims in [False, True]:
+                expected = np.prod(data, axis=axis, keepdims=keepdims)
+                value = qb.prod(data, axis=axis, keepdims=keepdims)
+                assert value.shape == list(np.shape(expected))
+                assert_close(value, expected.tolist(), 1e-15)
+                assert_close(qb.asarray(data).prod(axis, keepdims), expected.tolist(), 1e-15)
+                jitted = qb.jit(lambda t, a=axis, k=keepdims: qb.prod(t, axis=a, keepdims=k))(data)
+                assert jitted.tolist() == value.tolist()
+        # Eager float32 values round exactly like the traced graph.
+        data32 = qb.asarray(rng.uniform(0.5, 1.5, size=(4, 37)), dtype=qb.float32)
+        for axis in [None, 1]:
+            eager = qb.prod(data32, axis=axis)
+            assert eager.dtype == qb.float32
+            jitted = qb.jit(lambda t, a=axis: qb.prod(t, a))(data32)
+            assert float_bits(np.ravel(eager.tolist()).tolist()) == float_bits(np.ravel(jitted.tolist()).tolist())
+            reference = np.prod(np.asarray(data32, dtype=np.float64), axis=axis)
+            assert_relative(np.ravel(eager.tolist()).tolist(), np.ravel(reference).tolist(), 1e-6)
     # Gradients are the products of the other entries: with one zero only
     # that entry has a nonzero gradient; with two zeros every entry is zero.
     one_zero = qb.array([2.0, 0.0, -3.0, 7.0, 5.0])
