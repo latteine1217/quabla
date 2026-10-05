@@ -198,9 +198,16 @@ def test_adapter_structure_signatures_and_cache_bound():
         assert len(builds) == 4
         for scale in (3.0, 4.0, 5.0, 6.0):
             evaluate(params, batch, scale)
-        expect(
-            qb.RetraceLimitError, "max_traces=8", lambda: evaluate(params, batch, 7.0)
-        )
+        # A ninth signature evicts the least recently used program with a warning.
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            evaluate(params, batch, 7.0)
+        assert len(builds) == 9
+        (warning,) = caught
+        assert warning.category is qb.RetraceWarning
+        assert "max_traces=8" in str(warning.message)
         sum_value, sum_grads = transform(reduction="sum")(params, batch)
         expected_sum, expected_sum_grads = cpu_shards(params, batch, "sum")
         close(sum_value, expected_sum)

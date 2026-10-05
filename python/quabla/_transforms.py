@@ -14,8 +14,9 @@ leaf (D7): Python `bool`/`int`/`float` leaves are static weak constants, so
 they keep a `float32` program in `float32`, and a new value retraces. In a
 differentiated position (`argnums`, the primals of `jvp`/`vjp`) a Python
 scalar becomes a `float64` array instead, since a constant has no
-derivative. A function may be traced at most `max_traces` times (8 unless
-`jit` sets it) before `RetraceLimitError`; the cache never evicts.
+derivative. A function keeps at most `max_traces` traces (8 unless `jit`
+sets it); a new signature beyond that evicts the least recently used trace
+with a `RetraceWarning`.
 
 Values that the function reads from its closure or from globals are baked
 into the trace, as with `jax.jit`: an eager array that meets a traced value
@@ -58,7 +59,7 @@ import warnings
 from . import _quabla
 from ._array import arange, asarray, zeros
 from ._devices import ShapeDtype, require_device
-from ._errors import RetraceLimitError, UnsupportedOperationError
+from ._errors import RetraceWarning, UnsupportedOperationError
 from ._quabla import Tensor, TensorTraceGraph, TraceTensor, bool_, float32, float64
 from .tree import _LEAF, _describe, _flatten, _leaf_count, _leaf_paths, _unflatten
 
@@ -553,9 +554,10 @@ class _CaptureKey(tuple):
 
 class _TraceCache:
     """Compiled programs (or staged graphs) of one transformed function
-    keyed by signature. `probes` maps the signature of a staged function
-    that captured tracers to its `_Probe`; such graphs are keyed by
-    `_CaptureKey`."""
+    keyed by signature, in least-recently-used order: a hit moves its entry
+    to the end, and a full cache evicts the first. `probes` maps the
+    signature of a staged function that captured tracers to its `_Probe`;
+    such graphs are keyed by `_CaptureKey`."""
 
     __slots__ = ("entries", "max_traces", "probes")
 
@@ -564,8 +566,14 @@ class _TraceCache:
         self.max_traces = max_traces
         self.probes = {}
 
+    def get(self, key):
+        entry = self.entries.pop(key, None)
+        if entry is not None:
+            self.entries[key] = entry
+        return entry
+
     def lookup(self, key, build, transform):
-        entry = self.entries.get(key)
+        entry = self.get(key)
         if entry is None:
             self.ensure_room(key, transform)
             entry = build()
@@ -590,13 +598,18 @@ class _TraceCache:
 
     def ensure_room(self, key, transform):
         if len(self.entries) >= self.max_traces:
-            cached = "\n".join(f"  {_describe_signature(k)}" for k in self.entries)
-            raise RetraceLimitError(
-                f"{transform!r} exceeded max_traces={self.max_traces}; cached signatures:\n"
-                f"{cached}\nnew signature:\n  {_describe_signature(key)}\n"
-                "Python scalar arguments are static and part of the signature: pass "
+            evicted = next(iter(self.entries))
+            del self.entries[evicted]
+            warnings.warn(
+                f"{transform!r} exceeded max_traces={self.max_traces} and evicted its "
+                f"least recently used trace:\n  {_describe_signature(evicted)}\n"
+                f"new signature:\n  {_describe_signature(key)}\n"
+                "Each new signature is traced and compiled again. Python scalar "
+                "arguments are static and part of the signature: pass "
                 "quabla.array(value, dtype=...) to vary one without retracing, or raise "
-                "max_traces with quabla.jit"
+                "max_traces with quabla.jit",
+                RetraceWarning,
+                stacklevel=_user_stacklevel(),
             )
 
 
@@ -734,12 +747,12 @@ class _Transform:
         cache = self._inline_cache()
         probe = cache.probes.get(key)
         if probe is None:
-            value = cache.entries.get(key)
+            value = cache.get(key)
             if value is not None:
                 return value, []
         else:
             captures = probe.captures()
-            value = cache.entries.get(_CaptureKey((key, _avals(captures))))
+            value = cache.get(_CaptureKey((key, _avals(captures))))
             if value is not None:
                 return value, captures
         value = stage()
@@ -1831,7 +1844,8 @@ def jit(*args, **kwargs):
     and compiled on its first call per argument signature, then run from the
     cache. `device=None` means `"cpu"`; device targets are explicit.
     Arguments at `static_argnums` are static as a whole and must be hashable;
-    a signature beyond `max_traces` raises `RetraceLimitError`.
+    a signature beyond `max_traces` evicts the least recently used trace with
+    a `RetraceWarning`.
 
     The v0.1 decorator form `jit(input_specs)` of the 2D `Matrix` API still
     works unchanged: it is recognized by its non-callable spec list (D17).

@@ -25,16 +25,12 @@ with a native `log1p`, NaN-propagating `max`/`maximum`/`relu`, native
 | 10 | Native `float64` on CUDA (MLX hardware has no f64) | CUDA codegen | L |
 | 11 | Packaging and tooling: wheels and PyPI, type stubs, `__version__`, parameter save/load, value-showing `repr`, `debug.print` inside `jit` | CI, Python | M |
 
-Decisions for the owner before v0.3 work starts:
+Decisions taken by the owner on 2026-10-06 and implemented:
 
-- `max_traces` (default 8) raises `RetraceLimitError` for every transform,
-  and the trace cache is keyed by the root function across transform
-  objects, so a training loop whose collocation count changes every epoch
-  hits the limit. Options: least-recently-used eviction with a warning,
-  per-object caches, or keeping the hard limit.
-- `norm` computes `sqrt(sum(x*x))` without scaling, as numpy and JAX do; it
-  overflows for float32 magnitudes above about 1e19. Scaling by `max|x|`
-  would change results in the last bits.
+- Trace caches evict their least recently used trace with a
+  `RetraceWarning` beyond `max_traces` instead of raising
+  `RetraceLimitError`, so a training loop whose collocation count changes
+  every epoch keeps running.
 
 Smaller observations kept for later: `abs` has gradient -1 at 0 (JAX uses
 +1), `max` gives the whole gradient of a tie to the last element (JAX

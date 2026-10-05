@@ -99,8 +99,10 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8)
 
 - Every transformed function traces and compiles one CPU program on its
   first call per signature (pytree structure, array shapes and dtypes, and
-  static values) and reuses it afterwards; more than `max_traces` signatures
-  (8 by default) raise `quabla.RetraceLimitError`. Python scalars are static
+  static values) and reuses it afterwards. It keeps at most `max_traces`
+  traces (8 by default); a new signature beyond that evicts the least
+  recently used trace with a `quabla.RetraceWarning`, so a training loop
+  whose batch shape varies keeps running but retraces. Python scalars are static
   weak constants, so they keep `float32` programs in `float32`, except in
   differentiated positions, where they become `float64` arrays. Arrays and
   Python values read from closures are fixed at trace time; tracers of an
@@ -215,7 +217,10 @@ qb.jit(fun, device=None, static_argnums=(), max_traces=8)
   right one it is a `TypeError`; convert it with `qb.asarray` first.
 - Errors: `quabla.QuablaError` is the base of `TracerError` (a `TypeError`),
   `RetraceLimitError` (a `ValueError`), and `UnsupportedOperationError` (a
-  `ValueError` and `NotImplementedError` with `.op` and `.device`).
+  `ValueError` and `NotImplementedError` with `.op` and `.device`). Trace
+  caches no longer raise `RetraceLimitError`; it remains for existing
+  handlers. `quabla.RetraceWarning` (a `UserWarning`) reports an evicted
+  trace.
 
 ## Device Execution
 

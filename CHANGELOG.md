@@ -9,6 +9,15 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Changed
+
+- A transformed function that needs more than `max_traces` traces (8 by
+  default) evicts its least recently used trace and emits the new
+  `quabla.RetraceWarning` instead of raising `RetraceLimitError`, so a
+  training loop whose batch shape changes keeps running. Trace caches,
+  including `distributed.value_and_grad`, no longer raise
+  `RetraceLimitError`; the class remains for existing handlers.
+
 ## [0.2.3] - 2026-10-06
 
 ### Changed

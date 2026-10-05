@@ -9,6 +9,7 @@ this module, so the class is the same object in Python and Rust.
 __all__ = [
     "QuablaError",
     "RetraceLimitError",
+    "RetraceWarning",
     "TracerError",
     "UnsupportedOperationError",
 ]
@@ -37,4 +38,12 @@ class TracerError(QuablaError, TypeError):
 
 class RetraceLimitError(QuablaError, ValueError):
     """A transformed function needed more traces than its `max_traces`
-    bound; the message lists the cached signatures and the new one."""
+    bound. Trace caches now evict instead (see `RetraceWarning`); the class
+    remains so that existing handlers keep working."""
+
+
+class RetraceWarning(UserWarning):
+    """A transformed function needed more traces than its `max_traces`
+    bound, so its least recently used trace was evicted. Frequent eviction
+    means repeated tracing and compilation; the message names the evicted
+    and the new signature."""

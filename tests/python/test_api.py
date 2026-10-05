@@ -1356,7 +1356,9 @@ def test_jit_device_selection_checks_the_build():
     assert_raises(ValueError, qb.jit, masked_loss, max_traces=0, match="positive int")
 
 
-def test_trace_cache_keys_and_retrace_limit():
+def test_trace_cache_keys_and_lru_eviction():
+    import warnings
+
     traces = []
 
     def loss(x, scale):
@@ -1371,12 +1373,28 @@ def test_trace_cache_keys_and_retrace_limit():
     step(qb.array([1.0, 2.0], dtype=qb.float32), 2.0)  # new dtype
     assert len(traces) == 3
     assert traces[2][1] == qb.float32
-    error = assert_raises(qb.RetraceLimitError, step, qb.array([1.0, 2.0]), 5.0)
-    message = str(error)
+    # A hit makes the float64[2] trace the most recently used, so a fourth
+    # signature evicts the float64[3] trace with a warning instead of failing.
+    step(qb.array([5.0, 6.0]), 2.0)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        assert step(qb.array([1.0, 2.0]), 5.0).item() == 15.0
+    assert len(traces) == 4
+    (warning,) = caught
+    assert warning.category is qb.RetraceWarning
+    assert issubclass(qb.RetraceWarning, UserWarning)
+    assert warning.filename == __file__
+    message = str(warning.message)
     assert "max_traces=3" in message and "jit(" in message
-    assert "(float64[2], 2.0)" in message and "(float32[2], 2.0)" in message
+    assert "evicted its least recently used trace:\n  (float64[3], 2.0)" in message
     assert "new signature:\n  (float64[2], 5.0)" in message
-    assert isinstance(error, ValueError)
+    step(qb.array([7.0, 8.0]), 2.0)  # still cached
+    assert len(traces) == 4
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        step(qb.array([1.0, 2.0, 3.0]), 2.0)  # evicted, so traced again
+    assert len(traces) == 5 and len(caught) == 1
+    assert "(float32[2], 2.0)" in str(caught[0].message)
     # 1, 1.0, and True are different static values.
     counter = []
     typed = qb.jit(lambda x, s: counter.append(type(s)) or x * s)
