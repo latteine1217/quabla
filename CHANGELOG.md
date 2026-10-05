@@ -9,6 +9,8 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-06
+
 ### Changed
 
 - `float32` Cholesky JVPs, VJPs, and second derivatives use the native
@@ -200,7 +202,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/latteine1217/quabla/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/latteine1217/quabla/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/latteine1217/quabla/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/latteine1217/quabla/releases/tag/v0.1.0
