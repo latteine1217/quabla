@@ -5299,6 +5299,19 @@ impl TensorMlxAdamOptimizer {
         self.plan.step(&self.inputs).map_err(PyValueError::new_err)
     }
 
+    /// Learning rate of the next step; host schedules set it between steps.
+    #[getter]
+    fn learning_rate(&self) -> f32 {
+        self.plan.learning_rate()
+    }
+
+    #[setter]
+    fn set_learning_rate(&mut self, learning_rate: f32) -> PyResult<()> {
+        self.plan
+            .set_learning_rate(learning_rate)
+            .map_err(PyValueError::new_err)
+    }
+
     #[pyo3(signature = (inputs = None))]
     fn loss(&mut self, inputs: Option<&Bound<'_, PyDict>>) -> PyResult<PyTensor> {
         if let Some(inputs) = inputs {
@@ -7991,6 +8004,23 @@ impl TensorCudaAdamOptimizer {
             )
         };
         result.map_err(PyValueError::new_err)
+    }
+
+    /// Learning rate of the next step; host schedules set it between steps.
+    #[getter]
+    fn learning_rate(&self) -> f32 {
+        self.learning_rate
+    }
+
+    #[setter]
+    fn set_learning_rate(&mut self, learning_rate: f32) -> PyResult<()> {
+        if !(learning_rate.is_finite() && learning_rate >= 0.0) {
+            return Err(PyValueError::new_err(
+                "CUDA Adam learning_rate must be finite and nonnegative",
+            ));
+        }
+        self.learning_rate = learning_rate;
+        Ok(())
     }
 
     fn parameters(&self) -> PyResult<BTreeMap<String, PyTensor>> {

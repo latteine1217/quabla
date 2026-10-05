@@ -336,11 +336,517 @@ def test_trainer_releases_replaced_batch_payload():
     assert math.isclose(float(trainer.loss()), (0.5 - 0.01 * 4.0) ** 2 * 4.0)
 
 
+def test_schedules_match_hand_computed_optax_values():
+    from quabla.optim import (
+        constant,
+        cosine_decay,
+        exponential_decay,
+        piecewise_constant,
+        warmup_cosine_decay,
+    )
+
+    def close(schedule, expected):
+        for step, value in expected.items():
+            got = schedule(step)
+            assert math.isclose(got, value, rel_tol=1e-15, abs_tol=1e-15), (
+                step,
+                got,
+                value,
+            )
+
+    close(constant(0.5), {0: 0.5, 7: 0.5})
+    close(
+        exponential_decay(1.0, 10, 0.5),
+        {0: 1.0, 5: math.sqrt(0.5), 10: 0.5, 20: 0.25},
+    )
+    close(exponential_decay(1.0, 10, 0.5, staircase=True), {9: 1.0, 15: 0.5})
+    close(
+        exponential_decay(1.0, 10, 0.5, transition_begin=5),
+        {0: 1.0, 5: 1.0, 15: 0.5},
+    )
+    close(exponential_decay(1.0, 10, 0.5, end_value=0.3), {10: 0.5, 20: 0.3})
+    close(exponential_decay(1.0, 10, 2.0, end_value=3.0), {10: 2.0, 20: 3.0})
+    # 2 * (0.9 * 0.5 * (1 + cos(pi t / 100)) + 0.1)
+    close(
+        cosine_decay(2.0, 100, alpha=0.1),
+        {
+            0: 2.0,
+            25: 2 * (0.9 * 0.5 * (1 + math.sqrt(0.5)) + 0.1),
+            50: 1.1,
+            100: 0.2,
+            150: 0.2,
+        },
+    )
+    # decay_steps includes the warmup: peak at 10, end value from 110 on.
+    close(
+        warmup_cosine_decay(0.0, 1.0, 10, 110, end_value=0.1),
+        {0: 0.0, 5: 0.5, 10: 1.0, 60: 0.55, 110: 0.1, 200: 0.1},
+    )
+    close(warmup_cosine_decay(0.5, 1.0, 0, 100), {0: 1.0, 50: 0.5, 100: 0.0})
+    close(
+        piecewise_constant([10, 20], [1.0, 0.1, 0.01]),
+        {0: 1.0, 9: 1.0, 10: 0.1, 19: 0.1, 20: 0.01, 99: 0.01},
+    )
+    raises(ValueError, exponential_decay, 1.0, 0, 0.5)
+    raises(ValueError, exponential_decay, 1.0, 10, 0.0)
+    raises(ValueError, cosine_decay, 1.0, 0)
+    raises(ValueError, warmup_cosine_decay, 0.0, 1.0, 10, 10)
+    raises(ValueError, piecewise_constant, [10, 10], [1.0, 2.0, 3.0])
+    raises(ValueError, piecewise_constant, [10], [1.0])
+
+
+def test_adamw_decoupled_decay_against_reference():
+    from quabla.optim import AdamW
+
+    # One step by hand: m_hat = 2, v_hat = 4, so the Adam direction is 2/2.01;
+    # the decay adds weight_decay * p with the pre-update p.
+    params = {"w": qb.array([3.0]), "v": qb.array([-1.0], dtype=qb.float32)}
+    grads = {"w": qb.array([2.0]), "v": qb.array([-4.0], dtype=qb.float32)}
+    optimizer = AdamW(0.1, b1=0.5, b2=0.75, eps=0.01, weight_decay=0.5)
+    updated, state = optimizer.update(params, grads, optimizer.init(params))
+    assert math.isclose(scalar(updated["w"]), 3 - 0.1 * (2 / 2.01 + 0.5 * 3))
+    assert updated["v"].dtype == qb.float32
+    assert state["m"]["v"].dtype == qb.float64 and state["step"] == 1
+
+    # Multi-step f64 trajectory against a plain-Python reference.
+    lr, b1, b2, eps, wd = 0.03, 0.8, 0.95, 1e-3, 0.2
+    p, m, v = [1.0, -2.0], [0.0, 0.0], [0.0, 0.0]
+    params = qb.array(p)
+    optimizer = AdamW(lr, b1, b2, eps, wd)
+    state = optimizer.init(params)
+    for k, g in enumerate(([2.0, -4.0], [-1.0, 0.0], [0.5, 1.0]), start=1):
+        params, state = optimizer.update(params, qb.array(g), state)
+        for i in range(2):
+            m[i] = b1 * m[i] + (1 - b1) * g[i]
+            v[i] = b2 * v[i] + (1 - b2) * g[i] ** 2
+            direction = (m[i] / (1 - b1**k)) / (math.sqrt(v[i] / (1 - b2**k)) + eps)
+            p[i] -= lr * (direction + wd * p[i])
+        for got, want in zip(params.to_flat_list(), p):
+            assert math.isclose(got, want, rel_tol=1e-14), (got, want)
+
+    # Zero decay is bitwise Adam, including infinite parameters.
+    params = qb.array([0.5, math.inf, -3.0], dtype=qb.float32)
+    grads = qb.array([1.0, 1.0, -2.0], dtype=qb.float32)
+    adam, adamw = Adam(0.1), AdamW(0.1, weight_decay=0.0)
+    a, _ = adam.update(params, grads, adam.init(params))
+    w, _ = adamw.update(params, grads, adamw.init(params))
+    assert memoryview(a).tobytes() == memoryview(w).tobytes()
+    for value in (-1e-3, math.nan, math.inf):
+        raises(ValueError, AdamW, weight_decay=value)
+    raises(AttributeError, getattr, AdamW(), "step")
+
+
+def test_schedules_drive_adam_and_sgd_at_the_completed_step():
+    from quabla.optim import piecewise_constant
+
+    calls = []
+
+    def schedule(step):
+        calls.append(step)
+        return [0.1, 0.01][min(step, 1)]
+
+    # b1 = b2 = 0 makes the Adam direction g / (|g| + eps).
+    optimizer = Adam(schedule, b1=0.0, b2=0.0, eps=1e-8)
+    params = qb.array([1.0])
+    state = optimizer.init(params)
+    expected = 1.0
+    for rate in (0.1, 0.01, 0.01):
+        params, state = optimizer.update(params, qb.array([2.0]), state)
+        expected -= rate * 2 / (2 + 1e-8)
+        assert math.isclose(scalar(params), expected, rel_tol=1e-15)
+    assert calls == [0, 1, 2]
+    raises(TypeError, optimizer.step, {"w": params}, {"w": params})
+
+    sgd = SGD(piecewise_constant([1], [0.5, 0.25]))
+    params, state = qb.array([1.0]), sgd.init(qb.array([1.0]))
+    assert state == {"step": 0}
+    params, state = sgd.update(params, qb.array([2.0]), state)
+    assert scalar(params) == 0.0 and state == {"step": 1}
+    params, state = sgd.update(params, qb.array([2.0]), state)
+    assert scalar(params) == -0.5 and state == {"step": 2}
+    raises(ValueError, sgd.update, params, params, None)
+    raises(ValueError, sgd.update, params, params, {"step": -1})
+    # A schedule must yield finite nonnegative rates.
+    for bad in (-1.0, math.nan, math.inf):
+        broken = SGD(lambda step, bad=bad: bad)
+        raises(ValueError, broken.update, params, params, broken.init(params))
+
+
+def test_clip_by_global_norm_scaling_overflow_and_nonfinite():
+    from quabla.optim import clip_by_global_norm
+
+    grads = {"a": qb.array([3.0, 0.0]), "b": (qb.array(4.0), None)}
+    same, norm = clip_by_global_norm(grads, 10.0)
+    assert norm == 5.0 and same is grads
+    clipped, norm = clip_by_global_norm(grads, 1.0)
+    assert norm == 5.0
+    assert math.isclose(clipped["a"].to_flat_list()[0], 0.6)
+    assert clipped["a"].to_flat_list()[1] == 0.0
+    assert math.isclose(scalar(clipped["b"][0]), 0.8) and clipped["b"][1] is None
+
+    # Scaling by max |g| avoids the overflow and underflow of sum(g * g).
+    for magnitude in (1e200, 1e-200):
+        _, norm = clip_by_global_norm([qb.array([magnitude, magnitude])], 1e300)
+        assert math.isclose(norm, math.sqrt(2) * magnitude, rel_tol=1e-15)
+    clipped, norm = clip_by_global_norm([qb.array([1e200, -1e200])], 1.0)
+    for value, sign in zip(clipped[0].to_flat_list(), (1, -1)):
+        assert math.isclose(value, sign * math.sqrt(0.5), rel_tol=1e-15)
+    # float32 leaves are measured in float64 and keep their dtype.
+    clipped, norm = clip_by_global_norm([qb.array([3e30, 4e30], dtype=qb.float32)], 1.0)
+    assert clipped[0].dtype == qb.float32
+    assert math.isclose(norm, 5e30, rel_tol=1e-7)
+    assert math.isclose(clipped[0].to_flat_list()[1], 0.8, rel_tol=1e-7)
+    zero, norm = clip_by_global_norm([qb.zeros([3])], 1.0)
+    assert norm == 0.0 and zero[0].to_flat_list() == [0.0] * 3
+
+    # Non-finite norms never become finite clipped values.
+    for bad in (math.nan, math.inf, -math.inf):
+        clipped, norm = clip_by_global_norm(
+            {"a": qb.array([bad, 1.0]), "b": qb.array([2.0])}, 1.0
+        )
+        assert not math.isfinite(norm)
+        assert math.isnan(norm) == math.isnan(bad)
+        assert all(math.isnan(x) for x in clipped["a"].to_flat_list())
+        assert all(math.isnan(x) for x in clipped["b"].to_flat_list())
+    for value in (0.0, -1.0, math.nan, math.inf):
+        raises(ValueError, clip_by_global_norm, grads, value)
+    raises(TypeError, clip_by_global_norm, [qb.array([True])], 1.0)
+
+
+def test_clip_norm_option_clips_before_the_update():
+    from quabla.optim import AdamW, clip_by_global_norm
+
+    params = {"w": qb.array([1.0, -1.0]), "b": qb.array(0.5)}
+    grads = {"w": qb.array([30.0, -40.0]), "b": qb.array(0.0)}
+    clipped, _ = clip_by_global_norm(grads, 2.0)
+    for make in (
+        lambda clip: Adam(0.1, clip_norm=clip),
+        lambda clip: AdamW(0.1, weight_decay=0.1, clip_norm=clip),
+        lambda clip: SGD(0.1, clip_norm=clip),
+    ):
+        reference = make(None)
+        expected, _ = reference.update(params, clipped, reference.init(params))
+        optimizer = make(2.0)
+        actual, _ = optimizer.update(params, grads, optimizer.init(params))
+        for name in ("w", "b"):
+            assert actual[name].to_flat_list() == expected[name].to_flat_list()
+    for value in (0.0, -1.0, math.nan):
+        raises(ValueError, Adam, clip_norm=value)
+        raises(ValueError, SGD, clip_norm=value)
+    raises(TypeError, Adam(clip_norm=1.0).step, {"w": qb.array([1.0])}, {})
+
+
+def test_cpu_trainer_adamw_and_schedules():
+    from quabla.optim import AdamW, warmup_cosine_decay
+
+    train("cpu", AdamW(0.05, weight_decay=1e-5))
+    train("cpu", Adam(warmup_cosine_decay(0.0, 0.08, 20, 400, end_value=0.01)))
+    rates = []
+
+    def schedule(step):
+        rates.append(step)
+        return 0.05
+
+    trainer = train("cpu", SGD(schedule))
+    assert rates == list(range(300)) and trainer._state == {"step": 300}
+
+
+def test_device_trainer_sets_scheduled_rates_and_rejects_unsupported():
+    from quabla.optim import AdamW, piecewise_constant
+
+    for device in ("mlx", "cuda:0"):
+        for optimizer in (AdamW(), Adam(clip_norm=1.0)):
+            raises(
+                qb.UnsupportedOperationError,
+                Trainer,
+                lambda p: p.sum(),
+                qb.array([1.0]),
+                optimizer,
+                device=device,
+            )
+
+    events = []
+
+    class Executor:
+        learning_rate = None
+
+        def __setattr__(self, name, value):
+            events.append(("set", value))
+            object.__setattr__(self, name, value)
+
+        def step(self, *args):
+            events.append(("step", self.learning_rate))
+
+    def factory(traced, names, inputs, lr, retained, b1, b2, eps):
+        events.append(("create", lr))
+        return Executor()
+
+    with (
+        patch("quabla._devices.require_device", return_value=("mlx", 0)),
+        patch.object(qb._quabla, "mlx_adam_loss_optimizer", factory),
+    ):
+        trainer = Trainer(
+            lambda p, x: (p * x).sum(),
+            qb.array([1.0]),
+            Adam(piecewise_constant([1, 2], [0.0, 0.5, 0.25])),
+            qb.array([2.0]),
+            device="mlx",
+            batch_argnums=(0,),
+        )
+        trainer.step()
+        trainer.step(qb.array([3.0]))
+        trainer.step()
+    assert events == [
+        ("create", 0.0),
+        ("set", 0.0),
+        ("step", 0.0),
+        ("set", 0.5),
+        ("step", 0.5),
+        ("set", 0.25),
+        ("step", 0.25),
+    ]
+
+
+def test_mlx_trainer_schedule_matches_cpu():
+    if os.environ.get("QUABLA_MLX_TEST") != "1":
+        return
+    from quabla.optim import warmup_cosine_decay
+
+    schedule = warmup_cosine_decay(0.0, 0.05, 3, 12, end_value=0.005)
+    params = {"layers": [qb.array([0.0])], "bias": qb.array([0.0])}
+    x, target = qb.array([-1.0, 1.0]), qb.array([-1.0, 3.0])
+    cpu = Trainer(loss, params, Adam(schedule), x, target)
+    mlx = Trainer(loss, params, Adam(schedule), x, target, device="mlx")
+    assert mlx._executor.learning_rate == 0.0
+    for _ in range(12):
+        cpu.step()
+        mlx.step()
+    assert math.isclose(mlx._executor.learning_rate, schedule(11), rel_tol=1e-6)
+    for got, want in (
+        (mlx.params["bias"], cpu.params["bias"]),
+        (mlx.params["layers"][0], cpu.params["layers"][0]),
+    ):
+        assert math.isclose(scalar(got), scalar(want), rel_tol=1e-5), (got, want)
+    raises(ValueError, setattr, mlx._executor, "learning_rate", -1.0)
+    train("mlx", Adam(warmup_cosine_decay(0.0, 0.08, 20, 400, end_value=0.01)))
+
+
+def test_cuda_trainer_schedule():
+    if os.environ.get("QUABLA_CUDA_TEST") != "1":
+        return
+    from quabla.optim import warmup_cosine_decay
+
+    schedule = warmup_cosine_decay(0.0, 0.05, 3, 12, end_value=0.005)
+    params = {"layers": [qb.array([0.0])], "bias": qb.array([0.0])}
+    x, target = qb.array([-1.0, 1.0]), qb.array([-1.0, 3.0])
+    cpu = Trainer(loss, params, Adam(schedule), x, target)
+    cuda = Trainer(loss, params, Adam(schedule), x, target, device="cuda:0")
+    for _ in range(12):
+        cpu.step()
+        cuda.step()
+    for got, want in (
+        (cuda.params["bias"], cpu.params["bias"]),
+        (cuda.params["layers"][0], cpu.params["layers"][0]),
+    ):
+        assert math.isclose(scalar(got), scalar(want), rel_tol=1e-5), (got, want)
+    raises(ValueError, setattr, cuda._executor, "learning_rate", math.nan)
+    train("cuda:0", Adam(warmup_cosine_decay(0.0, 0.08, 20, 400, end_value=0.01)))
+
+
+def rosenbrock(p):
+    return (1 - p[0]) ** 2 + 100 * (p[1] - p[0] ** 2) ** 2
+
+
+def test_lbfgs_rosenbrock_converges_from_the_classic_start():
+    from quabla.optim import LBFGS
+
+    solution, info = LBFGS(tolerance_grad=1e-10).minimize(
+        rosenbrock, qb.array([-1.2, 1.0])
+    )
+    x, y = solution.to_flat_list()
+    assert abs(x - 1) < 1e-6 and abs(y - 1) < 1e-6, (x, y, info)
+    assert info["converged"] and info["loss"] < 1e-12, info
+    assert info["iterations"] < 60 and info["evaluations"] < 80, info
+    try:
+        from scipy.optimize import minimize
+    except ImportError:
+        return
+
+    def fun(p):
+        a, b = p
+        value = (1 - a) ** 2 + 100 * (b - a * a) ** 2
+        return value, [-2 * (1 - a) - 400 * a * (b - a * a), 200 * (b - a * a)]
+
+    reference = minimize(
+        fun, [-1.2, 1.0], jac=True, method="L-BFGS-B", options={"gtol": 1e-10}
+    )
+    print(
+        f"  rosenbrock: quabla {info['iterations']} it / {info['evaluations']} ev; "
+        f"scipy L-BFGS-B {reference.nit} it / {reference.nfev} ev"
+    )
+    assert info["iterations"] <= 2 * reference.nit + 10, (info, reference.nit)
+
+
+def test_lbfgs_ill_conditioned_quadratic_reaches_exact_minimizer():
+    from quabla.optim import LBFGS
+
+    n = 12
+    # A = D + u u' with eigenvalues spanning about 1e4; b fixed.
+    diagonal = [10.0 ** (4 * i / (n - 1)) for i in range(n)]
+    u = [math.sin(i + 1.0) for i in range(n)]
+    a = qb.array(
+        [[diagonal[i] * (i == j) + u[i] * u[j] for j in range(n)] for i in range(n)]
+    )
+    b = qb.array([math.cos(3.0 * i) for i in range(n)])
+    exact = qb.solve(a, b.reshape([n, 1])).reshape([n]).to_flat_list()
+
+    def quadratic(x, a, b):
+        return (
+            0.5 * (x * qb.matmul(a, x.reshape([n, 1])).reshape([n])).sum()
+            - (b * x).sum()
+        )
+
+    # With tolerances at zero the run ends where float64 loss differences
+    # (about 1e-16 * |f|) can no longer certify a decrease, so the line search
+    # stops; the iterate is then the minimizer to that resolution.
+    scale = max(abs(e) for e in exact)
+    results = {}
+    for history in (10, 20):
+        solution, info = LBFGS(
+            history=history,
+            max_iterations=1000,
+            tolerance_grad=0.0,
+            tolerance_change=0.0,
+        ).minimize(quadratic, qb.zeros([n]), a, b)
+        error = max(abs(s - e) for s, e in zip(solution.to_flat_list(), exact))
+        results[history] = (error, info)
+        assert info["reason"] == "line_search_failed", info
+    print(f"  quadratic (cond ~7e3): {results}")
+    assert results[20][0] < 1e-8 * scale and results[10][0] < 1e-7 * scale, results
+    assert results[20][1]["iterations"] < 120, results
+    try:
+        import numpy as np
+        from scipy.optimize import minimize
+    except ImportError:
+        return
+    matrix, vector = np.array(a.tolist()), np.array(b.tolist())
+    reference = minimize(
+        lambda x: (0.5 * x @ matrix @ x - vector @ x, matrix @ x - vector),
+        np.zeros(n),
+        jac=True,
+        method="L-BFGS-B",
+        options={"gtol": 0.0, "ftol": 0.0, "maxiter": 1000},
+    )
+    reference_error = float(np.abs(reference.x - np.array(exact)).max())
+    print(f"  scipy L-BFGS-B m=10: {reference.nit} it, error {reference_error:.2e}")
+    # Same memory: no more iterations than scipy needs (plus slack), and at
+    # least comparable accuracy.
+    assert results[10][1]["iterations"] <= 1.25 * reference.nit + 10, reference.nit
+    assert results[10][0] <= 4 * reference_error + 1e-12, reference_error
+
+
+def test_lbfgs_pytree_float32_and_nonfinite_backtracking():
+    from quabla.optim import LBFGS
+
+    # Linear least squares over a pytree with exact solution w = [1, -2], b = 3.
+    xs = qb.array([[0.0, 1.0], [1.0, 0.0], [1.0, 1.0], [2.0, -1.0]])
+    ys = qb.array([1.0, 4.0, 2.0, 7.0])
+
+    def residual(params, xs, ys):
+        prediction = qb.matmul(xs, params["w"].reshape([2, 1])).reshape([4])
+        return ((prediction + params["affine"][0] - ys) ** 2).sum()
+
+    params = {"w": qb.array([0.0, 0.0]), "affine": (qb.array(0.0), None)}
+    # The change test is purely relative, so a zero-residual fit is driven to
+    # the gradient tolerance rather than stopped once |f| is below 1e-9.
+    solution, info = LBFGS(tolerance_grad=1e-10).minimize(residual, params, xs, ys)
+    assert info["reason"] == "gradient_tolerance", info
+    assert solution["affine"][1] is None and info["converged"], info
+    for got, want in zip(
+        solution["w"].to_flat_list() + [scalar(solution["affine"][0])],
+        [1.0, -2.0, 3.0],
+    ):
+        assert abs(got - want) < 1e-9, (solution, info)
+    assert scalar(params["w"]) == 0.0
+
+    # float32 parameters keep their dtype; the line search stops at the
+    # float32 resolution instead of looping.
+    solution, info = LBFGS(max_iterations=200).minimize(
+        rosenbrock, qb.array([-1.2, 1.0], dtype=qb.float32)
+    )
+    assert solution.dtype == qb.float32, solution
+    assert all(abs(v - 1) < 1e-2 for v in solution.to_flat_list()), (solution, info)
+    assert info["reason"] != "max_iterations", info
+
+    # f(x) = -10 x - log(1 - x) has its minimum at 0.9. From 0 the first
+    # trial step (unit length along -g) lands on x = 1, where the loss is
+    # infinite; the line search must backtrack into the domain.
+    solution, info = LBFGS(tolerance_grad=1e-10, tolerance_change=0.0).minimize(
+        lambda x: (-10 * x - qb.log(1 - x)).sum(), qb.array([0.0])
+    )
+    assert abs(scalar(solution) - 0.9) < 1e-9 and info["converged"], (solution, info)
+
+    raises(ValueError, LBFGS, history=0)
+    raises(ValueError, LBFGS, tolerance_grad=-1.0)
+    raises(ValueError, LBFGS, line_search="backtracking")
+    raises(TypeError, LBFGS().minimize, rosenbrock, qb.array([True]))
+    raises(ValueError, LBFGS().minimize, lambda x: qb.log(x).sum(), qb.array([-1.0]))
+    capped = LBFGS(max_evaluations=5).minimize(rosenbrock, qb.array([-1.2, 1.0]))[1]
+    assert capped["reason"] == "max_evaluations" and capped["evaluations"] <= 5
+
+
+def test_lbfgs_after_adam_on_a_pinn_like_problem():
+    from quabla.optim import LBFGS
+
+    # u'' = -pi^2 sin(pi x) on [0, 1] with u(0) = u(1) = 0, solved by a small
+    # tanh network; u'' comes from nested grad inside vmap, as in PINNs.
+    def u(params, x):
+        return (qb.tanh(x * params["w1"] + params["b1"]) * params["w2"]).sum()
+
+    def objective(params, xs):
+        second = qb.vmap(lambda x: qb.grad(qb.grad(lambda z: u(params, z)))(x))(xs)
+        source = qb.sin(xs * math.pi) * math.pi**2
+        boundary = u(params, qb.array(0.0)) ** 2 + u(params, qb.array(1.0)) ** 2
+        return ((second + source) ** 2).mean() + boundary
+
+    width = 6
+    params = {
+        "w1": qb.array([math.sin(3.1 * k) for k in range(width)]),
+        "b1": qb.array([math.cos(1.7 * k) for k in range(width)]),
+        "w2": qb.array([0.3 * math.sin(2.3 * k + 1) for k in range(width)]),
+    }
+    xs = qb.linspace(0.0, 1.0, 17)
+    trainer = Trainer(objective, params, Adam(0.02), xs)
+    for _ in range(300):
+        trainer.step()
+    adam_loss = scalar(trainer.loss())
+    solution, info = LBFGS(max_iterations=300).minimize(objective, trainer.params, xs)
+    print(f"  pinn: adam {adam_loss:.3e} -> lbfgs {info['loss']:.3e} ({info})")
+    assert info["loss"] < 1e-3 * adam_loss, (adam_loss, info)
+    probe = [0.25, 0.5, 0.75]
+    error = max(
+        abs(u(solution, qb.array(x)).item() - math.sin(math.pi * x)) for x in probe
+    )
+    assert error < 1e-2, error
+
+
 def test_public_namespace_is_all():
     import quabla.optim as optim
 
     public = sorted(name for name in dir(optim) if not name.startswith("_"))
-    assert public == ["Adam", "SGD", "Trainer"], public
+    assert public == [
+        "Adam",
+        "AdamW",
+        "LBFGS",
+        "SGD",
+        "Trainer",
+        "clip_by_global_norm",
+        "constant",
+        "cosine_decay",
+        "exponential_decay",
+        "piecewise_constant",
+        "warmup_cosine_decay",
+    ], public
     assert sorted(optim.__all__) == public
 
 

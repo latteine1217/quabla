@@ -2016,12 +2016,20 @@ impl PyTensor {
     /// Pure host Adam leaf update with independent parameter and f64 moment
     /// buffers. Keep the eager expression's operation order before rounding
     /// the parameter once to its original dtype.
+    ///
+    /// A nonzero `weight_decay` gives AdamW's decoupled decay (Loshchilov and
+    /// Hutter): the step becomes `learning_rate * (delta + weight_decay *
+    /// parameter)` with the pre-update parameter, as in optax's `adamw`.
+    /// Zero keeps the Adam expression exactly, including for infinite
+    /// parameters, where `0 * inf` would otherwise introduce a NaN.
+    #[pyo3(signature = (gradient, first, second, hyperparameters, weight_decay = 0.0))]
     fn _adam_update(
         &self,
         gradient: &Self,
         first: &Self,
         second: &Self,
         hyperparameters: (f64, f64, f64, f64, f64, f64),
+        weight_decay: f64,
     ) -> PyResult<(Self, Self, Self)> {
         for tensor in [self, gradient, first, second] {
             if tensor.dtype == TensorDType::Bool {
@@ -2059,7 +2067,10 @@ impl PyTensor {
                     "failed to evaluate tensor /: division by zero is not supported",
                 ));
             }
-            let delta = (m / correction1) / denominator;
+            let mut delta = (m / correction1) / denominator;
+            if weight_decay != 0.0 {
+                delta += weight_decay * parameter;
+            }
             parameters.push(self.dtype.round(parameter - delta * learning_rate));
             moments.push(m);
             variances.push(v);
@@ -3196,7 +3207,13 @@ mod adam_tests {
     fn pure_adam_allocates_three_independent_buffers_and_preserves_aliases() {
         let input = PyTensor::from_shape_data(vec![2], vec![1.0, -2.0]).unwrap();
         let (parameters, moments, variances) = input
-            ._adam_update(&input, &input, &input, (0.1, 0.5, 0.75, 0.01, 0.5, 0.25))
+            ._adam_update(
+                &input,
+                &input,
+                &input,
+                (0.1, 0.5, 0.75, 0.01, 0.5, 0.25),
+                0.0,
+            )
             .unwrap();
         for output in [&parameters, &moments, &variances] {
             assert!(!storage_ptr_eq(&input.data, &output.data));

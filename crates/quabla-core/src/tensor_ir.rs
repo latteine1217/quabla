@@ -109,6 +109,15 @@ impl MlxAdamPlan {
         Err("MLX backend is unavailable: build Quabla on macOS with --features mlx".to_string())
     }
 
+    // `new` always fails without MLX, so no stub plan exists to report a rate.
+    pub fn learning_rate(&self) -> f32 {
+        0.0
+    }
+
+    pub fn set_learning_rate(&mut self, _learning_rate: f32) -> Result<(), String> {
+        Err("MLX backend is unavailable: build Quabla on macOS with --features mlx".to_string())
+    }
+
     pub fn step(&mut self, _inputs: &BTreeMap<String, DynamicTensor>) -> Result<(), String> {
         Err("MLX backend is unavailable: build Quabla on macOS with --features mlx".to_string())
     }
