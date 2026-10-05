@@ -9,7 +9,7 @@
 
 import sys as _sys
 
-from . import _array, _errors, _ops, _quabla, _transforms
+from . import _array, _custom, _errors, _ops, _quabla, _transforms
 from . import tree as tree
 # Kept out of `__all__`, so a star import does not shadow the standard
 # library module `random`.
@@ -39,6 +39,7 @@ from ._quabla import *  # noqa: F403
 # After the extension's names: the v0.2 `grad` and `jit` replace the v0.1
 # functions of the same names and dispatch the v0.1 call forms to them (D17).
 from ._transforms import *  # noqa: F403
+from ._custom import *  # noqa: F403
 
 __doc__ = _quabla.__doc__
 # The extension's names followed by the pure-Python v0.2 layers; a new list,
@@ -50,6 +51,7 @@ __all__ = list(
         + _errors.__all__
         + _ops.__all__
         + _transforms.__all__
+        + _custom.__all__
         + [
             "ShapeDtype",
             "devices",

@@ -1032,8 +1032,11 @@ impl MlxBackend {
                         .map_err(|error| error.to_string())
                 }
                 // AD happens on the IR before lowering, so the value is all
-                // that remains of a stop_gradient.
-                TensorOp::StopGradient { input } => Ok(mlx_value(&values, *input)?.clone()),
+                // that remains of a stop_gradient or a custom rule node (plan
+                // compilation already aliases the latter to its value).
+                TensorOp::StopGradient { input } | TensorOp::Custom { value: input, .. } => {
+                    Ok(mlx_value(&values, *input)?.clone())
+                }
                 // MLX scans in parallel, so float32 prefix sums may differ
                 // from the CPU's sequential rounded adds in the last bits.
                 TensorOp::CumSum {
@@ -2132,6 +2135,7 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Erf { .. } => "erf",
         TensorOp::Atan2 { .. } => "atan2",
         TensorOp::StopGradient { .. } => "stop_gradient",
+        TensorOp::Custom { .. } => "custom",
         TensorOp::CumSum { .. } => "cumsum",
         TensorOp::Concat { .. } => "concat",
         TensorOp::Slice { .. } => "slice",

@@ -60,6 +60,7 @@ python tests/python/test_cholesky_native.py
 python tests/python/test_buffer_narrow_import.py
 python tests/python/test_legacy_jacobian_direction.py
 python tests/python/test_ode_api.py
+python tests/python/test_custom_api.py
 ```
 
 The `quabla` package is a mixed Rust/Python project: the pure-Python

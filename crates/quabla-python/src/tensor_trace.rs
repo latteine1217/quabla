@@ -9,9 +9,9 @@ use pyo3::types::{PyAny, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use quabla_core::tensor_ir::{
     BatchingError, CudaBackend, CudaDataParallelExecutionPlan, CudaDataParallelTiming,
     CudaExecutionPlan, DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs,
-    SymbolicCotangent, TensorBackend, TensorComparison, TensorCondExecutionPlan, TensorDType,
-    TensorExecutionPlan, TensorForiExecutionPlan, TensorIr, TensorNodeId, TensorRegion,
-    TensorReplicaReduction, TensorScanExecutionPlan,
+    SymbolicCotangent, TensorBackend, TensorComparison, TensorCondExecutionPlan, TensorCustomRule,
+    TensorCustomTangent, TensorDType, TensorExecutionPlan, TensorForiExecutionPlan, TensorIr,
+    TensorNodeId, TensorRegion, TensorReplicaReduction, TensorScanExecutionPlan,
 };
 use quabla_core::{
     QuablaCompiler, QuablaExecutable, QuablaMultiOutputExecutable, QuablaMultiOutputProgram,
@@ -805,6 +805,24 @@ impl TensorTraceGraph {
         bindings: &[InlineBinding],
         outputs: &[TraceTensor],
     ) -> Result<Vec<TraceTensor>, String> {
+        self.inline_into_with(input_names, bindings, outputs, |_, _, spliced| Ok(spliced))
+    }
+
+    /// [`Self::inline_into`], with `finish(ir, bound, spliced)` mapping the
+    /// spliced output ids before they become tracers, where `bound[i]` is
+    /// the node bound to `input_names[i]` (a custom rule call wraps the
+    /// outputs in `Custom` nodes over those operands).
+    fn inline_into_with(
+        &self,
+        input_names: &[String],
+        bindings: &[InlineBinding],
+        outputs: &[TraceTensor],
+        finish: impl FnOnce(
+            &mut TensorIr,
+            &[TensorNodeId],
+            Vec<TensorNodeId>,
+        ) -> Result<Vec<TensorNodeId>, String>,
+    ) -> Result<Vec<TraceTensor>, String> {
         self.ensure_owns(&outputs.iter().collect::<Vec<_>>())?;
         if input_names.len() != bindings.len() {
             return Err(format!(
@@ -849,6 +867,7 @@ impl TensorTraceGraph {
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
         let mut traced = traced.iter();
         let mut bound = BTreeMap::new();
+        let mut bound_in_order = Vec::with_capacity(bindings.len());
         for (name, binding) in input_names.iter().zip(bindings) {
             let node_id = match binding {
                 InlineBinding::Traced(_) => {
@@ -871,12 +890,14 @@ impl TensorTraceGraph {
             if bound.insert(name.clone(), node_id).is_some() {
                 return Err(format!("callee input {name:?} is bound twice"));
             }
+            bound_in_order.push(node_id);
         }
         let output_ids = outputs
             .iter()
             .map(|output| output.node_id)
             .collect::<Vec<_>>();
         let spliced = ir.inline(&callee, &bound, &output_ids)?;
+        let spliced = finish(&mut ir, &bound_in_order, spliced)?;
         spliced
             .into_iter()
             .map(|node_id| {
@@ -966,6 +987,23 @@ impl TensorTraceGraph {
                 ))
             })
             .collect()
+    }
+}
+
+/// A frozen custom differentiation rule (`quabla.custom_vjp`,
+/// `quabla.custom_jvp`, `quabla.checkpoint`), built by
+/// `TensorTraceGraph._custom_rule`. Like `StagedExecutable`, the class is an
+/// implementation detail of `quabla._transforms` and is not registered.
+#[pyclass(name = "CustomRule", skip_from_py_object)]
+#[derive(Clone, Debug)]
+pub struct PyCustomRule {
+    rule: Arc<TensorCustomRule>,
+}
+
+#[pymethods]
+impl PyCustomRule {
+    fn __repr__(&self) -> String {
+        format!("CustomRule({})", self.rule.name())
     }
 }
 
@@ -2689,6 +2727,126 @@ impl TensorTraceGraph {
             .map_err(PyValueError::new_err)
     }
 
+    /// A call of a function with a custom differentiation rule: inlines
+    /// `outputs` of this staged primal graph like `_inline`, then wraps each
+    /// spliced output in a `Custom` node of `rule` whose operands are the
+    /// bindings, in `input_names` order (the rule's operand order).
+    #[pyo3(name = "_custom_call")]
+    fn py_custom_call(
+        &self,
+        py: Python<'_>,
+        rule: PyRef<'_, PyCustomRule>,
+        input_names: Vec<String>,
+        bindings: Vec<Bound<'_, PyAny>>,
+        outputs: Vec<TraceTensor>,
+    ) -> PyResult<Vec<TraceTensor>> {
+        let bindings = bindings
+            .iter()
+            .map(|binding| {
+                if let Ok(tensor) = binding.extract::<TraceTensor>() {
+                    Ok(InlineBinding::Traced(tensor))
+                } else if let Ok(tensor) = binding.extract::<PyRef<'_, PyTensor>>() {
+                    Ok(InlineBinding::Constant(
+                        tensor.to_dynamic_tensor().map_err(PyValueError::new_err)?,
+                    ))
+                } else {
+                    Err(PyTypeError::new_err(format!(
+                        "a custom rule operand must be a TraceTensor or a Tensor, got {}",
+                        binding.get_type().name()?
+                    )))
+                }
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let traced = bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                InlineBinding::Traced(tensor) => Some(tensor),
+                InlineBinding::Scalar(_) | InlineBinding::Constant(_) => None,
+            })
+            .collect::<Vec<_>>();
+        TraceTensor::ensure_liftable(&traced).map_err(|message| tracer_error(py, message))?;
+        let rule = rule.rule.clone();
+        self.inline_into_with(&input_names, &bindings, &outputs, |ir, bound, spliced| {
+            ir.custom(rule, &spliced, bound)
+        })
+        .map_err(PyValueError::new_err)
+    }
+
+    /// Freezes a custom differentiation rule from staged graphs (see
+    /// `TensorCustomRule`): `forward_outputs` are tracers of `forward`,
+    /// `backward_outputs` (one per operand, `None` for no cotangent) of
+    /// `backward`, and `tangent_outputs` of `tangent`, if given.
+    #[staticmethod]
+    #[pyo3(name = "_custom_rule")]
+    #[allow(clippy::too_many_arguments)]
+    fn py_custom_rule(
+        name: String,
+        forward: PyRef<'_, TensorTraceGraph>,
+        operand_names: Vec<String>,
+        output_count: usize,
+        forward_outputs: Vec<TraceTensor>,
+        backward: PyRef<'_, TensorTraceGraph>,
+        residual_names: Vec<String>,
+        cotangent_names: Vec<String>,
+        backward_outputs: Vec<Option<TraceTensor>>,
+        tangent: Option<PyRef<'_, TensorTraceGraph>>,
+        tangent_names: Vec<Option<String>>,
+        tangent_outputs: Vec<TraceTensor>,
+        rematerialize: bool,
+    ) -> PyResult<PyCustomRule> {
+        let snapshot = |graph: &TensorTraceGraph, tensors: &[&TraceTensor]| {
+            graph.ensure_owns(tensors)?;
+            Ok::<_, String>(
+                graph
+                    .ir
+                    .lock()
+                    .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+                    .clone(),
+            )
+        };
+        let rule = (|| {
+            let forward_ir = snapshot(&forward, &forward_outputs.iter().collect::<Vec<_>>())?;
+            let backward_ir = snapshot(
+                &backward,
+                &backward_outputs.iter().flatten().collect::<Vec<_>>(),
+            )?;
+            let tangent = match tangent {
+                Some(graph) => Some(TensorCustomTangent::new(
+                    snapshot(&graph, &tangent_outputs.iter().collect::<Vec<_>>())?,
+                    tangent_names,
+                    tangent_outputs
+                        .iter()
+                        .map(|output| output.node_id)
+                        .collect(),
+                )),
+                None => None,
+            };
+            TensorCustomRule::new(
+                name,
+                forward_ir,
+                operand_names,
+                output_count,
+                forward_outputs
+                    .iter()
+                    .map(|output| output.node_id)
+                    .collect(),
+                backward_ir,
+                residual_names,
+                cotangent_names,
+                backward_outputs
+                    .iter()
+                    .map(|output| output.as_ref().map(|output| output.node_id))
+                    .collect(),
+                tangent,
+                rematerialize,
+            )
+        })()
+        .map_err(PyValueError::new_err)?;
+        Ok(PyCustomRule {
+            rule: Arc::new(rule),
+        })
+    }
+
     /// Marks this graph as a trace in progress of a v0.2 transform, so
     /// tracers of the traces enclosing it are lifted into it as capture
     /// inputs (slice S4b); `_end_trace` must follow.
@@ -2763,6 +2921,16 @@ impl TensorTraceGraph {
             .lock()
             .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
             .node_count())
+    }
+
+    /// Whether forward mode through the graph fails on a `custom_vjp` call.
+    #[getter(_has_reverse_only_custom_rule)]
+    fn py_has_reverse_only_custom_rule(&self) -> PyResult<bool> {
+        Ok(self
+            .ir
+            .lock()
+            .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
+            .has_reverse_only_custom_rule())
     }
 
     #[getter(_has_f32_nodes)]
@@ -5593,6 +5761,7 @@ pub fn trace_tensor_python_function(
 fn compile_cpu_region(
     traced: &TensorTraceResult,
 ) -> Result<(&TensorTraceResult, TensorExecutionPlan), String> {
+    reject_custom_rules(&traced.graph, &[traced.output.node_id], "a cond branch")?;
     Ok((
         traced,
         traced.graph.compile_cpu_plan(traced.output.node_id)?.plan,
@@ -5605,6 +5774,30 @@ fn region_input_names(plan: &TensorExecutionPlan) -> Vec<String> {
         .keys()
         .cloned()
         .collect()
+}
+
+/// Rejects a control-flow body that calls a function with a custom
+/// differentiation rule: the body is frozen into a compiled region, which no
+/// longer carries the rule, so differentiating the region would silently use
+/// the primal computation's derivative instead.
+fn reject_custom_rules(
+    graph: &TensorTraceGraph,
+    outputs: &[TensorNodeId],
+    context: &str,
+) -> Result<(), String> {
+    let name = graph
+        .ir
+        .lock()
+        .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+        .custom_rule_name(outputs)?;
+    match name {
+        Some(name) => Err(format!(
+            "{context} calls {name}, which has a custom differentiation rule; functions \
+             with custom_vjp, custom_jvp, or checkpoint rules are not supported inside \
+             cond, fori_loop, or scan bodies"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Recompiles a region whose output also references `names`, or returns the
@@ -5977,6 +6170,8 @@ pub fn tensor_fori_loop_region(
             init.shape, output.shape
         )));
     }
+    reject_custom_rules(&body_graph, &[output.node_id], "a fori_loop body")
+        .map_err(PyValueError::new_err)?;
     let loop_plan = TensorForiExecutionPlan::new(
         lower,
         upper,
@@ -6129,6 +6324,8 @@ pub fn tensor_scan_region(
             init.shape, next.shape
         )));
     }
+    reject_custom_rules(&body_graph, &[next.node_id, output.node_id], "a scan body")
+        .map_err(PyValueError::new_err)?;
     let body_plan = body_graph
         .ir
         .lock()

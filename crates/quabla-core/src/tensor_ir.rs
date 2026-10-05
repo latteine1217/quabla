@@ -6,6 +6,8 @@ mod cholesky;
 #[cfg(test)]
 mod cholesky_tests;
 pub use cholesky::CholeskyAdKind;
+mod custom;
+pub use custom::{TensorCustomRule, TensorCustomTangent};
 mod host_storage;
 pub use host_storage::HostTensorStorage;
 
@@ -774,6 +776,20 @@ enum TensorOp {
     },
     Broadcast {
         input: TensorNodeId,
+    },
+    /// Output `output` of a call of a function with a custom differentiation
+    /// rule (`custom_vjp`, `custom_jvp`, `checkpoint`): the identity on its
+    /// primal `value`, which the symbolic transforms differentiate through
+    /// `rule` with respect to `operands` instead of through the primal
+    /// computation. The outputs of one call share `group`, the id of the
+    /// first of them, as `Scan` results do. Plan compilation aliases the
+    /// node to `value`, so backends never execute it; see `custom.rs`.
+    Custom {
+        value: TensorNodeId,
+        operands: Vec<TensorNodeId>,
+        rule: Arc<TensorCustomRule>,
+        output: usize,
+        group: usize,
     },
 }
 
@@ -2993,6 +3009,7 @@ impl TensorIr {
         let mut remap = HashMap::new();
         let mut mapped = vec![false; callee.nodes.len()];
         let mut groups = HashMap::new();
+        let mut custom_groups = HashMap::new();
         for (id, node) in callee.nodes.iter().enumerate() {
             if !reachable[id] {
                 continue;
@@ -3008,7 +3025,13 @@ impl TensorIr {
                 .any(|input| mapped[*input])
             {
                 mapped[id] = true;
-                self.push_batched(callee, node, &remap, &mapped, batch_size)?
+                self.push_batched(
+                    callee,
+                    node,
+                    (&remap, &mapped),
+                    batch_size,
+                    &mut custom_groups,
+                )?
             } else {
                 self.push_spliced(node, &remap, &mut groups)?
             };
@@ -3051,13 +3074,17 @@ impl TensorIr {
     /// Appends the batched form of a callee node with at least one mapped
     /// operand (see [`Self::inline_batched`]); the node's dtype and weak
     /// flag are kept, and its shape gains the leading batch axis.
+    ///
+    /// A `Custom` node is batched with its rule (`TensorCustomRule::batched`),
+    /// once per call: `custom_groups` maps a callee group id to the batched
+    /// group id and rule.
     fn push_batched(
         &mut self,
         callee: &TensorIr,
         node: &TensorNode,
-        remap: &HashMap<TensorNodeId, TensorNodeId>,
-        mapped: &[bool],
+        (remap, mapped): (&HashMap<TensorNodeId, TensorNodeId>, &[bool]),
         batch_size: usize,
+        custom_groups: &mut HashMap<usize, (usize, Arc<TensorCustomRule>)>,
     ) -> Result<TensorNodeId, BatchingError> {
         let target = |operand: TensorNodeId| {
             remap
@@ -3248,6 +3275,45 @@ impl TensorIr {
                 TensorOp::CholeskyAd {
                     inputs: arguments,
                     kind: *kind,
+                }
+            }
+            TensorOp::Custom {
+                value,
+                operands,
+                rule,
+                output,
+                group,
+            } => {
+                // Every output of a batched call is batched, so the primal
+                // value is broadcast when it does not depend on the batch.
+                let mut spliced = target(*value)?;
+                if !mapped[*value] {
+                    spliced = self.broadcast_to(spliced, batched_shape(batch_size, &node.shape))?;
+                }
+                let (batched_group, batched_rule) = match custom_groups.get(group) {
+                    Some(existing) => existing.clone(),
+                    None => {
+                        let operand_mapped = operands
+                            .iter()
+                            .map(|operand| mapped[*operand])
+                            .collect::<Vec<_>>();
+                        let entry = (
+                            self.nodes.len(),
+                            Arc::new(rule.batched(&operand_mapped, batch_size)?),
+                        );
+                        custom_groups.insert(*group, entry.clone());
+                        entry
+                    }
+                };
+                TensorOp::Custom {
+                    value: spliced,
+                    operands: operands
+                        .iter()
+                        .map(|operand| target(*operand))
+                        .collect::<Result<_, _>>()?,
+                    rule: batched_rule,
+                    output: *output,
+                    group: batched_group,
                 }
             }
             TensorOp::Solve { .. }
@@ -3481,11 +3547,23 @@ impl TensorIr {
         let mut scan_jvp_results = HashMap::new();
         let mut fori_vjp_jvp_groups = HashMap::new();
         let mut scan_vjp_jvp_groups = HashMap::new();
+        // Whether a node depends on a seeded tangent input: a custom rule is
+        // applied only to calls whose tangent is not known to be zero, so a
+        // `custom_vjp` call outside the differentiated path does not fail.
+        let mut active = vec![false; self.nodes.len()];
+        let custom_members = self.custom_groups();
+        let mut custom_pairs =
+            HashMap::<usize, HashMap<usize, (TensorNodeId, TensorNodeId)>>::new();
 
         for (node_index, node) in self.nodes.iter().enumerate() {
             if !reachable[node_index] && !matches!(node.op, TensorOp::Input { .. }) {
                 pairs.push((usize::MAX, usize::MAX));
                 continue;
+            }
+            if !matches!(node.op, TensorOp::Input { .. }) {
+                active[node_index] = tensor_op_inputs(&node.op)
+                    .iter()
+                    .any(|input| active[*input]);
             }
             let pair = match &node.op {
                 TensorOp::Input { name } => {
@@ -3497,7 +3575,10 @@ impl TensorIr {
                         symbolic_zero_tangent(&mut transformed, &node.shape)?
                     } else {
                         match input_tangent(&mut transformed, name, value, &node.shape)? {
-                            Some(tangent) => tangent,
+                            Some(tangent) => {
+                                active[node_index] = true;
+                                tangent
+                            }
                             None => symbolic_zero_like(&mut transformed, value)?,
                         }
                     };
@@ -3993,6 +4074,66 @@ impl TensorIr {
                         transformed.broadcast_to(tangent, node.shape.clone())?,
                     )
                 }
+                // The whole call is rebuilt at its first reachable output:
+                // the primal stays a `Custom` node, so a later reverse-mode
+                // transform still applies the rule, and the tangents come
+                // from the rule's tangent graph.
+                TensorOp::Custom {
+                    operands,
+                    rule,
+                    output,
+                    group,
+                    ..
+                } => {
+                    if !custom_pairs.contains_key(group) {
+                        let members = custom_members
+                            .get(group)
+                            .ok_or_else(|| format!("custom group {group} has no members"))?
+                            .iter()
+                            .filter(|(_, member)| reachable[*member])
+                            .map(|&(member_output, member)| match &self.nodes[member].op {
+                                TensorOp::Custom { value, .. } => {
+                                    Ok((member_output, pairs[*value].0))
+                                }
+                                _ => Err(format!(
+                                    "custom group {group} member {member} is not custom"
+                                )),
+                            })
+                            .collect::<Result<Vec<_>, String>>()?;
+                        let primal_operands = operands
+                            .iter()
+                            .map(|operand| pairs[*operand].0)
+                            .collect::<Vec<_>>();
+                        let ids = transformed.push_custom_group(
+                            rule.clone(),
+                            &members,
+                            &primal_operands,
+                        )?;
+                        let tangents = if operands.iter().any(|operand| active[*operand]) {
+                            let operand_tangents = operands
+                                .iter()
+                                .map(|operand| pairs[*operand].1)
+                                .collect::<Vec<_>>();
+                            Some(rule.splice_tangent(
+                                &mut transformed,
+                                &primal_operands,
+                                &operand_tangents,
+                            )?)
+                        } else {
+                            None
+                        };
+                        let mut rebuilt = HashMap::new();
+                        for ((member_output, _), id) in members.iter().zip(ids) {
+                            let tangent = match &tangents {
+                                Some(tangents) => tangents[*member_output],
+                                None => symbolic_zero_like(&mut transformed, id)?,
+                            };
+                            rebuilt.insert(*member_output, (id, tangent));
+                        }
+                        custom_pairs.insert(*group, rebuilt);
+                    }
+                    custom_pairs[group][output]
+                }
             };
             if transformed.node(pair.0)?.dtype != node.dtype {
                 return Err(format!(
@@ -4101,6 +4242,9 @@ impl TensorIr {
         let mut transformed = TensorIr::new();
         let mut values = Vec::with_capacity(self.nodes.len());
         let mut scan_values = HashMap::new();
+        // The forward graph of each custom call (primal outputs, then
+        // residuals), spliced at its first reachable output.
+        let mut custom_forward = HashMap::<usize, Vec<TensorNodeId>>::new();
         for (node_index, node) in self.nodes.iter().enumerate() {
             if prune_dead_primals
                 && !reachable[node_index]
@@ -4301,6 +4445,25 @@ impl TensorIr {
                 TensorOp::Broadcast { input } => {
                     transformed.broadcast_to(values[*input], node.shape.clone())?
                 }
+                // Under reverse mode the primal comes from the rule's forward
+                // graph, which also computes the residuals, as in JAX.
+                TensorOp::Custom {
+                    operands,
+                    rule,
+                    output,
+                    group,
+                    ..
+                } => {
+                    if !custom_forward.contains_key(group) {
+                        let operands = operands
+                            .iter()
+                            .map(|operand| values[*operand])
+                            .collect::<Vec<_>>();
+                        custom_forward
+                            .insert(*group, rule.splice_forward(&mut transformed, &operands)?);
+                    }
+                    custom_forward[group][*output]
+                }
             };
             debug_assert_eq!(values.len(), node_index);
             if transformed.node(value)?.dtype != node.dtype {
@@ -4337,6 +4500,8 @@ impl TensorIr {
             seeds.push(seed);
         }
         let mut processed_scan_groups = HashSet::new();
+        let custom_members = self.custom_groups();
+        let mut processed_custom_groups = HashSet::new();
 
         for node_id in (0..self.nodes.len()).rev() {
             let Some(upstream) = cotangents[node_id] else {
@@ -5024,6 +5189,53 @@ impl TensorIr {
                     let contribution = transformed.gather(upstream, indices.clone(), *axis)?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *base, upstream)?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *updates, contribution)?;
+                }
+                // The backward graph runs once per call, at the first output
+                // reached in reverse order. Every consumer of the call's
+                // outputs comes after all of them, so their cotangents are
+                // complete here; an output without one gets zeros.
+                TensorOp::Custom {
+                    operands,
+                    rule,
+                    group,
+                    ..
+                } => {
+                    if processed_custom_groups.insert(*group) {
+                        let forward = custom_forward
+                            .get(group)
+                            .ok_or_else(|| format!("custom group {group} has no forward values"))?
+                            .clone();
+                        let mut output_cotangents = forward[..rule.output_count()]
+                            .iter()
+                            .map(|_| None)
+                            .collect::<Vec<_>>();
+                        for (output, member) in custom_members.get(group).into_iter().flatten() {
+                            output_cotangents[*output] = cotangents[*member];
+                        }
+                        let output_cotangents = output_cotangents
+                            .into_iter()
+                            .zip(&forward)
+                            .map(|(cotangent, value)| match cotangent {
+                                Some(cotangent) => Ok(cotangent),
+                                None => symbolic_zero_like(&mut transformed, *value),
+                            })
+                            .collect::<Result<Vec<_>, String>>()?;
+                        let contributions = rule.splice_backward(
+                            &mut transformed,
+                            &forward[rule.output_count()..],
+                            &output_cotangents,
+                        )?;
+                        for (operand, contribution) in operands.iter().zip(contributions) {
+                            if let Some(contribution) = contribution {
+                                symbolic_accumulate(
+                                    &mut transformed,
+                                    &mut cotangents,
+                                    *operand,
+                                    contribution,
+                                )?;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -7532,6 +7744,9 @@ impl TensorIr {
                     }
                 }
                 TensorOp::StopGradient { .. } => {}
+                TensorOp::Custom { rule, .. } => {
+                    return Err(custom_rule_numeric_error(rule));
+                }
                 TensorOp::CumSum {
                     input,
                     axis,
@@ -8161,6 +8376,9 @@ impl TensorIr {
                     tangent
                 }
                 TensorOp::StopGradient { .. } => DynamicTensor::filled(node.shape.clone(), 0.0)?,
+                TensorOp::Custom { rule, .. } => {
+                    return Err(custom_rule_numeric_error(rule));
+                }
                 TensorOp::CumSum {
                     input,
                     axis,
@@ -8803,6 +9021,23 @@ impl TensorIr {
                     "%{id} = stop_gradient(%{input}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
+                TensorOp::Custom {
+                    value,
+                    operands,
+                    rule,
+                    output,
+                    group,
+                } => format!(
+                    "%{id} = custom(%{value}) {{rule = {:?}, output = {output}, group = {group}, \
+                     operands = [{}]}} : {}",
+                    rule.name(),
+                    operands
+                        .iter()
+                        .map(|operand| format!("%{operand}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
                 TensorOp::CumSum {
                     input,
                     axis,
@@ -9077,6 +9312,7 @@ impl TensorIr {
                     | TensorOp::Gather { .. }
                     | TensorOp::StopGradient { .. }
                     | TensorOp::Broadcast { .. }
+                    | TensorOp::Custom { .. }
             )
         {
             return Err(format!(
@@ -9695,7 +9931,7 @@ impl TensorIr {
                             .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {x} has no evaluated value"))?,
                     )?,
-                TensorOp::StopGradient { input } => values
+                TensorOp::StopGradient { input } | TensorOp::Custom { value: input, .. } => values
                     .get(*input)
                     .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
@@ -9968,6 +10204,9 @@ impl TensorIr {
                         second,
                         mixed,
                     }
+                }
+                TensorOp::Custom { rule, .. } => {
+                    return Err(custom_rule_numeric_error(rule));
                 }
                 TensorOp::StopGradient { input } => {
                     let input = values
@@ -14374,6 +14613,13 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                         "batch specialization does not yet transform Cond regions".to_string()
                     )
                 }
+                TensorOp::Custom { .. } => {
+                    return Err(
+                        "batch specialization applies to compiled plans, which have no custom \
+                         rule nodes"
+                            .to_string(),
+                    )
+                }
                 TensorOp::Fori { .. } => {
                     return Err(
                         "batch specialization does not yet transform Fori regions".to_string()
@@ -14580,7 +14826,8 @@ fn cuda_scalar_expression(
         | TensorOp::ForiVjpJvp { .. }
         | TensorOp::Scan { .. }
         | TensorOp::ScanVjp { .. }
-        | TensorOp::ScanVjpJvp { .. } => Err(format!(
+        | TensorOp::ScanVjpJvp { .. }
+        | TensorOp::Custom { .. } => Err(format!(
             "CUDA lowering does not yet support {}",
             tensor_op_name(&node.op)
         )),
@@ -14699,6 +14946,17 @@ fn is_fusable_elementwise_compute_op(op: &TensorOp) -> bool {
             | TensorOp::Powi { .. }
             | TensorOp::Pow { .. }
             | TensorOp::Cast { .. }
+    )
+}
+
+/// The error of the numeric (CPU evaluator) AD paths, which do not apply
+/// custom rules; only the symbolic transforms behind `quabla.grad`,
+/// `quabla.jvp`, and the other v0.2 transforms do.
+fn custom_rule_numeric_error(rule: &TensorCustomRule) -> String {
+    format!(
+        "{} has a custom differentiation rule, which only the symbolic transforms \
+         (quabla.grad, quabla.vjp, quabla.jvp, ...) apply",
+        rule.name()
     )
 }
 
@@ -14836,6 +15094,13 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         TensorOp::Atan2 { y, x } => vec![*y, *x],
         TensorOp::ScatterAdd { base, updates, .. } => vec![*base, *updates],
         TensorOp::Concat { inputs, .. } => inputs.clone(),
+        // The operands are inputs for reachability and inlining, so a rule
+        // can still be applied to them after the node is spliced.
+        TensorOp::Custom {
+            value, operands, ..
+        } => std::iter::once(*value)
+            .chain(operands.iter().copied())
+            .collect(),
     }
 }
 
@@ -14846,6 +15111,7 @@ fn tensor_value_operands(op: &TensorOp) -> Vec<TensorNodeId> {
         TensorOp::Where {
             on_true, on_false, ..
         } => vec![*on_true, *on_false],
+        TensorOp::Custom { value, .. } => vec![*value],
         _ => tensor_op_inputs(op),
     }
 }
@@ -15290,7 +15556,8 @@ fn infer_tensor_placement(
         | TensorOp::ForiVjpJvp { .. }
         | TensorOp::Scan { .. }
         | TensorOp::ScanVjp { .. }
-        | TensorOp::ScanVjpJvp { .. } => Err(format!(
+        | TensorOp::ScanVjpJvp { .. }
+        | TensorOp::Custom { .. } => Err(format!(
             "kernel node {node_id} contains {} regions; placement propagation requires explicit region lowering",
             tensor_op_name(&node.op)
         )),
@@ -15763,6 +16030,7 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Gather { .. } => "gather",
         TensorOp::ScatterAdd { .. } => "scatter_add",
         TensorOp::Broadcast { .. } => "broadcast",
+        TensorOp::Custom { .. } => "custom",
     }
 }
 
@@ -15908,6 +16176,8 @@ fn canonicalize_tensor_op(
                 .ok_or_else(|| format!("broadcast source node {input} is missing"))?;
             Ok((source.shape == output_shape).then_some(*input))
         }
+        // The identity on its value once the symbolic transforms are done.
+        TensorOp::Custom { value, .. } => Ok(Some(*value)),
         _ => Ok(None),
     }
 }
@@ -16228,7 +16498,8 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         | TensorOp::ForiVjpJvp { .. }
         | TensorOp::Scan { .. }
         | TensorOp::ScanVjp { .. }
-        | TensorOp::ScanVjpJvp { .. } => return None,
+        | TensorOp::ScanVjpJvp { .. }
+        | TensorOp::Custom { .. } => return None,
         TensorOp::ScalarConstant { value } => arguments[0] = value.to_bits(),
         TensorOp::Add { lhs, rhs }
         | TensorOp::Sub { lhs, rhs }
@@ -16401,7 +16672,8 @@ fn tensor_op_group_mut(op: &mut TensorOp) -> Option<&mut usize> {
         | TensorOp::ForiVjpJvp { group, .. }
         | TensorOp::Scan { group, .. }
         | TensorOp::ScanVjp { group, .. }
-        | TensorOp::ScanVjpJvp { group, .. } => Some(group),
+        | TensorOp::ScanVjpJvp { group, .. }
+        | TensorOp::Custom { group, .. } => Some(group),
         _ => None,
     }
 }
@@ -16786,6 +17058,22 @@ fn remap_tensor_op(
         }),
         TensorOp::Broadcast { input } => Ok(TensorOp::Broadcast {
             input: remap_node(*input)?,
+        }),
+        TensorOp::Custom {
+            value,
+            operands,
+            rule,
+            output,
+            group,
+        } => Ok(TensorOp::Custom {
+            value: remap_node(*value)?,
+            operands: operands
+                .iter()
+                .map(|operand| remap_node(*operand))
+                .collect::<Result<_, _>>()?,
+            rule: rule.clone(),
+            output: *output,
+            group: *group,
         }),
     }
 }
