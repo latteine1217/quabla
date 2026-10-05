@@ -4611,8 +4611,12 @@ def test_cuda_adam_loss_optimizer_owns_scalar_loss_and_parameters():
     )
 
     initial_loss = optimizer.loss().to_flat_list()[0]
+    # loss() runs a forward-only plan; the backward plan allocates its buffers
+    # on the first step(), so count from there to check that training does not
+    # grow device memory.
+    optimizer.step()
     initial_buffers = optimizer.device_buffer_count
-    for _ in range(250):
+    for _ in range(249):
         optimizer.step()
     final_loss = optimizer.loss().to_flat_list()[0]
     trained = optimizer.parameters()
