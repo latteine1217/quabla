@@ -2998,6 +2998,381 @@ def test_narrow_buffer_import_regressions():
     subprocess.run([sys.executable, str(script)], check=True)
 
 
+def same_values(actual, expected):
+    """Bitwise equality of two value lists, NaN matching NaN."""
+    return len(actual) == len(expected) and all(
+        struct.pack("<d", a) == struct.pack("<d", b) or (math.isnan(a) and math.isnan(b))
+        for a, b in zip(actual, expected)
+    )
+
+
+def central_gradient(function, value, step=1e-6):
+    """The gradient of a scalar array function by central differences."""
+    base = value.to_flat_list()
+    gradient = []
+    for element in range(len(base)):
+        plus, minus = list(base), list(base)
+        plus[element] += step
+        minus[element] -= step
+        lhs = function(qb.array(plus).reshape(value.shape)).item()
+        rhs = function(qb.array(minus).reshape(value.shape)).item()
+        gradient.append((lhs - rhs) / (2 * step))
+    return qb.array(gradient).reshape(value.shape)
+
+
+def assert_matches_finite_differences(function, value, tolerance=1e-6):
+    analytic = qb.grad(function)(value)
+    assert_close(analytic, central_gradient(function, value), tolerance)
+
+
+def assert_eager_matches_cpu_jit(function, *args):
+    eager, traced = function(*args), qb.jit(function)(*args)
+    assert eager.dtype == traced.dtype and eager.shape == traced.shape
+    assert same_values(eager.to_flat_list(), traced.to_flat_list()), (
+        eager.tolist(),
+        traced.tolist(),
+    )
+
+
+def reference_logsumexp(values):
+    peak = max(values)
+    return peak + math.log(sum(math.exp(v - peak) for v in values))
+
+
+def test_softmax_log_softmax_and_logsumexp_stay_finite_at_extreme_logits():
+    for dtype in (qb.float32, qb.float64):
+        x = qb.array([1000.0, 0.0], dtype=dtype)
+        assert_tensor(qb.softmax(x), [1.0, 0.0], dtype)
+        assert_tensor(qb.log_softmax(x), [0.0, -1000.0], dtype)
+        assert_tensor(qb.logsumexp(x), 1000.0, dtype)
+        assert_tensor(qb.grad(lambda t: qb.logsumexp(t))(x), [1.0, 0.0], dtype)
+        for function in (
+            lambda t: qb.softmax(t)[0],
+            lambda t: qb.log_softmax(t)[1],
+            lambda t: qb.sum(qb.log_softmax(t) * qb.array([0.25, 0.75], dtype=dtype)),
+        ):
+            gradient = qb.grad(function)(x).tolist()
+            assert all(math.isfinite(v) and abs(v) <= 1.0 for v in gradient), gradient
+        # Both entries at -1000 underflow every unshifted exp.
+        low = qb.array([-1000.0, -1000.0], dtype=dtype)
+        assert_close(qb.logsumexp(low), -1000.0 + math.log(2.0), 1e-7)
+        assert_close(qb.softmax(low), [0.5, 0.5], 0.0)
+    nan, inf = math.nan, math.inf
+    cases = {
+        (-inf, -inf): -inf,
+        (inf, 0.0): inf,
+        (inf, -inf): inf,
+        (-inf, 1.5): 1.5,
+    }
+    for values, expected in cases.items():
+        for dtype in (qb.float32, qb.float64):
+            assert qb.logsumexp(qb.array(values, dtype=dtype)).item() == expected
+            assert qb.jit(qb.logsumexp)(qb.array(values, dtype=dtype)).item() == expected
+    assert math.isnan(qb.logsumexp(qb.array([nan, 0.0])).item())
+
+
+def test_softmax_and_logsumexp_match_math_over_axes():
+    rows = [[0.5, -1.25, 3.0], [-0.75, 2.0, 0.125]]
+    x = qb.array(rows)
+    for row, actual in zip(rows, qb.logsumexp(x, axis=1).tolist()):
+        assert abs(actual - reference_logsumexp(row)) <= 1e-15 * abs(actual)
+    columns = list(zip(*rows))
+    assert_close(qb.logsumexp(x, axis=0), [reference_logsumexp(c) for c in columns], 1e-15)
+    assert_close(
+        qb.logsumexp(x, axis=(0, 1), keepdims=True),
+        [[reference_logsumexp(rows[0] + rows[1])]],
+        1e-15,
+    )
+    assert_close(qb.logsumexp(x), reference_logsumexp(rows[0] + rows[1]), 1e-15)
+    expected = [[math.exp(v - reference_logsumexp(row)) for v in row] for row in rows]
+    assert_close(qb.softmax(x), expected, 1e-15)
+    assert_close(qb.softmax(x, axis=-1).sum(axis=-1), [1.0, 1.0], 1e-15)
+    assert_close(
+        qb.log_softmax(x, axis=0),
+        [[v - reference_logsumexp(c) for v, c in zip(row, columns)] for row in rows],
+        1e-15,
+    )
+    weights = qb.array([[0.3, -1.0, 2.0], [1.5, 0.25, -0.5]])
+    for function in (
+        lambda t: qb.logsumexp(t, axis=1).sum(),
+        lambda t: qb.sum(qb.softmax(t, axis=0) * weights),
+        lambda t: qb.sum(qb.log_softmax(t) * weights),
+    ):
+        assert_matches_finite_differences(function, x)
+        assert_eager_matches_cpu_jit(function, x)
+    assert_close(qb.grad(lambda t: qb.logsumexp(t, axis=1).sum())(x), qb.softmax(x), 1e-15)
+    batched = qb.vmap(qb.softmax)(x)
+    assert_close(batched, qb.softmax(x, axis=-1), 0.0)
+    assert_close(qb.vmap(qb.logsumexp)(x), qb.logsumexp(x, axis=1), 0.0)
+
+
+def test_var_and_std_are_two_pass_and_differentiate():
+    offset = qb.array([1e8 + 1.0, 1e8 + 2.0, 1e8 + 3.0])
+    assert qb.var(offset).item() == 2.0 / 3.0
+    assert qb.var(offset, ddof=1).item() == 1.0
+    assert qb.std(offset, ddof=1).item() == 1.0
+    # The one-pass formula loses every digit at this offset.
+    naive = qb.mean(offset * offset) - qb.mean(offset) ** 2
+    assert abs(naive.item() - 2.0 / 3.0) > 0.1
+    offset32 = qb.array([1e4 + 1.0, 1e4 + 2.0, 1e4 + 3.0], dtype=qb.float32)
+    two_thirds32 = struct.unpack("<f", struct.pack("<f", 2.0 / 3.0))[0]
+    assert_tensor(qb.var(offset32), two_thirds32, qb.float32)
+    rows = [[1.0, 4.0, -2.0, 0.5], [3.0, 3.5, -1.0, 8.0], [0.25, -6.0, 2.0, 1.0]]
+    x = qb.array(rows)
+
+    def reference(values, ddof):
+        mean = sum(values) / len(values)
+        return sum((v - mean) ** 2 for v in values) / (len(values) - ddof)
+
+    assert_close(qb.var(x, axis=1), [reference(r, 0) for r in rows], 1e-15)
+    assert_close(qb.var(x, axis=0, ddof=1), [reference(c, 1) for c in zip(*rows)], 1e-15)
+    assert_close(qb.var(x, axis=(0, 1)), reference(rows[0] + rows[1] + rows[2], 0), 1e-15)
+    assert qb.var(x, axis=-1, keepdims=True).shape == [3, 1]
+    assert_close(qb.std(x, axis=1), [math.sqrt(reference(r, 0)) for r in rows], 1e-15)
+    for function in (
+        lambda t: qb.var(t, axis=1).sum(),
+        lambda t: qb.std(t, axis=0, ddof=1).sum(),
+        lambda t: qb.std(t),
+    ):
+        assert_matches_finite_differences(function, x)
+        assert_eager_matches_cpu_jit(function, x)
+    # d var / dx = 2 (x - mean) / (n - ddof); zero variance gives std a zero
+    # derivative under the sqrt convention.
+    assert_close(qb.grad(lambda t: qb.var(t, ddof=1))(offset), [-1.0, 0.0, 1.0], 0.0)
+    flat = qb.array([2.0, 2.0, 2.0])
+    assert_tensor(qb.grad(qb.std)(flat), [0.0, 0.0, 0.0], qb.float64)
+    assert math.isnan(qb.var(qb.array([5.0]), ddof=1).item())
+    assert_close(qb.vmap(qb.var)(x), qb.var(x, axis=1), 0.0)
+    assert_raises(ValueError, qb.var, x, axis=2)
+    assert_raises(ValueError, qb.var, x, axis=(1, -1))
+
+
+def test_silu_gelu_clip_sign_square_and_reciprocal():
+    points = [-50.0, -8.0, -5.0, -3.0, -0.5, 0.0, 0.5, 3.0, 50.0]
+
+    def gelu_reference(v):
+        u = math.sqrt(2.0 / math.pi) * (v + 0.044715 * v**3)
+        return v / (1.0 + math.exp(-2.0 * u)) if u > -700 else 0.0
+
+    for dtype, tolerance in ((qb.float64, 1e-15), (qb.float32, 1e-6)):
+        x = qb.array(points, dtype=dtype)
+        for actual, v in zip(qb.silu(x).tolist(), points):
+            expected = v / (1.0 + math.exp(-v))
+            assert abs(actual - expected) <= tolerance * max(abs(expected), 1e-30), (v, actual)
+        for actual, v in zip(qb.gelu(x).tolist(), points):
+            expected = gelu_reference(v)
+            # Relative accuracy holds in the negative tail too (-5 gives -2.3e-7).
+            assert abs(actual - expected) <= 4 * tolerance * abs(expected), (dtype, v, actual)
+        for function in (qb.silu, qb.gelu, qb.sign, qb.square, qb.reciprocal):
+            assert function(x).dtype == dtype
+            assert_eager_matches_cpu_jit(function, x)
+    tanh_form = [
+        0.5 * v * (1.0 + math.tanh(math.sqrt(2 / math.pi) * (v + 0.044715 * v**3)))
+        for v in (-1.0, 0.25, 2.0)
+    ]
+    assert_close(qb.gelu(qb.array([-1.0, 0.25, 2.0])), tanh_form, 1e-15)
+    assert qb.silu(qb.array([-1e4], dtype=qb.float32)).item() == 0.0
+    assert qb.gelu(qb.array([-1e4], dtype=qb.float32)).item() == 0.0
+    assert_raises(NotImplementedError, qb.gelu, qb.array([1.0]), approximate=False, match="erf")
+    smooth = qb.array([-3.0, -0.75, 0.0, 0.5, 2.5])
+    for function in (lambda t: qb.silu(t).sum(), lambda t: qb.gelu(t).sum()):
+        assert_matches_finite_differences(function, smooth)
+    assert_close(qb.grad(lambda t: qb.square(t).sum())(smooth), smooth * 2.0, 0.0)
+    assert_close(
+        qb.grad(lambda t: qb.reciprocal(t).sum())(qb.array([2.0, -4.0])), [-0.25, -0.0625], 0.0
+    )
+
+    nan, inf = math.nan, math.inf
+    values = qb.array([nan, -2.0, -1.0, 0.5, 3.0, -inf, inf])
+    clipped = qb.clip(values, -1.0, 1.0).tolist()
+    assert math.isnan(clipped[0]) and clipped[1:] == [-1.0, -1.0, 0.5, 1.0, -1.0, 1.0]
+    assert qb.clip(values, lo=0.0).tolist()[1:] == [0.0, 0.0, 0.5, 3.0, 0.0, inf]
+    assert qb.clip(values, hi=0.0).tolist()[1:] == [-2.0, -1.0, 0.0, 0.0, -inf, 0.0]
+    bounds = qb.array([0.0, 0.0, -0.5, 1.0, 2.0, 0.0, 0.0])
+    assert qb.clip(values, bounds, 2.5).tolist()[1:] == [0.0, -0.5, 1.0, 2.5, 0.0, 2.5]
+    assert math.isnan(qb.clip(qb.array([1.0]), nan, 2.0).item())
+    gradient = qb.grad(lambda t: qb.clip(t, -1.0, 1.0).sum())(qb.array([-2.0, -0.5, 0.75, 4.0]))
+    assert_tensor(gradient, [0.0, 1.0, 1.0, 0.0], qb.float64)
+    x32 = qb.array([0.5, 4.0], dtype=qb.float32)
+    assert_tensor(qb.clip(x32, 0.0, 1.0), [0.5, 1.0], qb.float32)
+
+    signs = qb.sign(qb.array([nan, -2.0, -0.0, 0.0, 3.0, -inf, inf], dtype=qb.float32))
+    assert signs.dtype == qb.float32
+    assert math.isnan(signs.tolist()[0]) and signs.tolist()[1:] == [-1.0, 0.0, 0.0, 1.0, -1.0, 1.0]
+    gradient = qb.grad(lambda t: qb.sign(t).sum())(qb.array([-2.0, 0.0, 3.0]))
+    assert_tensor(gradient, [0.0, 0.0, 0.0], qb.float64)
+    assert_close(qb.vmap(qb.gelu)(smooth), qb.gelu(smooth), 0.0)
+
+
+def test_reshape_accepts_varargs_and_one_inferred_extent():
+    x = qb.arange(6.0)
+    for shape in ([2, 3], (2, 3), [2, -1], (-1, 3)):
+        assert x.reshape(shape).shape == [2, 3]
+    assert x.reshape(3, 2).shape == [3, 2]
+    assert x.reshape(-1, 1).shape == [6, 1]
+    assert x.reshape(2, 3).reshape(-1).tolist() == x.tolist()
+    assert x.reshape(6).shape == [6]
+    assert qb.reshape(x, (3, -1)).shape == [3, 2]
+    assert qb.reshape(x, -1).shape == [6]
+    assert qb.array([5.0]).reshape([]).shape == []
+    assert_raises(ValueError, x.reshape, -1, -1, match="one dimension")
+    assert_raises(ValueError, x.reshape, 4, -1, match="size 6")
+    assert_raises(ValueError, x.reshape, 2, -2, match="negative")
+    assert_raises(TypeError, x.reshape)
+    assert_raises(ValueError, x.reshape, 4, 2)
+    traced = qb.jit(lambda t: t.reshape(3, -1) * 2.0)(x)
+    assert traced.shape == [3, 2] and traced.tolist() == [[0.0, 2.0], [4.0, 6.0], [8.0, 10.0]]
+    # Under vmap the extents are per example.
+    batched = qb.vmap(lambda t: t.reshape(-1, 2))(x.reshape(2, 3, 1).broadcast_to([2, 3, 2]))
+    assert batched.shape == [2, 3, 2]
+    gradient = qb.grad(lambda t: (t.reshape(-1) * qb.arange(6.0)).sum())(x.reshape(2, 3))
+    assert gradient.tolist() == [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]
+
+
+def test_transpose_property_reverses_axes():
+    x = qb.arange(24.0).reshape(2, 3, 4)
+    assert x.T.shape == [4, 3, 2]
+    assert x.T.tolist() == x.transpose().tolist()
+    assert qb.arange(3.0).T.tolist() == [0.0, 1.0, 2.0]
+    m = qb.array([[1.0, 2.0], [3.0, 4.0]])
+    assert qb.jit(lambda t: t.T @ t)(m).tolist() == (m.T @ m).tolist()
+    gradient = qb.grad(lambda t: (t.T * qb.array([[1.0, 2.0], [3.0, 4.0]])).sum())(m)
+    assert gradient.tolist() == [[1.0, 3.0], [2.0, 4.0]]
+
+
+def test_indexing_supports_none_ellipsis_and_strides():
+    x = qb.arange(24.0).reshape(2, 3, 4)
+    keys = [
+        (None,),
+        (Ellipsis, 0),
+        (slice(None), None),
+        (None, Ellipsis, None),
+        (Ellipsis, None, 1),
+        (0, Ellipsis),
+        (Ellipsis,),
+        (1, None, slice(None, None, 2), -1),
+        (slice(None, None, -1),),
+        (slice(None), slice(None, None, 2)),
+        (Ellipsis, slice(None, None, -2)),
+        (slice(1, None, -1), 2, slice(3, 0, -2)),
+        (slice(None), slice(-1, None)),
+        (Ellipsis, slice(1, 3), None),
+    ]
+    if np is not None:
+        reference = np.arange(24.0).reshape(2, 3, 4)
+        for key in keys:
+            expected = reference[key]
+            for value in (x[key], qb.jit(lambda t, key=key: t[key])(x)):
+                assert value.shape == list(expected.shape), (key, value.shape)
+                assert value.tolist() == expected.tolist(), key
+    assert x[None].shape == [1, 2, 3, 4]
+    assert x[..., 0].tolist() == x[:, :, 0].tolist()
+    assert x[0, None, ::-1, 0].tolist() == [[8.0, 4.0, 0.0]]
+    # Every key form differentiates: the gradient scatters back to the
+    # selected coordinates, twice for a coordinate selected twice.
+    weights = qb.arange(1.0, 7.0).reshape(1, 2, 3)
+    gradient = qb.grad(lambda t: (t[None, ::-1, 2::-2, 1] * weights[..., :2]).sum())(x)
+    # t[::-1, 2::-2, 1][b, k] is x[1 - b, 2 - 2k, 1], weighted by weights[0, b, k].
+    expected = [[[0.0] * 4 for _ in range(3)] for _ in range(2)]
+    for b in range(2):
+        for k in range(2):
+            expected[1 - b][2 - 2 * k][1] += weights.tolist()[0][b][k]
+    assert gradient.tolist() == expected
+    batched = qb.vmap(lambda row: row[::-1, None])(qb.arange(6.0).reshape(2, 3))
+    assert batched.tolist() == [[[2.0], [1.0], [0.0]], [[5.0], [4.0], [3.0]]]
+    assert_raises(IndexError, x.__getitem__, (Ellipsis, 0, Ellipsis))
+    assert_raises(IndexError, x.__getitem__, (0, 0, 0, 0))
+    assert_raises(IndexError, x.__getitem__, (None, 0, 0, 0, 0))
+    assert_raises(ValueError, x.__getitem__, slice(2, 1))
+    assert_raises(TypeError, x.__getitem__, "a")
+    assert_raises(IndexError, qb.jit(lambda t: t[..., 0, ...]), x)
+
+
+def test_squeeze_expand_dims_split_and_meshgrid():
+    x = qb.arange(6.0).reshape(1, 2, 1, 3)
+    assert qb.squeeze(x).shape == [2, 3]
+    assert qb.squeeze(x, axis=0).shape == [2, 1, 3]
+    assert qb.squeeze(x, axis=(0, -2)).shape == [2, 3]
+    assert qb.squeeze(qb.array([[4.0]])).shape == []
+    assert_raises(ValueError, qb.squeeze, x, axis=1, match="extent is not 1")
+    y = qb.arange(6.0).reshape(2, 3)
+    assert qb.expand_dims(y, 0).shape == [1, 2, 3]
+    assert qb.expand_dims(y, -1).shape == [2, 3, 1]
+    assert qb.expand_dims(y, (0, 3)).shape == [1, 2, 3, 1]
+    assert qb.expand_dims(y, (1, -1)).shape == [2, 1, 3, 1]
+    assert_raises(ValueError, qb.expand_dims, y, 4)
+
+    z = qb.arange(12.0).reshape(3, 4)
+    pieces = qb.split(z, 2, axis=1)
+    assert [p.tolist() for p in pieces] == [
+        [[0.0, 1.0], [4.0, 5.0], [8.0, 9.0]],
+        [[2.0, 3.0], [6.0, 7.0], [10.0, 11.0]],
+    ]
+    assert [p.shape for p in qb.split(z, [1, -1])] == [[1, 4], [1, 4], [1, 4]]
+    assert [p.shape for p in qb.split(z, [1, 3], axis=-1)] == [[3, 1], [3, 2], [3, 1]]
+    assert_raises(ValueError, qb.split, z, 3, axis=1, match="equal")
+    assert_raises(ValueError, qb.split, z, [2, 2], match="empty")
+    gradient = qb.grad(lambda t: (qb.split(t, [1], axis=0)[1] * 2.0).sum())(z)
+    assert gradient.tolist() == [[0.0] * 4, [2.0] * 4, [2.0] * 4]
+    traced = qb.jit(lambda t: qb.split(t, 4, axis=1)[3])(z)
+    assert traced.tolist() == [[3.0], [7.0], [11.0]]
+
+    a, b, c = qb.array([1.0, 2.0, 3.0]), qb.array([10.0, 20.0]), qb.array([5.0])
+    for indexing in ("xy", "ij"):
+        grids = qb.meshgrid(a, b, c, indexing=indexing)
+        if np is not None:
+            expected = np.meshgrid([1.0, 2.0, 3.0], [10.0, 20.0], [5.0], indexing=indexing)
+            assert [g.tolist() for g in grids] == [e.tolist() for e in expected]
+    xs, ys = qb.meshgrid(a, b)
+    assert xs.tolist() == [[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]]
+    assert ys.tolist() == [[10.0, 10.0, 10.0], [20.0, 20.0, 20.0]]
+    assert [g.tolist() for g in qb.meshgrid(a)] == [[1.0, 2.0, 3.0]]
+    assert_raises(ValueError, qb.meshgrid, a, indexing="xyz")
+    gradient = qb.grad(lambda t: (qb.meshgrid(t, b)[0] * qb.meshgrid(t, b)[1]).sum())(a)
+    assert gradient.tolist() == [30.0, 30.0, 30.0]
+
+
+def test_like_constructors_follow_shape_and_dtype():
+    x = qb.arange(6.0).reshape(2, 3).astype(qb.float32)
+    assert_tensor(qb.zeros_like(x), [[0.0] * 3] * 2, qb.float32)
+    assert_tensor(qb.ones_like(x), [[1.0] * 3] * 2, qb.float32)
+    assert_tensor(qb.full_like(x, 2.5), [[2.5] * 3] * 2, qb.float32)
+    assert_tensor(qb.full_like(x, 7.0, dtype=qb.float64), [[7.0] * 3] * 2, qb.float64)
+    assert_tensor(qb.zeros_like(qb.array([True, False])), [False, False], qb.bool_)
+    assert_tensor(qb.ones_like([1.0, 2.0]), [1.0, 1.0], qb.float64)
+    shifted = qb.jit(lambda t: t + qb.ones_like(t))(x)
+    assert_tensor(shifted, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], qb.float32)
+    assert_tensor(qb.jit(qb.zeros_like)(x), [[0.0] * 3] * 2, qb.float32)
+    gradient = qb.grad(lambda t: (t * qb.full_like(t, 3.0)).sum())(qb.array([1.0, 2.0]))
+    assert_tensor(gradient, [3.0, 3.0], qb.float64)
+    doubled = qb.vmap(lambda t: t * qb.full_like(t, 2.0))(x)
+    assert_tensor(doubled, [[0.0, 2.0, 4.0], [6.0, 8.0, 10.0]], qb.float32)
+
+
+def test_matmul_follows_numpy_rules_for_vectors():
+    v, w = qb.array([1.0, 2.0, 3.0]), qb.array([4.0, -1.0, 0.5])
+    m = qb.arange(6.0).reshape(2, 3)
+    stack = qb.arange(24.0).reshape(2, 3, 4)
+    assert_tensor(qb.matmul(v, w), 3.5, qb.float64)
+    assert_tensor(qb.matmul(m, v), [8.0, 26.0], qb.float64)
+    assert_tensor(qb.matmul(qb.array([1.0, -1.0]), m), [-3.0, -3.0, -3.0], qb.float64)
+    assert qb.matmul(v, stack).shape == [2, 4]
+    assert qb.matmul(stack, qb.ones([4])).shape == [2, 3]
+    assert qb.matmul(m, m.T).shape == [2, 2]
+    if np is not None:
+        s = np.arange(24.0).reshape(2, 3, 4)
+        assert qb.matmul(v, stack).tolist() == np.matmul([1.0, 2.0, 3.0], s).tolist()
+        assert qb.matmul(stack, qb.ones([4])).tolist() == np.matmul(s, np.ones(4)).tolist()
+    assert_tensor(qb.jit(qb.matmul)(v, w), 3.5, qb.float64)
+    assert_tensor(qb.jit(qb.matmul)(m, v), [8.0, 26.0], qb.float64)
+    gx, gy = qb.grad(lambda a, b: qb.matmul(a, b), argnums=(0, 1))(v, w)
+    assert gx.tolist() == w.tolist() and gy.tolist() == v.tolist()
+    gm = qb.grad(lambda a: qb.matmul(a, v).sum())(m)
+    assert gm.tolist() == [[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]]
+    assert_tensor(qb.vmap(qb.matmul, in_axes=(0, None))(m, v), [8.0, 26.0], qb.float64)
+    assert_raises(ValueError, qb.matmul, v, qb.ones([2]))
+
+
 if __name__ == "__main__":
     # Run every test_* function in definition order so new tests cannot be left out of a manual list
     for name, test in list(globals().items()):

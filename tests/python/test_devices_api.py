@@ -181,6 +181,69 @@ def test_device_stable_activations_and_nan_propagation_match_cpu():
         print("SKIP device activation parity: GPU gates unset")
 
 
+def test_device_compositions_and_shape_helpers_match_cpu():
+    ran = False
+    for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
+        if os.environ.get(gate) != "1":
+            continue
+        assert device in qb.devices(), f"{gate} requested but target not built"
+        ran = True
+        x = qb.array(
+            [[1000.0, 0.0, -3.0, 2.5], [-0.5, 1.25, 30.0, -30.0], [0.0, 0.0, 0.0, 0.0]],
+            dtype=qb.float32,
+        )
+        v = qb.array([0.5, -1.0, 2.0, 0.25], dtype=qb.float32)
+        functions = {
+            "softmax": lambda t: qb.softmax(t),
+            "log_softmax": lambda t: qb.log_softmax(t, axis=0),
+            "logsumexp": lambda t: qb.logsumexp(t, axis=-1),
+            "var": lambda t: qb.var(t, axis=1, ddof=1),
+            "std": lambda t: qb.std(t * 1e-3, axis=0),
+            "silu": lambda t: qb.silu(t),
+            "gelu": lambda t: qb.gelu(t),
+            "clip": lambda t: qb.clip(t, -1.0, 2.0),
+            "sign": lambda t: qb.sign(t),
+            "index": lambda t: t[None, ::-1, ..., 1::2].T,
+            "split": lambda t: qb.split(t, [1], axis=1)[1].reshape(-1),
+            "squeeze": lambda t: qb.squeeze(qb.expand_dims(t, (0, 2)), 0),
+            "matmul": lambda t: qb.matmul(t * 1e-3, v),
+        }
+        for name, function in functions.items():
+            value = qb.jit(function, device=device)(x)
+            expected = qb.jit(function)(x)
+            assert value.shape == expected.shape, (device, name)
+            for actual, reference in zip(value.to_flat_list(), expected.to_flat_list()):
+                assert abs(actual - reference) <= 4e-6 * max(1.0, abs(reference)), (
+                    device,
+                    name,
+                    value.tolist(),
+                    expected.tolist(),
+                )
+            weights = qb.arange(1.0, 1.0 + len(expected.to_flat_list()))
+            weights = weights.reshape(expected.shape).astype(qb.float32) * 0.1
+
+            def loss(t, function=function, weights=weights):
+                return qb.sum(function(t) * weights)
+
+            gradient = qb.jit(qb.grad(loss), device=device)(x)
+            reference = qb.jit(qb.grad(loss))(x)
+            assert all(math.isfinite(g) for g in reference.to_flat_list()), (name, reference)
+            for actual, expected_gradient in zip(
+                gradient.to_flat_list(), reference.to_flat_list()
+            ):
+                assert abs(actual - expected_gradient) <= 4e-5 * max(
+                    1.0, abs(expected_gradient)
+                ), (device, name, gradient.tolist(), reference.tolist())
+        special = qb.array([math.nan, -2.0, 0.0, 3.0, -math.inf], dtype=qb.float32)
+        signs = qb.jit(qb.sign, device=device)(special).tolist()
+        assert math.isnan(signs[0]) and signs[1:] == [-1.0, 0.0, 1.0, -1.0], (device, signs)
+        bounds = qb.array([[-math.inf, -math.inf], [math.inf, 0.0]], dtype=qb.float32)
+        totals = qb.jit(lambda t: qb.logsumexp(t, axis=1), device=device)(bounds)
+        assert totals.tolist() == [-math.inf, math.inf], (device, totals.tolist())
+    if not ran:
+        print("SKIP device compositions: GPU gates unset")
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_"):
