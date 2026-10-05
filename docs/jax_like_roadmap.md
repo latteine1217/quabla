@@ -965,8 +965,8 @@ Current state:
 - `TraceTensor.transpose(axes=None)` permutes every rank-N axis; omitting
   `axes` reverses the axis order, while a provided list must be a complete
   permutation. VJP uses the inverse permutation to restore input layout.
-- `TraceTensor.log()` requires strictly positive runtime tensor values and
-  returns a domain error instead of producing NaN for non-positive inputs.
+- `TraceTensor.log()` follows IEEE 754 like the devices: a zero input gives
+  `-inf` and a negative input gives `NaN`.
 - `TensorTraceGraph.hessian_scalar(output, input_name, inputs)` computes an
   exact dense Hessian for a scalar output and one named input using a mixed
   second-direction forward transform. Its O(n^2) basis evaluation is a
@@ -1449,8 +1449,8 @@ invariants; physical placement, aliases, effects beyond inputs, and buffer
 planning remain pending. `reshape` additionally exposes a logical alias
 candidate in the IR; physical buffer reuse is still deferred to buffer planning.
 Scalar-only constant subgraphs are folded during CPU-plan compilation when the
-fold preserves checked runtime semantics; division by zero and invalid log/powi
-domains intentionally remain runtime operations. A final DCE pass then removes
+fold produces the value execution would; a log of a non-positive constant and
+an invalid powi exponent remain runtime operations. A final DCE pass then removes
 the unreachable source constants and intermediates introduced by folding or CSE
 before any backend sees the plan. `buffer_plan()` now provides a backend-neutral
 exact-size temporary-slot schedule from final-use liveness; inputs remain

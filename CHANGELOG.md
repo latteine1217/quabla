@@ -9,6 +9,24 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Changed
+
+- The CPU executor and eager tensors return IEEE 754 values for `log` of a
+  non-positive value and for division by zero (`±inf`, `NaN`), as CUDA and
+  MLX already did, instead of raising. A guard such as
+  `where(x > 0, log(x), 0)` now works under CPU `jit`, which evaluates both
+  branches. The legacy 2D `Matrix` API keeps its checked errors.
+- Division derivatives no longer square the denominator: `d(l/r)` is
+  `(dl - (l/r) dr) / r`, and the native Cholesky jets use the same rule.
+  `float32` gradients with |denominator| below about 1e-19 or above 1e19 no
+  longer underflow, overflow, or fail (`d(x/y)/dy` at `x = y = 1e-25` is
+  `-1e25`, not an error or `-inf`). Division derivatives can change in the
+  last bits.
+- The CPU runs purely elementwise plans node by node instead of through a
+  per-element interpreter: `jit(lambda x, y: x + y)` over 2^20 `float32`
+  elements takes 19 ms instead of 76 ms, the same as eager. Results are
+  unchanged.
+
 ### Added
 
 - `quabla.log1p`, `Tensor.log1p`, and `TraceTensor.log1p`: a native
@@ -18,6 +36,9 @@ deprecated names keep working until 1.0 (see
 
 ### Fixed
 
+- `Trainer(..., device="mlx")` accepts parameters the loss does not depend
+  on, such as an output bias that a second derivative removes; it used to
+  fail with "MLX Adam parameter ... is not a plan input".
 - Traced `softplus` adds `log1p(exp(-|x|))` instead of `log(1 + exp(-|x|))`,
   which rounded the correction away in `float32`: `jit(softplus)(-20)` now
   returns 2.06e-9 instead of 0. Eager `softplus` evaluates the same per-op
