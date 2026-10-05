@@ -136,8 +136,10 @@ Prerequisites:
 - CUDA builds: Linux with an NVIDIA driver. CUDA libraries are loaded at run
   time: `libnvrtc.so` is required, `libcublas` is used for rank-two `f32`
   GEMM when present (otherwise an NVRTC tiled kernel), and `libcusolver` is
-  required for `solve`. Put their directory on `LD_LIBRARY_PATH`. The
-  two-GPU validation used CUDA 12.6.
+  required for `solve`. Put their directory on `LD_LIBRARY_PATH`. The loaded
+  `libnvrtc` must not be newer than the CUDA version the driver supports;
+  otherwise loading generated kernels fails with
+  `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. The two-GPU validation used CUDA 12.6.
 - CUDA + NCCL builds: additionally NCCL loadable as `libnccl.so` (for example
   through `LD_LIBRARY_PATH`) and at least two CUDA devices. Ordinary `cuda`
   builds neither link nor load NCCL.

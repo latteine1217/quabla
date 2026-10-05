@@ -18,20 +18,24 @@ clippy with `cuda-nccl`, the existing Python matrix/API suites, and the new
 device jit/AOT, Trainer convergence, and control-flow suites pass.
 The interleaved Poisson PINN benchmark compares
 1,000 steps per executor: native and Trainer checkpoint losses/weights are
-identical; Trainer/native synchronized step ratio is 1.00267, below the 1.02
-gate. This is one host/run and one retained-input workload, not a general
+identical; on the released tree the Trainer/native synchronized step ratio is
+1.0028, below the 1.02 gate. This is one host/run and one retained-input workload, not a general
 performance guarantee.
 
-A two-GPU validation run on a Linux node (2x RTX 3090, NCCL) completed in
-13 seconds with exit status 0. All five added suites, CUDA Trainer
-convergence, and NCCL parity pass. For both float64 and float32 input programs, Sum loss
-is 23.625 and Mean loss is 11.8125; the suite also checks replicated parameter
-gradients against an independent per-shard CPU oracle and the legacy CUDA
-helper. The retained Trainer benchmark has identical checkpoint losses and
-weights and a synchronized step ratio of 1.01039, below 1.02. This final run
-includes the Trainer failed-step regression fix. The run recorded a hash of
-the tested source snapshot together with its output and benchmark JSON;
-those records are not part of the repository.
+A two-GPU validation run of the released tree (`main` after the S5-S9
+commits; 2x RTX 3090, driver 560.35.05, NVRTC 12.6, NCCL) passes the
+workspace Rust tests with `QUABLA_CUDA_TEST=1 QUABLA_CUDA_NCCL_TEST=1` and
+`quabla-core/cuda-nccl`, and every `tests/python/test_*.py` suite with both
+variables set. Data-parallel parity against the CPU oracle passes for every
+float64/float32 and Sum/Mean case (16 cases of 5 steps each, maximum loss
+error 1.5e-8, maximum gradient error 2.4e-8, tolerance 1e-5). Two-GPU training matches single-GPU and CPU references: 200 steps
+on 256 rows reach a maximum relative loss difference of 2.7e-7 against CPU,
+and 50 steps on 65,536 rows with width 256 reach 6.0e-7 against a single GPU;
+in that larger configuration the steady-state step takes 4.71 ms on two GPUs
+and 8.40 ms on one. The retained Trainer benchmark reproduces the native
+executor's losses and weights exactly with a synchronized step ratio of
+1.0088, below the 1.02 gate. These are single runs on one node, not
+performance guarantees.
 
 Reproduction on a Linux machine with two CUDA GPUs and a loadable
 `libnccl.so` (CUDA ordinals 0 and 1; select them with
