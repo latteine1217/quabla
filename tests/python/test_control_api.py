@@ -489,16 +489,6 @@ def test_optional_device_while_loop_parity():
                 lambda s: collatz_like(carry, limit, s), (scale,), (qb.ones([], qb.float32),)
             )
 
-        if device == "cuda":
-            assert_raises(
-                qb.UnsupportedOperationError,
-                qb.jit(collatz_like, device=device),
-                carry,
-                limit,
-                scale,
-                match="while_loop",
-            )
-            continue
         assert_close(qb.jit(collatz_like, device=device)(carry, limit, scale), expected, 1e-4)
         cpu_value, cpu_tangent = qb.jit(forward)(scale)
         value, tangent = qb.jit(forward, device=device)(scale)

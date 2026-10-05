@@ -40,6 +40,8 @@ const CUDA_REDUCTION_BLOCK: u32 = 256;
 
 #[path = "cuda_cholesky.rs"]
 mod cholesky_backend;
+#[path = "cuda_host_loop.rs"]
+mod host_loop;
 
 /// NVIDIA CUDA backend for fused rank-N elementwise and rank-two matmul plans.
 ///
@@ -68,6 +70,9 @@ pub struct CudaExecutionPlan {
     solver: Option<Arc<Mutex<CudaSolver>>>,
     state: Arc<Mutex<CudaExecutionState>>,
     cond_branches: BTreeMap<TensorNodeId, CudaCondBranches>,
+    /// Loop nodes whose body is not fused-lowerable, keyed by the first node of
+    /// their result group; see `host_loop`.
+    host_loops: BTreeMap<TensorNodeId, host_loop::CudaHostLoop>,
     /// Host-to-device copies of array constants made by this plan's
     /// executions; see [`CudaExecutionPlan::constant_upload_count`].
     constant_uploads: Arc<AtomicUsize>,
@@ -457,16 +462,17 @@ impl CudaBackend {
             None
         };
         let fusion_regions = plan.fusion_regions();
+        let host_driven = host_loop::cuda_host_driven_nodes(&plan);
         let fused_candidate = region_context.is_none()
             && plan.uses_fused_elementwise_kernel()
             && !matches!(&plan.nodes[plan.output_node_id].op, TensorOp::Input { .. });
         let (source, fused_elementwise) = if fused_candidate {
             match plan.cuda_source() {
                 Ok(source) => (source, true),
-                Err(_) => (cuda_program_source(&plan)?, false),
+                Err(_) => (cuda_program_source(&plan, &host_driven)?, false),
             }
         } else {
-            (cuda_program_source(&plan)?, false)
+            (cuda_program_source(&plan, &host_driven)?, false)
         };
         let mut source = source;
         if fused_elementwise {
@@ -510,6 +516,20 @@ impl CudaBackend {
                 },
             );
         }
+        let mut host_loops = BTreeMap::new();
+        for node_id in &host_driven {
+            if host_loop::cuda_loop_group_members(&plan, *node_id).first() == Some(node_id) {
+                host_loops.insert(
+                    *node_id,
+                    host_loop::CudaHostLoop::compile(
+                        self,
+                        &context,
+                        *node_id,
+                        &plan.nodes[*node_id].op,
+                    )?,
+                );
+            }
+        }
         let pool_budget = cuda_pool_frontier_budget(&plan)?;
         Ok(CudaExecutionPlan {
             plan,
@@ -529,6 +549,7 @@ impl CudaBackend {
                 ..CudaExecutionState::default()
             })),
             cond_branches,
+            host_loops,
             constant_uploads: Arc::new(AtomicUsize::new(0)),
             primary_plan: Arc::new(Mutex::new(None)),
         })
@@ -822,18 +843,12 @@ pub(super) fn validate_cuda_plan(plan: &TensorExecutionPlan) -> Result<(), (Stri
                 })?;
                 ("Scan VJP JVP", cuda_scan_vjp_jvp_is_lowerable(scan_hvp))
             }
-            // A host-driven predicate loop would need a region executor with
-            // ping-pong carry buffers; until then the loop is rejected before
-            // any device work so callers get UnsupportedOperationError.
-            TensorOp::While { .. } => {
-                return Err((
-                    "While".into(),
-                    format!(
-                        "CUDA lowering does not yet support while_loop (node {node_id}); run it \
-                         on the CPU or MLX target, or use a bounded fori_loop"
-                    ),
-                ))
-            }
+            // A data-dependent trip count has no fused kernel; `While` always runs as a
+            // host-driven region loop.
+            TensorOp::While { .. } => (
+                "While",
+                Err("while_loop has a data-dependent trip count".to_string()),
+            ),
             TensorOp::Cond { branches, .. } => {
                 validate_cuda_plan(&branches.on_true.plan)?;
                 validate_cuda_plan(&branches.on_false.plan)?;
@@ -841,12 +856,25 @@ pub(super) fn validate_cuda_plan(plan: &TensorExecutionPlan) -> Result<(), (Stri
             }
             _ => continue,
         };
-        result.map_err(|error| {
-            (
-                op.to_string(),
-                format!("CUDA {op} node {node_id} cannot lower to a device loop: {error}"),
-            )
-        })?;
+        let Err(error) = result else {
+            continue;
+        };
+        // A loop the fused per-lane kernel cannot lower runs as a host-driven region loop when
+        // each of its regions lowers on its own; `ScanVjpJvp` has no such fallback.
+        let fallback = if matches!(node.op, TensorOp::ScanVjpJvp { .. }) {
+            String::new()
+        } else {
+            match host_loop::validate_cuda_host_loop(&node.op) {
+                Ok(()) => continue,
+                Err((_, region_error)) => {
+                    format!("; its host-driven region loop cannot lower either: {region_error}")
+                }
+            }
+        };
+        return Err((
+            op.to_string(),
+            format!("CUDA {op} node {node_id} cannot lower to a device loop: {error}{fallback}"),
+        ));
     }
     Ok(())
 }
@@ -1159,6 +1187,7 @@ impl CudaExecutionPlan {
                 blas: self.blas.as_ref(),
                 solver: self.solver.as_ref(),
                 cond_branches: &self.cond_branches,
+                host_loops: &self.host_loops,
                 region_captures: captures,
                 constant_uploads: &self.constant_uploads,
             },
@@ -1232,6 +1261,7 @@ impl CudaExecutionPlan {
                     blas: self.blas.as_ref(),
                     solver: self.solver.as_ref(),
                     cond_branches: &self.cond_branches,
+                    host_loops: &self.host_loops,
                     region_captures: &BTreeMap::new(),
                     constant_uploads: &self.constant_uploads,
                 },
@@ -1647,6 +1677,7 @@ struct CudaProgramRuntime<'a> {
     blas: Option<&'a Arc<Mutex<CudaBlas>>>,
     solver: Option<&'a Arc<Mutex<CudaSolver>>>,
     cond_branches: &'a BTreeMap<TensorNodeId, CudaCondBranches>,
+    host_loops: &'a BTreeMap<TensorNodeId, host_loop::CudaHostLoop>,
     /// When non-empty, this program is a `Cond` region: every input is bound to a parent-plan
     /// device buffer.
     region_captures: &'a BTreeMap<String, &'a CudaSlice<f32>>,
@@ -1832,6 +1863,7 @@ fn execute_cuda_device_program(
         blas,
         solver,
         cond_branches,
+        host_loops,
         region_captures,
         constant_uploads,
     } = runtime;
@@ -1852,6 +1884,7 @@ fn execute_cuda_device_program(
     let mut scan_cache = BTreeMap::<usize, CudaScanCache>::new();
     let mut scan_vjp_cache = BTreeMap::<usize, CudaScanVjpCache>::new();
     let mut scan_vjp_jvp_cache = BTreeMap::<usize, CudaScanVjpJvpCache>::new();
+    let mut host_loop_results = BTreeMap::<TensorNodeId, CudaSlice<f32>>::new();
     for region in plan.fusion_regions() {
         for node_id in &region.node_ids {
             if *node_id != region.output_node_id {
@@ -1882,6 +1915,44 @@ fn execute_cuda_device_program(
         let count = element_count(&node.shape)?;
         let launch_count = u32::try_from(count)
             .map_err(|_| format!("CUDA node {node_id} launch exceeds u32 element count"))?;
+        // Host-driven loops: the first node of a group runs the loop and parks its siblings'
+        // results until those nodes are reached.
+        let host_result = match host_loop_results.remove(&node_id) {
+            Some(result) => Some(result),
+            None => match host_loops.get(&node_id) {
+                Some(host) => {
+                    let mut result = None;
+                    for (member, buffer) in host.execute(plan, node_id, values, stream)? {
+                        if member == node_id {
+                            result = Some(buffer);
+                        } else {
+                            host_loop_results.insert(member, buffer);
+                        }
+                    }
+                    Some(result.ok_or_else(|| {
+                        format!("CUDA host-driven loop node {node_id} produced no result")
+                    })?)
+                }
+                None => None,
+            },
+        };
+        if let Some(result) = host_result {
+            let slot = values
+                .get_mut(node_id)
+                .ok_or_else(|| format!("CUDA loop node {node_id} is missing its buffer slot"))?;
+            if let Some(stale) = slot.replace(result) {
+                free_buffers.recycle(stale);
+            }
+            release_dead_cuda_values(
+                plan,
+                node_id,
+                values,
+                free_buffers,
+                retained_inputs,
+                &mut remaining_uses,
+            )?;
+            continue;
+        }
         match &node.op {
             TensorOp::Input { name } => {
                 if let Some(capture) = region_captures.get(name) {
@@ -4782,14 +4853,14 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
     Ok(())
 }
 
-/// Device loops compile their body into one elementwise expression whose
+/// Fused device loops compile their body into one elementwise expression whose
 /// arrays are all captures of the parent plan; an array constant in the body
-/// has no binding there, so it is rejected instead of being re-uploaded per
-/// iteration.
+/// has no binding there, so such a loop runs as a host-driven region loop,
+/// whose body program uploads the constant once.
 fn cuda_loop_constant_error(node_id: usize) -> String {
     format!(
-        "body node {node_id} is an array constant; CUDA device loops read arrays only through \
-         captures, so pass the array into the loop as an explicit operand"
+        "body node {node_id} is an array constant; fused CUDA device loops read arrays only \
+         through captures"
     )
 }
 
@@ -7618,7 +7689,12 @@ fn cuda_scan_vjp_jvp_group_kernel_source(
         for (unsigned long long reverse_step = {upper}ULL; reverse_step > {lower}ULL; --reverse_step) {{ unsigned long long step = reverse_step - 1ULL; float loop_index = (float)step; {tape_reverse} {reverse_output_setup} {gradient_updates} float nc = ({primal_carry} + {primal_output}); float nct = {next_cotangent_tangent}; carry_cotangent = nc; carry_cotangent_tangent = nct; }}\n\
         {target_writes}\n}}\n"))
 }
-fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
+/// `host_driven` lists loop nodes that run as host-driven region loops; they
+/// launch their regions' own programs, so no node kernel is emitted for them.
+fn cuda_program_source(
+    plan: &TensorExecutionPlan,
+    host_driven: &BTreeSet<TensorNodeId>,
+) -> Result<String, String> {
     let mut source = String::from(
         "__device__ __forceinline__ float quabla_powi(float base, unsigned int exponent) {\n\
     float result = 1.0f;\n\
@@ -7634,6 +7710,9 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
     );
     source.push_str(CUDA_LINALG_SOURCE);
     for (node_id, node) in plan.nodes.iter().enumerate() {
+        if host_driven.contains(&node_id) {
+            continue;
+        }
         let function = cuda_node_function_name(node_id);
         let count = element_count(&node.shape)?;
         let kernel = match &node.op {

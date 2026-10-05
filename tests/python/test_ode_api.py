@@ -99,11 +99,21 @@ def test_optional_device_parity():
         def solve(rate):
             return qb.ode.odeint(decay, y0, (0.0, 2.0), steps=40, args=(rate,))
 
-        functions = [solve]
-        # CUDA loop VJPs require operands of the carry's shape, and the
-        # solver passes the scalar t0 and dt; reverse mode runs on MLX only.
-        if device == "mlx":
-            functions.append(qb.grad(lambda rate: solve(rate).sum()))
+        def saved(rate):
+            return qb.ode.odeint(decay, y0, (0.0, 2.0), steps=40, args=(rate,), save=True)
+
+        # The scalar operands (rate, t0, dt) broadcast against the vector
+        # state, so their loop VJP reduces over the state axis every step.
+        functions = [
+            solve,
+            qb.grad(lambda rate: solve(rate).sum()),
+            qb.grad(lambda rate: saved(rate).sum()),
+            # Forward-over-reverse (HVP) of the scalar-operand loop.
+            lambda rate: qb.jvp(
+                qb.grad(lambda r: solve(r).sum()), (rate,), (qb.ones([], qb.float32),)
+            )[1],
+            lambda rate: qb.jvp(solve, (rate,), (qb.ones([], qb.float32),))[1],
+        ]
         for function in functions:
             expected = qb.jit(function)(k).tolist()
             actual = qb.jit(function, device=device)(k).tolist()
@@ -289,25 +299,20 @@ def test_optional_device_dopri5_parity():
         return (y * y).sum()
 
     mu = qb.array(1.0, dtype=qb.float32)
-    if os.environ.get("QUABLA_CUDA_TEST") == "1":
-        # The fused CUDA loop kernel cannot lower the carry slicing yet.
-        error = raises_error(qb.UnsupportedOperationError, qb.jit(loss, device="cuda"), mu)
-        assert "slice" in str(error), str(error)
-    if os.environ.get("QUABLA_MLX_TEST") != "1":
-        return
-    for operation in (loss, qb.value_and_grad(loss)):
-        cpu = qb.tree.flatten(qb.jit(operation)(mu))[0]
-        mlx = qb.tree.flatten(qb.jit(operation, device="mlx")(mu))[0]
-        for value, expected in zip(mlx, cpu):
-            assert abs(value.item() - expected.item()) < 1e-3 * max(1.0, abs(expected.item()))
-
-
-def raises_error(kind, function, *args):
-    try:
-        function(*args)
-    except kind as error:
-        return error
-    raise AssertionError(f"expected {kind.__name__}")
+    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
+        if os.environ.get(flag) != "1":
+            continue
+        # The body slices and concatenates its packed carry and takes norms,
+        # so CUDA runs it as a host-driven loop over the body's device program.
+        for operation in (loss, qb.value_and_grad(loss)):
+            cpu = qb.tree.flatten(qb.jit(operation)(mu))[0]
+            actual = qb.tree.flatten(qb.jit(operation, device=device)(mu))[0]
+            for value, expected in zip(actual, cpu):
+                assert abs(value.item() - expected.item()) < 1e-3 * max(1.0, abs(expected.item())), (
+                    device,
+                    value.item(),
+                    expected.item(),
+                )
 
 
 if __name__ == "__main__":

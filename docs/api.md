@@ -241,8 +241,9 @@ decorator: `@qb.jit(device="mlx", static_argnums=1)`, `@qb.grad(argnums=1)`.
   scalars stay weak. Every captured array is stored in the graph, so large
   ones grow memory and compile time; compiled plans merge equal constants
   and fold elementwise ops on them. CUDA uploads each constant once per
-  compiled plan, MLX once per constant, and CUDA `fori`/`scan` loop bodies
-  reject captured arrays.
+  compiled plan (a loop body with a captured array runs as a host-driven
+  region loop whose body program keeps it resident), and MLX once per
+  constant.
 - Closures over tracers: a function passed to a transform inside a traced
   function may close over tracers of that trace, or of any trace enclosing
   it, as in JAX:
@@ -639,7 +640,9 @@ constants of the other branch's dtype. Unsupported implicit capture raises
 scalar bool, is true. A traced carry or operand forms one region; CPU and
 MLX evaluate the predicate, read it back to the host once per iteration, and
 then run the body, so the trip count may depend on traced values. CUDA
-raises `UnsupportedOperationError` for now. Forward mode (`jvp`) runs the
+does the same with device-resident carry buffers: the predicate and body
+regions are compiled once and only the scalar predicate is read back per
+iteration. Forward mode (`jvp`) runs the
 same loop over a packed primal/tangent carry. Reverse mode (`grad`, `vjp`,
 and the reverse-mode `jacobian`/`hessian`) raises an error naming
 `fori_loop`, as in JAX: a data-dependent trip count leaves no fixed tape, so
@@ -694,9 +697,7 @@ Heun's method (`"heun"`), or forward Euler (`"euler"`), at times
 `t0 + i * dt` so long integrations do not drift. A traced state forms one
 `fori_loop` region (a `scan` region with `save=True`, which returns the
 `n + 1` states stacked on axis zero), so solves differentiate with respect
-to `y0`, `t0`, `t1`, and `args` and run under `jit` on every device (CUDA
-supports the forward solve; its loop VJP needs operands of the carry's
-shape, while the solver passes scalar time operands). `y0` is
+to `y0`, `t0`, `t1`, and `args` and run under `jit` on every device. `y0` is
 a single array, and `f` must receive traced values through `args`, as loop
 bodies do.
 
@@ -710,9 +711,10 @@ I-controller, and the first step follows Hairer and Wanner's starting-step
 algorithm. The last step lands exactly on `t1`, and integration may run
 backward. The solve is a bounded `fori_loop` whose body stops advancing
 once `t1` is reached, so it is reverse-mode differentiable; a traced solve
-therefore always pays `max_steps` step attempts. It runs on the CPU and
-MLX; the fused CUDA loop kernel cannot lower its carry slicing yet and
-raises `UnsupportedOperationError`. Step sizes are controller
+therefore always pays `max_steps` step attempts. It runs on every device;
+its body slices and concatenates the packed carry and takes norms, so CUDA
+runs it as a host-driven region loop (see the CUDA loop lowering notes).
+Step sizes are controller
 outputs without gradients (only the final step depends on `t1`), so
 derivatives are those of the discrete scheme on the chosen mesh and are
 piecewise smooth across accept/reject changes. An eager solve stops at
@@ -787,7 +789,9 @@ Its symbolic JVP paired carry uses a leading extent of two. In the direct
 broadcast case, `ScanVjp` and `ScanVjpJvp` aggregate output cotangents, and
 their tangents for HVP, back to each carry lane before reverse replay;
 broadcast capture gradients use device-side atomic reduction. General
-unequal-count output graphs and indexed bodies remain explicit CUDA rejections.
+unequal-count output graphs and indexed bodies have no fused `ScanVjpJvp`
+kernel and remain explicit CUDA rejections; their primal Scan and first-order
+`ScanVjp` run as host-driven region loops.
 
 Current migration status:
 
@@ -970,6 +974,20 @@ name keeps working through 0.x.
   captures and matching carry/output shapes,
   plus a per-step output that directly broadcasts a carry-shaped value; the
   latter aggregates primal and tangent output cotangents per carry lane.
+  Every loop node outside these fused subsets except `ScanVjpJvp` (bodies
+  that slice, concatenate, reshape across lanes, reduce, contain `Cond` or
+  array constants; capture gradients that reduce over broadcast axes inside
+  the body VJP; `While`) runs as a host-driven region loop instead: each
+  region (body, predicate, body JVP or body VJP) is compiled once to the
+  per-node CUDA program, and the host launches it once per iteration on
+  device-resident carry buffers, with no host copy per iteration except the
+  `While` predicate. Reverse passes keep the carry tape on the device, in
+  full for short loops and as square-root checkpoint blocks replayed in
+  reverse otherwise (the CPU scheme), and accumulate each capture gradient
+  once per iteration in reverse order, its broadcast axes reduced inside the
+  body VJP; float32 results differ from the CPU only by rounding order.
+  Launch cost dominates small bodies: a 1000-step loop over 1024 lanes takes
+  about 0.1 ms fused versus about 80 ms host-driven on a GTX 1660 SUPER.
   `tensor_scan_region(lower, upper, body, init, operands)` applies the same
   one-time region tracing contract to a `(next_carry, output)` body and returns
   the final carry plus a leading-axis stack of fixed-shape outputs.
@@ -1039,8 +1057,9 @@ name keeps working through 0.x.
   (one device stream synchronization) and runs only the selected branch on the
   device, so an inactive branch such as `log(x)` for `x <= 0` cannot inject
   NaN into values or gradients. CUDA compiles both branch regions with the
-  parent plan and binds captures as device buffers; it rejects `Cond` inside
-  fused `Fori`/`Scan` device-loop bodies. Vmapped predicates or operands are
+  parent plan and binds captures as device buffers; a `Fori`/`Scan` body
+  containing `Cond` runs as a host-driven region loop. Vmapped predicates or
+  operands are
   rejected at trace time.
   `tensor_cond_fn(on_true, on_false, input_specs)` remains the host-boolean
   function-level boundary; `tensor_cond_value_and_grad_fn(...)` and
