@@ -1902,10 +1902,9 @@ impl DynamicTensor {
         )
     }
 
+    // Division and log follow IEEE 754 (±inf, NaN) like the devices and
+    // eager tensors, so a `where` guard can mask an invalid branch.
     fn div(&self, rhs: &Self) -> Result<Self, String> {
-        if rhs.data.contains(&0.0) {
-            return Err("division by zero is not supported".to_string());
-        }
         self.elementwise(rhs, |lhs, rhs| lhs / rhs)
     }
 
@@ -1953,9 +1952,6 @@ impl DynamicTensor {
     }
 
     fn reciprocal(&self) -> Result<Self, String> {
-        if self.data.contains(&0.0) {
-            return Err("division by zero is not supported".to_string());
-        }
         Self::new(
             self.shape.clone(),
             self.data.iter().map(|value| 1.0 / value).collect(),
@@ -2200,9 +2196,6 @@ impl DynamicTensor {
     }
 
     fn log(&self) -> Result<Self, String> {
-        if self.data.iter().any(|value| value <= 0.0) {
-            return Err("log requires strictly positive tensor values".to_string());
-        }
         Self::new(
             self.shape.clone(),
             self.data.iter().map(|value| value.ln()).collect(),
@@ -2435,11 +2428,7 @@ impl DynamicTensor {
                     values[row * n + column] = self.dtype.round(if row == column {
                         sqrt_derivative_value(reduced, 0)
                     } else {
-                        let diagonal = values[column * n + column];
-                        if diagonal == 0.0 {
-                            return Err("division by zero is not supported".to_string());
-                        }
-                        reduced / diagonal
+                        reduced / values[column * n + column]
                     });
                 }
             }
@@ -13389,9 +13378,9 @@ fn cuda_scalar_expression(
     match &node.op {
         TensorOp::Input { .. } => Ok(format!("input_{node_id}[quabla_offset_{node_id}(index)]")),
         TensorOp::ScalarConstant { value } if value.is_finite() => Ok(cuda_scalar_literal(*value)),
-        TensorOp::ScalarConstant { .. } => Err(
-            "CUDA lowering does not support non-finite scalar constants".to_string(),
-        ),
+        TensorOp::ScalarConstant { .. } => {
+            Err("CUDA lowering does not support non-finite scalar constants".to_string())
+        }
         // `is_fusable_elementwise_subgraph` keeps array constants out of whole-plan kernels; the
         // per-node program binds them as device buffers.
         TensorOp::Constant { .. } => {
@@ -13432,18 +13421,15 @@ fn cuda_scalar_expression(
         }
         TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
         TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
-        TensorOp::Powi { input, exponent } => Ok(format!(
-            "quabla_powi({}, {}U)",
-            child(*input)?,
-            exponent
-        )),
+        TensorOp::Powi { input, exponent } => {
+            Ok(format!("quabla_powi({}, {}U)", child(*input)?, exponent))
+        }
         TensorOp::Pow { base, exponent } => {
             Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
         }
-        TensorOp::Div { .. } | TensorOp::Log { .. } => Err(
-            "CUDA lowering does not yet support div or log because their CPU execution has checked domain semantics"
-                .to_string(),
-        ),
+        TensorOp::Div { .. } | TensorOp::Log { .. } => {
+            Err("CUDA loop-body lowering does not yet support div or log".to_string())
+        }
         TensorOp::Sum { .. }
         | TensorOp::SumAxis { .. }
         | TensorOp::Matmul { .. }
@@ -13898,10 +13884,6 @@ fn reuse_forward_binary(
         || !(right.shape == node.shape || right.shape.is_empty())
         || left.dtype == TensorDType::Bool
     {
-        return Ok(None);
-    }
-    // Preserve the established error path before taking or mutating any operand.
-    if matches!(node.op, TensorOp::Div { .. }) && right.data.contains(&0.0) {
         return Ok(None);
     }
     let scalar = right.shape.is_empty();

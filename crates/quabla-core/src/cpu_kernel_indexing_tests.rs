@@ -152,7 +152,7 @@ fn axis_reductions_preserve_linear_order_identity_and_rounding() {
 }
 
 #[test]
-fn broadcasting_and_division_errors_still_precede_fast_paths() {
+fn broadcasting_errors_precede_fast_paths_and_division_follows_ieee() {
     let lhs = fixture(&[2, 3], &[1.0], TensorDType::F64);
     let invalid = fixture(&[2], &[2.0], TensorDType::F64);
     assert_eq!(
@@ -162,9 +162,9 @@ fn broadcasting_and_division_errors_still_precede_fast_paths() {
     for shape in [vec![], vec![1, 1, 1], vec![2, 3]] {
         for zero in [0.0, -0.0] {
             let rhs = fixture(&shape, &[zero], TensorDType::F64);
-            assert_eq!(
-                lhs.div(&rhs).unwrap_err(),
-                "division by zero is not supported"
+            assert_bits(
+                &lhs.div(&rhs).unwrap(),
+                &previous_elementwise(&lhs, &rhs, |a, b| a / b).unwrap(),
             );
             assert_bits(
                 &rhs.div(&lhs).unwrap(),
@@ -172,10 +172,14 @@ fn broadcasting_and_division_errors_still_precede_fast_paths() {
             );
         }
         let rhs = fixture(&shape, &[2.0], TensorDType::F64);
-        assert_eq!(
-            lhs.sub(&rhs).unwrap().log().unwrap_err(),
-            "log requires strictly positive tensor values"
-        );
+        assert!(lhs
+            .sub(&rhs)
+            .unwrap()
+            .log()
+            .unwrap()
+            .data()
+            .iter()
+            .all(|value| value.is_nan()));
     }
 }
 

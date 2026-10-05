@@ -9601,16 +9601,17 @@ fn array_constants_fold_like_per_node_execution() {
     assert_eq!(folded.dtype(), TensorDType::F32);
     assert_eq!(folded.data().as_ref(), unfolded.data().as_ref());
 
-    // A zero divisor is left to fail at execution, as without folding.
+    // A zero divisor folds to the IEEE quotient that execution produces.
     let z = graph.constant(must!(vector(&[1.0, 0.0, 2.0])), false);
     let ones = graph.constant(must!(vector(&[1.0, 1.0, 1.0])), false);
     let quotient = must!(graph.div(ones, z));
     let plan = must!(graph.compile_cpu(quotient));
-    assert!(plan.lower_text().contains("div("), "{}", plan.lower_text());
-    let error = plan
-        .evaluate(&BTreeMap::new())
-        .expect_err("division by zero must fail");
-    assert!(error.contains("division by zero"), "{error}");
+    let folded = must!(plan.evaluate(&BTreeMap::new()));
+    assert_eq!(folded.data().as_ref(), &[1.0, f64::INFINITY, 0.5]);
+    assert_eq!(
+        folded.data().as_ref(),
+        must!(graph.evaluate(quotient, &inputs)).data().as_ref()
+    );
 }
 
 #[test]

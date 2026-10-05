@@ -850,31 +850,21 @@ impl PyTensor {
         base.try_map(|lhs| lhs * rhs)
     }
 
+    // Division follows IEEE 754 (±inf, NaN), as traced CPU, CUDA and MLX
+    // execution do.
     pub fn try_div(&self, rhs: &Self) -> Result<Self, String> {
-        self.try_elementwise(rhs, "/", |lhs, rhs| {
-            if rhs == 0.0 {
-                return Err("division by zero is not supported".to_string());
-            }
-
-            Ok(lhs / rhs)
-        })
+        self.try_elementwise(rhs, "/", |lhs, rhs| Ok(lhs / rhs))
     }
 
     pub fn try_div_scalar(&self, rhs: f64) -> Result<Self, String> {
         let base = self.arithmetic_base();
         let rhs = base.dtype.round(rhs);
-        if rhs == 0.0 {
-            return Err("division by zero scalar is not supported".to_string());
-        }
         base.try_map(|lhs| lhs / rhs)
     }
 
     pub fn try_scalar_div(&self, lhs: f64) -> Result<Self, String> {
         let base = self.arithmetic_base();
         let lhs = base.dtype.round(lhs);
-        if base.data.iter().any(|value| value == 0.0) {
-            return Err("division by zero is not supported".to_string());
-        }
         base.try_map(|rhs| lhs / rhs)
     }
 

@@ -121,14 +121,23 @@ fn checkpoint_vjp_matches_full_tape_bits_across_block_boundaries() -> Result<(),
     Ok(())
 }
 
+// Solves `c * y = 1` for a one-element carry: a zero carry is a checked
+// runtime error (log and division follow IEEE and no longer fail).
+fn singular_solve(graph: &mut TensorIr, carry: usize) -> Result<usize, String> {
+    let matrix = graph.reshape(carry, vec![1, 1])?;
+    let rhs = graph.constant(DynamicTensor::filled(vec![1, 1], 1.0)?, false);
+    let solution = graph.solve(matrix, rhs)?;
+    graph.reshape(solution, vec![1])
+}
+
 #[test]
 fn checkpoint_preserves_first_forward_failure() -> Result<(), String> {
     let mut graph = TensorIr::new();
     let carry = graph.input("c", vec![1])?;
-    let output = graph.log(carry)?;
+    let output = singular_solve(&mut graph, carry)?;
     let body = graph.compile_cpu(output)?;
     let plan = TensorForiExecutionPlan::new(0, 101, body, "c", "i")?;
-    let initial = DynamicTensor::filled(vec![1], -1.0)?;
+    let initial = DynamicTensor::filled(vec![1], 0.0)?;
     let expected = plan
         .evaluate_with_tape(initial.clone(), &BTreeMap::new())
         .unwrap_err();
@@ -209,10 +218,10 @@ fn scan_checkpoint_matches_public_full_tape_and_preserves_outputs() -> Result<()
 fn scan_checkpoint_keeps_checked_output_errors_before_cotangent_validation() -> Result<(), String> {
     let mut graph = TensorIr::new();
     let carry = graph.input("c", vec![1])?;
-    let output = graph.log(carry)?;
+    let output = singular_solve(&mut graph, carry)?;
     let body = graph.compile_cpu_many(&[carry, output])?.0;
     let plan = TensorScanExecutionPlan::new(0, 17, body, "c", "i")?;
-    let initial = DynamicTensor::filled(vec![1], -1.0)?;
+    let initial = DynamicTensor::filled(vec![1], 0.0)?;
     let expected = plan
         .evaluate_with_tape(initial.clone(), &BTreeMap::new())
         .unwrap_err();

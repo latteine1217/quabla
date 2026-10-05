@@ -85,8 +85,10 @@ fn folded_fanout_aliases_and_retained_outputs_match_node_execution() -> Result<(
 #[test]
 fn folding_preserves_checked_constant_errors() -> Result<(), String> {
     let mut graph = TensorIr::new();
-    let constant = graph.constant(DynamicTensor::filled(vec![2], -1.0)?, false);
-    let invalid = graph.log(constant)?;
+    // A singular solve is a checked runtime error; log and division follow IEEE.
+    let singular = graph.constant(DynamicTensor::filled(vec![2, 2], 0.0)?, false);
+    let rhs = graph.constant(DynamicTensor::filled(vec![2, 1], 1.0)?, false);
+    let invalid = graph.solve(singular, rhs)?;
     let plan = graph.compile_cpu(invalid)?;
     assert_eq!(
         plan.evaluate(&BTreeMap::new()).unwrap_err(),
@@ -250,8 +252,9 @@ fn linear_reverse_chain_and_dead_errors_preserve_vjp_contract() -> Result<(), St
                 .collect::<Vec<_>>()
         );
         assert_eq!(gradients["x"].data().as_ref(), &[1.0; 4]);
-        let negative = graph.scalar_constant(-1.0);
-        graph.log(negative)?;
+        let singular = graph.constant(DynamicTensor::filled(vec![1, 1], 0.0)?, false);
+        let rhs = graph.constant(DynamicTensor::filled(vec![1, 1], 1.0)?, false);
+        graph.solve(singular, rhs)?;
         assert!(graph
             .value_and_vjp(output, &inputs, DynamicTensor::filled(vec![4], 1.0)?)
             .is_err());

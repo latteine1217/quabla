@@ -419,12 +419,11 @@ def test_tensor_supports_numeric_scalars_on_both_sides():
     assert (12.0 / tensor).to_flat_list() == [12.0, -6.0, 4.0, 3.0]
     assert (-tensor).to_flat_list() == [-1.0, 2.0, -3.0, -4.0]
 
-    try:
-        tensor / 0.0
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("tensor division accepted a zero scalar")
+    # Division by zero follows IEEE 754, like traced and device execution.
+    assert (tensor / 0.0).to_flat_list() == [math.inf, -math.inf, math.inf, math.inf]
+    zeros = quabla.Tensor([2, 2], [0.0, -0.0, 1.0, 1.0])
+    assert (tensor / zeros).to_flat_list()[:2] == [math.inf, math.inf]
+    assert math.isnan((tensor * 0.0 / 0.0).to_flat_list()[0])
 
 
 def test_tensor_power_supports_integer_and_float_exponents():
@@ -3187,11 +3186,8 @@ def test_tensor_cond_fn_only_executes_selected_branch():
     )
     negative = {"x": quabla.Tensor([1], [-2.0])}
     assert condition(False, negative).to_flat_list() == [-4.0]
-    try:
-        condition(True, negative)
-        assert False, "expected selected log branch to reject a negative input"
-    except ValueError as error:
-        assert "log" in str(error)
+    # The selected log branch runs: log(-2) is NaN under IEEE semantics.
+    assert math.isnan(condition(True, negative).to_flat_list()[0])
 
     try:
         quabla.tensor_cond_fn(lambda x: x, lambda x: x.sum(), [("x", [1])])
