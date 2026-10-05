@@ -613,8 +613,10 @@ name keeps working through 0.x.
 - `Tensor.gather(indices, axis=0)` and `Tensor.scatter_add(indices, updates,
   axis=0)` support static integer index sequences, including negative and
   repeated indices. `scatter_add` is functional and accumulates repeated
-  destinations; its traced lowering uses slice/concat/pad-slice so VJPs route
-  repeated gather/scatter coordinates correctly. Dynamic tensor indices
+  destinations in index order. Each traces to one native `gather` or
+  `scatter_add` IR node on the CPU, CUDA, and MLX, so staged programs and
+  their derivatives stay the same size for any index count; the VJP of one is
+  the other. Dynamic tensor indices
   (pending `I32` index tensors), boolean-mask indexing, and assignment-style
   scatter are not yet supported.
 - `quabla.einsum("ij,jk->ik", [lhs, rhs])` and

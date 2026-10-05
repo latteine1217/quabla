@@ -2452,6 +2452,72 @@ def test_escaped_tracers_raise_tracer_error_instead_of_mixing_graphs():
     )
 
 
+def lowered_node_count(function, *args):
+    text = qb.jit(function).lower(*args).as_text()
+    return len([line for line in text.splitlines() if line.lstrip().startswith("%")])
+
+
+def test_jit_gather_and_scatter_add_are_constant_size_and_match_eager():
+    # Each traces to one IR node, so neither the staged program nor its
+    # gradient grows with the index count; they used to emit one slice or one
+    # padded add per index.
+    def sized(count):
+        rows = 8
+        indices = [(5 * k + 3) % rows for k in range(count)]
+        x = qb.array([[0.25 * i - 0.5 * j for j in range(3)] for i in range(rows)])
+        u = qb.array([[0.125 * k + j for j in range(3)] for k in range(count)])
+        scatter = lambda b, v: b.scatter_add(indices, v, axis=0)  # noqa: E731
+        loss = lambda y: qb.sum(qb.sin(y.gather(indices, axis=0)))  # noqa: E731
+        return (
+            lowered_node_count(scatter, x, u),
+            lowered_node_count(qb.grad(loss), x),
+        )
+
+    assert sized(64) == sized(1024), (sized(64), sized(1024))
+
+    # Values and derivatives match eager for repeated indices on both axes.
+    # Dyadic data keeps every sum exact, so equality holds in any order.
+    x = qb.array([[0.25 * i - 0.5 * j for j in range(5)] for i in range(4)])
+    devices = ["cpu"] + (["mlx"] if os.environ.get("QUABLA_MLX_TEST") == "1" else [])
+    devices += ["cuda"] if os.environ.get("QUABLA_CUDA_TEST") == "1" else []
+    for axis, indices in ((0, [3, 1, 3, 0, 3]), (1, [4, 0, 4, 4, 2, 1])):
+        shape = [4, 5]
+        shape[axis] = len(indices)
+        u = qb.array([[0.5 * i + 0.25 * j for j in range(shape[1])] for i in range(shape[0])])
+        w = qb.array([[1.0 - 0.75 * i + j for j in range(shape[1])] for i in range(shape[0])])
+        c = qb.array([[0.5 * i - j for j in range(5)] for i in range(4)])
+        zeros = qb.zeros([4, 5])
+        for device in devices:
+            jit = lambda f: qb.jit(f, device=device)  # noqa: E731
+            assert_close(jit(lambda y: y.gather(indices, axis=axis))(x), x.gather(indices, axis=axis), 0)
+            assert_close(
+                jit(lambda b, v: b.scatter_add(indices, v, axis=axis))(x, u),
+                x.scatter_add(indices, u, axis=axis),
+                0,
+            )
+            gather_grad = jit(qb.grad(lambda y: qb.sum(y.gather(indices, axis=axis) * w)))(x)
+            assert_close(gather_grad, zeros.scatter_add(indices, w, axis=axis), 0)
+            base_grad, update_grad = jit(
+                qb.grad(lambda b, v: qb.sum(b.scatter_add(indices, v, axis=axis) * c), argnums=(0, 1))
+            )(x, u)
+            assert_close(base_grad, c, 0)
+            assert_close(update_grad, c.gather(indices, axis=axis), 0)
+            stacked = qb.stack([x, x * 2.0, x - 1.0])
+            stacked_u = qb.stack([u, u - 0.5, u * 4.0])
+            assert_close(
+                jit(qb.vmap(lambda y: y.gather(indices, axis=axis)))(stacked),
+                stacked.gather(indices, axis=axis + 1),
+                0,
+            )
+            assert_close(
+                jit(qb.vmap(lambda b, v: b.scatter_add(indices, v, axis=axis)))(
+                    stacked, stacked_u
+                ),
+                stacked.scatter_add(indices, stacked_u, axis=axis + 1),
+                0,
+            )
+
+
 def test_narrow_buffer_import_regressions():
     if np is None:
         return

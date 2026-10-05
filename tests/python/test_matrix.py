@@ -1195,7 +1195,7 @@ def test_compiler_facade_cuda_rejects_every_unsupported_scan_lane_form():
         (
             "indexed gather on an unpacked carry",
             primal(lambda i, c, s: (c.gather([2, 0, 1], 0) * s, c * s), [3], [3]),
-            "unsupported slice operation",
+            "unsupported gather operation",
         ),
         (
             "reshape that moves a capture axis",

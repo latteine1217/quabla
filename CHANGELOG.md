@@ -9,6 +9,19 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Changed
+
+- Traced `gather` and `scatter_add` lower to native IR nodes instead of one
+  slice, or one padded add, per index, so a staged program and its gradient
+  keep a constant node count. With 16000 indices into a 4000 x 4 array, jit
+  `scatter_add` takes 0.22 ms instead of 513 ms on the CPU and 0.42 ms
+  instead of 201 ms on Apple silicon, and jit `grad` of a gather loss 1.5 ms
+  instead of 514 ms and 0.46 ms instead of 256 ms. On CUDA (GTX 1660 SUPER)
+  with 4000 indices, the first call compiles in 22 ms instead of 320 s and a
+  call takes 0.26 ms instead of 184 ms. Results, including gradients, JVPs,
+  and HVPs, are bitwise unchanged on the CPU, CUDA, and Metal, except that a
+  `-0.0` entry is no longer turned into `+0.0` by an added zero.
+
 ## [0.2.2] - 2026-10-06
 
 ### Changed

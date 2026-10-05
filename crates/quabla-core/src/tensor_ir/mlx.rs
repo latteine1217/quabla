@@ -6,6 +6,8 @@
 
 #[path = "mlx_cholesky.rs"]
 mod cholesky_backend;
+#[path = "mlx_scatter.rs"]
+mod scatter_backend;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
@@ -1099,6 +1101,42 @@ impl MlxBackend {
                     )
                     .map_err(|error| error.to_string())
                 }
+                TensorOp::Gather {
+                    input,
+                    indices,
+                    axis,
+                } => {
+                    let indices = indices
+                        .iter()
+                        .map(|index| {
+                            i32::try_from(*index)
+                                .map_err(|_| "MLX gather index exceeds i32".to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let count = i32::try_from(indices.len())
+                        .map_err(|_| "MLX gather index count exceeds i32".to_string())?;
+                    mlx_value(&values, *input)?
+                        .take_axis_device(
+                            Array::from_slice(&indices, &[count]),
+                            i32::try_from(*axis)
+                                .map_err(|_| "MLX gather axis exceeds i32".to_string())?,
+                            &stream,
+                        )
+                        .map_err(|error| error.to_string())
+                }
+                TensorOp::ScatterAdd {
+                    base,
+                    updates,
+                    indices,
+                    axis,
+                } => scatter_backend::evaluate(
+                    mlx_value(&values, *base)?,
+                    mlx_value(&values, *updates)?,
+                    indices,
+                    *axis,
+                    &node.shape,
+                    &stream,
+                ),
             }
             .map_err(|error| {
                 format!(
@@ -2011,6 +2049,8 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Concat { .. } => "concat",
         TensorOp::Slice { .. } => "slice",
         TensorOp::PadSlice { .. } => "pad_slice",
+        TensorOp::Gather { .. } => "gather",
+        TensorOp::ScatterAdd { .. } => "scatter_add",
         TensorOp::Broadcast { .. } => "broadcast",
     }
 }

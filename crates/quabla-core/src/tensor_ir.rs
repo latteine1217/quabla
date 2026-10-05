@@ -706,6 +706,24 @@ enum TensorOp {
         axis: usize,
         start: usize,
     },
+    /// The entries of `input` at `indices` along `axis`, in index order;
+    /// a repeated index repeats its entry. One node replaces a slice per
+    /// index, so traced gathers and their gradients stay O(1) in nodes.
+    Gather {
+        input: TensorNodeId,
+        indices: Arc<[usize]>,
+        axis: usize,
+    },
+    /// `base` with entry `j` of `updates` along `axis` added to entry
+    /// `indices[j]`. Contributions to one destination accumulate in
+    /// increasing `j`, and every sum rounds to the node dtype, exactly as a
+    /// chain of one padded add per index would.
+    ScatterAdd {
+        base: TensorNodeId,
+        updates: TensorNodeId,
+        indices: Arc<[usize]>,
+        axis: usize,
+    },
     Broadcast {
         input: TensorNodeId,
     },
@@ -2157,6 +2175,75 @@ impl DynamicTensor {
         Self::new(output_shape.to_vec(), data)
     }
 
+    /// Copies the entries at `indices` along `axis`; see [`TensorOp::Gather`].
+    fn gather_axis(&self, indices: &[usize], axis: usize) -> Result<Self, String> {
+        let extent = *self
+            .shape
+            .get(axis)
+            .ok_or_else(|| format!("gather axis {axis} is out of bounds for {:?}", self.shape))?;
+        if let Some(index) = indices.iter().find(|index| **index >= extent) {
+            return Err(format!(
+                "gather index {index} is out of bounds for axis {axis} with extent {extent}"
+            ));
+        }
+        let mut shape = self.shape.clone();
+        shape[axis] = indices.len();
+        let outer = element_count(&self.shape[..axis])?;
+        let inner = element_count(&self.shape[axis + 1..])?;
+        let mut data = Vec::with_capacity(element_count(&shape)?);
+        for outer_index in 0..outer {
+            for index in indices {
+                let start = (outer_index * extent + index) * inner;
+                data.extend((start..start + inner).map(|position| self.data.get(position)));
+            }
+        }
+        Self::new(shape, data).map(|gathered| gathered.into_dtype(self.dtype))
+    }
+
+    /// `self` with `updates` added at `indices` along `axis`, rounding every
+    /// sum to `rounding` (`F64` for derivative arithmetic). Contributions to
+    /// one destination accumulate in increasing update order, or decreasing
+    /// order with `reverse`; see [`TensorOp::ScatterAdd`].
+    fn scatter_add_axis(
+        &self,
+        updates: &Self,
+        indices: &[usize],
+        axis: usize,
+        rounding: TensorDType,
+        reverse: bool,
+    ) -> Result<Self, String> {
+        let extent = *self
+            .shape
+            .get(axis)
+            .ok_or_else(|| format!("scatter axis {axis} is out of bounds for {:?}", self.shape))?;
+        let mut expected = self.shape.clone();
+        expected[axis] = indices.len();
+        if updates.shape != expected || indices.iter().any(|index| *index >= extent) {
+            return Err(format!(
+                "cannot scatter updates of shape {:?} into {:?} along axis {axis} at {} indices",
+                updates.shape,
+                self.shape,
+                indices.len()
+            ));
+        }
+        let outer = element_count(&self.shape[..axis])?;
+        let inner = element_count(&self.shape[axis + 1..])?;
+        let mut data = self.data.to_vec();
+        let count = indices.len();
+        for outer_index in 0..outer {
+            for step in 0..count {
+                let source = if reverse { count - 1 - step } else { step };
+                let destination = (outer_index * extent + indices[source]) * inner;
+                let source = (outer_index * count + source) * inner;
+                for offset in 0..inner {
+                    let slot = &mut data[destination + offset];
+                    *slot = rounding.round(*slot + updates.data.get(source + offset));
+                }
+            }
+        }
+        Self::new(self.shape.clone(), data)
+    }
+
     fn mean_all(&self) -> Result<Self, String> {
         self.sum_all()?.scale(1.0 / self.data.len() as f64)
     }
@@ -2985,6 +3072,45 @@ impl TensorIr {
                 axis: axis + 1,
                 start: *start,
             },
+            TensorOp::Gather {
+                input,
+                indices,
+                axis,
+            } => TensorOp::Gather {
+                input: target(*input)?,
+                indices: indices.clone(),
+                axis: axis + 1,
+            },
+            TensorOp::ScatterAdd {
+                base,
+                updates,
+                indices,
+                axis,
+            } => {
+                // Both operands need the batch axis; an unmapped one is the
+                // same for every example.
+                let mut operands = [*base, *updates];
+                for operand in &mut operands {
+                    let spliced = target(*operand)?;
+                    *operand = if mapped[*operand] {
+                        spliced
+                    } else {
+                        let source = self.node(spliced)?;
+                        let (shape, dtype, weak) = (
+                            batched_shape(batch_size, &source.shape),
+                            source.dtype,
+                            source.weak,
+                        );
+                        self.push_node(TensorOp::Broadcast { input: spliced }, shape, dtype, weak)
+                    };
+                }
+                TensorOp::ScatterAdd {
+                    base: operands[0],
+                    updates: operands[1],
+                    indices: indices.clone(),
+                    axis: axis + 1,
+                }
+            }
             TensorOp::Cholesky { input } => TensorOp::Cholesky {
                 input: target(*input)?,
             },
@@ -3655,6 +3781,40 @@ impl TensorIr {
                         transformed.pad_slice(tangent, node.shape.clone(), *axis, *start)?,
                     )
                 }
+                TensorOp::Gather {
+                    input,
+                    indices,
+                    axis,
+                } => {
+                    let (value, tangent) = pairs[*input];
+                    (
+                        transformed.gather(value, indices.clone(), *axis)?,
+                        transformed.gather(tangent, indices.clone(), *axis)?,
+                    )
+                }
+                TensorOp::ScatterAdd {
+                    base,
+                    updates,
+                    indices,
+                    axis,
+                } => {
+                    let (base_value, base_tangent) = pairs[*base];
+                    let (update_value, update_tangent) = pairs[*updates];
+                    (
+                        transformed.scatter_add(
+                            base_value,
+                            update_value,
+                            indices.clone(),
+                            *axis,
+                        )?,
+                        transformed.scatter_add(
+                            base_tangent,
+                            update_tangent,
+                            indices.clone(),
+                            *axis,
+                        )?,
+                    )
+                }
                 TensorOp::Broadcast { input } => {
                     let (value, tangent) = pairs[*input];
                     (
@@ -3941,6 +4101,22 @@ impl TensorIr {
                 TensorOp::PadSlice { input, axis, start } => {
                     transformed.pad_slice(values[*input], node.shape.clone(), *axis, *start)?
                 }
+                TensorOp::Gather {
+                    input,
+                    indices,
+                    axis,
+                } => transformed.gather(values[*input], indices.clone(), *axis)?,
+                TensorOp::ScatterAdd {
+                    base,
+                    updates,
+                    indices,
+                    axis,
+                } => transformed.scatter_add(
+                    values[*base],
+                    values[*updates],
+                    indices.clone(),
+                    *axis,
+                )?,
                 TensorOp::Broadcast { input } => {
                     transformed.broadcast_to(values[*input], node.shape.clone())?
                 }
@@ -4578,6 +4754,32 @@ impl TensorIr {
                         self.node(*input)?.shape[*axis],
                     )?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
+                }
+                TensorOp::Gather {
+                    input,
+                    indices,
+                    axis,
+                } => {
+                    let base = match cotangents[*input] {
+                        Some(existing) => existing,
+                        None => {
+                            let dtype = transformed.node(upstream)?.dtype;
+                            let zero = transformed.constant_like(0.0, dtype, false);
+                            transformed.broadcast_to(zero, self.node(*input)?.shape.clone())?
+                        }
+                    };
+                    cotangents[*input] =
+                        Some(transformed.gather_cotangent(base, upstream, indices, *axis)?);
+                }
+                TensorOp::ScatterAdd {
+                    base,
+                    updates,
+                    indices,
+                    axis,
+                } => {
+                    let contribution = transformed.gather(upstream, indices.clone(), *axis)?;
+                    symbolic_accumulate(&mut transformed, &mut cotangents, *base, upstream)?;
+                    symbolic_accumulate(&mut transformed, &mut cotangents, *updates, contribution)?;
                 }
             }
         }
@@ -6092,6 +6294,104 @@ impl TensorIr {
         self.push_derived(TensorOp::PadSlice { input, axis, start }, output_shape)
     }
 
+    /// The entries of `input` at `indices` along `axis` (already
+    /// normalized); see [`TensorOp::Gather`].
+    pub fn gather(
+        &mut self,
+        input: TensorNodeId,
+        indices: Arc<[usize]>,
+        axis: usize,
+    ) -> Result<TensorNodeId, String> {
+        let mut shape = self.node(input)?.shape.clone();
+        let extent = *shape
+            .get(axis)
+            .ok_or_else(|| format!("gather axis {axis} is out of bounds for shape {shape:?}"))?;
+        if indices.is_empty() {
+            return Err("gather indices must not be empty".to_string());
+        }
+        if let Some(index) = indices.iter().find(|index| **index >= extent) {
+            return Err(format!(
+                "gather index {index} is out of bounds for axis {axis} with extent {extent}"
+            ));
+        }
+        shape[axis] = indices.len();
+        self.push_derived(
+            TensorOp::Gather {
+                input,
+                indices,
+                axis,
+            },
+            shape,
+        )
+    }
+
+    /// `base` plus `updates` scattered to `indices` along `axis` (already
+    /// normalized); the operands are promoted like `add`. See
+    /// [`TensorOp::ScatterAdd`].
+    pub fn scatter_add(
+        &mut self,
+        base: TensorNodeId,
+        updates: TensorNodeId,
+        indices: Arc<[usize]>,
+        axis: usize,
+    ) -> Result<TensorNodeId, String> {
+        let shape = self.node(base)?.shape.clone();
+        let update_shape = &self.node(updates)?.shape;
+        let extent = *shape
+            .get(axis)
+            .ok_or_else(|| format!("scatter axis {axis} is out of bounds for shape {shape:?}"))?;
+        if indices.is_empty() {
+            return Err("scatter indices must not be empty".to_string());
+        }
+        if let Some(index) = indices.iter().find(|index| **index >= extent) {
+            return Err(format!(
+                "scatter index {index} is out of bounds for axis {axis} with extent {extent}"
+            ));
+        }
+        let mut expected = shape.clone();
+        expected[axis] = indices.len();
+        if *update_shape != expected {
+            return Err(format!(
+                "scatter updates shape {update_shape:?} is incompatible with base shape \
+                 {shape:?}, axis {axis}, and {} indices",
+                indices.len()
+            ));
+        }
+        let [base, updates] = self.coerce_operands("scatter_add", [base, updates])?;
+        self.push_derived(
+            TensorOp::ScatterAdd {
+                base,
+                updates,
+                indices,
+                axis,
+            },
+            shape,
+        )
+    }
+
+    /// `base`, the cotangent accumulated so far for the input of
+    /// `gather(input, indices, axis)` (zeros if there is none yet), plus the
+    /// gather's cotangent `upstream`. Reverse mode used to visit one slice per
+    /// index, from the last index to the first, adding each into the running
+    /// sum; scattering repeated entries in decreasing index order into that
+    /// same running sum reproduces those sums bit for bit.
+    fn gather_cotangent(
+        &mut self,
+        base: TensorNodeId,
+        upstream: TensorNodeId,
+        indices: &Arc<[usize]>,
+        axis: usize,
+    ) -> Result<TensorNodeId, String> {
+        let mut seen = HashSet::new();
+        if indices.iter().all(|index| seen.insert(*index)) {
+            return self.scatter_add(base, upstream, indices.clone(), axis);
+        }
+        let positions = (0..indices.len()).rev().collect::<Arc<[usize]>>();
+        let reversed = self.gather(upstream, positions, axis)?;
+        let reversed_indices = indices.iter().rev().copied().collect::<Arc<[usize]>>();
+        self.scatter_add(base, reversed, reversed_indices, axis)
+    }
+
     pub fn evaluate(
         &self,
         output: TensorNodeId,
@@ -6849,6 +7149,37 @@ impl TensorIr {
                     &mut cotangents[*input],
                     cotangent.slice_axis(*axis, *start, self.node(*input)?.shape[*axis])?,
                 )?,
+                // Scattered into the running sum in decreasing index order, as
+                // in `TensorIr::gather_cotangent`.
+                TensorOp::Gather {
+                    input,
+                    indices,
+                    axis,
+                } => {
+                    let base = match cotangents[*input].take() {
+                        Some(existing) => existing,
+                        None => DynamicTensor::filled(self.node(*input)?.shape.clone(), 0.0)?,
+                    };
+                    cotangents[*input] = Some(base.scatter_add_axis(
+                        &cotangent,
+                        indices,
+                        *axis,
+                        TensorDType::F64,
+                        true,
+                    )?);
+                }
+                TensorOp::ScatterAdd {
+                    base,
+                    updates,
+                    indices,
+                    axis,
+                } => {
+                    accumulate(
+                        &mut cotangents[*updates],
+                        cotangent.gather_axis(indices, *axis)?,
+                    )?;
+                    accumulate(&mut cotangents[*base], cotangent)?;
+                }
                 TensorOp::Broadcast { input } => accumulate(
                     &mut cotangents[*input],
                     cotangent.reduce_to_shape(&self.node(*input)?.shape)?,
@@ -7400,6 +7731,31 @@ impl TensorIr {
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
                     .pad_slice(&node.shape, *axis, *start)?,
+                TensorOp::Gather {
+                    input,
+                    indices,
+                    axis,
+                } => tangents
+                    .get(*input)
+                    .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
+                    .gather_axis(indices, *axis)?,
+                TensorOp::ScatterAdd {
+                    base,
+                    updates,
+                    indices,
+                    axis,
+                } => tangents
+                    .get(*base)
+                    .ok_or_else(|| format!("node {base} has no evaluated tangent"))?
+                    .scatter_add_axis(
+                        tangents
+                            .get(*updates)
+                            .ok_or_else(|| format!("node {updates} has no evaluated tangent"))?,
+                        indices,
+                        *axis,
+                        TensorDType::F64,
+                        false,
+                    )?,
                 TensorOp::Broadcast { input } => tangents
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
@@ -7990,6 +8346,25 @@ impl TensorIr {
                     "%{id} = pad_slice(%{input}, axis={axis}, start={start}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
+                TensorOp::Gather {
+                    input,
+                    indices,
+                    axis,
+                } => format!(
+                    "%{id} = gather(%{input}, axis={axis}, indices={}) : {}",
+                    format_index_list(indices),
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
+                TensorOp::ScatterAdd {
+                    base,
+                    updates,
+                    indices,
+                    axis,
+                } => format!(
+                    "%{id} = scatter_add(%{base}, %{updates}, axis={axis}, indices={}) : {}",
+                    format_index_list(indices),
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
                 TensorOp::Broadcast { input } => format!(
                     "%{id} = broadcast(%{input}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
@@ -8212,6 +8587,7 @@ impl TensorIr {
                     | TensorOp::Concat { .. }
                     | TensorOp::Slice { .. }
                     | TensorOp::PadSlice { .. }
+                    | TensorOp::Gather { .. }
                     | TensorOp::Broadcast { .. }
             )
         {
@@ -8833,6 +9209,34 @@ impl TensorIr {
                     .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .pad_slice(&node.shape, *axis, *start)?,
+                TensorOp::Gather {
+                    input,
+                    indices,
+                    axis,
+                } => values
+                    .get(*input)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .gather_axis(indices, *axis)?,
+                TensorOp::ScatterAdd {
+                    base,
+                    updates,
+                    indices,
+                    axis,
+                } => values
+                    .get(*base)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| format!("node {base} has no evaluated value"))?
+                    .scatter_add_axis(
+                        values
+                            .get(*updates)
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| format!("node {updates} has no evaluated value"))?,
+                        indices,
+                        *axis,
+                        node.dtype,
+                        false,
+                    )?,
                 TensorOp::Broadcast { input } => values
                     .get(*input)
                     .and_then(Option::as_ref)
@@ -9564,6 +9968,45 @@ impl TensorIr {
                         first: input.first.pad_slice(&node.shape, *axis, *start)?,
                         second: input.second.pad_slice(&node.shape, *axis, *start)?,
                         mixed: input.mixed.pad_slice(&node.shape, *axis, *start)?,
+                    }
+                }
+                TensorOp::Gather {
+                    input,
+                    indices,
+                    axis,
+                } => {
+                    let input = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    MixedTangent {
+                        value: input.value.gather_axis(indices, *axis)?,
+                        first: input.first.gather_axis(indices, *axis)?,
+                        second: input.second.gather_axis(indices, *axis)?,
+                        mixed: input.mixed.gather_axis(indices, *axis)?,
+                    }
+                }
+                TensorOp::ScatterAdd {
+                    base,
+                    updates,
+                    indices,
+                    axis,
+                } => {
+                    let base = values
+                        .get(*base)
+                        .ok_or_else(|| format!("node {base} has no evaluated value"))?;
+                    let updates = values
+                        .get(*updates)
+                        .ok_or_else(|| format!("node {updates} has no evaluated value"))?;
+                    // The primal rounds every sum to the node dtype; derivative
+                    // components stay f64, as for a chain of adds.
+                    let scatter = |base: &DynamicTensor, updates: &DynamicTensor, rounding| {
+                        base.scatter_add_axis(updates, indices, *axis, rounding, false)
+                    };
+                    MixedTangent {
+                        value: scatter(&base.value, &updates.value, node.dtype)?,
+                        first: scatter(&base.first, &updates.first, TensorDType::F64)?,
+                        second: scatter(&base.second, &updates.second, TensorDType::F64)?,
+                        mixed: scatter(&base.mixed, &updates.mixed, TensorDType::F64)?,
                     }
                 }
                 TensorOp::Broadcast { input } => {
@@ -13260,6 +13703,22 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                 TensorOp::PadSlice { input, axis, start } => {
                     specialized.pad_slice(mapped(*input)?, node.shape.clone(), *axis, *start)?
                 }
+                TensorOp::Gather {
+                    input,
+                    indices,
+                    axis,
+                } => specialized.gather(mapped(*input)?, indices.clone(), *axis)?,
+                TensorOp::ScatterAdd {
+                    base,
+                    updates,
+                    indices,
+                    axis,
+                } => specialized.scatter_add(
+                    mapped(*base)?,
+                    mapped(*updates)?,
+                    indices.clone(),
+                    *axis,
+                )?,
                 TensorOp::Broadcast { input } => {
                     specialized.broadcast_to(mapped(*input)?, node.shape.clone())?
                 }
@@ -13461,6 +13920,8 @@ fn cuda_scalar_expression(
         | TensorOp::Concat { .. }
         | TensorOp::Slice { .. }
         | TensorOp::PadSlice { .. }
+        | TensorOp::Gather { .. }
+        | TensorOp::ScatterAdd { .. }
         | TensorOp::Broadcast { .. }
         | TensorOp::Cond { .. }
         | TensorOp::Fori { .. }
@@ -13728,6 +14189,8 @@ fn evaluate_fused_element(
         | TensorOp::Concat { .. }
         | TensorOp::Slice { .. }
         | TensorOp::PadSlice { .. }
+        | TensorOp::Gather { .. }
+        | TensorOp::ScatterAdd { .. }
         | TensorOp::Broadcast { .. }
         | TensorOp::Cond { .. }
         | TensorOp::Fori { .. }
@@ -13867,10 +14330,12 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         | TensorOp::Log { input }
         | TensorOp::Slice { input, .. }
         | TensorOp::PadSlice { input, .. }
+        | TensorOp::Gather { input, .. }
         | TensorOp::Broadcast { input }
         | TensorOp::Cast { input } => {
             vec![*input]
         }
+        TensorOp::ScatterAdd { base, updates, .. } => vec![*base, *updates],
         TensorOp::Concat { inputs, .. } => inputs.clone(),
     }
 }
@@ -14416,11 +14881,27 @@ fn infer_tensor_placement(
             }
             Ok(placement)
         }
-        TensorOp::Slice { input, axis, .. } | TensorOp::PadSlice { input, axis, .. } => {
+        TensorOp::Slice { input, axis, .. }
+        | TensorOp::PadSlice { input, axis, .. }
+        | TensorOp::Gather { input, axis, .. } => {
             let placement = unary(*input)?;
             if sharded_tensor_axis(&placement) == Some(*axis) {
                 return Err(format!(
                     "kernel node {node_id} slices along a sharded axis; explicit redistribution is required"
+                ));
+            }
+            Ok(placement)
+        }
+        TensorOp::ScatterAdd {
+            base,
+            updates,
+            axis,
+            ..
+        } => {
+            let placement = merge(&[*base, *updates])?;
+            if sharded_tensor_axis(&placement) == Some(*axis) {
+                return Err(format!(
+                    "kernel node {node_id} scatters along a sharded axis; explicit redistribution is required"
                 ));
             }
             Ok(placement)
@@ -14761,6 +15242,8 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Concat { .. } => "concat",
         TensorOp::Slice { .. } => "slice",
         TensorOp::PadSlice { .. } => "pad_slice",
+        TensorOp::Gather { .. } => "gather",
+        TensorOp::ScatterAdd { .. } => "scatter_add",
         TensorOp::Broadcast { .. } => "broadcast",
     }
 }
@@ -15022,6 +15505,8 @@ fn tensor_reverse_retained_primals(
                     | TensorOp::Concat { .. }
                     | TensorOp::Slice { .. }
                     | TensorOp::PadSlice { .. }
+                    | TensorOp::Gather { .. }
+                    | TensorOp::ScatterAdd { .. }
                     | TensorOp::Broadcast { .. }
             )
         {
@@ -15294,11 +15779,35 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
             arguments[1] = *axis as u64;
             arguments[2] = *start as u64;
         }
+        TensorOp::Gather {
+            input,
+            indices,
+            axis,
+        } => {
+            arguments[0] = *input as u64;
+            arguments[1] = *axis as u64;
+            list = Some(indices.as_ref());
+        }
+        TensorOp::ScatterAdd {
+            base,
+            updates,
+            indices,
+            axis,
+        } => {
+            arguments[0] = *base as u64;
+            arguments[1] = *updates as u64;
+            arguments[2] = *axis as u64;
+            list = Some(indices.as_ref());
+        }
     }
     let argument_count = match op {
         TensorOp::Slice { .. } => 4,
-        TensorOp::Compare { .. } | TensorOp::Where { .. } | TensorOp::PadSlice { .. } => 3,
-        TensorOp::Add { .. }
+        TensorOp::Compare { .. }
+        | TensorOp::Where { .. }
+        | TensorOp::PadSlice { .. }
+        | TensorOp::ScatterAdd { .. } => 3,
+        TensorOp::Gather { .. }
+        | TensorOp::Add { .. }
         | TensorOp::Sub { .. }
         | TensorOp::Mul { .. }
         | TensorOp::Div { .. }
@@ -15685,6 +16194,26 @@ fn remap_tensor_op(
             input: remap_node(*input)?,
             axis: *axis,
             start: *start,
+        }),
+        TensorOp::Gather {
+            input,
+            indices,
+            axis,
+        } => Ok(TensorOp::Gather {
+            input: remap_node(*input)?,
+            indices: indices.clone(),
+            axis: *axis,
+        }),
+        TensorOp::ScatterAdd {
+            base,
+            updates,
+            indices,
+            axis,
+        } => Ok(TensorOp::ScatterAdd {
+            base: remap_node(*base)?,
+            updates: remap_node(*updates)?,
+            indices: indices.clone(),
+            axis: *axis,
         }),
         TensorOp::Broadcast { input } => Ok(TensorOp::Broadcast {
             input: remap_node(*input)?,
@@ -16086,6 +16615,23 @@ fn broadcast_offset(
 }
 
 /// MLIR-style tensor type; `Bool` prints as `i1` like StableHLO predicates.
+/// An index list for IR text, abbreviated after a few entries so that large
+/// gathers keep one readable line per node.
+fn format_index_list(indices: &[usize]) -> String {
+    const SHOWN: usize = 8;
+    let shown = indices
+        .iter()
+        .take(SHOWN)
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if indices.len() > SHOWN {
+        format!("[{shown}, ...] ({} total)", indices.len())
+    } else {
+        format!("[{shown}]")
+    }
+}
+
 fn format_tensor_type(shape: &[usize], dtype: TensorDType) -> String {
     let dtype = match dtype {
         TensorDType::Bool => "i1".to_string(),
