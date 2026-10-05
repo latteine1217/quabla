@@ -60,6 +60,8 @@ python tests/python/test_cholesky_native.py
 python tests/python/test_buffer_narrow_import.py
 python tests/python/test_legacy_jacobian_direction.py
 python tests/python/test_ode_api.py
+python tests/python/test_packaging_api.py
+actionlint .github/workflows/*.yml     # when a workflow changes
 ```
 
 The `quabla` package is a mixed Rust/Python project: the pure-Python
@@ -80,7 +82,18 @@ them; CI does.
 CI (`.github/workflows/ci.yml`) runs the Linux gates on every push to `main`
 and every pull request. The macOS MLX check
 (`.github/workflows/macos-mlx.yml`) runs on pull requests that touch the MLX
-backend or the Cargo manifests, and on demand.
+backend or the Cargo manifests, and on demand. The wheel build
+(`.github/workflows/wheels.yml`) runs on version tags and on demand; it
+uploads wheels as workflow artifacts and publishes nothing. To build and
+check a wheel locally, see
+[Building Wheels](README.md#building-wheels) in the README.
+
+The extension's type stub `python/quabla/_quabla.pyi` is maintained by hand.
+When an extension class or function is added or renamed, update the stub;
+`tests/python/test_packaging_api.py` fails while an exported name is
+missing from it or a typed array method does not exist at run time. The
+package version lives only in `crates/quabla-python/Cargo.toml`
+(`pyproject.toml` declares it dynamic).
 
 GPU runtime suites are opt-in through environment variables and need the
 matching hardware, so CI does not run them:

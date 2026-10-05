@@ -27,7 +27,7 @@ impl From<TensorDType> for PyDType {
 #[pymethods]
 impl PyDType {
     #[getter]
-    fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         match self.dtype {
             TensorDType::F32 => "float32",
             TensorDType::F64 => "float64",

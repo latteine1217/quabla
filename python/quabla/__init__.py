@@ -7,9 +7,10 @@
 # as an attribute and as an importable module path. Later v0.2 layers are
 # pure Python on top of these names.
 
+import importlib.metadata as _metadata
 import sys as _sys
 
-from . import _array, _errors, _ops, _quabla, _transforms
+from . import _array, _errors, _io, _ops, _quabla, _transforms
 from . import tree as tree
 # Kept out of `__all__`, so a star import does not shadow the standard
 # library module `random`.
@@ -24,6 +25,7 @@ from ._devices import ShapeDtype as ShapeDtype
 from ._devices import devices as devices
 from ._array import *  # noqa: F403
 from ._errors import *  # noqa: F403
+from ._io import *  # noqa: F403
 from ._ops import *  # noqa: F403
 
 # Re-exported as attributes but kept out of `__all__`, so a star import
@@ -41,6 +43,17 @@ from ._quabla import *  # noqa: F403
 from ._transforms import *  # noqa: F403
 
 __doc__ = _quabla.__doc__
+
+# The version of the installed distribution. The Cargo manifest of
+# `quabla-python` is the single source of truth: maturin derives the package
+# metadata version from it (`dynamic = ["version"]` in pyproject.toml), and
+# the extension carries the same string, which serves a source tree that is
+# importable without installed metadata.
+try:
+    __version__ = _metadata.version(__name__)
+except _metadata.PackageNotFoundError:
+    __version__ = _quabla.__version__
+
 # The extension's names followed by the pure-Python v0.2 layers; a new list,
 # so these additions do not mutate the extension's own `__all__`.
 __all__ = list(
@@ -48,6 +61,7 @@ __all__ = list(
         list(_quabla.__all__)
         + _array.__all__
         + _errors.__all__
+        + _io.__all__
         + _ops.__all__
         + _transforms.__all__
         + [

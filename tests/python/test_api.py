@@ -103,7 +103,8 @@ def test_dtype_reprs_are_unchanged():
     assert repr(quabla.float64) == "quabla.float64"
     assert repr(quabla.bool_) == "quabla.bool_"
     tensor = quabla.Tensor([2], [1.0, 2.0], dtype=quabla.float32)
-    assert repr(tensor) == "Tensor(shape=[2], dtype=quabla.float32)"
+    # Tensors show their values since v0.3; the dtype prints by name.
+    assert repr(tensor) == "Tensor([1., 2.], dtype=float32)"
 
 
 def requires_numpy(test):

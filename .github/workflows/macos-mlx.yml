@@ -74,3 +74,4 @@ jobs:
       - run: .venv-ci/bin/python tests/python/test_legacy_jacobian_direction.py
       - run: .venv-ci/bin/python tests/python/test_ode_api.py
       - run: .venv-ci/bin/python tests/python/test_random_api.py
+      - run: .venv-ci/bin/python tests/python/test_packaging_api.py

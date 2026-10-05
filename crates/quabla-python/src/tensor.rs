@@ -3000,14 +3000,7 @@ impl PyTensor {
     }
 
     fn __repr__(&self) -> String {
-        match self.dtype {
-            TensorDType::F64 => format!("Tensor(shape={:?})", self.shape),
-            dtype => format!(
-                "Tensor(shape={:?}, dtype={})",
-                self.shape,
-                PyDType::from(dtype).__repr__()
-            ),
-        }
+        crate::repr::tensor_repr(&self.shape, self.dtype, |index| self.data.get(index))
     }
 }
 

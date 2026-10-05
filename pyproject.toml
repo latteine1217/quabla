@@ -7,7 +7,9 @@ build-backend = "maturin"
 
 [project]
 name = "quabla"
-version = "0.2.3"
+# Taken from crates/quabla-python/Cargo.toml by maturin, so the package
+# metadata and the extension's `__version__` cannot disagree.
+dynamic = ["version"]
 description = "Rust-backed SciML runtime experiment exposed to Python"
 readme = "README.md"
 requires-python = ">=3.10"
