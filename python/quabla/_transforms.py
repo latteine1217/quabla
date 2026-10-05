@@ -1806,12 +1806,20 @@ class _Jacobian(_Transform):
         pieces = [[[] for _ in selected] for _ in traced]
         output_sizes = [_size(output.shape) for output in traced]
         output_total = sum(output_sizes)
+        # A custom_vjp call has no forward-mode rule, so its graph always
+        # uses reverse mode, as jax.jacrev would.
         reverse = (
-            0 < output_total < total
+            0 < output_total
             and all(output.dtype != bool_ for output in traced)
             and (
-                all(output.dtype == float32 for output in traced)
-                or not staged.graph._has_f32_nodes
+                staged.graph._has_reverse_only_custom_rule
+                or (
+                    output_total < total
+                    and (
+                        all(output.dtype == float32 for output in traced)
+                        or not staged.graph._has_f32_nodes
+                    )
+                )
             )
         )
         if reverse:
@@ -2099,8 +2107,8 @@ def jacobian(fun, argnums=0):
     """`fun` transformed to return its dense Jacobian: for each output leaf,
     blocks of shape `[*out.shape, *in.shape]` with the pytree structure of
     the arguments selected by `argnums`. Uses reverse mode when floating
-    output elements are fewer than selected input elements, forward mode
-    otherwise. Graphs containing F32 nodes retain forward mode for F64
+    output elements are fewer than selected input elements, or when `fun`
+    calls a `custom_vjp` function, forward mode otherwise. Graphs containing F32 nodes retain forward mode for F64
     output blocks to preserve their precision. Both directions use bounded basis batches and compose with
     other staged transforms. Direction selection can change last-bit
     rounding; it preserves shape, dtype, and pytree structure."""

@@ -62,6 +62,7 @@ python tests/python/test_legacy_jacobian_direction.py
 python tests/python/test_ode_api.py
 python tests/python/test_linalg_api.py
 python tests/python/test_packaging_api.py
+python tests/python/test_custom_api.py
 actionlint .github/workflows/*.yml     # when a workflow changes
 ```
 

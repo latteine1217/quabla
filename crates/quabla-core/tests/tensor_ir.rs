@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use quabla_core::tensor_ir::{
     CpuBackend, DynamicTensor, SymbolicCotangent, TensorBackend, TensorBufferSlot,
-    TensorCondExecutionPlan, TensorDType, TensorDeviceBackend, TensorDeviceId, TensorDeviceMesh,
-    TensorExecutionPlan, TensorForiExecutionPlan, TensorForiMultiExecutionPlan,
+    TensorCondExecutionPlan, TensorCustomRule, TensorDType, TensorDeviceBackend, TensorDeviceId,
+    TensorDeviceMesh, TensorExecutionPlan, TensorForiExecutionPlan, TensorForiMultiExecutionPlan,
     TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr, TensorNodeId, TensorPartitionSpec,
     TensorPlacement, TensorReplicaReduction, TensorScanExecutionPlan, TensorShardingPlan,
 };
@@ -11599,4 +11599,128 @@ fn while_region_requires_a_scalar_bool_predicate() {
     .map(|_| ())
     .unwrap_err();
     assert!(error.contains("scalar bool"), "{error}");
+}
+
+/// A `custom_vjp`-style rule for `x * x` whose backward graph returns
+/// `3 * g` instead of the true derivative, so a test can tell the rule
+/// from the primal derivative. The residual is the operand.
+fn custom_square_rule() -> Result<std::sync::Arc<TensorCustomRule>, String> {
+    let mut forward = TensorIr::new();
+    let x = forward.input("x", vec![2])?;
+    let square = forward.mul(x, x)?;
+    let mut backward = TensorIr::new();
+    backward.input("residual", vec![2])?;
+    let g = backward.input("g", vec![2])?;
+    let three = backward.scalar_constant(3.0);
+    let scaled = backward.mul(g, three)?;
+    Ok(std::sync::Arc::new(TensorCustomRule::new(
+        "custom_square".to_string(),
+        forward,
+        vec!["x".to_string()],
+        1,
+        vec![square, x],
+        backward,
+        vec!["residual".to_string()],
+        vec!["g".to_string()],
+        vec![Some(scaled)],
+        None,
+        false,
+    )?))
+}
+
+#[test]
+fn custom_rule_node_is_its_value_and_reverse_mode_applies_the_rule() {
+    let rule = must!(custom_square_rule());
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let value = must!(graph.mul(x, x));
+    let wrapped = must!(graph.custom(rule.clone(), &[value], &[x]));
+    let loss = must!(graph.sum(wrapped[0]));
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![2], vec![2.0, -1.0])),
+    )]);
+
+    // Plan compilation aliases the node to its value.
+    let plan = must!(graph.compile_cpu(wrapped[0]));
+    assert!(
+        !plan.lower_text().contains("custom"),
+        "{}",
+        plan.lower_text()
+    );
+    assert_eq!(
+        must!(plan.evaluate(&inputs)).data().to_vec(),
+        vec![4.0, 1.0]
+    );
+
+    let vjp = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    let gradient = vjp.gradients["x"];
+    let plan = must!(vjp.graph.compile_cpu(gradient));
+    assert_eq!(
+        must!(plan.evaluate(&inputs)).data().to_vec(),
+        vec![3.0, 3.0]
+    );
+
+    let tangents = BTreeMap::from([("x".to_string(), "dx".to_string())]);
+    let error = graph
+        .symbolic_jvp_many_with_tangent_inputs(&[loss], &tangents)
+        .err()
+        .unwrap_or_default();
+    assert!(error.contains("forward-mode differentiation"), "{error}");
+    assert!(graph.has_reverse_only_custom_rule());
+    assert_eq!(
+        must!(graph.custom_rule_name(&[loss])).as_deref(),
+        Some("custom_square")
+    );
+}
+
+#[test]
+fn custom_rule_node_batches_with_its_rule() {
+    let rule = must!(custom_square_rule());
+    let mut callee = TensorIr::new();
+    let x = must!(callee.input("x", vec![2]));
+    let value = must!(callee.mul(x, x));
+    let wrapped = must!(callee.custom(rule, &[value], &[x]));
+
+    let mut graph = TensorIr::new();
+    let xs = must!(graph.input("xs", vec![3, 2]));
+    let bindings = BTreeMap::from([("x".to_string(), (xs, true))]);
+    let batched = must!(graph.inline_batched(&callee, &bindings, 3, &wrapped));
+    assert!(batched[0].1);
+    let loss = must!(graph.sum(batched[0].0));
+    let vjp = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    let plan = must!(vjp.graph.compile_cpu(vjp.gradients["xs"]));
+    let inputs = BTreeMap::from([(
+        "xs".to_string(),
+        must!(DynamicTensor::new(
+            vec![3, 2],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        )),
+    )]);
+    assert_eq!(must!(plan.evaluate(&inputs)).data().to_vec(), vec![3.0; 6]);
+}
+
+#[test]
+fn custom_rule_rejects_mismatched_graphs() {
+    let mut forward = TensorIr::new();
+    let x = must!(forward.input("x", vec![2]));
+    let mut backward = TensorIr::new();
+    must!(backward.input("g", vec![2]));
+    let wrong = must!(backward.input("h", vec![3]));
+    let error = TensorCustomRule::new(
+        "bad".to_string(),
+        forward,
+        vec!["x".to_string()],
+        1,
+        vec![x],
+        backward,
+        vec![],
+        vec!["g".to_string()],
+        vec![Some(wrong)],
+        None,
+        false,
+    )
+    .err()
+    .unwrap_or_default();
+    assert!(error.contains("cotangent for operand 0"), "{error}");
 }

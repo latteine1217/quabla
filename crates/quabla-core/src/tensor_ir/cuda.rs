@@ -2846,10 +2846,12 @@ fn execute_cuda_device_program(
                 continue;
             }
             // Like reshape, cast and stop_gradient only copy the float buffer: both sides share
-            // the same execution dtype, and AD has already run on the IR.
+            // the same execution dtype, and AD has already run on the IR. Plan compilation
+            // aliases a custom rule node to its value, so one only reaches here unaliased.
             TensorOp::Reshape { input }
             | TensorOp::Cast { input }
-            | TensorOp::StopGradient { input } => {
+            | TensorOp::StopGradient { input }
+            | TensorOp::Custom { value: input, .. } => {
                 let (before, current_and_after) = values.split_at_mut(node_id);
                 let input = cuda_value(before, *input)?;
                 let slot = current_and_after
@@ -7639,7 +7641,8 @@ fn cuda_program_source(plan: &TensorExecutionPlan) -> Result<String, String> {
             | TensorOp::Constant { .. }
             | TensorOp::Reshape { .. }
             | TensorOp::Cast { .. }
-            | TensorOp::StopGradient { .. } => continue,
+            | TensorOp::StopGradient { .. }
+            | TensorOp::Custom { .. } => continue,
             TensorOp::ScalarConstant { value } if value.is_finite() => format!(
                 "extern \"C\" __global__ void {function}(float* out, unsigned long long count) {{\n\
                     unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
@@ -8328,6 +8331,7 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Erf { .. } => "erf",
         TensorOp::Atan2 { .. } => "atan2",
         TensorOp::StopGradient { .. } => "stop_gradient",
+        TensorOp::Custom { .. } => "custom",
         TensorOp::CumSum { .. } => "cumsum",
         TensorOp::Concat { .. } => "concat",
         TensorOp::Slice { .. } => "slice",

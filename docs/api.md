@@ -27,6 +27,7 @@ the repository root. Per-feature status and validation records are in
 - [Core API](#core-api)
   - [Arrays and NumPy](#arrays-and-numpy)
   - [Function Transforms](#function-transforms)
+  - [Custom Differentiation Rules](#custom-differentiation-rules)
   - [Pytrees](#pytrees)
   - [Random Numbers](#random-numbers)
   - [Saving and Loading](#saving-and-loading)
@@ -294,6 +295,79 @@ decorator: `@qb.jit(device="mlx", static_argnums=1)`, `@qb.grad(argnums=1)`.
   caches no longer raise `RetraceLimitError`; it remains for existing
   handlers. `quabla.RetraceWarning` (a `UserWarning`) reports an evicted
   trace.
+
+### Custom Differentiation Rules
+
+`custom_vjp`, `custom_jvp`, and `checkpoint` (alias `remat`) follow JAX:
+
+```python
+@qb.custom_vjp
+def log1pexp(x):
+    return qb.log(1.0 + qb.exp(x))
+
+def log1pexp_fwd(x):
+    return log1pexp(x), x                      # (output, residuals)
+
+def log1pexp_bwd(x, g):                        # (residuals, cotangent)
+    return (g * (1.0 - 1.0 / (1.0 + qb.exp(x))),)
+
+log1pexp.defvjp(log1pexp_fwd, log1pexp_bwd)
+
+@qb.custom_jvp
+def safe_norm(x):
+    return qb.sqrt(qb.sum(x * x))
+
+@safe_norm.defjvp
+def safe_norm_jvp(primals, tangents):
+    (x,), (t,) = primals, tangents
+    norm = safe_norm(x)
+    return norm, qb.sum(x * t) / qb.where(qb.equal(norm, 0.0), 1.0, norm)
+
+layer = qb.checkpoint(lambda h: qb.tanh(h @ w + b))
+```
+
+- `custom_vjp(fun, nondiff_argnums=())`, then `f.defvjp(fwd, bwd)`:
+  `fwd(*args)` returns `(out, residuals)` with `out` structured like
+  `fun(*args)`; `bwd(*nondiff_args, residuals, cotangent)` returns a tuple
+  with one cotangent per differentiable argument, each with that
+  argument's pytree structure, `None` for zeros. Reverse mode (`grad`,
+  `value_and_grad`, `vjp`, `jacobian`, which uses reverse mode for such
+  functions) evaluates `fwd` and `bwd`; forward mode (`jvp`) raises
+  `ValueError`, as JAX does. `bwd` is ordinary traced code, so `grad` of
+  `grad` and `hessian` (forward over reverse) differentiate it.
+- `custom_jvp(fun, nondiff_argnums=())`, then `f.defjvp(rule)` (usable as
+  a decorator): `rule(*nondiff_args, primals, tangents)` returns
+  `(primal_out, tangent_out)`, with `tangent_out` linear in `tangents`.
+  Forward mode uses the rule. Reverse mode uses its transpose, obtained by
+  differentiating `tangent_out` with respect to `tangents` at zero tangents,
+  which is exact for a linear rule; higher orders differentiate the rule.
+  The primal value is always `fun(*args)`; the rule's `primal_out` is not
+  used.
+- `checkpoint(fun, static_argnums=())`: values and derivatives of every
+  order equal those of `fun`. In reverse mode the backward pass recomputes
+  the intermediates of `fun` from its arguments and the values it closes
+  over instead of reading them from the forward pass: the compiled plan
+  contains the recomputation (plan CSE does not merge it back), so the
+  forward intermediates are not live until the backward pass. The memory
+  saving depends on the backend releasing buffers after their last use.
+- Outside any transform the wrapped function simply calls `fun`. Inside
+  one, the call is staged: the rule graphs are traced from `fwd`, `bwd`, or
+  the JVP rule (or derived from `fun` for `checkpoint`) once per call, and
+  the IR records them in `custom` nodes that the symbolic transforms apply
+  and plan compilation removes, so the result runs under `jit` on every
+  device. `vmap` batches the rules with the function, including for a
+  later reverse pass (`grad(vmap(f))`). A call of the function itself
+  inside its own `fwd`, `bwd`, or JVP rule evaluates `fun` without the
+  rule.
+- Arguments at `nondiff_argnums` (`static_argnums` for `checkpoint`) are
+  passed through unchanged and not differentiated; they must not hold
+  traced arrays. Python scalars in other arguments are constants. `fun`,
+  `fwd`, `bwd`, and the JVP rule must not close over tracers of an
+  enclosing transform (a `TypeError`); pass such values as arguments.
+  `checkpoint` may close over them and differentiates through them. Every
+  traced output must be floating-point.
+- A body of `cond`, `fori_loop`, or `scan` that calls such a
+  function raises `ValueError`, since compiled regions do not keep rules.
 
 ### Pytrees
 
@@ -1290,5 +1364,8 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
   `pinv`. Batched CUDA solves and decompositions issue one cuSOLVER call per
   batch element. Derivatives at exactly singular matrices raise instead of
   returning non-finite values.
+- `custom_vjp`, `custom_jvp`, and `checkpoint` functions cannot be called
+  inside control-flow bodies, and their rules cannot close over tracers of
+  an enclosing transform (`checkpoint` can).
   `jacobian` and `hessian` are dense: their basis constant and result grow
   quadratically with the number of input elements.
