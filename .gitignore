@@ -18,3 +18,7 @@ __pycache__/
 # macOS metadata
 .DS_Store
 ._*
+
+# Local developer artefacts that are not part of the project.
+/uv.lock
+/target-*/
