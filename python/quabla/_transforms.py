@@ -1,11 +1,12 @@
-"""Composable function transforms on the CPU (docs/api_v0_2_design.md,
-sections 3.3-3.5 and 3.11, decisions D5-D8 and D16-D17; slices S2-S4b).
+"""Composable staged function transforms (docs/api_v0_2_design.md,
+sections 3.3-3.6 and 3.11, decisions D5-D8 and D16-D17; slices S2-S5).
 
 Every transform is staged, as `jit` is: the first call with a new argument
 signature traces the function into a Tensor IR graph, applies the symbolic
 transform (reverse mode for `grad`/`value_and_grad`/`vjp`, forward mode for
 `jvp`, eligible smaller input/output basis for `jacobian`), compiles one
-multi-output CPU program, and caches it.
+multi-output program, and caches it. CPU is
+the default; an outer `jit(device=...)` selects CUDA or MLX explicitly.
 Later calls with the same signature only flatten the arguments and run the
 program. The signature is the pytree structure of the positional arguments
 plus the shape and dtype of every array leaf and the value of every static
@@ -50,9 +51,11 @@ with.
 
 import inspect
 import weakref
+import warnings
 
 from . import _quabla
 from ._array import arange, asarray, zeros
+from ._devices import ShapeDtype, require_device
 from ._errors import RetraceLimitError, UnsupportedOperationError
 from ._quabla import Tensor, TensorTraceGraph, TraceTensor, bool_, float32, float64
 from .tree import _LEAF, _describe, _flatten, _leaf_count, _leaf_paths, _unflatten
@@ -133,7 +136,9 @@ def _normalize_argnums(argnums, count, what):
     normalized = []
     for position in positions:
         if not isinstance(position, int) or isinstance(position, bool):
-            raise TypeError(f"{what} must be an int or a tuple of ints, got {argnums!r}")
+            raise TypeError(
+                f"{what} must be an int or a tuple of ints, got {argnums!r}"
+            )
         if not -count <= position < count:
             raise ValueError(
                 f"{what}={argnums!r} is out of range for a call with {count} positional arguments"
@@ -177,7 +182,7 @@ def _signature(args, static_argnums, converted_argnums):
     traced = False
     for position, leaf in enumerate(leaves):
         kind = type(leaf)
-        if kind is Tensor:
+        if kind is Tensor or kind is _Aval:
             pass
         elif kind in _STATIC_TYPES:
             key.append(_static_key(leaf))
@@ -286,7 +291,10 @@ def _parameter_names(fun, count):
     except (TypeError, ValueError):
         return names
     for index, parameter in enumerate(parameters[:count]):
-        if parameter.kind not in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD):
+        if parameter.kind not in (
+            parameter.POSITIONAL_ONLY,
+            parameter.POSITIONAL_OR_KEYWORD,
+        ):
             break
         names[index] = parameter.name
     return names
@@ -386,7 +394,9 @@ def _trace(fun, in_node, leaves, names):
         result = fun(*_unflatten(in_node, iter(values)))
         outputs = []
         out_node = _flatten(result, outputs)
-        outputs = [graph._lift(output) if _is_traced(output) else output for output in outputs]
+        outputs = [
+            graph._lift(output) if _is_traced(output) else output for output in outputs
+        ]
     finally:
         captured = graph._end_trace()
     if not captured:
@@ -416,8 +426,12 @@ def _splice(staged, bindings):
     to `bindings`, and returns its result pytree; constant results (Python
     scalars, `None`) are returned unchanged."""
     traced = [output for output in staged.outputs if _is_traced(output)]
-    spliced = iter(staged.graph._inline(staged.input_names, bindings, traced) if traced else ())
-    flat = [next(spliced) if _is_traced(output) else output for output in staged.outputs]
+    spliced = iter(
+        staged.graph._inline(staged.input_names, bindings, traced) if traced else ()
+    )
+    flat = [
+        next(spliced) if _is_traced(output) else output for output in staged.outputs
+    ]
     return _unflatten(staged.out_node, iter(flat))
 
 
@@ -447,9 +461,11 @@ class _Program:
 
     __slots__ = ("executable", "template", "out_node")
 
-    def __init__(self, graph, input_names, outputs, out_node):
+    def __init__(self, graph, input_names, outputs, out_node, target="cpu", ordinal=0):
         traced = [output for output in outputs if _is_traced(output)]
-        self.executable = graph._compile_cpu(traced, input_names) if traced else None
+        self.executable = (
+            graph._compile(traced, input_names, target, ordinal) if traced else None
+        )
         self.template = []
         index = 0
         for output in outputs:
@@ -462,7 +478,9 @@ class _Program:
 
     def run(self, inputs):
         results = self.executable(inputs) if self.executable is not None else ()
-        flat = [results[slot] if type(slot) is int else slot.value for slot in self.template]
+        flat = [
+            results[slot] if type(slot) is int else slot.value for slot in self.template
+        ]
         if self.out_node is _LEAF:
             return flat[0]
         return _unflatten(self.out_node, iter(flat))
@@ -654,7 +672,9 @@ class _Transform:
 
     def _compile(self, in_node, leaves):
         (staged,) = _compilable((self._stage(in_node, leaves, self._names(in_node)),))
-        return _Program(staged.graph, staged.input_names, staged.outputs, staged.out_node)
+        return _Program(
+            staged.graph, staged.input_names, staged.outputs, staged.out_node
+        )
 
     def _call_traced(self, args, static_argnums, converted_argnums):
         """A call on tracers of an enclosing trace: stages this transform for
@@ -706,13 +726,19 @@ def _stage_value_and_grad(staged, in_node, leaves, names, argnums, has_aux, what
     out_node = staged.out_node
     outputs = staged.outputs
     if has_aux:
-        if not (type(out_node) is tuple and out_node[0] is tuple and len(out_node[1]) == 2):
-            raise TypeError(f"{what} with has_aux=True requires fun to return a (value, aux) pair")
+        if not (
+            type(out_node) is tuple and out_node[0] is tuple and len(out_node[1]) == 2
+        ):
+            raise TypeError(
+                f"{what} with has_aux=True requires fun to return a (value, aux) pair"
+            )
         value_node, aux_node = out_node[1]
     else:
         value_node, aux_node = out_node, None
     if value_node is not _LEAF:
-        raise TypeError(f"{what} requires fun to return a single scalar array as its value")
+        raise TypeError(
+            f"{what} requires fun to return a single scalar array as its value"
+        )
     value = outputs[0]
     if not _is_traced(value):
         raise ValueError(
@@ -740,7 +766,9 @@ def _stage_value_and_grad(staged, in_node, leaves, names, argnums, has_aux, what
                 raise TypeError(
                     f"{what} cannot differentiate with respect to static argument {argnum}"
                 )
-            grad_leaves.append(None if leaf.dtype == bool_ else gradients[names[position]])
+            grad_leaves.append(
+                None if leaf.dtype == bool_ else gradients[names[position]]
+            )
     if len(argnums) == 1 and not isinstance(argnums, _Tuple):
         grads_node = in_node[1][argnums[0]]
     else:
@@ -781,11 +809,15 @@ class _ValueAndGrad(_Transform):
     def _stage(self, in_node, leaves, names):
         staged = _stage(self._fun, in_node, leaves, names)
         argnums = self._positions(len(in_node[1]))
-        graph, value, value_node, aux, aux_node, grad_leaves, grads_node = _stage_value_and_grad(
-            staged, in_node, leaves, names, argnums, self._has_aux, self._kind
+        graph, value, value_node, aux, aux_node, grad_leaves, grads_node = (
+            _stage_value_and_grad(
+                staged, in_node, leaves, names, argnums, self._has_aux, self._kind
+            )
         )
         value_part = [value] + aux
-        value_part_node = (tuple, (value_node, aux_node)) if self._has_aux else value_node
+        value_part_node = (
+            (tuple, (value_node, aux_node)) if self._has_aux else value_node
+        )
         if self._kind == "value_and_grad":
             outputs = value_part + grad_leaves
             out_node = (tuple, (value_part_node, grads_node))
@@ -795,30 +827,94 @@ class _ValueAndGrad(_Transform):
         else:
             outputs = grad_leaves
             out_node = grads_node
-        return _Staged(graph, staged.input_names, outputs, out_node, staged.captures, staged.probe)
+        return _Staged(
+            graph, staged.input_names, outputs, out_node, staged.captures, staged.probe
+        )
 
 
 class _Jit(_Transform):
     def __init__(self, fun, device, static_argnums, max_traces):
-        if device not in (None, "cpu"):
-            _check_device(device)
+        self._target, self._ordinal = require_device(device, "jit")
+        self._device = device or "cpu"
+        self._warned_precision = False
         if isinstance(static_argnums, int):
             static_argnums = (static_argnums,)
         static_argnums = tuple(static_argnums)
-        if not isinstance(max_traces, int) or isinstance(max_traces, bool) or max_traces < 1:
+        if (
+            not isinstance(max_traces, int)
+            or isinstance(max_traces, bool)
+            or max_traces < 1
+        ):
             raise ValueError(f"max_traces must be a positive int, got {max_traces!r}")
         self._max_traces = max_traces
-        super().__init__(fun, ("jit", "cpu", static_argnums, max_traces))
+        super().__init__(
+            fun, ("jit", self._target, self._ordinal, static_argnums, max_traces)
+        )
         self._static_argnums = static_argnums
         self._static_by_count = {}
 
     def _stage(self, in_node, leaves, names):
         return _stage(self._fun, in_node, leaves, names)
 
+    def _compile(self, in_node, leaves):
+        (staged,) = _compilable((self._stage(in_node, leaves, self._names(in_node)),))
+        return self._compile_staged(staged)
+
+    def _compile_staged(self, staged):
+        program = _Program(
+            staged.graph,
+            staged.input_names,
+            staged.outputs,
+            staged.out_node,
+            self._target,
+            self._ordinal,
+        )
+        if self._target != "cpu" and not self._warned_precision:
+            if any(
+                _is_traced(output) and output.dtype == float64
+                for output in staged.outputs
+            ) or any(
+                staged.graph.input(name).dtype == float64 for name in staged.input_names
+            ):
+                warnings.warn(
+                    f"{self._target} executes float64 programs as float32",
+                    UserWarning,
+                    stacklevel=3,
+                )
+                self._warned_precision = True
+        return program
+
+    def lower(self, *args):
+        """Trace without execution; ShapeDtype leaves need no host storage."""
+        abstract = []
+        node = _flatten(args, abstract)
+        args = _unflatten(
+            node,
+            iter(
+                [
+                    _Aval(list(leaf.shape), leaf.dtype)
+                    if isinstance(leaf, ShapeDtype)
+                    else leaf
+                    for leaf in abstract
+                ]
+            ),
+        )
+        statics = self._statics(len(args)) if self._static_argnums else ()
+        converted = self._converted_positions(len(args))
+        in_node, leaves, _, key, traced = _signature(args, statics, converted)
+        if traced:
+            raise TypeError(
+                "lower() requires arrays or ShapeDtype, not enclosing tracers"
+            )
+        (staged,) = _compilable((self._stage(in_node, leaves, self._names(in_node)),))
+        return _Lowered(self, staged, key, statics, converted)
+
     def _statics(self, count):
         statics = self._static_by_count.get(count)
         if statics is None:
-            statics = frozenset(_normalize_argnums(self._static_argnums, count, "static_argnums"))
+            statics = frozenset(
+                _normalize_argnums(self._static_argnums, count, "static_argnums")
+            )
             self._static_by_count[count] = statics
         return statics
 
@@ -837,18 +933,36 @@ class _Jit(_Transform):
         return self._fun(*args)
 
 
-def _check_device(device):
-    if isinstance(device, str) and (
-        device in ("cuda", "mlx") or (device.startswith("cuda:") and device[5:].isdigit())
-    ):
-        raise UnsupportedOperationError(
-            f"quabla.jit(device={device!r}) is not implemented yet: the v0.2 transforms "
-            "compile for 'cpu' only so far; use the tensor_*_cuda_fn / tensor_*_mlx_fn "
-            "helpers for device execution meanwhile",
-            op="jit",
-            device=device,
+class _Lowered:
+    """A staged ordered-output program, compiled only on explicit request."""
+
+    def __init__(self, jit, staged, key, statics, converted):
+        self.program = staged.graph._as_program(
+            [output for output in staged.outputs if _is_traced(output)]
         )
-    raise ValueError(f"device must be None, 'cpu', 'cuda', 'cuda:N', or 'mlx', got {device!r}")
+        self._jit = jit
+        self._staged = staged
+        self._key = key
+        self._statics = statics
+        self._converted = converted
+        self._compiled_program = None
+
+    def as_text(self):
+        return self.program.lower_text()
+
+    def compile(self):
+        if self._compiled_program is None:
+            self._compiled_program = self._jit._compile_staged(self._staged)
+
+        def execute(*args):
+            _, _, arrays, key, traced = _signature(args, self._statics, self._converted)
+            if traced or key != self._key:
+                raise ValueError(
+                    "compiled lower() call must match its input structure, shapes, dtypes and statics"
+                )
+            return self._compiled_program.run(arrays)
+
+        return execute
 
 
 # -- forward mode ------------------------------------------------------------------
@@ -901,18 +1015,29 @@ class _Jvp(_Transform):
         in_node, leaves, arrays, key, traced = _signature(primals, (), converted)
         tangent_leaves = []
         tangent_node = _flatten(tuple(tangents), tangent_leaves)
-        if traced or self._inlines(key) or any(_is_traced(tangent) for tangent in tangent_leaves):
+        if (
+            traced
+            or self._inlines(key)
+            or any(_is_traced(tangent) for tangent in tangent_leaves)
+        ):
             return self._jvp_traced(primals, converted, tangent_node, tangent_leaves)
         entry = self._compiled(key, lambda: self._compile(in_node, leaves))
         if entry is None:
             return self._jvp_traced(primals, converted, tangent_node, tangent_leaves)
         if tangent_node != in_node:
-            raise ValueError("jvp tangents must have the pytree structure of the primals")
+            raise ValueError(
+                "jvp tangents must have the pytree structure of the primals"
+            )
         inputs = list(arrays)
         for position in entry.tangent_positions:
             primal = leaves[position]
             inputs.append(
-                _as_like(tangent_leaves[position], primal.shape, primal.dtype, "a jvp tangent")
+                _as_like(
+                    tangent_leaves[position],
+                    primal.shape,
+                    primal.dtype,
+                    "a jvp tangent",
+                )
             )
         return entry.program.run(inputs)
 
@@ -924,18 +1049,27 @@ class _Jvp(_Transform):
             key, lambda: self._stage_jvp(in_node, leaves)
         )
         if tangent_node != in_node:
-            raise ValueError("jvp tangents must have the pytree structure of the primals")
+            raise ValueError(
+                "jvp tangents must have the pytree structure of the primals"
+            )
         bindings += captures
         for position in tangent_positions:
             primal = leaves[position]
             bindings.append(
-                _traced_like(tangent_leaves[position], primal.shape, primal.dtype, "a jvp tangent")
+                _traced_like(
+                    tangent_leaves[position],
+                    primal.shape,
+                    primal.dtype,
+                    "a jvp tangent",
+                )
             )
         return _splice(staged, bindings)
 
     def _compile(self, in_node, leaves):
         staged, tangent_positions = _compilable(self._stage_jvp(in_node, leaves))
-        program = _Program(staged.graph, staged.input_names, staged.outputs, staged.out_node)
+        program = _Program(
+            staged.graph, staged.input_names, staged.outputs, staged.out_node
+        )
         return _JvpProgram(program, tangent_positions)
 
     def _stage_jvp(self, in_node, leaves):
@@ -952,7 +1086,8 @@ class _Jvp(_Transform):
         if not tangent_positions:
             raise ValueError("jvp requires at least one floating-point primal")
         tangent_names = {
-            names[position]: _TANGENT_PREFIX + names[position] for position in tangent_positions
+            names[position]: _TANGENT_PREFIX + names[position]
+            for position in tangent_positions
         }
         traced = [output for output in staged.outputs if _is_traced(output)]
         if traced:
@@ -1016,12 +1151,16 @@ class VjpFunction:
         program = self._program
         cotangent_leaves = []
         if _flatten(cotangent, cotangent_leaves) != program.out_node:
-            raise ValueError("the cotangent must have the pytree structure of the primal output")
+            raise ValueError(
+                "the cotangent must have the pytree structure of the primal output"
+            )
         if any(_is_traced(leaf) for leaf in cotangent_leaves):
             return self._transform._traced_pullback(self._primals)(cotangent)
         inputs = list(self._arrays)
         for position, shape, dtype in program.cotangent_specs:
-            inputs.append(_as_like(cotangent_leaves[position], shape, dtype, "a vjp cotangent"))
+            inputs.append(
+                _as_like(cotangent_leaves[position], shape, dtype, "a vjp cotangent")
+            )
         return program.reverse.run(inputs)
 
     def __repr__(self):
@@ -1045,11 +1184,15 @@ class _TracedVjpFunction:
     def __call__(self, cotangent):
         cotangent_leaves = []
         if _flatten(cotangent, cotangent_leaves) != self._out_node:
-            raise ValueError("the cotangent must have the pytree structure of the primal output")
+            raise ValueError(
+                "the cotangent must have the pytree structure of the primal output"
+            )
         bindings = list(self._bindings)
         for position, shape, dtype in self._cotangent_specs:
             bindings.append(
-                _traced_like(cotangent_leaves[position], shape, dtype, "a vjp cotangent")
+                _traced_like(
+                    cotangent_leaves[position], shape, dtype, "a vjp cotangent"
+                )
             )
         return _splice(self._reverse, bindings)
 
@@ -1070,8 +1213,8 @@ class _Vjp(_Transform):
             entry = self._compiled(key, lambda: self._compile(in_node, leaves))
         if entry is None:
             in_node, leaves, key, bindings = _traced_signature(primals, (), converted)
-            (forward, reverse, cotangent_specs, out_node), captures = self._inline_staged(
-                key, lambda: self._stage_vjp(in_node, leaves)
+            (forward, reverse, cotangent_specs, out_node), captures = (
+                self._inline_staged(key, lambda: self._stage_vjp(in_node, leaves))
             )
             bindings += captures
             result = _splice(forward, bindings)
@@ -1092,13 +1235,21 @@ class _Vjp(_Transform):
         (_, reverse, cotangent_specs, out_node), captures = self._inline_staged(
             key, lambda: self._stage_vjp(in_node, leaves)
         )
-        return _TracedVjpFunction(reverse, cotangent_specs, out_node, bindings + captures)
+        return _TracedVjpFunction(
+            reverse, cotangent_specs, out_node, bindings + captures
+        )
 
     def _compile(self, in_node, leaves):
-        forward, reverse, cotangent_specs, out_node = _compilable(self._stage_vjp(in_node, leaves))
+        forward, reverse, cotangent_specs, out_node = _compilable(
+            self._stage_vjp(in_node, leaves)
+        )
         return _VjpProgram(
-            _Program(forward.graph, forward.input_names, forward.outputs, forward.out_node),
-            _Program(reverse.graph, reverse.input_names, reverse.outputs, reverse.out_node),
+            _Program(
+                forward.graph, forward.input_names, forward.outputs, forward.out_node
+            ),
+            _Program(
+                reverse.graph, reverse.input_names, reverse.outputs, reverse.out_node
+            ),
             cotangent_specs,
             out_node,
             len(in_node[1]),
@@ -1113,8 +1264,14 @@ class _Vjp(_Transform):
         staged = _stage(self._fun, in_node, leaves, names)
         out_node, outputs = staged.out_node, staged.outputs
         if self._has_aux:
-            if not (type(out_node) is tuple and out_node[0] is tuple and len(out_node[1]) == 2):
-                raise TypeError("vjp with has_aux=True requires fun to return an (out, aux) pair")
+            if not (
+                type(out_node) is tuple
+                and out_node[0] is tuple
+                and len(out_node[1]) == 2
+            ):
+                raise TypeError(
+                    "vjp with has_aux=True requires fun to return an (out, aux) pair"
+                )
             out_node = out_node[1][0]
             outputs = outputs[: _leaf_count(out_node)]
         seeded = []
@@ -1124,11 +1281,17 @@ class _Vjp(_Transform):
                 seeded.append(output)
                 cotangent_specs.append((position, output.shape, output.dtype))
         if not seeded:
-            raise ValueError("vjp requires a floating-point output computed from the primals")
-        cotangent_names = [f"{_COTANGENT_PREFIX}{index}" for index in range(len(seeded))]
+            raise ValueError(
+                "vjp requires a floating-point output computed from the primals"
+            )
+        cotangent_names = [
+            f"{_COTANGENT_PREFIX}{index}" for index in range(len(seeded))
+        ]
         graph, _, gradients = staged.graph._symbolic_vjp(seeded, cotangent_names, [])
         grad_outputs = [
-            gradients[name] if type(leaf) in _ARRAY_LEAVES and leaf.dtype != bool_ else None
+            gradients[name]
+            if type(leaf) in _ARRAY_LEAVES and leaf.dtype != bool_
+            else None
             for leaf, name in zip(leaves, names)
         ]
         reverse = _Staged(
@@ -1176,7 +1339,12 @@ def _leaf_axes(spec, node, axes, what):
             for child_spec, child in zip(spec[1], node[1]):
                 _leaf_axes(child_spec, child, axes, what)
             return
-    elif spec[0] is dict and type(node) is tuple and node[0] is dict and spec[1] == node[1]:
+    elif (
+        spec[0] is dict
+        and type(node) is tuple
+        and node[0] is dict
+        and spec[1] == node[1]
+    ):
         for child_spec, child in zip(spec[2], node[2]):
             _leaf_axes(child_spec, child, axes, what)
         return
@@ -1256,7 +1424,9 @@ class _Vmap(_Transform):
                     f"{shape[axis]} along axis {axis}, the earlier mapped leaves {batch}"
                 )
             if axis:
-                tracer = tracer.transpose([axis] + [a for a in range(len(shape)) if a != axis])
+                tracer = tracer.transpose(
+                    [axis] + [a for a in range(len(shape)) if a != axis]
+                )
             example_leaves.append(_Aval(shape[:axis] + shape[axis + 1 :], leaf.dtype))
             bound[name] = (tracer, True)
         if batch is None:
@@ -1289,7 +1459,9 @@ class _Vmap(_Transform):
                 output, mapped = next(spliced)
             outputs.append(_place_output(graph, output, mapped, out_axis, batch))
         input_names = [name for name in names if name in bound] + capture_names
-        return _Staged(graph, input_names, outputs, inner.out_node, inner.captures, inner.probe)
+        return _Staged(
+            graph, input_names, outputs, inner.out_node, inner.captures, inner.probe
+        )
 
 
 def _place_output(graph, value, mapped, out_axis, batch):
@@ -1600,7 +1772,8 @@ def value_and_grad(fun, argnums=0, has_aux=False):
     tuple giving a tuple of gradients). `fun` must return a scalar array, or
     `(scalar, aux)` with `has_aux=True`, giving `((value, aux), grads)`.
     `bool_` leaves get `None` instead of a gradient. Staged and cached per
-    argument signature (see the module notes); CPU only in this release."""
+    argument signature (see the module notes); wrap it in `jit(device=...)`
+    for device execution."""
     return _ValueAndGrad(fun, argnums, has_aux, "value_and_grad")
 
 
@@ -1621,7 +1794,7 @@ def grad(*args, **kwargs):
 def jit(*args, **kwargs):
     """`jit(fun, device=None, static_argnums=(), max_traces=8)`: `fun` traced
     and compiled on its first call per argument signature, then run from the
-    cache. `device=None` means `"cpu"`, the only device of this release.
+    cache. `device=None` means `"cpu"`; device targets are explicit.
     Arguments at `static_argnums` are static as a whole and must be hashable;
     a signature beyond `max_traces` raises `RetraceLimitError`.
 
@@ -1636,7 +1809,9 @@ def jit(*args, **kwargs):
 grad.__signature__ = inspect.signature(_new_grad)
 jit.__signature__ = inspect.signature(_new_jit)
 
-_LEGACY_GRAD_KEYWORDS = frozenset({"function", "input_specs", "values", "output_cotangent"})
+_LEGACY_GRAD_KEYWORDS = frozenset(
+    {"function", "input_specs", "values", "output_cotangent"}
+)
 
 
 def _is_input_specs(value):

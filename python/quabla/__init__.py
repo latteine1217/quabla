@@ -11,6 +11,8 @@ import sys as _sys
 
 from . import _array, _errors, _ops, _quabla, _transforms
 from . import tree as tree
+from ._devices import ShapeDtype as ShapeDtype
+from ._devices import devices as devices
 from ._array import *  # noqa: F403
 from ._errors import *  # noqa: F403
 from ._ops import *  # noqa: F403
@@ -34,8 +36,15 @@ __doc__ = _quabla.__doc__
 # so these additions do not mutate the extension's own `__all__`.
 __all__ = list(
     dict.fromkeys(
-        list(_quabla.__all__) + _array.__all__ + _errors.__all__ + _ops.__all__
+        list(_quabla.__all__)
+        + _array.__all__
+        + _errors.__all__
+        + _ops.__all__
         + _transforms.__all__
+        + [
+            "ShapeDtype",
+            "devices",
+        ]
     )
 )
 
