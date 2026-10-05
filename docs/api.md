@@ -273,6 +273,17 @@ branches and bodies may ignore operands, and `cond` branches may return
 constants of the other branch's dtype. Unsupported implicit capture raises
 `TracerError` naming `operands=`.
 
+`qb.ode.odeint(f, y0, (t0, t1), steps=n, method="rk4", args=(), save=False)`
+integrates `dy/dt = f(y, t, *args)` with `n` equal steps of classical RK4,
+Heun's method (`"heun"`), or forward Euler (`"euler"`), at times
+`t0 + i * dt` so long integrations do not drift. A traced state forms one
+`fori_loop` region (a `scan` region with `save=True`, which returns the
+`n + 1` states stacked on axis zero), so solves differentiate with respect
+to `y0`, `t0`, `t1`, and `args` and run under `jit` on every device. `y0` is
+a single array, and `f` must receive traced values through `args`, as loop
+bodies do. Adaptive step-size control needs a traced loop condition and is
+not provided.
+
 `qb.distributed.value_and_grad(fun, devices=["cuda:0", "cuda:1"], shard_argnums=(1,),
 argnums=0, reduction="mean")` is experimental single-node CUDA/NCCL execution.
 Arguments and replicated parameters may be pytrees. Full batches split equally
