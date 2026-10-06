@@ -469,6 +469,7 @@ impl CudaBackend {
         region_context: Option<&Arc<CudaContext>>,
     ) -> Result<CudaExecutionPlan<T>, String> {
         validate_cuda_plan(&plan).map_err(|(_, message)| message)?;
+        ensure_cuda_driver_available()?;
         ensure_nvrtc_runtime_available()?;
         // The fused epilogue binds only uploaded inputs and never runs `Cond` first; region plans
         // need the per-node program.
@@ -958,6 +959,14 @@ fn validate_cuda_data_parallel_devices(device_ordinals: &[usize]) -> Result<(), 
     {
         return Err("CUDA data-parallel device ordinals must be unique".to_string());
     }
+    ensure_cuda_driver_available()?;
+    // SAFETY: probing for the NCCL library only dlopens fixed sonames and drops the handles,
+    // as `ensure_cuda_driver_available` does for the driver.
+    if !unsafe { cudarc::nccl::sys::is_culib_present() } {
+        return Err(
+            "NCCL library is unavailable. Install NCCL and add the directory that provides libnccl.so to LD_LIBRARY_PATH".to_string(),
+        );
+    }
     let available = CudaContext::device_count()
         .map_err(|error| format!("failed to query CUDA device count: {error:?}"))?;
     let available = usize::try_from(available)
@@ -972,6 +981,19 @@ fn validate_cuda_data_parallel_devices(device_ordinals: &[usize]) -> Result<(), 
         ));
     }
     Ok(())
+}
+
+/// cudarc loads the CUDA driver lazily and panics when no candidate library loads. Builds with
+/// the CUDA feature, such as the published Linux wheels, also run on hosts without an NVIDIA
+/// driver, so every entry point that creates a context checks first and fails with an error.
+fn ensure_cuda_driver_available() -> Result<(), String> {
+    // SAFETY: cudarc's probe dlopens the same fixed driver sonames that `culib` loads and drops
+    // each handle immediately; it resolves no symbols and runs only the library's initializers.
+    if unsafe { cudarc::driver::sys::is_culib_present() } {
+        Ok(())
+    } else {
+        Err("CUDA driver library is unavailable. Install an NVIDIA driver that provides libcuda.so to use device=\"cuda\"".to_string())
+    }
 }
 
 fn ensure_nvrtc_runtime_available() -> Result<(), String> {
@@ -1643,6 +1665,7 @@ impl TensorBackend for CudaBackend {
         plan: &TensorExecutionPlan,
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<DynamicTensor, String> {
+        ensure_cuda_driver_available()?;
         ensure_nvrtc_runtime_available()?;
         ensure_cuda_f32_execution(plan)?;
         if let Some((lhs, rhs)) = direct_rank_two_matmul_inputs(plan)? {

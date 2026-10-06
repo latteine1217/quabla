@@ -1,12 +1,24 @@
-# Wheel builds: CPU wheels for Linux x86_64 (manylinux_2_28) and MLX wheels
-# for macOS arm64, for every supported CPython, uploaded as workflow
-# artifacts. Nothing is published: the workflow has read-only permissions and
-# no PyPI or release upload step. It runs for version tags and on demand.
+# Wheel builds and PyPI publishing for two distributions of the same `quabla`
+# import package:
 #
-# Each job installs its CPython 3.12 wheel into a fresh virtual environment
-# and runs the packaging and core API suites against it. Hosted runners have
-# no usable Metal device, so the MLX backend of the macOS wheel is built and
-# packaged here but only exercised on Apple silicon hosts.
+# - `quabla`: Linux x86_64 wheels (manylinux_2_28) with the CPU and CUDA
+#   (+NCCL) backends, macOS arm64 CPU wheels, and the source distribution.
+#   CUDA libraries are loaded at run time, so the Linux wheel installs and runs
+#   on CPU-only hosts and reports a missing driver when CUDA is requested.
+# - `quabla-mlx`: macOS arm64 wheels with the CPU and MLX backends, bundling
+#   MLX's Metal kernels. It replaces `quabla` rather than extending it; the
+#   two distributions must not be installed into the same environment.
+#
+# Every CPython listed in `-i` gets a wheel. Each job installs its CPython 3.12
+# wheel into a fresh virtual environment and runs the packaging and core API
+# suites against it. Hosted runners have no NVIDIA driver and no usable Metal
+# device, so the GPU backends are built and packaged here but only exercised on
+# GPU hosts.
+#
+# Publishing uses PyPI trusted publishing (OIDC); no API token is stored. A
+# version tag publishes to TestPyPI and then to PyPI, and a manual run can
+# publish to TestPyPI only. Each upload waits for approval in its GitHub
+# environment (`testpypi`, `pypi`).
 #
 # No build cache on purpose: release artifacts are built from a clean state.
 name: Wheels
@@ -15,10 +27,15 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      testpypi:
+        description: Publish the built distributions to TestPyPI
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -29,21 +46,23 @@ env:
 
 jobs:
   linux:
-    name: linux x86_64 (manylinux_2_28, cpu)
+    name: quabla linux x86_64 (manylinux_2_28, cpu + cuda)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Builds inside the official manylinux_2_28 image, which carries every
-      # CPython and in which maturin checks and repairs the platform tag.
+      # CPython and in which maturin checks and repairs the platform tag. The
+      # image has no CUDA toolkit; cudarc then loads every CUDA library at run
+      # time, so the wheel links none of them.
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           maturin-version: v1.15.0
           target: x86_64
           manylinux: "2_28"
           args: >-
-            --release --out dist
-            -i python3.10 python3.11 python3.12 python3.13
+            --release --features cuda-nccl --out dist
+            -i python3.10 python3.11 python3.12 python3.13 python3.14
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
@@ -53,21 +72,35 @@ jobs:
           .venv-wheel/bin/python -m pip install dist/*-cp312-*.whl
           .venv-wheel/bin/python tests/python/test_packaging_api.py
           .venv-wheel/bin/python tests/python/test_api.py
+      # A CUDA request on a host without a driver must raise an ordinary
+      # error; a Rust panic surfaces as a BaseException that `except
+      # Exception` does not catch.
+      - name: Check CUDA without a driver
+        run: |
+          .venv-wheel/bin/python - <<'EOF'
+          import quabla as qb
+          assert qb.devices() == ["cpu", "cuda"], qb.devices()
+          try:
+              qb.jit(lambda x: x * 2.0, device="cuda")(qb.array([1.0], dtype=qb.float32))
+          except Exception as error:
+              assert "CUDA driver library is unavailable" in str(error), error
+          else:
+              raise AssertionError("CUDA ran on a host without an NVIDIA driver")
+          EOF
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wheels-linux-x86_64
+          name: dist-linux-x86_64
           path: dist/*.whl
           if-no-files-found: error
 
   macos:
-    name: macos arm64 (mlx)
+    name: quabla macos arm64 (cpu)
     runs-on: macos-15
-    # A cold build compiles MLX C++ from source through mlx-rs (cmake).
-    timeout-minutes: 90
+    timeout-minutes: 45
     env:
-      # MLX needs macOS 14; the deployment target also sets the wheel's
-      # platform tag, so pip refuses the wheel on older systems.
-      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      # The CPU build has no macOS 14 requirement; 11.0 is the first macOS
+      # release on Apple silicon.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Pinned to a master commit (the stable branch is not in master's
@@ -83,7 +116,60 @@ jobs:
             3.10
             3.11
             3.13
+            3.14
             3.12
+      - name: Build wheels
+        run: |
+          python -m pip install 'maturin==1.15.0'
+          python -m maturin build --release --out dist \
+            -i python3.10 python3.11 python3.12 python3.13 python3.14
+      - name: Test the cp312 wheel
+        run: |
+          python -m venv .venv-wheel
+          .venv-wheel/bin/python -m pip install dist/*-cp312-*.whl
+          .venv-wheel/bin/python -c "import quabla; assert quabla.devices() == ['cpu'], quabla.devices()"
+          .venv-wheel/bin/python tests/python/test_packaging_api.py
+          .venv-wheel/bin/python tests/python/test_api.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-macos-arm64
+          path: dist/*.whl
+          if-no-files-found: error
+
+  macos-mlx:
+    name: quabla-mlx macos arm64 (cpu + mlx)
+    runs-on: macos-15
+    # A cold build compiles MLX C++ from source through mlx-rs (cmake).
+    timeout-minutes: 90
+    env:
+      # MLX needs macOS 14; the deployment target also sets the wheel's
+      # platform tag, so pip refuses the wheel on older systems.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: |
+            3.10
+            3.11
+            3.13
+            3.14
+            3.12
+      # The variant shares pyproject.toml with `quabla`: only the distribution
+      # name changes, and the MLX license notice joins the license files
+      # because MLX is compiled into the extension. The greps fail the job if
+      # either rewrite stops matching.
+      - name: Rename the distribution
+        run: |
+          sed -i '' \
+            -e 's/^name = "quabla"$/name = "quabla-mlx"/' \
+            -e 's|^license-files = \["LICENSE-MIT", "LICENSE-APACHE"\]$|license-files = ["LICENSE-MIT", "LICENSE-APACHE", "licenses/MLX.txt"]|' \
+            pyproject.toml
+          grep -qx 'name = "quabla-mlx"' pyproject.toml
+          grep -q '"licenses/MLX.txt"' pyproject.toml
       # MLX loads its Metal kernels from an `mlx.metallib` next to the binary
       # that links it, before its compiled-in build path, which does not exist
       # on users' machines. The first build makes mlx-sys write the metallib
@@ -96,16 +182,93 @@ jobs:
           cp "$MLX_RS_METAL_PATH/mlx.metallib" python/quabla/
           python -m pip install 'maturin==1.15.0'
           python -m maturin build --release --features mlx --out dist \
-            -i python3.10 python3.11 python3.12 python3.13
+            -i python3.10 python3.11 python3.12 python3.13 python3.14
       - name: Test the cp312 wheel
         run: |
           python -m venv .venv-wheel
           .venv-wheel/bin/python -m pip install dist/*-cp312-*.whl
-          .venv-wheel/bin/python -c "import pathlib, quabla; assert (pathlib.Path(quabla.__file__).parent / 'mlx.metallib').is_file()"
+          .venv-wheel/bin/python - <<'EOF'
+          import importlib.metadata, pathlib, quabla
+          assert (pathlib.Path(quabla.__file__).parent / "mlx.metallib").is_file()
+          assert quabla.devices() == ["cpu", "mlx"], quabla.devices()
+          dist = importlib.metadata.distribution("quabla-mlx")
+          assert dist.version == quabla.__version__, (dist.version, quabla.__version__)
+          assert any(f.name == "MLX.txt" for f in dist.files), "MLX license notice missing"
+          EOF
           .venv-wheel/bin/python tests/python/test_packaging_api.py
           .venv-wheel/bin/python tests/python/test_api.py
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wheels-macos-arm64
+          name: dist-macos-arm64-mlx
           path: dist/*.whl
           if-no-files-found: error
+
+  sdist:
+    name: quabla sdist
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # Installing from the sdist proves that it carries the whole workspace
+      # the extension needs; a source build enables no GPU feature.
+      - name: Build and install the sdist
+        run: |
+          python -m pip install 'maturin==1.15.0'
+          python -m maturin sdist --out dist
+          python -m venv .venv-sdist
+          .venv-sdist/bin/python -m pip install dist/*.tar.gz
+          .venv-sdist/bin/python tests/python/test_packaging_api.py
+          .venv-sdist/bin/python tests/python/test_api.py
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # One upload covers both distributions: the OIDC token is scoped to every
+  # project whose trusted publisher names this workflow and environment.
+  publish-testpypi:
+    name: publish to TestPyPI
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.testpypi
+    needs: [linux, macos, macos-mlx, sdist]
+    runs-on: ubuntu-24.04
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/quabla/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # Manual runs may repeat a version that TestPyPI already holds.
+          skip-existing: true
+
+  publish-pypi:
+    name: publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [publish-testpypi]
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/quabla/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

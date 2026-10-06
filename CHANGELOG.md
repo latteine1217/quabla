@@ -9,6 +9,21 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Added
+
+- PyPI distributions built by the `Wheels` workflow: `quabla` (Linux x86_64
+  wheels with the CPU and CUDA + NCCL backends, macOS arm64 CPU wheels, and
+  the source distribution) and `quabla-mlx` (macOS arm64 wheels with the CPU
+  and MLX backends). Both provide the `quabla` package; install one per
+  environment. Wheels cover CPython 3.10 to 3.14. Version tags publish to
+  TestPyPI and then PyPI through trusted publishing.
+
+### Fixed
+
+- A CUDA request on a host without the NVIDIA driver library, or a
+  data-parallel request without NCCL, raises an error naming the missing
+  library instead of a Rust panic.
+
 ## [0.3.0] - 2026-10-06
 
 The JAX-ecosystem gaps of the v0.3 plan in `docs/jax_like_roadmap.md`:

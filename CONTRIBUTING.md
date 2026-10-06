@@ -85,9 +85,11 @@ CI (`.github/workflows/ci.yml`) runs the Linux gates on every push to `main`
 and every pull request. The macOS MLX check
 (`.github/workflows/macos-mlx.yml`) runs on pull requests that touch the MLX
 backend or the Cargo manifests, and on demand. The wheel build
-(`.github/workflows/wheels.yml`) runs on version tags and on demand; it
-uploads wheels as workflow artifacts and publishes nothing. To build and
-check a wheel locally, see
+(`.github/workflows/wheels.yml`) runs on version tags and on demand. It
+builds the `quabla` and `quabla-mlx` distributions; a version tag then
+publishes them to TestPyPI and PyPI, each upload waiting for approval in the
+`testpypi` or `pypi` GitHub environment, and a manual run can publish to
+TestPyPI only. To build and check a wheel locally, see
 [Building Wheels](README.md#building-wheels) in the README.
 
 The extension's type stub `python/quabla/_quabla.pyi` is maintained by hand.

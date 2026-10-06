@@ -6,7 +6,7 @@ traced program on CPU, CUDA, and Apple silicon.**
 
 [![CI](https://github.com/latteine1217/quabla/actions/workflows/ci.yml/badge.svg)](https://github.com/latteine1217/quabla/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation-from-source)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation)
 [![Release v0.3.0](https://img.shields.io/badge/release-v0.3.0-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.3.0)
 
 ![A tanh MLP trained with Quabla matches the exact solution of a 1D Poisson problem; its training loss falls from about 50 to 2.5e-4.](docs/assets/pinn_poisson.png)
@@ -127,6 +127,23 @@ length at least 256, with bounded shared memory and no global scratch buffer.
 GPU results are checked with absolute and relative tolerances of `1e-5`;
 finite CPU derivative results use `1e-12`.
 
+## Installation
+
+```sh
+pip install quabla       # Linux x86_64: CPU + CUDA; macOS arm64: CPU
+pip install quabla-mlx   # macOS 14+ on Apple silicon: CPU + MLX
+```
+
+Both distributions provide the same `quabla` package, so install one of them
+per environment and uninstall it before switching to the other. Wheels cover
+CPython 3.10 to 3.14; on other platforms pip builds the source distribution,
+which needs a Rust toolchain and enables the CPU backend only.
+
+The Linux wheel does not bundle CUDA. The CPU backend works on any host, and
+`device="cuda"` needs an NVIDIA driver and the CUDA libraries listed under
+CUDA builds below; without them it raises an error naming the missing
+library.
+
 ## Installation From Source
 
 Prerequisites:
@@ -186,9 +203,12 @@ MACOSX_DEPLOYMENT_TARGET=14.0 maturin build --release --features mlx
 ```
 
 The `Wheels` workflow ([.github/workflows/wheels.yml](.github/workflows/wheels.yml))
-builds CPU wheels for Linux x86_64 (manylinux_2_28) and MLX wheels for
-macOS arm64, for CPython 3.10 to 3.13, on version tags and on demand, and
-keeps them as workflow artifacts. They are not published to PyPI.
+builds the published distributions for CPython 3.10 to 3.14: `quabla` wheels
+for Linux x86_64 (manylinux_2_28, `cuda-nccl` features) and macOS arm64 (CPU),
+the `quabla` source distribution, and `quabla-mlx` wheels for macOS arm64
+(`mlx` feature). Version tags publish them to TestPyPI and then PyPI through
+trusted publishing, each upload after approval; a manual run builds them and
+can publish to TestPyPI only.
 
 ## Quickstart
 

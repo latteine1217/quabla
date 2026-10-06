@@ -23,11 +23,10 @@ with a native `log1p`, NaN-propagating `max`/`maximum`/`relu`, native
 | 8 | Linear algebra | Done: batched `solve`, `qb.linalg` with `slogdet`/`det`/`inv`/`cho_solve`/`eigh`/`qr`/`svd`/`lstsq` (CPU and CUDA; MLX rejects them) |
 | 9 | `custom_vjp`/`custom_jvp`, `checkpoint`, `jit` keywords | Done; custom rules cannot run inside control-flow bodies |
 | 10 | Native `float64` on CUDA | Done as opt-in `jit(..., precision="float64")`; `Trainer` and NCCL stay `float32` |
-| 11 | Packaging and tooling | Done except publishing: `__version__`, value `repr`, `save`/`load`, type stubs, wheel workflow (never run on GitHub yet; no PyPI) |
+| 11 | Packaging and tooling | Done: `__version__`, value `repr`, `save`/`load`, type stubs, wheel workflow; PyPI publishing of `quabla` and `quabla-mlx` added after v0.3.0 |
 
-All items shipped in v0.3.0. Open follow-ups: publishing wheels to PyPI
-(the wheel workflow builds artifacts only), a CUDA HVP fallback for Scan
-bodies that are not elementwise, caching to cut the per-iteration cost of
+All items shipped in v0.3.0. Open follow-ups: the first PyPI upload, a CUDA
+HVP fallback for Scan bodies that are not elementwise, caching to cut the per-iteration cost of
 host-driven CUDA loops, and `float64` for the device `Trainer`.
 
 Decisions taken by the owner on 2026-10-06 and implemented:
