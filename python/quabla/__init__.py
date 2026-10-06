@@ -10,7 +10,7 @@
 import importlib.metadata as _metadata
 import sys as _sys
 
-from . import _array, _custom, _errors, _io, _ops, _quabla, _transforms
+from . import _array, _custom, _errors, _io, _newton, _ops, _quabla, _transforms
 from . import tree as tree
 # Kept out of `__all__`, so a star import does not shadow the standard
 # library module `random`.
@@ -27,6 +27,7 @@ from ._devices import devices as devices
 from ._array import *  # noqa: F403
 from ._errors import *  # noqa: F403
 from ._io import *  # noqa: F403
+from ._newton import *  # noqa: F403
 from ._ops import *  # noqa: F403
 
 # Re-exported as attributes but kept out of `__all__`, so a star import
@@ -69,6 +70,7 @@ __all__ = list(
         + _array.__all__
         + _errors.__all__
         + _io.__all__
+        + _newton.__all__
         + _ops.__all__
         + _transforms.__all__
         + _custom.__all__

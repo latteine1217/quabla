@@ -1,6 +1,5 @@
 """Iterative and implicit solvers: linalg.cg, linalg.gmres, and the Newton
-root finder `newton` (private in `quabla._newton` until its public home is
-chosen).
+root finder `quabla.newton`.
 
 Solutions are checked against the dense `linalg.solve` and closed forms;
 derivatives against the derivatives of the dense solve, analytic
@@ -12,7 +11,7 @@ import math
 import os
 
 import quabla as qb
-from quabla._newton import newton
+from quabla import newton
 
 
 def raises(kind, function, *args, match=None, **kwargs):

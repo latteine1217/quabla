@@ -901,6 +901,35 @@ with linearly dependent rows, can leave a pivot of rounding size, and is
 then solved with huge values instead of raising; LAPACK's float32 rounding
 can do so where the CPU's float64 elimination finds an exact zero.
 
+Iterative and implicit solvers take functions instead of matrices:
+
+- `qb.linalg.cg(matvec, b, *, args=(), x0=None, tol=1e-5, atol=0.0,
+  maxiter=None, M=None, info=False)` solves `matvec(x, *args) = b` for a
+  symmetric positive-definite operator by preconditioned conjugate
+  gradients (`M(r, *args)` applies the preconditioner).
+- `qb.linalg.gmres(matvec, b, *, args=(), x0=None, tol=1e-5, atol=0.0,
+  restart=20, maxiter=None, M=None, info=False)` solves a general operator
+  by restarted, right-preconditioned GMRES with a twice-applied classical
+  Gram-Schmidt Arnoldi process and Givens rotations.
+- `qb.newton(f, x0, *, args=(), tol=None, maxiter=50, info=False)` finds a
+  root of `f(x, *args) = 0` by Newton's method with a dense Jacobian,
+  Householder QR steps, and an Armijo backtracking line search on
+  `||f||^2`; `tol` defaults to the square root of the dtype's machine
+  epsilon. An exactly singular Jacobian stops the iteration with failure.
+
+Each runs eagerly in Python or, under `jit`, as one `while_loop` region that
+stops at convergence (`||b - A x|| <= max(tol * ||b||, atol)` for the linear
+solvers, `||dx|| <= tol * (1 + ||x||)` for `newton`). Derivatives with
+respect to `b` and the array leaves of `args` follow the implicit function
+theorem at the solution, one adjoint solve, instead of differentiating the
+iterations; `x0` gets no gradient. Pass every array the operator depends on
+through `args`: values a Python function closes over are not differentiated.
+Reverse mode composes twice (`grad(grad(...))`); forward mode and `vmap`
+of a solution are not supported, and a solve cannot run inside a `cond`,
+`fori_loop`, or `scan` body. An eager solve that does not converge raises
+`RuntimeError`; `info=True` returns `(x, info)` with `"iterations"`,
+`"residual_norm"`, and `"success"`, the only report under `jit`.
+
 `qb.ode.odeint(f, y0, (t0, t1), steps=n, method="rk4", args=(), save=False, saveat=None)`
 integrates `dy/dt = f(y, t, *args)` with `n` equal steps of classical RK4,
 Heun's method (`"heun"`), or forward Euler (`"euler"`), at times

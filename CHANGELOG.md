@@ -26,9 +26,14 @@ deprecated names keep working until 1.0 (see
   the iterations; reverse mode composes twice. `info=True` returns the
   iteration count, true residual norm, and success flag; an eager solve that
   does not converge raises `RuntimeError` otherwise.
-- A Newton root finder with a backtracking line search and
-  implicit-function-theorem gradients, not yet exported while its public
-  location is decided.
+- `quabla.newton(f, x0, *, args=(), tol=None, maxiter=50, info=False)`:
+  Newton's method for `f(x, *args) = 0` with a dense Jacobian, Householder
+  QR steps, and an Armijo backtracking line search on `||f||^2`, run as one
+  `while_loop` region under `jit`. Gradients with respect to the arrays in
+  `args` follow the implicit function theorem at the root; reverse mode
+  composes twice. An exactly singular Jacobian stops with failure instead of
+  raising; `info=True` returns the iteration count, residual norm, and
+  success flag.
 - `quabla.ode.odeint(method="rosenbrock23")`: the adaptive, L-stable
   Rosenbrock 2(3) method of Shampine and Reichelt (MATLAB's ode23s) for
   stiff problems. It forms `df/dy` and `df/dt` by one batched forward-mode

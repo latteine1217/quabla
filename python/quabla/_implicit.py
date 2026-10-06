@@ -1,5 +1,5 @@
 """Implicit-function-theorem derivatives for the iterative solvers
-(`linalg.cg`, `linalg.gmres`, and the Newton root finder `_newton.newton`).
+(`linalg.cg`, `linalg.gmres`, and the Newton root finder `newton`).
 
 A solver iterates in a `while_loop`, which has no reverse mode, and the
 derivative of the iterations is not the derivative of the solution anyway:
