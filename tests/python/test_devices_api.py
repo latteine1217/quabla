@@ -315,6 +315,135 @@ def test_device_expm1_erf_erfc_atan2_stop_gradient_cumsum_and_prod_match_cpu():
         print("SKIP device new-op parity: GPU gates unset")
 
 
+def same_or_close(actual, expected, tolerance):
+    """Entrywise: NaN matches NaN, infinities and zeros match exactly, and
+    other values agree within `tolerance` relative to the expected value.
+    Returns the largest relative difference seen."""
+    assert actual.shape == expected.shape, (actual.shape, expected.shape)
+    worst = 0.0
+    for x, y in zip(actual.to_flat_list(), expected.to_flat_list()):
+        if math.isnan(y) or math.isinf(y) or y == 0.0:
+            assert x == y or (math.isnan(x) and math.isnan(y)), (x, y)
+            continue
+        worst = max(worst, abs(x - y) / abs(y))
+        assert abs(x - y) <= tolerance * abs(y), (x, y, tolerance)
+    return worst
+
+
+# Inputs per function: interior points plus domain edges, poles, values
+# outside the domain (NaN), large magnitudes, and halfway points for round.
+# Metal flushes float32 subnormals to zero, so no input or derivative here
+# is subnormal.
+DEVICE_UNARY_MATH_POINTS = {
+    "tan": [-1.5, -0.7, -1e-3, 0.0, 0.4, 1.2, 3.0, 20.0],
+    "arcsin": [-1.0, -0.999, -0.5, -1e-4, 0.0, 0.3, 0.97, 1.0, 1.5],
+    "arccos": [-1.0, -0.999, -0.5, -1e-4, 0.0, 0.3, 0.97, 1.0, -1.5],
+    "arctan": [-1e30, -40.0, -1.0, -1e-4, 0.0, 0.5, 3.0, 1e30],
+    "sinh": [-89.0, -10.0, -1.0, -1e-4, 0.0, 0.5, 3.0, 89.0, 100.0],
+    "cosh": [-89.0, -10.0, -1.0, -1e-4, 0.0, 0.5, 3.0, 89.0, -100.0],
+    "arcsinh": [-1e30, -40.0, -1.0, -1e-4, 0.0, 0.5, 3.0, 1e30],
+    "arccosh": [1.0, 1.0001, 1.5, 2.0, 10.0, 1e30, 0.5],
+    "arctanh": [-1.0, -0.999, -0.5, -1e-4, 0.0, 0.3, 0.97, 1.0, 2.0],
+    "log2": [0.0, 1e-30, 0.3, 1.0, 2.0, 1024.0, 1e30, -1.0],
+    "log10": [0.0, 1e-30, 0.3, 1.0, 10.0, 1e10, 1e30, -1.0],
+    "cbrt": [-3e38, -27.0, -2.0, -1e-30, -0.0, 0.0, 1e-30, 0.3, 8.0, 3e38],
+    "floor": [-2.5, -1.5, -0.5, -0.0, 0.0, 0.5, 1.5, 2.5, 1e30],
+    "ceil": [-2.5, -1.5, -0.5, -0.0, 0.0, 0.5, 1.5, 2.5, 1e30],
+    "round": [-3.5, -2.5, -1.5, -0.5, -0.0, 0.5, 1.5, 2.5, 3.5, 0.49999997],
+}
+
+
+def test_device_unary_math_fmod_and_mod_match_cpu():
+    ran = False
+    for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
+        if os.environ.get(gate) != "1":
+            continue
+        assert device in qb.devices(), f"{gate} requested but target not built"
+        ran = True
+        for name, points in DEVICE_UNARY_MATH_POINTS.items():
+            function = getattr(qb, name)
+            x = qb.array(points, dtype=qb.float32)
+            # The device float32 math functions are within a few ulp of the
+            # correctly rounded CPU values (the MLX cbrt is power plus a
+            # Newton step); floor, ceil and round are exact.
+            same_or_close(qb.jit(function, device=device)(x), qb.jit(function)(x), 1e-6)
+
+            # Derivatives inside the domain, where they are finite.
+            interior = qb.array(
+                [p for p in points if math.isfinite(qb.jit(qb.grad(function))(qb.array(p)).item())],
+                dtype=qb.float32,
+            )
+
+            def total(t, f=function):
+                return qb.sum(f(t) * t)
+
+            same_or_close(
+                qb.jit(qb.grad(total), device=device)(interior),
+                qb.jit(qb.grad(total))(interior),
+                4e-6,
+            )
+        # Second derivatives, a fused elementwise chain, and vmap.
+        point = qb.array([0.3, -0.6], dtype=qb.float32)
+
+        def chain(p):
+            return qb.sum(
+                qb.tan(p) * qb.arcsinh(3.0 * p) + qb.arctanh(p) * qb.cbrt(p - 2.0)
+                + qb.cosh(p) / qb.arccosh(2.0 - p) + qb.log2(p * p + 1.0) * qb.arcsin(p)
+                + qb.sinh(p) * qb.arccos(p) * qb.log10(3.0 + p) + qb.arctan(p) * qb.round(4.0 * p)
+            )
+
+        same_or_close(
+            qb.jit(qb.hessian(chain), device=device)(point),
+            qb.jit(qb.hessian(chain))(point),
+            4e-6,
+        )
+        batch = qb.array([[0.1, -0.2, 0.3], [0.4, -0.5, 0.6]], dtype=qb.float32)
+        per_row = qb.vmap(qb.grad(chain))
+        same_or_close(qb.jit(per_row, device=device)(batch), qb.jit(per_row)(batch), 4e-6)
+        # Elementwise loop bodies lower the new ops too.
+
+        def loop(v):
+            return qb.sum(
+                qb.fori_loop(
+                    0,
+                    5,
+                    lambda i, c: qb.arctan(c) + qb.fmod(c, 0.7) * qb.cosh(0.1 * c) + qb.cbrt(c),
+                    v,
+                )
+            )
+
+        start = qb.array([0.3, -1.2, 2.5], dtype=qb.float32)
+        for function in (loop, qb.grad(loop)):
+            same_or_close(qb.jit(function, device=device)(start), qb.jit(function)(start), 4e-6)
+
+        # fmod and mod are exact everywhere (CUDA fmodf; MLX composes fmod
+        # from its exact floor-mod `remainder` of the magnitudes), so the
+        # device matches the CPU bitwise, including signed zeros.
+        numerators = [5.5, -5.5, 6.0, -6.0, 0.0, -0.0, 1e-30, -1e-30, 3e30, math.inf, math.nan]
+        divisors = [2.0, -2.0, 0.1, -0.1, 3.0, math.inf, -math.inf, 0.0]
+        xs = qb.array([a for a in numerators for _ in divisors], dtype=qb.float32)
+        ys = qb.array([b for _ in numerators for b in divisors], dtype=qb.float32)
+        for function in (qb.fmod, qb.mod):
+            actual = qb.jit(function, device=device)(xs, ys).tolist()
+            expected = qb.jit(function)(xs, ys).tolist()
+            for got, want, pair in zip(actual, expected, zip(xs.tolist(), ys.tolist())):
+                if math.isnan(want):
+                    assert math.isnan(got), (device, function, pair, got)
+                else:
+                    assert got == want, (device, function, pair, got, want)
+                    assert math.copysign(1.0, got) == math.copysign(1.0, want), (pair, got)
+            gradient = qb.grad(lambda a, b, f=function: qb.sum(f(a, b) * a), argnums=(0, 1))
+            finite_x = qb.array([5.5, -5.5, 7.25, -0.3], dtype=qb.float32)
+            finite_y = qb.array([2.0, 2.0, -3.0, 0.1], dtype=qb.float32)
+            for got, want in zip(
+                qb.jit(gradient, device=device)(finite_x, finite_y),
+                qb.jit(gradient)(finite_x, finite_y),
+            ):
+                same_or_close(got, want, 4e-6)
+    if not ran:
+        print("SKIP device unary math parity: GPU gates unset")
+
+
 def test_jit_precision_argument():
     raises(ValueError, qb.jit, lambda x: x, precision="float16")
     raises(ValueError, qb.jit, lambda x: x, device="cpu", precision="float32")
@@ -371,6 +500,32 @@ def test_cuda_float64_precision_matches_cpu():
         "elementwise",
         lambda a, b: qb.exp(a) + qb.log(a) * qb.erf(b) + qb.erfc(b) + qb.log1p(a)
         + qb.expm1(b) + qb.tanh(b) * qb.sin(a) + a**b + qb.atan2(b, a) + qb.sqrt(a),
+        x,
+        y,
+    )
+    unary_math = [
+        lambda a, b: qb.tan(b),
+        lambda a, b: qb.arcsin(a - 1.0),
+        lambda a, b: qb.arccos(a - 1.0),
+        lambda a, b: qb.arctan(b),
+        lambda a, b: qb.sinh(b),
+        lambda a, b: qb.cosh(b),
+        lambda a, b: qb.arcsinh(b),
+        lambda a, b: qb.arccosh(a + 1.0),
+        lambda a, b: qb.arctanh(a - 1.0),
+        lambda a, b: qb.log2(a),
+        lambda a, b: qb.log10(a),
+        lambda a, b: qb.cbrt(b),
+        lambda a, b: qb.floor(3.0 * b),
+        lambda a, b: qb.ceil(3.0 * b),
+        lambda a, b: qb.round(3.0 * b),
+        lambda a, b: qb.fmod(b, a),
+        lambda a, b: qb.mod(b, a - 1.0),
+    ]
+    compare("unary math", lambda a, b: tuple(f(a, b) for f in unary_math), x, y)
+    compare(
+        "unary math gradient",
+        qb.grad(lambda a, b: qb.sum(sum(f(a, b) * a for f in unary_math)), argnums=(0, 1)),
         x,
         y,
     )

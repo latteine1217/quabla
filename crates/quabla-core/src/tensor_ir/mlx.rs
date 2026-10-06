@@ -17,6 +17,7 @@ use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 use super::{
     sqrt_derivative_coefficient, DynamicTensor, TensorBackend, TensorComparison, TensorConstant,
     TensorDType, TensorDeviceBackend, TensorExecutionPlan, TensorForiExecutionPlan, TensorOp,
+    UnaryMathKind,
 };
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
@@ -1061,6 +1062,14 @@ impl MlxBackend {
                 }
                 TensorOp::Atan2 { y, x } => {
                     ops::atan2_device(mlx_value(&values, *y)?, mlx_value(&values, *x)?, &stream)
+                        .map_err(|error| error.to_string())
+                }
+                TensorOp::UnaryMath { input, kind } => {
+                    mlx_unary_math(mlx_value(&values, *input)?, *kind, &stream)
+                        .map_err(|error| error.to_string())
+                }
+                TensorOp::Fmod { x, y } => {
+                    mlx_fmod(mlx_value(&values, *x)?, mlx_value(&values, *y)?, &stream)
                         .map_err(|error| error.to_string())
                 }
                 // AD happens on the IR before lowering, so the value is all
@@ -2186,6 +2195,98 @@ fn mlx_erfc(input: &Array, stream: &StreamOrDevice) -> Result<Array, mlx_rs::err
     ops::r#where_device(&negative, &reflected, &positive, stream)
 }
 
+/// `kind(input)` with MLX's own op for every kind except `cbrt`, which MLX
+/// lacks (see [`mlx_cbrt`]). The MLX kernels are compiled without fast math
+/// and call Metal's `precise` transcendental functions; `round` is Metal's
+/// `rint`, halfway cases to even.
+fn mlx_unary_math(
+    input: &Array,
+    kind: UnaryMathKind,
+    stream: &StreamOrDevice,
+) -> Result<Array, mlx_rs::error::Exception> {
+    match kind {
+        UnaryMathKind::Tan => ops::tan_device(input, stream),
+        UnaryMathKind::Arcsin => ops::asin_device(input, stream),
+        UnaryMathKind::Arccos => ops::acos_device(input, stream),
+        UnaryMathKind::Arctan => ops::atan_device(input, stream),
+        UnaryMathKind::Sinh => ops::sinh_device(input, stream),
+        UnaryMathKind::Cosh => ops::cosh_device(input, stream),
+        UnaryMathKind::Arcsinh => ops::asinh_device(input, stream),
+        UnaryMathKind::Arccosh => ops::acosh_device(input, stream),
+        UnaryMathKind::Arctanh => ops::atanh_device(input, stream),
+        UnaryMathKind::Log2 => input.log2_device(stream),
+        UnaryMathKind::Log10 => input.log10_device(stream),
+        UnaryMathKind::Cbrt => mlx_cbrt(input, stream),
+        UnaryMathKind::Floor => input.floor_device(stream),
+        UnaryMathKind::Ceil => ops::ceil_device(input, stream),
+        UnaryMathKind::Round => ops::round_device(input, 0, stream),
+    }
+}
+
+/// The real cube root on MLX, which has no `cbrt`: `y = |x|^(1/3)` from
+/// `power` (whose error is amplified by the rounding of the exponent `1/3`
+/// to `f32`, by up to `ln|x| * 2^-25` relative) followed by one Newton step
+/// `y - (y - |x| / y^2) / 3` for `y^3 = |x|`, which squares that error away
+/// and leaves the rounding of the step, about one float32 ulp. The sign of
+/// `x` is restored afterwards. Zeros, infinities and NaN, where the Newton
+/// step would form `0 / 0` or `inf / inf`, return `x` itself, as `cbrt`
+/// does. Metal flushes float32 subnormals to zero (MLX's `sqrt` and `log2`
+/// see them as zeros too), so a subnormal `x` counts as a zero: it returns
+/// `x * 1`, the flushed signed zero, not the subnormal itself.
+fn mlx_cbrt(input: &Array, stream: &StreamOrDevice) -> Result<Array, mlx_rs::error::Exception> {
+    let scalar = Array::from_f32;
+    let magnitude = input.abs_device(stream)?;
+    let root = magnitude.power_device(scalar(1.0 / 3.0), stream)?;
+    let quotient = magnitude.divide_device(root.square_device(stream)?, stream)?;
+    let step = root
+        .subtract_device(&quotient, stream)?
+        .divide_device(scalar(3.0), stream)?;
+    let refined = root.subtract_device(&step, stream)?;
+    let signed = ops::r#where_device(
+        input.lt_device(scalar(0.0), stream)?,
+        refined.negative_device(stream)?,
+        &refined,
+        stream,
+    )?;
+    let regular = ops::logical_and_device(
+        magnitude.gt_device(scalar(0.0), stream)?,
+        magnitude.lt_device(scalar(f32::INFINITY), stream)?,
+        stream,
+    )?;
+    let flushed = input.multiply_device(scalar(1.0), stream)?;
+    ops::r#where_device(&regular, &signed, &flushed, stream)
+}
+
+/// C `fmod(x, y)` on MLX, which only has the floor-mod `remainder` (sign of
+/// `y`). `remainder` computes Metal's exact `fmod` and adds `y` when the
+/// signs of that remainder and `y` differ, which would round; for `|x|` and
+/// `|y|` the signs never differ, so `remainder(|x|, |y|)` is the exact
+/// `fmod(|x|, |y|)`, and `fmod(x, y)` is it with the sign of `x`. A zero
+/// result takes the sign of `x` through `x * 0`, so `fmod(-0, y)` and
+/// `fmod(-2, 1)` are `-0` as in C.
+fn mlx_fmod(
+    x: &Array,
+    y: &Array,
+    stream: &StreamOrDevice,
+) -> Result<Array, mlx_rs::error::Exception> {
+    let scalar = Array::from_f32;
+    let magnitude = x
+        .abs_device(stream)?
+        .remainder_device(y.abs_device(stream)?, stream)?;
+    let signed = ops::r#where_device(
+        x.lt_device(scalar(0.0), stream)?,
+        magnitude.negative_device(stream)?,
+        &magnitude,
+        stream,
+    )?;
+    ops::r#where_device(
+        magnitude.eq_device(scalar(0.0), stream)?,
+        x.multiply_device(scalar(0.0), stream)?,
+        &signed,
+        stream,
+    )
+}
+
 fn mlx_value(values: &[Array], node_id: usize) -> Result<&Array, String> {
     values
         .get(node_id)
@@ -2240,6 +2341,8 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Erf { .. } => "erf",
         TensorOp::Erfc { .. } => "erfc",
         TensorOp::Atan2 { .. } => "atan2",
+        TensorOp::UnaryMath { kind, .. } => kind.name(),
+        TensorOp::Fmod { .. } => "fmod",
         TensorOp::StopGradient { .. } => "stop_gradient",
         TensorOp::Custom { .. } => "custom",
         TensorOp::CumSum { .. } => "cumsum",

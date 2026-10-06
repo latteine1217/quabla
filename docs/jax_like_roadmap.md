@@ -9,7 +9,7 @@ traced integer indexing (`sort`, `argmax`, `x[idx]`, `.at[]`) are not in it.
 
 | # | Item | Status |
 | --- | --- | --- |
-| 1 | Native elementwise ops: `tan`, `arcsin`, `arccos`, `arctan`, `sinh`, `cosh`, `arcsinh`, `arccosh`, `arctanh`, `log2`, `log10`, `cbrt`, `floor`, `ceil`, `round`, `fmod` (with floor `mod`), on every backend with derivatives | Planned |
+| 1 | Native elementwise ops: `tan`, `arcsin`, `arccos`, `arctan`, `sinh`, `cosh`, `arcsinh`, `arccosh`, `arctanh`, `log2`, `log10`, `cbrt`, `floor`, `ceil`, `round`, `fmod` (with floor `mod`), on every backend with derivatives | Done |
 | 2 | jax.numpy compositions: `flip`, `roll`, `pad`, `tile`, `repeat`, `moveaxis`, `swapaxes`, `ravel`, `diag`, `diagonal`, `trace`, `outer`, `dot`, `tensordot`, `kron`, `cross`, `diff`, `trapezoid`, `interp`, `polyval`, `logaddexp`, `hypot`, `exp2`, `isinf`, `nan_to_num`; `linalg.norm` (`ord`, `axis`), `linalg.matrix_power`, `linalg.pinv` | Planned |
 | 3 | Stiff ODEs and `saveat`: an adaptive L-stable Rosenbrock method in `odeint`, and states at requested times through each method's dense output | Planned |
 | 4 | Iterative and implicit solvers: matrix-free `linalg.cg` and `linalg.gmres`, Newton root finding, each with an implicit-function-theorem gradient instead of differentiating the iterations | Planned |

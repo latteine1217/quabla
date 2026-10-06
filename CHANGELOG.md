@@ -17,6 +17,19 @@ deprecated names keep working until 1.0 (see
   and MLX backends). Both provide the `quabla` package; install one per
   environment. Wheels cover CPython 3.10 to 3.14. Version tags publish to
   TestPyPI and then PyPI through trusted publishing.
+- Native elementwise `tan`, `arcsin`, `arccos`, `arctan`, `sinh`, `cosh`,
+  `arcsinh`, `arccosh`, `arctanh`, `log2`, `log10`, `cbrt`, `floor`, `ceil`,
+  and `round` (half to even) as module functions, `Tensor` and
+  `TraceTensor` methods, and one IR op on the CPU, CUDA (float32 and
+  `precision="float64"`), and MLX, with derivatives of every order under
+  `grad`, `jvp`, `vmap`, and `hessian`. Out-of-domain inputs give NaN, not
+  an error. The derivative forms avoid cancellation near the domain edges
+  and overflow at large magnitudes (`arcsinh'(1e200) == 1e-200`).
+  `quabla.round` is not in `__all__`, like `abs`.
+- `fmod(x1, x2)` (C `fmod`, sign of `x1`, exact) as a native broadcasting
+  op on every backend with partials `1` and `-trunc(x1 / x2)`, and
+  `mod`/`remainder` with NumPy's floor-mod semantics (sign of `x2`),
+  composed from `fmod` as NumPy does.
 
 ### Fixed
 

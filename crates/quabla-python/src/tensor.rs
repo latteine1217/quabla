@@ -2,7 +2,7 @@ use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyEllipsis, PyMemoryView, PySlice, PySliceMethods, PyTuple};
-use quabla_core::tensor_ir::{HostTensorStorage, TensorComparison, TensorDType};
+use quabla_core::tensor_ir::{HostTensorStorage, TensorComparison, TensorDType, UnaryMathKind};
 use std::borrow::Cow;
 use std::ffi::c_int;
 use std::sync::Arc;
@@ -1710,6 +1710,33 @@ impl PyTensor {
         self.try_map(|y| y.atan2(x))
     }
 
+    /// Elementwise `kind(self)` with the `f64` function of the CPU Tensor IR
+    /// `UnaryMath` op, rounded once to the dtype.
+    pub fn try_unary_math(&self, kind: UnaryMathKind) -> Result<Self, String> {
+        self.try_unary(kind.name(), move |x| kind.evaluate(x))
+    }
+
+    /// Elementwise C `fmod(self, y)` (the sign of `self`) with broadcasting
+    /// and the dtype promotion of the other binary ops; `bool` operands are
+    /// rejected.
+    pub fn try_fmod(&self, y: &Self) -> Result<Self, String> {
+        self.ensure_not_bool("fmod")?;
+        y.ensure_not_bool("fmod")?;
+        self.try_elementwise(y, "fmod", |x, y| Ok(x % y))
+    }
+
+    /// `fmod(self, y)` for a Python number `y`, a weak scalar rounded to the
+    /// tensor dtype.
+    pub fn try_fmod_scalar(&self, y: f64) -> Result<Self, String> {
+        self.ensure_not_bool("fmod")?;
+        let y = self.dtype.round(y);
+        self.try_map(|x| x % y)
+    }
+
+    fn unary_math(&self, kind: UnaryMathKind) -> PyResult<Self> {
+        self.try_unary_math(kind).map_err(PyValueError::new_err)
+    }
+
     /// Inclusive prefix sums along `axis` (over the flattened tensor when
     /// `None`, like NumPy), from the last entry when `reverse`. Every running
     /// sum rounds to the dtype, as the CPU Tensor IR `cumsum` does.
@@ -2650,6 +2677,83 @@ impl PyTensor {
         Err(PyTypeError::new_err(
             "expected Tensor or numeric scalar operand",
         ))
+    }
+
+    /// C `fmod(self, y)` of a tensor or Python number `y`: the remainder of
+    /// the quotient truncated toward zero, with the sign of `self`.
+    fn fmod(&self, y: &Bound<'_, PyAny>) -> PyResult<EagerOrTraced> {
+        if let Some(result) = traced(self, y, TracedBinary::Arithmetic("fmod"), true) {
+            return result;
+        }
+        if let Ok(y) = y.extract::<PyRef<'_, PyTensor>>() {
+            return eager(self.try_fmod(&y));
+        }
+        if let Ok(y) = y.extract::<f64>() {
+            return eager(self.try_fmod_scalar(y));
+        }
+        Err(PyTypeError::new_err(
+            "expected Tensor or numeric scalar operand",
+        ))
+    }
+
+    fn tan(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Tan)
+    }
+
+    fn arcsin(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Arcsin)
+    }
+
+    fn arccos(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Arccos)
+    }
+
+    fn arctan(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Arctan)
+    }
+
+    fn sinh(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Sinh)
+    }
+
+    fn cosh(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Cosh)
+    }
+
+    fn arcsinh(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Arcsinh)
+    }
+
+    fn arccosh(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Arccosh)
+    }
+
+    fn arctanh(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Arctanh)
+    }
+
+    fn log2(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Log2)
+    }
+
+    fn log10(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Log10)
+    }
+
+    fn cbrt(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Cbrt)
+    }
+
+    fn floor(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Floor)
+    }
+
+    fn ceil(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Ceil)
+    }
+
+    fn round(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Round)
     }
 
     /// The value itself: outside a transform nothing is differentiated.

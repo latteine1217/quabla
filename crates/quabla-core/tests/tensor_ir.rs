@@ -7,6 +7,7 @@ use quabla_core::tensor_ir::{
     TensorDeviceMesh, TensorExecutionPlan, TensorForiExecutionPlan, TensorForiMultiExecutionPlan,
     TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr, TensorNodeId, TensorPartitionSpec,
     TensorPlacement, TensorReplicaReduction, TensorScanExecutionPlan, TensorShardingPlan,
+    UnaryMathKind,
 };
 use quabla_core::{QuablaCompiler, QuablaMultiOutputProgram, QuablaPrecision, QuablaTarget};
 
@@ -11305,6 +11306,407 @@ fn atan2_derivatives_avoid_overflow_and_vanish_at_the_origin() {
         let inputs = must!(shaped_inputs(&[("p", vec![2], vec![y, x])]));
         assert_hessian_routes(&pair, angle, "p", &inputs, &expected, 1e-13);
     }
+}
+
+/// The f64 function each `UnaryMathKind` must evaluate: Rust std, and the
+/// musl ports of the `libm` crate for the inverse hyperbolic functions.
+fn unary_math_reference(kind: UnaryMathKind) -> fn(f64) -> f64 {
+    match kind {
+        UnaryMathKind::Tan => f64::tan,
+        UnaryMathKind::Arcsin => f64::asin,
+        UnaryMathKind::Arccos => f64::acos,
+        UnaryMathKind::Arctan => f64::atan,
+        UnaryMathKind::Sinh => f64::sinh,
+        UnaryMathKind::Cosh => f64::cosh,
+        UnaryMathKind::Arcsinh => libm::asinh,
+        UnaryMathKind::Arccosh => libm::acosh,
+        UnaryMathKind::Arctanh => libm::atanh,
+        UnaryMathKind::Log2 => f64::log2,
+        UnaryMathKind::Log10 => f64::log10,
+        UnaryMathKind::Cbrt => f64::cbrt,
+        UnaryMathKind::Floor => f64::floor,
+        UnaryMathKind::Ceil => f64::ceil,
+        UnaryMathKind::Round => f64::round_ties_even,
+    }
+}
+
+#[test]
+fn unary_math_and_fmod_values_follow_the_f64_reference() {
+    let points = SPECIAL_POINTS
+        .iter()
+        .copied()
+        .chain([
+            -27.0,
+            -2.5,
+            -1.5,
+            -0.5,
+            1.0 - f64::EPSILON / 2.0,
+            1.0,
+            1.0 + f64::EPSILON,
+            1.5,
+            2.5,
+            1e22,
+            1e300,
+        ])
+        .collect::<Vec<_>>();
+    let count = points.len();
+    for dtype in [TensorDType::F64, TensorDType::F32] {
+        let mut graph = TensorIr::new();
+        let x = must!(graph.input_typed("x", vec![count], dtype));
+        let inputs = BTreeMap::from([(
+            "x".to_string(),
+            must!(DynamicTensor::with_dtype(
+                vec![count],
+                points.clone(),
+                dtype
+            )),
+        )]);
+        // float32 rounds the input and then the f64 result, once each.
+        let round = |value: f64| match dtype {
+            TensorDType::F32 => f64::from(value as f32),
+            _ => value,
+        };
+        for kind in UnaryMathKind::ALL {
+            let output = must!(graph.unary_math(x, kind));
+            let reference = unary_math_reference(kind);
+            let expected = points
+                .iter()
+                .map(|point| round(reference(round(*point))))
+                .collect::<Vec<_>>();
+            let value = must!(graph.evaluate(output, &inputs));
+            assert_eq!(value.dtype(), dtype);
+            assert_same_bits(&value.data(), &expected);
+            let plan = must!(graph.compile_cpu(output));
+            assert_same_bits(&must!(plan.evaluate(&inputs)).data(), &expected);
+            assert!(graph.lower_text().contains(&format!("{}(%", kind.name())));
+        }
+    }
+
+    // round is half-to-even; cbrt is the real cube root; poles give
+    // infinities and the outside of a domain NaN.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![6]));
+    let inputs = must!(shaped_inputs(&[(
+        "x",
+        vec![6],
+        vec![-2.5, -0.5, 0.5, 1.5, 2.5, -27.0]
+    )]));
+    let rounded = must!(graph.unary_math(x, UnaryMathKind::Round));
+    assert_same_bits(
+        &must!(graph.evaluate(rounded, &inputs)).data(),
+        &[-2.0, -0.0, 0.0, 2.0, 2.0, -27.0],
+    );
+    let root = must!(graph.unary_math(x, UnaryMathKind::Cbrt));
+    assert_eq!(must!(graph.evaluate(root, &inputs)).data()[5], -3.0);
+    let poles = must!(shaped_inputs(&[(
+        "x",
+        vec![6],
+        vec![1.0, -1.0, 0.0, 2.0, -2.0, 0.5]
+    )]));
+    let atanh = must!(graph.unary_math(x, UnaryMathKind::Arctanh));
+    let value = must!(graph.evaluate(atanh, &poles));
+    let value = value.data();
+    assert_eq!(&value[..3], &[f64::INFINITY, f64::NEG_INFINITY, 0.0]);
+    assert!(value[3].is_nan() && value[4].is_nan());
+    let acosh = must!(graph.unary_math(x, UnaryMathKind::Arccosh));
+    assert!(must!(graph.evaluate(acosh, &poles)).data()[5].is_nan());
+
+    // Two kinds of the same input stay distinct under CSE: the kind is part
+    // of the key.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![]));
+    let tan = must!(graph.unary_math(x, UnaryMathKind::Tan));
+    let sinh = must!(graph.unary_math(x, UnaryMathKind::Sinh));
+    let total = must!(graph.add(tan, sinh));
+    let inputs = must!(shaped_inputs(&[("x", vec![], vec![0.5])]));
+    let plan = must!(graph.compile_cpu(total));
+    assert_eq!(
+        must!(plan.evaluate(&inputs)).data()[0],
+        0.5_f64.tan() + 0.5_f64.sinh()
+    );
+
+    // The ops fuse into one CUDA elementwise kernel through their CUDA math
+    // functions; `rintf` is the halfway-to-even round.
+    let mut fused = TensorIr::new();
+    let x = must!(fused.input("x", vec![3]));
+    let one = fused.scalar_constant(1.0);
+    // arccosh takes x + 1, inside its domain [1, inf) like x in [-1, 1] is
+    // inside the others'.
+    let shifted = must!(fused.add(x, one));
+    let mut total = x;
+    for kind in UnaryMathKind::ALL {
+        let operand = if kind == UnaryMathKind::Arccosh {
+            shifted
+        } else {
+            x
+        };
+        let value = must!(fused.unary_math(operand, kind));
+        total = must!(fused.add(total, value));
+    }
+    let divisor = fused.scalar_constant(0.75);
+    let output = must!(fused.fmod(total, divisor));
+    let plan = must!(fused.compile_cpu(output));
+    assert!(plan.uses_fused_elementwise_kernel());
+    let inputs = must!(shaped_inputs(&[("x", vec![3], vec![0.25, 0.5, 0.75])]));
+    let value = must!(plan.evaluate(&inputs));
+    assert!(value.data().iter().all(|entry| entry.is_finite()));
+    assert_eq!(value, must!(fused.evaluate(output, &inputs)));
+    let source = must!(plan.cuda_source());
+    for function in [
+        "tanf(", "asinf(", "acosf(", "atanf(", "sinhf(", "coshf(", "asinhf(", "acoshf(", "atanhf(",
+        "log2f(", "log10f(", "cbrtf(", "floorf(", "ceilf(", "rintf(", "fmodf(",
+    ] {
+        assert!(
+            source.contains(function),
+            "{function} is missing from {source}"
+        );
+    }
+
+    // fmod is C fmod (`%` on f64) for every pair of special points, with
+    // broadcasting.
+    let pairs = SPECIAL_POINTS.len() * SPECIAL_POINTS.len();
+    let mut graph = TensorIr::new();
+    let xs = must!(graph.input("xs", vec![pairs]));
+    let ys = must!(graph.input("ys", vec![pairs]));
+    let remainder = must!(graph.fmod(xs, ys));
+    let numerators = (0..pairs)
+        .map(|index| SPECIAL_POINTS[index / SPECIAL_POINTS.len()])
+        .collect::<Vec<_>>();
+    let divisors = (0..pairs)
+        .map(|index| SPECIAL_POINTS[index % SPECIAL_POINTS.len()])
+        .collect::<Vec<_>>();
+    let expected = numerators
+        .iter()
+        .zip(&divisors)
+        .map(|(x, y)| x % y)
+        .collect::<Vec<_>>();
+    let inputs = must!(shaped_inputs(&[
+        ("xs", vec![pairs], numerators),
+        ("ys", vec![pairs], divisors),
+    ]));
+    assert_same_bits(&must!(graph.evaluate(remainder, &inputs)).data(), &expected);
+    let plan = must!(graph.compile_cpu(remainder));
+    assert_same_bits(&must!(plan.evaluate(&inputs)).data(), &expected);
+    assert!(graph.lower_text().contains("fmod(%"));
+    let mut broadcast = TensorIr::new();
+    let x = must!(broadcast.input("x", vec![2, 1]));
+    let y = must!(broadcast.input("y", vec![3]));
+    let remainder = must!(broadcast.fmod(x, y));
+    let inputs = must!(shaped_inputs(&[
+        ("x", vec![2, 1], vec![7.5, -7.5]),
+        ("y", vec![3], vec![2.0, -2.0, 4.0]),
+    ]));
+    let value = must!(broadcast.evaluate(remainder, &inputs));
+    assert_eq!(value.shape(), &[2, 3]);
+    assert_same_bits(&value.data(), &[1.5, 1.5, 3.5, -1.5, -1.5, -3.5]);
+
+    // Scalar constants fold through the same kernels.
+    let mut folded = TensorIr::new();
+    let half = folded.scalar_constant(0.5);
+    let three = folded.scalar_constant(3.0);
+    let asin = must!(folded.unary_math(half, UnaryMathKind::Arcsin));
+    let remainder = must!(folded.fmod(asin, three));
+    let value = must!(must!(folded.compile_cpu(remainder)).evaluate(&BTreeMap::new()));
+    assert_eq!(value.data()[0], 0.5_f64.asin() % 3.0);
+
+    // Bool operands are rejected like the other math ops.
+    let mut rejected = TensorIr::new();
+    let mask = must!(rejected.input_typed("mask", vec![2], TensorDType::Bool));
+    assert!(rejected.unary_math(mask, UnaryMathKind::Floor).is_err());
+    assert!(rejected.fmod(mask, mask).is_err());
+}
+
+/// `(kind, points, first derivatives, second derivative at points[0])`.
+type UnaryMathDerivativeCase = (UnaryMathKind, Vec<f64>, fn(f64) -> f64, fn(f64) -> f64);
+
+#[test]
+fn unary_math_derivatives_agree_across_routes() {
+    let cases: Vec<UnaryMathDerivativeCase> = vec![
+        (
+            UnaryMathKind::Tan,
+            vec![0.4, -1.3, 0.0, 1.5],
+            |x| 1.0 + x.tan() * x.tan(),
+            |x| 2.0 * x.tan() * (1.0 + x.tan() * x.tan()),
+        ),
+        (
+            UnaryMathKind::Arcsin,
+            vec![0.6, -0.999, 0.0, 0.3],
+            |x| 1.0 / ((1.0 - x) * (1.0 + x)).sqrt(),
+            |x| x / ((1.0 - x) * (1.0 + x)).powf(1.5),
+        ),
+        (
+            UnaryMathKind::Arccos,
+            vec![-0.6, 0.999, 0.0, 0.3],
+            |x| -1.0 / ((1.0 - x) * (1.0 + x)).sqrt(),
+            |x| -x / ((1.0 - x) * (1.0 + x)).powf(1.5),
+        ),
+        (
+            UnaryMathKind::Arctan,
+            vec![2.0, -30.0, 0.0, 0.5],
+            |x| 1.0 / (1.0 + x * x),
+            |x| -2.0 * x / (1.0 + x * x).powi(2),
+        ),
+        (
+            UnaryMathKind::Sinh,
+            vec![1.5, -5.0, 0.0, 20.0],
+            f64::cosh,
+            f64::sinh,
+        ),
+        (
+            UnaryMathKind::Cosh,
+            vec![1.5, -5.0, 0.0, 20.0],
+            f64::sinh,
+            f64::cosh,
+        ),
+        (
+            UnaryMathKind::Arcsinh,
+            vec![-3.0, 0.5, 0.0, 40.0],
+            |x| 1.0 / (x * x + 1.0).sqrt(),
+            |x| -x / (x * x + 1.0).powf(1.5),
+        ),
+        (
+            UnaryMathKind::Arccosh,
+            vec![1.5, 1.001, 10.0, 1e5],
+            |x| 1.0 / ((x - 1.0) * (x + 1.0)).sqrt(),
+            |x| -x / ((x - 1.0) * (x + 1.0)).powf(1.5),
+        ),
+        (
+            UnaryMathKind::Arctanh,
+            vec![0.6, -0.999, 0.0, 0.3],
+            |x| 1.0 / ((1.0 - x) * (1.0 + x)),
+            |x| 2.0 * x / ((1.0 - x) * (1.0 + x)).powi(2),
+        ),
+        (
+            UnaryMathKind::Log2,
+            vec![3.0, 1e-3, 1.0, 1e4],
+            |x| 1.0 / (x * std::f64::consts::LN_2),
+            |x| -1.0 / (x * x * std::f64::consts::LN_2),
+        ),
+        (
+            UnaryMathKind::Log10,
+            vec![3.0, 1e-3, 1.0, 1e4],
+            |x| 1.0 / (x * std::f64::consts::LN_10),
+            |x| -1.0 / (x * x * std::f64::consts::LN_10),
+        ),
+        (
+            UnaryMathKind::Cbrt,
+            vec![-0.2, -27.0, 1e-6, 8.0],
+            |x| 1.0 / (3.0 * x.cbrt() * x.cbrt()),
+            |x| -2.0 / (9.0 * x.cbrt().powi(5)),
+        ),
+    ];
+    for (kind, points, first, second) in cases {
+        let mut graph = TensorIr::new();
+        let x = must!(graph.input("x", vec![points.len()]));
+        let output = must!(graph.unary_math(x, kind));
+        let total = must!(graph.sum(output));
+        let inputs = must!(shaped_inputs(&[("x", vec![points.len()], points.clone())]));
+        let expected = points.iter().map(|point| first(*point)).collect::<Vec<_>>();
+        assert_gradient_routes(&graph, total, &inputs, &[("x", expected)], 2e-15);
+
+        let mut scalar = TensorIr::new();
+        let x = must!(scalar.input("x", vec![]));
+        let output = must!(scalar.unary_math(x, kind));
+        let inputs = must!(shaped_inputs(&[("x", vec![], vec![points[0]])]));
+        assert_hessian_routes(&scalar, output, "x", &inputs, &[second(points[0])], 1e-14);
+    }
+
+    // floor, ceil and round have a zero derivative of every order, also at
+    // their jumps.
+    let points = vec![-1.5, -0.5, 0.0, 0.5, 2.0];
+    let inputs = must!(shaped_inputs(&[("x", vec![5], points)]));
+    for kind in [
+        UnaryMathKind::Floor,
+        UnaryMathKind::Ceil,
+        UnaryMathKind::Round,
+    ] {
+        let mut graph = TensorIr::new();
+        let x = must!(graph.input("x", vec![5]));
+        let output = must!(graph.unary_math(x, kind));
+        let total = must!(graph.sum(output));
+        assert_gradient_routes(&graph, total, &inputs, &[("x", vec![0.0; 5])], 0.0);
+        assert_hessian_routes(&graph, total, "x", &inputs, &[0.0; 25], 0.0);
+    }
+
+    // arcsinh' does not overflow for large |x| and is 0 at +-inf.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![5]));
+    let output = must!(graph.unary_math(x, UnaryMathKind::Arcsinh));
+    let total = must!(graph.sum(output));
+    let inputs = must!(shaped_inputs(&[(
+        "x",
+        vec![5],
+        vec![1e200, -1e300, f64::INFINITY, f64::NEG_INFINITY, 0.0]
+    )]));
+    assert_gradient_routes(
+        &graph,
+        total,
+        &inputs,
+        &[("x", vec![1e-200, 1e-300, 0.0, 0.0, 1.0])],
+        1e-15,
+    );
+}
+
+#[test]
+fn fmod_derivatives_are_one_and_minus_the_truncated_quotient() {
+    // (x, y, -trunc(x / y)) with the quotient of the exact remainder:
+    // fmod(0.3, 0.1) = 0.1 - 2.8e-17, so its quotient is 2.
+    let cases = [
+        (5.5, 2.0, -2.0),
+        (-5.5, 2.0, 2.0),
+        (7.0, -3.0, 2.0),
+        (-7.25, -3.0, -2.0),
+        (0.3, 0.1, -2.0),
+        (1e-30, 1.0, -0.0),
+        (4.0, f64::INFINITY, -0.0),
+    ];
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![cases.len()]));
+    let y = must!(graph.input("y", vec![cases.len()]));
+    let remainder = must!(graph.fmod(x, y));
+    let total = must!(graph.sum(remainder));
+    let inputs = must!(shaped_inputs(&[
+        (
+            "x",
+            vec![cases.len()],
+            cases.iter().map(|case| case.0).collect()
+        ),
+        (
+            "y",
+            vec![cases.len()],
+            cases.iter().map(|case| case.1).collect()
+        ),
+    ]));
+    assert_gradient_routes(
+        &graph,
+        total,
+        &inputs,
+        &[
+            ("x", vec![1.0; cases.len()]),
+            ("y", cases.iter().map(|case| case.2).collect()),
+        ],
+        0.0,
+    );
+
+    // Piecewise linear: every second partial is zero.
+    let mut pair = TensorIr::new();
+    let p = must!(pair.input("p", vec![2]));
+    let x = must!(pair.slice_axis(p, 0, 0, 1));
+    let y = must!(pair.slice_axis(p, 0, 1, 2));
+    let remainder = must!(pair.fmod(x, y));
+    let output = must!(pair.sum(remainder));
+    let inputs = must!(shaped_inputs(&[("p", vec![2], vec![7.0, -3.0])]));
+    assert_hessian_routes(&pair, output, "p", &inputs, &[0.0; 4], 0.0);
+
+    // A scalar constant divisor receives no cotangent and the other operand
+    // still differentiates.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let divisor = graph.scalar_constant(2.0);
+    let remainder = must!(graph.fmod(x, divisor));
+    let total = must!(graph.sum(remainder));
+    let inputs = must!(shaped_inputs(&[("x", vec![2], vec![5.5, -3.0])]));
+    assert_gradient_routes(&graph, total, &inputs, &[("x", vec![1.0, 1.0])], 0.0);
 }
 
 #[test]

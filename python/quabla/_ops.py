@@ -9,9 +9,9 @@ one, keeping the weak scalar typing of the method form:
 `qb.maximum(x, 0.0)` keeps the dtype of `x`. `power` keeps a Python number
 in either position the same way.
 
-`abs`, `sum`, `max`, `min`, `any`, and `all` shadow Python builtins, so they
-are attributes of `quabla` but not listed in `__all__`: `from quabla import *`
-leaves the builtins alone.
+`abs`, `round`, `sum`, `max`, `min`, `any`, and `all` shadow Python builtins,
+so they are attributes of `quabla` but not listed in `__all__`:
+`from quabla import *` leaves the builtins alone.
 
 The remaining functions (activations, `softmax`/`logsumexp`, `var`/`std`,
 and the shape helpers) are compositions of those methods, so they work
@@ -30,22 +30,35 @@ from ._quabla import Tensor, TraceTensor
 from ._quabla import where as _where
 
 __all__ = [
+    "arccos",
+    "arccosh",
+    "arcsin",
+    "arcsinh",
+    "arctan",
+    "arctanh",
     "astype",
     "atan2",
     "broadcast_to",
+    "cbrt",
+    "ceil",
     "cholesky",
     "clip",
     "cos",
+    "cosh",
     "cumsum",
     "erf",
     "erfc",
     "exp",
     "expand_dims",
     "expm1",
+    "floor",
+    "fmod",
     "full_like",
     "gelu",
     "log",
+    "log10",
     "log1p",
+    "log2",
     "log_softmax",
     "logsumexp",
     "matmul",
@@ -53,17 +66,20 @@ __all__ = [
     "mean",
     "meshgrid",
     "minimum",
+    "mod",
     "norm",
     "ones_like",
     "power",
     "prod",
     "reciprocal",
     "relu",
+    "remainder",
     "reshape",
     "sigmoid",
     "sign",
     "silu",
     "sin",
+    "sinh",
     "softmax",
     "softplus",
     "solve",
@@ -73,6 +89,7 @@ __all__ = [
     "squeeze",
     "std",
     "stop_gradient",
+    "tan",
     "tanh",
     "transpose",
     "tril",
@@ -134,6 +151,21 @@ sin = _unary("sin")
 softplus = _unary("softplus")
 sqrt = _unary("sqrt")
 tanh = _unary("tanh")
+tan = _unary("tan")
+arcsin = _unary("arcsin")
+arccos = _unary("arccos")
+arctan = _unary("arctan")
+sinh = _unary("sinh")
+cosh = _unary("cosh")
+arcsinh = _unary("arcsinh")
+arccosh = _unary("arccosh")
+arctanh = _unary("arctanh")
+log2 = _unary("log2")
+log10 = _unary("log10")
+cbrt = _unary("cbrt")
+floor = _unary("floor")
+ceil = _unary("ceil")
+round = _unary("round")
 stop_gradient = _unary("stop_gradient")
 cholesky = _unary("cholesky")
 tril = _unary("tril")
@@ -182,6 +214,48 @@ def atan2(x1, x2):
         x2 = _array(x2)
         return asarray(x1, dtype=x2.dtype).atan2(x2)
     return _array(x1).atan2(x2 if isinstance(x2, numbers.Number) else _array(x2))
+
+
+def fmod(x1, x2):
+    """Elementwise C `fmod(x1, x2)`: the remainder `x1 - n x2` of the quotient
+    `n` truncated toward zero, which has the sign of `x1` (NumPy's `fmod`);
+    `quabla.fmod(x, y)` is `x.fmod(y)`.
+
+    Either operand may be a Python number, which adopts the dtype of the
+    array operand. The result is exact; it is NaN for `x2 == 0` or an
+    infinite `x1`, and `x1` for an infinite `x2`. The derivative is `1` in
+    `x1` and `-trunc(x1 / x2)` in `x2` (zero second derivatives).
+    """
+    if isinstance(x1, numbers.Number) and not isinstance(x2, numbers.Number):
+        x2 = _array(x2)
+        return asarray(x1, dtype=x2.dtype).fmod(x2)
+    return _array(x1).fmod(x2 if isinstance(x2, numbers.Number) else _array(x2))
+
+
+def mod(x1, x2):
+    """Elementwise floor-mod remainder with NumPy's `mod`/`remainder`
+    semantics: `x1 - floor(x1 / x2) x2`, which has the sign of `x2`, as
+    Python's `%` on floats.
+
+    It is computed from the exact `fmod` the way NumPy does it: where the
+    truncated remainder `r = fmod(x1, x2)` is nonzero and its sign differs
+    from that of `x2`, the result is `r + x2`; a zero result is `0` with the
+    sign of `x2`. Forming `x1 - floor(x1 / x2) * x2` instead would round the
+    quotient and the product and lose the small remainders. The derivative
+    is `1` in `x1` and `-floor(x1 / x2)` in `x2`. `quabla.remainder` is the
+    same function.
+    """
+    r = fmod(x1, x2)
+    y = asarray(x2, dtype=r.dtype) if isinstance(x2, numbers.Number) else _array(x2)
+    y_negative = y < 0.0
+    adjust = ((r < 0.0) & (y > 0.0)) | ((r > 0.0) & y_negative)
+    floored = _where(adjust, r + y, r)
+    # `r * r` is +0 for either zero, so the zero result takes the sign of `x2`.
+    zero = r * r
+    return _where(r.equal(0.0), _where(y_negative, -zero, zero), floored)
+
+
+remainder = mod
 
 
 def cumsum(x, axis=None, reverse=False):

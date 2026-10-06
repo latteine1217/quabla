@@ -3147,6 +3147,476 @@ def test_expm1_erf_and_atan2_gradients_and_hessians_match_closed_forms():
     assert qb.hessian(angle)(qb.array([0.0, 0.0])).tolist() == [[0.0, 0.0], [0.0, 0.0]]
 
 
+def _math_reference(function, pole=None):
+    """`function` with NumPy's IEEE results where `math` raises: NaN outside
+    the domain, a signed infinity on overflow, and `pole(p)` at a pole."""
+
+    def reference(p):
+        if pole is not None and pole(p) is not None:
+            return pole(p)
+        try:
+            return function(p)
+        except OverflowError:
+            return math.copysign(math.inf, p) if function is math.sinh else math.inf
+        except ValueError:
+            return math.nan
+
+    return reference
+
+
+def _integral(function):
+    """`math.floor`/`math.ceil`/`round` as a float; infinities and NaN pass."""
+    return lambda p: p if not math.isfinite(p) else float(function(p))
+
+
+# Python's `round` of a float rounds halfway cases to even, like NumPy's.
+_UNARY_MATH_REFERENCES = {
+    "tan": _math_reference(math.tan),
+    "arcsin": _math_reference(math.asin),
+    "arccos": _math_reference(math.acos),
+    "arctan": _math_reference(math.atan),
+    "sinh": _math_reference(math.sinh),
+    "cosh": _math_reference(math.cosh),
+    "arcsinh": _math_reference(math.asinh),
+    "arccosh": _math_reference(math.acosh),
+    "arctanh": _math_reference(
+        math.atanh, lambda p: math.copysign(math.inf, p) if abs(p) == 1.0 else None
+    ),
+    "log2": _math_reference(math.log2, lambda p: -math.inf if p == 0.0 else None),
+    "log10": _math_reference(math.log10, lambda p: -math.inf if p == 0.0 else None),
+    "floor": _integral(math.floor),
+    "ceil": _integral(math.ceil),
+    "round": _integral(round),
+}
+# math.cbrt is new in Python 3.11; the exact cubes of the edge test cover
+# older versions.
+if hasattr(math, "cbrt"):
+    _UNARY_MATH_REFERENCES["cbrt"] = math.cbrt
+UNARY_MATH_NAMES = [
+    "tan",
+    "arcsin",
+    "arccos",
+    "arctan",
+    "sinh",
+    "cosh",
+    "arcsinh",
+    "arccosh",
+    "arctanh",
+    "log2",
+    "log10",
+    "cbrt",
+    "floor",
+    "ceil",
+    "round",
+]
+UNARY_MATH_POINTS = SPECIAL_POINTS + [
+    -1e300,
+    -27.0,
+    -2.5,
+    -1.5,
+    -1.0 - 2.0**-52,
+    -1.0,
+    -(1.0 - 2.0**-53),
+    -0.5,
+    0.1,
+    0.25,
+    1.0 - 2.0**-53,
+    1.0,
+    1.0 + 2.0**-52,
+    1.5,
+    2.5,
+    27.0,
+    1e22,
+    1e300,
+]
+
+
+def test_unary_math_values_match_math_eagerly_and_traced():
+    for dtype in [qb.float64, qb.float32]:
+        x = qb.array(UNARY_MATH_POINTS, dtype=dtype)
+        inputs = x.tolist()
+        for name in UNARY_MATH_NAMES:
+            function = getattr(qb, name)
+            eager = function(x)
+            jitted = qb.jit(function)(x)
+            method = getattr(x, name)()
+            assert eager.dtype == jitted.dtype == method.dtype == dtype, name
+            assert float_bits(eager.tolist()) == float_bits(jitted.tolist()), name
+            assert float_bits(eager.tolist()) == float_bits(method.tolist()), name
+            if name not in _UNARY_MATH_REFERENCES:
+                continue
+            reference = [_UNARY_MATH_REFERENCES[name](p) for p in inputs]
+            if dtype == qb.float32:
+                # One float32 rounding of the f64 result.
+                reference = [float32_round(value) for value in reference]
+                assert_relative(eager.tolist(), reference, 1.2e-7)
+            elif name in ("floor", "ceil", "round"):
+                assert_relative(eager.tolist(), reference, 0)
+            else:
+                # The CPU uses Rust std (the platform libm) and, for the
+                # inverse hyperbolic functions, the musl port of `libm`.
+                assert_relative(eager.tolist(), reference, 4.5e-16)
+    assert_raises(ValueError, qb.tan, qb.array([True]), match="bool")
+    for name in UNARY_MATH_NAMES:
+        assert getattr(qb, name).__name__ == name
+        # `round` shadows a builtin, so the star import leaves it out.
+        assert (name in qb.__all__) == (name != "round"), name
+    for name in ["fmod", "mod", "remainder"]:
+        assert name in qb.__all__
+
+
+def test_unary_math_edge_values():
+    def values(name, points, dtype=qb.float64):
+        return getattr(qb, name)(qb.array(points, dtype=dtype)).tolist()
+
+    nan, inf, half_pi = math.nan, math.inf, math.pi / 2
+    # Out-of-domain inputs give NaN and poles give infinities, never errors.
+    assert_relative(values("arcsin", [-1.0, 1.0, 1.5, -inf]), [-half_pi, half_pi, nan, nan], 0)
+    assert_relative(values("arccos", [-1.0, 1.0, -1.5]), [math.pi, 0.0, nan], 0)
+    assert_relative(values("arctanh", [-1.0, 1.0, 2.0, 0.0]), [-inf, inf, nan, 0.0], 0)
+    assert_relative(values("arccosh", [1.0, 0.5, -inf, inf]), [0.0, nan, nan, inf], 0)
+    assert_relative(values("log2", [0.0, -0.0, -1.0, inf]), [-inf, -inf, nan, inf], 0)
+    assert_relative(values("log10", [0.0, -2.0]), [-inf, nan], 0)
+    assert_relative(values("arctan", [inf, -inf, 1e300]), [half_pi, -half_pi, half_pi], 0)
+    assert_relative(values("sinh", [711.0, -711.0, -inf]), [inf, -inf, -inf], 0)
+    assert_relative(values("cosh", [-711.0, inf]), [inf, inf], 0)
+    assert_relative(values("tan", [inf, 0.0]), [nan, 0.0], 0)
+    for dtype in [qb.float64, qb.float32]:
+        # Exact powers of ten and two give exact integers.
+        assert values("log10", [10.0**k for k in range(11)], dtype) == list(range(11))
+        powers = range(-126, 128, 7)
+        assert values("log2", [2.0**k for k in powers], dtype) == list(powers)
+        # Real cube roots with the sign of x, exact for exact cubes.
+        cubes = [-1e9, -27.0, -8.0, -0.125, 0.0, 0.125, 8.0, 27.0, 1e9]
+        roots = [-1e3, -3.0, -2.0, -0.5, 0.0, 0.5, 2.0, 3.0, 1e3]
+        assert values("cbrt", cubes, dtype) == roots
+        assert values("cbrt", [-inf, inf], dtype) == [-inf, inf]
+        # Halfway cases round to even, as in NumPy and JAX.
+        halves = [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]
+        assert values("round", halves, dtype) == [-4.0, -2.0, -2.0, -0.0, 0.0, 2.0, 2.0, 4.0]
+        assert values("floor", [-1.5, -0.5, 0.5, 1.5], dtype) == [-2.0, -1.0, 0.0, 1.0]
+        assert values("ceil", [-1.5, -0.5, 0.5, 1.5], dtype) == [-1.0, -0.0, 1.0, 2.0]
+    assert math.copysign(1.0, values("round", [-0.5])[0]) == -1.0
+    assert math.copysign(1.0, values("ceil", [-0.5])[0]) == -1.0
+    big = [2.0**52 + 1.0, 0.49999999999999994, -(2.0**53)]
+    assert values("round", big) == [2.0**52 + 1.0, 0.0, -(2.0**53)]
+    # The inverse hyperbolic functions keep their relative accuracy near
+    # their zeros, at the edge of the domain, and at large magnitudes.
+    edge = 1.0 - 2.0**-53
+    assert_relative(values("arccosh", [1.0 + 2.0**-52]), [math.acosh(1.0 + 2.0**-52)], 4.5e-16)
+    assert_relative(values("arcsinh", [1e-300, -1e300]), [1e-300, -math.asinh(1e300)], 4.5e-16)
+    assert_relative(values("arctanh", [1e-300, edge]), [1e-300, math.atanh(edge)], 4.5e-16)
+    if np is not None:
+        points = np.array(UNARY_MATH_POINTS)
+        with np.errstate(all="ignore"):
+            for name in UNARY_MATH_NAMES:
+                expected = getattr(np, name)(points)
+                actual = np.array(getattr(qb, name)(qb.array(points)).tolist())
+                same = (actual == expected) | (np.isnan(actual) & np.isnan(expected))
+                close = np.abs(actual - expected) <= 4.5e-16 * np.abs(expected)
+                assert np.all(same | close), (name, points[~(same | close)])
+
+
+_LN2, _LN10 = math.log(2.0), math.log(10.0)
+
+
+def _real_cbrt(p):
+    return math.copysign(abs(p) ** (1.0 / 3.0), p)
+
+
+# (first derivative, second derivative, interior points) per function. The
+# arcsin/arccos references use the factored (1 - p)(1 + p): 1 - p * p loses
+# relative accuracy near |p| = 1 (5e-14 at p = 0.999).
+_UNARY_MATH_DERIVATIVES = {
+    "tan": (
+        lambda p: 1.0 + math.tan(p) ** 2,
+        lambda p: 2.0 * math.tan(p) * (1.0 + math.tan(p) ** 2),
+        [-1.3, -0.4, 0.0, 0.7, 1.5],
+    ),
+    "arcsin": (
+        lambda p: 1.0 / math.sqrt((1.0 - p) * (1.0 + p)),
+        lambda p: p / ((1.0 - p) * (1.0 + p)) ** 1.5,
+        [-0.99, -0.3, 0.0, 0.6, 0.999],
+    ),
+    "arccos": (
+        lambda p: -1.0 / math.sqrt((1.0 - p) * (1.0 + p)),
+        lambda p: -p / ((1.0 - p) * (1.0 + p)) ** 1.5,
+        [-0.99, -0.3, 0.0, 0.6, 0.999],
+    ),
+    "arctan": (
+        lambda p: 1.0 / (1.0 + p * p),
+        lambda p: -2.0 * p / (1.0 + p * p) ** 2,
+        [-30.0, -0.5, 0.0, 1.0, 4.0],
+    ),
+    "sinh": (math.cosh, math.sinh, [-5.0, -0.5, 0.0, 1.0, 20.0]),
+    "cosh": (math.sinh, math.cosh, [-5.0, -0.5, 0.0, 1.0, 20.0]),
+    "arcsinh": (
+        lambda p: 1.0 / math.sqrt(p * p + 1.0),
+        lambda p: -p / (p * p + 1.0) ** 1.5,
+        [-40.0, -1.0, 0.0, 0.5, 1.5],
+    ),
+    "arccosh": (
+        lambda p: 1.0 / math.sqrt((p - 1.0) * (p + 1.0)),
+        lambda p: -p / ((p - 1.0) * (p + 1.0)) ** 1.5,
+        [1.001, 1.5, 2.0, 10.0, 1e5],
+    ),
+    "arctanh": (
+        lambda p: 1.0 / ((1.0 - p) * (1.0 + p)),
+        lambda p: 2.0 * p / ((1.0 - p) * (1.0 + p)) ** 2,
+        [-0.99, -0.3, 0.0, 0.6, 0.999],
+    ),
+    "log2": (
+        lambda p: 1.0 / (p * _LN2),
+        lambda p: -1.0 / (p * p * _LN2),
+        [1e-3, 0.5, 1.0, 3.0, 1e4],
+    ),
+    "log10": (
+        lambda p: 1.0 / (p * _LN10),
+        lambda p: -1.0 / (p * p * _LN10),
+        [1e-3, 0.5, 1.0, 3.0, 1e4],
+    ),
+    "cbrt": (
+        lambda p: 1.0 / (3.0 * _real_cbrt(p) ** 2),
+        lambda p: -2.0 / (9.0 * _real_cbrt(p) ** 5),
+        [-27.0, -0.2, 1e-6, 1.0, 8.0],
+    ),
+}
+
+
+def test_unary_math_derivatives_match_closed_forms_and_finite_differences():
+    for name, (first, second, points) in _UNARY_MATH_DERIVATIVES.items():
+        function = getattr(qb, name)
+        x = qb.array(points)
+        expected_first = [first(p) for p in points]
+        expected_second = [second(p) for p in points]
+
+        def total(t, f=function):
+            return qb.sum(f(t))
+
+        routes = [
+            qb.grad(total)(x),
+            qb.jit(qb.grad(total))(x),
+            qb.vmap(qb.grad(function))(x),
+            qb.jvp(function, (x,), (qb.ones([len(points)]),))[1],
+        ]
+        for gradient in routes:
+            # The IR and the closed form round differently, within a few ulp.
+            assert_relative(gradient.tolist(), expected_first, 2e-15)
+        hessian = qb.jit(qb.hessian(total))(x).tolist()
+        size = len(points)
+        assert all(hessian[i][j] == 0.0 for i in range(size) for j in range(size) if i != j)
+        diagonal = [hessian[i][i] for i in range(size)]
+        for actual in [diagonal, qb.vmap(qb.grad(qb.grad(function)))(x).tolist()]:
+            assert_relative(actual, expected_second, 1e-13)
+        # Central differences of the first derivative, O(h^2) accurate.
+        gradient = qb.grad(function)
+        for point, expected in zip(points, expected_second):
+            step = 1e-6 * max(1.0, abs(point))
+            if name in ("arcsin", "arccos", "arctanh") and abs(point) > 0.9:
+                step = 1e-8
+            if (name == "arccosh" and point < 1.01) or (name == "cbrt" and abs(point) < 1e-3):
+                step = 1e-10
+            difference = (
+                gradient(qb.array(point + step)).item() - gradient(qb.array(point - step)).item()
+            ) / (2.0 * step)
+            assert abs(difference - expected) <= 1e-5 * max(1.0, abs(expected)), (
+                name,
+                point,
+                difference,
+                expected,
+            )
+        # float32: the derivative graph runs in float32, within a few ulp.
+        x32 = qb.array(points, dtype=qb.float32)
+        gradient32 = qb.jit(qb.grad(total))(x32)
+        assert gradient32.dtype == qb.float32
+        assert_relative(gradient32.tolist(), [first(p) for p in x32.tolist()], 2e-6)
+
+
+def test_unary_math_derivative_edges():
+    def gradient(name, points):
+        function = getattr(qb, name)
+        return qb.jit(qb.grad(lambda t: qb.sum(function(t))))(qb.array(points)).tolist()
+
+    def second(name, points):
+        function = getattr(qb, name)
+        return qb.jit(qb.vmap(qb.grad(qb.grad(function))))(qb.array(points)).tolist()
+
+    inf = math.inf
+    # arcsinh' = 1 / sqrt(x^2 + 1) is formed as r / sqrt(1 + u^2) with
+    # r = 1 / max(|x|, 1), so it neither overflows nor turns NaN at +-inf.
+    assert_relative(
+        gradient("arcsinh", [1e200, -1e300, inf, -inf]), [1e-200, 1e-300, 0.0, 0.0], 1e-15
+    )
+    assert second("arcsinh", [1e200, inf, -inf]) == [0.0, 0.0, 0.0]
+    assert_relative(second("arcsinh", [-3.0]), [3.0 / 10.0**1.5], 1e-15)
+    # arccosh' = 1 / (sqrt(x - 1) sqrt(x + 1)): no overflow, accurate near 1.
+    above_one = 1.0 + 2.0**-52
+    assert_relative(
+        gradient("arccosh", [1e200, above_one]),
+        [1e-200, 1.0 / math.sqrt(2.0**-52 * (2.0 + 2.0**-52))],
+        1e-15,
+    )
+    # The factored (1 - x)(1 + x) keeps the poles accurate at 1 - 2^-53.
+    edge = 1.0 - 2.0**-53
+    assert gradient("arcsin", [edge, -edge]) == [2.0**26, 2.0**26]
+    assert_relative(gradient("arctanh", [edge]), [1.0 / (2.0**-53 * (2.0 - 2.0**-53))], 1e-15)
+    # Poles and out-of-domain points follow IEEE arithmetic, never errors.
+    assert gradient("arcsin", [1.0, -1.0]) == [inf, inf]
+    assert all(math.isnan(value) for value in gradient("arcsin", [1.5, -2.0]))
+    assert all(math.isnan(value) for value in gradient("arccosh", [0.5]))
+    assert gradient("arctanh", [1.0]) == [inf]
+    assert gradient("log2", [0.0]) == [inf]
+    assert gradient("cbrt", [0.0, inf]) == [inf, 0.0]
+    assert gradient("arctan", [1e200, inf]) == [0.0, 0.0]
+    # The piecewise-constant functions have a zero derivative of every
+    # order, also at their jumps, and composite gradients route around them.
+    for name in ("floor", "ceil", "round"):
+        function = getattr(qb, name)
+        points = [-1.5, -0.5, 0.0, 0.5, 1.0, 2.5, inf]
+        assert gradient(name, points) == [0.0] * len(points)
+        assert second(name, points) == [0.0] * len(points)
+        _, tangent = qb.jvp(function, (qb.array(points),), (qb.ones([len(points)]),))
+        assert tangent.tolist() == [0.0] * len(points)
+        product = qb.grad(lambda t, f=function: qb.sum(f(t) * t))(qb.array([1.25]))
+        assert product.tolist() == [function(qb.array(1.25)).item()]
+    # tan' reuses the primal: 1 + tan(x)^2 near pi / 2.
+    near_pole = 1.5707963
+    assert_relative(gradient("tan", [near_pole]), [1.0 + math.tan(near_pole) ** 2], 1e-15)
+    # Batched shapes under vmap and jit keep the per-entry derivative.
+    batch = qb.array([[0.1, 0.2, 0.3], [-0.4, 0.5, -0.6]])
+    batched = qb.jit(qb.vmap(qb.grad(lambda row: qb.sum(qb.arctanh(row) * qb.cosh(row)))))(batch)
+    for row, values in zip(batch.tolist(), batched.tolist()):
+        expected = [math.cosh(p) / (1.0 - p * p) + math.atanh(p) * math.sinh(p) for p in row]
+        assert_relative(values, expected, 1e-14)
+
+
+# Every sign combination, zeros of both signs, infinities, NaN, and a zero
+# divisor.
+_REMAINDER_NUMERATORS = [
+    5.5, -5.5, 6.0, -6.0, 0.0, -0.0, 1e-30, -1e-30, 1e20, -1e20, math.inf, math.nan,
+]
+_REMAINDER_DIVISORS = [2.0, -2.0, 3.0, -3.0, 0.1, -0.1, math.inf, -math.inf, 0.0, math.nan]
+
+
+def _python_fmod(x, y):
+    try:
+        return math.fmod(x, y)
+    except ValueError:
+        return math.nan
+
+
+def _python_mod(x, y):
+    # Python's float % is NumPy's floor-mod, also for signed zeros and
+    # infinite divisors.
+    try:
+        return x % y
+    except ZeroDivisionError:
+        return math.nan
+
+
+def _same_float(lhs, rhs):
+    if math.isnan(rhs):
+        return math.isnan(lhs)
+    return lhs == rhs and math.copysign(1.0, lhs) == math.copysign(1.0, rhs)
+
+
+def test_fmod_and_mod_sign_conventions_match_numpy():
+    xs = [x for x in _REMAINDER_NUMERATORS for _ in _REMAINDER_DIVISORS]
+    ys = [y for _ in _REMAINDER_NUMERATORS for y in _REMAINDER_DIVISORS]
+    for dtype in [qb.float64, qb.float32]:
+        x, y = qb.array(xs, dtype=dtype), qb.array(ys, dtype=dtype)
+        pairs = list(zip(x.tolist(), y.tolist()))
+        for function, reference in [
+            (qb.fmod, _python_fmod),
+            (qb.mod, _python_mod),
+            (qb.remainder, _python_mod),
+        ]:
+            expected = [reference(a, b) for a, b in pairs]
+            if dtype == qb.float32:
+                expected = [float32_round(value) for value in expected]
+            for result in [function(x, y), qb.jit(function)(x, y)]:
+                assert result.dtype == dtype
+                for actual, wanted, pair in zip(result.tolist(), expected, pairs):
+                    assert _same_float(actual, wanted), (function, dtype, pair, actual, wanted)
+        if np is not None:
+            numpy_dtype = np.float64 if dtype == qb.float64 else np.float32
+            a = np.array(x.tolist(), dtype=numpy_dtype)
+            b = np.array(y.tolist(), dtype=numpy_dtype)
+            with np.errstate(all="ignore"):
+                for function, numpy_function in [(qb.fmod, np.fmod), (qb.mod, np.mod)]:
+                    expected = numpy_function(a, b).astype(np.float64).tolist()
+                    for actual, wanted in zip(function(x, y).tolist(), expected):
+                        assert _same_float(actual, wanted), (function, actual, wanted)
+    assert qb.fmod.__name__ == "fmod" and qb.remainder is qb.mod
+    # fmod is exact, also for a large quotient, where x - trunc(x / y) * y
+    # would lose every digit; mod adds y to a small negative remainder.
+    big = qb.array([1e20, -1e20, 2.0**60 + 1.0])
+    assert qb.fmod(big, 0.1).tolist() == [math.fmod(v, 0.1) for v in big.tolist()]
+    assert qb.mod(big, -3.0).tolist() == [v % -3.0 for v in big.tolist()]
+    assert qb.mod(qb.array([-1e-30]), 1.0).tolist() == [1.0]
+    # Broadcasting and weak Python scalars in either position.
+    x32 = qb.array([[7.5], [-7.5]], dtype=qb.float32)
+    divisors = [2.0, -2.0, 4.0]
+    y32 = qb.array(divisors, dtype=qb.float32)
+    for function, reference in [(qb.fmod, _python_fmod), (qb.mod, _python_mod)]:
+        expected = [[reference(a, b) for b in divisors] for a in [7.5, -7.5]]
+        for result in [function(x32, y32), qb.jit(function)(x32, y32)]:
+            assert result.shape == [2, 3] and result.dtype == qb.float32
+            assert result.tolist() == expected
+        assert function(x32, 2.0).dtype == qb.float32
+        assert function(-7.0, y32).dtype == qb.float32
+        assert function(-7.0, y32).tolist() == [reference(-7.0, b) for b in divisors]
+        traced = qb.jit(lambda t, f=function: f(t, -2.0))(y32)
+        assert traced.tolist() == [reference(b, -2.0) for b in divisors]
+    assert qb.array([7.5, -7.5]).fmod(2.0).tolist() == [1.5, -1.5]
+    assert_raises(ValueError, qb.fmod, qb.array([True]), qb.array([True]), match="bool")
+
+
+def test_fmod_and_mod_derivatives_are_piecewise_linear():
+    x = qb.array([5.5, -5.5, 7.0, -7.25, 0.3, 1e-30])
+    y = qb.array([2.0, 2.0, -3.0, -3.0, 0.1, 1.0])
+    pairs = list(zip(x.tolist(), y.tolist()))
+    # d fmod / dy is -trunc(x / y) of the exact quotient: 0.3 < 3 * 0.1 in
+    # binary, so fmod(0.3, 0.1) is 0.1 - 2.8e-17 and the quotient is 2.
+    fmod_y = [-float(round((a - math.fmod(a, b)) / b)) for a, b in pairs]
+    mod_y = [-float(round((a - a % b) / b)) for a, b in pairs]
+    assert fmod_y == [-2.0, 2.0, 2.0, -2.0, -2.0, -0.0]
+    assert mod_y == [-2.0, 3.0, 3.0, -2.0, -2.0, -0.0]
+    for function, expected_y in [(qb.fmod, fmod_y), (qb.mod, mod_y)]:
+
+        def total(a, b, f=function):
+            return qb.sum(f(a, b))
+
+        for transform in [qb.grad, lambda f, **options: qb.jit(qb.grad(f, **options))]:
+            gx, gy = transform(total, argnums=(0, 1))(x, y)
+            assert gx.tolist() == [1.0] * 6 and gy.tolist() == expected_y, (function, gy)
+        _, tangent = qb.jvp(function, (x, y), (qb.ones([6]), qb.full([6], 2.0)))
+        assert tangent.tolist() == [1.0 + 2.0 * d for d in expected_y]
+        per_entry = qb.vmap(qb.grad(function, argnums=(0, 1)))(x, y)
+        assert per_entry[0].tolist() == [1.0] * 6 and per_entry[1].tolist() == expected_y
+
+        def on_pair(p, f=function):
+            return f(p[0], p[1])
+
+        assert qb.jit(qb.hessian(on_pair))(qb.array([7.0, -3.0])).tolist() == [[0.0] * 2] * 2
+    # A Python number operand gets no derivative; the array operand does.
+    assert qb.grad(lambda a: qb.sum(qb.fmod(a, 2.0)))(x).tolist() == [1.0] * 6
+    divisors = qb.array([2.0, -2.0])
+    assert qb.grad(lambda b: qb.sum(qb.mod(5.5, b)))(divisors).tolist() == [-2.0, 3.0]
+    # Central differences agree away from the jumps.
+    step = 1e-7
+    for a, b in [(5.5, 2.0), (-7.25, -3.0), (4.0, 0.7), (-4.0, 0.7)]:
+        for function, expected in [
+            (qb.fmod, -float(math.trunc(a / b))),
+            (qb.mod, -float(math.floor(a / b))),
+        ]:
+            difference = (
+                function(qb.array(a), qb.array(b + step)).item()
+                - function(qb.array(a), qb.array(b - step)).item()
+            ) / (2.0 * step)
+            assert abs(difference - expected) <= 1e-6, (function, a, b, difference, expected)
+
+
 def test_stop_gradient_keeps_values_and_zeroes_every_derivative():
     x = qb.array([0.5, -2.0, 3.0])
     assert_tensor(qb.stop_gradient(x), x.tolist(), qb.float64)
