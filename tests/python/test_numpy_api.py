@@ -523,7 +523,7 @@ def test_device_results_match_cpu():
     ]
     for device in devices:
         assert device in qb.devices(), f"{device} requested but not built"
-        cases = transform_cases(qb.float32) + (svd_cases() if device == "cuda" else [])
+        cases = transform_cases(qb.float32) + svd_cases()
         for function, arguments in cases:
             arguments = tuple(a.astype(qb.float32) for a in arguments)
             expected = qb.jit(function)(*arguments)

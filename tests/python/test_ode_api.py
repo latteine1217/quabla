@@ -690,8 +690,7 @@ def test_optional_device_rosenbrock23_and_saveat_parity():
     for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
         if os.environ.get(flag) != "1":
             continue
-        # MLX has no linear solves, so rosenbrock23 runs on CUDA only.
-        losses = explicit + ([stiff, saved("rosenbrock23", {"rtol": 1e-4, "atol": 1e-6, "max_steps": 64})] if device == "cuda" else [])
+        losses = explicit + [stiff, saved("rosenbrock23", {"rtol": 1e-4, "atol": 1e-6, "max_steps": 64})]
         for loss in losses:
             for operation in (loss, qb.value_and_grad(loss)):
                 cpu = qb.tree.flatten(qb.jit(operation)(mu))[0]

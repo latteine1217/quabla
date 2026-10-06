@@ -487,8 +487,9 @@ def test_root_reports_non_convergence():
 # -- devices ----------------------------------------------------------------------
 
 
-def test_optional_cuda_solvers_match_cpu():
-    if os.environ.get("QUABLA_CUDA_TEST") != "1":
+def test_optional_device_solvers_match_cpu():
+    devices = [device for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")) if os.environ.get(gate) == "1"]
+    if not devices:
         return
     a32, n32 = spd(8).astype(qb.float32), nonsymmetric(8).astype(qb.float32)
     b32 = vector(8).astype(qb.float32)
@@ -509,11 +510,12 @@ def test_optional_cuda_solvers_match_cpu():
         (qb.value_and_grad(gmres_loss, argnums=(0, 1)), (b32, n32)),
         (qb.value_and_grad(root_loss), (p32,)),
     )
-    for function, arguments in cases:
-        expected = qb.tree.leaves(qb.jit(function)(*arguments))
-        actual = qb.tree.leaves(qb.jit(function, device="cuda")(*arguments))
-        for got, want in zip(actual, expected):
-            assert_close(got, want, 1e-4)
+    for device in devices:
+        for function, arguments in cases:
+            expected = qb.tree.leaves(qb.jit(function)(*arguments))
+            actual = qb.tree.leaves(qb.jit(function, device=device)(*arguments))
+            for got, want in zip(actual, expected):
+                assert_close(got, want, 1e-4)
 
 
 if __name__ == "__main__":
