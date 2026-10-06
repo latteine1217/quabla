@@ -1128,8 +1128,7 @@ pub struct TensorForiExecutionPlan {
     carry_name: String,
     index_name: String,
     external_captures: BTreeMap<String, Vec<usize>>,
-    #[cfg(feature = "mlx")]
-    mlx_vjp: Option<TensorMlxVjpPlan>,
+    derivatives: Arc<TensorLoopDerivatives>,
 }
 
 /// A loop with a traced termination predicate (`while_loop`).
@@ -1149,14 +1148,40 @@ pub struct TensorWhileExecutionPlan {
     external_captures: BTreeMap<String, Vec<usize>>,
 }
 
-/// Precompiled body reverse plan used by device backends that execute fixed
-/// loop iterations through host-side dispatch.
+/// The compiled symbolic VJP of a loop body.
+///
+/// The plan reads the body inputs plus one cotangent input per seeded body
+/// output and returns the summed VJP for the carry and every external
+/// capture; `bool` inputs have no gradient and no output. The CPU and MLX
+/// loop executors run this one plan per iteration, so a loop derivative is
+/// the same derivative graph as `unroll=True` and the CUDA host loop.
 #[derive(Clone, Debug)]
-#[cfg(feature = "mlx")]
-struct TensorMlxVjpPlan {
+struct TensorRegionVjpPlan {
     plan: TensorExecutionPlan,
-    cotangent_name: String,
+    cotangent_names: Vec<String>,
+    /// Gradient outputs by input name, in plan output order.
     gradient_node_ids: BTreeMap<String, TensorNodeId>,
+}
+
+/// The compiled symbolic forward-mode transform of one loop body output.
+///
+/// The plan reads the body inputs plus one tangent input per entry of
+/// `tangent_names` (the index and `bool` inputs have zero tangents) and
+/// returns the output value and its tangent, in that output order.
+#[derive(Clone, Debug)]
+struct TensorRegionJvpPlan {
+    plan: TensorExecutionPlan,
+    /// Capture name to tangent input name.
+    tangent_names: BTreeMap<String, String>,
+}
+
+/// Symbolic derivative plans of a loop body, compiled on first use and
+/// shared by every clone of the loop plan, so a region differentiates its
+/// body once instead of on every call. A failed build keeps its error.
+#[derive(Debug, Default)]
+struct TensorLoopDerivatives {
+    vjp: std::sync::OnceLock<Result<TensorRegionVjpPlan, String>>,
+    forward_jvp: std::sync::OnceLock<Result<TensorRegionJvpPlan, String>>,
 }
 
 /// The forward carry sequence for one fixed-bound `Fori` invocation.
@@ -1167,21 +1192,6 @@ struct TensorMlxVjpPlan {
 #[derive(Clone, Debug)]
 pub struct TensorForiTape {
     carries: Vec<DynamicTensor>,
-}
-
-/// A fixed-bound region loop with several independently shaped carries.
-///
-/// The body has one output per carry, in `carry_names` order. It is not yet a
-/// parent Tensor IR node; the initial use is reverse-loop lowering where the
-/// carry contains a cotangent plus capture-gradient accumulators.
-#[derive(Clone, Debug)]
-pub struct TensorForiMultiExecutionPlan {
-    lower: usize,
-    upper: usize,
-    body: TensorMultiRegion,
-    carry_names: Vec<String>,
-    index_name: String,
-    external_captures: BTreeMap<String, Vec<usize>>,
 }
 
 /// A fixed-bound carry/output region scan.
@@ -1196,15 +1206,7 @@ pub struct TensorScanExecutionPlan {
     carry_name: String,
     index_name: String,
     external_captures: BTreeMap<String, Vec<usize>>,
-    #[cfg(feature = "mlx")]
-    mlx_vjp: Option<TensorScanMlxVjpPlan>,
-}
-
-#[derive(Clone, Debug)]
-#[cfg(feature = "mlx")]
-struct TensorScanMlxVjpPlan {
-    carry: TensorMlxVjpPlan,
-    output: TensorMlxVjpPlan,
+    derivatives: Arc<TensorLoopDerivatives>,
 }
 
 /// Compiled forward-over-reverse transform for one fixed-bound `Fori` VJP.
@@ -1220,8 +1222,6 @@ pub struct TensorForiVjpJvpExecutionPlan {
     cotangent_name: String,
     tangent_names: BTreeMap<String, String>,
     gradient_tangent_plans: BTreeMap<String, TensorExecutionPlan>,
-    #[cfg(feature = "mlx")]
-    mlx_forward_jvp: TensorForiMlxForwardJvpPlan,
 }
 
 /// Compiled forward-over-reverse transform for one fixed-bound `Scan` VJP.
@@ -1240,26 +1240,9 @@ pub struct TensorScanVjpJvpExecutionPlan {
     tangent_names: BTreeMap<String, String>,
     carry_gradient_tangent_plans: BTreeMap<String, TensorExecutionPlan>,
     output_gradient_tangent_plans: BTreeMap<String, TensorExecutionPlan>,
-    #[cfg(feature = "mlx")]
-    mlx_forward_jvp: TensorScanMlxForwardJvpPlan,
-}
-
-#[derive(Clone, Debug)]
-#[cfg(feature = "mlx")]
-struct TensorScanMlxForwardJvpPlan {
-    plan: TensorExecutionPlan,
-    value_node_id: TensorNodeId,
-    tangent_node_id: TensorNodeId,
-    tangent_names: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug)]
-#[cfg(feature = "mlx")]
-struct TensorForiMlxForwardJvpPlan {
-    plan: TensorExecutionPlan,
-    value_node_id: TensorNodeId,
-    tangent_node_id: TensorNodeId,
-    tangent_names: BTreeMap<String, String>,
+    /// The carry output's forward JVP, which replays the primal and
+    /// directional carry tapes.
+    forward_jvp: TensorRegionJvpPlan,
 }
 
 #[derive(Clone, Debug)]
@@ -1277,12 +1260,6 @@ type TensorScanCheckpointVjpResult = (
 pub type TensorScanJvpResult = (
     (DynamicTensor, DynamicTensor),
     (DynamicTensor, DynamicTensor),
-);
-
-pub type TensorForiMultiVjpResult = (
-    Vec<DynamicTensor>,
-    Vec<DynamicTensor>,
-    BTreeMap<String, DynamicTensor>,
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -8420,7 +8397,7 @@ impl TensorIr {
                     captures,
                 } => {
                     let external = tensor_forward_capture_values(captures, &values)?;
-                    let (_, carry_gradient, external_gradients) = loop_plan.value_and_vjp(
+                    let (_, carry_gradient, external_gradients) = loop_plan.runtime_value_and_vjp(
                         values
                             .get(*carry)
                             .and_then(Option::as_ref)
@@ -8516,7 +8493,7 @@ impl TensorIr {
                             None => DynamicTensor::filled(scan_plan.output_shape()?, 0.0)?,
                         };
                         let external_inputs = tensor_forward_capture_values(captures, &values)?;
-                        let (carry_gradient, external_gradients) = scan_plan.vjp(
+                        let (carry_gradient, external_gradients) = scan_plan.runtime_vjp(
                             values
                                 .get(*carry)
                                 .and_then(Option::as_ref)
@@ -9202,7 +9179,7 @@ impl TensorIr {
                     let external_inputs = tensor_fori_capture_values(captures, &values)?;
                     let external_tangents = tensor_fori_capture_values(captures, &tangents)?;
                     loop_plan
-                        .jvp(
+                        .runtime_jvp(
                             values
                                 .get(*carry)
                                 .cloned()
@@ -13710,35 +13687,130 @@ impl TensorCondExecutionPlan {
     }
 }
 
-#[cfg(feature = "mlx")]
-fn build_tensor_fori_mlx_vjp_plan(
-    body_plan: &TensorExecutionPlan,
-    captures: &BTreeMap<String, Vec<usize>>,
-    output_node_id: TensorNodeId,
-    carry_name: &str,
-    external_captures: &BTreeMap<String, Vec<usize>>,
-) -> Option<TensorMlxVjpPlan> {
-    let mut cotangent_name = "__quabla_mlx_fori_cotangent".to_string();
-    while captures.contains_key(&cotangent_name) {
-        cotangent_name.push('_');
+impl TensorRegionVjpPlan {
+    /// Differentiates the body `outputs` jointly, one cotangent input each,
+    /// with respect to every body input except the loop index.
+    fn new(
+        body: &TensorExecutionPlan,
+        outputs: &[TensorNodeId],
+        captures: &BTreeMap<String, Vec<usize>>,
+        index_name: &str,
+    ) -> Result<Self, String> {
+        let cotangent_names = (0..outputs.len())
+            .map(|index| {
+                let mut name = format!("__quabla_loop_cotangent_{index}");
+                while captures.contains_key(&name) {
+                    name.push('_');
+                }
+                name
+            })
+            .collect::<Vec<_>>();
+        let ir = body.as_ir();
+        let (graph, gradients) = if let [output] = outputs {
+            let vjp = ir.symbolic_vjp(*output, &cotangent_names[0])?;
+            (vjp.graph, vjp.gradients)
+        } else {
+            let seeds = outputs
+                .iter()
+                .zip(&cotangent_names)
+                .map(|(output, name)| (*output, SymbolicCotangent::Input(name.clone())))
+                .collect::<Vec<_>>();
+            let vjp = ir.symbolic_vjp_many(&seeds)?;
+            (vjp.graph, vjp.gradients)
+        };
+        let (names, ids): (Vec<_>, Vec<_>) = gradients
+            .into_iter()
+            .filter(|(name, _)| name != index_name)
+            .unzip();
+        let (plan, ids) = graph.compile_cpu_many(&ids)?;
+        Ok(Self {
+            plan,
+            cotangent_names,
+            gradient_node_ids: names.into_iter().zip(ids).collect(),
+        })
     }
-    let symbolic = body_plan
-        .as_ir()
-        .symbolic_vjp(output_node_id, &cotangent_name)
-        .ok()?;
-    let mut names = vec![carry_name.to_string()];
-    names.extend(external_captures.keys().cloned());
-    let output_node_ids = names
-        .iter()
-        .map(|name| symbolic.gradients.get(name).copied())
-        .collect::<Option<Vec<_>>>()?;
-    let (plan, output_node_ids) = symbolic.graph.compile_cpu_many(&output_node_ids).ok()?;
-    let gradient_node_ids = names.into_iter().zip(output_node_ids).collect();
-    Some(TensorMlxVjpPlan {
-        plan,
-        cotangent_name,
-        gradient_node_ids,
-    })
+
+    /// Evaluates the VJP on the CPU for one iteration's body `inputs` and one
+    /// cotangent per seeded output.
+    fn evaluate(
+        &self,
+        mut inputs: BTreeMap<String, DynamicTensor>,
+        cotangents: impl IntoIterator<Item = DynamicTensor>,
+    ) -> Result<BTreeMap<String, DynamicTensor>, String> {
+        for (name, cotangent) in self.cotangent_names.iter().zip(cotangents) {
+            inputs.insert(name.clone(), cotangent);
+        }
+        let values = self.plan.evaluate_many(&inputs)?;
+        Ok(self.gradient_node_ids.keys().cloned().zip(values).collect())
+    }
+}
+
+impl TensorRegionJvpPlan {
+    fn new(
+        body: &TensorExecutionPlan,
+        output: TensorNodeId,
+        tangent_names: BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        let transformed = body
+            .as_ir()
+            .symbolic_jvp_with_tangent_inputs(output, &tangent_names)?;
+        let (plan, _) = transformed
+            .graph
+            .compile_cpu_many(&[transformed.value, transformed.tangent])?;
+        Ok(Self {
+            plan,
+            tangent_names,
+        })
+    }
+
+    /// The forward JVP of a loop body output with a fresh tangent input for
+    /// every differentiable input except the index.
+    fn for_loop_body(
+        body: &TensorExecutionPlan,
+        output: TensorNodeId,
+        captures: &BTreeMap<String, Vec<usize>>,
+        index_name: &str,
+    ) -> Result<Self, String> {
+        let mut tangent_names = BTreeMap::new();
+        for (index, name) in captures.keys().enumerate() {
+            if name == index_name || body.input_dtype(name)? == TensorDType::Bool {
+                continue;
+            }
+            let mut tangent_name = format!("__quabla_loop_tangent_{index}");
+            while captures.contains_key(&tangent_name) {
+                tangent_name.push('_');
+            }
+            tangent_names.insert(name.clone(), tangent_name);
+        }
+        Self::new(body, output, tangent_names)
+    }
+
+    /// Evaluates one iteration on the CPU: `carry_tangent` is the tangent of
+    /// `carry_name` and `external_tangents` holds the other captures'.
+    fn evaluate(
+        &self,
+        mut inputs: BTreeMap<String, DynamicTensor>,
+        carry_name: &str,
+        carry_tangent: DynamicTensor,
+        external_tangents: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<(DynamicTensor, DynamicTensor), String> {
+        for (name, tangent_name) in &self.tangent_names {
+            let tangent = if name == carry_name {
+                carry_tangent.clone()
+            } else {
+                external_tangents
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("loop JVP lacks a tangent for capture {name:?}"))?
+            };
+            inputs.insert(tangent_name.clone(), tangent);
+        }
+        let mut values = self.plan.evaluate_many(&inputs)?.into_iter();
+        match (values.next(), values.next()) {
+            (Some(value), Some(tangent)) => Ok((value, tangent)),
+            _ => Err("loop JVP plan did not return a value and a tangent".to_string()),
+        }
+    }
 }
 
 // VJP consumers need block boundaries rather than the public complete carry tape.
@@ -13869,14 +13941,6 @@ impl TensorForiExecutionPlan {
             .filter(|(name, _)| *name != &carry_name && *name != &index_name)
             .map(|(name, shape)| (name.clone(), shape.clone()))
             .collect::<BTreeMap<_, _>>();
-        #[cfg(feature = "mlx")]
-        let mlx_vjp = build_tensor_fori_mlx_vjp_plan(
-            &body.plan,
-            &body.captures,
-            body.plan.output_node_id,
-            &carry_name,
-            &external_captures,
-        );
         Ok(Self {
             lower,
             upper,
@@ -13884,9 +13948,40 @@ impl TensorForiExecutionPlan {
             carry_name,
             index_name,
             external_captures,
-            #[cfg(feature = "mlx")]
-            mlx_vjp,
+            derivatives: Arc::default(),
         })
+    }
+
+    /// The body's symbolic VJP, compiled on first use.
+    fn vjp_plan(&self) -> Result<&TensorRegionVjpPlan, String> {
+        self.derivatives
+            .vjp
+            .get_or_init(|| {
+                TensorRegionVjpPlan::new(
+                    &self.body.plan,
+                    &[self.body.plan.output_node_id],
+                    &self.body.captures,
+                    &self.index_name,
+                )
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// The body's symbolic forward JVP, compiled on first use.
+    fn forward_jvp_plan(&self) -> Result<&TensorRegionJvpPlan, String> {
+        self.derivatives
+            .forward_jvp
+            .get_or_init(|| {
+                TensorRegionJvpPlan::for_loop_body(
+                    &self.body.plan,
+                    self.body.plan.output_node_id,
+                    &self.body.captures,
+                    &self.index_name,
+                )
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     pub fn carry_shape(&self) -> Result<Vec<usize>, String> {
@@ -13948,12 +14043,66 @@ impl TensorForiExecutionPlan {
         Ok((carry, TensorForiTape { carries }))
     }
 
+    /// Forward-mode derivative through the loop; each iteration runs the
+    /// body's compiled symbolic JVP.
     pub fn jvp(
         &self,
         initial_carry: DynamicTensor,
         initial_tangent: DynamicTensor,
         external_inputs: &BTreeMap<String, DynamicTensor>,
         external_tangents: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<(DynamicTensor, DynamicTensor), String> {
+        self.jvp_with(
+            initial_carry,
+            initial_tangent,
+            external_inputs,
+            external_tangents,
+            |inputs, tangent| {
+                self.forward_jvp_plan()?.evaluate(
+                    inputs,
+                    &self.carry_name,
+                    tangent,
+                    external_tangents,
+                )
+            },
+        )
+    }
+
+    /// The `Fori` rule of the v0.1 runtime JVP engine, which keeps
+    /// differentiating the body with that engine so v0.1 results stay
+    /// unchanged; it goes away with the engine.
+    fn runtime_jvp(
+        &self,
+        initial_carry: DynamicTensor,
+        initial_tangent: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+        external_tangents: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<(DynamicTensor, DynamicTensor), String> {
+        self.jvp_with(
+            initial_carry,
+            initial_tangent,
+            external_inputs,
+            external_tangents,
+            |inputs, tangent| {
+                self.body
+                    .plan
+                    .jvp(&inputs, &self.body_tangents(tangent, external_tangents)?)
+            },
+        )
+    }
+
+    /// Runs the tangent recurrence with `step(body_inputs, carry_tangent)`
+    /// returning the next carry and its tangent.
+    fn jvp_with(
+        &self,
+        initial_carry: DynamicTensor,
+        initial_tangent: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+        external_tangents: &BTreeMap<String, DynamicTensor>,
+        mut step: impl FnMut(
+            BTreeMap<String, DynamicTensor>,
+            DynamicTensor,
+        ) -> Result<(DynamicTensor, DynamicTensor), String>,
     ) -> Result<(DynamicTensor, DynamicTensor), String> {
         self.validate_external_inputs(external_inputs)?;
         self.validate_external_inputs(external_tangents)?;
@@ -13966,20 +14115,70 @@ impl TensorForiExecutionPlan {
         let mut carry = initial_carry;
         let mut tangent = initial_tangent;
         for index in self.lower..self.upper {
-            let inputs = self.body_inputs(carry, index, external_inputs)?;
-            let tangents = self.body_tangents(tangent, external_tangents)?;
-            let (next_carry, next_tangent) = self.body.plan.jvp(&inputs, &tangents)?;
-            carry = next_carry;
-            tangent = next_tangent;
+            (carry, tangent) = step(self.body_inputs(carry, index, external_inputs)?, tangent)?;
         }
         Ok((carry, tangent))
     }
 
+    /// Reverse-mode derivative through the loop with checkpointed carries;
+    /// each iteration runs the body's compiled symbolic VJP.
     pub fn value_and_vjp(
         &self,
         initial_carry: DynamicTensor,
         external_inputs: &BTreeMap<String, DynamicTensor>,
         output_cotangent: DynamicTensor,
+    ) -> Result<
+        (
+            DynamicTensor,
+            DynamicTensor,
+            BTreeMap<String, DynamicTensor>,
+        ),
+        String,
+    > {
+        self.value_and_vjp_with(
+            initial_carry,
+            external_inputs,
+            output_cotangent,
+            |inputs, cotangent| self.vjp_plan()?.evaluate(inputs, [cotangent]),
+        )
+    }
+
+    /// The `Fori` rule of the v0.1 runtime VJP engine, which keeps
+    /// differentiating the body with that engine so v0.1 results stay
+    /// unchanged; it goes away with the engine.
+    fn runtime_value_and_vjp(
+        &self,
+        initial_carry: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+        output_cotangent: DynamicTensor,
+    ) -> Result<
+        (
+            DynamicTensor,
+            DynamicTensor,
+            BTreeMap<String, DynamicTensor>,
+        ),
+        String,
+    > {
+        self.value_and_vjp_with(
+            initial_carry,
+            external_inputs,
+            output_cotangent,
+            |inputs, cotangent| Ok(self.body.plan.value_and_vjp(&inputs, cotangent)?.1),
+        )
+    }
+
+    /// Runs the reverse recurrence with `step(body_inputs, carry_cotangent)`
+    /// returning the body gradients by input name. A capture without a
+    /// gradient (a `bool` input in the symbolic VJP) contributes zero.
+    fn value_and_vjp_with(
+        &self,
+        initial_carry: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+        output_cotangent: DynamicTensor,
+        mut step: impl FnMut(
+            BTreeMap<String, DynamicTensor>,
+            DynamicTensor,
+        ) -> Result<BTreeMap<String, DynamicTensor>, String>,
     ) -> Result<
         (
             DynamicTensor,
@@ -14044,8 +14243,8 @@ impl TensorForiExecutionPlan {
             for (local_offset, carry) in carries.into_iter().enumerate().rev() {
                 let offset = start + local_offset;
                 let index = self.lower + offset;
-                let (_, gradients) = self.body.plan.value_and_vjp(
-                    &self.body_inputs(carry, index, external_inputs)?,
+                let gradients = step(
+                    self.body_inputs(carry, index, external_inputs)?,
                     carry_cotangent,
                 )?;
                 carry_cotangent = gradients
@@ -14053,9 +14252,9 @@ impl TensorForiExecutionPlan {
                     .cloned()
                     .ok_or_else(|| "fori loop body did not return a carry gradient".to_string())?;
                 for name in self.external_captures.keys() {
-                    let contribution = gradients.get(name).ok_or_else(|| {
-                        format!("fori loop body did not return a gradient for capture {name:?}")
-                    })?;
+                    let Some(contribution) = gradients.get(name) else {
+                        continue;
+                    };
                     let accumulated = external_gradients.get_mut(name).ok_or_else(|| {
                         format!("fori loop external gradient {name:?} is missing")
                     })?;
@@ -14314,20 +14513,6 @@ impl TensorForiVjpJvpExecutionPlan {
             }
             tangent_names.insert(name.clone(), tangent_name);
         }
-        #[cfg(feature = "mlx")]
-        let mlx_forward_jvp = {
-            let transformed =
-                body.symbolic_jvp_with_tangent_inputs(body_plan.output_node_id, &tangent_names)?;
-            let (plan, output_node_ids) = transformed
-                .graph
-                .compile_cpu_many(&[transformed.value, transformed.tangent])?;
-            TensorForiMlxForwardJvpPlan {
-                plan,
-                value_node_id: output_node_ids[0],
-                tangent_node_id: output_node_ids[1],
-                tangent_names: tangent_names.clone(),
-            }
-        };
         let mut jvp_tangent_names = tangent_names.clone();
         let mut cotangent_tangent_name = format!("{namespace}_cotangent_tangent");
         while loop_plan
@@ -14364,8 +14549,6 @@ impl TensorForiVjpJvpExecutionPlan {
             cotangent_name,
             tangent_names: jvp_tangent_names,
             gradient_tangent_plans,
-            #[cfg(feature = "mlx")]
-            mlx_forward_jvp,
         })
     }
 
@@ -14397,11 +14580,11 @@ impl TensorForiVjpJvpExecutionPlan {
                 self.loop_plan.lower + offset,
                 external_inputs,
             )?;
-            let tangents = self.loop_plan.body_tangents(tangent, external_tangents)?;
-            self.loop_plan.body.plan.as_ir().jvp(
-                self.loop_plan.body.plan.output_node_id,
-                &inputs,
-                &tangents,
+            self.loop_plan.forward_jvp_plan()?.evaluate(
+                inputs,
+                &self.loop_plan.carry_name,
+                tangent,
+                external_tangents,
             )
         };
         let mut checkpoints = None;
@@ -14448,10 +14631,8 @@ impl TensorForiVjpJvpExecutionPlan {
                 )?;
                 let body_gradients = self
                     .loop_plan
-                    .body
-                    .plan
-                    .value_and_vjp(&inputs, carry_cotangent.clone())?
-                    .1;
+                    .vjp_plan()?
+                    .evaluate(inputs.clone(), [carry_cotangent.clone()])?;
                 let mut jvp_inputs = inputs;
                 jvp_inputs.insert(self.cotangent_name.clone(), carry_cotangent.clone());
                 let mut jvp_tangents = BTreeMap::new();
@@ -14585,27 +14766,15 @@ impl TensorScanVjpJvpExecutionPlan {
             compile_gradient_tangents(carry_vjp, &carry_cotangent_name)?;
         let output_gradient_tangent_plans =
             compile_gradient_tangents(output_vjp, &output_cotangent_name)?;
-        #[cfg(feature = "mlx")]
-        let mlx_forward_jvp = {
-            let forward_tangent_names = tangent_names
+        let forward_jvp = TensorRegionJvpPlan::new(
+            body_plan,
+            body_plan.output_node_ids[0],
+            tangent_names
                 .iter()
                 .filter(|(name, _)| scan_plan.body.captures.contains_key(*name))
                 .map(|(name, tangent_name)| (name.clone(), tangent_name.clone()))
-                .collect::<BTreeMap<_, _>>();
-            let transformed = body.symbolic_jvp_with_tangent_inputs(
-                body_plan.output_node_ids[0],
-                &forward_tangent_names,
-            )?;
-            let (plan, output_node_ids) = transformed
-                .graph
-                .compile_cpu_many(&[transformed.value, transformed.tangent])?;
-            TensorScanMlxForwardJvpPlan {
-                plan,
-                value_node_id: output_node_ids[0],
-                tangent_node_id: output_node_ids[1],
-                tangent_names: forward_tangent_names,
-            }
-        };
+                .collect(),
+        )?;
         Ok(Self {
             scan_plan,
             namespace: namespace.to_string(),
@@ -14614,8 +14783,7 @@ impl TensorScanVjpJvpExecutionPlan {
             tangent_names,
             carry_gradient_tangent_plans,
             output_gradient_tangent_plans,
-            #[cfg(feature = "mlx")]
-            mlx_forward_jvp,
+            forward_jvp,
         })
     }
 
@@ -14652,11 +14820,11 @@ impl TensorScanVjpJvpExecutionPlan {
             let inputs =
                 self.scan_plan
                     .inputs(carry, self.scan_plan.lower + offset, external_inputs)?;
-            let tangents = self.scan_plan.tangents(tangent, external_tangents)?;
-            self.scan_plan.body.plan.as_ir().jvp(
-                self.scan_plan.body.plan.output_node_ids[0],
-                &inputs,
-                &tangents,
+            self.forward_jvp.evaluate(
+                inputs,
+                &self.scan_plan.carry_name,
+                tangent,
+                external_tangents,
             )
         };
         let mut checkpoints = None;
@@ -14706,9 +14874,9 @@ impl TensorScanVjpJvpExecutionPlan {
                 let output_step_cotangent_tangent = output_cotangent_tangent
                     .slice_axis(0, offset, 1)?
                     .reshape(output_step_shape.clone())?;
-                let (_, primal_gradients) = self.scan_plan.body.plan.value_and_vjp_many(
-                    &inputs,
-                    vec![carry_cotangent.clone(), output_step_cotangent.clone()],
+                let primal_gradients = self.scan_plan.vjp_plan()?.evaluate(
+                    inputs.clone(),
+                    [carry_cotangent.clone(), output_step_cotangent.clone()],
                 )?;
                 let mut jvp_inputs = inputs;
                 jvp_inputs.insert(self.carry_cotangent_name.clone(), carry_cotangent.clone());
@@ -14838,26 +15006,6 @@ impl TensorScanExecutionPlan {
             .filter(|(name, _)| *name != &carry_name && *name != &index_name)
             .map(|(name, shape)| (name.clone(), shape.clone()))
             .collect::<BTreeMap<_, _>>();
-        #[cfg(feature = "mlx")]
-        let mlx_vjp = match (
-            build_tensor_fori_mlx_vjp_plan(
-                &body.plan,
-                body.captures(),
-                body.plan.output_node_ids[0],
-                &carry_name,
-                &external_captures,
-            ),
-            build_tensor_fori_mlx_vjp_plan(
-                &body.plan,
-                body.captures(),
-                body.plan.output_node_ids[1],
-                &carry_name,
-                &external_captures,
-            ),
-        ) {
-            (Some(carry), Some(output)) => Some(TensorScanMlxVjpPlan { carry, output }),
-            _ => None,
-        };
         Ok(Self {
             lower,
             upper,
@@ -14865,9 +15013,25 @@ impl TensorScanExecutionPlan {
             carry_name,
             index_name,
             external_captures,
-            #[cfg(feature = "mlx")]
-            mlx_vjp,
+            derivatives: Arc::default(),
         })
+    }
+
+    /// The body's joint symbolic VJP of `(next_carry, output)`, with the
+    /// carry cotangent then the step-output cotangent, compiled on first use.
+    fn vjp_plan(&self) -> Result<&TensorRegionVjpPlan, String> {
+        self.derivatives
+            .vjp
+            .get_or_init(|| {
+                TensorRegionVjpPlan::new(
+                    &self.body.plan,
+                    &self.body.plan.output_node_ids,
+                    self.body.captures(),
+                    &self.index_name,
+                )
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     pub fn carry_shape(&self) -> Result<Vec<usize>, String> {
@@ -15001,6 +15165,10 @@ impl TensorScanExecutionPlan {
             final_carry_cotangent,
             output_cotangent,
             true,
+            |inputs, carry_cotangent, output_cotangent| {
+                self.vjp_plan()?
+                    .evaluate(inputs, [carry_cotangent, output_cotangent])
+            },
         )?;
         Ok((
             carry,
@@ -15024,10 +15192,45 @@ impl TensorScanExecutionPlan {
             final_carry_cotangent,
             output_cotangent,
             false,
+            |inputs, carry_cotangent, output_cotangent| {
+                self.vjp_plan()?
+                    .evaluate(inputs, [carry_cotangent, output_cotangent])
+            },
         )?;
         Ok((gradient, captures))
     }
 
+    /// The `Scan` rule of the v0.1 runtime VJP engine, which keeps
+    /// differentiating the body with that engine so v0.1 results stay
+    /// unchanged; it goes away with the engine.
+    fn runtime_vjp(
+        &self,
+        initial_carry: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+        final_carry_cotangent: DynamicTensor,
+        output_cotangent: DynamicTensor,
+    ) -> Result<(DynamicTensor, BTreeMap<String, DynamicTensor>), String> {
+        let (_, _, gradient, captures) = self.value_and_vjp_internal(
+            initial_carry,
+            external_inputs,
+            final_carry_cotangent,
+            output_cotangent,
+            false,
+            |inputs, carry_cotangent, output_cotangent| {
+                Ok(self
+                    .body
+                    .plan
+                    .value_and_vjp_many(&inputs, vec![carry_cotangent, output_cotangent])?
+                    .1)
+            },
+        )?;
+        Ok((gradient, captures))
+    }
+
+    /// Runs the reverse recurrence with `step(body_inputs, carry_cotangent,
+    /// step_output_cotangent)` returning the body gradients by input name. A
+    /// capture without a gradient (a `bool` input in the symbolic VJP)
+    /// contributes zero.
     fn value_and_vjp_internal(
         &self,
         initial_carry: DynamicTensor,
@@ -15035,6 +15238,11 @@ impl TensorScanExecutionPlan {
         final_carry_cotangent: DynamicTensor,
         output_cotangent: DynamicTensor,
         keep_outputs: bool,
+        mut step: impl FnMut(
+            BTreeMap<String, DynamicTensor>,
+            DynamicTensor,
+            DynamicTensor,
+        ) -> Result<BTreeMap<String, DynamicTensor>, String>,
     ) -> Result<TensorScanCheckpointVjpResult, String> {
         self.validate(initial_carry.clone(), external_inputs)?;
         let steps = self.upper - self.lower;
@@ -15125,18 +15333,15 @@ impl TensorScanExecutionPlan {
                     .slice_axis(0, offset, 1)?
                     .reshape(output_shape.clone())?;
                 let inputs = self.inputs(carry, self.lower + offset, external_inputs)?;
-                let (_, gradients) = self
-                    .body
-                    .plan
-                    .value_and_vjp_many(&inputs, vec![carry_cotangent, output_gradient])?;
+                let gradients = step(inputs, carry_cotangent, output_gradient)?;
                 carry_cotangent = gradients
                     .get(&self.carry_name)
                     .cloned()
                     .ok_or_else(|| "scan body has no carry gradient".to_string())?;
                 for name in self.external_captures.keys() {
-                    let contribution = gradients
-                        .get(name)
-                        .ok_or_else(|| format!("scan body has no gradient for {name:?}"))?;
+                    let Some(contribution) = gradients.get(name) else {
+                        continue;
+                    };
                     let accumulated = external_gradients
                         .get_mut(name)
                         .ok_or_else(|| format!("scan gradient {name:?} is missing"))?;
@@ -15209,259 +15414,6 @@ fn stack_scan_outputs(outputs: Vec<DynamicTensor>) -> Result<DynamicTensor, Stri
         .map(|value| value.reshape(shape.clone()))
         .collect::<Result<Vec<_>, _>>()?;
     DynamicTensor::concat(&reshaped.iter().collect::<Vec<_>>(), 0)
-}
-
-impl TensorForiMultiExecutionPlan {
-    pub fn new(
-        lower: usize,
-        upper: usize,
-        body: TensorExecutionPlan,
-        carry_names: Vec<String>,
-        index_name: impl Into<String>,
-    ) -> Result<Self, String> {
-        if upper < lower {
-            return Err(format!(
-                "multi-carry fori loop requires upper >= lower, got {upper} < {lower}"
-            ));
-        }
-        if carry_names.is_empty() {
-            return Err("multi-carry fori loop requires at least one carry".to_string());
-        }
-        let index_name = index_name.into();
-        let mut names = BTreeSet::new();
-        for name in &carry_names {
-            if name == &index_name || !names.insert(name.as_str()) {
-                return Err(
-                    "multi-carry fori names must be distinct from the index and each other"
-                        .to_string(),
-                );
-            }
-        }
-        let body = TensorMultiRegion::new(body)?;
-        if body.output_shapes().len() != carry_names.len() {
-            return Err(format!(
-                "multi-carry fori body has {} outputs, expected {}",
-                body.output_shapes().len(),
-                carry_names.len()
-            ));
-        }
-        for (name, output_shape) in carry_names.iter().zip(body.output_shapes()) {
-            let carry_shape = body
-                .captures()
-                .get(name)
-                .ok_or_else(|| format!("multi-carry fori body does not capture carry {name:?}"))?;
-            if carry_shape != output_shape {
-                return Err(format!(
-                    "multi-carry fori output for {name:?} has shape {output_shape:?}, expected {carry_shape:?}"
-                ));
-            }
-        }
-        check_loop_region_inputs(&body.plan, "multi-carry fori")?;
-        for (name, output) in carry_names.iter().zip(&body.plan.output_node_ids) {
-            check_region_output_dtype(&body.plan, *output, name, "multi-carry fori")?;
-        }
-        let index_shape = body.captures().get(&index_name).ok_or_else(|| {
-            format!("multi-carry fori body does not capture index {index_name:?}")
-        })?;
-        if !index_shape.is_empty() {
-            return Err(format!(
-                "multi-carry fori index capture must be scalar, got shape {index_shape:?}"
-            ));
-        }
-        let external_captures = body
-            .captures()
-            .iter()
-            .filter(|(name, _)| *name != &index_name && !carry_names.contains(*name))
-            .map(|(name, shape)| (name.clone(), shape.clone()))
-            .collect();
-        Ok(Self {
-            lower,
-            upper,
-            body,
-            carry_names,
-            index_name,
-            external_captures,
-        })
-    }
-
-    pub fn carry_names(&self) -> &[String] {
-        &self.carry_names
-    }
-
-    pub fn external_captures(&self) -> &BTreeMap<String, Vec<usize>> {
-        &self.external_captures
-    }
-
-    pub fn evaluate(
-        &self,
-        initial_carries: Vec<DynamicTensor>,
-        external_inputs: &BTreeMap<String, DynamicTensor>,
-    ) -> Result<Vec<DynamicTensor>, String> {
-        if initial_carries.len() != self.carry_names.len() {
-            return Err(format!(
-                "multi-carry fori received {} carries, expected {}",
-                initial_carries.len(),
-                self.carry_names.len()
-            ));
-        }
-        self.validate_external_inputs(external_inputs)?;
-        for (carry, name) in initial_carries.iter().zip(&self.carry_names) {
-            let shape = self
-                .body
-                .captures()
-                .get(name)
-                .ok_or_else(|| format!("multi-carry fori carry {name:?} is missing"))?;
-            if &carry.shape != shape {
-                return Err(format!(
-                    "multi-carry fori initial carry {name:?} has shape {:?}, expected {shape:?}",
-                    carry.shape
-                ));
-            }
-        }
-        let mut carries = initial_carries;
-        for index in self.lower..self.upper {
-            let mut inputs = external_inputs.clone();
-            inputs.insert(
-                self.index_name.clone(),
-                DynamicTensor::new(vec![], vec![index as f64])?,
-            );
-            for (name, carry) in self.carry_names.iter().zip(&carries) {
-                inputs.insert(name.clone(), carry.clone());
-            }
-            carries = self.body.evaluate(&inputs)?;
-        }
-        Ok(carries)
-    }
-
-    /// Executes a multi-carry loop and reverses all body outputs together.
-    ///
-    /// This is the reverse-loop primitive needed by symbolic `Fori` VJP. The
-    /// body plan receives one joint reverse pass per iteration rather than one
-    /// pass per carry, preserving shared-subgraph work.
-    pub fn value_and_vjp(
-        &self,
-        initial_carries: Vec<DynamicTensor>,
-        external_inputs: &BTreeMap<String, DynamicTensor>,
-        output_cotangents: Vec<DynamicTensor>,
-    ) -> Result<TensorForiMultiVjpResult, String> {
-        if output_cotangents.len() != self.carry_names.len() {
-            return Err(format!(
-                "multi-carry fori received {} output cotangents, expected {}",
-                output_cotangents.len(),
-                self.carry_names.len()
-            ));
-        }
-        if initial_carries.len() != self.carry_names.len() {
-            return Err(format!(
-                "multi-carry fori received {} carries, expected {}",
-                initial_carries.len(),
-                self.carry_names.len()
-            ));
-        }
-        self.validate_external_inputs(external_inputs)?;
-        for ((carry, cotangent), name) in initial_carries
-            .iter()
-            .zip(&output_cotangents)
-            .zip(&self.carry_names)
-        {
-            let shape = self
-                .body
-                .captures()
-                .get(name)
-                .ok_or_else(|| format!("multi-carry fori carry {name:?} is missing"))?;
-            if &carry.shape != shape || &cotangent.shape != shape {
-                return Err(format!(
-                    "multi-carry fori carry and cotangent for {name:?} must have shape {shape:?}"
-                ));
-            }
-        }
-
-        let mut tape = Vec::with_capacity(self.upper - self.lower + 1);
-        let mut carries = initial_carries;
-        tape.push(carries.clone());
-        for index in self.lower..self.upper {
-            carries = self
-                .body
-                .evaluate(&self.body_inputs(carries, index, external_inputs)?)?;
-            tape.push(carries.clone());
-        }
-        let outputs = carries;
-        let mut carry_cotangents = output_cotangents;
-        let mut external_gradients = self
-            .external_captures
-            .iter()
-            .map(|(name, shape)| {
-                DynamicTensor::filled(shape.clone(), 0.0).map(|value| (name.clone(), value))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        for offset in (0..self.upper - self.lower).rev() {
-            let index = self.lower + offset;
-            let (_, gradients) = self.body.plan.value_and_vjp_many(
-                &self.body_inputs(tape[offset].clone(), index, external_inputs)?,
-                carry_cotangents,
-            )?;
-            carry_cotangents = self
-                .carry_names
-                .iter()
-                .map(|name| {
-                    gradients
-                        .get(name)
-                        .cloned()
-                        .ok_or_else(|| format!("multi-carry body has no gradient for {name:?}"))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            for name in self.external_captures.keys() {
-                let gradient = gradients.get(name).ok_or_else(|| {
-                    format!("multi-carry body has no gradient for external capture {name:?}")
-                })?;
-                let slot = external_gradients.get_mut(name).ok_or_else(|| {
-                    format!("multi-carry external gradient slot {name:?} is missing")
-                })?;
-                *slot = slot.add(gradient)?;
-            }
-        }
-        Ok((outputs, carry_cotangents, external_gradients))
-    }
-
-    fn body_inputs(
-        &self,
-        carries: Vec<DynamicTensor>,
-        index: usize,
-        external_inputs: &BTreeMap<String, DynamicTensor>,
-    ) -> Result<BTreeMap<String, DynamicTensor>, String> {
-        let mut inputs = external_inputs.clone();
-        inputs.insert(
-            self.index_name.clone(),
-            DynamicTensor::new(vec![], vec![index as f64])?,
-        );
-        for (name, carry) in self.carry_names.iter().zip(carries) {
-            inputs.insert(name.clone(), carry);
-        }
-        Ok(inputs)
-    }
-
-    fn validate_external_inputs(
-        &self,
-        external_inputs: &BTreeMap<String, DynamicTensor>,
-    ) -> Result<(), String> {
-        if external_inputs.len() != self.external_captures.len() {
-            return Err(
-                "multi-carry fori external inputs must match body captures exactly".to_string(),
-            );
-        }
-        for (name, expected_shape) in &self.external_captures {
-            let value = external_inputs
-                .get(name)
-                .ok_or_else(|| format!("missing multi-carry fori external input {name:?}"))?;
-            if &value.shape != expected_shape {
-                return Err(format!(
-                    "multi-carry fori external input {name:?} has shape {:?}, expected {expected_shape:?}",
-                    value.shape
-                ));
-            }
-        }
-        Ok(())
-    }
 }
 
 impl TensorForiTape {

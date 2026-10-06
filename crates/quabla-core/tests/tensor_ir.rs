@@ -7,9 +7,9 @@ use quabla_core::tensor_ir::{
     CpuBackend, DynamicTensor, SymbolicCotangent, TensorBackend, TensorBufferSlot,
     TensorCondExecutionPlan, TensorCustomRule, TensorDType, TensorDeviceBackend, TensorDeviceId,
     TensorDeviceMesh, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan,
-    TensorForiMultiExecutionPlan, TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr,
-    TensorNodeId, TensorPartitionSpec, TensorPlacement, TensorReplicaReduction,
-    TensorScanExecutionPlan, TensorShardingPlan, UnaryMathKind,
+    TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr, TensorNodeId, TensorPartitionSpec,
+    TensorPlacement, TensorReplicaReduction, TensorScanExecutionPlan, TensorShardingPlan,
+    UnaryMathKind,
 };
 use quabla_core::{QuablaCompiler, QuablaMultiOutputProgram, QuablaPrecision, QuablaTarget};
 
@@ -1045,56 +1045,6 @@ fn fori_region_allows_an_unused_index_input() {
         .as_ref(),
         &[7.0]
     );
-}
-
-#[test]
-fn multi_carry_fori_region_preserves_ordered_outputs_and_external_captures() {
-    let mut body = TensorIr::new();
-    let position = must!(body.input("position", vec![]));
-    let energy = must!(body.input("energy", vec![1]));
-    let index = must!(body.input("index", vec![]));
-    let scale = must!(body.input("scale", vec![1]));
-    let next_position = must!(body.add(position, index));
-    let next_energy = must!(body.mul(energy, scale));
-    let (body_plan, _) = must!(body.compile_cpu_many(&[next_position, next_energy]));
-    let loop_plan = must!(TensorForiMultiExecutionPlan::new(
-        0,
-        2,
-        body_plan,
-        vec!["position".to_string(), "energy".to_string()],
-        "index",
-    ));
-    assert_eq!(loop_plan.carry_names(), &["position", "energy"]);
-    let carries = must!(loop_plan.evaluate(
-        vec![
-            must!(DynamicTensor::new(vec![], vec![1.0])),
-            must!(DynamicTensor::new(vec![1], vec![2.0])),
-        ],
-        &BTreeMap::from([(
-            "scale".to_string(),
-            must!(DynamicTensor::new(vec![1], vec![3.0])),
-        )]),
-    ));
-    assert_eq!(carries[0].data().as_ref(), &[2.0]);
-    assert_eq!(carries[1].data().as_ref(), &[18.0]);
-
-    let (_, initial_gradients, external_gradients) = must!(loop_plan.value_and_vjp(
-        vec![
-            must!(DynamicTensor::new(vec![], vec![1.0])),
-            must!(DynamicTensor::new(vec![1], vec![2.0])),
-        ],
-        &BTreeMap::from([(
-            "scale".to_string(),
-            must!(DynamicTensor::new(vec![1], vec![3.0])),
-        )]),
-        vec![
-            must!(DynamicTensor::new(vec![], vec![1.0])),
-            must!(DynamicTensor::new(vec![1], vec![1.0])),
-        ],
-    ));
-    assert_eq!(initial_gradients[0].data().as_ref(), &[1.0]);
-    assert_eq!(initial_gradients[1].data().as_ref(), &[9.0]);
-    assert_eq!(external_gradients["scale"].data().as_ref(), &[12.0]);
 }
 
 #[test]
