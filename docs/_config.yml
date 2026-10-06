@@ -1,0 +1,6 @@
+# GitHub Pages builds this directory with its built-in Jekyll (Settings ->
+# Pages -> Deploy from a branch -> main, /docs), so no workflow is needed.
+# The default plugins rewrite links between .md files to the rendered pages
+# and serve each directory's README.md as its index.
+title: Quabla
+description: Differentiable scientific computing for PINNs on CPU, CUDA, and Apple silicon
