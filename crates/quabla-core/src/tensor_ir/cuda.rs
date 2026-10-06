@@ -21,8 +21,8 @@ use cudarc::nccl::{group_end, group_start, Comm as NcclComm, ReduceOp as NcclRed
 
 use super::{
     contiguous_strides, cuda_elementwise_formula, cuda_scalar_literal, element_count, region_op,
-    tensor_op_inputs, DynamicTensor, LinalgKind, RegionView, TensorBackend, TensorDType,
-    TensorDeviceBackend, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan,
+    tensor_op_inputs, DynamicTensor, LinalgKind, RegionKind, RegionNode, RegionView, TensorBackend,
+    TensorDType, TensorDeviceBackend, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan,
     TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget, TensorFusionRegion, TensorNodeId, TensorOp,
     TensorReplicaReduction, TensorScanExecutionPlan, TensorScanTarget,
     TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget, TensorShardingPlan, UnaryMathKind,
@@ -896,7 +896,10 @@ pub(super) fn cuda_fused_loop_lowering(op: &TensorOp) -> Option<Result<(), Strin
     Some(match op {
         // A data-dependent trip count has no fused kernel; `While` always runs as a
         // host-driven region loop.
-        TensorOp::While { .. } => Err("while_loop has a data-dependent trip count".to_string()),
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::While { .. },
+            ..
+        }) => Err("while_loop has a data-dependent trip count".to_string()),
         TensorOp::Fori { loop_plan, .. } => cuda_fori_body_is_lowerable(loop_plan),
         TensorOp::ForiJvp { loop_plan, .. } => cuda_fori_jvp_is_lowerable(loop_plan),
         TensorOp::ForiVjp {
@@ -2184,7 +2187,10 @@ fn execute_cuda_device_program<T: CudaReal>(
                 )?;
             }
             // `validate_cuda_plan` rejects While before compilation.
-            TensorOp::While { .. } => {
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::While { .. },
+                ..
+            }) => {
                 return Err(format!(
                     "CUDA While node {node_id} reached execution without validation"
                 ))
@@ -7838,7 +7844,7 @@ fn cuda_program_source(
             TensorOp::Solve { .. }
             | TensorOp::Linalg { .. }
             | TensorOp::Cond { .. }
-            | TensorOp::While { .. } => {
+            | TensorOp::Region(RegionNode { kind: RegionKind::While { .. }, .. }) => {
                 String::new()
             }
             TensorOp::Fori {

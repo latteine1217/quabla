@@ -24,7 +24,7 @@ pub use extremum::TensorExtremum;
 mod host_storage;
 pub use host_storage::HostTensorStorage;
 mod region;
-use region::{region_op, RegionView};
+use region::{region_op, RegionKind, RegionNode, RegionView};
 mod region_batching;
 #[cfg(test)]
 mod region_batching_tests;
@@ -656,13 +656,6 @@ enum TensorOp {
         target: TensorForiVjpTarget,
         group: usize,
     },
-    /// A data-dependent loop: the body runs while the predicate region
-    /// returns true. Only the final carry is produced.
-    While {
-        carry: TensorNodeId,
-        loop_plan: TensorWhileExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-    },
     /// One selected result of a shared fixed-bound `Scan` execution.
     Scan {
         carry: TensorNodeId,
@@ -697,6 +690,10 @@ enum TensorOp {
         target: TensorScanVjpTarget,
         group: usize,
     },
+    /// A control-flow region node (`cond`, `while_loop`, `fori_loop`,
+    /// `scan`, and the derivative nodes of the fixed-bound loops); see
+    /// `region.rs`.
+    Region(RegionNode),
     Sum {
         input: TensorNodeId,
     },
@@ -3343,9 +3340,10 @@ impl TensorIr {
             | TensorOp::Scan { .. }
             | TensorOp::ScanVjp { .. }
             | TensorOp::ScanVjpJvp { .. }
-            | TensorOp::While { .. } => {
-                return self.push_batched_loop(node, (remap, mapped), batch_size, loop_groups)
-            }
+            | TensorOp::Region(RegionNode {
+                kind: RegionKind::While { .. },
+                ..
+            }) => return self.push_batched_loop(node, (remap, mapped), batch_size, loop_groups),
             TensorOp::Cond { .. } => {
                 return self.push_batched_cond(node, (remap, mapped), batch_size)
             }
@@ -3729,11 +3727,11 @@ impl TensorIr {
                     &pairs,
                     &format!("__quabla_fori_jvp_{node_index}"),
                 )?,
-                TensorOp::While {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { carry, loop_plan },
                     captures,
-                } => symbolic_jvp_while(
+                    ..
+                }) => symbolic_jvp_while(
                     &mut transformed,
                     loop_plan,
                     *carry,
@@ -4282,11 +4280,11 @@ impl TensorIr {
                     loop_plan,
                     captures,
                 } => symbolic_clone_fori(&mut transformed, *carry, loop_plan, captures, &values)?,
-                TensorOp::While {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { carry, loop_plan },
                     captures,
-                } => symbolic_clone_while(&mut transformed, *carry, loop_plan, captures, &values)?,
+                    ..
+                }) => symbolic_clone_while(&mut transformed, *carry, loop_plan, captures, &values)?,
                 TensorOp::ForiVjp { .. } => {
                     return Err(
                         "symbolic VJP through a Fori VJP result is not implemented".to_string()
@@ -4544,7 +4542,10 @@ impl TensorIr {
                     &mut cotangents,
                     node_id,
                 )?,
-                TensorOp::While { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { .. },
+                    ..
+                }) => {
                     return Err(WHILE_LOOP_REVERSE_MODE_ERROR.to_string());
                 }
                 TensorOp::ForiVjp { .. } => {
@@ -5702,11 +5703,11 @@ impl TensorIr {
         )?;
         let dtype = loop_plan.body.plan.input_dtype(&loop_plan.carry_name)?;
         Ok(self.push_node(
-            TensorOp::While {
-                carry,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::While { carry, loop_plan },
                 captures,
-            },
+                tangent_captures: Vec::new(),
+            }),
             carry_shape,
             dtype,
             false,
@@ -7795,7 +7796,10 @@ impl TensorIr {
                         accumulate(&mut cotangents[*capture], gradient)?;
                     }
                 }
-                TensorOp::While { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { .. },
+                    ..
+                }) => {
                     return Err(WHILE_LOOP_REVERSE_MODE_ERROR.to_string());
                 }
                 TensorOp::ForiVjp { .. } => {
@@ -8460,11 +8464,11 @@ impl TensorIr {
                         )?
                         .1
                 }
-                TensorOp::While {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { carry, loop_plan },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let external_inputs = tensor_fori_capture_values(captures, &values)?;
                     let external_tangents = tensor_fori_capture_values(captures, &tangents)?;
                     loop_plan
@@ -9200,11 +9204,7 @@ impl TensorIr {
                     branches.false_node_count(),
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::While {
-                    carry,
-                    loop_plan,
-                    captures,
-                } => format!(
+                TensorOp::Region(RegionNode { kind: RegionKind::While { carry, loop_plan }, captures, .. }) => format!(
                     "%{id} = while(carry=%{carry}, captures={captures:?}, predicate_nodes={}, body_nodes={}) : {}",
                     loop_plan.predicate.plan.node_count(),
                     loop_plan.body.plan.node_count(),
@@ -9826,11 +9826,11 @@ impl TensorIr {
                     let branch_inputs = tensor_forward_capture_values(captures, &values)?;
                     branches.evaluate(predicate, &branch_inputs)?
                 }
-                TensorOp::While {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { carry, loop_plan },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let external_inputs = tensor_forward_capture_values(captures, &values)?;
                     loop_plan.evaluate(
                         values
@@ -10757,7 +10757,7 @@ impl TensorIr {
                             .where_select(&on_true.mixed, &on_false.mixed)?,
                     }
                 }
-                TensorOp::While { .. } => return Err(WHILE_LOOP_REVERSE_MODE_ERROR.to_string()),
+                TensorOp::Region(RegionNode { kind: RegionKind::While { .. }, .. }) => return Err(WHILE_LOOP_REVERSE_MODE_ERROR.to_string()),
                 TensorOp::Cond { .. } => return Err(
                     "mixed second-order differentiation through Cond regions is not implemented"
                         .to_string(),

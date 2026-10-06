@@ -67,11 +67,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::{
-    batched_shape, BatchingError, TensorComparison, TensorCondExecutionPlan, TensorExecutionPlan,
-    TensorForiExecutionPlan, TensorForiVjpJvpBindings, TensorForiVjpJvpExecutionPlan,
-    TensorForiVjpTarget, TensorIr, TensorNode, TensorNodeId, TensorOp, TensorScanExecutionPlan,
-    TensorScanTarget, TensorScanVjpBindings, TensorScanVjpJvpBindings,
-    TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget, TensorWhileExecutionPlan,
+    batched_shape, BatchingError, RegionKind, RegionNode, TensorComparison,
+    TensorCondExecutionPlan, TensorExecutionPlan, TensorForiExecutionPlan,
+    TensorForiVjpJvpBindings, TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget, TensorIr,
+    TensorNode, TensorNodeId, TensorOp, TensorScanExecutionPlan, TensorScanTarget,
+    TensorScanVjpBindings, TensorScanVjpJvpBindings, TensorScanVjpJvpExecutionPlan,
+    TensorScanVjpTarget, TensorWhileExecutionPlan,
 };
 
 /// Which result of a batched loop group a member node selects.
@@ -671,11 +672,11 @@ impl TensorIr {
                     Ok(members)
                 },
             ),
-            TensorOp::While {
-                carry,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::While { carry, loop_plan },
                 captures,
-            } => {
+                ..
+            }) => {
                 let mut inputs = mapped_names(captures);
                 if mapped[*carry] {
                     inputs.insert(loop_plan.carry_name().to_string());

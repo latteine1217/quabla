@@ -318,11 +318,11 @@ fn while_parts(
     TensorNodeId,
     &[(String, TensorNodeId)],
 ) {
-    let TensorOp::While {
-        loop_plan,
-        carry,
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::While { loop_plan, carry },
         captures,
-    } = &graph.nodes[node].op
+        ..
+    }) = &graph.nodes[node].op
     else {
         panic!("expected a batched while node");
     };

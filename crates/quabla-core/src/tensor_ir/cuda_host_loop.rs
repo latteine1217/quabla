@@ -45,9 +45,9 @@ use cudarc::driver::{
 };
 
 use super::super::{
-    element_count, DynamicTensor, RegionView, SymbolicCotangent, TensorCarryCheckpoints,
-    TensorExecutionPlan, TensorForiVjpTarget, TensorIr, TensorNodeId, TensorOp, TensorScanTarget,
-    TensorScanVjpTarget,
+    element_count, DynamicTensor, RegionKind, RegionNode, RegionView, SymbolicCotangent,
+    TensorCarryCheckpoints, TensorExecutionPlan, TensorForiVjpTarget, TensorIr, TensorNodeId,
+    TensorOp, TensorScanTarget, TensorScanVjpTarget,
 };
 use super::{
     cuda_fori_jvp_tangent_names, cuda_fused_loop_lowering, cuda_scalar_predicate, cuda_value,
@@ -331,7 +331,10 @@ fn forward_over_reverse_region(
 /// that the fallback can lower.
 fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>), String> {
     match op {
-        TensorOp::While { loop_plan, .. } => Ok((
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::While { loop_plan, .. },
+            ..
+        }) => Ok((
             HostLoopKind::While {
                 carry: loop_plan.carry_name().to_string(),
             },
@@ -655,7 +658,11 @@ impl<T: CudaReal> CudaHostLoop<T> {
         let captures = loop_captures(op, values)?;
         match &self.kind {
             HostLoopKind::While { carry } => {
-                let TensorOp::While { carry: initial, .. } = op else {
+                let TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { carry: initial, .. },
+                    ..
+                }) = op
+                else {
                     return Err(mismatch(node_id));
                 };
                 let mut state = host.copy(cuda_value(values, *initial)?)?;
