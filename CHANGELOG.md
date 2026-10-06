@@ -20,8 +20,27 @@ deprecated names keep working until 1.0 (see
   rules exactly as `unroll=True` does. Values are evaluated on CPU, MLX,
   and CUDA (fused, host-driven, and graph-replayed loops) as before; a
   custom rule node is the identity on its value, like `stop_gradient`.
+- Forward mode for `linalg.cg`, `linalg.gmres`, and `newton`: `jvp` used
+  to raise. The tangent follows the implicit function theorem at the
+  computed solution, as the gradient does: one more solve, `x_dot = A^-1
+  (b_dot - A_dot x)` with the same Krylov method for the linear solvers and
+  `x_dot = -J^-1 (df/dargs) args_dot` with the dense Jacobian at the root
+  for `newton`. Every combination of two derivative passes now uses the
+  rules (`jvp(grad(...))`, `grad` of `jvp`, `jvp(jvp(...))`, and `vmap` of
+  them, which gives forward-mode Jacobians), and a third reverse pass
+  (`grad(grad(grad(...)))`) works too; a third pass involving forward mode
+  raises instead of differentiating the iterations. Each solver keeps its
+  `custom_vjp` rule and gains a forward-mode rule beside it, so every
+  reverse-mode result is unchanged, and `jacobian` and `hessian` of a
+  solution still use reverse mode.
 
 ### Changed
+
+- Staging a `linalg.cg`, `linalg.gmres`, or `newton` call (the first call
+  of a `jit` function, or of a transform) traces the solver's new
+  forward-mode rules too: about 3 to 6 times longer than before for the
+  Krylov solvers (a float64 `gmres` of size 8 under `jit`: 7 ms before, 29
+  ms after), with no change to the compiled plans' run time.
 
 - Eager `Tensor` ops no longer carry their own numerics: each evaluates
   the Tensor IR nodes that a trace of it records with the core's CPU

@@ -4,8 +4,9 @@ Both iterate in a `while_loop`, so an eager solve runs in Python and a
 traced one is a single loop region whose trip count is the actual number of
 iterations (a bounded `fori_loop` would pay for `maxiter` iterations on
 every call, and `maxiter` is a safety cap far above the typical count).
-`while_loop` has no reverse mode, which costs nothing here: derivatives
-come from the implicit rule of `_implicit`, never from the iterations.
+`while_loop` has no reverse mode, which costs nothing here: derivatives,
+forward and reverse, come from the implicit rules of `_implicit`, never
+from the iterations.
 
 Internally every vector is flat (`[n]`); the public functions reshape to
 the shape of `b` around the user's `matvec` and preconditioner. The loop
@@ -20,6 +21,7 @@ from ._array import arange, asarray, eye, zeros
 from ._control import _bindings, while_loop
 from ._implicit import (
     ORDER,
+    args_jvp,
     args_vjp,
     check_args,
     finish,
@@ -99,6 +101,26 @@ def _linear_adjoint(build, apply, precondition, symmetric):
     return adjoint
 
 
+def _linear_tangent(build, apply, precondition):
+    """The forward-mode rule of `x = A(args)^-1 b`: `x_dot = A^-1 (b_dot -
+    (d(A x)/d args) args_dot)`, one solve with `A` itself built by
+    `build(operator, preconditioner, order)`; the initial guess has no
+    effect on the solution, so its tangent is ignored."""
+
+    def tangent(order, x, operands, tangents):
+        _, _, *args = operands
+        rhs = tangents[0]
+        args_dot = args_jvp(lambda *values: apply(x, *values), tuple(args), tangents[2:])
+        if args_dot is not None:
+            rhs = rhs - args_dot
+        x_dot, _ = build(apply, precondition, order)(
+            rhs, zeros(list(rhs.shape), rhs.dtype), *args
+        )
+        return x_dot
+
+    return tangent
+
+
 def _threshold(b, tol, atol):
     """The residual norm at which a solve stops: `max(tol * ||b||, atol)`."""
     return (_norm(b) * tol).maximum(atol)
@@ -159,7 +181,13 @@ def _cg(apply, precondition, tol, atol, maxiter, order):
         return _cg(apply, precondition, tol, atol, maxiter, order)
 
     solve = _cg_solve(apply, precondition, tol, atol, maxiter)
-    return implicit("cg", solve, _linear_adjoint(build, apply, precondition, True), order)
+    return implicit(
+        "cg",
+        solve,
+        _linear_adjoint(build, apply, precondition, True),
+        _linear_tangent(build, apply, precondition),
+        order,
+    )
 
 
 # -- GMRES ------------------------------------------------------------------------
@@ -319,7 +347,13 @@ def _gmres(apply, precondition, tol, atol, restart, maxiter, order):
         return _gmres(apply, precondition, tol, atol, restart, maxiter, order)
 
     solve = _gmres_solve(apply, precondition, tol, atol, restart, maxiter)
-    return implicit("gmres", solve, _linear_adjoint(build, apply, precondition, False), order)
+    return implicit(
+        "gmres",
+        solve,
+        _linear_adjoint(build, apply, precondition, False),
+        _linear_tangent(build, apply, precondition),
+        order,
+    )
 
 
 # -- public functions -------------------------------------------------------------
@@ -387,15 +421,18 @@ def cg(matvec, b, *, args=(), x0=None, tol=1e-5, atol=0.0, maxiter=None, M=None,
     about one more solve, and `x0` receives no gradient. Pass every array
     `A` depends on through `args` (a tuple of arrays or pytrees): values a
     Python `matvec` closes over are not differentiated, and under a
-    transform closing over a traced value raises. Reverse mode composes
-    twice (`grad(grad(...))`, and the reverse-mode `jacobian` and `hessian`
-    of the solution); forward mode (`jvp`) is not supported. `vmap`
+    transform closing over a traced value raises. Forward mode (`jvp`)
+    solves one tangent system, `x_dot = A^-1 (b_dot - A_dot x)`, with the
+    same method. Every combination of two derivative passes uses these
+    rules (`grad(grad(...))`, `jvp(grad(...))`, `jvp(jvp(...))`, and the
+    reverse-mode `jacobian` and `hessian` of the solution), and so does a
+    third reverse pass; a third pass involving forward mode raises. `vmap`
     batches the solve over `b`, `x0`, and `args` and composes with these
     derivatives in both orders: each example stops at its own tolerance,
     because the batched loop freezes an example's state once it converges,
-    so a batch costs the iterations of its slowest example. The solve
-    cannot run inside a `cond`, `fori_loop`, or `scan` body (use
-    `fori_loop(..., unroll=True)`).
+    so a batch costs the iterations of its slowest example. The solve may
+    run inside `cond`, `fori_loop`, `scan`, and `while_loop` bodies (an
+    implicit time step, say), whose derivatives apply these rules.
 
     An eager solve that does not converge raises `RuntimeError`; with
     `info=True` it returns `(x, info)` instead, where `info` holds
@@ -433,7 +470,8 @@ def gmres(
 
     Derivatives follow the implicit function theorem as in `cg`: the
     gradient solves `A^T lambda = x_bar` by GMRES, applying `A^T` (and
-    `M^T`) as the VJP of `matvec` (and `M`) with respect to `x`. The same
+    `M^T`) as the VJP of `matvec` (and `M`) with respect to `x`, and the
+    tangent solves `A x_dot = b_dot - A_dot x` by GMRES. The same
     rules apply to `args`, `info`, and the supported transforms as in `cg`;
     `info["iterations"]` counts Arnoldi steps over all cycles.
     """

@@ -15,7 +15,9 @@
 //!   residuals) in place of the primal value, then its backward graph, which
 //!   maps the residuals and the output cotangents to operand cotangents;
 //! - forward mode splices the rule's tangent graph, or fails for a rule
-//!   without one (a `custom_vjp` function, as in JAX);
+//!   without one (a `custom_vjp` function, as in JAX); a tangent graph may
+//!   also read the call's primal outputs (the implicit solvers' rules read
+//!   the solution);
 //! - batching (`vmap`) batches the rule graphs along with the primal.
 //!
 //! Every spliced rule graph is ordinary IR, so a reverse-mode graph through
@@ -25,17 +27,21 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::{batched_shape, BatchingError, TensorDType, TensorIr, TensorNodeId, TensorOp};
+use super::{
+    batched_shape, BatchingError, TensorDType, TensorIr, TensorNode, TensorNodeId, TensorOp,
+};
 
 /// The forward-mode part of a [`TensorCustomRule`]: a graph taking the
-/// operand inputs of the rule and one tangent input per differentiable
+/// operand inputs of the rule, one tangent input per differentiable
 /// operand (`tangent_names[i]` for operand `i`, `None` for a `bool`
-/// operand), with one tangent output per rule output.
+/// operand), and optionally the call's primal outputs (`output_names[i]`
+/// for output `i`), with one tangent output per rule output.
 #[derive(Clone, Debug)]
 pub struct TensorCustomTangent {
     graph: TensorIr,
     tangent_names: Vec<Option<String>>,
     outputs: Vec<TensorNodeId>,
+    output_names: Vec<String>,
 }
 
 impl TensorCustomTangent {
@@ -48,7 +54,17 @@ impl TensorCustomTangent {
             graph,
             tangent_names,
             outputs,
+            output_names: Vec::new(),
         }
+    }
+
+    /// The tangent graph reading the call's primal outputs: the input named
+    /// `output_names[i]` is bound to output `i`, so a rule whose tangent
+    /// depends on the result (an implicit solve's solution) does not
+    /// recompute it. `output_names` is empty or has one name per output.
+    pub fn with_output_inputs(mut self, output_names: Vec<String>) -> Self {
+        self.output_names = output_names;
+        self
     }
 }
 
@@ -59,7 +75,11 @@ impl TensorCustomTangent {
 /// - `backward` takes the residuals (`residual_names`) and one cotangent per
 ///   output (`cotangent_names`) and returns one cotangent per operand, or
 ///   `None` for an operand that receives none.
-/// - `tangent` is the forward-mode rule, absent for `custom_vjp`.
+/// - `tangent` is the forward-mode rule, absent for `custom_vjp` (unless the
+///   function also defines one, as the implicit solvers do).
+/// - `prefer_reverse` asks `jacobian` and `hessian` for reverse mode; it
+///   defaults to the absence of a tangent graph, and every `custom_vjp`
+///   rule sets it, since its primary rule is the backward graph.
 /// - `rematerialize` marks a `checkpoint` rule, whose residuals are the
 ///   operands and whose backward graph recomputes the primal: the residuals
 ///   are bound through a multiplication by one, which plan compilation does
@@ -78,6 +98,7 @@ pub struct TensorCustomRule {
     backward_outputs: Vec<Option<TensorNodeId>>,
     tangent: Option<TensorCustomTangent>,
     rematerialize: bool,
+    prefer_reverse: bool,
 }
 
 type Aval = (Vec<usize>, TensorDType);
@@ -173,6 +194,7 @@ impl TensorCustomRule {
         tangent: Option<TensorCustomTangent>,
         rematerialize: bool,
     ) -> Result<Self, String> {
+        let prefer_reverse = tangent.is_none();
         let rule = Self {
             name,
             operand_names,
@@ -185,9 +207,17 @@ impl TensorCustomRule {
             backward_outputs,
             tangent,
             rematerialize,
+            prefer_reverse,
         };
         rule.validate()?;
         Ok(rule)
+    }
+
+    /// This rule with the reverse-mode preference of `jacobian` and
+    /// `hessian` (see the type notes) set to `prefer_reverse`.
+    pub fn with_prefer_reverse(mut self, prefer_reverse: bool) -> Self {
+        self.prefer_reverse = prefer_reverse;
+        self
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -273,6 +303,16 @@ impl TensorCustomRule {
                 if let Some(tangent_name) = tangent_name {
                     check_input(&tangent.graph, tangent_name, expected, "tangent")?;
                 }
+            }
+            if !tangent.output_names.is_empty() && tangent.output_names.len() != outputs.len() {
+                return Err(format!(
+                    "custom rule {name} has a tangent graph with {} output inputs for {} outputs",
+                    tangent.output_names.len(),
+                    outputs.len()
+                ));
+            }
+            for (output_name, expected) in tangent.output_names.iter().zip(&outputs) {
+                check_input(&tangent.graph, output_name, expected, "tangent output")?;
             }
             for (index, (output, expected)) in tangent.outputs.iter().zip(&outputs).enumerate() {
                 let actual = aval(&tangent.graph, *output)?;
@@ -420,13 +460,23 @@ impl TensorCustomRule {
             .collect())
     }
 
+    /// Whether the tangent graph reads the call's primal outputs.
+    pub(super) fn tangent_reads_outputs(&self) -> bool {
+        self.tangent
+            .as_ref()
+            .is_some_and(|tangent| !tangent.output_names.is_empty())
+    }
+
     /// Splices the tangent graph: one tangent per output. `tangents[i]` is
-    /// the tangent of operand `i`.
+    /// the tangent of operand `i`, and `outputs[i]` the primal value of
+    /// output `i` when the tangent graph reads the outputs (see
+    /// [`Self::tangent_reads_outputs`]; empty otherwise).
     pub(super) fn splice_tangent(
         &self,
         graph: &mut TensorIr,
         operands: &[TensorNodeId],
         tangents: &[TensorNodeId],
+        outputs: &[TensorNodeId],
     ) -> Result<Vec<TensorNodeId>, String> {
         let tangent = self.tangent.as_ref().ok_or_else(|| {
             format!(
@@ -443,6 +493,18 @@ impl TensorCustomRule {
                 names.push(name);
                 bound.push(*node);
             }
+        }
+        if !tangent.output_names.is_empty() {
+            if outputs.len() != tangent.output_names.len() {
+                return Err(format!(
+                    "custom rule {} tangent reads {} outputs, got {}",
+                    self.name,
+                    tangent.output_names.len(),
+                    outputs.len()
+                ));
+            }
+            names.extend(tangent.output_names.iter().map(String::as_str));
+            bound.extend_from_slice(outputs);
         }
         splice(graph, &tangent.graph, &names, &bound, &tangent.outputs)
     }
@@ -558,6 +620,15 @@ impl TensorCustomRule {
                         bindings.push((name.as_str(), input, mapped));
                     }
                 }
+                // Every output of a batched call is batched.
+                for (name, (shape, dtype)) in tangent.output_names.iter().zip(&outputs) {
+                    let input = graph.input_typed(
+                        name.clone(),
+                        batched_shape(batch_size, shape),
+                        *dtype,
+                    )?;
+                    bindings.push((name.as_str(), input, true));
+                }
                 let spliced = splice_batched(
                     &mut graph,
                     &tangent.graph,
@@ -573,6 +644,7 @@ impl TensorCustomRule {
                     graph,
                     tangent_names: tangent.tangent_names.clone(),
                     outputs,
+                    output_names: tangent.output_names.clone(),
                 })
             }
         };
@@ -589,7 +661,8 @@ impl TensorCustomRule {
             backward_outputs,
             tangent,
             self.rematerialize,
-        )?)
+        )?
+        .with_prefer_reverse(self.prefer_reverse))
     }
 }
 
@@ -655,12 +728,19 @@ impl TensorIr {
     }
 
     /// Whether a `Custom` node has a rule without a tangent graph (a
-    /// `custom_vjp` call), so forward mode through it fails; `jacobian`
-    /// uses reverse mode for such graphs.
+    /// `custom_vjp` call), so forward mode through it fails.
     pub fn has_reverse_only_custom_rule(&self) -> bool {
         self.nodes
             .iter()
             .any(|node| matches!(&node.op, TensorOp::Custom { rule, .. } if rule.tangent.is_none()))
+    }
+
+    /// Whether a `Custom` node, here or in a control-flow region body, has a
+    /// rule that prefers reverse mode (a `custom_vjp` call, with or without
+    /// a forward-mode rule); `jacobian` and `hessian` use reverse mode for
+    /// such graphs.
+    pub fn prefers_reverse_mode(&self) -> bool {
+        nodes_prefer_reverse(&self.nodes)
     }
 
     /// The name of the rule of the first `Custom` node that `outputs`
@@ -676,4 +756,15 @@ impl TensorIr {
                 _ => None,
             }))
     }
+}
+
+fn nodes_prefer_reverse(nodes: &[TensorNode]) -> bool {
+    nodes.iter().any(|node| match &node.op {
+        TensorOp::Custom { rule, .. } => rule.prefer_reverse,
+        TensorOp::Region(region) => region
+            .regions()
+            .into_iter()
+            .any(|plan| nodes_prefer_reverse(&plan.nodes)),
+        _ => false,
+    })
 }

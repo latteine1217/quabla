@@ -956,13 +956,19 @@ Each runs eagerly in Python or, under `jit`, as one `while_loop` region that
 stops at convergence (`||b - A x|| <= max(tol * ||b||, atol)` for the linear
 solvers, `||dx|| <= tol * (1 + ||x||)` for `newton`). Derivatives with
 respect to `b` and the array leaves of `args` follow the implicit function
-theorem at the solution, one adjoint solve, instead of differentiating the
-iterations; `x0` gets no gradient. Pass every array the operator depends on
-through `args`: values a Python function closes over are not differentiated.
-Reverse mode composes twice (`grad(grad(...))`, and the reverse-mode
-`jacobian` and `hessian` of a solution); forward mode (`jvp`) is not
-supported, and a solve cannot run inside a `cond`, `fori_loop`, or `scan`
-body. `vmap` batches a solve over `b`, `x0`, and the leaves of `args`, and
+theorem at the solution instead of differentiating the iterations: reverse
+mode solves one adjoint system, and forward mode (`jvp`, or `vmap` of `jvp`
+for a forward-mode Jacobian) one tangent system, `x_dot = A^-1 (b_dot -
+A_dot x)` for the linear solvers and `x_dot = -J^-1 (df/dargs) args_dot`
+for `newton`; `x0` gets no derivative. Pass every array the operator
+depends on through `args`: values a Python function closes over are not
+differentiated. Every combination of two derivative passes uses these rules
+(`grad(grad(...))`, `jvp(grad(...))`, `grad` of `jvp`, `jvp(jvp(...))`),
+and so does a third reverse pass; a third pass involving forward mode
+raises. `jacobian` and `hessian` of a solution use reverse mode. A solve
+may run inside `cond`, `fori_loop`, `scan`, and `while_loop` bodies, such as
+an implicit time step in a `fori_loop`, and the loop's derivatives apply
+the rules. `vmap` batches a solve over `b`, `x0`, and the leaves of `args`, and
 composes with the derivatives in both orders (`vmap(grad(...))`,
 `grad` of a loss over `vmap`): each example stops at its own tolerance,
 because the batched loop freezes an example's state once it has converged,

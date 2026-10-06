@@ -3005,9 +3005,30 @@ impl TensorTraceGraph {
     /// Freezes a custom differentiation rule from staged graphs (see
     /// `TensorCustomRule`): `forward_outputs` are tracers of `forward`,
     /// `backward_outputs` (one per operand, `None` for no cotangent) of
-    /// `backward`, and `tangent_outputs` of `tangent`, if given.
+    /// `backward`, and `tangent_outputs` of `tangent`, if given, whose
+    /// inputs `output_names` (one per output, or none) read the call's
+    /// outputs. `prefer_reverse` (default: no tangent graph) asks `jacobian`
+    /// and `hessian` for reverse mode.
     #[staticmethod]
     #[pyo3(name = "_custom_rule")]
+    #[pyo3(signature = (
+        name,
+        forward,
+        operand_names,
+        output_count,
+        forward_outputs,
+        backward,
+        residual_names,
+        cotangent_names,
+        backward_outputs,
+        tangent,
+        tangent_names,
+        tangent_outputs,
+        rematerialize,
+        *,
+        output_names = Vec::new(),
+        prefer_reverse = None,
+    ))]
     #[allow(clippy::too_many_arguments)]
     fn py_custom_rule(
         name: String,
@@ -3023,6 +3044,8 @@ impl TensorTraceGraph {
         tangent_names: Vec<Option<String>>,
         tangent_outputs: Vec<TraceTensor>,
         rematerialize: bool,
+        output_names: Vec<String>,
+        prefer_reverse: Option<bool>,
     ) -> PyResult<PyCustomRule> {
         let snapshot = |graph: &TensorTraceGraph, tensors: &[&TraceTensor]| {
             graph.ensure_owns(tensors)?;
@@ -3041,17 +3064,20 @@ impl TensorTraceGraph {
                 &backward_outputs.iter().flatten().collect::<Vec<_>>(),
             )?;
             let tangent = match tangent {
-                Some(graph) => Some(TensorCustomTangent::new(
-                    snapshot(&graph, &tangent_outputs.iter().collect::<Vec<_>>())?,
-                    tangent_names,
-                    tangent_outputs
-                        .iter()
-                        .map(|output| output.node_id)
-                        .collect(),
-                )),
+                Some(graph) => Some(
+                    TensorCustomTangent::new(
+                        snapshot(&graph, &tangent_outputs.iter().collect::<Vec<_>>())?,
+                        tangent_names,
+                        tangent_outputs
+                            .iter()
+                            .map(|output| output.node_id)
+                            .collect(),
+                    )
+                    .with_output_inputs(output_names),
+                ),
                 None => None,
             };
-            TensorCustomRule::new(
+            let rule = TensorCustomRule::new(
                 name,
                 forward_ir,
                 operand_names,
@@ -3069,7 +3095,11 @@ impl TensorTraceGraph {
                     .collect(),
                 tangent,
                 rematerialize,
-            )
+            )?;
+            Ok::<_, String>(match prefer_reverse {
+                Some(prefer_reverse) => rule.with_prefer_reverse(prefer_reverse),
+                None => rule,
+            })
         })()
         .map_err(PyValueError::new_err)?;
         Ok(PyCustomRule {
@@ -3161,6 +3191,18 @@ impl TensorTraceGraph {
             .lock()
             .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
             .has_reverse_only_custom_rule())
+    }
+
+    /// Whether `jacobian` and `hessian` use reverse mode for the graph
+    /// because it calls a `custom_vjp` function (see
+    /// `TensorIr::prefers_reverse_mode`).
+    #[getter(_prefers_reverse_mode)]
+    fn py_prefers_reverse_mode(&self) -> PyResult<bool> {
+        Ok(self
+            .ir
+            .lock()
+            .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
+            .prefers_reverse_mode())
     }
 
     #[getter(_has_f32_nodes)]

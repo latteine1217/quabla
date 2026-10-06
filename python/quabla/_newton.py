@@ -5,9 +5,9 @@ The iteration is a `while_loop`, so an eager solve runs in Python and a
 traced one is a single loop region that stops as soon as it converges;
 Newton converges in a handful of iterations, so a bounded `fori_loop`
 would mostly run masked iterations up to `maxiter`. Derivatives with
-respect to `args` come from the implicit function theorem at the root (see
-`_implicit`), not from the iterations, which also makes the `while_loop`'s
-lack of a reverse mode irrelevant.
+respect to `args`, in forward and reverse mode, come from the implicit
+function theorem at the root (see `_implicit`), not from the iterations,
+which also makes the `while_loop`'s lack of a reverse mode irrelevant.
 """
 
 import math
@@ -17,6 +17,7 @@ from ._array import asarray, eye, zeros
 from ._control import _bindings, while_loop
 from ._implicit import (
     ORDER,
+    args_jvp,
     args_vjp,
     check_args,
     finish,
@@ -171,7 +172,16 @@ def _solver(apply, tol, maxiter, order):
         lam = _solve(_jacobian(apply, x, args).T, x_bar)
         return (None, *args_vjp(lambda *values: apply(x, *values), tuple(args), -lam))
 
-    return implicit("newton", _iteration(apply, tol, maxiter), adjoint, order)
+    def tangent(order, x, operands, tangents):
+        # J x_dot = -(df/dargs) args_dot with the dense Jacobian at the root;
+        # the initial guess has no effect on the root.
+        _, *args = operands
+        f_dot = args_jvp(lambda *values: apply(x, *values), tuple(args), tangents[1:])
+        if f_dot is None:
+            return None
+        return -_solve(_jacobian(apply, x, args), f_dot)
+
+    return implicit("newton", _iteration(apply, tol, maxiter), adjoint, tangent, order)
 
 
 def newton(f, x0, *, args=(), tol=None, maxiter=50, info=False):
@@ -192,17 +202,20 @@ def newton(f, x0, *, args=(), tol=None, maxiter=50, info=False):
     Derivatives with respect to the array leaves of `args` follow the
     implicit function theorem, `dx/dargs = -J^-1 df/dargs` at the root,
     computed from one dense Jacobian and solve with the transposed Jacobian;
-    `x0` receives no gradient. Pass every array `f` depends on through
-    `args`: values a Python `f` closes over are not differentiated, and
-    under a transform closing over a traced value raises. Reverse mode
-    composes twice (`grad(grad(...))`, `hessian` through `jacobian`'s
-    reverse mode); forward mode (`jvp`) is not supported. `vmap` batches
-    the solve over `x0` and `args` and composes with these derivatives in
-    both orders: each example stops at its own convergence test, because
-    the batched loop freezes an example's iterate once it has converged or
-    stalled, so a batch costs the iterations of its slowest example. The
-    solve cannot run inside a `cond`, `fori_loop`, or `scan` body (use
-    `fori_loop(..., unroll=True)`).
+    `x0` receives no derivative. Forward mode (`jvp`) applies the same
+    theorem with one dense solve with `J`. Pass every array `f` depends on
+    through `args`: values a Python `f` closes over are not differentiated,
+    and under a transform closing over a traced value raises. Every
+    combination of two derivative passes uses these rules
+    (`grad(grad(...))`, `jvp(grad(...))`, `jvp(jvp(...))`, `hessian`
+    through `jacobian`'s reverse mode), and so does a third reverse pass; a
+    third pass involving forward mode raises. `vmap` batches the solve over
+    `x0` and `args` and composes with these derivatives in both orders:
+    each example stops at its own convergence test, because the batched
+    loop freezes an example's iterate once it has converged or stalled, so
+    a batch costs the iterations of its slowest example. The solve may run
+    inside `cond`, `fori_loop`, `scan`, and `while_loop` bodies, whose
+    derivatives apply these rules.
 
     An eager solve that does not converge raises `RuntimeError`; with
     `info=True` it returns `(x, info)` instead, where `info` holds

@@ -4068,10 +4068,34 @@ impl TensorIr {
                                 .iter()
                                 .map(|operand| pairs[*operand].1)
                                 .collect::<Vec<_>>();
+                            // A tangent graph that reads the outputs gets the
+                            // rebuilt `Custom` nodes, so differentiating the
+                            // tangent again applies the rule to them; an
+                            // output pruned from the graph is recomputed by
+                            // the rule's forward graph.
+                            let mut outputs = Vec::new();
+                            if rule.tangent_reads_outputs() {
+                                let mut known = vec![None; rule.output_count()];
+                                for ((member_output, _), id) in members.iter().zip(&ids) {
+                                    known[*member_output] = Some(*id);
+                                }
+                                let forward = if known.iter().any(Option::is_none) {
+                                    rule.splice_forward(&mut transformed, &primal_operands)?
+                                } else {
+                                    Vec::new()
+                                };
+                                for (index, value) in known.into_iter().enumerate() {
+                                    outputs.push(match value {
+                                        Some(value) => value,
+                                        None => forward[index],
+                                    });
+                                }
+                            }
                             Some(rule.splice_tangent(
                                 &mut transformed,
                                 &primal_operands,
                                 &operand_tangents,
+                                &outputs,
                             )?)
                         } else {
                             None

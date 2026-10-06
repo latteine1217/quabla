@@ -5,11 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use quabla_core::compiler::QuablaCompileError;
 use quabla_core::tensor_ir::{
     CpuBackend, DynamicTensor, SymbolicCotangent, TensorBackend, TensorBufferSlot,
-    TensorCondExecutionPlan, TensorCustomRule, TensorDType, TensorDeviceBackend, TensorDeviceId,
-    TensorDeviceMesh, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan,
-    TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr, TensorNodeId, TensorPartitionSpec,
-    TensorPlacement, TensorReplicaReduction, TensorScanExecutionPlan, TensorShardingPlan,
-    UnaryMathKind,
+    TensorCondExecutionPlan, TensorCustomRule, TensorCustomTangent, TensorDType,
+    TensorDeviceBackend, TensorDeviceId, TensorDeviceMesh, TensorExecutionPlan, TensorExtremum,
+    TensorForiExecutionPlan, TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr,
+    TensorNodeId, TensorPartitionSpec, TensorPlacement, TensorReplicaReduction,
+    TensorScanExecutionPlan, TensorShardingPlan, UnaryMathKind,
 };
 use quabla_core::{QuablaCompiler, QuablaMultiOutputProgram, QuablaPrecision, QuablaTarget};
 
@@ -14203,6 +14203,81 @@ fn custom_rule_in_a_loop_body_is_applied_by_the_loop_derivatives() {
         )),
     )]);
     assert_eq!(must!(plan.evaluate(&inputs)).data().to_vec(), vec![10.0; 6]);
+}
+
+/// `exp(x)` with a reverse rule and a tangent graph that reads the output
+/// (`exp(x) t`), as the implicit solvers' rules read the solution.
+fn custom_exp_rule_reading_its_output() -> Result<std::sync::Arc<TensorCustomRule>, String> {
+    let mut forward = TensorIr::new();
+    let x = forward.input("x", vec![2])?;
+    let y = forward.exp(x)?;
+    let mut backward = TensorIr::new();
+    let residual = backward.input("residual", vec![2])?;
+    let g = backward.input("g", vec![2])?;
+    let scaled = backward.mul(g, residual)?;
+    let mut tangent = TensorIr::new();
+    tangent.input("x", vec![2])?;
+    let t = tangent.input("t", vec![2])?;
+    let output = tangent.input("y", vec![2])?;
+    let product = tangent.mul(output, t)?;
+    let rule = TensorCustomRule::new(
+        "custom_exp".to_string(),
+        forward,
+        vec!["x".to_string()],
+        1,
+        vec![y, y],
+        backward,
+        vec!["residual".to_string()],
+        vec!["g".to_string()],
+        vec![Some(scaled)],
+        Some(
+            TensorCustomTangent::new(tangent, vec![Some("t".to_string())], vec![product])
+                .with_output_inputs(vec!["y".to_string()]),
+        ),
+        false,
+    )?;
+    Ok(std::sync::Arc::new(rule.with_prefer_reverse(true)))
+}
+
+#[test]
+fn custom_tangent_graph_reads_the_call_outputs() {
+    let rule = must!(custom_exp_rule_reading_its_output());
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let value = must!(graph.exp(x));
+    let wrapped = must!(graph.custom(rule, &[value], &[x]));
+    let loss = must!(graph.sum(wrapped[0]));
+    assert!(graph.prefers_reverse_mode());
+    assert!(!graph.has_reverse_only_custom_rule());
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![0.5, -1.0])),
+        ),
+        (
+            "dx".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![2.0, 3.0])),
+        ),
+    ]);
+    let expected = [2.0 * 0.5_f64.exp(), 3.0 * (-1.0_f64).exp()];
+    let tangents = BTreeMap::from([("x".to_string(), "dx".to_string())]);
+    let jvp = must!(graph.symbolic_jvp_many_with_tangent_inputs(&[wrapped[0]], &tangents));
+    let plan = must!(jvp.graph.compile_cpu(jvp.tangents[0]));
+    assert_eq!(
+        must!(plan.evaluate(&inputs)).data().to_vec(),
+        expected.to_vec()
+    );
+    // Forward over reverse reads the rebuilt output inside the backward
+    // graph's residual and the tangent graph alike: the HVP of sum(exp(x)).
+    let vjp = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    let hvp = must!(vjp
+        .graph
+        .symbolic_jvp_many_with_tangent_inputs(&[vjp.gradients["x"]], &tangents));
+    let plan = must!(hvp.graph.compile_cpu(hvp.tangents[0]));
+    assert_eq!(
+        must!(plan.evaluate(&inputs)).data().to_vec(),
+        expected.to_vec()
+    );
 }
 
 #[test]
