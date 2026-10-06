@@ -3,7 +3,7 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyEllipsis, PyMemoryView, PySlice, PySliceMethods, PyTuple};
 use quabla_core::tensor_ir::{
-    HostTensorStorage, TensorComparison, TensorDType, TensorExtremum, UnaryMathKind,
+    BinaryMathKind, HostTensorStorage, TensorComparison, TensorDType, TensorExtremum, UnaryMathKind,
 };
 use std::borrow::Cow;
 use std::ffi::c_int;
@@ -1700,7 +1700,7 @@ impl PyTensor {
     pub fn try_atan2(&self, x: &Self) -> Result<Self, String> {
         self.ensure_not_bool("atan2")?;
         x.ensure_not_bool("atan2")?;
-        self.try_elementwise(x, "atan2", |y, x| Ok(y.atan2(x)))
+        self.try_elementwise(x, "atan2", |y, x| Ok(BinaryMathKind::Atan2.evaluate(y, x)))
     }
 
     /// `atan2(self, x)` for a Python number `x`, a weak scalar rounded to the
@@ -1708,7 +1708,7 @@ impl PyTensor {
     pub fn try_atan2_scalar(&self, x: f64) -> Result<Self, String> {
         self.ensure_not_bool("atan2")?;
         let x = self.dtype.round(x);
-        self.try_map(|y| y.atan2(x))
+        self.try_map(|y| BinaryMathKind::Atan2.evaluate(y, x))
     }
 
     /// Elementwise `kind(self)` with the `f64` function of the CPU Tensor IR
@@ -1723,7 +1723,7 @@ impl PyTensor {
     pub fn try_fmod(&self, y: &Self) -> Result<Self, String> {
         self.ensure_not_bool("fmod")?;
         y.ensure_not_bool("fmod")?;
-        self.try_elementwise(y, "fmod", |x, y| Ok(x % y))
+        self.try_elementwise(y, "fmod", |x, y| Ok(BinaryMathKind::Fmod.evaluate(x, y)))
     }
 
     /// `fmod(self, y)` for a Python number `y`, a weak scalar rounded to the
@@ -1731,7 +1731,7 @@ impl PyTensor {
     pub fn try_fmod_scalar(&self, y: f64) -> Result<Self, String> {
         self.ensure_not_bool("fmod")?;
         let y = self.dtype.round(y);
-        self.try_map(|x| x % y)
+        self.try_map(|x| BinaryMathKind::Fmod.evaluate(x, y))
     }
 
     fn unary_math(&self, kind: UnaryMathKind) -> PyResult<Self> {
@@ -1882,7 +1882,7 @@ impl PyTensor {
     }
 
     pub fn try_powf(&self, exponent: f64) -> Result<Self, String> {
-        self.try_unary("pow", |value| value.powf(exponent))
+        self.try_unary("pow", |value| BinaryMathKind::Pow.evaluate(value, exponent))
     }
 
     /// Elementwise `self ** exponent` of two tensors with broadcasting and
@@ -1891,7 +1891,9 @@ impl PyTensor {
     pub fn try_pow(&self, exponent: &Self) -> Result<Self, String> {
         self.ensure_not_bool("pow")?;
         exponent.ensure_not_bool("pow")?;
-        self.try_elementwise(exponent, "**", |base, exponent| Ok(base.powf(exponent)))
+        self.try_elementwise(exponent, "**", |base, exponent| {
+            Ok(BinaryMathKind::Pow.evaluate(base, exponent))
+        })
     }
 
     /// `base ** self` for a Python number `base`, which is a weak scalar
@@ -1899,7 +1901,7 @@ impl PyTensor {
     pub fn try_scalar_pow(&self, base: f64) -> Result<Self, String> {
         self.ensure_not_bool("pow")?;
         let base = self.dtype.round(base);
-        self.try_map(|exponent| base.powf(exponent))
+        self.try_map(|exponent| BinaryMathKind::Pow.evaluate(base, exponent))
     }
 
     pub fn try_concat(tensors: &[PyTensor], axis: usize) -> Result<Self, String> {

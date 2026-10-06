@@ -3003,10 +3003,8 @@ fn execute_cuda_device_program<T: CudaReal>(
             | TensorOp::Sqrt { .. }
             | TensorOp::SqrtDerivative { .. }
             | TensorOp::Powi { .. }
-            | TensorOp::Pow { .. }
-            | TensorOp::Atan2 { .. }
             | TensorOp::UnaryMath { .. }
-            | TensorOp::Fmod { .. }
+            | TensorOp::BinaryMath { .. }
             | TensorOp::CumSum { .. }
             | TensorOp::Triangular { .. }
             | TensorOp::Matmul { .. }
@@ -3621,12 +3619,7 @@ fn launch_cuda_node<T: CudaReal>(
         | TensorOp::Mul { lhs, rhs }
         | TensorOp::Greater { lhs, rhs }
         | TensorOp::Compare { lhs, rhs, .. }
-        | TensorOp::Pow {
-            base: lhs,
-            exponent: rhs,
-        }
-        | TensorOp::Atan2 { y: lhs, x: rhs }
-        | TensorOp::Fmod { x: lhs, y: rhs } => {
+        | TensorOp::BinaryMath { lhs, rhs, .. } => {
             launch.arg(cuda_value(values, *lhs)?);
             launch.arg(cuda_value(values, *rhs)?);
             launch.arg(output);
@@ -4980,13 +4973,11 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
             | TensorOp::Sqrt { .. }
             | TensorOp::SqrtDerivative { .. }
             | TensorOp::Powi { .. }
-            | TensorOp::Pow { .. }
-            | TensorOp::Atan2 { .. }
-            | TensorOp::Fmod { .. }
             | TensorOp::StopGradient { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
             TensorOp::UnaryMath { kind, .. } if kind.cuda_loop_lowerable() => {}
+            TensorOp::BinaryMath { kind, .. } if kind.cuda_loop_lowerable() => {}
             TensorOp::Reshape { input } if body.nodes[*input].shape == node.shape => {}
             _ => {
                 return Err(format!(
@@ -5071,13 +5062,11 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
             | TensorOp::Sqrt { .. }
             | TensorOp::SqrtDerivative { .. }
             | TensorOp::Powi { .. }
-            | TensorOp::Pow { .. }
-            | TensorOp::Atan2 { .. }
-            | TensorOp::Fmod { .. }
             | TensorOp::StopGradient { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
             TensorOp::UnaryMath { kind, .. } if kind.cuda_loop_lowerable() => {}
+            TensorOp::BinaryMath { kind, .. } if kind.cuda_loop_lowerable() => {}
             TensorOp::Reshape { input }
                 if cuda_shapes_match_without_leading_units(
                     &scan_plan.body.plan.nodes[*input].shape,
@@ -5299,14 +5288,15 @@ fn cuda_fori_body_expression_inner(
         TensorOp::Powi { input, exponent } => {
             Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
         }
-        TensorOp::Pow { base, exponent } => {
-            Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
-        }
-        TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
+        TensorOp::BinaryMath { lhs, rhs, kind } if kind.cuda_loop_lowerable() => Ok(format!(
+            "{}({}, {})",
+            kind.cuda_function(),
+            child(*lhs)?,
+            child(*rhs)?
+        )),
         TensorOp::UnaryMath { input, kind } if kind.cuda_loop_lowerable() => {
             Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
         }
-        TensorOp::Fmod { x, y } => Ok(format!("fmodf({}, {})", child(*x)?, child(*y)?)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
         // already run, so stop_gradient is the identity too.
         TensorOp::Broadcast { input }
@@ -5461,14 +5451,15 @@ fn cuda_scan_body_expression_in_half_inner(
         TensorOp::Powi { input, exponent } => {
             Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
         }
-        TensorOp::Pow { base, exponent } => {
-            Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
-        }
-        TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
+        TensorOp::BinaryMath { lhs, rhs, kind } if kind.cuda_loop_lowerable() => Ok(format!(
+            "{}({}, {})",
+            kind.cuda_function(),
+            child(*lhs)?,
+            child(*rhs)?
+        )),
         TensorOp::UnaryMath { input, kind } if kind.cuda_loop_lowerable() => {
             Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
         }
-        TensorOp::Fmod { x, y } => Ok(format!("fmodf({}, {})", child(*x)?, child(*y)?)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
         // already run, so stop_gradient is the identity too.
         TensorOp::Broadcast { input }
@@ -5613,14 +5604,15 @@ fn cuda_elementwise_plan_expression_with_index_inner(
         TensorOp::Powi { input, exponent } => {
             Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
         }
-        TensorOp::Pow { base, exponent } => {
-            Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
-        }
-        TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
+        TensorOp::BinaryMath { lhs, rhs, kind } if kind.cuda_loop_lowerable() => Ok(format!(
+            "{}({}, {})",
+            kind.cuda_function(),
+            child(*lhs)?,
+            child(*rhs)?
+        )),
         TensorOp::UnaryMath { input, kind } if kind.cuda_loop_lowerable() => {
             Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
         }
-        TensorOp::Fmod { x, y } => Ok(format!("fmodf({}, {})", child(*x)?, child(*y)?)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
         // already run, so stop_gradient is the identity too.
         TensorOp::Broadcast { input }
@@ -7878,12 +7870,7 @@ fn cuda_program_source(
             | TensorOp::Mul { lhs, rhs }
             | TensorOp::Greater { lhs, rhs }
             | TensorOp::Compare { lhs, rhs, .. }
-            | TensorOp::Pow {
-                base: lhs,
-                exponent: rhs,
-            }
-            | TensorOp::Atan2 { y: lhs, x: rhs }
-            | TensorOp::Fmod { x: lhs, y: rhs } => {
+            | TensorOp::BinaryMath { lhs, rhs, .. } => {
                 let lhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*lhs].shape);
                 let rhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*rhs].shape);
                 let expression = match &node.op {
@@ -7898,12 +7885,8 @@ fn cuda_program_source(
                         "lhs[{lhs_offset}] {} rhs[{rhs_offset}] ? 1.0f : 0.0f",
                         kind.operator()
                     ),
-                    TensorOp::Pow { .. } => format!("powf(lhs[{lhs_offset}], rhs[{rhs_offset}])"),
-                    TensorOp::Atan2 { .. } => {
-                        format!("atan2f(lhs[{lhs_offset}], rhs[{rhs_offset}])")
-                    }
-                    TensorOp::Fmod { .. } => {
-                        format!("fmodf(lhs[{lhs_offset}], rhs[{rhs_offset}])")
+                    TensorOp::BinaryMath { kind, .. } => {
+                        format!("{}(lhs[{lhs_offset}], rhs[{rhs_offset}])", kind.cuda_function())
                     }
                     _ => unreachable!(),
                 };
@@ -8616,11 +8599,9 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Mean { .. } => "mean",
         TensorOp::MeanAxis { .. } => "mean_axis",
         TensorOp::Powi { .. } => "powi",
-        TensorOp::Pow { .. } => "pow",
+        TensorOp::BinaryMath { kind, .. } => kind.name(),
         TensorOp::Transpose { .. } => "transpose",
-        TensorOp::Atan2 { .. } => "atan2",
         TensorOp::UnaryMath { kind, .. } => kind.name(),
-        TensorOp::Fmod { .. } => "fmod",
         TensorOp::StopGradient { .. } => "stop_gradient",
         TensorOp::Custom { .. } => "custom",
         TensorOp::CumSum { .. } => "cumsum",

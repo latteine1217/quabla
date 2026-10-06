@@ -17,9 +17,10 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
-    sqrt_derivative_coefficient, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor,
-    TensorBackend, TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend,
-    TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
+    sqrt_derivative_coefficient, BinaryMathKind, DeviceOptimizerConfig, DeviceUpdateRule,
+    DynamicTensor, TensorBackend, TensorComparison, TensorConstant, TensorDType,
+    TensorDeviceBackend, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorOp,
+    UnaryMathKind,
 };
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
@@ -1136,16 +1137,8 @@ impl MlxBackend {
                     ops::r#where_device(&origin, &zero, &domain, &stream)
                         .map_err(|error| error.to_string())
                 }
-                TensorOp::Atan2 { y, x } => {
-                    ops::atan2_device(mlx_value(&values, *y)?, mlx_value(&values, *x)?, &stream)
-                        .map_err(|error| error.to_string())
-                }
                 TensorOp::UnaryMath { input, kind } => {
                     mlx_unary_math(mlx_value(&values, *input)?, *kind, &stream)
-                        .map_err(|error| error.to_string())
-                }
-                TensorOp::Fmod { x, y } => {
-                    mlx_fmod(mlx_value(&values, *x)?, mlx_value(&values, *y)?, &stream)
                         .map_err(|error| error.to_string())
                 }
                 // AD happens on the IR before lowering, so the value is all
@@ -1175,9 +1168,13 @@ impl MlxBackend {
                         .power_device(&exponent, &stream)
                         .map_err(|error| error.to_string())
                 }
-                TensorOp::Pow { base, exponent } => mlx_value(&values, *base)?
-                    .power_device(mlx_value(&values, *exponent)?, &stream)
-                    .map_err(|error| error.to_string()),
+                TensorOp::BinaryMath { lhs, rhs, kind } => mlx_binary_math(
+                    mlx_value(&values, *lhs)?,
+                    mlx_value(&values, *rhs)?,
+                    *kind,
+                    &stream,
+                )
+                .map_err(|error| error.to_string()),
                 TensorOp::Matmul { lhs, rhs } => mlx_value(&values, *lhs)?
                     .matmul_device(mlx_value(&values, *rhs)?, &stream)
                     .map_err(|error| error.to_string()),
@@ -2324,6 +2321,20 @@ fn mlx_unary_math(
     }
 }
 
+/// `kind(lhs, rhs)` with MLX's own op, except `fmod` (see [`mlx_fmod`]).
+fn mlx_binary_math(
+    lhs: &Array,
+    rhs: &Array,
+    kind: BinaryMathKind,
+    stream: &StreamOrDevice,
+) -> Result<Array, mlx_rs::error::Exception> {
+    match kind {
+        BinaryMathKind::Pow => lhs.power_device(rhs, stream),
+        BinaryMathKind::Atan2 => ops::atan2_device(lhs, rhs, stream),
+        BinaryMathKind::Fmod => mlx_fmod(lhs, rhs, stream),
+    }
+}
+
 /// `exp(x) - 1` on MLX. MLX's own expm1 is off by up to several hundred
 /// float32 ulp, and `exp(x) - 1` cancels near zero. Kahan's
 /// `(u - 1) * x / log(u)` with `u = exp(x)` keeps both within a few ulp: it
@@ -2501,11 +2512,9 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Mean { .. } => "mean",
         TensorOp::MeanAxis { .. } => "mean_axis",
         TensorOp::Powi { .. } => "powi",
-        TensorOp::Pow { .. } => "pow",
+        TensorOp::BinaryMath { kind, .. } => kind.name(),
         TensorOp::Transpose { .. } => "transpose",
-        TensorOp::Atan2 { .. } => "atan2",
         TensorOp::UnaryMath { kind, .. } => kind.name(),
-        TensorOp::Fmod { .. } => "fmod",
         TensorOp::StopGradient { .. } => "stop_gradient",
         TensorOp::Custom { .. } => "custom",
         TensorOp::CumSum { .. } => "cumsum",

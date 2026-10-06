@@ -81,8 +81,8 @@ const CUDA_GRAPH_EAGER_RUNS: usize = 2;
 /// handle is pointed at the recording stream). Excluded are nodes that read
 /// back to the host (`Cond`, `While`), call cuSOLVER, run nested loops
 /// (host-driven or fused, which allocate tapes), or are Cholesky kernels.
-/// Every elementwise math kind (`UnaryMath`) is admitted: each runs as one
-/// NVRTC kernel of the per-node program.
+/// Every elementwise math kind (`UnaryMath`, `BinaryMath`) is admitted:
+/// each runs as one NVRTC kernel of the per-node program.
 fn cuda_graph_capturable<T: CudaReal>(region: &CudaExecutionPlan<T>) -> bool {
     region.host_loops.is_empty()
         && region.cond_branches.is_empty()
@@ -104,9 +104,8 @@ fn cuda_graph_capturable<T: CudaReal>(region: &CudaExecutionPlan<T>) -> bool {
                     | TensorOp::Sqrt { .. }
                     | TensorOp::SqrtDerivative { .. }
                     | TensorOp::Powi { .. }
-                    | TensorOp::Pow { .. }
                     | TensorOp::UnaryMath { .. }
-                    | TensorOp::Atan2 { .. }
+                    | TensorOp::BinaryMath { .. }
                     | TensorOp::CumSum { .. }
                     | TensorOp::Matmul { .. }
                     | TensorOp::Sum { .. }
