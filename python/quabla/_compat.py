@@ -100,7 +100,6 @@ REPLACEMENTS = {
     "tensor_vmap_vjp_cuda_fn": 'qb.jit(<vjp of vmap>, device="cuda")',
     "tensor_vmap_vjp_fn": "qb.vjp(qb.vmap(f, ...), *primals)",
     "tensor_vmap_vjp_mlx_fn": 'qb.jit(<vjp of vmap>, device="mlx")',
-    "trace": "quabla.legacy.trace",
     "trace_tensor": "qb.jit(f).lower(...) or Compiler().trace(f, specs)",
     "value_and_grad_fn": "quabla.legacy.value_and_grad_fn",
     "vjp_fn": "quabla.legacy.vjp_fn",

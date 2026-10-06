@@ -63,6 +63,7 @@ python tests/python/test_ode_api.py
 python tests/python/test_linalg_api.py
 python tests/python/test_packaging_api.py
 python tests/python/test_custom_api.py
+python tests/python/test_numpy_api.py
 actionlint .github/workflows/*.yml     # when a workflow changes
 ```
 

@@ -75,5 +75,6 @@ jobs:
       - run: .venv-ci/bin/python tests/python/test_ode_api.py
       - run: .venv-ci/bin/python tests/python/test_linalg_api.py
       - run: .venv-ci/bin/python tests/python/test_custom_api.py
+      - run: .venv-ci/bin/python tests/python/test_numpy_api.py
       - run: .venv-ci/bin/python tests/python/test_random_api.py
       - run: .venv-ci/bin/python tests/python/test_packaging_api.py
