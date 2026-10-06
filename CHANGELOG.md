@@ -43,6 +43,27 @@ deprecated names keep working until 1.0 (see
   `rosenbrock23`, cubic Hermite for the fixed-step methods), written by
   masked updates inside the loop so adaptive steps are not shortened, and
   differentiable.
+- jax.numpy-style functions composed from existing ops, so they
+  differentiate and run under `jit` and `vmap` on every device: `flip`,
+  `roll`, `pad` (`constant`, `edge`, `reflect`, `symmetric`, `wrap`),
+  `tile`, `repeat`, `moveaxis`, `swapaxes`, `ravel`, `diag`, `diagonal`,
+  `trace`, `outer`, `dot`, `tensordot`, `kron`, `cross`, `diff`,
+  `trapezoid`, `interp`, `polyval`, `logaddexp`, `hypot`, `exp2`, `isinf`,
+  and `nan_to_num`. `logaddexp` and `hypot` neither overflow nor underflow
+  and have finite gradients at ties and at the origin; `interp` evaluates
+  every interval (no `searchsorted` without integer arrays) and is
+  differentiable in `x`, `xp`, and `fp`.
+- `quabla.linalg.norm` with NumPy's vector and matrix `ord` values and
+  `axis`/`keepdims` (the vector 2-norm and `"fro"` reuse the scaled `norm`
+  method, and general `p` norms are scaled likewise),
+  `quabla.linalg.matrix_power`, and `quabla.linalg.pinv` (NumPy's
+  `rtol=None` cutoff).
+
+### Changed
+
+- `quabla.trace` is the array `trace(a, offset=0, axis1=0, axis2=1)`. The
+  v0.1 call form `trace(function, input_specs)` keeps working and warns on
+  the call, as `grad` and `jit` do, instead of on attribute access.
 
 ### Fixed
 

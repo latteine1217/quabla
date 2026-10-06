@@ -44,6 +44,10 @@ from ._quabla import *  # noqa: F403
 from ._transforms import *  # noqa: F403
 from ._custom import *  # noqa: F403
 
+# Likewise, the array `trace` replaces the v0.1 function of the same name and
+# dispatches its call form `trace(function, input_specs)` to it.
+from ._ops import trace as trace
+
 __doc__ = _quabla.__doc__
 
 # The version of the installed distribution. The Cargo manifest of

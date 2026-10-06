@@ -27,6 +27,10 @@ against each other as in NumPy.
 - `lstsq(a, b)`: the least-squares solution of `a @ x ~= b` for a tall `a`
   of full column rank (the minimum-norm solution for a wide `a` of full row
   rank), from `qr`.
+- `norm(x, ord=None, axis=None, keepdims=False)`: vector and matrix norms
+  as NumPy, scaled so that float32 does not overflow.
+- `matrix_power(a, n)`: by repeated squaring; a negative `n` uses `inv`.
+- `pinv(a, rtol=None)`: the pseudo-inverse from `svd`.
 
 No derivative forms an explicit inverse: the gradient of `logabsdet` is
 `solve(a^T, g I)` and its tangent `trace(solve(a, da))`. The derivatives of
@@ -44,7 +48,9 @@ differentiating them raises.
 
 Devices: CPU and CUDA (cuSOLVER `getrf`/`getrs`, `syevd`, `geqrf`/`orgqr`,
 and `gesvdj`, `float32`). MLX rejects `solve`, `slogdet`, `eigh`, `qr`, and
-`svd`, because MLX's factorizations only run on its CPU stream.
+`svd`, because MLX's factorizations only run on its CPU stream, and with
+them `pinv`, `matrix_power` with a negative exponent, and the `svd`-based
+norms.
 
 Two matrix-free iterative solvers take a function `matvec(x, *args)`
 instead of a matrix (see `_krylov.py`): `cg` for symmetric positive-definite
@@ -55,10 +61,13 @@ solution, in reverse mode only (composable twice), and they do not support
 """
 
 import collections
+import math
+import numbers
+import operator
 
 from ._array import asarray, eye, zeros
 from ._krylov import cg, gmres
-from ._quabla import Tensor, TraceTensor, concat
+from ._quabla import Tensor, TraceTensor, concat, float32, where
 
 __all__ = [
     "EighResult",
@@ -74,6 +83,9 @@ __all__ = [
     "gmres",
     "inv",
     "lstsq",
+    "matrix_power",
+    "norm",
+    "pinv",
     "qr",
     "slogdet",
     "solve",
@@ -350,3 +362,159 @@ def lstsq(a, b, return_residuals=False):
     if vector:
         residuals = residuals.reshape(list(residuals.shape[:-1]))
     return LstsqResult(solution, residuals)
+
+
+def _norm_axes(axis, ndim):
+    """`axis` (an int or a sequence of ints) as distinct non-negative axes."""
+    try:
+        axes = (operator.index(axis),)
+    except TypeError:
+        axes = tuple(operator.index(value) for value in axis)
+    normalized = []
+    for value in axes:
+        if not -ndim <= value < ndim:
+            raise ValueError(f"axis {value} is out of bounds for rank {ndim}")
+        normalized.append(value % ndim)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"repeated axis in {axis!r}")
+    return tuple(normalized)
+
+
+def _vector_norm(x, ord, axis, keepdims):
+    if ord is None or ord == 2:
+        # The scaled native norm: no overflow or underflow of the squares.
+        return x.norm(axis=axis, keepdims=keepdims)
+    magnitude = x.abs()
+    if ord == math.inf:
+        return magnitude.max(axis=axis, keepdims=keepdims)
+    if ord == -math.inf:
+        return magnitude.min(axis=axis, keepdims=keepdims)
+    if ord == 0:
+        return x.not_equal(0.0).astype(x.dtype).sum(axis=axis, keepdims=keepdims)
+    if ord == 1:
+        return magnitude.sum(axis=axis, keepdims=keepdims)
+    # (sum |x|^p)^(1/p) scaled by the dominant magnitude `m` (the largest
+    # for p > 0, the smallest for p < 0), so that no |x/m|^p overflows. The
+    # result is independent of `m`, which therefore enters through
+    # `stop_gradient` and leaves the exact gradient.
+    p = float(ord)
+    extreme = magnitude.max if p > 0 else magnitude.min
+    peak = extreme(axis=axis, keepdims=True).stop_gradient()
+    # A zero (or NaN) peak divides by one instead.
+    scale = where(peak > 0.0, peak, 1.0)
+    result = ((magnitude / scale) ** p).sum(axis=axis, keepdims=True) ** (1.0 / p) * scale
+    # An infinite scale makes the ratios NaN; the norm is then infinite.
+    result = where(peak.isfinite().logical_or(peak.isnan()), result, peak)
+    return result if keepdims else result.reshape(
+        [extent for index, extent in enumerate(result.shape) if index != axis]
+    )
+
+
+def _matrix_norm(x, ord, axes, keepdims):
+    row, column = axes
+    if ord is None or ord == "fro":
+        return x.norm(axis=axes, keepdims=keepdims)
+    kept = [1 if index in axes else extent for index, extent in enumerate(x.shape)]
+    if ord in (1, -1, math.inf, -math.inf):
+        # Induced 1-norm: largest absolute column sum; inf-norm: row sum.
+        summed, reduced = (row, column) if ord in (1, -1) else (column, row)
+        sums = x.abs().sum(axis=summed, keepdims=True)
+        result = sums.max(axis=reduced, keepdims=True) if ord > 0 else sums.min(
+            axis=reduced, keepdims=True
+        )
+    elif ord in (2, -2, "nuc"):
+        rest = [index for index in range(len(x.shape)) if index not in axes]
+        values = svd(x.transpose(rest + [row, column]), compute_uv=False)
+        if ord == "nuc":
+            result = values.sum(axis=-1)
+        else:
+            result = values[..., 0] if ord == 2 else values[..., -1]
+        result = result.reshape(kept)
+    else:
+        raise ValueError(f"invalid norm order {ord!r} for matrices")
+    if keepdims:
+        return result
+    return result.reshape([extent for index, extent in enumerate(x.shape) if index not in axes])
+
+
+def norm(x, ord=None, axis=None, keepdims=False):
+    """The vector or matrix norm of `x`, as NumPy's `linalg.norm`.
+
+    `axis` selects a vector norm (an int) or a matrix norm (a pair of
+    axes); with `axis=None`, `ord=None` is the 2-norm of the flattened `x`
+    of any rank, and any other `ord` needs a 1-D (vector) or 2-D (matrix)
+    `x`. Vector orders: `None` or 2 (the scaled native `norm`, which does
+    not overflow in float32), 1, `inf`, `-inf`, 0 (the count of nonzero
+    entries, with a zero derivative), and any other real `p`,
+    `sum(|x|**p)**(1/p)`, scaled by the largest magnitude (smallest for
+    `p < 0`) so that the powers neither overflow nor underflow. Matrix
+    orders: `None` or `"fro"` (scaled), 1 and -1 (max and min absolute
+    column sum), `inf` and `-inf` (row sums), and 2, -2, and `"nuc"` (the
+    largest, the smallest, and the sum of the singular values, from `svd`,
+    so CPU and CUDA only). `keepdims` keeps the reduced axes with extent
+    1."""
+    x = _array(x)
+    ndim = len(x.shape)
+    if axis is None:
+        if ord is None:
+            result = x.norm()
+            return result.reshape([1] * ndim) if keepdims else result
+        if ndim not in (1, 2):
+            raise ValueError(f"improper number of dimensions to norm: ord={ord!r} with rank {ndim}")
+        axes = tuple(range(ndim))
+    else:
+        axes = _norm_axes(axis, ndim)
+    if isinstance(ord, str) and len(axes) == 1:
+        raise ValueError(f"invalid norm order {ord!r} for vectors")
+    if not (ord is None or isinstance(ord, str) or isinstance(ord, numbers.Real)) or (
+        isinstance(ord, numbers.Real) and math.isnan(ord)
+    ):
+        raise ValueError(f"invalid norm order {ord!r}")
+    if len(axes) == 1:
+        return _vector_norm(x, ord, axes[0], keepdims)
+    if len(axes) == 2:
+        return _matrix_norm(x, ord, axes, keepdims)
+    raise ValueError(f"norm takes one axis (vector) or two (matrix), got {axis!r}")
+
+
+def matrix_power(a, n):
+    """`a` raised to the integer power `n` for each square matrix of the
+    leading axes, by repeated squaring (about `2 log2 |n|` products); `n = 0`
+    gives the identity and a negative `n` powers `inv(a)`."""
+    a = _square(a, "matrix_power")
+    try:
+        n = operator.index(n)
+    except TypeError:
+        raise TypeError(f"exponent must be an integer, got {type(n).__name__}") from None
+    if n == 0:
+        identity = eye(a.shape[-1], dtype=a.dtype)
+        return _to_batch(identity, tuple(a.shape[:-2]))
+    if n < 0:
+        a, n = inv(a), -n
+    result, power = None, a
+    while True:
+        if n & 1:
+            result = power if result is None else result @ power
+        n >>= 1
+        if not n:
+            return result
+        power = power @ power
+
+
+def pinv(a, rtol=None):
+    """The Moore-Penrose pseudo-inverse of each matrix of the leading axes,
+    `V diag(1/s) U^T` from `svd`, with every singular value at or below
+    `rtol * max(s)` treated as zero. `rtol=None` means
+    `max(m, n) * eps(dtype)`, NumPy's `rtol=None` cutoff (NumPy's legacy
+    `rcond` default is a fixed 1e-15, JAX uses ten times this). Derivatives
+    come from those of `svd`: exact for distinct nonzero singular values,
+    infinite or NaN for a rank-deficient non-square `a` (see `svd`). CPU
+    and CUDA only."""
+    a = _matrix(a, "pinv")
+    m, n = a.shape[-2], a.shape[-1]
+    if rtol is None:
+        rtol = max(m, n) * (2.0**-23 if a.dtype == float32 else 2.0**-52)
+    u, s, vh = svd(a)
+    kept = s > s[..., :1] * rtol
+    inverse = where(kept, 1.0 / where(kept, s, 1.0), 0.0)
+    return _matrix_transpose(vh) @ (inverse.reshape(list(inverse.shape) + [1]) * _matrix_transpose(u))

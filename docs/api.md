@@ -147,6 +147,40 @@ qb.eye(n, m=None, dtype=None)
   - `quabla.matmul` follows NumPy for rank-1 operands: vector @ vector is a
     scalar, matrix @ vector and vector @ matrix drop the vector's unit axis.
     The `@` operator keeps requiring rank-2 or higher operands.
+- jax.numpy-style functions with NumPy signatures and semantics, composed
+  from reshapes, transposes, broadcasts, slices, static-index gathers,
+  `concat`, `where`, and `matmul`, so they differentiate and run under
+  `jit` and `vmap` on every device. Shifts, pad widths, repeats, and axes
+  are static Python ints (there are no integer arrays), and no result may
+  be empty:
+  - Shapes: `flip`, `roll`, `pad(x, pad_width, mode="constant",
+    constant_values=0)` with modes `constant`, `edge`, `reflect`,
+    `symmetric`, and `wrap`, `tile`, `repeat` (an int, or one count per
+    entry), `moveaxis`, `swapaxes`, `ravel`, `diag(v, k=0)` (1-D to 2-D and
+    back), `diagonal(x, offset=0, axis1=0, axis2=1)`, and `trace` with the
+    same arguments. `trace(function, input_specs)`, the v0.1 call form, is
+    still dispatched to `quabla.legacy.trace` with its deprecation warning.
+  - Products: `outer`, `dot` (NumPy's rules: a `tensordot` over the last
+    axis of `a` and the second-to-last of `b` beyond rank 2), `tensordot(a,
+    b, axes=2)`, `kron`, and `cross(a, b, axisa=-1, axisb=-1, axisc=-1,
+    axis=None)` for 3-vectors and 2-vectors.
+  - Calculus: `diff(x, n=1, axis=-1, prepend=None, append=None)`,
+    `trapezoid(y, x=None, dx=1.0, axis=-1)`, `polyval(p, x)` by Horner's
+    rule (from `p[0]`, so an infinite `x` gives the polynomial's limit where
+    NumPy gives NaN), and `interp(x, xp, fp, left=None, right=None)` for a
+    strictly increasing `xp` (checked when `xp` is eager). Without
+    `searchsorted`, `interp` evaluates every interval, O(`x.size *
+    len(xp)`) work and memory, and is exact at the knots and differentiable
+    in `x`, `xp`, and `fp`; its derivative in `x` at a knot is the slope to
+    the right (at `xp[-1]`, the last slope), as in JAX.
+  - Elementwise: `logaddexp(a, b)` as `hi + log1p(exp(lo - hi))` (no
+    overflow, gradient split evenly at ties, `x1 + x2` where both are
+    infinite of one sign); `hypot(a, b)` scaled by `max(|a|, |b|)`, so it
+    neither overflows nor underflows in `float32`, with gradient
+    `(a, b) / hypot` and zero at the origin; `exp2(x)` as `2 ** x`, exact
+    for integer `x`; `isinf(x)`; and `nan_to_num(x, copy=True, nan=0.0,
+    posinf=None, neginf=None)`, whose defaults are the dtype's finite
+    limits.
 - Operators: `-x` and `x ** y` work on traced values as on eager ones;
   `x ** y` with a non-integer or tensor exponent is the differentiable
   elementwise `pow` op (`qb.power`), described under
@@ -766,6 +800,24 @@ is written with `solve`, `matmul`, and the decompositions themselves:
   rank-deficient `a` is not supported: `R` is singular and the result is
   non-finite or meaningless, without an error. Derivatives come from those
   of `qr` and the triangular solves.
+- `norm(x, ord=None, axis=None, keepdims=False)` follows NumPy: an int
+  `axis` gives a vector norm, a pair of axes a matrix norm, and `axis=None`
+  with `ord=None` the 2-norm of the flattened `x` (another `ord` then needs
+  a 1-D or 2-D `x`). Vector orders are `None`/2 (the scaled method
+  `x.norm`, which does not overflow in `float32`), 1, `inf`, `-inf`, 0 (the
+  count of nonzero entries, derivative zero), and any real `p`, computed as
+  `m * sum((|x| / m)**p)**(1/p)` with `m` the largest magnitude (the
+  smallest for `p < 0`) through `stop_gradient`, so the powers neither
+  overflow nor underflow and the gradient is exact. Matrix orders are
+  `None`/`"fro"` (scaled), 1/-1 and `inf`/`-inf` (extreme absolute column
+  and row sums), and 2/-2/`"nuc"` from the singular values.
+- `matrix_power(a, n)` takes an integer `n` and multiplies by repeated
+  squaring; `n = 0` gives the identity and a negative `n` powers `inv(a)`.
+- `pinv(a, rtol=None)` is `V diag(1/s) U^T` from `svd`, dropping singular
+  values at or below `rtol * max(s)`; `rtol=None` is NumPy's
+  `max(m, n) * eps` (JAX uses ten times that). Its derivatives are those of
+  `svd`: exact for distinct nonzero singular values, infinite or NaN for a
+  rank-deficient non-square `a`.
 
 Derivatives at exactly singular matrices are undefined: the derivatives of
 `slogdet`, `det`, and `inv` call `solve`, which raises on the CPU and reports
@@ -774,7 +826,8 @@ eigenvalue makes `F` infinite, so the eigenvector derivative is inf or NaN,
 as in JAX, while the eigenvalue derivative stays defined. MLX rejects
 `solve`, `slogdet`, `det`, `inv`, `eigh`, `qr`, `svd`, and `lstsq` with
 `UnsupportedOperationError`, because MLX's factorizations only run on its
-CPU stream.
+CPU stream, and with them `pinv`, `matrix_power` with a negative `n`, and
+the 2, -2, and `"nuc"` matrix norms.
 
 `qb.ode.odeint(f, y0, (t0, t1), steps=n, method="rk4", args=(), save=False, saveat=None)`
 integrates `dy/dt = f(y, t, *args)` with `n` equal steps of classical RK4,
@@ -1492,8 +1545,7 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - The legacy 2D `Matrix`/`TraceGraph` API is not migrated to the facade.
 - `quabla.vmap` cannot batch `cond`/`fori`/`scan` regions over a mapped
   argument.
-- `qb.linalg` has no `svd`, `qr`, `eig` (non-symmetric), `lstsq`, or
-  `pinv`. Batched CUDA solves and decompositions issue one cuSOLVER call per
+- `qb.linalg` has no `eig` (non-symmetric). Batched CUDA solves and decompositions issue one cuSOLVER call per
   batch element. Derivatives at exactly singular matrices raise instead of
   returning non-finite values.
 - `custom_vjp`, `custom_jvp`, and `checkpoint` functions cannot be called
