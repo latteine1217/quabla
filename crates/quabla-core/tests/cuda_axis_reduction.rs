@@ -1,5 +1,7 @@
 #![cfg(all(feature = "cuda", target_os = "linux"))]
 
+mod support;
+
 use quabla_core::tensor_ir::{CudaBackend, DynamicTensor, TensorIr};
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -24,7 +26,7 @@ fn execute(
 
 #[test]
 fn long_axis_reductions_match_wide_reference() -> Result<(), String> {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return Ok(());
     }
     for shape in [

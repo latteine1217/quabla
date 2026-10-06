@@ -1,9 +1,9 @@
 """S8 wrapper contracts; NCCL parity is opt-in on a two-GPU host."""
 
-import os
-
 import quabla as qb
 from quabla import distributed
+
+from _support import enabled, require, run, skip
 
 
 def expect(error_type, fragment, operation):
@@ -239,8 +239,8 @@ def test_adapter_structure_signatures_and_cache_bound():
 
 
 def test_feature_unavailable_contract():
-    if os.environ.get("QUABLA_CUDA_NCCL_TEST") == "1":
-        return
+    if enabled("nccl"):
+        skip("NCCL runtime validation enabled")
     params, batch = arguments()
     error = expect(
         qb.UnsupportedOperationError, "CUDA", lambda: transform()(params, batch)
@@ -250,8 +250,7 @@ def test_feature_unavailable_contract():
 
 
 def test_nccl_numerical_parity():
-    if os.environ.get("QUABLA_CUDA_NCCL_TEST") != "1":
-        return
+    require("nccl")
     for dtype in (qb.float64, qb.float32):
         params, batch = arguments(dtype=dtype)
         for reduction in ("sum", "mean"):
@@ -293,14 +292,4 @@ def test_public_namespace_is_all():
 
 
 if __name__ == "__main__":
-    for name, test in sorted(globals().copy().items()):
-        if name.startswith("test_") and callable(test):
-            nccl_enabled = os.environ.get("QUABLA_CUDA_NCCL_TEST") == "1"
-            if name == "test_nccl_numerical_parity" and not nccl_enabled:
-                print(f"SKIP {name}: QUABLA_CUDA_NCCL_TEST=1 required")
-                continue
-            if name == "test_feature_unavailable_contract" and nccl_enabled:
-                print(f"SKIP {name}: NCCL runtime validation enabled")
-                continue
-            test()
-            print(f"PASS {name}")
+    run(globals())

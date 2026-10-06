@@ -1,30 +1,10 @@
 """Custom differentiation rules: custom_vjp, custom_jvp, and checkpoint."""
 
 import math
-import os
 
 import quabla as qb
 
-
-def raises(kind, function, *args, match=None):
-    try:
-        function(*args)
-    except kind as error:
-        if match is not None:
-            assert match in str(error), str(error)
-        return
-    raise AssertionError(f"expected {kind.__name__}")
-
-
-def assert_close(actual, expected, tolerance=1e-12):
-    actual = actual.tolist() if hasattr(actual, "tolist") else actual
-    expected = expected.tolist() if hasattr(expected, "tolist") else expected
-    if isinstance(actual, list):
-        assert len(actual) == len(expected), (actual, expected)
-        for got, want in zip(actual, expected):
-            assert_close(got, want, tolerance)
-        return
-    assert abs(actual - expected) <= tolerance * max(1.0, abs(expected)), (actual, expected)
+from _support import assert_close, devices, raises, run
 
 
 def sigmoid(x):
@@ -348,9 +328,7 @@ def test_custom_rules_on_devices_match_cpu():
         qb.grad(lambda p: mlp(p, x, True)),
     )
     arguments = (qb.array([0.0, 1.0, 50.0]), qb.array([0.0, 1.0]), params)
-    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(flag) != "1":
-            continue
+    for device in devices():
         for function, argument in zip(functions, arguments):
             expected = qb.tree.leaves(qb.jit(function)(argument))
             actual = qb.tree.leaves(qb.jit(function, device=device)(argument))
@@ -359,7 +337,4 @@ def test_custom_rules_on_devices_match_cpu():
 
 
 if __name__ == "__main__":
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
-            print(f"PASS {name}")
+    run(globals())

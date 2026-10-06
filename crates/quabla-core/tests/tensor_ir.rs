@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use quabla_core::compiler::QuablaCompileError;
@@ -515,7 +517,7 @@ fn mlx_f32_mlp_value_and_gradients_match_the_cpu_f32_reference() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_f32_mlp_value_and_gradients_match_the_cpu_f32_reference_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     assert_f32_mlp_parity(QuablaTarget::Cuda { device_ordinal: 0 });
@@ -530,7 +532,7 @@ fn compiler_facade_multi_output_mlx_matches_cpu() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn compiler_facade_multi_output_cuda_matches_cpu_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     assert_multi_output_parity(QuablaTarget::Cuda { device_ordinal: 0 });
@@ -1414,7 +1416,7 @@ fn symbolic_jvp_many_retains_scan_vjp_jvp_sibling_targets() {
     assert_eq!(outputs[1].data().as_ref(), &[26.0]);
 
     #[cfg(all(feature = "cuda", target_os = "linux"))]
-    if std::env::var_os("QUABLA_CUDA_TEST").is_some() {
+    if crate::support::Gate::Cuda.enabled() {
         let cuda = must!(CudaBackend::default().execute_many(&plan, &output_ids, &inputs));
         for (actual, expected) in cuda.iter().zip(&outputs) {
             assert_eq!(actual.shape(), expected.shape());
@@ -2015,7 +2017,7 @@ fn symbolic_jvp_transforms_fori_region_without_unrolling_parent_loop() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_structural_fori_jvp_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     let mut body = TensorIr::new();
@@ -2219,7 +2221,7 @@ fn symbolic_hvp_through_fori_lowers_to_structural_fori_vjp_jvp() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_structural_fori_hvp_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -2279,7 +2281,7 @@ fn cuda_backend_executes_structural_fori_hvp_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_only_the_selected_cond_region_with_ad_parity_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     must!(assert_log_guard_cond_matches_cpu("CUDA", |plan, inputs| {
@@ -2290,7 +2292,7 @@ fn cuda_backend_executes_only_the_selected_cond_region_with_ad_parity_when_enabl
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_differentiates_scan_regions_with_a_pruned_sibling_result_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     must!(assert_pruned_scan_regions_match_cpu(
@@ -2302,7 +2304,7 @@ fn cuda_backend_differentiates_scan_regions_with_a_pruned_sibling_result_when_en
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_reuses_cond_regions_and_rejects_non_finite_predicates_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     let (graph, loss) = must!(log_guard_cond_graph());
@@ -2383,7 +2385,7 @@ fn cuda_backend_reuses_cond_regions_and_rejects_non_finite_predicates_when_enabl
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_runs_cond_inside_fori_and_scan_bodies_as_host_driven_loops_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     let mut on_true = TensorIr::new();
@@ -2442,7 +2444,7 @@ fn cuda_backend_runs_cond_inside_fori_and_scan_bodies_as_host_driven_loops_when_
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_while_loops_as_host_driven_region_loops_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     let (graph, output, inputs) = must!(doubling_while_graph());
@@ -2525,7 +2527,7 @@ fn host_driven_fori_loss(
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_matches_cpu_for_host_driven_fori_vjp_and_hvp_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     for rotate in [false, true] {
@@ -2601,7 +2603,7 @@ fn cuda_backend_executes_elementwise_fixed_fori_regions_on_device() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_fixed_fori_vjp_with_device_resident_carry_tape_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -2655,7 +2657,7 @@ fn cuda_backend_executes_fixed_fori_vjp_with_device_resident_carry_tape_when_ena
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_fuses_grouped_fori_vjp_targets_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -2724,7 +2726,7 @@ fn cuda_backend_fuses_grouped_fori_vjp_targets_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_reduces_scalar_fori_capture_vjp_on_device_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -2774,7 +2776,7 @@ fn cuda_backend_reduces_scalar_fori_capture_vjp_on_device_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_reduces_broadcast_fori_capture_vjp_on_device_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -2829,7 +2831,7 @@ fn cuda_backend_reduces_broadcast_fori_capture_vjp_on_device_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_fixed_scan_regions_with_shared_device_results_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -2873,7 +2875,7 @@ fn cuda_backend_executes_fixed_scan_regions_with_shared_device_results_when_enab
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_fixed_scan_vjp_with_device_resident_carry_tape_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -2928,7 +2930,7 @@ fn cuda_backend_executes_fixed_scan_vjp_with_device_resident_carry_tape_when_ena
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_fuses_grouped_scan_vjp_targets_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -2997,7 +2999,7 @@ fn cuda_backend_fuses_grouped_scan_vjp_targets_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_reduces_scalar_scan_capture_vjp_on_device_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -3047,7 +3049,7 @@ fn cuda_backend_reduces_scalar_scan_capture_vjp_on_device_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_reduces_broadcast_scan_capture_vjp_on_device_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -3197,7 +3199,7 @@ fn assert_cuda_outputs_match_cpu(
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_grouped_scan_vjp_matches_cpu_for_broadcast_and_equal_lane_outputs_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -3231,7 +3233,7 @@ fn cuda_grouped_scan_vjp_matches_cpu_for_broadcast_and_equal_lane_outputs_when_e
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_grouped_scan_vjp_jvp_matches_cpu_for_broadcast_and_equal_lane_outputs_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -3334,7 +3336,7 @@ fn cuda_group_fori_loss(
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_grouped_fori_vjp_matches_cpu_for_broadcast_captures_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -3442,7 +3444,7 @@ fn cuda_sum_of_gradients(
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_grouped_loop_capture_reductions_repeat_exactly_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -3521,7 +3523,7 @@ fn cuda_grouped_loop_capture_reductions_repeat_exactly_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_compiled_grouped_scan_vjp_value_and_grad_plan_executes_repeatedly_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -3550,7 +3552,7 @@ fn cuda_compiled_grouped_scan_vjp_value_and_grad_plan_executes_repeatedly_when_e
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_compiled_grouped_scan_vjp_jvp_plan_executes_repeatedly_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -3606,7 +3608,7 @@ fn cuda_compiled_grouped_scan_vjp_jvp_plan_executes_repeatedly_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_compiled_grouped_fori_vjp_plan_executes_repeatedly_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -3630,7 +3632,7 @@ fn cuda_compiled_grouped_fori_vjp_plan_executes_repeatedly_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_compiled_scan_plan_retaining_carry_and_outputs_executes_repeatedly_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -3681,7 +3683,7 @@ fn cuda_compiled_scan_plan_retaining_carry_and_outputs_executes_repeatedly_when_
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_compiled_cond_plan_alternates_branches_across_executions_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -3713,7 +3715,7 @@ fn cuda_compiled_cond_plan_alternates_branches_across_executions_when_enabled() 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_retained_adam_trains_through_grouped_scan_gradients_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -5086,7 +5088,7 @@ fn cuda_data_parallel_validates_replica_device_contract_before_lowering() {
 #[cfg(all(feature = "cuda-nccl", target_os = "linux"))]
 #[test]
 fn cuda_data_parallel_sharded_schedule_matches_cpu_oracle_on_two_gpus() {
-    if std::env::var_os("QUABLA_CUDA_NCCL_TEST").is_none() {
+    if !crate::support::Gate::CudaNccl.enabled() {
         return;
     }
     let (plan, sharding, column_sum, mean) = must!(mixed_reduction_data_parallel_plan());
@@ -5186,7 +5188,7 @@ fn assert_data_parallel_outputs_match(
 #[cfg(all(feature = "cuda-nccl", target_os = "linux"))]
 #[test]
 fn cuda_data_parallel_recreates_communicators_after_a_failed_call_on_two_gpus() {
-    if std::env::var_os("QUABLA_CUDA_NCCL_TEST").is_none() {
+    if !crate::support::Gate::CudaNccl.enabled() {
         return;
     }
     let (plan, sharding, _, _) = must!(mixed_reduction_data_parallel_plan());
@@ -5245,7 +5247,7 @@ fn cuda_free_bytes(
 #[cfg(all(feature = "cuda-nccl", target_os = "linux"))]
 #[test]
 fn cuda_data_parallel_compile_execute_drop_cycles_keep_device_memory_stable_on_two_gpus() {
-    if std::env::var_os("QUABLA_CUDA_NCCL_TEST").is_none() {
+    if !crate::support::Gate::CudaNccl.enabled() {
         return;
     }
     const CYCLES: usize = 50;
@@ -5563,7 +5565,7 @@ fn buffer_plan_preserves_reshape_as_an_input_alias() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_fused_elementwise_plan_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -5595,7 +5597,7 @@ fn cuda_backend_executes_fused_elementwise_plan_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_execution_plan_reuses_buffers_for_updated_inputs_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -5640,7 +5642,7 @@ fn cuda_execution_plan_reuses_buffers_for_updated_inputs_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_execution_plan_updates_a_retained_parameter_with_device_sgd_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -5689,7 +5691,7 @@ fn cuda_execution_plan_updates_a_retained_parameter_with_device_sgd_when_enabled
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_execution_plan_updates_a_retained_parameter_with_device_adam_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -5738,7 +5740,7 @@ fn cuda_execution_plan_updates_a_retained_parameter_with_device_adam_when_enable
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_execution_plans_synchronize_multi_parameter_device_sgd_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -5801,7 +5803,7 @@ fn cuda_execution_plans_synchronize_multi_parameter_device_sgd_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_execution_plans_synchronize_multi_parameter_device_adam_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -5870,7 +5872,7 @@ fn cuda_execution_plans_synchronize_multi_parameter_device_adam_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_direct_rank_two_matmul_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -5907,7 +5909,7 @@ fn cuda_backend_executes_direct_rank_two_matmul_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_tiled_rank_two_matmul_inside_generic_plan_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -5966,7 +5968,7 @@ fn cuda_epilogue_test_inputs(
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_matmul_bias_tanh_epilogue_only_fuses_plan_inputs_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -6011,7 +6013,7 @@ fn cuda_matmul_bias_tanh_epilogue_only_fuses_plan_inputs_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_two_layer_mlp_matches_cpu_across_single_and_multi_output_plans_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -6069,7 +6071,7 @@ fn cuda_two_layer_mlp_matches_cpu_across_single_and_multi_output_plans_when_enab
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_broadcast_batched_matmul_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -6106,7 +6108,7 @@ fn cuda_backend_executes_broadcast_batched_matmul_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_broadcast_batched_matmul_vjp_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -6150,7 +6152,7 @@ fn cuda_backend_executes_broadcast_batched_matmul_vjp_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_broadcast_batched_matmul_trains_with_retained_adam_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -6204,7 +6206,7 @@ fn cuda_broadcast_batched_matmul_trains_with_retained_adam_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_two_layer_mlp_scalar_loss_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -6248,7 +6250,7 @@ fn cuda_backend_executes_two_layer_mlp_scalar_loss_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_symbolic_vjp_for_broadcast_bias_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -6601,7 +6603,7 @@ fn solve_rejects_unsupported_shapes_and_singular_matrices() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_rank_two_solve_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
 
@@ -6923,7 +6925,7 @@ fn mlx_backend_serializes_concurrent_execution_across_threads() {
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
 fn mlx_backend_solves_through_the_cpu_stream_lu() {
-    if std::env::var_os("QUABLA_MLX_TEST").is_none() {
+    if !crate::support::Gate::Mlx.enabled() {
         return;
     }
     let mut graph = TensorIr::new();
@@ -8087,7 +8089,7 @@ fn mlx_bool_masks_comparisons_and_guarded_gradients_match_cpu() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_bool_masks_comparisons_and_guarded_gradients_match_cpu_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     assert_bool_parity(QuablaTarget::Cuda { device_ordinal: 0 });
@@ -8850,7 +8852,7 @@ fn mlx_pow_values_derivatives_and_loop_bodies_match_cpu() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_pow_values_derivatives_and_loop_bodies_match_cpu_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     assert_device_parity(
@@ -8862,7 +8864,7 @@ fn cuda_pow_values_derivatives_and_loop_bodies_match_cpu_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_fuses_pow_chains_into_one_region_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     let mut graph = TensorIr::new();
@@ -9035,7 +9037,7 @@ fn mlx_sqrt_values_derivatives_and_loop_bodies_match_cpu() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_sqrt_values_derivatives_and_loop_bodies_match_cpu_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     assert_device_parity(
@@ -10300,7 +10302,7 @@ fn mlx_backend_executes_array_constants_like_cpu() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_executes_array_constants_like_cpu_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     assert_constant_chain_parity(QuablaTarget::Cuda { device_ordinal: 0 });
@@ -10309,7 +10311,7 @@ fn cuda_backend_executes_array_constants_like_cpu_when_enabled() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_backend_uploads_array_constants_once_per_plan_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     let mut graph = TensorIr::new();
@@ -11932,7 +11934,7 @@ fn mlx_batched_while_loops_match_the_cpu() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_batched_while_loops_match_the_cpu_when_enabled() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     let target = QuablaTarget::Cuda { device_ordinal: 0 };
@@ -12100,7 +12102,7 @@ fn log1p_device_plans() -> Result<Vec<PlanWithInputs>, String> {
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
 fn mlx_log1p_matches_cpu_values_and_gradients() {
-    if std::env::var_os("QUABLA_MLX_TEST").is_none() {
+    if !crate::support::Gate::Mlx.enabled() {
         return;
     }
     for (plan, inputs) in must!(log1p_device_plans()) {
@@ -12119,7 +12121,7 @@ fn mlx_log1p_matches_cpu_values_and_gradients() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_log1p_matches_cpu_values_and_gradients() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     for (plan, inputs) in must!(log1p_device_plans()) {
@@ -12390,7 +12392,7 @@ fn mlx_gather_and_scatter_add_match_cpu_bits_with_repeated_indices() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_gather_and_scatter_add_match_cpu_bits_with_repeated_indices() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     let (graph, outputs, inputs) = must!(gather_scatter_device_case());
@@ -13694,7 +13696,7 @@ fn assert_extremum_device_parity(
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
 fn mlx_extremum_axis_matches_cpu_bitwise() {
-    if std::env::var_os("QUABLA_MLX_TEST").is_none() {
+    if !crate::support::Gate::Mlx.enabled() {
         return;
     }
     assert_extremum_device_parity(|plan, inputs| MlxBackend.execute(plan, inputs));
@@ -13703,7 +13705,7 @@ fn mlx_extremum_axis_matches_cpu_bitwise() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_extremum_axis_matches_cpu_bitwise() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     assert_extremum_device_parity(|plan, inputs| CudaBackend::new(0).execute(plan, inputs));
@@ -13847,7 +13849,7 @@ fn cumsum_device_plans() -> Result<Vec<PlanWithInputs>, String> {
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
 fn mlx_new_ops_match_cpu_values_and_gradients() {
-    if std::env::var_os("QUABLA_MLX_TEST").is_none() {
+    if !crate::support::Gate::Mlx.enabled() {
         return;
     }
     for (plan, inputs) in must!(new_op_device_plans()) {
@@ -13878,7 +13880,7 @@ fn mlx_new_ops_match_cpu_values_and_gradients() {
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 #[test]
 fn cuda_new_ops_match_cpu_values_and_gradients() {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return;
     }
     for (plan, inputs) in must!(new_op_device_plans()) {

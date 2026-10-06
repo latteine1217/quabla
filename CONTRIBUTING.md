@@ -79,9 +79,8 @@ that build; if `quabla.__file__` does not point into `python/quabla/`
 afterwards, run `python -m pip uninstall quabla` and build again.
 
 NumPy is an optional runtime dependency: importing `quabla` never imports
-it, and the NumPy interop tests in `tests/python/test_api.py` print
-`skipped` without it. Install it (`python -m pip install numpy`) to run
-them; CI does.
+it, and the tests that need it report `SKIP` without it. Install it
+(`python -m pip install numpy`) to run them; CI does.
 
 CI (`.github/workflows/ci.yml`) runs the Linux gates on every push to `main`
 and every pull request. The macOS MLX check
@@ -101,8 +100,24 @@ missing from it or a typed array method does not exist at run time. The
 package version lives only in `crates/quabla-python/Cargo.toml`
 (`pyproject.toml` declares it dynamic).
 
+Each Python suite is a plain script built on the shared harness
+`tests/python/_support.py`. Its runner calls the `test_*` functions in
+definition order and prints one line per test: `PASS name`, `PASS name
+(gate off: ...)` when part of the test was gated off, `SKIP name: reason`
+when the test could not run, or `FAIL name` with the traceback; then a
+summary line such as `test_api.py: 102 passed, 4 skipped, 0 failed`. The
+script exits non-zero when any test failed. A new suite ends with
+`run(globals())` and takes `raises`, `skip`, and the gate helpers from the
+harness.
+
 GPU runtime suites are opt-in through environment variables and need the
-matching hardware, so CI does not run them:
+matching hardware, so CI does not run them. A gate is on exactly when its
+variable is `1`; any other value, `0` included, leaves it off. The Python
+suites (`enabled`, `require`, and `devices` in `tests/python/_support.py`)
+and the Rust tests (`Gate` in `crates/quabla-core/tests/support/mod.rs`)
+apply the same rule. A gated-off Python test reports `SKIP` with the
+variable to set, and one whose gate is on for a build without that target
+fails; a gated-off Rust test returns early and passes:
 
 ```sh
 # MLX build on Apple silicon:
@@ -115,8 +130,9 @@ QUABLA_CUDA_NCCL_TEST=1 cargo test -p quabla-core --features cuda-nccl
 ```
 
 The Rust MLX tests run whenever `quabla-core/mlx` is enabled on macOS
-(`cargo test --workspace --features quabla-core/mlx`). If a change touches a
-GPU backend and you do not have the hardware, say so in the pull request.
+(`cargo test --workspace --features quabla-core/mlx`); a few of them also
+need `QUABLA_MLX_TEST=1`. If a change touches a GPU backend and you do not
+have the hardware, say so in the pull request.
 
 ## Commits and Pull Requests
 

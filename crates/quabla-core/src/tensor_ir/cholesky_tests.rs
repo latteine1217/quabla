@@ -407,7 +407,7 @@ fn compact_cholesky_internal_batches_match_independent_matrices() -> Result<(), 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
 fn compact_cholesky_mlx_keeps_resident_reference_results() -> Result<(), String> {
-    if std::env::var("QUABLA_MLX_TEST").as_deref() != Ok("1") {
+    if !crate::test_support::Gate::Mlx.enabled() {
         return Ok(());
     }
     let backend = MlxBackend;

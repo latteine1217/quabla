@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 import quabla as qb
 
+from _support import run
+
 
 def assert_close(actual, expected, tolerance=1e-12):
     expected = qb.asarray(expected)
@@ -221,6 +223,4 @@ def test_jacobian_widening_preserves_output_precision():
 
 
 if __name__ == "__main__":
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
+    run(globals())

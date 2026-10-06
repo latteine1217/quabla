@@ -5,6 +5,8 @@ import runpy
 
 import quabla
 
+from _support import devices, enabled, require, run, skip
+
 
 def assert_close_rows(actual, expected, tol=1e-12):
     assert len(actual) == len(expected)
@@ -723,8 +725,7 @@ def test_python_entrypoints_keep_backend_errors_for_unbuilt_targets():
 
 
 def test_compiler_facade_cuda_matches_cpu_for_primal_jvp_and_vjp():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     compiler = quabla.Compiler()
     assert compiler.capability("cuda") is True
@@ -761,8 +762,7 @@ def test_compiler_facade_cuda_matches_cpu_for_primal_jvp_and_vjp():
 
 
 def test_compiler_facade_cuda_executes_nonlinear_scan_hvp():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     def scan_loss(initial, scale):
         carry, outputs = quabla.tensor_scan_region(
@@ -792,8 +792,7 @@ def test_compiler_facade_cuda_executes_nonlinear_scan_hvp():
 
 
 def test_compiler_facade_cuda_executes_equal_count_reshaped_scan_hvp():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     def scan_loss(initial, scale):
         carry, outputs = quabla.tensor_scan_region(
@@ -822,8 +821,7 @@ def test_compiler_facade_cuda_executes_equal_count_reshaped_scan_hvp():
 
 
 def test_compiler_facade_cuda_executes_broadcast_scan_primal():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     def scan_values(initial, scale):
         _, outputs = quabla.tensor_scan_region(
@@ -850,8 +848,7 @@ def test_compiler_facade_cuda_executes_broadcast_scan_primal():
 
 
 def test_compiler_facade_cuda_aggregates_broadcast_scan_vjp():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     def scan_loss(initial, scale):
         carry, outputs = quabla.tensor_scan_region(
@@ -881,8 +878,7 @@ def test_compiler_facade_cuda_aggregates_broadcast_scan_vjp():
 
 
 def test_compiler_facade_cuda_executes_broadcast_scan_hvp():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     def scan_loss(initial, scale):
         carry, outputs = quabla.tensor_scan_region(
@@ -912,8 +908,7 @@ def test_compiler_facade_cuda_executes_broadcast_scan_hvp():
 
 
 def test_compiler_facade_cuda_aggregates_broadcast_capture_scan_hvp():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     def scan_loss(initial, scale):
         carry, outputs = quabla.tensor_scan_region(
@@ -944,8 +939,7 @@ def test_compiler_facade_cuda_aggregates_broadcast_capture_scan_hvp():
 
 
 def test_cuda_value_and_grad_groups_broadcast_scan_vjp_targets():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     # Requesting both gradients fuses them into one grouped Scan VJP kernel, which must reduce the
     # per-step output cotangents onto the carry lanes exactly like the single-target kernel.
@@ -990,8 +984,7 @@ def test_cuda_value_and_grad_groups_broadcast_scan_vjp_targets():
 
 
 def test_cuda_value_and_grad_reexecutes_grouped_scan_vjp_plan():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     # Training loops call one compiled value-and-grad function per step, so its grouped Scan VJP
     # plan must run any number of times; alternating inputs exposes state left by the prior call.
@@ -1038,8 +1031,7 @@ def test_cuda_value_and_grad_reexecutes_grouped_scan_vjp_plan():
 
 
 def test_compiler_facade_cuda_runs_indexed_unequal_lane_scan_hvp_host_driven():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     def scan_loss(initial, scale):
         carry, outputs = quabla.tensor_scan_region(
@@ -1071,8 +1063,7 @@ def test_compiler_facade_cuda_runs_indexed_unequal_lane_scan_hvp_host_driven():
 
 
 def test_compiler_facade_cuda_executes_packed_pair_scan_bodies():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     # The nonlinear JVP tangent half reads the primal half; the row swap reads the other half.
     def scan_loss(initial, scale):
@@ -1137,8 +1128,7 @@ def _scan_rejection_program(body, carry_shape, capture_shape, result="outputs"):
 
 
 def test_compiler_facade_cuda_runs_non_fused_scan_forms_as_host_driven_loops():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     # Each case carries its program with the carry and capture shapes.
     def primal(body, carry_shape, capture_shape):
@@ -1502,7 +1492,7 @@ def test_trace_tensor_getitem_preserves_slice_ad_and_backend_parity():
     assert symbolic_value.to_flat_list() == gradients["x"].to_flat_list()
 
     cpu = traced.output.compile_cpu().evaluate(inputs)
-    if os.environ.get("QUABLA_MLX_TEST") is not None:
+    if enabled("mlx"):
         mlx = traced.output.compile_mlx().evaluate(inputs)
         assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
         mlx_gradient = symbolic.output.compile_mlx().evaluate(
@@ -1511,7 +1501,7 @@ def test_trace_tensor_getitem_preserves_slice_ad_and_backend_parity():
         assert_close_rows(
             [mlx_gradient.to_flat_list()], [gradients["x"].to_flat_list()], tol=1e-5
         )
-    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+    if enabled("cuda"):
         cuda = traced.output.compile_cuda().evaluate(inputs)
         assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
@@ -1568,8 +1558,7 @@ def test_trace_tensor_stack_supports_symbolic_vjp():
 
 
 def test_cuda_trace_tensor_concat_keeps_primal_and_symbolic_vjp_on_device():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda left, right: quabla.concat([left, right], axis=1).powi(2).sum(),
@@ -1591,8 +1580,7 @@ def test_cuda_trace_tensor_concat_keeps_primal_and_symbolic_vjp_on_device():
 
 
 def test_mlx_trace_tensor_compiles_and_matches_cpu():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     traced = quabla.trace_tensor(
         lambda x, y, bias: quabla.concat([x, y], axis=0)
@@ -1614,8 +1602,7 @@ def test_mlx_trace_tensor_compiles_and_matches_cpu():
 
 
 def test_mlx_strided_outputs_read_back_in_row_major_order():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     cases = [
         (lambda x: x.transpose([1, 0]), [2, 3], [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]),
@@ -1630,8 +1617,7 @@ def test_mlx_strided_outputs_read_back_in_row_major_order():
 
 
 def test_mlx_execution_plan_retains_static_inputs_across_calls():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     traced = quabla.trace_tensor(
         lambda x, weight, bias: (x.matmul(weight) + bias).tanh(),
@@ -1663,8 +1649,7 @@ def test_mlx_execution_plan_retains_static_inputs_across_calls():
 
 
 def test_mlx_symbolic_vjp_executes_mlp_bias_gradient():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     traced = quabla.trace_tensor(
         lambda x, weight, bias: (x.matmul(weight) + bias).tanh().sum(),
@@ -1683,8 +1668,7 @@ def test_mlx_symbolic_vjp_executes_mlp_bias_gradient():
 
 
 def test_mlx_trace_tensor_executes_masked_loss():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     traced = quabla.trace_tensor(
         lambda x: quabla.where(x.gt(0.0), x.powi(2), x).sum(), [("x", [2, 2])]
@@ -1696,8 +1680,7 @@ def test_mlx_trace_tensor_executes_masked_loss():
 
 
 def test_mlx_symbolic_vjp_executes_masked_loss_gradient():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     traced = quabla.trace_tensor(
         lambda x: quabla.where(x.gt(0.0), x.powi(2), x).sum(), [("x", [2, 2])]
@@ -1713,8 +1696,7 @@ def test_mlx_symbolic_vjp_executes_masked_loss_gradient():
 
 
 def test_mlx_greater_returns_float_mask_like_cpu():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     inputs = {
         "x": quabla.Tensor([3], [1.0, 2.0, 3.0]),
@@ -1730,8 +1712,7 @@ def test_mlx_greater_returns_float_mask_like_cpu():
 
 
 def test_cuda_trace_tensor_slice_keeps_primal_and_symbolic_vjp_on_device():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda x: x.slice(1, 1, 3).powi(2).sum(), [("x", [2, 4, 2])]
@@ -1748,8 +1729,7 @@ def test_cuda_trace_tensor_slice_keeps_primal_and_symbolic_vjp_on_device():
 
 
 def test_cuda_trace_tensor_broadcast_to_keeps_primal_and_symbolic_vjp_on_device():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda x: x.broadcast_to([2, 3, 2]).powi(2).sum(), [("x", [1, 3, 1])]
@@ -1762,8 +1742,7 @@ def test_cuda_trace_tensor_broadcast_to_keeps_primal_and_symbolic_vjp_on_device(
 
 
 def test_cuda_multi_parameter_sgd_keeps_gradient_plans_synchronized():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda x, weight, bias: (x * weight) + bias,
@@ -1794,8 +1773,7 @@ def test_cuda_multi_parameter_sgd_keeps_gradient_plans_synchronized():
 
 
 def test_cuda_adam_keeps_optimizer_state_on_device():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda x, weight: x * weight,
@@ -1819,8 +1797,7 @@ def test_cuda_adam_keeps_optimizer_state_on_device():
 
 
 def test_cuda_plan_evaluates_with_static_inputs_retained_on_device():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda x, bias: (x + bias).tanh(),
@@ -1843,8 +1820,7 @@ def test_cuda_plan_evaluates_with_static_inputs_retained_on_device():
 
 
 def test_cuda_plan_reuses_dead_temporary_buffers():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda x, weight, bias: ((x.matmul(weight) + bias).tanh() + bias),
@@ -1868,8 +1844,7 @@ def test_cuda_plan_reuses_dead_temporary_buffers():
 
 
 def test_cuda_fuses_rank_two_matmul_bias_tanh_epilogue():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda x, weight, bias: (x.matmul(weight) + bias).tanh(),
@@ -1902,8 +1877,7 @@ def _cuda_mlp_tensor(shape, seed):
 
 
 def test_cuda_matmul_bias_tanh_with_computed_operands_matches_cpu():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     specs = [("x", [4, 3]), ("w", [3, 2]), ("b", [1, 2])]
     inputs = {name: _cuda_mlp_tensor(shape, seed) for seed, (name, shape) in enumerate(specs)}
@@ -1922,8 +1896,7 @@ def test_cuda_matmul_bias_tanh_with_computed_operands_matches_cpu():
 
 
 def test_cuda_two_layer_mlp_forward_and_value_and_grad_match_cpu():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     specs = [
         ("x", [4, 3]),
@@ -1959,8 +1932,7 @@ def test_cuda_two_layer_mlp_forward_and_value_and_grad_match_cpu():
 
 
 def test_cuda_fuses_elementwise_tail_after_matmul():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda x, weight, bias: ((x.matmul(weight) + bias).tanh()).sin(),
@@ -1980,8 +1952,7 @@ def test_cuda_fuses_elementwise_tail_after_matmul():
 
 
 def test_cuda_multi_parameter_adam_keeps_gradient_plans_synchronized():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda x, weight, bias: (x * weight) + bias,
@@ -2016,8 +1987,7 @@ def test_cuda_multi_parameter_adam_keeps_gradient_plans_synchronized():
 
 
 def test_cuda_adam_optimizer_updates_minibatch_inputs_without_resetting_state():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda x, weight: x * weight,
@@ -2053,8 +2023,7 @@ def test_cuda_adam_optimizer_updates_minibatch_inputs_without_resetting_state():
 
 
 def test_cuda_adam_vjp_optimizer_updates_parameters_from_one_shared_graph():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda x, weight, bias: (x * weight) + bias,
@@ -2085,8 +2054,7 @@ def test_cuda_adam_vjp_optimizer_updates_parameters_from_one_shared_graph():
 
 
 def test_cuda_batched_matmul_vjp_matches_cpu_trace_evaluation():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda lhs, rhs: lhs @ rhs,
@@ -2114,8 +2082,7 @@ def test_cuda_batched_matmul_vjp_matches_cpu_trace_evaluation():
 
 
 def test_cuda_global_reductions_match_cpu_and_reset_output_buffers():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     values = [0.125 * (index % 13) for index in range(8192)]
     inputs = {"x": quabla.Tensor([128, 64], values)}
@@ -2132,8 +2099,7 @@ def test_cuda_global_reductions_match_cpu_and_reset_output_buffers():
 
 
 def test_multi_axis_keepdims_reductions_match_cpu_on_mlx_and_cuda():
-    if os.environ.get("QUABLA_MLX_TEST") is None and os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    targets = devices()
 
     traced = quabla.trace_tensor(
         lambda x: x.mean(axis=[0, 2], keepdims=True), [("x", [2, 3, 2])]
@@ -2141,18 +2107,17 @@ def test_multi_axis_keepdims_reductions_match_cpu_on_mlx_and_cuda():
     inputs = {"x": quabla.Tensor([2, 3, 2], [float(value) for value in range(1, 13)])}
     cpu = traced.output.compile_cpu().evaluate(inputs)
 
-    if os.environ.get("QUABLA_MLX_TEST") is not None:
+    if "mlx" in targets:
         mlx = traced.output.compile_mlx().evaluate(inputs)
         assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
-    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+    if "cuda" in targets:
         cuda = traced.output.compile_cuda().evaluate(inputs)
         assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
 
 def test_cuda_sqrt_composite_lowering_matches_cpu():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(lambda x: x.sqrt(), [("x", [2, 2])])
     inputs = {"x": quabla.Tensor([2, 2], [0.25, 1.0, 4.0, 9.0])}
@@ -2164,8 +2129,7 @@ def test_cuda_sqrt_composite_lowering_matches_cpu():
 
 
 def test_cuda_checked_div_and_log_lowering_matches_cpu():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda x, scale: (x / scale).log(),
@@ -2373,12 +2337,12 @@ def test_trace_tensor_sqrt_and_norm_define_zero_subgradient_and_preserve_symboli
 
     symbolic_inputs = {**inputs, "loss_cotangent": quabla.Tensor([], [1.0])}
     cpu_gradient = symbolic.output.compile_cpu().evaluate(symbolic_inputs)
-    if os.environ.get("QUABLA_MLX_TEST") is not None:
+    if enabled("mlx"):
         mlx_gradient = symbolic.output.compile_mlx().evaluate(symbolic_inputs)
         assert_close_rows(
             [mlx_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
         )
-    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+    if enabled("cuda"):
         cuda_gradient = symbolic.output.compile_cuda().evaluate(symbolic_inputs)
         assert_close_rows(
             [cuda_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
@@ -2418,12 +2382,12 @@ def test_trace_tensor_reduction_extrema_split_tied_gradients_equally():
         ).to_flat_list() == expected_gradient
 
         cpu_gradient = symbolic.output.compile_cpu().evaluate(symbolic_inputs)
-        if os.environ.get("QUABLA_MLX_TEST") is not None:
+        if enabled("mlx"):
             mlx_gradient = symbolic.output.compile_mlx().evaluate(symbolic_inputs)
             assert_close_rows(
                 [mlx_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
             )
-        if os.environ.get("QUABLA_CUDA_TEST") is not None:
+        if enabled("cuda"):
             cuda_gradient = symbolic.output.compile_cuda().evaluate(symbolic_inputs)
             assert_close_rows(
                 [cuda_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
@@ -2462,12 +2426,12 @@ def test_trace_tensor_gather_and_scatter_add_preserve_repeated_index_gradients()
     ).to_flat_list() == [2.0, 2.0, 1.0]
 
     cpu_gradient = symbolic.output.compile_cpu().evaluate(symbolic_inputs)
-    if os.environ.get("QUABLA_MLX_TEST") is not None:
+    if enabled("mlx"):
         mlx_gradient = symbolic.output.compile_mlx().evaluate(symbolic_inputs)
         assert_close_rows(
             [mlx_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
         )
-    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+    if enabled("cuda"):
         cuda_gradient = symbolic.output.compile_cuda().evaluate(symbolic_inputs)
         assert_close_rows(
             [cuda_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
@@ -2493,12 +2457,12 @@ def test_trace_tensor_einsum_scoped_matmul_subset_preserves_backend_ad():
     symbolic_inputs = {**inputs, "loss_cotangent": quabla.Tensor([], [1.0])}
     cpu_gradient = symbolic.output.compile_cpu().evaluate(symbolic_inputs)
     assert cpu_gradient.to_flat_list() == gradients["left"].to_flat_list()
-    if os.environ.get("QUABLA_MLX_TEST") is not None:
+    if enabled("mlx"):
         mlx_gradient = symbolic.output.compile_mlx().evaluate(symbolic_inputs)
         assert_close_rows(
             [mlx_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
         )
-    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+    if enabled("cuda"):
         cuda_gradient = symbolic.output.compile_cuda().evaluate(symbolic_inputs)
         assert_close_rows(
             [cuda_gradient.to_flat_list()], [cpu_gradient.to_flat_list()], tol=1e-5
@@ -2561,8 +2525,8 @@ def test_tensor_cuda_data_parallel_constructor_rejects_unavailable_collective_ru
     # The rejection only happens where the collective runtime is missing (no
     # cuda-nccl build, fewer than two GPUs, or no loadable NCCL). Hosts that
     # opt into the two-GPU suite have that runtime, so construction succeeds.
-    if os.environ.get("QUABLA_CUDA_NCCL_TEST") is not None:
-        return
+    if enabled("nccl"):
+        skip("the two-GPU NCCL suite has the collective runtime")
     try:
         quabla.tensor_value_and_grad_data_parallel_cuda_fn(
             lambda x, weight: ((x * weight).powi(2)).mean(),
@@ -2613,10 +2577,10 @@ def test_trace_tensor_maximum_and_minimum_route_tie_gradients_to_rhs():
         ).to_flat_list() == expected_right
 
         cpu = traced.output.compile_cpu().evaluate(inputs)
-        if os.environ.get("QUABLA_MLX_TEST") is not None:
+        if enabled("mlx"):
             mlx = traced.output.compile_mlx().evaluate(inputs)
             assert_close_rows([mlx.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
-        if os.environ.get("QUABLA_CUDA_TEST") is not None:
+        if enabled("cuda"):
             cuda = traced.output.compile_cuda().evaluate(inputs)
             assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=1e-5)
 
@@ -3378,9 +3342,9 @@ def test_tensor_cond_supports_second_order_ad_through_symbolic_regions():
 
 def device_cond_compilers():
     compilers = []
-    if os.environ.get("QUABLA_MLX_TEST") is not None:
+    if enabled("mlx"):
         compilers.append(("mlx", lambda output: output.compile_mlx()))
-    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+    if enabled("cuda"):
         compilers.append(("cuda", lambda output: output.compile_cuda()))
     return compilers
 
@@ -3471,9 +3435,9 @@ def test_device_tensor_cond_matches_cpu_for_nested_regions():
 
 def test_tensor_cond_rejects_vmapped_predicates_before_device_lowering():
     vmap_functions = [quabla.tensor_vmap_fn]
-    if os.environ.get("QUABLA_MLX_TEST") is not None:
+    if enabled("mlx"):
         vmap_functions.append(quabla.tensor_vmap_mlx_fn)
-    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+    if enabled("cuda"):
         vmap_functions.append(quabla.tensor_vmap_cuda_fn)
     for vmap_function in vmap_functions:
         try:
@@ -3555,8 +3519,7 @@ def test_tensor_value_and_grad_batch_fn_specializes_collocation_batches():
 
 
 def test_tensor_jit_batch_cuda_fn_specializes_bounded_batches():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     compiled = quabla.tensor_jit_batch_cuda_fn(
         lambda x, weight: (x.matmul(weight)).tanh(),
@@ -3585,8 +3548,7 @@ def test_tensor_jit_batch_cuda_fn_specializes_bounded_batches():
 
 
 def test_tensor_value_and_grad_batch_cuda_fn_specializes_collocation_batches():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     compiled = quabla.tensor_value_and_grad_batch_cuda_fn(
         lambda x, weight: (x * weight).powi(2).mean(),
@@ -3717,7 +3679,7 @@ def test_tensor_vmap_fori_region_vjp_preserves_per_example_gradients():
     assert_close_rows([gradients["initial"].to_flat_list()], [[1.0, 1.0]])
     assert_close_rows([gradients["scale"].to_flat_list()], [[3.0, 3.0]])
 
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
+    if not enabled("cuda"):
         return
 
     cuda = quabla.tensor_vmap_vjp_cuda_fn(function, [("initial", []), ("scale", [])], 2)
@@ -3732,8 +3694,7 @@ def test_tensor_vmap_fori_region_vjp_preserves_per_example_gradients():
 
 
 def test_tensor_vmap_fori_region_vjp_executes_on_mlx():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     vjp = quabla.tensor_vmap_vjp_mlx_fn(
         lambda initial, scale: quabla.tensor_fori_loop_region(
@@ -3815,7 +3776,7 @@ def test_tensor_vmap_scan_region_vjp_matches_cpu_on_cuda():
     expected_value, expected_gradients = cpu(values, cotangent)
 
     assert expected_value.shape == [2, 3]
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
+    if not enabled("cuda"):
         return
 
     cuda = quabla.tensor_vmap_vjp_cuda_fn(
@@ -3874,7 +3835,7 @@ def test_tensor_vmap_hvp_scalar_scan_region_matches_finite_difference_and_cuda()
     ]
     assert_close_rows([actual.to_flat_list()], [expected], tol=2e-3)
 
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
+    if not enabled("cuda"):
         return
 
     cuda = quabla.tensor_vmap_hvp_scalar_cuda_fn(function, specs, 2, "initial")
@@ -3900,7 +3861,7 @@ def test_tensor_vmap_hvp_scalar_restores_nonleading_input_axis_on_cuda():
         [actual.to_flat_list()], [[0.1, 0.2, 0.3, 0.8, -1.0, 1.2]], tol=1e-12
     )
 
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
+    if not enabled("cuda"):
         return
 
     cuda = quabla.tensor_vmap_hvp_scalar_cuda_fn(
@@ -3953,7 +3914,7 @@ def test_tensor_vmap_hvp_scalar_scan_capture_matches_finite_difference_and_cuda(
     ]
     assert_close_rows([actual.to_flat_list()], [expected], tol=2e-3)
 
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
+    if not enabled("cuda"):
         return
 
     cuda = quabla.tensor_vmap_hvp_scalar_cuda_fn(function, specs, 2, "scale")
@@ -3980,7 +3941,7 @@ def test_tensor_vmap_hvp_scalar_fori_capture_matches_exact_hessian_and_cuda():
     )(values, direction)
     assert_close_rows([actual.to_flat_list()], [[2.1, -7.2]], tol=1e-12)
 
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
+    if not enabled("cuda"):
         return
 
     cuda = quabla.tensor_vmap_hvp_scalar_cuda_fn(
@@ -4017,7 +3978,7 @@ def test_tensor_vmap_hvp_scalar_fori_capture_restores_nonleading_axis_on_cuda():
         [actual.to_flat_list()], [[3.0, 24.0, 81.0, 192.0, 375.0, 648.0]], tol=1e-12
     )
 
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
+    if not enabled("cuda"):
         return
 
     cuda = quabla.tensor_vmap_hvp_scalar_cuda_fn(
@@ -4058,7 +4019,7 @@ def test_tensor_vmap_fori_jvp_preserves_mapped_capture_and_nonleading_axes():
     )
     assert_close_rows([tangent.to_flat_list()], [[3.0, 6.0, 9.0, 12.0, 15.0, 18.0]])
 
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
+    if not enabled("cuda"):
         return
 
     cuda = quabla.tensor_vmap_jvp_cuda_fn(
@@ -4133,7 +4094,7 @@ def test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace():
     nonleading_values = {"x": quabla.Tensor([2, 3], [1.0, 3.0, 5.0, 2.0, 4.0, 6.0])}
     nonleading_expected = [[3.0, 7.0, 11.0]]
 
-    if os.environ.get("QUABLA_MLX_TEST") is not None:
+    if enabled("mlx"):
         mlx_compiled = quabla.tensor_vmap_mlx_fn(
             lambda x, weight: x.matmul(weight).tanh(), input_specs, 3
         )
@@ -4146,7 +4107,7 @@ def test_tensor_vmap_cuda_and_mlx_fn_use_the_same_batched_trace():
             [mlx_nonleading(nonleading_values).to_flat_list()], nonleading_expected, tol=1e-5
         )
 
-    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+    if enabled("cuda"):
         cuda_compiled = quabla.tensor_vmap_cuda_fn(
             lambda x, weight: x.matmul(weight).tanh(), input_specs, 3
         )
@@ -4207,7 +4168,7 @@ def test_tensor_vmap_vjp_matches_per_example_loop_and_aggregates_unmapped_gradie
     assert_close_rows([gradients["x"].to_flat_list()], [expected_x])
     assert_close_rows([gradients["weight"].to_flat_list()], [expected_weight])
 
-    if os.environ.get("QUABLA_MLX_TEST") is not None:
+    if enabled("mlx"):
         mlx_vjp = quabla.tensor_vmap_vjp_mlx_fn(
             lambda x, weight: (x * weight).tanh().sum(),
             [("x", [2]), ("weight", [2])],
@@ -4251,7 +4212,7 @@ def test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes():
         [[direction * (1.0 - math.tanh(value) ** 2) for value, direction in zip(values, tangents)]],
     )
 
-    if os.environ.get("QUABLA_MLX_TEST") is not None:
+    if enabled("mlx"):
         mlx_jvp = quabla.tensor_vmap_jvp_mlx_fn(
             lambda x: x.tanh(),
             [("x", [2])],
@@ -4275,7 +4236,7 @@ def test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes():
             tol=1e-5,
         )
 
-    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+    if enabled("cuda"):
         cuda_jvp = quabla.tensor_vmap_jvp_cuda_fn(
             lambda x: x.tanh(),
             [("x", [2])],
@@ -4301,8 +4262,7 @@ def test_tensor_vmap_jvp_matches_per_example_loop_with_nonleading_axes():
 
 
 def test_tensor_vmap_cuda_vjp_matches_cpu_single_batched_plan():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     def function(x, weight):
         return (x * weight).tanh().sum()
@@ -4367,7 +4327,7 @@ def test_tensor_vmap_batched_mlp_gradients_match_loop_on_cpu_and_cuda():
     assert_close_rows([gradients["x"].to_flat_list()], [expected_x])
     assert_close_rows([gradients["weight"].to_flat_list()], [expected_weight])
 
-    if os.environ.get("QUABLA_CUDA_TEST") is not None:
+    if enabled("cuda"):
         cuda = quabla.tensor_vmap_vjp_cuda_fn(function, input_specs, 3, in_axes=[0, None])
         cuda_value, cuda_gradients = cuda(values, cotangent)
         assert_close_rows([cuda_value.to_flat_list()], [expected_value], tol=2e-5)
@@ -4378,8 +4338,7 @@ def test_tensor_vmap_batched_mlp_gradients_match_loop_on_cpu_and_cuda():
 
 
 def test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     compiled = quabla.tensor_jit_cuda_fn(
         lambda x, weight, bias: (x @ weight + bias).tanh(),
@@ -4410,8 +4369,7 @@ def test_tensor_jit_cuda_fn_reuses_a_callable_cuda_plan():
 
 
 def test_tensor_value_and_grad_cuda_fn_uses_one_callable_plan():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     value_and_grad = quabla.tensor_value_and_grad_cuda_fn(
         lambda x, target, weight, bias: ((x * weight + bias - target).powi(2)).mean(),
@@ -4446,8 +4404,7 @@ def test_tensor_value_and_grad_cuda_fn_uses_one_callable_plan():
 
 
 def test_tensor_value_and_grad_mlx_fn_uses_one_symbolic_plan():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     value_and_grad = quabla.tensor_value_and_grad_mlx_fn(
         lambda x, target, weight, bias: ((x * weight + bias - target).powi(2)).mean(),
@@ -4477,8 +4434,7 @@ def test_tensor_value_and_grad_mlx_fn_uses_one_symbolic_plan():
 
 
 def test_tensor_value_and_grad_mlx_fn_supports_fixed_fori_regions():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     def function(initial, scale):
         return quabla.tensor_fori_loop_region(
@@ -4516,8 +4472,7 @@ def test_tensor_value_and_grad_mlx_fn_supports_fixed_fori_regions():
 
 
 def test_tensor_value_and_grad_mlx_fn_supports_fixed_scan_regions():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     def function(initial, scale):
         carry, outputs = quabla.tensor_scan_region(
@@ -4560,8 +4515,7 @@ def test_tensor_value_and_grad_mlx_fn_supports_fixed_scan_regions():
 
 
 def test_tensor_value_and_grad_batch_mlx_fn_specializes_collocation_batches():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     def function(x, target, weight):
         return ((x * weight - target).powi(2)).mean()
@@ -4615,8 +4569,7 @@ def test_tensor_value_and_grad_batch_mlx_fn_specializes_collocation_batches():
 
 
 def test_cuda_adam_loss_optimizer_owns_scalar_loss_and_parameters():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
 
     traced = quabla.trace_tensor(
         lambda x, weight, bias: (x * weight) + bias,
@@ -4655,8 +4608,7 @@ def test_cuda_adam_loss_optimizer_owns_scalar_loss_and_parameters():
 
 
 def test_mlx_adam_loss_optimizer_keeps_parameters_and_moments_on_device():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     traced = quabla.trace_tensor(
         lambda x, weight, bias: (x * weight) + bias,
@@ -4689,8 +4641,7 @@ def test_mlx_adam_loss_optimizer_keeps_parameters_and_moments_on_device():
 
 
 def test_mlx_adam_loss_optimizer_refreshes_dynamic_minibatches():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     traced = quabla.trace_tensor(
         lambda x, target, weight, bias: (x * weight) + bias,
@@ -4724,8 +4675,7 @@ def test_mlx_adam_loss_optimizer_refreshes_dynamic_minibatches():
 
 
 def test_mlx_poisson_pinn_matches_cpu_reference():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     collocation = [0.15, 0.35, 0.55, 0.75, 0.9]
     coordinates = collocation + [0.0, 1.0]
@@ -4791,8 +4741,7 @@ def test_mlx_poisson_pinn_matches_cpu_reference():
 
 
 def test_mlx_two_layer_poisson_pinn_matches_cpu_reference():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
 
     example = runpy.run_path(
         os.path.join(os.path.dirname(__file__), "..", "..", "examples", "pinn_mlp_mlx.py")
@@ -6761,14 +6710,12 @@ def assert_float32_mlp_device_parity(compile_device):
 
 
 def test_mlx_float32_mlp_matches_the_cpu_float32_reference():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
     assert_float32_mlp_device_parity(lambda output: output.compile_mlx())
 
 
 def test_cuda_float32_mlp_matches_the_cpu_float32_reference():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
     assert_float32_mlp_device_parity(lambda output: output.compile_cuda())
 
 
@@ -7139,7 +7086,7 @@ def test_masked_loss_gradients_match_finite_differences_and_skip_bool_inputs():
         ),
         "bool output",
     )
-    if os.environ.get("QUABLA_MLX_TEST") is not None:
+    if enabled("mlx"):
         expect_error(
             lambda: quabla.tensor_value_and_grad_mlx_fn(
                 masked_residual_loss, MASKED_SPECS, ["mask"]
@@ -7204,19 +7151,14 @@ def assert_bool_device_parity(compile_device):
 
 
 def test_mlx_bool_masks_and_guarded_gradients_match_cpu():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
     assert_bool_device_parity(lambda output: output.compile_mlx())
 
 
 def test_cuda_bool_masks_and_guarded_gradients_match_cpu():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
     assert_bool_device_parity(lambda output: output.compile_cuda())
 
 
 if __name__ == "__main__":
-    # Run every test_* function in definition order so new tests cannot be left out of a manual list
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
+    run(globals())
