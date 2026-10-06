@@ -120,10 +120,15 @@ reduces carry storage from O(T·C) to O(√T·C) at the cost of a measured
 replay. CUDA uses the same scheme for host-driven loops and keeps a full
 on-device tape for its fused elementwise loop kernels.
 
-Second-order *reverse-over-reverse* through `fori_loop` and `scan` (for
-example `grad(grad(f))` where the loop is inside `f` and both are reverse
-mode) is rejected with a `ValueError`. Forward-over-reverse works, so
-`hessian` and Hessian-vector products via `jvp(grad(f))` are available.
+Second-order derivatives through `fori_loop` and `scan` work in every
+combination of modes but one: forward-over-reverse (`hessian`,
+`jvp(grad(f))`), reverse-over-forward (`grad` of a `jvp`), and
+reverse-over-reverse (`grad(grad(f))` with the loop inside `f`, or the
+`hessian` of a function that calls a `custom_vjp` solver), but not forward
+over forward through a `fori_loop`. Reverse mode over a loop's reverse pass
+is computed from the loop's forward-mode and forward-over-reverse passes
+(the Hessian is symmetric), with the same checkpointing, so it needs the
+loop body's forward mode. A third derivative pass through a loop raises.
 
 ## 4.4 `scan`
 

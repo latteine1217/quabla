@@ -794,9 +794,7 @@ def test_solvers_compose_with_odeint_and_loops_under_vmap():
     # A root whose parameter comes from an ODE solve (a fori_loop region):
     # p(k) = y(1) for y' = -k y, y(0) = 2. The gradient in k goes through the
     # solver's implicit rule and the loop's reverse rule, and matches the
-    # closed-form root at the same integrated p. (A second reverse pass would
-    # need the reverse mode of the loop's own reverse pass, which no loop
-    # has; the Hessian of a solve alone composes, see above.)
+    # closed-form root at the same integrated p.
     x0 = qb.array([1.0, 1.0])
 
     def decayed(k):
@@ -814,6 +812,25 @@ def test_solvers_compose_with_odeint_and_loops_under_vmap():
     expected = per_example(qb.grad(closed_form), (rates,), (0,))
     assert_tree_close(qb.vmap(qb.grad(total))(rates), expected, 1e-12)
     assert_tree_close(qb.jit(qb.vmap(qb.grad(total)))(rates), expected, 1e-12)
+    # The Hessian goes through the solver's rule and reverse mode over the
+    # loop's reverse pass (hessian uses reverse mode for a custom_vjp
+    # solver); it matches the closed form, forward over reverse, and central
+    # differences of the gradient, also under jit and vmap.
+    for rate in (0.2, 1.5):
+        k = qb.array([rate])
+        expected = qb.hessian(closed_form)(k)
+        assert_tree_close(qb.hessian(total)(k), expected, 1e-11)
+        assert_tree_close(qb.jit(qb.hessian(total))(k), expected, 1e-11)
+        forward_over_reverse = qb.jvp(qb.grad(total), (k,), (qb.ones([1]),))[1]
+        assert_tree_close(forward_over_reverse, expected.reshape([1]), 1e-11)
+        step = 1e-5
+        difference = (qb.grad(total)(k + step) - qb.grad(total)(k - step)) / (2 * step)
+        assert abs(difference.item() - expected.item()) < 1e-7
+    assert_tree_close(
+        qb.vmap(qb.hessian(lambda k: total(k.reshape([1]))))(rates),
+        per_example(qb.hessian(lambda k: closed_form(k.reshape([1]))), (rates,), (0,)),
+        1e-11,
+    )
     # The Hessian of the integrated parameter itself is forward over reverse
     # through the loop, also under vmap.
     assert_tree_close(

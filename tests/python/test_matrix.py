@@ -1284,12 +1284,32 @@ def test_compiler_facade_rejects_scan_derivatives_beyond_forward_over_reverse():
         [2],
         "loss",
     ).vjp("loss_cotangent")["capture"]
+    # Reverse mode over the Scan VJP is supported: with a ones cotangent it
+    # is the Hessian row sums, which central differences of the gradient give.
+    second = gradient.vjp("second_cotangent")["capture"].compile("cpu")
+    first = gradient.compile("cpu")
+    initial = quabla.Tensor([2], [0.3, -0.4])
+    capture = [0.7, 1.2]
+
+    def inputs(values):
+        return {
+            "initial": initial,
+            "capture": quabla.Tensor([2], values),
+            "loss_cotangent": quabla.Tensor([], [1.0]),
+            "second_cotangent": quabla.Tensor([2], [1.0, 1.0]),
+        }
+
+    reverse = second(inputs(capture)).to_flat_list()
+    step = 1e-6
+    for index in range(2):
+        up = [value + (step if k == index else 0.0) for k, value in enumerate(capture)]
+        down = [value - (step if k == index else 0.0) for k, value in enumerate(capture)]
+        difference = sum(
+            (a - b) / (2 * step)
+            for a, b in zip(first(inputs(up)).to_flat_list(), first(inputs(down)).to_flat_list())
+        )
+        assert abs(reverse[index] - difference) < 1e-7, (reverse, difference)
     cases = [
-        (
-            "VJP of a Scan VJP",
-            lambda: gradient.vjp("second_cotangent"),
-            "symbolic VJP through a Scan VJP result is not implemented",
-        ),
         (
             "JVP of a Scan VJP JVP",
             lambda: gradient.jvp("capture").jvp("initial"),

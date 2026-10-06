@@ -2056,7 +2056,8 @@ def test_inlined_transforms_cache_their_staged_graph_and_reject_unsupported_call
         match="batched tracer",
     )
     assert error.op == "nested transform"
-    # Second-order reverse mode through a region stays an explicit error.
+    # Second-order reverse mode through an inlined region matches forward
+    # over reverse.
 
     def scan_loss(initial, scale):
         carry, outputs = qb.tensor_scan_region(
@@ -2069,12 +2070,10 @@ def test_inlined_transforms_cache_their_staged_graph_and_reject_unsupported_call
         return carry + outputs.sum()
 
     g = qb.grad(scan_loss, argnums=1)
-    assert_raises(
-        ValueError,
-        qb.grad(lambda i, s: g(i, s), argnums=1),
-        qb.array(0.4),
-        qb.array(0.8),
-        match="not implemented",
+    assert_close(
+        qb.grad(lambda i, s: g(i, s), argnums=1)(qb.array(0.4), qb.array(0.8)),
+        qb.jvp(lambda s: g(qb.array(0.4), s), (qb.array(0.8),), (qb.array(1.0),))[1].item(),
+        1e-13,
     )
     # Forward over reverse through the inlined region matches the direct
     # composition, and two splices in one trace stay separate executions.

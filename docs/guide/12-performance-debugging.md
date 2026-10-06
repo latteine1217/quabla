@@ -177,8 +177,9 @@ yet addressed:
 - **Loop carries** are single arrays; `cond` results and carries must be
   floating-point.
 - **`while_loop`** has no reverse-mode derivative (as in JAX).
-  Reverse-over-reverse through `fori_loop`/`scan` regions is rejected;
-  forward-over-reverse (Hessians, HVPs) works.
+  Second derivatives through `fori_loop`/`scan` regions work in every mode
+  combination except forward over forward through a `fori_loop`; third
+  derivatives through loops raise.
 - **`jacobian`/`hessian`** return dense arrays.
 - **`qb.linalg`** has no non-symmetric `eig`; `lstsq` requires full rank;
   batched CUDA decompositions issue one cuSOLVER call per batch element.

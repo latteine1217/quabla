@@ -293,8 +293,12 @@ decorator: `@qb.jit(device="mlx", static_argnums=1)`, `@qb.grad(argnums=1)`.
   `jacobian` and `hessian` are forward mode vectorized with `vmap` over the
   input elements (as `jax.jacfwd`), so they compose too, for example
   `grad(lambda x: qb.sum(qb.hessian(f)(x)))` or `vmap(hessian(f))`.
-  Second-order reverse mode through `fori`/`scan` regions is rejected with
-  a `ValueError`.
+  Second-order derivatives through `fori`/`scan` regions work in every
+  combination of modes except forward over forward through a `fori_loop`
+  (a `fori_loop` JVP has no forward-mode rule); reverse mode over a loop's
+  reverse pass uses the loop body's forward mode, so a body that calls a
+  `custom_vjp` function needs its forward-mode rule. A third derivative
+  pass through a loop raises.
 - `vmap(fun, in_axes=0, out_axes=0)` vectorizes `fun`, which sees one
   example, with JAX semantics. `in_axes` is an int (the mapped axis,
   negative counts from the end), `None` (an argument shared by every

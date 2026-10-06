@@ -437,6 +437,20 @@ def test_second_derivatives_of_loops_with_custom_rules():
     gradient = qb.grad(lambda w: loss(w, False))
     difference = (gradient(w + step * v) - gradient(w - step * v)) / (2.0 * step)
     assert_close(hvp, difference, 1e-8)
+    # Reverse over reverse (the VJP of the loop's VJP) gives the same.
+    assert_close(qb.vjp(gradient, w)[1](v)[0], hvp, 1e-12)
+
+
+def test_hessian_through_a_loop_needs_the_body_forward_mode():
+    # Reverse mode over a loop's reverse pass differentiates the body in
+    # forward mode, which a custom_vjp function without a forward-mode rule
+    # does not have.
+    def loss(x):
+        return qb.fori_loop(0, 3, lambda i, c, x: 0.5 * c + tripled_back(x * c), x, operands=(x,)).sum()
+
+    x = qb.array([0.3, 0.5])
+    raises(ValueError, qb.hessian(loss), x, match="reverse mode over a loop's reverse pass")
+    raises(ValueError, qb.hessian(loss), x, match="defines only a reverse-mode rule")
 
 
 def test_vmap_of_loops_with_custom_rules_matches_per_example_calls():

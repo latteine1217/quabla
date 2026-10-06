@@ -1075,6 +1075,61 @@ def test_hessian_through_a_linear_loop_matches_the_closed_form():
     assert_close(qb.hessian(loss, argnums=1)(x, s), expected_s, 1e-11)
 
 
+
+def test_reverse_over_reverse_through_loops_matches_forward_over_reverse():
+    # The VJP of a loop's VJP: its pullback of a direction u is the Hessian
+    # times u, which forward over reverse gives too; the loop VJP nodes used
+    # to reject a second reverse pass.
+    fori_loss, scan_loss, nested_loss = loop_losses()
+    for dtype, tolerance in ((qb.float64, 1e-12), (qb.float32, 2e-5)):
+        carries, scales, rows = batched_loop_arguments(dtype)
+        cases = (
+            (fori_loss, (carries[0], scales[0])),
+            (scan_loss, (carries[0], scales[0], rows[0])),
+            (nested_loss, (carries[0], scales[0])),
+        )
+        for loss, arguments in cases:
+            argnums = tuple(range(len(arguments)))
+            directions = tuple(value * 0.5 + 0.25 for value in arguments)
+            gradient = qb.grad(loss, argnums=argnums)
+            expected = qb.jvp(gradient, arguments, directions)[1]
+            for transform in (lambda f: f, qb.jit):
+                actual = transform(lambda *a: qb.vjp(gradient, *a)[1](directions))(*arguments)
+                assert_tree_close(actual, expected, tolerance)
+            # Under vmap, against per-example calls.
+            batched = (carries, scales, rows)[: len(arguments)]
+
+            def pullback(*a, gradient=gradient):
+                return qb.vjp(gradient, *a)[1](tuple(value * 0.5 + 0.25 for value in a))
+
+            assert_vmap_matches_examples(pullback, batched, (0,) * len(arguments), tolerance)
+
+    # Closed form: c <- c * s five times, loss sum((x s^5)^2). Its gradient
+    # in s is 10 x^2 s^9, and the reverse pass over it gives 90 x^2 s^8.
+    def loss(x, s):
+        return (fori_loop(0, 5, lambda i, c, s: c * s, x, operands=(s,)) ** 2).sum()
+
+    x, s = qb.array([0.5, -1.5, 2.0]), qb.array([1.1, 0.9, -0.7])
+    second = qb.grad(lambda s: qb.grad(loss, argnums=1)(x, s).sum())(s)
+    assert_close(
+        second, [90 * a * a * b**8 for a, b in zip(x.to_flat_list(), s.to_flat_list())], 1e-11
+    )
+    # Central differences of the gradient.
+    step = 1e-6
+    for index in range(3):
+        bump = qb.eye(3)[index] * step
+        difference = (
+            qb.grad(loss, argnums=1)(x, s + bump) - qb.grad(loss, argnums=1)(x, s - bump)
+        ) / (2 * step)
+        assert abs(difference.sum().item() - second.to_flat_list()[index]) < 1e-6
+    # A third pass over a loop is not supported.
+    assert_raises(
+        ValueError,
+        qb.grad(lambda s: qb.grad(lambda s: qb.grad(loss, argnums=1)(x, s).sum())(s).sum()),
+        s,
+        match="is not implemented",
+    )
+
 # ---- vmap of cond regions ----
 
 
@@ -1615,15 +1670,15 @@ def second_order_region_losses(unroll):
 
 
 def second_order_derivatives(loss, w, v, kind):
-    """Forward-over-reverse, reverse-over-forward, and forward-over-forward
-    derivatives of `loss` in direction `v`, as far as the region kind has
-    them (`while_loop` is forward-mode only; a `fori_loop` JVP has no
-    second-order rule)."""
+    """Forward-over-reverse, reverse-over-reverse, reverse-over-forward, and
+    forward-over-forward derivatives of `loss` in direction `v`, as far as
+    the region kind has them (`while_loop` is forward-mode only; a
+    `fori_loop` JVP has no forward-mode rule)."""
     derivatives = {}
     if kind != "while":
         derivatives["hvp"] = qb.jvp(qb.grad(loss), (w,), (v,))[1]
         derivatives["hessian"] = qb.hessian(loss)(w)
-    if kind in ("cond", "scan"):
+        derivatives["vjp of grad"] = qb.vjp(qb.grad(loss), w)[1](v)[0]
         derivatives["grad of jvp"] = qb.grad(lambda w: qb.jvp(loss, (w,), (v,))[1])(w)
     if kind in ("cond", "scan", "while"):
         derivatives["jvp of jvp"] = qb.jvp(lambda w: qb.jvp(loss, (w,), (v,))[1], (w,), (v,))[1]

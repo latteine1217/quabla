@@ -191,8 +191,15 @@ The reverse pass of a loop needs every carry. `TensorCarryCheckpoints` stores
 one carry per block of about `sqrt(T)` iterations during the forward pass,
 then re-runs each block forward and consumes it in reverse. Short loops keep
 the full tape. Reverse mode through `While` is rejected because its trip
-count is not fixed. Reverse-over-reverse through loop regions is rejected;
-forward-over-reverse (`ForiVjpJvp`, `ScanVjpJvp`) is supported.
+count is not fixed. Forward-over-reverse is `ForiVjpJvp`/`ScanVjpJvp`.
+Reverse mode over a `ForiVjp` group, the gradient `G(x, g) = J(x)^T g` of
+`g . Phi(x)`, needs no new kind: for cotangents `u` on the gradients,
+`(dG/dx)^T u = H u = (dG/dx) u` by the symmetry of the Hessian, a
+`ForiVjpJvp` in the direction `u`, and `(dG/dg)^T u = J u`, a `ForiJvp`
+(`ScanVjp` alike, with the scan's forward mode). Reverse mode over a
+`ForiJvp` is a `ForiVjp` and a `ForiVjpJvp` the same way. The derivatives
+of `ForiVjpJvp`/`ScanVjpJvp` (third order) and the forward mode of a
+`ForiJvp` are not implemented.
 
 ## 13.5 Batching (`vmap`)
 

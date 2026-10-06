@@ -791,5 +791,108 @@ def test_optional_device_vmap_of_odeint_parity():
                 assert_trees_close(actual, expected, tolerance)
 
 
+
+# -- implicit time stepping -------------------------------------------------------
+
+IMPLICIT_SIZE, IMPLICIT_STEPS, IMPLICIT_DT = 6, 20, 0.1
+
+
+def laplacian(dtype):
+    n = IMPLICIT_SIZE
+    return qb.array(
+        [[2.0 if i == j else (-1.0 if abs(i - j) == 1 else 0.0) for j in range(n)] for i in range(n)],
+        dtype=dtype,
+    )
+
+
+def backward_euler(k, y0, tol):
+    """y' = -k L y by backward Euler, solving (I + dt k L) y_next = y with
+    conjugate gradients at every step of a fori_loop. With k = 30 the system
+    is stiff: dt k max(eig(L)) is about 12, where forward Euler diverges."""
+    lap = laplacian(y0.dtype)
+
+    def operator(v, k):
+        return v + IMPLICIT_DT * k * (lap @ v.reshape([-1, 1])).reshape([-1])
+
+    def step(i, y, k):
+        return qb.linalg.cg(operator, y, args=(k,), tol=tol)
+
+    return qb.fori_loop(0, IMPLICIT_STEPS, step, y0, operands=(k,))
+
+
+def backward_euler_closed_form(k, y0):
+    """sum((I + dt k L)^-N y0) from the eigendecomposition of L."""
+    eigenvalues, vectors = qb.linalg.eigh(laplacian(y0.dtype))
+    coefficients = (vectors.T @ y0.reshape([-1, 1])).reshape([-1])
+    scaled = coefficients * (1.0 + IMPLICIT_DT * k * eigenvalues) ** (-IMPLICIT_STEPS)
+    return (vectors @ scaled.reshape([-1, 1])).sum()
+
+
+def test_implicit_time_stepping_with_cg_has_closed_form_derivatives():
+    # Each step calls linalg.cg; derivatives in k come from cg's implicit
+    # rules inside the loop's reverse, forward, and second-order passes.
+    for dtype, tolerance, tol in ((qb.float64, 1e-10, 1e-13), (qb.float32, 2e-4, 1e-6)):
+        y0 = qb.array([float(i + 1) for i in range(IMPLICIT_SIZE)], dtype=dtype)
+
+        def total(k, y0=y0, tol=tol):
+            return backward_euler(k, y0, tol).sum()
+
+        def closed(k, y0=y0):
+            return backward_euler_closed_form(k, y0)
+
+        def relative(actual, expected, tolerance=tolerance):
+            assert actual.dtype == dtype
+            assert abs(actual.item() - expected.item()) <= tolerance * abs(expected.item())
+
+        k, one = qb.array(30.0, dtype=dtype), qb.array(1.0, dtype=dtype)
+        relative(total(k), closed(k))
+        relative(qb.grad(total)(k), qb.grad(closed)(k))
+        relative(qb.jit(qb.grad(total))(k), qb.grad(closed)(k))
+        relative(qb.jvp(total, (k,), (one,))[1], qb.grad(closed)(k))
+        second = qb.grad(qb.grad(closed))(k)
+        # hessian reverses the loop's reverse pass (cg is a custom_vjp
+        # function); forward over reverse and reverse over forward agree.
+        relative(qb.hessian(total)(k), second)
+        relative(qb.jit(qb.hessian(total))(k), second)
+        relative(qb.jvp(qb.grad(total), (k,), (one,))[1], second)
+        relative(qb.grad(lambda k: qb.jvp(total, (k,), (one,))[1])(k), second)
+        if dtype == qb.float64:
+            step = 1e-4
+            difference = (qb.grad(total)(k + step) - qb.grad(total)(k - step)) / (2 * step)
+            relative(difference, second, 1e-6)
+            # Gradients with respect to the initial state: (I + dt k L)^-N 1.
+            gradient = qb.grad(lambda y0: backward_euler(k, y0, tol).sum())(y0)
+            expected = qb.grad(lambda y0: backward_euler_closed_form(k, y0))(y0)
+            for got, want in zip(gradient.tolist(), expected.tolist()):
+                assert abs(got - want) <= 1e-10 * max(1.0, abs(want))
+        # vmap over stiffness coefficients, against per-example calls.
+        ks = qb.array([5.0, 30.0, 80.0], dtype=dtype)
+        for function in (qb.grad(total), qb.hessian(total)):
+            batched = qb.vmap(function)(ks).tolist()
+            for index in range(3):
+                expected = function(ks[index]).item()
+                assert abs(batched[index] - expected) <= tolerance * max(1.0, abs(expected))
+
+
+def test_optional_device_implicit_time_stepping_parity():
+    precisions = {"mlx": (None,), "cuda": (None, "float64")}
+    runs = [(device, precision) for device in devices(*precisions) for precision in precisions[device]]
+    for device, precision in runs:
+        dtype = qb.float64 if precision == "float64" else qb.float32
+        tolerance, tol = (1e-9, 1e-12) if precision == "float64" else (2e-4, 1e-6)
+        options = {"device": device}
+        if precision is not None:
+            options["precision"] = precision
+        y0 = qb.array([float(i + 1) for i in range(IMPLICIT_SIZE)], dtype=dtype)
+
+        def total(k, y0=y0, tol=tol):
+            return backward_euler(k, y0, tol).sum()
+
+        k = qb.array(30.0, dtype=dtype)
+        for function in (total, qb.grad(total), qb.hessian(total)):
+            expected = qb.jit(function)(k).item()
+            actual = qb.jit(function, **options)(k).item()
+            assert abs(actual - expected) <= tolerance * max(1.0, abs(expected))
+
 if __name__ == "__main__":
     run(globals())

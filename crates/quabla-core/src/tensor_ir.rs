@@ -4220,6 +4220,8 @@ impl TensorIr {
         let mut transformed = TensorIr::new();
         let mut values = Vec::with_capacity(self.nodes.len());
         let mut scan_values = HashMap::new();
+        // The new group of each multi-result region node copied as is.
+        let mut cloned_region_groups = HashMap::new();
         // The forward graph of each custom call (primal outputs, then
         // residuals), spliced at its first reachable output.
         let mut custom_forward = HashMap::<usize, Vec<TensorNodeId>>::new();
@@ -4289,22 +4291,21 @@ impl TensorIr {
                     captures,
                     ..
                 }) => symbolic_clone_while(&mut transformed, *carry, loop_plan, captures, &values)?,
-                TensorOp::Region(RegionNode {
-                    kind: RegionKind::ForiVjp { .. },
-                    ..
-                }) => {
-                    return Err(
-                        "symbolic VJP through a Fori VJP result is not implemented".to_string()
-                    );
-                }
-                TensorOp::Region(RegionNode {
-                    kind: RegionKind::ForiJvp { .. },
-                    ..
-                }) => {
-                    return Err(
-                        "symbolic VJP through a Fori JVP result is not implemented".to_string()
-                    );
-                }
+                TensorOp::Region(
+                    region @ RegionNode {
+                        kind:
+                            RegionKind::ForiVjp { .. }
+                            | RegionKind::ForiJvp { .. }
+                            | RegionKind::ScanVjp { .. },
+                        ..
+                    },
+                ) => symbolic_clone_region(
+                    &mut transformed,
+                    node,
+                    region,
+                    &values,
+                    &mut cloned_region_groups,
+                )?,
                 TensorOp::Region(RegionNode {
                     kind: RegionKind::ForiVjpJvp { .. },
                     ..
@@ -4351,14 +4352,6 @@ impl TensorIr {
                         TensorScanTarget::Carry => result.0,
                         TensorScanTarget::Outputs => result.1,
                     }
-                }
-                TensorOp::Region(RegionNode {
-                    kind: RegionKind::ScanVjp { .. },
-                    ..
-                }) => {
-                    return Err(
-                        "symbolic VJP through a Scan VJP result is not implemented".to_string()
-                    );
                 }
                 TensorOp::Region(RegionNode {
                     kind: RegionKind::ScanVjpJvp { .. },
@@ -4504,6 +4497,7 @@ impl TensorIr {
             seeds.push(seed);
         }
         let mut processed_scan_groups = HashSet::new();
+        let mut processed_loop_vjp_groups = HashSet::new();
         let custom_members = self.custom_groups();
         let mut processed_custom_groups = HashSet::new();
 
@@ -4576,21 +4570,56 @@ impl TensorIr {
                     return Err(WHILE_LOOP_REVERSE_MODE_ERROR.to_string());
                 }
                 TensorOp::Region(RegionNode {
-                    kind: RegionKind::ForiVjp { .. },
+                    kind:
+                        RegionKind::ForiVjp {
+                            carry,
+                            output_cotangent,
+                            loop_plan,
+                            group,
+                            ..
+                        },
+                    captures,
                     ..
                 }) => {
-                    return Err(
-                        "symbolic VJP through a Fori VJP result is not implemented".to_string()
-                    );
+                    if processed_loop_vjp_groups.insert(*group) {
+                        symbolic_vjp_fori_vjp(
+                            &mut transformed,
+                            SymbolicVjpLoopVjpContext {
+                                source: self,
+                                values: &values,
+                                group: *group,
+                                namespace: format!("__quabla_fori_vjp_vjp_{node_id}"),
+                            },
+                            (*carry, *output_cotangent),
+                            loop_plan,
+                            captures,
+                            &mut cotangents,
+                        )?;
+                    }
                 }
                 TensorOp::Region(RegionNode {
-                    kind: RegionKind::ForiJvp { .. },
-                    ..
-                }) => {
-                    return Err(
-                        "symbolic VJP through a Fori JVP result is not implemented".to_string()
-                    );
-                }
+                    kind:
+                        RegionKind::ForiJvp {
+                            carry,
+                            carry_tangent,
+                            loop_plan,
+                        },
+                    captures,
+                    tangent_captures,
+                }) => symbolic_vjp_fori_jvp(
+                    &mut transformed,
+                    SymbolicVjpForiJvpContext {
+                        carry: *carry,
+                        carry_tangent: *carry_tangent,
+                        captures,
+                        tangent_captures,
+                        values: &values,
+                        upstream,
+                        namespace: format!("__quabla_fori_jvp_vjp_{node_id}"),
+                    },
+                    loop_plan,
+                    &mut cotangents,
+                )?,
                 TensorOp::Region(RegionNode {
                     kind: RegionKind::ForiVjpJvp { .. },
                     ..
@@ -4701,12 +4730,33 @@ impl TensorIr {
                     }
                 }
                 TensorOp::Region(RegionNode {
-                    kind: RegionKind::ScanVjp { .. },
+                    kind:
+                        RegionKind::ScanVjp {
+                            carry,
+                            final_carry_cotangent,
+                            output_cotangent,
+                            scan_plan,
+                            group,
+                            ..
+                        },
+                    captures,
                     ..
                 }) => {
-                    return Err(
-                        "symbolic VJP through a Scan VJP result is not implemented".to_string()
-                    );
+                    if processed_loop_vjp_groups.insert(*group) {
+                        symbolic_vjp_scan_vjp(
+                            &mut transformed,
+                            SymbolicVjpLoopVjpContext {
+                                source: self,
+                                values: &values,
+                                group: *group,
+                                namespace: format!("__quabla_scan_vjp_vjp_{node_id}"),
+                            },
+                            (*carry, *final_carry_cotangent, *output_cotangent),
+                            scan_plan,
+                            captures,
+                            &mut cotangents,
+                        )?;
+                    }
                 }
                 TensorOp::Region(RegionNode {
                     kind: RegionKind::ScanVjpJvp { .. },
@@ -12104,6 +12154,389 @@ fn symbolic_vjp_fori(
             group,
         )?;
         symbolic_accumulate(transformed, cotangents, *parent_node_id, gradient)?;
+    }
+    Ok(())
+}
+
+/// A copy of the region node `region` (of `node`) in `transformed` with
+/// each operand replaced by its rebuilt value. The members of a
+/// multi-result group share one new group, the id of the first member
+/// copied, as `inline` gives them.
+fn symbolic_clone_region(
+    transformed: &mut TensorIr,
+    node: &TensorNode,
+    region: &RegionNode,
+    values: &[TensorNodeId],
+    groups: &mut HashMap<usize, usize>,
+) -> Result<TensorNodeId, String> {
+    let mut region = region.clone();
+    for operand in region.operands_mut() {
+        *operand = values
+            .get(*operand)
+            .copied()
+            .filter(|value| *value != usize::MAX)
+            .ok_or_else(|| format!("region operand node {operand} has no symbolic value"))?;
+    }
+    if let Some(group) = region.group_mut() {
+        *group = *groups.entry(*group).or_insert(transformed.nodes.len());
+    }
+    Ok(transformed.push_node(
+        TensorOp::Region(region),
+        node.shape.clone(),
+        node.dtype,
+        node.weak,
+    ))
+}
+
+/// The source graph and rebuilt values of a reverse-mode pass over a group
+/// of loop VJP nodes (`ForiVjp` or `ScanVjp`).
+struct SymbolicVjpLoopVjpContext<'a> {
+    source: &'a TensorIr,
+    values: &'a [TensorNodeId],
+    group: usize,
+    /// The prefix of the forward-over-reverse plan's input names.
+    namespace: String,
+}
+
+/// The rebuilt value of the source node `node_id`.
+fn symbolic_value(values: &[TensorNodeId], node_id: TensorNodeId) -> Result<TensorNodeId, String> {
+    values
+        .get(node_id)
+        .copied()
+        .filter(|value| *value != usize::MAX)
+        .ok_or_else(|| format!("node {node_id} has no symbolic value"))
+}
+
+/// The cotangents that reach the members of a loop VJP group: the carry
+/// gradient's and each capture gradient's, by capture name; a member
+/// without one (unused, or pruned from the graph) is absent.
+fn symbolic_loop_vjp_member_cotangents(
+    source: &TensorIr,
+    group: usize,
+    cotangents: &[Option<TensorNodeId>],
+) -> (Option<TensorNodeId>, BTreeMap<String, TensorNodeId>) {
+    let mut carry = None;
+    let mut external = BTreeMap::new();
+    for (node_id, node) in source.nodes.iter().enumerate() {
+        let target = match &node.op {
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ForiVjp {
+                        target,
+                        group: candidate,
+                        ..
+                    },
+                ..
+            }) if *candidate == group => match target {
+                TensorForiVjpTarget::Carry => None,
+                TensorForiVjpTarget::External(name) => Some(name),
+            },
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ScanVjp {
+                        target,
+                        group: candidate,
+                        ..
+                    },
+                ..
+            }) if *candidate == group => match target {
+                TensorScanVjpTarget::Carry => None,
+                TensorScanVjpTarget::External(name) => Some(name),
+            },
+            _ => continue,
+        };
+        let Some(cotangent) = cotangents[node_id] else {
+            continue;
+        };
+        match target {
+            None => carry = Some(cotangent),
+            Some(name) => {
+                external.insert(name.clone(), cotangent);
+            }
+        }
+    }
+    (carry, external)
+}
+
+/// The direction of a reverse pass over a loop VJP group: the cotangent of
+/// the carry gradient and of each capture gradient, zero where none
+/// arrives, with the rebuilt captures they pair with.
+type SymbolicLoopDirection = (
+    TensorNodeId,
+    Vec<(String, TensorNodeId)>,
+    Vec<(String, TensorNodeId)>,
+);
+
+fn symbolic_loop_vjp_direction(
+    transformed: &mut TensorIr,
+    context: &SymbolicVjpLoopVjpContext<'_>,
+    carry: TensorNodeId,
+    captures: &[(String, TensorNodeId)],
+    cotangents: &[Option<TensorNodeId>],
+) -> Result<SymbolicLoopDirection, String> {
+    let (carry_cotangent, capture_cotangents) =
+        symbolic_loop_vjp_member_cotangents(context.source, context.group, cotangents);
+    let carry_direction = match carry_cotangent {
+        Some(cotangent) => cotangent,
+        None => symbolic_zero_like(transformed, symbolic_value(context.values, carry)?)?,
+    };
+    let mut primal_captures = Vec::with_capacity(captures.len());
+    let mut directions = Vec::with_capacity(captures.len());
+    for (name, node_id) in captures {
+        let value = symbolic_value(context.values, *node_id)?;
+        let direction = match capture_cotangents.get(name) {
+            Some(cotangent) => *cotangent,
+            None => symbolic_zero_like(transformed, value)?,
+        };
+        primal_captures.push((name.clone(), value));
+        directions.push((name.clone(), direction));
+    }
+    Ok((carry_direction, primal_captures, directions))
+}
+
+/// Explains a missing forward-mode rule met while reversing a loop VJP.
+fn symbolic_loop_vjp_reverse_error(error: String) -> String {
+    format!(
+        "reverse mode over a loop's reverse pass (a Hessian through the loop) differentiates \
+         the loop body in forward mode: {error}"
+    )
+}
+
+/// Reverse mode over a group of `ForiVjp` nodes.
+///
+/// The group computes the gradient `G(x, g) = J(x)^T g` of `s = g . Phi(x)`,
+/// where `Phi` is the loop as a function of `x = (carry, captures)`, `J` its
+/// Jacobian, and `g` the output cotangent. For cotangents `u` on the
+/// gradients, `(dG/dx)^T u = H u = (dG/dx) u`, because the Hessian `H` of
+/// `s` is symmetric: the forward-over-reverse `ForiVjpJvp` in the direction
+/// `u` with a zero cotangent tangent. And `(dG/dg)^T u = J u`: the loop's
+/// `ForiJvp` in the direction `u`. Both reuse the existing loop derivatives
+/// and their carry checkpointing, so the reverse pass over a loop VJP costs
+/// one forward-over-reverse loop and one forward-mode loop; the loop body
+/// needs a forward-mode rule.
+fn symbolic_vjp_fori_vjp(
+    transformed: &mut TensorIr,
+    context: SymbolicVjpLoopVjpContext<'_>,
+    (carry, output_cotangent): (TensorNodeId, TensorNodeId),
+    loop_plan: &TensorForiExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+    cotangents: &mut [Option<TensorNodeId>],
+) -> Result<(), String> {
+    let (carry_direction, primal_captures, directions) =
+        symbolic_loop_vjp_direction(transformed, &context, carry, captures, cotangents)?;
+    let carry_value = symbolic_value(context.values, carry)?;
+    let cotangent_value = symbolic_value(context.values, output_cotangent)?;
+    let zero_cotangent_tangent = symbolic_zero_like(transformed, cotangent_value)?;
+    // The body's forward mode is otherwise compiled on first execution;
+    // build it now so a missing forward-mode rule is reported here.
+    loop_plan
+        .forward_jvp_plan()
+        .map_err(symbolic_loop_vjp_reverse_error)?;
+    let plan = TensorForiVjpJvpExecutionPlan::new(loop_plan.clone(), &context.namespace)
+        .map_err(symbolic_loop_vjp_reverse_error)?;
+    let bindings = || TensorForiVjpJvpBindings {
+        carry: carry_value,
+        carry_tangent: carry_direction,
+        output_cotangent: cotangent_value,
+        output_cotangent_tangent: zero_cotangent_tangent,
+        captures: primal_captures.clone(),
+        tangent_captures: directions.clone(),
+    };
+    let group = transformed.nodes.len();
+    let carry_contribution =
+        transformed.fori_vjp_jvp(plan.clone(), bindings(), TensorForiVjpTarget::Carry, group)?;
+    let mut contributions = vec![(carry, carry_contribution)];
+    for (name, node_id) in captures {
+        let contribution = transformed.fori_vjp_jvp(
+            plan.clone(),
+            bindings(),
+            TensorForiVjpTarget::External(name.clone()),
+            group,
+        )?;
+        contributions.push((*node_id, contribution));
+    }
+    let cotangent_contribution = transformed.fori_jvp(
+        carry_value,
+        carry_direction,
+        loop_plan.clone(),
+        primal_captures.clone(),
+        directions.clone(),
+    )?;
+    contributions.push((output_cotangent, cotangent_contribution));
+    for (target, contribution) in contributions {
+        symbolic_accumulate(transformed, cotangents, target, contribution)?;
+    }
+    Ok(())
+}
+
+/// Reverse mode over a group of `ScanVjp` nodes: as for `ForiVjp`, with the
+/// scan's final carry and stacked outputs as `Phi`. The gradients' cotangent
+/// direction `u` gives `H u` by the forward-over-reverse `ScanVjpJvp` with
+/// zero cotangent tangents, and the cotangents of the final-carry and output
+/// cotangents are the tangents of the final carry and the outputs, the scan's
+/// forward mode in the direction `u`.
+fn symbolic_vjp_scan_vjp(
+    transformed: &mut TensorIr,
+    context: SymbolicVjpLoopVjpContext<'_>,
+    (carry, final_carry_cotangent, output_cotangent): (TensorNodeId, TensorNodeId, TensorNodeId),
+    scan_plan: &TensorScanExecutionPlan,
+    captures: &[(String, TensorNodeId)],
+    cotangents: &mut [Option<TensorNodeId>],
+) -> Result<(), String> {
+    let (carry_direction, primal_captures, directions) =
+        symbolic_loop_vjp_direction(transformed, &context, carry, captures, cotangents)?;
+    let carry_value = symbolic_value(context.values, carry)?;
+    let final_carry_value = symbolic_value(context.values, final_carry_cotangent)?;
+    let output_value = symbolic_value(context.values, output_cotangent)?;
+    let zero_final_carry = symbolic_zero_like(transformed, final_carry_value)?;
+    let zero_output = symbolic_zero_like(transformed, output_value)?;
+    let plan = TensorScanVjpJvpExecutionPlan::new(scan_plan.clone(), &context.namespace)
+        .map_err(symbolic_loop_vjp_reverse_error)?;
+    let bindings = || TensorScanVjpJvpBindings {
+        carry: carry_value,
+        carry_tangent: carry_direction,
+        final_carry_cotangent: final_carry_value,
+        final_carry_cotangent_tangent: zero_final_carry,
+        output_cotangent: output_value,
+        output_cotangent_tangent: zero_output,
+        captures: primal_captures.clone(),
+        tangent_captures: directions.clone(),
+    };
+    let group = transformed.nodes.len();
+    let carry_contribution =
+        transformed.scan_vjp_jvp(plan.clone(), bindings(), TensorScanVjpTarget::Carry, group)?;
+    let mut contributions = vec![(carry, carry_contribution)];
+    for (name, node_id) in captures {
+        let contribution = transformed.scan_vjp_jvp(
+            plan.clone(),
+            bindings(),
+            TensorScanVjpTarget::External(name.clone()),
+            group,
+        )?;
+        contributions.push((*node_id, contribution));
+    }
+    // The scan's forward mode reads (value, tangent) pairs by source node.
+    let mut pairs = vec![(usize::MAX, usize::MAX); context.source.nodes.len()];
+    pairs[carry] = (carry_value, carry_direction);
+    for ((_, node_id), ((_, value), (_, direction))) in
+        captures.iter().zip(primal_captures.iter().zip(&directions))
+    {
+        pairs[*node_id] = (*value, *direction);
+    }
+    let ((_, final_carry_tangent), (_, output_tangent)) = symbolic_jvp_scan(
+        transformed,
+        scan_plan,
+        carry,
+        captures,
+        &pairs,
+        &context.namespace,
+    )
+    .map_err(symbolic_loop_vjp_reverse_error)?;
+    contributions.push((final_carry_cotangent, final_carry_tangent));
+    contributions.push((output_cotangent, output_tangent));
+    for (target, contribution) in contributions {
+        symbolic_accumulate(transformed, cotangents, target, contribution)?;
+    }
+    Ok(())
+}
+
+struct SymbolicVjpForiJvpContext<'a> {
+    carry: TensorNodeId,
+    carry_tangent: TensorNodeId,
+    captures: &'a [(String, TensorNodeId)],
+    tangent_captures: &'a [(String, TensorNodeId)],
+    values: &'a [TensorNodeId],
+    upstream: TensorNodeId,
+    namespace: String,
+}
+
+/// Reverse mode over a `ForiJvp` node, the tangent `t = J(x) x_dot` of the
+/// loop `Phi` at `x = (carry, captures)` in the direction `x_dot`. For a
+/// cotangent `u` on `t`: `(dt/dx_dot)^T u = J^T u`, the loop's `ForiVjp` with
+/// cotangent `u`; and `(dt/dx)^T u = d/dx (u . J(x) x_dot) = H x_dot` with
+/// `H` the Hessian of `u . Phi`, the forward-over-reverse `ForiVjpJvp` with
+/// cotangent `u` in the direction `x_dot`.
+fn symbolic_vjp_fori_jvp(
+    transformed: &mut TensorIr,
+    context: SymbolicVjpForiJvpContext<'_>,
+    loop_plan: &TensorForiExecutionPlan,
+    cotangents: &mut [Option<TensorNodeId>],
+) -> Result<(), String> {
+    let carry_value = symbolic_value(context.values, context.carry)?;
+    let tangent_value = symbolic_value(context.values, context.carry_tangent)?;
+    let primal_captures = context
+        .captures
+        .iter()
+        .map(|(name, node_id)| Ok((name.clone(), symbolic_value(context.values, *node_id)?)))
+        .collect::<Result<Vec<_>, String>>()?;
+    let tangent_captures = context
+        .tangent_captures
+        .iter()
+        .map(|(name, node_id)| Ok((name.clone(), symbolic_value(context.values, *node_id)?)))
+        .collect::<Result<Vec<_>, String>>()?;
+    let tangent_nodes = context
+        .tangent_captures
+        .iter()
+        .cloned()
+        .collect::<BTreeMap<_, _>>();
+    let mut contributions = Vec::new();
+    let group = transformed.nodes.len();
+    contributions.push((
+        context.carry_tangent,
+        transformed.fori_vjp(
+            carry_value,
+            context.upstream,
+            loop_plan.clone(),
+            primal_captures.clone(),
+            TensorForiVjpTarget::Carry,
+            group,
+        )?,
+    ));
+    for (name, _) in context.captures {
+        let target = tangent_nodes
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("fori JVP capture {name:?} has no tangent"))?;
+        contributions.push((
+            target,
+            transformed.fori_vjp(
+                carry_value,
+                context.upstream,
+                loop_plan.clone(),
+                primal_captures.clone(),
+                TensorForiVjpTarget::External(name.clone()),
+                group,
+            )?,
+        ));
+    }
+    let plan = TensorForiVjpJvpExecutionPlan::new(loop_plan.clone(), &context.namespace)?;
+    let zero_cotangent_tangent = symbolic_zero_like(transformed, context.upstream)?;
+    let bindings = || TensorForiVjpJvpBindings {
+        carry: carry_value,
+        carry_tangent: tangent_value,
+        output_cotangent: context.upstream,
+        output_cotangent_tangent: zero_cotangent_tangent,
+        captures: primal_captures.clone(),
+        tangent_captures: tangent_captures.clone(),
+    };
+    let group = transformed.nodes.len();
+    contributions.push((
+        context.carry,
+        transformed.fori_vjp_jvp(plan.clone(), bindings(), TensorForiVjpTarget::Carry, group)?,
+    ));
+    for (name, node_id) in context.captures {
+        contributions.push((
+            *node_id,
+            transformed.fori_vjp_jvp(
+                plan.clone(),
+                bindings(),
+                TensorForiVjpTarget::External(name.clone()),
+                group,
+            )?,
+        ));
+    }
+    for (target, contribution) in contributions {
+        symbolic_accumulate(transformed, cotangents, target, contribution)?;
     }
     Ok(())
 }

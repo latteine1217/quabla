@@ -33,6 +33,21 @@ deprecated names keep working until 1.0 (see
   `custom_vjp` rule and gains a forward-mode rule beside it, so every
   reverse-mode result is unchanged, and `jacobian` and `hessian` of a
   solution still use reverse mode.
+- Reverse mode over a loop's reverse pass: `grad(grad(f))` with a
+  `fori_loop` or `scan` inside `f`, `hessian` of a function that calls a
+  `custom_vjp` solver after a loop (for example `newton` with `args`
+  computed by `odeint`) or inside one (an implicit time stepper calling
+  `linalg.cg` every step), and `grad` of a `jvp` through a `fori_loop`
+  used to raise "symbolic VJP through a Fori VJP (or JVP) result is not
+  implemented". For the gradient `G = J^T g` of a loop `Phi` with output
+  cotangent `g`, the reverse pass with cotangents `u` is `H u`, by the
+  symmetry of the Hessian the existing forward-over-reverse loop in the
+  direction `u`, and `J u`, the loop's forward mode; reverse mode over a
+  loop JVP uses the same two. So it reuses the loop derivatives and their
+  checkpointing on every backend and composes with `vmap`; the loop body
+  needs a forward-mode rule (a `custom_vjp` function without one raises).
+  Forward mode over a `fori_loop` JVP and third derivatives through loops
+  still raise.
 
 ### Changed
 

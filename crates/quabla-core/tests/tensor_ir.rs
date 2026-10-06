@@ -1013,6 +1013,80 @@ fn forward_over_reverse_binds_a_float32_seed_tangent_to_a_cond_region() {
     }
 }
 
+/// `fori(0, 3, carry * scale)` over a vector carry and scale: the final
+/// carry is `c s^3`.
+fn cubed_fori_graph() -> Result<(TensorIr, TensorNodeId), String> {
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![2])?;
+    body.input("index", vec![])?;
+    let scale = body.input("scale", vec![2])?;
+    let next = body.mul(carry, scale)?;
+    let loop_plan =
+        TensorForiExecutionPlan::new(0, 3, body.compile_region(next)?, "carry", "index")?;
+    let mut graph = TensorIr::new();
+    let c = graph.input("c", vec![2])?;
+    let s = graph.input("s", vec![2])?;
+    let output = graph.fori(c, loop_plan, vec![("scale".to_string(), s)])?;
+    Ok((graph, output))
+}
+
+#[test]
+fn reverse_mode_over_loop_vjp_and_jvp_nodes_matches_closed_forms() {
+    let (graph, output) = must!(cubed_fori_graph());
+    let inputs = BTreeMap::from([
+        (
+            "c".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![0.5, -2.0])),
+        ),
+        (
+            "s".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![1.5, 0.75])),
+        ),
+        (
+            "ds".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![1.0, -1.0])),
+        ),
+    ]);
+    let evaluate = |graph: &TensorIr, node: TensorNodeId| -> Result<Vec<f64>, String> {
+        Ok(graph.compile_cpu(node)?.evaluate(&inputs)?.data().to_vec())
+    };
+    let mut graph = graph;
+    let loss = must!(graph.sum(output));
+    // First pass: the gradient in s is 3 c s^2 (ForiVjp nodes).
+    let first = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    let mut reversed = first.graph.clone();
+    let gradient_sum = must!(reversed.sum(first.gradients["s"]));
+    // Second reverse pass over the ForiVjp group: d/ds = 6 c s, d/dc = 3 s^2.
+    let second = must!(reversed.symbolic_vjp_many(&[(gradient_sum, SymbolicCotangent::Ones)]));
+    assert_eq!(
+        must!(evaluate(&second.graph, second.gradients["s"])),
+        vec![6.0 * 0.5 * 1.5, 6.0 * -2.0 * 0.75]
+    );
+    assert_eq!(
+        must!(evaluate(&second.graph, second.gradients["c"])),
+        vec![3.0 * 1.5 * 1.5, 3.0 * 0.75 * 0.75]
+    );
+    // Reverse mode over the ForiJvp tangent 3 c s^2 ds: d/ds = 6 c s ds,
+    // d/dc = 3 s^2 ds, and d/dds = 3 c s^2.
+    let tangents = BTreeMap::from([("s".to_string(), "ds".to_string())]);
+    let forward = must!(graph.symbolic_jvp_many_with_tangent_inputs(&[loss], &tangents));
+    let over = must!(forward
+        .graph
+        .symbolic_vjp_many(&[(forward.tangents[0], SymbolicCotangent::Ones)]));
+    assert_eq!(
+        must!(evaluate(&over.graph, over.gradients["s"])),
+        vec![6.0 * 0.5 * 1.5, -(6.0 * -2.0 * 0.75)]
+    );
+    assert_eq!(
+        must!(evaluate(&over.graph, over.gradients["c"])),
+        vec![3.0 * 1.5 * 1.5, -3.0 * 0.75 * 0.75]
+    );
+    assert_eq!(
+        must!(evaluate(&over.graph, over.gradients["ds"])),
+        vec![3.0 * 0.5 * 1.5 * 1.5, 3.0 * -2.0 * 0.75 * 0.75]
+    );
+}
+
 #[test]
 fn fori_region_executes_and_differentiates_without_static_unrolling() {
     let mut body = TensorIr::new();
