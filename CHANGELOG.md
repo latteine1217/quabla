@@ -28,6 +28,38 @@ deprecated names keep working until 1.0 (see
   runner prints `PASS`, `SKIP` with its reason, or `FAIL` for every test
   and a summary line, and exits non-zero on a failure; a gated test that
   used to return silently and print `PASS` now prints `SKIP`.
+- On the CPU, derivatives through `fori_loop` and `scan` regions (`grad`,
+  `vjp`, `jvp`, `hessian`, and their `jit` and `vmap` forms) differentiate
+  the loop body with the same compiled symbolic VJP and JVP plans as MLX,
+  the CUDA host loop, and `unroll=True`, instead of the v0.1 runtime
+  derivative engines. Each region compiles its body derivative plans once,
+  on first use. Results change at the rounding level: over a 2,000-case
+  sweep of loop bodies (`sqrt`/`abs`, `relu`, `log`/division, `exp`,
+  `power`, `where`, `clip`/`sign`, `minimum`/`max`, fan-out, smooth), inputs
+  (regular, signed zeros, subnormal, overflow, inf/NaN), 3 and 40 steps,
+  and every transform, 6.7% of `float64` results changed, all within 5 ulp
+  (at most 7.2e-16 relative); 40% of `float32` results changed, 92% of the
+  changed elements within 8 ulp and at most 5.6e-5 relative on small
+  cancelling components, because the runtime engine did the body's
+  derivative arithmetic in `float64` and rounded once while the symbolic
+  plans round every operation. No result became non-finite and no error
+  appeared or disappeared. In that sweep, carry gradients and loop JVPs
+  now match `unroll=True` bit for bit; capture gradients still sum the
+  iterations' contributions in a different order than the unrolled graph.
+  The
+  deprecated v0.1 `tensor_*` entry points keep the runtime engines, also
+  through loops, so their results are unchanged.
+- MLX `scan` derivatives run one joint VJP of the body's carry and output
+  per iteration, as the CPU and CUDA do, instead of two VJPs whose
+  gradients were added: results change at the rounding level (at most
+  7.1e-6 relative over the sweep above), and an `inf` gradient that the
+  sum turned into NaN stays `inf`.
+
+### Removed
+
+- `quabla_core::tensor_ir::TensorForiMultiExecutionPlan` (and its
+  `TensorForiMultiVjpResult` alias), a multi-carry loop plan that no IR
+  node, backend, or Python entry point used.
 
 ### Fixed
 

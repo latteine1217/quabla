@@ -1414,9 +1414,7 @@ fn mlx_fori_value_and_vjp(
     external_captures: &BTreeMap<String, Array>,
     output_cotangent: Array,
 ) -> Result<MlxForiVjpEvaluation, String> {
-    let vjp = loop_plan.mlx_vjp.as_ref().ok_or_else(|| {
-        "MLX Fori VJP requires a body with supported symbolic reverse lowering".to_string()
-    })?;
+    let vjp = loop_plan.vjp_plan()?;
     let stream = StreamOrDevice::gpu();
     let steps = loop_plan.upper - loop_plan.lower;
     let evaluate = |offset, carry| {
@@ -1464,7 +1462,6 @@ fn mlx_fori_value_and_vjp(
                 .map(|value| (name.clone(), value))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let output_ids = vjp.gradient_node_ids.values().copied().collect::<Vec<_>>();
     loop {
         let block = if let Some(checkpoints) = &mut checkpoints {
             checkpoints.pop_block(evaluate)?
@@ -1485,27 +1482,17 @@ fn mlx_fori_value_and_vjp(
                     (loop_plan.lower + offset) as f64,
                 )?)?,
             );
-            body_inputs.insert(vjp.cotangent_name.clone(), carry_gradient);
-            let gradients = backend.execute_arrays_with_retained(
-                &vjp.plan,
-                &output_ids,
-                &BTreeMap::new(),
-                &body_inputs,
-            )?;
-            let gradients = vjp
-                .gradient_node_ids
-                .keys()
-                .cloned()
-                .zip(gradients)
-                .collect::<BTreeMap<_, _>>();
+            let gradients =
+                mlx_region_vjp_gradients(backend, vjp, &body_inputs, vec![carry_gradient])?;
             carry_gradient = gradients
                 .get(&loop_plan.carry_name)
                 .cloned()
                 .ok_or_else(|| "MLX Fori VJP body has no carry gradient".to_string())?;
             for name in loop_plan.external_captures.keys() {
-                let contribution = gradients
-                    .get(name)
-                    .ok_or_else(|| format!("MLX Fori VJP has no gradient for capture {name:?}"))?;
+                // A `bool` capture has no gradient and contributes zero.
+                let Some(contribution) = gradients.get(name) else {
+                    continue;
+                };
                 let accumulated = external_gradients
                     .get_mut(name)
                     .ok_or_else(|| format!("MLX Fori VJP gradient {name:?} is missing"))?;
@@ -1535,37 +1522,7 @@ fn mlx_fori_jvp(
     external_captures: &BTreeMap<String, Array>,
     external_tangents: &BTreeMap<String, Array>,
 ) -> Result<Array, String> {
-    let body = loop_plan.body.plan.as_ir();
-    let mut tangent_names = BTreeMap::new();
-    for (index, name) in loop_plan.body.captures.keys().enumerate() {
-        if name == &loop_plan.index_name {
-            continue;
-        }
-        let mut tangent_name = format!("__quabla_mlx_fori_jvp_tangent_{index}");
-        while loop_plan.body.captures.contains_key(&tangent_name)
-            || tangent_names
-                .values()
-                .any(|candidate| candidate == &tangent_name)
-        {
-            tangent_name.push('_');
-        }
-        tangent_names.insert(name.clone(), tangent_name);
-    }
-    let forward = body.symbolic_jvp_with_seed(
-        loop_plan.body.plan.output_node_id,
-        |graph, name, value, shape| {
-            tangent_names
-                .get(name)
-                .map(|tangent_name| {
-                    let dtype = graph.node_dtype(value)?;
-                    graph.input_typed(tangent_name.clone(), shape.to_vec(), dtype)
-                })
-                .transpose()
-        },
-    )?;
-    let (forward_plan, outputs) = forward
-        .graph
-        .compile_cpu_many(&[forward.value, forward.tangent])?;
+    let forward = loop_plan.forward_jvp_plan()?;
     let mut carry = initial_carry;
     let mut carry_tangent = initial_tangent;
     for index in loop_plan.lower..loop_plan.upper {
@@ -1575,7 +1532,7 @@ fn mlx_fori_jvp(
             loop_plan.index_name.clone(),
             mlx_array_from_dynamic(&DynamicTensor::filled(vec![], index as f64)?)?,
         );
-        for (name, tangent_name) in &tangent_names {
+        for (name, tangent_name) in &forward.tangent_names {
             let tangent = if name == &loop_plan.carry_name {
                 carry_tangent.clone()
             } else {
@@ -1587,8 +1544,8 @@ fn mlx_fori_jvp(
             inputs.insert(tangent_name.clone(), tangent);
         }
         let outputs = backend.execute_arrays_with_retained(
-            &forward_plan,
-            &outputs,
+            &forward.plan,
+            &forward.plan.output_node_ids,
             &BTreeMap::new(),
             &inputs,
         )?;
@@ -1617,6 +1574,8 @@ fn mlx_fori_vjp_jvp(
 ) -> Result<BTreeMap<String, Array>, String> {
     let stream = StreamOrDevice::gpu();
     let loop_plan = &plan.loop_plan;
+    let forward = loop_plan.forward_jvp_plan()?;
+    let vjp = loop_plan.vjp_plan()?;
     let steps = loop_plan.upper - loop_plan.lower;
     let evaluate = |offset, (carry, tangent): (Array, Array)| {
         let mut inputs = external_captures.clone();
@@ -1628,7 +1587,7 @@ fn mlx_fori_vjp_jvp(
                 (loop_plan.lower + offset) as f64,
             )?)?,
         );
-        for (name, tangent_name) in &plan.mlx_forward_jvp.tangent_names {
+        for (name, tangent_name) in &forward.tangent_names {
             let value = if name == &loop_plan.carry_name {
                 tangent.clone()
             } else {
@@ -1640,11 +1599,8 @@ fn mlx_fori_vjp_jvp(
             inputs.insert(tangent_name.clone(), value);
         }
         let values = backend.execute_arrays_with_retained(
-            &plan.mlx_forward_jvp.plan,
-            &[
-                plan.mlx_forward_jvp.value_node_id,
-                plan.mlx_forward_jvp.tangent_node_id,
-            ],
+            &forward.plan,
+            &forward.plan.output_node_ids,
             &BTreeMap::new(),
             &inputs,
         )?;
@@ -1705,15 +1661,8 @@ fn mlx_fori_vjp_jvp(
                     (loop_plan.lower + offset) as f64,
                 )?)?,
             );
-            let body_gradients = mlx_region_vjp_gradients(
-                backend,
-                loop_plan.mlx_vjp.as_ref().ok_or_else(|| {
-                    "MLX Fori VJP JVP requires a body with supported symbolic reverse lowering"
-                        .to_string()
-                })?,
-                &inputs,
-                carry_cotangent.clone(),
-            )?;
+            let body_gradients =
+                mlx_region_vjp_gradients(backend, vjp, &inputs, vec![carry_cotangent.clone()])?;
             let mut jvp_inputs = inputs;
             jvp_inputs.insert(plan.cotangent_name.clone(), carry_cotangent);
             for (name, tangent_name) in &plan.tangent_names {
@@ -1810,7 +1759,7 @@ fn mlx_scan_vjp_jvp(
                 (scan_plan.lower + offset) as f64,
             )?)?,
         );
-        for (name, tangent_name) in &plan.mlx_forward_jvp.tangent_names {
+        for (name, tangent_name) in &plan.forward_jvp.tangent_names {
             let value = if name == &scan_plan.carry_name {
                 tangent.clone()
             } else {
@@ -1822,11 +1771,8 @@ fn mlx_scan_vjp_jvp(
             inputs.insert(tangent_name.clone(), value);
         }
         let values = backend.execute_arrays_with_retained(
-            &plan.mlx_forward_jvp.plan,
-            &[
-                plan.mlx_forward_jvp.value_node_id,
-                plan.mlx_forward_jvp.tangent_node_id,
-            ],
+            &plan.forward_jvp.plan,
+            &plan.forward_jvp.plan.output_node_ids,
             &BTreeMap::new(),
             &inputs,
         )?;
@@ -1856,10 +1802,7 @@ fn mlx_scan_vjp_jvp(
         full_tape = Some(states);
     }
 
-    let vjp = scan_plan.mlx_vjp.as_ref().ok_or_else(|| {
-        "MLX Scan VJP JVP requires body outputs with supported symbolic reverse lowering"
-            .to_string()
-    })?;
+    let vjp = scan_plan.vjp_plan()?;
     let output_step_shape = scan_plan.body.output_shapes()[1].clone();
     let mut carry_cotangent = final_carry_cotangent;
     let mut carry_cotangent_tangent = final_carry_cotangent_tangent;
@@ -1904,13 +1847,11 @@ fn mlx_scan_vjp_jvp(
                 &output_step_shape,
                 &stream,
             )?;
-            let carry_gradients =
-                mlx_region_vjp_gradients(backend, &vjp.carry, &inputs, carry_cotangent.clone())?;
-            let output_gradients = mlx_region_vjp_gradients(
+            let primal_gradients = mlx_region_vjp_gradients(
                 backend,
-                &vjp.output,
+                vjp,
                 &inputs,
-                output_step_cotangent.clone(),
+                vec![carry_cotangent.clone(), output_step_cotangent.clone()],
             )?;
             let mut jvp_inputs = inputs;
             jvp_inputs.insert(plan.carry_cotangent_name.clone(), carry_cotangent);
@@ -1961,16 +1902,10 @@ fn mlx_scan_vjp_jvp(
                     .add_device(&contribution, &stream)
                     .map_err(|error| error.to_string())?;
             }
-            carry_cotangent = carry_gradients
+            carry_cotangent = primal_gradients
                 .get(&scan_plan.carry_name)
-                .ok_or_else(|| "MLX Scan carry VJP has no carry gradient".to_string())?
-                .add_device(
-                    output_gradients
-                        .get(&scan_plan.carry_name)
-                        .ok_or_else(|| "MLX Scan output VJP has no carry gradient".to_string())?,
-                    &stream,
-                )
-                .map_err(|error| error.to_string())?;
+                .cloned()
+                .ok_or_else(|| "MLX Scan VJP has no carry gradient".to_string())?;
         }
         if checkpoints.is_some() {
             transforms::eval(
@@ -1993,9 +1928,7 @@ fn mlx_scan_value_and_vjp(
     final_carry_cotangent: Array,
     output_cotangent: Array,
 ) -> Result<MlxScanVjpEvaluation, String> {
-    let vjp = scan_plan.mlx_vjp.as_ref().ok_or_else(|| {
-        "MLX Scan VJP requires body outputs with supported symbolic reverse lowering".to_string()
-    })?;
+    let vjp = scan_plan.vjp_plan()?;
     let stream = StreamOrDevice::gpu();
     let steps = scan_plan.upper - scan_plan.lower;
     let evaluate = |offset, carry| {
@@ -2071,34 +2004,27 @@ fn mlx_scan_value_and_vjp(
                 &output_step_shape,
                 &stream,
             )?;
-            let carry_gradients =
-                mlx_region_vjp_gradients(backend, &vjp.carry, &body_inputs, carry_gradient)?;
-            let output_gradients =
-                mlx_region_vjp_gradients(backend, &vjp.output, &body_inputs, output_gradient)?;
-            let carry_from_carry = carry_gradients
+            // One joint VJP of both body outputs, as on the CPU and the CUDA host loop.
+            let gradients = mlx_region_vjp_gradients(
+                backend,
+                vjp,
+                &body_inputs,
+                vec![carry_gradient, output_gradient],
+            )?;
+            carry_gradient = gradients
                 .get(&scan_plan.carry_name)
-                .ok_or_else(|| "MLX Scan carry VJP has no carry gradient".to_string())?;
-            let carry_from_output = output_gradients
-                .get(&scan_plan.carry_name)
-                .ok_or_else(|| "MLX Scan output VJP has no carry gradient".to_string())?;
-            carry_gradient = carry_from_carry
-                .add_device(carry_from_output, &stream)
-                .map_err(|error| error.to_string())?;
+                .cloned()
+                .ok_or_else(|| "MLX Scan VJP has no carry gradient".to_string())?;
             for name in scan_plan.external_captures.keys() {
-                let carry_contribution = carry_gradients
-                    .get(name)
-                    .ok_or_else(|| format!("MLX Scan carry VJP has no gradient for {name:?}"))?;
-                let output_contribution = output_gradients
-                    .get(name)
-                    .ok_or_else(|| format!("MLX Scan output VJP has no gradient for {name:?}"))?;
-                let contribution = carry_contribution
-                    .add_device(output_contribution, &stream)
-                    .map_err(|error| error.to_string())?;
+                // A `bool` capture has no gradient and contributes zero.
+                let Some(contribution) = gradients.get(name) else {
+                    continue;
+                };
                 let accumulated = external_gradients
                     .get_mut(name)
                     .ok_or_else(|| format!("MLX Scan VJP gradient {name:?} is missing"))?;
                 *accumulated = accumulated
-                    .add_device(&contribution, &stream)
+                    .add_device(contribution, &stream)
                     .map_err(|error| error.to_string())?;
             }
         }
@@ -2114,14 +2040,17 @@ fn mlx_scan_value_and_vjp(
     })
 }
 
+/// Runs a loop body's shared symbolic VJP with one cotangent per seeded output.
 fn mlx_region_vjp_gradients(
     backend: &MlxBackend,
-    vjp: &super::TensorMlxVjpPlan,
+    vjp: &super::TensorRegionVjpPlan,
     body_inputs: &BTreeMap<String, Array>,
-    cotangent: Array,
+    cotangents: Vec<Array>,
 ) -> Result<BTreeMap<String, Array>, String> {
     let mut inputs = body_inputs.clone();
-    inputs.insert(vjp.cotangent_name.clone(), cotangent);
+    for (name, cotangent) in vjp.cotangent_names.iter().zip(cotangents) {
+        inputs.insert(name.clone(), cotangent);
+    }
     let output_ids = vjp.gradient_node_ids.values().copied().collect::<Vec<_>>();
     let values =
         backend.execute_arrays_with_retained(&vjp.plan, &output_ids, &BTreeMap::new(), &inputs)?;
