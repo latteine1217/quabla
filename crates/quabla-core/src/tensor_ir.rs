@@ -612,11 +612,6 @@ enum TensorOp {
         on_true: TensorNodeId,
         on_false: TensorNodeId,
     },
-    Fori {
-        carry: TensorNodeId,
-        loop_plan: TensorForiExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-    },
     /// Tangent result of a fixed-bound `Fori`. The matching primal remains an
     /// ordinary `Fori`, avoiding the packed slice/concat carry representation.
     ForiJvp {
@@ -3326,7 +3321,10 @@ impl TensorIr {
                     rhs: operands[1],
                 }
             }
-            TensorOp::Fori { .. }
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Fori { .. },
+                ..
+            })
             | TensorOp::ForiJvp { .. }
             | TensorOp::ForiVjp { .. }
             | TensorOp::ForiVjpJvp { .. }
@@ -3713,11 +3711,11 @@ impl TensorIr {
                     &pairs,
                     &format!("__quabla_cond_jvp_{node_index}"),
                 )?,
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, loop_plan },
                     captures,
-                } => symbolic_jvp_fori(
+                    ..
+                }) => symbolic_jvp_fori(
                     &mut transformed,
                     loop_plan,
                     *carry,
@@ -4277,11 +4275,11 @@ impl TensorIr {
                     captures,
                     &values,
                 )?,
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, loop_plan },
                     captures,
-                } => symbolic_clone_fori(&mut transformed, *carry, loop_plan, captures, &values)?,
+                    ..
+                }) => symbolic_clone_fori(&mut transformed, *carry, loop_plan, captures, &values)?,
                 TensorOp::Region(RegionNode {
                     kind: RegionKind::While { carry, loop_plan },
                     captures,
@@ -4531,11 +4529,11 @@ impl TensorIr {
                     &mut cotangents,
                     node_id,
                 )?,
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, loop_plan },
                     captures,
-                } => symbolic_vjp_fori(
+                    ..
+                }) => symbolic_vjp_fori(
                     &mut transformed,
                     loop_plan,
                     SymbolicVjpForiContext {
@@ -5646,11 +5644,11 @@ impl TensorIr {
         )?;
         let dtype = loop_plan.body.plan.input_dtype(&loop_plan.carry_name)?;
         Ok(self.push_node(
-            TensorOp::Fori {
-                carry,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Fori { carry, loop_plan },
                 captures,
-            },
+                tangent_captures: Vec::new(),
+            }),
             carry_shape,
             dtype,
             false,
@@ -7783,11 +7781,11 @@ impl TensorIr {
                         accumulate(&mut cotangents[*capture], gradient)?;
                     }
                 }
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, loop_plan },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let external = tensor_forward_capture_values(captures, &values)?;
                     let (_, carry_gradient, external_gradients) = loop_plan.runtime_value_and_vjp(
                         values
@@ -8459,11 +8457,11 @@ impl TensorIr {
                     let branch_tangents = tensor_cond_capture_values(captures, &tangents)?;
                     branches.jvp(predicate, &branch_inputs, &branch_tangents)?.1
                 }
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, loop_plan },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let external_inputs = tensor_fori_capture_values(captures, &values)?;
                     let external_tangents = tensor_fori_capture_values(captures, &tangents)?;
                     loop_plan
@@ -8841,8 +8839,10 @@ impl TensorIr {
                 TensorOp::Region(RegionNode {
                     kind: RegionKind::Cond { .. },
                     ..
-                }) | TensorOp::Fori { .. }
-                    | TensorOp::Scan { .. }
+                }) | TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { .. },
+                    ..
+                }) | TensorOp::Scan { .. }
             )
         }) {
             return self.symbolic_hessian_scalar_through_regions(output, input_name, inputs);
@@ -8937,8 +8937,10 @@ impl TensorIr {
                 TensorOp::Region(RegionNode {
                     kind: RegionKind::Cond { .. },
                     ..
-                }) | TensorOp::Fori { .. }
-                    | TensorOp::Scan { .. }
+                }) | TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { .. },
+                    ..
+                }) | TensorOp::Scan { .. }
             )
         }) {
             return self.symbolic_hvp_scalar_through_regions(
@@ -9231,11 +9233,7 @@ impl TensorIr {
                     loop_plan.body.plan.node_count(),
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
-                    captures,
-                } => format!(
+                TensorOp::Region(RegionNode { kind: RegionKind::Fori { carry, loop_plan }, captures, .. }) => format!(
                     "%{id} = fori(carry=%{carry}, lower={}, upper={}, captures={captures:?}, body_nodes={}) : {}",
                     loop_plan.lower,
                     loop_plan.upper,
@@ -9866,11 +9864,11 @@ impl TensorIr {
                         &external_inputs,
                     )?
                 }
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, loop_plan },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let external_inputs = tensor_forward_capture_values(captures, &values)?;
                     loop_plan.evaluate(
                         values
@@ -10787,11 +10785,7 @@ impl TensorIr {
                     "mixed second-order differentiation through Cond regions is not implemented"
                         .to_string(),
                 ),
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
-                    captures,
-                } => {
+                TensorOp::Region(RegionNode { kind: RegionKind::Fori { carry, loop_plan }, captures, .. }) => {
                     let initial_carry = values
                         .get(*carry)
                         .cloned()

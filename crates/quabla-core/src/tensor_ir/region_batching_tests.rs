@@ -86,11 +86,11 @@ fn a_mapped_carry_leaves_unmapped_captures_unbatched() -> Result<(), String> {
     let (node, mapped) = results[0];
     assert!(mapped);
     assert_eq!(graph.nodes[node].shape, vec![BATCH, 3]);
-    let TensorOp::Fori {
-        carry,
-        loop_plan,
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::Fori { carry, loop_plan },
         captures,
-    } = &graph.nodes[node].op
+        ..
+    }) = &graph.nodes[node].op
     else {
         panic!("expected a batched fori node");
     };
@@ -113,11 +113,11 @@ fn a_mapped_capture_maps_the_carry_by_the_fixed_point() -> Result<(), String> {
     let (graph, results) = batched(&callee, &[("x", false), ("s", true)], &[looped])?;
     let (node, mapped) = results[0];
     assert!(mapped);
-    let TensorOp::Fori {
-        carry,
-        loop_plan,
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::Fori { carry, loop_plan },
         captures,
-    } = &graph.nodes[node].op
+        ..
+    }) = &graph.nodes[node].op
     else {
         panic!("expected a batched fori node");
     };
@@ -247,7 +247,11 @@ fn nested_loops_batch_the_inner_region_inside_the_outer_body() -> Result<(), Str
     let looped = callee.fori(x, outer_plan, vec![("shift".to_string(), s)])?;
     let (graph, results) = batched(&callee, &[("x", false), ("s", true)], &[looped])?;
     assert!(results[0].1);
-    let TensorOp::Fori { loop_plan, .. } = &graph.nodes[results[0].0].op else {
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::Fori { loop_plan, .. },
+        ..
+    }) = &graph.nodes[results[0].0].op
+    else {
         panic!("expected a batched outer fori node");
     };
     let inner = loop_plan
@@ -256,7 +260,10 @@ fn nested_loops_batch_the_inner_region_inside_the_outer_body() -> Result<(), Str
         .nodes
         .iter()
         .find_map(|node| match &node.op {
-            TensorOp::Fori { loop_plan, .. } => Some(loop_plan),
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Fori { loop_plan, .. },
+                ..
+            }) => Some(loop_plan),
             _ => None,
         })
         .expect("the outer body keeps its inner fori");

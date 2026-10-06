@@ -361,11 +361,11 @@ impl TensorIr {
                 .collect::<BTreeSet<_>>()
         };
         match &node.op {
-            TensorOp::Fori {
-                carry,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Fori { carry, loop_plan },
                 captures,
-            } => {
+                ..
+            }) => {
                 let mut inputs = mapped_names(captures);
                 if mapped[*carry] {
                     inputs.insert(loop_plan.carry_name.clone());

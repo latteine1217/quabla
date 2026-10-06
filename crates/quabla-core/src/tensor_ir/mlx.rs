@@ -804,12 +804,15 @@ impl MlxBackend {
                         .remove(&carry_name)
                         .ok_or_else(|| "MLX While carry is missing".to_string())
                 }
-                TensorOp::Fori { .. } => {
-                    let TensorOp::Fori {
-                        carry,
-                        loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { .. },
+                    ..
+                }) => {
+                    let TensorOp::Region(RegionNode {
+                        kind: RegionKind::Fori { carry, loop_plan },
                         captures,
-                    } = &node.op
+                        ..
+                    }) = &node.op
                     else {
                         unreachable!();
                     };

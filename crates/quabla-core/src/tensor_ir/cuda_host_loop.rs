@@ -343,7 +343,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
                 loop_plan.body_plan().clone(),
             ],
         )),
-        TensorOp::Fori { loop_plan, .. } => Ok((
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::Fori { loop_plan, .. },
+            ..
+        }) => Ok((
             HostLoopKind::Fori {
                 names: loop_names(
                     loop_plan.lower,
@@ -683,7 +686,11 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 Ok(vec![(node_id, state)])
             }
             HostLoopKind::Fori { names } => {
-                let TensorOp::Fori { carry, .. } = op else {
+                let TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, .. },
+                    ..
+                }) = op
+                else {
                     return Err(mismatch(node_id));
                 };
                 let index = LoopIndex::new(&mut host, names)?;

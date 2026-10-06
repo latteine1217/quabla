@@ -909,7 +909,10 @@ pub(super) fn cuda_fused_loop_lowering(op: &TensorOp) -> Option<Result<(), Strin
             kind: RegionKind::While { .. },
             ..
         }) => Err("while_loop has a data-dependent trip count".to_string()),
-        TensorOp::Fori { loop_plan, .. } => cuda_fori_body_is_lowerable(loop_plan),
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::Fori { loop_plan, .. },
+            ..
+        }) => cuda_fori_body_is_lowerable(loop_plan),
         TensorOp::ForiJvp { loop_plan, .. } => cuda_fori_jvp_is_lowerable(loop_plan),
         TensorOp::ForiVjp {
             loop_plan, target, ..
@@ -2251,9 +2254,11 @@ fn execute_cuda_device_program<T: CudaReal>(
                 )?;
                 continue;
             }
-            TensorOp::Fori {
-                carry, captures, ..
-            } => {
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Fori { carry, .. },
+                captures,
+                ..
+            }) => {
                 let (before, current_and_after) = values.split_at_mut(node_id);
                 let slot = current_and_after.first_mut().ok_or_else(|| {
                     format!("CUDA Fori node {node_id} is missing its buffer slot")
@@ -7856,11 +7861,7 @@ fn cuda_program_source(
             | TensorOp::Region(RegionNode { kind: RegionKind::While { .. }, .. }) => {
                 String::new()
             }
-            TensorOp::Fori {
-                loop_plan,
-                captures,
-                ..
-            } => cuda_fori_node_kernel_source(node_id, loop_plan, captures)?,
+            TensorOp::Region(RegionNode { kind: RegionKind::Fori { loop_plan, .. }, captures, .. }) => cuda_fori_node_kernel_source(node_id, loop_plan, captures)?,
             TensorOp::ForiJvp {
                 loop_plan,
                 captures,
