@@ -45,13 +45,12 @@ use cudarc::driver::{
 };
 
 use super::super::{
-    element_count, DynamicTensor, SymbolicCotangent, TensorCarryCheckpoints, TensorExecutionPlan,
-    TensorForiVjpTarget, TensorIr, TensorNodeId, TensorOp, TensorScanTarget, TensorScanVjpTarget,
+    element_count, DynamicTensor, RegionKind, RegionNode, SymbolicCotangent,
+    TensorCarryCheckpoints, TensorExecutionPlan, TensorForiVjpTarget, TensorIr, TensorNodeId,
+    TensorOp, TensorScanTarget, TensorScanVjpTarget,
 };
 use super::{
-    cuda_fori_body_is_lowerable, cuda_fori_jvp_is_lowerable, cuda_fori_jvp_tangent_names,
-    cuda_fori_vjp_jvp_is_lowerable, cuda_fori_vjp_plan, cuda_scalar_predicate,
-    cuda_scan_body_is_lowerable, cuda_scan_vjp_jvp_is_lowerable, cuda_scan_vjp_plans, cuda_value,
+    cuda_fori_jvp_tangent_names, cuda_fused_loop_lowering, cuda_scalar_predicate, cuda_value,
     execute_cuda_device_program, recycle_cuda_computed_values, CudaBackend, CudaBufferPool,
     CudaExecutionPlan, CudaExecutionState, CudaProgramRuntime, CudaReal,
 };
@@ -192,16 +191,13 @@ enum HostLoopKind {
     },
 }
 
-/// Group key of a loop node whose sibling nodes share one execution.
-fn loop_group_key(op: &TensorOp) -> Option<(u8, usize)> {
-    match op {
-        TensorOp::Scan { group, .. } => Some((0, *group)),
-        TensorOp::ScanVjp { group, .. } => Some((1, *group)),
-        TensorOp::ForiVjp { group, .. } => Some((2, *group)),
-        TensorOp::ForiVjpJvp { group, .. } => Some((3, *group)),
-        TensorOp::ScanVjpJvp { group, .. } => Some((4, *group)),
-        _ => None,
-    }
+/// Group key of a loop node whose sibling nodes share one execution: group
+/// ids are compared within one op kind.
+fn loop_group_key(op: &TensorOp) -> Option<(&'static str, usize)> {
+    let TensorOp::Region(region) = op else {
+        return None;
+    };
+    Some((region.name(), region.group()?))
 }
 
 /// Nodes produced by the same loop execution as `node_id`, in node order.
@@ -226,25 +222,9 @@ pub(super) fn cuda_loop_fused_error(
     plan: &TensorExecutionPlan,
     node_id: TensorNodeId,
 ) -> Option<String> {
-    let members = cuda_loop_group_members(plan, node_id);
-    let error = |member: TensorNodeId| -> Option<String> {
-        match &plan.nodes[member].op {
-            TensorOp::While { .. } => Some("while_loop has a data-dependent trip count".into()),
-            TensorOp::Fori { loop_plan, .. } => cuda_fori_body_is_lowerable(loop_plan).err(),
-            TensorOp::ForiJvp { loop_plan, .. } => cuda_fori_jvp_is_lowerable(loop_plan).err(),
-            TensorOp::ForiVjp {
-                loop_plan, target, ..
-            } => cuda_fori_vjp_plan(loop_plan, target).err(),
-            TensorOp::ForiVjpJvp { plan, .. } => cuda_fori_vjp_jvp_is_lowerable(plan).err(),
-            TensorOp::Scan { scan_plan, .. } => cuda_scan_body_is_lowerable(scan_plan).err(),
-            TensorOp::ScanVjp {
-                scan_plan, target, ..
-            } => cuda_scan_vjp_plans(scan_plan, target).err(),
-            TensorOp::ScanVjpJvp { plan, .. } => cuda_scan_vjp_jvp_is_lowerable(plan).err(),
-            _ => None,
-        }
-    };
-    members.into_iter().find_map(error)
+    cuda_loop_group_members(plan, node_id)
+        .into_iter()
+        .find_map(|member| cuda_fused_loop_lowering(&plan.nodes[member].op)?.err())
 }
 
 /// The set of nodes that run host-driven, every member of a host-driven group
@@ -353,7 +333,10 @@ fn forward_over_reverse_region(
 /// that the fallback can lower.
 fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>), String> {
     match op {
-        TensorOp::While { loop_plan, .. } => Ok((
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::While { loop_plan, .. },
+            ..
+        }) => Ok((
             HostLoopKind::While {
                 carry: loop_plan.carry_name().to_string(),
             },
@@ -362,7 +345,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
                 loop_plan.body_plan().clone(),
             ],
         )),
-        TensorOp::Fori { loop_plan, .. } => Ok((
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::Fori { loop_plan, .. },
+            ..
+        }) => Ok((
             HostLoopKind::Fori {
                 names: loop_names(
                     loop_plan.lower,
@@ -373,7 +359,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
             },
             vec![loop_plan.body.plan.clone()],
         )),
-        TensorOp::ForiJvp { loop_plan, .. } => {
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::ForiJvp { loop_plan, .. },
+            ..
+        }) => {
             let tangents = cuda_fori_jvp_tangent_names(loop_plan);
             let body = &loop_plan.body.plan;
             let forward = body
@@ -395,7 +384,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
                 vec![forward],
             ))
         }
-        TensorOp::ForiVjp { loop_plan, .. } => {
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::ForiVjp { loop_plan, .. },
+            ..
+        }) => {
             let body = &loop_plan.body.plan;
             let mut taken = loop_plan.body.captures().keys().cloned().collect();
             let cotangent = fresh_name("__quabla_cuda_loop_cotangent", &taken);
@@ -430,7 +422,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
                 vec![body.clone(), reverse],
             ))
         }
-        TensorOp::ForiVjpJvp { plan, .. } => {
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::ForiVjpJvp { plan, .. },
+            ..
+        }) => {
             let loop_plan = &plan.loop_plan;
             let body = &loop_plan.body.plan;
             let mut forward_tangents = plan.tangent_names.clone();
@@ -470,7 +465,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
                 vec![forward, reverse],
             ))
         }
-        TensorOp::Scan { scan_plan, .. } => Ok((
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::Scan { scan_plan, .. },
+            ..
+        }) => Ok((
             HostLoopKind::Scan {
                 names: loop_names(
                     scan_plan.lower,
@@ -481,7 +479,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
             },
             vec![scan_plan.body.plan.clone()],
         )),
-        TensorOp::ScanVjp { scan_plan, .. } => {
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::ScanVjp { scan_plan, .. },
+            ..
+        }) => {
             let body = &scan_plan.body.plan;
             let [carry_output, step_output] = body.output_node_ids() else {
                 return Err("scan body must return a carry and an output".to_string());
@@ -530,7 +531,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
                 vec![carry_body, reverse],
             ))
         }
-        TensorOp::ScanVjpJvp { plan, .. } => {
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::ScanVjpJvp { plan, .. },
+            ..
+        }) => {
             let scan_plan = &plan.scan_plan;
             let body = &scan_plan.body.plan;
             let [carry_output, step_output] = body.output_node_ids() else {
@@ -677,7 +681,11 @@ impl<T: CudaReal> CudaHostLoop<T> {
         let captures = loop_captures(op, values)?;
         match &self.kind {
             HostLoopKind::While { carry } => {
-                let TensorOp::While { carry: initial, .. } = op else {
+                let TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { carry: initial, .. },
+                    ..
+                }) = op
+                else {
                     return Err(mismatch(node_id));
                 };
                 let mut state = host.copy(cuda_value(values, *initial)?)?;
@@ -698,7 +706,11 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 Ok(vec![(node_id, state)])
             }
             HostLoopKind::Fori { names } => {
-                let TensorOp::Fori { carry, .. } = op else {
+                let TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, .. },
+                    ..
+                }) = op
+                else {
                     return Err(mismatch(node_id));
                 };
                 let index = LoopIndex::new(&mut host, names)?;
@@ -714,12 +726,16 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 Ok(vec![(node_id, state)])
             }
             HostLoopKind::ForiJvp { names, tangents } => {
-                let TensorOp::ForiJvp {
-                    carry,
-                    carry_tangent,
+                let TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiJvp {
+                            carry,
+                            carry_tangent,
+                            ..
+                        },
                     tangent_captures,
                     ..
-                } = op
+                }) = op
                 else {
                     return Err(mismatch(node_id));
                 };
@@ -746,11 +762,15 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 Ok(vec![(node_id, tangent)])
             }
             HostLoopKind::ForiVjp { names, reverse } => {
-                let TensorOp::ForiVjp {
-                    carry,
-                    output_cotangent,
+                let TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiVjp {
+                            carry,
+                            output_cotangent,
+                            ..
+                        },
                     ..
-                } = op
+                }) = op
                 else {
                     return Err(mismatch(node_id));
                 };
@@ -797,15 +817,19 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 reverse_tangents,
                 reverse,
             } => {
-                let TensorOp::ForiVjpJvp {
-                    carry,
-                    carry_tangent,
-                    output_cotangent,
-                    output_cotangent_tangent,
+                let TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiVjpJvp {
+                            carry,
+                            carry_tangent,
+                            output_cotangent,
+                            output_cotangent_tangent,
+                            plan: hvp,
+                            ..
+                        },
                     tangent_captures,
-                    plan: hvp,
                     ..
-                } = op
+                }) = op
                 else {
                     return Err(mismatch(node_id));
                 };
@@ -873,7 +897,11 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 fori_vjp_results(&mut host, plan, &members, &names.carry, gradients)
             }
             HostLoopKind::Scan { names } => {
-                let TensorOp::Scan { carry, .. } = op else {
+                let TensorOp::Region(RegionNode {
+                    kind: RegionKind::Scan { carry, .. },
+                    ..
+                }) = op
+                else {
                     return Err(mismatch(node_id));
                 };
                 let index = LoopIndex::new(&mut host, names)?;
@@ -905,7 +933,11 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 members
                     .iter()
                     .map(|member| {
-                        let TensorOp::Scan { target, .. } = &plan.nodes[*member].op else {
+                        let TensorOp::Region(RegionNode {
+                            kind: RegionKind::Scan { target, .. },
+                            ..
+                        }) = &plan.nodes[*member].op
+                        else {
                             return Err(mismatch(*member));
                         };
                         let buffer = match target {
@@ -923,13 +955,17 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 output_cotangent,
                 reverse,
             } => {
-                let TensorOp::ScanVjp {
-                    carry,
-                    final_carry_cotangent,
-                    output_cotangent: output_cotangents,
-                    scan_plan,
+                let TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ScanVjp {
+                            carry,
+                            final_carry_cotangent,
+                            output_cotangent: output_cotangents,
+                            scan_plan,
+                            ..
+                        },
                     ..
-                } = op
+                }) = op
                 else {
                     return Err(mismatch(node_id));
                 };
@@ -984,17 +1020,21 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 reverse_tangents,
                 reverse,
             } => {
-                let TensorOp::ScanVjpJvp {
-                    carry,
-                    carry_tangent,
-                    final_carry_cotangent,
-                    final_carry_cotangent_tangent,
-                    output_cotangent: output_cotangents,
-                    output_cotangent_tangent: output_cotangent_tangents,
-                    plan: hvp,
+                let TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ScanVjpJvp {
+                            carry,
+                            carry_tangent,
+                            final_carry_cotangent,
+                            final_carry_cotangent_tangent,
+                            output_cotangent: output_cotangents,
+                            output_cotangent_tangent: output_cotangent_tangents,
+                            plan: hvp,
+                            ..
+                        },
                     tangent_captures,
                     ..
-                } = op
+                }) = op
                 else {
                     return Err(mismatch(node_id));
                 };
@@ -1091,14 +1131,7 @@ fn loop_captures<'a, T: CudaReal>(
     values: &'a [Option<CudaSlice<T>>],
 ) -> Result<BTreeMap<String, &'a CudaSlice<T>>, String> {
     let captures = match op {
-        TensorOp::While { captures, .. }
-        | TensorOp::Fori { captures, .. }
-        | TensorOp::ForiJvp { captures, .. }
-        | TensorOp::ForiVjp { captures, .. }
-        | TensorOp::ForiVjpJvp { captures, .. }
-        | TensorOp::Scan { captures, .. }
-        | TensorOp::ScanVjp { captures, .. }
-        | TensorOp::ScanVjpJvp { captures, .. } => captures,
+        TensorOp::Region(region) if region.is_loop() => &region.captures,
         _ => return Err("CUDA host-driven loop node has no captures".to_string()),
     };
     named_values(captures, values)
@@ -1115,7 +1148,11 @@ fn named_values<'a, T: CudaReal>(
 }
 
 fn scan_output_count(op: &TensorOp) -> Result<usize, String> {
-    let TensorOp::Scan { scan_plan, .. } = op else {
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::Scan { scan_plan, .. },
+        ..
+    }) = op
+    else {
         return Err("CUDA host-driven Scan node is not a Scan".to_string());
     };
     element_count(&scan_plan.body.output_shapes()[1])
@@ -1150,7 +1187,14 @@ fn fori_vjp_results<T: CudaReal>(
         .iter()
         .map(|member| {
             let target = match &plan.nodes[*member].op {
-                TensorOp::ForiVjp { target, .. } | TensorOp::ForiVjpJvp { target, .. } => target,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjp { target, .. },
+                    ..
+                })
+                | TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjpJvp { target, .. },
+                    ..
+                }) => target,
                 _ => return Err(mismatch(*member)),
             };
             let name = match target {
@@ -1173,7 +1217,14 @@ fn scan_vjp_results<T: CudaReal>(
         .iter()
         .map(|member| {
             let target = match &plan.nodes[*member].op {
-                TensorOp::ScanVjp { target, .. } | TensorOp::ScanVjpJvp { target, .. } => target,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjp { target, .. },
+                    ..
+                })
+                | TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjpJvp { target, .. },
+                    ..
+                }) => target,
                 _ => return Err(mismatch(*member)),
             };
             let name = match target {

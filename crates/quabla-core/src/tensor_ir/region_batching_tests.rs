@@ -86,11 +86,11 @@ fn a_mapped_carry_leaves_unmapped_captures_unbatched() -> Result<(), String> {
     let (node, mapped) = results[0];
     assert!(mapped);
     assert_eq!(graph.nodes[node].shape, vec![BATCH, 3]);
-    let TensorOp::Fori {
-        carry,
-        loop_plan,
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::Fori { carry, loop_plan },
         captures,
-    } = &graph.nodes[node].op
+        ..
+    }) = &graph.nodes[node].op
     else {
         panic!("expected a batched fori node");
     };
@@ -113,11 +113,11 @@ fn a_mapped_capture_maps_the_carry_by_the_fixed_point() -> Result<(), String> {
     let (graph, results) = batched(&callee, &[("x", false), ("s", true)], &[looped])?;
     let (node, mapped) = results[0];
     assert!(mapped);
-    let TensorOp::Fori {
-        carry,
-        loop_plan,
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::Fori { carry, loop_plan },
         captures,
-    } = &graph.nodes[node].op
+        ..
+    }) = &graph.nodes[node].op
     else {
         panic!("expected a batched fori node");
     };
@@ -160,15 +160,18 @@ fn a_scan_capture_that_only_feeds_outputs_leaves_the_carry_unmapped() -> Result<
     };
     assert_eq!(axes, &vec![1, 0, 2]);
     assert_eq!(graph.nodes[*input].shape, vec![5, BATCH, 3]);
-    let TensorOp::Scan {
-        scan_plan, group, ..
-    } = &graph.nodes[final_carry].op
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::Scan {
+            scan_plan, group, ..
+        },
+        ..
+    }) = &graph.nodes[final_carry].op
     else {
         panic!("expected a batched scan node");
     };
     // Both results come from one batched scan.
     assert!(
-        matches!(&graph.nodes[*input].op, TensorOp::Scan { group: other, .. } if other == group)
+        matches!(&graph.nodes[*input].op, TensorOp::Region(RegionNode { kind: RegionKind::Scan { group: other, .. }, .. }) if other == group)
     );
     let body = &scan_plan.body.plan;
     assert_eq!(body.input_shape("carry")?, vec![3]);
@@ -194,14 +197,18 @@ fn reverse_pass_members_share_one_batched_group_with_every_input_mapped() -> Res
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            TensorOp::ForiVjp {
-                carry,
-                output_cotangent,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ForiVjp {
+                        carry,
+                        output_cotangent,
+                        loop_plan,
+                        group,
+                        ..
+                    },
                 captures,
-                group,
                 ..
-            } => Some((
+            }) => Some((
                 *carry,
                 *output_cotangent,
                 captures.clone(),
@@ -247,7 +254,11 @@ fn nested_loops_batch_the_inner_region_inside_the_outer_body() -> Result<(), Str
     let looped = callee.fori(x, outer_plan, vec![("shift".to_string(), s)])?;
     let (graph, results) = batched(&callee, &[("x", false), ("s", true)], &[looped])?;
     assert!(results[0].1);
-    let TensorOp::Fori { loop_plan, .. } = &graph.nodes[results[0].0].op else {
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::Fori { loop_plan, .. },
+        ..
+    }) = &graph.nodes[results[0].0].op
+    else {
         panic!("expected a batched outer fori node");
     };
     let inner = loop_plan
@@ -256,7 +267,10 @@ fn nested_loops_batch_the_inner_region_inside_the_outer_body() -> Result<(), Str
         .nodes
         .iter()
         .find_map(|node| match &node.op {
-            TensorOp::Fori { loop_plan, .. } => Some(loop_plan),
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Fori { loop_plan, .. },
+                ..
+            }) => Some(loop_plan),
             _ => None,
         })
         .expect("the outer body keeps its inner fori");
@@ -318,11 +332,11 @@ fn while_parts(
     TensorNodeId,
     &[(String, TensorNodeId)],
 ) {
-    let TensorOp::While {
-        loop_plan,
-        carry,
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::While { loop_plan, carry },
         captures,
-    } = &graph.nodes[node].op
+        ..
+    }) = &graph.nodes[node].op
     else {
         panic!("expected a batched while node");
     };
@@ -473,9 +487,11 @@ fn an_unmapped_predicate_keeps_one_cond_with_one_output_batchedness() -> Result<
     let (node, mapped) = results[0];
     assert!(mapped);
     assert_eq!(graph.nodes[node].shape, vec![BATCH, 3]);
-    let TensorOp::Cond {
-        branches, captures, ..
-    } = &graph.nodes[node].op
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::Cond { branches, .. },
+        captures,
+        ..
+    }) = &graph.nodes[node].op
     else {
         panic!("an unmapped predicate keeps the lazy cond");
     };
@@ -519,10 +535,13 @@ fn a_mapped_predicate_selects_between_both_batched_branches() -> Result<(), Stri
     };
     // The [B] predicate is broadcast over the output's trailing axis.
     assert_eq!(graph.nodes[*condition].shape, vec![BATCH, 1]);
-    assert!(graph
-        .nodes
-        .iter()
-        .all(|node| !matches!(node.op, TensorOp::Cond { .. })));
+    assert!(graph.nodes.iter().all(|node| !matches!(
+        node.op,
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::Cond { .. },
+            ..
+        })
+    )));
     // The mapped x enters each branch once behind a gradient mask; the
     // unmapped s and w are bound as they are.
     let frozen = |name: &str| -> Result<usize, String> {

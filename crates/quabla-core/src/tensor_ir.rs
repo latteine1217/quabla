@@ -23,6 +23,8 @@ mod extremum;
 pub use extremum::TensorExtremum;
 mod host_storage;
 pub use host_storage::HostTensorStorage;
+mod region;
+use region::{RegionKind, RegionNode};
 mod region_batching;
 #[cfg(test)]
 mod region_batching_tests;
@@ -558,6 +560,10 @@ impl std::fmt::Debug for TensorConstant {
     }
 }
 
+// `Region` is the largest variant, as the forward-over-reverse loop variants
+// were before it; boxing it would change every node's layout and is left to
+// a separate change.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 enum TensorOp {
     Input {
@@ -610,91 +616,10 @@ enum TensorOp {
         on_true: TensorNodeId,
         on_false: TensorNodeId,
     },
-    /// A scalar-predicate lazy branch. The regions own their input captures
-    /// and are evaluated only after the predicate has been materialized.
-    Cond {
-        predicate: TensorNodeId,
-        branches: TensorCondExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-    },
-    Fori {
-        carry: TensorNodeId,
-        loop_plan: TensorForiExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-    },
-    /// Tangent result of a fixed-bound `Fori`. The matching primal remains an
-    /// ordinary `Fori`, avoiding the packed slice/concat carry representation.
-    ForiJvp {
-        carry: TensorNodeId,
-        carry_tangent: TensorNodeId,
-        loop_plan: TensorForiExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-        tangent_captures: Vec<(String, TensorNodeId)>,
-    },
-    /// One selected result of a shared fixed-bound `Fori` reverse pass.
-    ForiVjp {
-        carry: TensorNodeId,
-        output_cotangent: TensorNodeId,
-        loop_plan: TensorForiExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-        target: TensorForiVjpTarget,
-        group: usize,
-    },
-    /// One selected directional derivative of a shared fixed-bound `Fori`
-    /// reverse pass. This is the structural forward-over-reverse rule used by
-    /// compiled HVP and Hessian transforms.
-    ForiVjpJvp {
-        carry: TensorNodeId,
-        carry_tangent: TensorNodeId,
-        output_cotangent: TensorNodeId,
-        output_cotangent_tangent: TensorNodeId,
-        plan: TensorForiVjpJvpExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-        tangent_captures: Vec<(String, TensorNodeId)>,
-        target: TensorForiVjpTarget,
-        group: usize,
-    },
-    /// A data-dependent loop: the body runs while the predicate region
-    /// returns true. Only the final carry is produced.
-    While {
-        carry: TensorNodeId,
-        loop_plan: TensorWhileExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-    },
-    /// One selected result of a shared fixed-bound `Scan` execution.
-    Scan {
-        carry: TensorNodeId,
-        scan_plan: TensorScanExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-        target: TensorScanTarget,
-        group: usize,
-    },
-    /// One selected result of a shared fixed-bound `Scan` reverse pass.
-    ScanVjp {
-        carry: TensorNodeId,
-        final_carry_cotangent: TensorNodeId,
-        output_cotangent: TensorNodeId,
-        scan_plan: TensorScanExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-        target: TensorScanVjpTarget,
-        group: usize,
-    },
-    /// One selected directional derivative of a shared fixed-bound `Scan`
-    /// reverse pass. Both the final-carry and stacked-output cotangents are
-    /// differentiated together, preserving the joint reverse semantics.
-    ScanVjpJvp {
-        carry: TensorNodeId,
-        carry_tangent: TensorNodeId,
-        final_carry_cotangent: TensorNodeId,
-        final_carry_cotangent_tangent: TensorNodeId,
-        output_cotangent: TensorNodeId,
-        output_cotangent_tangent: TensorNodeId,
-        plan: TensorScanVjpJvpExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-        tangent_captures: Vec<(String, TensorNodeId)>,
-        target: TensorScanVjpTarget,
-        group: usize,
-    },
+    /// A control-flow region node (`cond`, `while_loop`, `fori_loop`,
+    /// `scan`, and the derivative nodes of the fixed-bound loops); see
+    /// `region.rs`.
+    Region(RegionNode),
     Sum {
         input: TensorNodeId,
     },
@@ -1037,9 +962,11 @@ pub struct TensorExecutionPlan {
 
 /// A frozen, explicitly captured branch region.
 ///
-/// Regions retain the normal Tensor IR input contract, but are kept separate
-/// from their parent until a future nested `Cond` node owns them. This makes
-/// lazy branch evaluation available without treating `where` as control flow.
+/// Regions retain the normal Tensor IR input contract and stay separate from
+/// the parent graph: the region node that owns them (a `Cond` branch, a loop
+/// body or predicate) binds its operands to the region inputs by name. This
+/// makes lazy branch evaluation available without treating `where` as
+/// control flow.
 #[derive(Clone, Debug)]
 pub struct TensorRegion {
     plan: TensorExecutionPlan,
@@ -1059,7 +986,7 @@ pub struct TensorMultiRegion {
 
 /// Two shape-compatible CPU branch regions selected by a host boolean.
 ///
-/// `TensorOp::Cond` materializes its scalar predicate before selecting a
+/// A `Cond` region node materializes its scalar predicate before selecting a
 /// region. MLX and CUDA read a device predicate back once and execute only the
 /// selected region on the device; CUDA compiles both regions ahead of time and
 /// rejects `Cond` inside fused device loop bodies.
@@ -1072,8 +999,9 @@ pub struct TensorCondExecutionPlan {
 /// A frozen, fixed-bound loop body with an explicit carry capture and an
 /// optional scalar index capture.
 ///
-/// This is the region-level execution contract used by a future `Fori` IR
-/// node. It is intentionally separate from host-static graph unrolling.
+/// This is the region-level execution contract of the `Fori` region node and
+/// its derivative nodes. It is intentionally separate from host-static graph
+/// unrolling.
 #[derive(Clone, Debug)]
 pub struct TensorForiExecutionPlan {
     lower: usize,
@@ -3331,19 +3259,42 @@ impl TensorIr {
                     rhs: operands[1],
                 }
             }
-            TensorOp::Fori { .. }
-            | TensorOp::ForiJvp { .. }
-            | TensorOp::ForiVjp { .. }
-            | TensorOp::ForiVjpJvp { .. }
-            | TensorOp::Scan { .. }
-            | TensorOp::ScanVjp { .. }
-            | TensorOp::ScanVjpJvp { .. }
-            | TensorOp::While { .. } => {
-                return self.push_batched_loop(node, (remap, mapped), batch_size, loop_groups)
-            }
-            TensorOp::Cond { .. } => {
-                return self.push_batched_cond(node, (remap, mapped), batch_size)
-            }
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Fori { .. },
+                ..
+            })
+            | TensorOp::Region(RegionNode {
+                kind: RegionKind::ForiJvp { .. },
+                ..
+            })
+            | TensorOp::Region(RegionNode {
+                kind: RegionKind::ForiVjp { .. },
+                ..
+            })
+            | TensorOp::Region(RegionNode {
+                kind: RegionKind::ForiVjpJvp { .. },
+                ..
+            })
+            | TensorOp::Region(RegionNode {
+                kind: RegionKind::Scan { .. },
+                ..
+            })
+            | TensorOp::Region(RegionNode {
+                kind: RegionKind::ScanVjp { .. },
+                ..
+            })
+            | TensorOp::Region(RegionNode {
+                kind: RegionKind::ScanVjpJvp { .. },
+                ..
+            })
+            | TensorOp::Region(RegionNode {
+                kind: RegionKind::While { .. },
+                ..
+            }) => return self.push_batched_loop(node, (remap, mapped), batch_size, loop_groups),
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Cond { .. },
+                ..
+            }) => return self.push_batched_cond(node, (remap, mapped), batch_size),
             TensorOp::Input { .. }
             | TensorOp::ScalarConstant { .. }
             | TensorOp::Constant { .. } => {
@@ -3700,11 +3651,15 @@ impl TensorIr {
                         transformed.where_select(condition_value, true_tangent, false_tangent)?,
                     )
                 }
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => symbolic_jvp_cond(
+                    ..
+                }) => symbolic_jvp_cond(
                     &mut transformed,
                     pairs[*predicate].0,
                     branches,
@@ -3712,11 +3667,11 @@ impl TensorIr {
                     &pairs,
                     &format!("__quabla_cond_jvp_{node_index}"),
                 )?,
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, loop_plan },
                     captures,
-                } => symbolic_jvp_fori(
+                    ..
+                }) => symbolic_jvp_fori(
                     &mut transformed,
                     loop_plan,
                     *carry,
@@ -3724,11 +3679,11 @@ impl TensorIr {
                     &pairs,
                     &format!("__quabla_fori_jvp_{node_index}"),
                 )?,
-                TensorOp::While {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { carry, loop_plan },
                     captures,
-                } => symbolic_jvp_while(
+                    ..
+                }) => symbolic_jvp_while(
                     &mut transformed,
                     loop_plan,
                     *carry,
@@ -3736,19 +3691,26 @@ impl TensorIr {
                     &pairs,
                     &format!("__quabla_while_jvp_{node_index}"),
                 )?,
-                TensorOp::ForiJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic JVP through a Fori JVP result is not implemented".to_string()
                     );
                 }
-                TensorOp::ForiVjp {
-                    carry,
-                    output_cotangent,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiVjp {
+                            carry,
+                            output_cotangent,
+                            loop_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => symbolic_jvp_fori_vjp(
+                    ..
+                }) => symbolic_jvp_fori_vjp(
                     &mut transformed,
                     SymbolicJvpForiVjpContext {
                         loop_plan,
@@ -3762,18 +3724,25 @@ impl TensorIr {
                     &mut fori_vjp_jvp_groups,
                     &format!("__quabla_fori_vjp_jvp_{node_index}"),
                 )?,
-                TensorOp::ForiVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjpJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic JVP through a Fori VJP JVP result is not implemented".to_string(),
                     );
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_jvp_results.contains_key(group) {
                         let result = symbolic_jvp_scan(
                             &mut transformed,
@@ -3793,15 +3762,19 @@ impl TensorIr {
                         TensorScanTarget::Outputs => result.1,
                     }
                 }
-                TensorOp::ScanVjp {
-                    carry,
-                    final_carry_cotangent,
-                    output_cotangent,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ScanVjp {
+                            carry,
+                            final_carry_cotangent,
+                            output_cotangent,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => symbolic_jvp_scan_vjp(
+                    ..
+                }) => symbolic_jvp_scan_vjp(
                     &mut transformed,
                     SymbolicJvpScanVjpContext {
                         scan_plan,
@@ -3816,7 +3789,10 @@ impl TensorIr {
                     &mut scan_vjp_jvp_groups,
                     &format!("__quabla_scan_vjp_jvp_{node_index}"),
                 )?,
-                TensorOp::ScanVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjpJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic JVP through a Scan VJP JVP result is not implemented".to_string(),
                     );
@@ -4261,49 +4237,66 @@ impl TensorIr {
                     values[*on_true],
                     values[*on_false],
                 )?,
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => symbolic_clone_cond(
+                    ..
+                }) => symbolic_clone_cond(
                     &mut transformed,
                     values[*predicate],
                     branches,
                     captures,
                     &values,
                 )?,
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, loop_plan },
                     captures,
-                } => symbolic_clone_fori(&mut transformed, *carry, loop_plan, captures, &values)?,
-                TensorOp::While {
-                    carry,
-                    loop_plan,
+                    ..
+                }) => symbolic_clone_fori(&mut transformed, *carry, loop_plan, captures, &values)?,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { carry, loop_plan },
                     captures,
-                } => symbolic_clone_while(&mut transformed, *carry, loop_plan, captures, &values)?,
-                TensorOp::ForiVjp { .. } => {
+                    ..
+                }) => symbolic_clone_while(&mut transformed, *carry, loop_plan, captures, &values)?,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Fori VJP result is not implemented".to_string()
                     );
                 }
-                TensorOp::ForiJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Fori JVP result is not implemented".to_string()
                     );
                 }
-                TensorOp::ForiVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjpJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Fori VJP JVP result is not implemented".to_string(),
                     );
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_values.contains_key(group) {
                         let carry = values.get(*carry).copied().ok_or_else(|| {
                             format!("scan carry node {carry} has no symbolic value")
@@ -4332,12 +4325,18 @@ impl TensorIr {
                         TensorScanTarget::Outputs => result.1,
                     }
                 }
-                TensorOp::ScanVjp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Scan VJP result is not implemented".to_string()
                     );
                 }
-                TensorOp::ScanVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjpJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Scan VJP JVP result is not implemented".to_string(),
                     );
@@ -4506,11 +4505,15 @@ impl TensorIr {
                         )?;
                     }
                 }
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => symbolic_vjp_cond(
+                    ..
+                }) => symbolic_vjp_cond(
                     &mut transformed,
                     values[*predicate],
                     branches,
@@ -4522,11 +4525,11 @@ impl TensorIr {
                     &mut cotangents,
                     node_id,
                 )?,
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, loop_plan },
                     captures,
-                } => symbolic_vjp_fori(
+                    ..
+                }) => symbolic_vjp_fori(
                     &mut transformed,
                     loop_plan,
                     SymbolicVjpForiContext {
@@ -4539,40 +4542,60 @@ impl TensorIr {
                     &mut cotangents,
                     node_id,
                 )?,
-                TensorOp::While { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { .. },
+                    ..
+                }) => {
                     return Err(WHILE_LOOP_REVERSE_MODE_ERROR.to_string());
                 }
-                TensorOp::ForiVjp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Fori VJP result is not implemented".to_string()
                     );
                 }
-                TensorOp::ForiJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Fori JVP result is not implemented".to_string()
                     );
                 }
-                TensorOp::ForiVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjpJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Fori VJP JVP result is not implemented".to_string(),
                     );
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            group,
+                            ..
+                        },
                     captures,
-                    group,
                     ..
-                } => {
+                }) => {
                     if processed_scan_groups.insert(*group) {
                         let mut carry_upstream = None;
                         let mut output_upstream = None;
                         for (scan_node_id, scan_node) in self.nodes.iter().enumerate() {
-                            let TensorOp::Scan {
-                                target,
-                                group: candidate_group,
+                            let TensorOp::Region(RegionNode {
+                                kind:
+                                    RegionKind::Scan {
+                                        target,
+                                        group: candidate_group,
+                                        ..
+                                    },
                                 ..
-                            } = &scan_node.op
+                            }) = &scan_node.op
                             else {
                                 continue;
                             };
@@ -4650,12 +4673,18 @@ impl TensorIr {
                         )?;
                     }
                 }
-                TensorOp::ScanVjp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Scan VJP result is not implemented".to_string()
                     );
                 }
-                TensorOp::ScanVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjpJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Scan VJP JVP result is not implemented".to_string(),
                     );
@@ -5508,8 +5537,9 @@ impl TensorIr {
     }
 
     /// Adds a lazy conditional with explicit ordered bindings from region input
-    /// names to parent graph values. This is the primitive used by future
-    /// traced nested control flow; `cond` is the input-name convenience form.
+    /// names to parent graph values. This is the primitive used by traced
+    /// control flow, nested regions included; `cond` is the input-name
+    /// convenience form.
     pub fn cond_with_captures(
         &mut self,
         predicate: TensorNodeId,
@@ -5550,11 +5580,14 @@ impl TensorIr {
         let shape = branches.output_shape()?;
         let dtype = branches.on_true.plan.output_dtype()?;
         Ok(self.push_node(
-            TensorOp::Cond {
-                predicate,
-                branches,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Cond {
+                    predicate,
+                    branches,
+                },
                 captures,
-            },
+                tangent_captures: Vec::new(),
+            }),
             shape,
             dtype,
             false,
@@ -5630,11 +5663,11 @@ impl TensorIr {
         )?;
         let dtype = loop_plan.body.plan.input_dtype(&loop_plan.carry_name)?;
         Ok(self.push_node(
-            TensorOp::Fori {
-                carry,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Fori { carry, loop_plan },
                 captures,
-            },
+                tangent_captures: Vec::new(),
+            }),
             carry_shape,
             dtype,
             false,
@@ -5696,11 +5729,11 @@ impl TensorIr {
         )?;
         let dtype = loop_plan.body.plan.input_dtype(&loop_plan.carry_name)?;
         Ok(self.push_node(
-            TensorOp::While {
-                carry,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::While { carry, loop_plan },
                 captures,
-            },
+                tangent_captures: Vec::new(),
+            }),
             carry_shape,
             dtype,
             false,
@@ -5761,13 +5794,15 @@ impl TensorIr {
         }
         let dtype = loop_plan.body.plan.input_dtype(&loop_plan.carry_name)?;
         Ok(self.push_node(
-            TensorOp::ForiJvp {
-                carry,
-                carry_tangent,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::ForiJvp {
+                    carry,
+                    carry_tangent,
+                    loop_plan,
+                },
                 captures,
                 tangent_captures,
-            },
+            }),
             carry_shape,
             dtype,
             false,
@@ -5829,25 +5864,31 @@ impl TensorIr {
             .node_dtype(scan_plan.body.plan.output_node_ids[1])?;
         let group = self.nodes.len();
         let carry_id = self.push_node(
-            TensorOp::Scan {
-                carry,
-                scan_plan: scan_plan.clone(),
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Scan {
+                    carry,
+                    scan_plan: scan_plan.clone(),
+                    target: TensorScanTarget::Carry,
+                    group,
+                },
                 captures: captures.clone(),
-                target: TensorScanTarget::Carry,
-                group,
-            },
+                tangent_captures: Vec::new(),
+            }),
             carry_shape,
             carry_dtype,
             false,
         );
         let outputs_id = self.push_node(
-            TensorOp::Scan {
-                carry,
-                scan_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Scan {
+                    carry,
+                    scan_plan,
+                    target: TensorScanTarget::Outputs,
+                    group,
+                },
                 captures,
-                target: TensorScanTarget::Outputs,
-                group,
-            },
+                tangent_captures: Vec::new(),
+            }),
             output_shape,
             output_dtype,
             false,
@@ -5906,14 +5947,17 @@ impl TensorIr {
             TensorForiVjpTarget::External(name) => name,
         })?;
         Ok(self.push_node(
-            TensorOp::ForiVjp {
-                carry,
-                output_cotangent,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::ForiVjp {
+                    carry,
+                    output_cotangent,
+                    loop_plan,
+                    target,
+                    group,
+                },
                 captures,
-                target,
-                group,
-            },
+                tangent_captures: Vec::new(),
+            }),
             shape,
             dtype,
             false,
@@ -5990,17 +6034,19 @@ impl TensorIr {
             TensorForiVjpTarget::External(name) => name,
         })?;
         Ok(self.push_node(
-            TensorOp::ForiVjpJvp {
-                carry,
-                carry_tangent,
-                output_cotangent,
-                output_cotangent_tangent,
-                plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::ForiVjpJvp {
+                    carry,
+                    carry_tangent,
+                    output_cotangent,
+                    output_cotangent_tangent,
+                    plan,
+                    target,
+                    group,
+                },
                 captures,
                 tangent_captures,
-                target,
-                group,
-            },
+            }),
             shape,
             dtype,
             false,
@@ -6069,15 +6115,18 @@ impl TensorIr {
             TensorScanVjpTarget::External(name) => name,
         })?;
         Ok(self.push_node(
-            TensorOp::ScanVjp {
-                carry,
-                final_carry_cotangent,
-                output_cotangent,
-                scan_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::ScanVjp {
+                    carry,
+                    final_carry_cotangent,
+                    output_cotangent,
+                    scan_plan,
+                    target,
+                    group,
+                },
                 captures,
-                target,
-                group,
-            },
+                tangent_captures: Vec::new(),
+            }),
             shape,
             dtype,
             false,
@@ -6167,19 +6216,21 @@ impl TensorIr {
             TensorScanVjpTarget::External(name) => name,
         })?;
         Ok(self.push_node(
-            TensorOp::ScanVjpJvp {
-                carry,
-                carry_tangent,
-                final_carry_cotangent,
-                final_carry_cotangent_tangent,
-                output_cotangent,
-                output_cotangent_tangent,
-                plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::ScanVjpJvp {
+                    carry,
+                    carry_tangent,
+                    final_carry_cotangent,
+                    final_carry_cotangent_tangent,
+                    output_cotangent,
+                    output_cotangent_tangent,
+                    plan,
+                    target,
+                    group,
+                },
                 captures,
                 tangent_captures,
-                target,
-                group,
-            },
+            }),
             shape,
             dtype,
             false,
@@ -7739,11 +7790,15 @@ impl TensorIr {
                     accumulate(&mut cotangents[*on_true], true_contribution)?;
                     accumulate(&mut cotangents[*on_false], false_contribution)?;
                 }
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let predicate = tensor_scalar_predicate(
                         values
                             .get(*predicate)
@@ -7763,11 +7818,11 @@ impl TensorIr {
                         accumulate(&mut cotangents[*capture], gradient)?;
                     }
                 }
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, loop_plan },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let external = tensor_forward_capture_values(captures, &values)?;
                     let (_, carry_gradient, external_gradients) = loop_plan.runtime_value_and_vjp(
                         values
@@ -7789,41 +7844,61 @@ impl TensorIr {
                         accumulate(&mut cotangents[*capture], gradient)?;
                     }
                 }
-                TensorOp::While { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { .. },
+                    ..
+                }) => {
                     return Err(WHILE_LOOP_REVERSE_MODE_ERROR.to_string());
                 }
-                TensorOp::ForiVjp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjp { .. },
+                    ..
+                }) => {
                     return Err(
                         "direct VJP through a Fori VJP result is not implemented".to_string()
                     )
                 }
-                TensorOp::ForiJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "direct VJP through a Fori JVP result is not implemented".to_string()
                     )
                 }
-                TensorOp::ForiVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjpJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "direct VJP through a Fori VJP JVP result is not implemented".to_string(),
                     )
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            group,
+                            ..
+                        },
                     captures,
-                    group,
                     ..
-                } => {
+                }) => {
                     if processed_scan_groups.insert(*group) {
                         let mut current_cotangent = Some(cotangent);
                         let mut carry_cotangent = None;
                         let mut output_cotangent = None;
                         for (scan_node_id, scan_node) in self.nodes.iter().enumerate() {
-                            let TensorOp::Scan {
-                                target,
-                                group: candidate_group,
+                            let TensorOp::Region(RegionNode {
+                                kind:
+                                    RegionKind::Scan {
+                                        target,
+                                        group: candidate_group,
+                                        ..
+                                    },
                                 ..
-                            } = &scan_node.op
+                            }) = &scan_node.op
                             else {
                                 continue;
                             };
@@ -7887,12 +7962,18 @@ impl TensorIr {
                         }
                     }
                 }
-                TensorOp::ScanVjp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjp { .. },
+                    ..
+                }) => {
                     return Err(
                         "direct VJP through a Scan VJP result is not implemented".to_string()
                     )
                 }
-                TensorOp::ScanVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjpJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "direct VJP through a Scan VJP JVP result is not implemented".to_string(),
                     )
@@ -8418,11 +8499,15 @@ impl TensorIr {
                             .get(*on_false)
                             .ok_or_else(|| format!("node {on_false} has no evaluated tangent"))?,
                     )?,
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let predicate = tensor_scalar_predicate(
                         values
                             .get(*predicate)
@@ -8432,11 +8517,11 @@ impl TensorIr {
                     let branch_tangents = tensor_cond_capture_values(captures, &tangents)?;
                     branches.jvp(predicate, &branch_inputs, &branch_tangents)?.1
                 }
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, loop_plan },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let external_inputs = tensor_fori_capture_values(captures, &values)?;
                     let external_tangents = tensor_fori_capture_values(captures, &tangents)?;
                     loop_plan
@@ -8454,11 +8539,11 @@ impl TensorIr {
                         )?
                         .1
                 }
-                TensorOp::While {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { carry, loop_plan },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let external_inputs = tensor_fori_capture_values(captures, &values)?;
                     let external_tangents = tensor_fori_capture_values(captures, &tangents)?;
                     loop_plan
@@ -8476,22 +8561,31 @@ impl TensorIr {
                         )?
                         .1
                 }
-                TensorOp::ForiVjp { .. } => {
-                    return Err("JVP through a Fori VJP result is not implemented".to_string())
-                }
-                TensorOp::ForiJvp { .. } => {
-                    return Err("JVP through a Fori JVP result is not implemented".to_string())
-                }
-                TensorOp::ForiVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjp { .. },
+                    ..
+                }) => return Err("JVP through a Fori VJP result is not implemented".to_string()),
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiJvp { .. },
+                    ..
+                }) => return Err("JVP through a Fori JVP result is not implemented".to_string()),
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjpJvp { .. },
+                    ..
+                }) => {
                     return Err("JVP through a Fori VJP JVP result is not implemented".to_string())
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_jvp_cache.contains_key(group) {
                         let external_inputs = tensor_fori_capture_values(captures, &values)?;
                         let external_tangents = tensor_fori_capture_values(captures, &tangents)?;
@@ -8522,10 +8616,14 @@ impl TensorIr {
                         TensorScanTarget::Outputs => cached.output_tangent.clone(),
                     }
                 }
-                TensorOp::ScanVjp { .. } => {
-                    return Err("JVP through a Scan VJP result is not implemented".to_string())
-                }
-                TensorOp::ScanVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjp { .. },
+                    ..
+                }) => return Err("JVP through a Scan VJP result is not implemented".to_string()),
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjpJvp { .. },
+                    ..
+                }) => {
                     return Err("JVP through a Scan VJP JVP result is not implemented".to_string())
                 }
                 TensorOp::Sum { input } => tangents
@@ -8811,7 +8909,16 @@ impl TensorIr {
         if self.nodes.iter().any(|node| {
             matches!(
                 node.op,
-                TensorOp::Cond { .. } | TensorOp::Fori { .. } | TensorOp::Scan { .. }
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Cond { .. },
+                    ..
+                }) | TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { .. },
+                    ..
+                }) | TensorOp::Region(RegionNode {
+                    kind: RegionKind::Scan { .. },
+                    ..
+                })
             )
         }) {
             return self.symbolic_hessian_scalar_through_regions(output, input_name, inputs);
@@ -8903,7 +9010,16 @@ impl TensorIr {
         if self.nodes.iter().any(|node| {
             matches!(
                 node.op,
-                TensorOp::Cond { .. } | TensorOp::Fori { .. } | TensorOp::Scan { .. }
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Cond { .. },
+                    ..
+                }) | TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { .. },
+                    ..
+                }) | TensorOp::Region(RegionNode {
+                    kind: RegionKind::Scan { .. },
+                    ..
+                })
             )
         }) {
             return self.symbolic_hvp_scalar_through_regions(
@@ -9154,7 +9270,10 @@ impl TensorIr {
             .enumerate()
             .map(|(id, node)| match &node.op {
                 TensorOp::Input { name } => {
-                    format!("%{id} = input[name={name}] : {}", format_tensor_type(&node.shape, node.dtype))
+                    format!(
+                        "%{id} = input[name={name}] : {}",
+                        format_tensor_type(&node.shape, node.dtype)
+                    )
                 }
                 TensorOp::ScalarConstant { value } => {
                     format!(
@@ -9176,79 +9295,9 @@ impl TensorIr {
                     "%{id} = add(%{lhs}, %{rhs}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::ScanVjp { target, group, .. } => format!(
-                    "%{id} = scan_vjp(group={group}, target={target:?}) : {}",
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::ScanVjpJvp { target, group, .. } => format!(
-                    "%{id} = scan_vjp_jvp(group={group}, target={target:?}) : {}",
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::Cond {
-                    predicate,
-                    branches,
-                    captures,
-                } => format!(
-                    "%{id} = cond(%{predicate}, captures={captures:?}, true_nodes={}, false_nodes={}) : {}",
-                    branches.true_node_count(),
-                    branches.false_node_count(),
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::While {
-                    carry,
-                    loop_plan,
-                    captures,
-                } => format!(
-                    "%{id} = while(carry=%{carry}, captures={captures:?}, predicate_nodes={}, body_nodes={}) : {}",
-                    loop_plan.predicate.plan.node_count(),
-                    loop_plan.body.plan.node_count(),
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
-                    captures,
-                } => format!(
-                    "%{id} = fori(carry=%{carry}, lower={}, upper={}, captures={captures:?}, body_nodes={}) : {}",
-                    loop_plan.lower,
-                    loop_plan.upper,
-                    loop_plan.body.plan.node_count(),
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::ForiJvp {
-                    carry,
-                    carry_tangent,
-                    loop_plan,
-                    captures,
-                    tangent_captures,
-                } => format!(
-                    "%{id} = fori_jvp(carry=%{carry}, carry_tangent=%{carry_tangent}, lower={}, upper={}, captures={captures:?}, tangent_captures={tangent_captures:?}, body_nodes={}) : {}",
-                    loop_plan.lower,
-                    loop_plan.upper,
-                    loop_plan.body.plan.node_count(),
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::ForiVjp { target, group, .. } => format!(
-                    "%{id} = fori_vjp(group={group}, target={target:?}) : {}",
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::ForiVjpJvp { target, group, .. } => format!(
-                    "%{id} = fori_vjp_jvp(group={group}, target={target:?}) : {}",
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::Scan {
-                    scan_plan,
-                    captures,
-                    target,
-                    group,
-                    ..
-                } => format!(
-                    "%{id} = scan(group={group}, target={target:?}, lower={}, upper={}, captures={captures:?}, body_nodes={}) : {}",
-                    scan_plan.lower,
-                    scan_plan.upper,
-                    scan_plan.body.plan.node_count(),
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
+                TensorOp::Region(region) => {
+                    region.lower_text(id, &format_tensor_type(&node.shape, node.dtype))
+                }
                 TensorOp::Sub { lhs, rhs } => format!(
                     "%{id} = sub(%{lhs}, %{rhs}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
@@ -9279,7 +9328,10 @@ impl TensorIr {
                     format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Sum { input } => {
-                    format!("%{id} = sum(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
+                    format!(
+                        "%{id} = sum(%{input}) : {}",
+                        format_tensor_type(&node.shape, node.dtype)
+                    )
                 }
                 TensorOp::SumAxis { input, axis } => format!(
                     "%{id} = sum(%{input}, axis={axis}) : {}",
@@ -9294,8 +9346,14 @@ impl TensorIr {
                     "%{id} = matmul(%{lhs}, %{rhs}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::CholeskyAd { inputs, kind } => format!("%{id} = cholesky_{kind:?}({inputs:?}) : {}", format_tensor_type(&node.shape, node.dtype)),
-                TensorOp::Cholesky { input } => format!("%{id} = cholesky(%{input}) : {}", format_tensor_type(&node.shape, node.dtype)),
+                TensorOp::CholeskyAd { inputs, kind } => format!(
+                    "%{id} = cholesky_{kind:?}({inputs:?}) : {}",
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
+                TensorOp::Cholesky { input } => format!(
+                    "%{id} = cholesky(%{input}) : {}",
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
                 TensorOp::Solve { matrix, rhs } => format!(
                     "%{id} = solve(%{matrix}, %{rhs}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
@@ -9311,17 +9369,26 @@ impl TensorIr {
                     format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Sqrt { input } => {
-                    format!("%{id} = sqrt(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
+                    format!(
+                        "%{id} = sqrt(%{input}) : {}",
+                        format_tensor_type(&node.shape, node.dtype)
+                    )
                 }
                 TensorOp::SqrtDerivative { input, order } => format!(
                     "%{id} = sqrt_derivative(%{input}, order={order}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Reshape { input } => {
-                    format!("%{id} = reshape(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
+                    format!(
+                        "%{id} = reshape(%{input}) : {}",
+                        format_tensor_type(&node.shape, node.dtype)
+                    )
                 }
                 TensorOp::Mean { input } => {
-                    format!("%{id} = mean(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
+                    format!(
+                        "%{id} = mean(%{input}) : {}",
+                        format_tensor_type(&node.shape, node.dtype)
+                    )
                 }
                 TensorOp::MeanAxis { input, axis } => format!(
                     "%{id} = mean(%{input}, axis={axis}) : {}",
@@ -9806,11 +9873,15 @@ impl TensorIr {
                             .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {on_false} has no evaluated value"))?,
                     )?,
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let predicate = tensor_scalar_predicate(
                         values
                             .get(*predicate)
@@ -9820,11 +9891,11 @@ impl TensorIr {
                     let branch_inputs = tensor_forward_capture_values(captures, &values)?;
                     branches.evaluate(predicate, &branch_inputs)?
                 }
-                TensorOp::While {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { carry, loop_plan },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let external_inputs = tensor_forward_capture_values(captures, &values)?;
                     loop_plan.evaluate(
                         values
@@ -9835,11 +9906,11 @@ impl TensorIr {
                         &external_inputs,
                     )?
                 }
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { carry, loop_plan },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let external_inputs = tensor_forward_capture_values(captures, &values)?;
                     loop_plan.evaluate(
                         values
@@ -9850,13 +9921,17 @@ impl TensorIr {
                         &external_inputs,
                     )?
                 }
-                TensorOp::ForiJvp {
-                    carry,
-                    carry_tangent,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiJvp {
+                            carry,
+                            carry_tangent,
+                            loop_plan,
+                        },
                     captures,
                     tangent_captures,
-                } => {
+                    ..
+                }) => {
                     let external_inputs = tensor_forward_capture_values(captures, &values)?;
                     let external_tangents =
                         tensor_forward_capture_values(tangent_captures, &values)?;
@@ -9879,14 +9954,18 @@ impl TensorIr {
                         )?
                         .1
                 }
-                TensorOp::ForiVjp {
-                    carry,
-                    output_cotangent,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiVjp {
+                            carry,
+                            output_cotangent,
+                            loop_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !fori_vjp_cache.contains_key(group) {
                         let external_inputs = tensor_forward_capture_values(captures, &values)?;
                         let (_, carry_gradient, external_gradients) = loop_plan.value_and_vjp(
@@ -9924,17 +10003,21 @@ impl TensorIr {
                             .ok_or_else(|| format!("fori VJP has no gradient for {name:?}"))?,
                     }
                 }
-                TensorOp::ForiVjpJvp {
-                    carry,
-                    carry_tangent,
-                    output_cotangent,
-                    output_cotangent_tangent,
-                    plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiVjpJvp {
+                            carry,
+                            carry_tangent,
+                            output_cotangent,
+                            output_cotangent_tangent,
+                            plan,
+                            target,
+                            group,
+                        },
                     captures,
                     tangent_captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !fori_vjp_jvp_cache.contains_key(group) {
                         let external_inputs = tensor_forward_capture_values(captures, &values)?;
                         let external_tangents =
@@ -9986,13 +10069,17 @@ impl TensorIr {
                         .cloned()
                         .ok_or_else(|| format!("fori VJP JVP has no gradient for {name:?}"))?
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_cache.contains_key(group) {
                         let external_inputs = tensor_forward_capture_values(captures, &values)?;
                         let (carry, outputs) = scan_plan.evaluate(
@@ -10013,15 +10100,19 @@ impl TensorIr {
                         TensorScanTarget::Outputs => cached.outputs.clone(),
                     }
                 }
-                TensorOp::ScanVjp {
-                    carry,
-                    final_carry_cotangent,
-                    output_cotangent,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ScanVjp {
+                            carry,
+                            final_carry_cotangent,
+                            output_cotangent,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_vjp_cache.contains_key(group) {
                         let external_inputs = tensor_forward_capture_values(captures, &values)?;
                         let (carry_gradient, external_gradients) = scan_plan.vjp(
@@ -10066,19 +10157,23 @@ impl TensorIr {
                             .ok_or_else(|| format!("scan VJP has no gradient for {name:?}"))?,
                     }
                 }
-                TensorOp::ScanVjpJvp {
-                    carry,
-                    carry_tangent,
-                    final_carry_cotangent,
-                    final_carry_cotangent_tangent,
-                    output_cotangent,
-                    output_cotangent_tangent,
-                    plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ScanVjpJvp {
+                            carry,
+                            carry_tangent,
+                            final_carry_cotangent,
+                            final_carry_cotangent_tangent,
+                            output_cotangent,
+                            output_cotangent_tangent,
+                            plan,
+                            target,
+                            group,
+                        },
                     captures,
                     tangent_captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_vjp_jvp_cache.contains_key(group) {
                         let external_inputs = tensor_forward_capture_values(captures, &values)?;
                         let external_tangents =
@@ -10751,16 +10846,12 @@ impl TensorIr {
                             .where_select(&on_true.mixed, &on_false.mixed)?,
                     }
                 }
-                TensorOp::While { .. } => return Err(WHILE_LOOP_REVERSE_MODE_ERROR.to_string()),
-                TensorOp::Cond { .. } => return Err(
+                TensorOp::Region(RegionNode { kind: RegionKind::While { .. }, .. }) => return Err(WHILE_LOOP_REVERSE_MODE_ERROR.to_string()),
+                TensorOp::Region(RegionNode { kind: RegionKind::Cond { .. }, .. }) => return Err(
                     "mixed second-order differentiation through Cond regions is not implemented"
                         .to_string(),
                 ),
-                TensorOp::Fori {
-                    carry,
-                    loop_plan,
-                    captures,
-                } => {
+                TensorOp::Region(RegionNode { kind: RegionKind::Fori { carry, loop_plan }, captures, .. }) => {
                     let initial_carry = values
                         .get(*carry)
                         .cloned()
@@ -10808,26 +10899,26 @@ impl TensorIr {
                     }
                     carry
                 }
-                TensorOp::ForiVjp { .. } => return Err(
+                TensorOp::Region(RegionNode { kind: RegionKind::ForiVjp { .. }, .. }) => return Err(
                     "mixed second-order differentiation through Fori VJP results is not implemented"
                         .to_string(),
                 ),
-                TensorOp::ForiJvp { .. } => return Err(
+                TensorOp::Region(RegionNode { kind: RegionKind::ForiJvp { .. }, .. }) => return Err(
                     "mixed differentiation through Fori JVP results is not implemented".to_string(),
                 ),
-                TensorOp::ForiVjpJvp { .. } => return Err(
+                TensorOp::Region(RegionNode { kind: RegionKind::ForiVjpJvp { .. }, .. }) => return Err(
                     "mixed differentiation through Fori VJP JVP results is not implemented"
                         .to_string(),
                 ),
-                TensorOp::Scan { .. } => return Err(
+                TensorOp::Region(RegionNode { kind: RegionKind::Scan { .. }, .. }) => return Err(
                     "mixed second-order differentiation through Scan regions is not implemented"
                         .to_string(),
                 ),
-                TensorOp::ScanVjp { .. } => return Err(
+                TensorOp::Region(RegionNode { kind: RegionKind::ScanVjp { .. }, .. }) => return Err(
                     "mixed second-order differentiation through Scan VJP results is not implemented"
                         .to_string(),
                 ),
-                TensorOp::ScanVjpJvp { .. } => return Err(
+                TensorOp::Region(RegionNode { kind: RegionKind::ScanVjpJvp { .. }, .. }) => return Err(
                     "mixed differentiation through Scan VJP JVP results is not implemented"
                         .to_string(),
                 ),
@@ -14281,34 +14372,9 @@ impl TensorExecutionPlan {
                         "MLX backend does not support non-finite constants".into(),
                     ))
                 }
-                TensorOp::Cond { branches, .. } => {
-                    branches.on_true.plan.validate_mlx()?;
-                    branches.on_false.plan.validate_mlx()?;
-                }
-                TensorOp::While { loop_plan, .. } => {
-                    loop_plan.predicate.plan.validate_mlx()?;
-                    loop_plan.body.plan.validate_mlx()?;
-                }
-                TensorOp::Fori { loop_plan, .. }
-                | TensorOp::ForiJvp { loop_plan, .. }
-                | TensorOp::ForiVjp { loop_plan, .. } => loop_plan.body.plan.validate_mlx()?,
-                TensorOp::ForiVjpJvp { plan, .. } => {
-                    plan.loop_plan.body.plan.validate_mlx()?;
-                    for gradient in plan.gradient_tangent_plans.values() {
-                        gradient.validate_mlx()?;
-                    }
-                }
-                TensorOp::Scan { scan_plan, .. } | TensorOp::ScanVjp { scan_plan, .. } => {
-                    scan_plan.body.plan.validate_mlx()?
-                }
-                TensorOp::ScanVjpJvp { plan, .. } => {
-                    plan.scan_plan.body.plan.validate_mlx()?;
-                    for gradient in plan
-                        .carry_gradient_tangent_plans
-                        .values()
-                        .chain(plan.output_gradient_tangent_plans.values())
-                    {
-                        gradient.validate_mlx()?;
+                TensorOp::Region(region) => {
+                    for plan in region.regions().into_iter().chain(region.derived_regions()) {
+                        plan.validate_mlx()?;
                     }
                 }
                 _ => {}
@@ -15193,57 +15259,16 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                 TensorOp::Broadcast { input } => {
                     specialized.broadcast_to(mapped(*input)?, node.shape.clone())?
                 }
-                TensorOp::Cond { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Cond regions".to_string()
-                    )
-                }
-                TensorOp::While { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform While regions".to_string()
-                    )
+                TensorOp::Region(region) => {
+                    return Err(format!(
+                        "batch specialization does not yet transform {} regions",
+                        region.label()
+                    ))
                 }
                 TensorOp::Custom { .. } => {
                     return Err(
                         "batch specialization applies to compiled plans, which have no custom \
                          rule nodes"
-                            .to_string(),
-                    )
-                }
-                TensorOp::Fori { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Fori regions".to_string()
-                    )
-                }
-                TensorOp::ForiJvp { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Fori JVP regions".to_string(),
-                    )
-                }
-                TensorOp::ForiVjp { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Fori VJP regions".to_string(),
-                    )
-                }
-                TensorOp::ForiVjpJvp { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Fori VJP JVP regions"
-                            .to_string(),
-                    )
-                }
-                TensorOp::Scan { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Scan regions".to_string()
-                    )
-                }
-                TensorOp::ScanVjp { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Scan VJP regions".to_string(),
-                    )
-                }
-                TensorOp::ScanVjpJvp { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Scan VJP JVP regions"
                             .to_string(),
                     )
                 }
@@ -15585,93 +15610,7 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
             on_true,
             on_false,
         } => vec![*condition, *on_true, *on_false],
-        TensorOp::Cond {
-            predicate,
-            captures,
-            ..
-        } => std::iter::once(*predicate)
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::While {
-            carry, captures, ..
-        } => std::iter::once(*carry)
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::Fori {
-            carry, captures, ..
-        } => std::iter::once(*carry)
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::ForiJvp {
-            carry,
-            carry_tangent,
-            captures,
-            tangent_captures,
-            ..
-        } => std::iter::once(*carry)
-            .chain(std::iter::once(*carry_tangent))
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .chain(tangent_captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::ForiVjp {
-            carry,
-            output_cotangent,
-            captures,
-            ..
-        } => std::iter::once(*carry)
-            .chain(std::iter::once(*output_cotangent))
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::ForiVjpJvp {
-            carry,
-            carry_tangent,
-            output_cotangent,
-            output_cotangent_tangent,
-            captures,
-            tangent_captures,
-            ..
-        } => std::iter::once(*carry)
-            .chain(std::iter::once(*carry_tangent))
-            .chain(std::iter::once(*output_cotangent))
-            .chain(std::iter::once(*output_cotangent_tangent))
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .chain(tangent_captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::Scan {
-            carry, captures, ..
-        } => std::iter::once(*carry)
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::ScanVjp {
-            carry,
-            final_carry_cotangent,
-            output_cotangent,
-            captures,
-            ..
-        } => std::iter::once(*carry)
-            .chain(std::iter::once(*final_carry_cotangent))
-            .chain(std::iter::once(*output_cotangent))
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::ScanVjpJvp {
-            carry,
-            carry_tangent,
-            final_carry_cotangent,
-            final_carry_cotangent_tangent,
-            output_cotangent,
-            output_cotangent_tangent,
-            captures,
-            tangent_captures,
-            ..
-        } => std::iter::once(*carry)
-            .chain(std::iter::once(*carry_tangent))
-            .chain(std::iter::once(*final_carry_cotangent))
-            .chain(std::iter::once(*final_carry_cotangent_tangent))
-            .chain(std::iter::once(*output_cotangent))
-            .chain(std::iter::once(*output_cotangent_tangent))
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .chain(tangent_captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
+        TensorOp::Region(region) => region.operands(),
         TensorOp::Sum { input }
         | TensorOp::SumAxis { input, .. }
         | TensorOp::ExtremumAxis { input, .. }
@@ -16053,13 +15992,24 @@ fn tensor_forward_last_uses(
     }
 }
 
+/// The execution group of a region node whose sibling nodes share one
+/// region execution; see [`RegionNode::group`].
 fn tensor_op_group(op: &TensorOp) -> Option<usize> {
     match op {
-        TensorOp::ForiVjp { group, .. }
-        | TensorOp::ForiVjpJvp { group, .. }
-        | TensorOp::Scan { group, .. }
-        | TensorOp::ScanVjp { group, .. }
-        | TensorOp::ScanVjpJvp { group, .. } => Some(*group),
+        TensorOp::Region(region) => region.group(),
+        _ => None,
+    }
+}
+
+/// The group of a multi-result node, mutably: a region execution group
+/// ([`RegionNode::group`]) or the call group of a `Custom` node. Both are the
+/// node id of the group's first member, so splicing renumbers them alike.
+/// Only region groups are executed; plan compilation aliases `Custom`
+/// nodes, so the evaluators' group caches never see a call group.
+fn tensor_op_group_mut(op: &mut TensorOp) -> Option<&mut usize> {
+    match op {
+        TensorOp::Region(region) => region.group_mut(),
+        TensorOp::Custom { group, .. } => Some(group),
         _ => None,
     }
 }
@@ -16142,16 +16092,7 @@ fn infer_tensor_placement(
             on_true,
             on_false,
         } => merge(&[*condition, *on_true, *on_false]),
-        TensorOp::Cond { .. }
-        | TensorOp::While { .. }
-        | TensorOp::Fori { .. }
-        | TensorOp::ForiJvp { .. }
-        | TensorOp::ForiVjp { .. }
-        | TensorOp::ForiVjpJvp { .. }
-        | TensorOp::Scan { .. }
-        | TensorOp::ScanVjp { .. }
-        | TensorOp::ScanVjpJvp { .. }
-        | TensorOp::Custom { .. } => Err(format!(
+        TensorOp::Region(_) | TensorOp::Custom { .. } => Err(format!(
             "kernel node {node_id} contains {} regions; placement propagation requires explicit region lowering",
             tensor_op_name(&node.op)
         )),
@@ -16609,15 +16550,7 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Greater { .. } => "greater",
         TensorOp::Compare { kind, .. } => kind.name(),
         TensorOp::Where { .. } => "where",
-        TensorOp::Cond { .. } => "cond",
-        TensorOp::Fori { .. } => "fori",
-        TensorOp::While { .. } => "while",
-        TensorOp::ForiJvp { .. } => "fori_jvp",
-        TensorOp::ForiVjp { .. } => "fori_vjp",
-        TensorOp::ForiVjpJvp { .. } => "fori_vjp_jvp",
-        TensorOp::Scan { .. } => "scan",
-        TensorOp::ScanVjp { .. } => "scan_vjp",
-        TensorOp::ScanVjpJvp { .. } => "scan_vjp_jvp",
+        TensorOp::Region(region) => region.name(),
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::ExtremumAxis { kind, .. } => match kind {
@@ -17093,15 +17026,7 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         TensorOp::Input { .. }
         | TensorOp::Constant { .. }
         | TensorOp::CholeskyAd { .. }
-        | TensorOp::Cond { .. }
-        | TensorOp::While { .. }
-        | TensorOp::Fori { .. }
-        | TensorOp::ForiJvp { .. }
-        | TensorOp::ForiVjp { .. }
-        | TensorOp::ForiVjpJvp { .. }
-        | TensorOp::Scan { .. }
-        | TensorOp::ScanVjp { .. }
-        | TensorOp::ScanVjpJvp { .. }
+        | TensorOp::Region(_)
         | TensorOp::Custom { .. } => return None,
         TensorOp::ScalarConstant { value } => arguments[0] = value.to_bits(),
         TensorOp::Add { lhs, rhs }
@@ -17274,20 +17199,6 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
     })
 }
 
-/// The execution-group id of a node that shares one region execution with
-/// its sibling results, if the op has one.
-fn tensor_op_group_mut(op: &mut TensorOp) -> Option<&mut usize> {
-    match op {
-        TensorOp::ForiVjp { group, .. }
-        | TensorOp::ForiVjpJvp { group, .. }
-        | TensorOp::Scan { group, .. }
-        | TensorOp::ScanVjp { group, .. }
-        | TensorOp::ScanVjpJvp { group, .. }
-        | TensorOp::Custom { group, .. } => Some(group),
-        _ => None,
-    }
-}
-
 // Dense indexing removes hash work without allocating a full table for sparse outputs.
 enum TensorNodeRemap {
     Dense(Vec<TensorNodeId>),
@@ -17370,173 +17281,13 @@ fn remap_tensor_op(
             on_true: remap_node(*on_true)?,
             on_false: remap_node(*on_false)?,
         }),
-        TensorOp::Cond {
-            predicate,
-            branches,
-            captures,
-        } => Ok(TensorOp::Cond {
-            predicate: remap_node(*predicate)?,
-            branches: branches.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-        }),
-        TensorOp::ForiJvp {
-            carry,
-            carry_tangent,
-            loop_plan,
-            captures,
-            tangent_captures,
-        } => Ok(TensorOp::ForiJvp {
-            carry: remap_node(*carry)?,
-            carry_tangent: remap_node(*carry_tangent)?,
-            loop_plan: loop_plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            tangent_captures: tangent_captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-        }),
-        TensorOp::ForiVjp {
-            carry,
-            output_cotangent,
-            loop_plan,
-            captures,
-            target,
-            group,
-        } => Ok(TensorOp::ForiVjp {
-            carry: remap_node(*carry)?,
-            output_cotangent: remap_node(*output_cotangent)?,
-            loop_plan: loop_plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            target: target.clone(),
-            group: *group,
-        }),
-        TensorOp::ScanVjpJvp {
-            carry,
-            carry_tangent,
-            final_carry_cotangent,
-            final_carry_cotangent_tangent,
-            output_cotangent,
-            output_cotangent_tangent,
-            plan,
-            captures,
-            tangent_captures,
-            target,
-            group,
-        } => Ok(TensorOp::ScanVjpJvp {
-            carry: remap_node(*carry)?,
-            carry_tangent: remap_node(*carry_tangent)?,
-            final_carry_cotangent: remap_node(*final_carry_cotangent)?,
-            final_carry_cotangent_tangent: remap_node(*final_carry_cotangent_tangent)?,
-            output_cotangent: remap_node(*output_cotangent)?,
-            output_cotangent_tangent: remap_node(*output_cotangent_tangent)?,
-            plan: plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            tangent_captures: tangent_captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            target: target.clone(),
-            group: *group,
-        }),
-        TensorOp::ForiVjpJvp {
-            carry,
-            carry_tangent,
-            output_cotangent,
-            output_cotangent_tangent,
-            plan,
-            captures,
-            tangent_captures,
-            target,
-            group,
-        } => Ok(TensorOp::ForiVjpJvp {
-            carry: remap_node(*carry)?,
-            carry_tangent: remap_node(*carry_tangent)?,
-            output_cotangent: remap_node(*output_cotangent)?,
-            output_cotangent_tangent: remap_node(*output_cotangent_tangent)?,
-            plan: plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            tangent_captures: tangent_captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            target: target.clone(),
-            group: *group,
-        }),
-        TensorOp::Fori {
-            carry,
-            loop_plan,
-            captures,
-        } => Ok(TensorOp::Fori {
-            carry: remap_node(*carry)?,
-            loop_plan: loop_plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-        }),
-        TensorOp::While {
-            carry,
-            loop_plan,
-            captures,
-        } => Ok(TensorOp::While {
-            carry: remap_node(*carry)?,
-            loop_plan: loop_plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-        }),
-        TensorOp::Scan {
-            carry,
-            scan_plan,
-            captures,
-            target,
-            group,
-        } => Ok(TensorOp::Scan {
-            carry: remap_node(*carry)?,
-            scan_plan: scan_plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            target: *target,
-            group: *group,
-        }),
-        TensorOp::ScanVjp {
-            carry,
-            final_carry_cotangent,
-            output_cotangent,
-            scan_plan,
-            captures,
-            target,
-            group,
-        } => Ok(TensorOp::ScanVjp {
-            carry: remap_node(*carry)?,
-            final_carry_cotangent: remap_node(*final_carry_cotangent)?,
-            output_cotangent: remap_node(*output_cotangent)?,
-            scan_plan: scan_plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            target: target.clone(),
-            group: *group,
-        }),
+        TensorOp::Region(region) => {
+            let mut region = region.clone();
+            for operand in region.operands_mut() {
+                *operand = remap_node(*operand)?;
+            }
+            Ok(TensorOp::Region(region))
+        }
         TensorOp::Sum { input } => Ok(TensorOp::Sum {
             input: remap_node(*input)?,
         }),

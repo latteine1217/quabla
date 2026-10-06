@@ -18,9 +18,9 @@ use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
     adam_element, sgd_element, sqrt_derivative_coefficient, AdamArith, AdamCoefficients, AdamOrder,
-    BinaryMathKind, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, TensorBackend,
-    TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend, TensorExecutionPlan,
-    TensorExtremum, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
+    BinaryMathKind, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, RegionKind, RegionNode,
+    TensorBackend, TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend,
+    TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
 };
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
@@ -749,11 +749,15 @@ impl MlxBackend {
                     &stream,
                 )
                 .map_err(|error| error.to_string()),
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => {
+                    ..
+                }) => {
                     // Host synchronization point: the scalar predicate is read back once and only
                     // the selected branch runs on the GPU stream. Computing both branches with
                     // `where` is avoided so NaN/Inf from the unselected branch cannot leak into
@@ -767,11 +771,11 @@ impl MlxBackend {
                         .collect::<Result<BTreeMap<_, _>, _>>()?;
                     mlx_execute_plan_output(self, branches.selected(predicate), &branch_inputs)
                 }
-                TensorOp::While {
-                    carry,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::While { carry, loop_plan },
                     captures,
-                } => {
+                    ..
+                }) => {
                     // Host synchronization point per iteration: the scalar predicate is read back
                     // (like `Cond`) and decides whether the body region is dispatched again.
                     let mut region_inputs = captures
@@ -799,12 +803,15 @@ impl MlxBackend {
                         .remove(&carry_name)
                         .ok_or_else(|| "MLX While carry is missing".to_string())
                 }
-                TensorOp::Fori { .. } => {
-                    let TensorOp::Fori {
-                        carry,
-                        loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Fori { .. },
+                    ..
+                }) => {
+                    let TensorOp::Region(RegionNode {
+                        kind: RegionKind::Fori { carry, loop_plan },
                         captures,
-                    } = &node.op
+                        ..
+                    }) = &node.op
                     else {
                         unreachable!();
                     };
@@ -834,13 +841,17 @@ impl MlxBackend {
                     }
                     Ok(carry)
                 }
-                TensorOp::ForiJvp {
-                    carry,
-                    carry_tangent,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiJvp {
+                            carry,
+                            carry_tangent,
+                            loop_plan,
+                        },
                     captures,
                     tangent_captures,
-                } => {
+                    ..
+                }) => {
                     let captures = captures
                         .iter()
                         .map(|(name, node_id)| {
@@ -862,14 +873,18 @@ impl MlxBackend {
                         &tangents,
                     )
                 }
-                TensorOp::ForiVjp {
-                    carry,
-                    output_cotangent,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiVjp {
+                            carry,
+                            output_cotangent,
+                            loop_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !fori_vjp_cache.contains_key(group) {
                         let captures = captures
                             .iter()
@@ -899,17 +914,21 @@ impl MlxBackend {
                             .ok_or_else(|| format!("MLX Fori VJP has no gradient for {name:?}")),
                     }
                 }
-                TensorOp::ForiVjpJvp {
-                    carry,
-                    carry_tangent,
-                    output_cotangent,
-                    output_cotangent_tangent,
-                    plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiVjpJvp {
+                            carry,
+                            carry_tangent,
+                            output_cotangent,
+                            output_cotangent_tangent,
+                            plan,
+                            target,
+                            group,
+                        },
                     captures,
                     tangent_captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !fori_vjp_jvp_cache.contains_key(group) {
                         let captures = captures
                             .iter()
@@ -950,13 +969,17 @@ impl MlxBackend {
                         .cloned()
                         .ok_or_else(|| format!("MLX Fori VJP JVP has no gradient for {name:?}"))
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_cache.contains_key(group) {
                         let external_captures = captures
                             .iter()
@@ -1017,15 +1040,19 @@ impl MlxBackend {
                         super::TensorScanTarget::Outputs => outputs.clone(),
                     })
                 }
-                TensorOp::ScanVjp {
-                    carry,
-                    final_carry_cotangent,
-                    output_cotangent,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ScanVjp {
+                            carry,
+                            final_carry_cotangent,
+                            output_cotangent,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_vjp_cache.contains_key(group) {
                         let captures = captures
                             .iter()
@@ -1056,19 +1083,23 @@ impl MlxBackend {
                             .ok_or_else(|| format!("MLX Scan VJP has no gradient for {name:?}")),
                     }
                 }
-                TensorOp::ScanVjpJvp {
-                    carry,
-                    carry_tangent,
-                    final_carry_cotangent,
-                    final_carry_cotangent_tangent,
-                    output_cotangent,
-                    output_cotangent_tangent,
-                    plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ScanVjpJvp {
+                            carry,
+                            carry_tangent,
+                            final_carry_cotangent,
+                            final_carry_cotangent_tangent,
+                            output_cotangent,
+                            output_cotangent_tangent,
+                            plan,
+                            target,
+                            group,
+                        },
                     captures,
                     tangent_captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_vjp_jvp_cache.contains_key(group) {
                         let captures = captures
                             .iter()
@@ -2417,15 +2448,7 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Greater { .. } => "greater",
         TensorOp::Compare { kind, .. } => kind.name(),
         TensorOp::Where { .. } => "where",
-        TensorOp::Cond { .. } => "cond",
-        TensorOp::While { .. } => "while",
-        TensorOp::Fori { .. } => "fori",
-        TensorOp::ForiJvp { .. } => "fori_jvp",
-        TensorOp::ForiVjp { .. } => "fori_vjp",
-        TensorOp::ForiVjpJvp { .. } => "fori_vjp_jvp",
-        TensorOp::Scan { .. } => "scan",
-        TensorOp::ScanVjp { .. } => "scan_vjp",
-        TensorOp::ScanVjpJvp { .. } => "scan_vjp_jvp",
+        TensorOp::Region(region) => region.name(),
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::ExtremumAxis { kind, .. } => match kind {

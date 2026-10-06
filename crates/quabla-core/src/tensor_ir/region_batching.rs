@@ -67,11 +67,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::{
-    batched_shape, BatchingError, TensorComparison, TensorCondExecutionPlan, TensorExecutionPlan,
-    TensorForiExecutionPlan, TensorForiVjpJvpBindings, TensorForiVjpJvpExecutionPlan,
-    TensorForiVjpTarget, TensorIr, TensorNode, TensorNodeId, TensorOp, TensorScanExecutionPlan,
-    TensorScanTarget, TensorScanVjpBindings, TensorScanVjpJvpBindings,
-    TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget, TensorWhileExecutionPlan,
+    batched_shape, BatchingError, RegionKind, RegionNode, TensorComparison,
+    TensorCondExecutionPlan, TensorExecutionPlan, TensorForiExecutionPlan,
+    TensorForiVjpJvpBindings, TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget, TensorIr,
+    TensorNode, TensorNodeId, TensorOp, TensorScanExecutionPlan, TensorScanTarget,
+    TensorScanVjpBindings, TensorScanVjpJvpBindings, TensorScanVjpJvpExecutionPlan,
+    TensorScanVjpTarget, TensorWhileExecutionPlan,
 };
 
 /// Which result of a batched loop group a member node selects.
@@ -360,11 +361,11 @@ impl TensorIr {
                 .collect::<BTreeSet<_>>()
         };
         match &node.op {
-            TensorOp::Fori {
-                carry,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Fori { carry, loop_plan },
                 captures,
-            } => {
+                ..
+            }) => {
                 let mut inputs = mapped_names(captures);
                 if mapped[*carry] {
                     inputs.insert(loop_plan.carry_name.clone());
@@ -382,13 +383,17 @@ impl TensorIr {
                 let plan = loop_plan.with_body(body.plan)?;
                 Ok((self.fori(carry, plan, captures)?, carry_mapped))
             }
-            TensorOp::ForiJvp {
-                carry,
-                carry_tangent,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ForiJvp {
+                        carry,
+                        carry_tangent,
+                        loop_plan,
+                    },
                 captures,
                 tangent_captures,
-            } => {
+                ..
+            }) => {
                 // One body evaluates both the primal and the tangent of each
                 // input, so an input is mapped when either of them is.
                 let mut inputs = mapped_names(captures);
@@ -415,14 +420,18 @@ impl TensorIr {
                     self.fori_jvp(carry, carry_tangent, plan, captures, tangent_captures)?;
                 Ok((tangent, carry_mapped))
             }
-            TensorOp::ForiVjp {
-                carry,
-                output_cotangent,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ForiVjp {
+                        carry,
+                        output_cotangent,
+                        loop_plan,
+                        target,
+                        group,
+                    },
                 captures,
-                target,
-                group,
-            } => self.batched_group_member(
+                ..
+            }) => self.batched_group_member(
                 groups,
                 ("fori_vjp", *group),
                 fori_target(target),
@@ -456,17 +465,21 @@ impl TensorIr {
                     Ok(members)
                 },
             ),
-            TensorOp::ForiVjpJvp {
-                carry,
-                carry_tangent,
-                output_cotangent,
-                output_cotangent_tangent,
-                plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ForiVjpJvp {
+                        carry,
+                        carry_tangent,
+                        output_cotangent,
+                        output_cotangent_tangent,
+                        plan,
+                        target,
+                        group,
+                    },
                 captures,
                 tangent_captures,
-                target,
-                group,
-            } => self.batched_group_member(
+                ..
+            }) => self.batched_group_member(
                 groups,
                 ("fori_vjp_jvp", *group),
                 fori_target(target),
@@ -516,13 +529,17 @@ impl TensorIr {
                     Ok(members)
                 },
             ),
-            TensorOp::Scan {
-                carry,
-                scan_plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::Scan {
+                        carry,
+                        scan_plan,
+                        target,
+                        group,
+                    },
                 captures,
-                target,
-                group,
-            } => {
+                ..
+            }) => {
                 let target = match target {
                     TensorScanTarget::Carry => LoopTarget::Carry,
                     TensorScanTarget::Outputs => LoopTarget::Outputs,
@@ -556,15 +573,19 @@ impl TensorIr {
                     ]))
                 })
             }
-            TensorOp::ScanVjp {
-                carry,
-                final_carry_cotangent,
-                output_cotangent,
-                scan_plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ScanVjp {
+                        carry,
+                        final_carry_cotangent,
+                        output_cotangent,
+                        scan_plan,
+                        target,
+                        group,
+                    },
                 captures,
-                target,
-                group,
-            } => self.batched_group_member(
+                ..
+            }) => self.batched_group_member(
                 groups,
                 ("scan_vjp", *group),
                 scan_vjp_target(target),
@@ -603,19 +624,23 @@ impl TensorIr {
                     Ok(members)
                 },
             ),
-            TensorOp::ScanVjpJvp {
-                carry,
-                carry_tangent,
-                final_carry_cotangent,
-                final_carry_cotangent_tangent,
-                output_cotangent,
-                output_cotangent_tangent,
-                plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ScanVjpJvp {
+                        carry,
+                        carry_tangent,
+                        final_carry_cotangent,
+                        final_carry_cotangent_tangent,
+                        output_cotangent,
+                        output_cotangent_tangent,
+                        plan,
+                        target,
+                        group,
+                    },
                 captures,
                 tangent_captures,
-                target,
-                group,
-            } => self.batched_group_member(
+                ..
+            }) => self.batched_group_member(
                 groups,
                 ("scan_vjp_jvp", *group),
                 scan_vjp_target(target),
@@ -671,11 +696,11 @@ impl TensorIr {
                     Ok(members)
                 },
             ),
-            TensorOp::While {
-                carry,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::While { carry, loop_plan },
                 captures,
-            } => {
+                ..
+            }) => {
                 let mut inputs = mapped_names(captures);
                 if mapped[*carry] {
                     inputs.insert(loop_plan.carry_name().to_string());
@@ -806,11 +831,15 @@ impl TensorIr {
         (remap, mapped): (&HashMap<TensorNodeId, TensorNodeId>, &[bool]),
         batch_size: usize,
     ) -> Result<(TensorNodeId, bool), BatchingError> {
-        let TensorOp::Cond {
-            predicate,
-            branches,
+        let TensorOp::Region(RegionNode {
+            kind:
+                RegionKind::Cond {
+                    predicate,
+                    branches,
+                },
             captures,
-        } = &node.op
+            ..
+        }) = &node.op
         else {
             return Err(BatchingError::Invalid(format!(
                 "{} is not a cond region node",
