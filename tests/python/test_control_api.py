@@ -1221,6 +1221,34 @@ def test_optional_device_vmap_of_loops_matches_cpu():
             assert_tree_close(actual, expected, tolerance)
 
 
+def test_eager_cond_predicate_matches_the_traced_rule():
+    # A floating predicate selects the true branch when nonzero, eagerly as
+    # under jit; it used to be decided by `bool(Tensor)`, which is always true
+    # for a floating Tensor, so an eager 0.0 took the true branch.
+    def f(p, x):
+        return qb.cond(p, lambda v: v + 1.0, lambda v: v - 1.0, x)
+
+    x = qb.array(0.0)
+    for p in (0.0, -0.0, 2.0, -3.0):
+        for dtype in (qb.float32, qb.float64):
+            pred = qb.array(p, dtype=dtype)
+            assert f(pred, x).item() == qb.jit(f)(pred, x).item() == (1.0 if p != 0 else -1.0)
+    for bad in (float("nan"), float("inf")):
+        for call in (f, qb.jit(f)):
+            try:
+                call(qb.array(bad), x)
+            except ValueError as error:
+                assert "finite" in str(error)
+            else:
+                raise AssertionError(f"a {bad} predicate was accepted")
+    try:
+        f(qb.array([1.0, 0.0]), x)
+    except ValueError as error:
+        assert "scalar" in str(error)
+    else:
+        raise AssertionError("a vector predicate was accepted")
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_") and callable(test):

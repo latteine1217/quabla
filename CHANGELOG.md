@@ -39,6 +39,10 @@ deprecated names keep working until 1.0 (see
 
 ### Fixed
 
+- An eager `cond` with a floating `Tensor` predicate took the true branch
+  even for `0.0`, because a floating `Tensor` is always truthy; it now
+  follows the traced rule (nonzero selects the true branch, a non-finite or
+  non-scalar predicate raises), so eager and `jit` agree.
 - The forward-mode tangent of a legacy `TensorIr::greater` mask has the
   mask's shape instead of a scalar, so forward-over-reverse
   differentiation of a graph that reshapes such a mask no longer fails.

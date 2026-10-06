@@ -5,6 +5,7 @@ and eager bodies see a Python integer. Scan outputs stack on axis zero.
 `while_loop` is the one loop with a traced trip count.
 """
 
+import math
 import operator
 
 from . import _quabla
@@ -68,6 +69,21 @@ def _bindings(values):
     ]
 
 
+def _concrete_predicate(pred):
+    """The branch an eager `cond` takes, by the traced region's rule: a
+    scalar predicate selects the true branch when it is nonzero, and a
+    non-finite one is rejected. `bool(Tensor)` cannot decide this, because
+    a floating `Tensor` is always truthy."""
+    if not isinstance(pred, _quabla.Tensor):
+        return bool(pred)
+    if pred.shape not in ([], [1]):
+        raise ValueError(f"cond predicate must be scalar, got shape {list(pred.shape)}")
+    value = pred.item()
+    if not math.isfinite(value):
+        raise ValueError("conditional predicate must be finite")
+    return value != 0
+
+
 def cond(pred, true_fun, false_fun, *operands):
     """Run the selected branch; traced scalar predicates form lazy regions.
 
@@ -75,7 +91,7 @@ def cond(pred, true_fun, false_fun, *operands):
     by a traced branch explicitly as an operand.
     """
     if not isinstance(pred, TraceTensor):
-        return (true_fun if bool(pred) else false_fun)(*operands)
+        return (true_fun if _concrete_predicate(pred) else false_fun)(*operands)
     predicate, *captures = _bindings((pred, *operands))
     # Constant branch results bind to the region through one of its inputs; a
     # cond without operands passes the predicate as that hidden input.
