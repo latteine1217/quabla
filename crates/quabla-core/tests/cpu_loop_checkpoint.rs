@@ -1,5 +1,5 @@
 use quabla_core::tensor_ir::{
-    DynamicTensor, TensorDType, TensorExecutionPlan, TensorForiExecutionPlan,
+    DynamicTensor, SymbolicCotangent, TensorDType, TensorExecutionPlan, TensorForiExecutionPlan,
     TensorForiVjpJvpExecutionPlan, TensorIr, TensorScanExecutionPlan,
     TensorScanVjpJvpExecutionPlan,
 };
@@ -38,7 +38,12 @@ type Gradients = (
     BTreeMap<String, DynamicTensor>,
 );
 
-fn body(dtype: TensorDType, n: usize) -> Result<TensorExecutionPlan, String> {
+/// The body plan and its per-step symbolic VJP oracle, which reads the body
+/// inputs plus the cotangent `ct` and returns the `c` and `w` gradients.
+fn body(
+    dtype: TensorDType,
+    n: usize,
+) -> Result<(TensorExecutionPlan, TensorExecutionPlan), String> {
     let mut graph = TensorIr::new();
     let carry = graph.input_typed("c", vec![n], dtype)?;
     let index = graph.input_typed("i", vec![], dtype)?;
@@ -48,12 +53,17 @@ fn body(dtype: TensorDType, n: usize) -> Result<TensorExecutionPlan, String> {
     let scale = graph.scalar_constant(0.0001);
     let index = graph.mul(index, scale)?;
     let next = graph.add(next, index)?;
-    graph.compile_cpu(next)
+    let vjp = graph.symbolic_vjp(next, "ct")?;
+    let step_vjp = vjp
+        .graph
+        .compile_cpu_many(&[vjp.gradients["c"], vjp.gradients["w"]])?
+        .0;
+    Ok((graph.compile_cpu(next)?, step_vjp))
 }
 
 fn reference(
     plan: &TensorForiExecutionPlan,
-    body: &TensorExecutionPlan,
+    step_vjp: &TensorExecutionPlan,
     lower: usize,
     steps: usize,
     initial: DynamicTensor,
@@ -71,14 +81,18 @@ fn reference(
             "i".into(),
             DynamicTensor::new(vec![], vec![(lower + offset) as f64])?,
         );
-        let (_, gradients) = body.value_and_vjp(&inputs, cotangent)?;
-        cotangent = gradients["c"].clone();
+        inputs.insert("ct".into(), cotangent);
+        let [carry_gradient, weight_gradient]: [DynamicTensor; 2] = step_vjp
+            .evaluate_many(&inputs)?
+            .try_into()
+            .map_err(|_| "the step VJP returns two gradients".to_string())?;
+        cotangent = carry_gradient;
         gradient = DynamicTensor::new(
             gradient.shape().to_vec(),
             gradient
                 .data()
                 .iter()
-                .zip(gradients["w"].data().iter())
+                .zip(weight_gradient.data().iter())
                 .map(|(left, right)| left + right)
                 .collect(),
         )?;
@@ -95,8 +109,8 @@ fn checkpoint_vjp_matches_full_tape_bits_across_block_boundaries() -> Result<(),
     for dtype in [TensorDType::F64, TensorDType::F32] {
         for steps in [0, 1, 4, 8, 17, 64, 101] {
             let lower = 3;
-            let body = body(dtype, 4)?;
-            let plan = TensorForiExecutionPlan::new(lower, lower + steps, body.clone(), "c", "i")?;
+            let (body, step_vjp) = body(dtype, 4)?;
+            let plan = TensorForiExecutionPlan::new(lower, lower + steps, body, "c", "i")?;
             let initial = DynamicTensor::with_dtype(vec![4], vec![-0.0, 0.1, 0.5, -1.2], dtype)?;
             let external = BTreeMap::from([(
                 "w".into(),
@@ -105,7 +119,7 @@ fn checkpoint_vjp_matches_full_tape_bits_across_block_boundaries() -> Result<(),
             let seed = DynamicTensor::filled(vec![4], 1.0)?;
             let expected = reference(
                 &plan,
-                &body,
+                &step_vjp,
                 lower,
                 steps,
                 initial.clone(),
@@ -164,7 +178,16 @@ fn scan_checkpoint_matches_public_full_tape_and_preserves_outputs() -> Result<()
             let next = graph.tanh(product)?;
             let output = graph.sin(next)?;
             let body = graph.compile_cpu_many(&[next, output])?.0;
-            let scan = TensorScanExecutionPlan::new(3, 3 + steps, body.clone(), "c", "i")?;
+            // Per-step oracle: the joint symbolic VJP of both body outputs.
+            let vjp = graph.symbolic_vjp_many(&[
+                (next, SymbolicCotangent::Input("ct".into())),
+                (output, SymbolicCotangent::Input("ot".into())),
+            ])?;
+            let step_vjp = vjp
+                .graph
+                .compile_cpu_many(&[vjp.gradients["c"], vjp.gradients["w"]])?
+                .0;
+            let scan = TensorScanExecutionPlan::new(3, 3 + steps, body, "c", "i")?;
             let initial = DynamicTensor::with_dtype(vec![4], vec![-0.0, 0.1, 0.5, -1.2], dtype)?;
             let external = BTreeMap::from([(
                 "w".into(),
@@ -183,17 +206,19 @@ fn scan_checkpoint_matches_public_full_tape_and_preserves_outputs() -> Result<()
                     "i".into(),
                     DynamicTensor::filled(vec![], (3 + offset) as f64)?,
                 );
-                let (_, gradients) = body.value_and_vjp_many(
-                    &inputs,
-                    vec![cotangent, DynamicTensor::filled(vec![4], 0.2)?],
-                )?;
-                cotangent = gradients["c"].clone();
+                inputs.insert("ct".into(), cotangent);
+                inputs.insert("ot".into(), DynamicTensor::filled(vec![4], 0.2)?);
+                let [carry_gradient, weight_gradient]: [DynamicTensor; 2] = step_vjp
+                    .evaluate_many(&inputs)?
+                    .try_into()
+                    .map_err(|_| "the step VJP returns two gradients".to_string())?;
+                cotangent = carry_gradient;
                 gradient = DynamicTensor::new(
                     vec![4],
                     gradient
                         .data()
                         .iter()
-                        .zip(gradients["w"].data().iter())
+                        .zip(weight_gradient.data().iter())
                         .map(|(a, b)| a + b)
                         .collect(),
                 )?;
@@ -264,6 +289,15 @@ fn higher_order_checkpoints_match_single_step_reverse_recurrence() -> Result<(),
                 let out = graph.sin(next)?;
                 let carry_body = graph.compile_cpu(next)?;
                 let body = graph.compile_cpu_many(&[next, out])?.0;
+                // Per-step forward oracle: the carry's symbolic JVP.
+                let forward = graph.symbolic_jvp_with_tangent_inputs(
+                    next,
+                    &BTreeMap::from([("c".into(), "tc".into()), ("w".into(), "tw".into())]),
+                )?;
+                let step_jvp = forward
+                    .graph
+                    .compile_cpu_many(&[forward.value, forward.tangent])?
+                    .0;
                 let external = BTreeMap::from([(
                     "w".into(),
                     DynamicTensor::with_dtype(vec![4], vec![0.9, 1.01, 0.7, -0.2], dtype)?,
@@ -280,9 +314,12 @@ fn higher_order_checkpoints_match_single_step_reverse_recurrence() -> Result<(),
                     states.push((carry.clone(), tangent.clone()));
                     let mut inputs = external.clone();
                     inputs.insert("c".into(), carry);
-                    let mut tangents = directions.clone();
-                    tangents.insert("c".into(), tangent);
-                    (carry, tangent) = carry_body.jvp(&inputs, &tangents)?;
+                    inputs.insert("tc".into(), tangent);
+                    inputs.insert("tw".into(), directions["w"].clone());
+                    [carry, tangent] = step_jvp
+                        .evaluate_many(&inputs)?
+                        .try_into()
+                        .map_err(|_| "the step JVP returns a value and a tangent".to_string())?;
                 }
                 let seed = DynamicTensor::filled(vec![4], 1.0)?;
                 let seed_tangent = DynamicTensor::filled(vec![4], 0.01)?;
@@ -379,8 +416,8 @@ fn higher_order_checkpoints_match_single_step_reverse_recurrence() -> Result<(),
 fn profile_checkpoint_vjp() -> Result<(), String> {
     for steps in [64, 512, 4096] {
         let n = 512;
-        let body = body(TensorDType::F64, n)?;
-        let plan = TensorForiExecutionPlan::new(3, 3 + steps, body.clone(), "c", "i")?;
+        let (body, step_vjp) = body(TensorDType::F64, n)?;
+        let plan = TensorForiExecutionPlan::new(3, 3 + steps, body, "c", "i")?;
         let initial = DynamicTensor::filled(vec![n], 0.1)?;
         let external = BTreeMap::from([("w".into(), DynamicTensor::filled(vec![n], 0.9)?)]);
         let seed = DynamicTensor::filled(vec![n], 1.0)?;
@@ -399,7 +436,7 @@ fn profile_checkpoint_vjp() -> Result<(), String> {
                 let result = if full_tape {
                     reference(
                         &plan,
-                        &body,
+                        &step_vjp,
                         3,
                         steps,
                         initial.clone(),

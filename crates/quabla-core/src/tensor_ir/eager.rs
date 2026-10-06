@@ -16,8 +16,8 @@
 use std::sync::Arc;
 
 use super::{
-    matmul_host_float_block, DynamicTensor, HostTensorStorage, TensorComparison, TensorDType,
-    UnaryMathKind,
+    matmul_host_float_block, BinaryMathKind, DynamicTensor, HostTensorStorage, TensorComparison,
+    TensorDType, UnaryMathKind,
 };
 
 /// A single-node op of the CPU evaluator that eager arrays run directly.
@@ -34,17 +34,12 @@ pub enum EagerKernel {
     /// `where(condition, on_true, on_false)`: the condition selects where it
     /// is nonzero (`NaN` included).
     Where,
-    Exp,
-    Log,
-    Log1p,
-    Expm1,
-    Erf,
-    Erfc,
-    Tanh,
-    Sin,
-    Cos,
     Sqrt,
+    /// A `UnaryMath` node: every kind runs its own `f64` rule, so a new kind
+    /// needs no change here.
     UnaryMath(UnaryMathKind),
+    /// A `BinaryMath` node (`pow`, `atan2`, `fmod`), likewise by its kind.
+    BinaryMath(BinaryMathKind),
     Sum,
     SumAxis(usize),
     Mean,
@@ -150,17 +145,9 @@ impl EagerKernel {
             Self::Greater => input.greater(rhs()),
             Self::Compare(kind) => input.compare(rhs(), kind),
             Self::Where => input.where_select(&operands[1], &operands[2]),
-            Self::Exp => input.exp(),
-            Self::Log => input.log(),
-            Self::Log1p => input.log1p(),
-            Self::Expm1 => input.map_f64(f64::exp_m1),
-            Self::Erf => input.map_f64(libm::erf),
-            Self::Erfc => input.map_f64(libm::erfc),
-            Self::Tanh => input.tanh(),
-            Self::Sin => input.sin(),
-            Self::Cos => input.cos(),
             Self::Sqrt => input.sqrt(),
             Self::UnaryMath(kind) => input.map_f64(|x| kind.evaluate(x)),
+            Self::BinaryMath(kind) => input.elementwise(rhs(), kind.function()),
             Self::Sum => input.sum_all(),
             Self::SumAxis(axis) => input.reduce_axis(axis, 1.0),
             Self::Mean => input.mean_all(),
@@ -188,12 +175,25 @@ impl EagerKernel {
             }
             (Self::Compare(_) | Self::Where, _) => None,
             (
-                Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Greater | Self::Matmul,
+                Self::Add
+                | Self::Sub
+                | Self::Mul
+                | Self::Div
+                | Self::Greater
+                | Self::BinaryMath(_)
+                | Self::Matmul,
                 [lhs, rhs],
             ) if lhs.dtype() == rhs.dtype() => floating(lhs.dtype()),
-            (Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Greater | Self::Matmul, _) => {
-                None
-            }
+            (
+                Self::Add
+                | Self::Sub
+                | Self::Mul
+                | Self::Div
+                | Self::Greater
+                | Self::BinaryMath(_)
+                | Self::Matmul,
+                _,
+            ) => None,
             (_, [input]) => floating(input.dtype()),
             _ => None,
         }
@@ -240,16 +240,8 @@ impl EagerKernel {
                 f64::from(kind.evaluate(x, y))
             }),
             Self::Where => select_lanes(lane(0), lane(1), lane(2), count, dtype),
-            Self::Exp => unary_lanes(lane(0), count, dtype, f64::exp),
-            Self::Log => unary_lanes(lane(0), count, dtype, f64::ln),
-            Self::Log1p => unary_lanes(lane(0), count, dtype, f64::ln_1p),
-            Self::Expm1 => unary_lanes(lane(0), count, dtype, f64::exp_m1),
-            Self::Erf => unary_lanes(lane(0), count, dtype, libm::erf),
-            Self::Erfc => unary_lanes(lane(0), count, dtype, libm::erfc),
-            Self::Tanh => unary_lanes(lane(0), count, dtype, f64::tanh),
-            Self::Sin => unary_lanes(lane(0), count, dtype, f64::sin),
-            Self::Cos => unary_lanes(lane(0), count, dtype, f64::cos),
             Self::UnaryMath(kind) => unary_lanes(lane(0), count, dtype, kind.function()),
+            Self::BinaryMath(kind) => binary_lanes(lane(0), lane(1), count, dtype, kind.function()),
             // The evaluator's `sum_all`: a sequential `f64` sum in storage
             // order, and for `Mean` that sum times `1 / count`.
             Self::Sum | Self::Mean => {
@@ -548,7 +540,11 @@ mod tests {
         tensor.data().iter().map(|value| value.to_bits()).collect()
     }
 
-    fn check(kernel: EagerKernel, build: Build, operands: &[DynamicTensor]) {
+    fn check(
+        kernel: EagerKernel,
+        build: impl Fn(&mut TensorIr, &[TensorNodeId]) -> Result<TensorNodeId, String>,
+        operands: &[DynamicTensor],
+    ) {
         let mut ir = TensorIr::new();
         let nodes = operands
             .iter()
@@ -586,22 +582,7 @@ mod tests {
     #[test]
     fn matches_one_node_graph() {
         let unary: Vec<(EagerKernel, Build)> = vec![
-            (EagerKernel::Exp, |ir, x| ir.exp(x[0])),
-            (EagerKernel::Log, |ir, x| ir.log(x[0])),
-            (EagerKernel::Log1p, |ir, x| ir.log1p(x[0])),
-            (EagerKernel::Expm1, |ir, x| ir.expm1(x[0])),
-            (EagerKernel::Erf, |ir, x| ir.erf(x[0])),
-            (EagerKernel::Erfc, |ir, x| ir.erfc(x[0])),
-            (EagerKernel::Tanh, |ir, x| ir.tanh(x[0])),
-            (EagerKernel::Sin, |ir, x| ir.sin(x[0])),
-            (EagerKernel::Cos, |ir, x| ir.cos(x[0])),
             (EagerKernel::Sqrt, |ir, x| ir.sqrt(x[0])),
-            (EagerKernel::UnaryMath(UnaryMathKind::Arctanh), |ir, x| {
-                ir.unary_math(x[0], UnaryMathKind::Arctanh)
-            }),
-            (EagerKernel::UnaryMath(UnaryMathKind::Round), |ir, x| {
-                ir.unary_math(x[0], UnaryMathKind::Round)
-            }),
             (EagerKernel::Sum, |ir, x| ir.sum(x[0])),
             (EagerKernel::Mean, |ir, x| ir.mean(x[0])),
         ];
@@ -631,6 +612,32 @@ mod tests {
         ];
         let where_select: Build = |ir, x| ir.where_select(x[0], x[1], x[2]);
         for dtype in [TensorDType::F32, TensorDType::F64] {
+            for kind in UnaryMathKind::ALL {
+                let build = |ir: &mut TensorIr, x: &[TensorNodeId]| ir.unary_math(x[0], kind);
+                check(
+                    EagerKernel::UnaryMath(kind),
+                    build,
+                    &[operand(&[4, 6], dtype, 0)],
+                );
+                check(
+                    EagerKernel::UnaryMath(kind),
+                    build,
+                    &[operand(&[], dtype, 3)],
+                );
+            }
+            for kind in BinaryMathKind::ALL {
+                let build =
+                    |ir: &mut TensorIr, x: &[TensorNodeId]| ir.binary_math(x[0], x[1], kind);
+                for (lhs, rhs) in [
+                    (vec![4, 6], vec![4, 6]),
+                    (vec![4, 1], vec![1, 6]),
+                    (vec![4, 6], vec![]),
+                    (vec![], vec![4, 6]),
+                ] {
+                    let operands = [operand(&lhs, dtype, 0), operand(&rhs, dtype, 3)];
+                    check(EagerKernel::BinaryMath(kind), build, &operands);
+                }
+            }
             for (kernel, build) in &unary {
                 check(*kernel, *build, &[operand(&[4, 6], dtype, 0)]);
                 check(*kernel, *build, &[operand(&[], dtype, 3)]);
@@ -702,7 +709,7 @@ mod tests {
         let added = [signaling.clone(), plain];
         check(EagerKernel::Add, |ir, x| ir.add(x[0], x[1]), &added);
         check(
-            EagerKernel::Exp,
+            EagerKernel::UnaryMath(UnaryMathKind::Exp),
             |ir, x| ir.exp(x[0]),
             std::slice::from_ref(&signaling),
         );
@@ -734,6 +741,15 @@ mod tests {
             (EagerKernel::Sub, |ir, x| ir.sub(x[0], x[1])),
             (EagerKernel::Mul, |ir, x| ir.mul(x[0], x[1])),
             (EagerKernel::Div, |ir, x| ir.div(x[0], x[1])),
+            (EagerKernel::BinaryMath(BinaryMathKind::Pow), |ir, x| {
+                ir.binary_math(x[0], x[1], BinaryMathKind::Pow)
+            }),
+            (EagerKernel::BinaryMath(BinaryMathKind::Atan2), |ir, x| {
+                ir.binary_math(x[0], x[1], BinaryMathKind::Atan2)
+            }),
+            (EagerKernel::BinaryMath(BinaryMathKind::Fmod), |ir, x| {
+                ir.binary_math(x[0], x[1], BinaryMathKind::Fmod)
+            }),
         ];
         for dtype in [TensorDType::F32, TensorDType::F64] {
             let lhs = pairs.iter().map(|pair| pair.0).collect::<Vec<_>>();
@@ -809,11 +825,13 @@ mod tests {
         assert!(EagerKernel::Greater
             .evaluate(&[EagerOperand::array(&mask), EagerOperand::array(&mask)])
             .is_err());
-        assert!(EagerKernel::Exp
-            .evaluate(&[EagerOperand::array(&mask)])
-            .is_err());
-        assert!(EagerKernel::Exp
+        let exp = EagerKernel::UnaryMath(UnaryMathKind::Exp);
+        assert!(exp.evaluate(&[EagerOperand::array(&mask)]).is_err());
+        assert!(exp
             .evaluate(&[EagerOperand::array(&f32), EagerOperand::array(&f32)])
+            .is_err());
+        assert!(EagerKernel::BinaryMath(BinaryMathKind::Pow)
+            .evaluate(&[EagerOperand::array(&f32), EagerOperand::array(&f64)])
             .is_err());
         assert!(EagerKernel::Compare(TensorComparison::Less)
             .evaluate(&[EagerOperand::array(&f32), EagerOperand::array(&f64)])

@@ -3,7 +3,8 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyEllipsis, PyMemoryView, PySlice, PySliceMethods, PyTuple};
 use quabla_core::tensor_ir::{
-    EagerKernel, EagerOperand, HostTensorStorage, TensorComparison, TensorDType, UnaryMathKind,
+    BinaryMathKind, EagerKernel, EagerOperand, HostTensorStorage, TensorComparison, TensorDType,
+    UnaryMathKind,
 };
 use std::borrow::Cow;
 use std::ffi::c_int;
@@ -1003,31 +1004,31 @@ impl PyTensor {
     }
 
     pub fn try_tanh(&self) -> Result<Self, String> {
-        self.unary(EagerKernel::Tanh, TraceTensor::tanh_tensor)
+        self.try_unary_math(UnaryMathKind::Tanh)
     }
 
     pub fn try_exp(&self) -> Result<Self, String> {
-        self.unary(EagerKernel::Exp, TraceTensor::exp_tensor)
+        self.try_unary_math(UnaryMathKind::Exp)
     }
 
     pub fn try_log(&self) -> Result<Self, String> {
-        self.unary(EagerKernel::Log, TraceTensor::log_tensor)
+        self.try_unary_math(UnaryMathKind::Log)
     }
 
     pub fn try_log1p(&self) -> Result<Self, String> {
-        self.unary(EagerKernel::Log1p, TraceTensor::log1p_tensor)
+        self.try_unary_math(UnaryMathKind::Log1p)
     }
 
     pub fn try_expm1(&self) -> Result<Self, String> {
-        self.unary(EagerKernel::Expm1, TraceTensor::expm1_tensor)
+        self.try_unary_math(UnaryMathKind::Expm1)
     }
 
     pub fn try_erf(&self) -> Result<Self, String> {
-        self.unary(EagerKernel::Erf, TraceTensor::erf_tensor)
+        self.try_unary_math(UnaryMathKind::Erf)
     }
 
     pub fn try_erfc(&self) -> Result<Self, String> {
-        self.unary(EagerKernel::Erfc, TraceTensor::erfc_tensor)
+        self.try_unary_math(UnaryMathKind::Erfc)
     }
 
     pub fn try_sqrt(&self) -> Result<Self, String> {
@@ -1035,11 +1036,11 @@ impl PyTensor {
     }
 
     pub fn try_sin(&self) -> Result<Self, String> {
-        self.unary(EagerKernel::Sin, TraceTensor::sin_tensor)
+        self.try_unary_math(UnaryMathKind::Sin)
     }
 
     pub fn try_cos(&self) -> Result<Self, String> {
-        self.unary(EagerKernel::Cos, TraceTensor::cos_tensor)
+        self.try_unary_math(UnaryMathKind::Cos)
     }
 
     pub fn try_unary_math(&self, kind: UnaryMathKind) -> Result<Self, String> {
@@ -1055,23 +1056,31 @@ impl PyTensor {
     /// Elementwise `atan2(self, x)` with broadcasting and the promotion of
     /// the other binary ops.
     pub fn try_atan2(&self, x: &Self) -> Result<Self, String> {
-        self.binary_op(x, None, TracedBinary::Arithmetic("atan2"))
+        let kernel = EagerKernel::BinaryMath(BinaryMathKind::Atan2);
+        self.binary_op(x, Some(kernel), TracedBinary::Arithmetic("atan2"))
     }
 
     /// `atan2(self, x)` for a Python number `x`, a weak scalar.
     pub fn try_atan2_scalar(&self, x: f64) -> Result<Self, String> {
-        Self::evaluated([self], |[tensor]| tensor.float_scalar_binary(x, "atan2"))
+        let kernel = EagerKernel::BinaryMath(BinaryMathKind::Atan2);
+        self.scalar_op(x, Some(kernel), false, |tensor| {
+            tensor.float_scalar_binary(x, "atan2")
+        })
     }
 
     /// Elementwise C `fmod(self, y)` (the sign of `self`) with broadcasting
     /// and the promotion of the other binary ops.
     pub fn try_fmod(&self, y: &Self) -> Result<Self, String> {
-        self.binary_op(y, None, TracedBinary::Arithmetic("fmod"))
+        let kernel = EagerKernel::BinaryMath(BinaryMathKind::Fmod);
+        self.binary_op(y, Some(kernel), TracedBinary::Arithmetic("fmod"))
     }
 
     /// `fmod(self, y)` for a Python number `y`, a weak scalar.
     pub fn try_fmod_scalar(&self, y: f64) -> Result<Self, String> {
-        Self::evaluated([self], |[tensor]| tensor.float_scalar_binary(y, "fmod"))
+        let kernel = EagerKernel::BinaryMath(BinaryMathKind::Fmod);
+        self.scalar_op(y, Some(kernel), false, |tensor| {
+            tensor.float_scalar_binary(y, "fmod")
+        })
     }
 
     /// Inclusive prefix sums along `axis` (over the flattened tensor when
@@ -1113,7 +1122,8 @@ impl PyTensor {
     /// Elementwise `self ** exponent` of two tensors with broadcasting and
     /// the promotion of the other binary ops.
     pub fn try_pow(&self, exponent: &Self) -> Result<Self, String> {
-        self.binary_op(exponent, None, TracedBinary::Arithmetic("pow"))
+        let kernel = EagerKernel::BinaryMath(BinaryMathKind::Pow);
+        self.binary_op(exponent, Some(kernel), TracedBinary::Arithmetic("pow"))
     }
 
     /// `base ** self` for a Python number `base`, a weak scalar.
@@ -1220,6 +1230,9 @@ fn arithmetic_kernel(op: &str) -> Option<EagerKernel> {
         "mul" => EagerKernel::Mul,
         "div" => EagerKernel::Div,
         "greater" => EagerKernel::Greater,
+        "pow" => EagerKernel::BinaryMath(BinaryMathKind::Pow),
+        "atan2" => EagerKernel::BinaryMath(BinaryMathKind::Atan2),
+        "fmod" => EagerKernel::BinaryMath(BinaryMathKind::Fmod),
         _ => return None,
     })
 }
@@ -1569,12 +1582,26 @@ impl PyTensor {
                 ));
             }
         }
+        use quabla_core::tensor_ir::{AdamCoefficients, AdamOrder, F64Arith};
+
         let (learning_rate, b1, b2, eps, correction1, correction2) = hyperparameters;
         if correction1 == 0.0 || correction2 == 0.0 {
             return Err(PyValueError::new_err(
                 "division by zero scalar is not supported",
             ));
         }
+        // The shared canonical rule in float64; the corrections are the
+        // caller's (Python's `1 - b ** t`), `1 - beta` is formed in float64.
+        let coefficients = AdamCoefficients::with_corrections(
+            learning_rate,
+            b1,
+            b2,
+            eps,
+            correction1,
+            correction2,
+            weight_decay,
+        );
+        let mut arith = F64Arith::default();
         let mut parameters = Vec::with_capacity(self.data.len());
         let mut moments = Vec::with_capacity(self.data.len());
         let mut variances = Vec::with_capacity(self.data.len());
@@ -1585,19 +1612,22 @@ impl PyTensor {
             .zip(first.data.iter())
             .zip(second.data.iter())
         {
-            let m = m * b1 + gradient * (1.0 - b1);
-            let v = v * b2 + (gradient * gradient) * (1.0 - b2);
-            let denominator = (v / correction2).sqrt() + eps;
-            if denominator == 0.0 {
+            let (parameter, m, v) = arith.adam(
+                AdamOrder::Canonical,
+                &coefficients,
+                parameter,
+                gradient,
+                m,
+                v,
+            );
+            // The corrections are nonzero, so a zero divisor is a zero
+            // denominator `sqrt(v / c2) + eps`.
+            if arith.zero_divisor {
                 return Err(PyValueError::new_err(
                     "failed to evaluate tensor /: division by zero is not supported",
                 ));
             }
-            let mut delta = (m / correction1) / denominator;
-            if weight_decay != 0.0 {
-                delta += weight_decay * parameter;
-            }
-            parameters.push(self.dtype.round(parameter - delta * learning_rate));
+            parameters.push(self.dtype.round(parameter));
             moments.push(m);
             variances.push(v);
         }

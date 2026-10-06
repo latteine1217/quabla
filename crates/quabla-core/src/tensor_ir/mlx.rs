@@ -17,9 +17,10 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
-    sqrt_derivative_coefficient, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor,
-    TensorBackend, TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend,
-    TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
+    adam_element, sgd_element, sqrt_derivative_coefficient, AdamArith, AdamCoefficients, AdamOrder,
+    BinaryMathKind, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, TensorBackend,
+    TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend, TensorExecutionPlan,
+    TensorExtremum, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
 };
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
@@ -317,6 +318,7 @@ impl MlxAdamPlan {
                     .map_err(|error| format!("MLX gradient clipping failed: {error}"))?,
                 None => gradient,
             };
+            let mut arith = MlxArith { stream: &stream };
             let DeviceUpdateRule::Adam {
                 beta1,
                 beta2,
@@ -324,10 +326,9 @@ impl MlxAdamPlan {
                 weight_decay,
             } = self.config.rule
             else {
-                let updated_parameter = gradient
-                    .multiply_device(&learning_rate, &stream)
-                    .and_then(|step| parameter.subtract_device(&step, &stream))
-                    .map_err(|error| format!("MLX SGD parameter update failed: {error}"))?;
+                let updated_parameter =
+                    sgd_element(&mut arith, &learning_rate, &parameter, &gradient)
+                        .map_err(|error| format!("MLX SGD parameter update failed: {error}"))?;
                 self.retained_inputs
                     .values
                     .insert(parameter_name.clone(), updated_parameter);
@@ -358,68 +359,27 @@ impl MlxAdamPlan {
                 .step
                 .checked_add(1)
                 .ok_or_else(|| "MLX Adam step counter overflow".to_string())?;
-            // `1 - beta` and the bias corrections are formed from the float64
-            // betas and rounded once, as the host computes them; `1 - beta2`
-            // of the float32-rounded 0.999 is 1.3e-5 relative off.
-            let (correction1, correction2) =
-                DeviceOptimizerConfig::adam_corrections(beta1, beta2, state.step);
-            let correction1 = Array::from_f32(correction1 as f32);
-            let correction2 = Array::from_f32(correction2 as f32);
-            let one_minus_beta1 = Array::from_f32((1.0 - beta1) as f32);
-            let one_minus_beta2 = Array::from_f32((1.0 - beta2) as f32);
-            let (beta1, beta2, epsilon, weight_decay) = (
-                beta1 as f32,
-                beta2 as f32,
-                epsilon as f32,
-                weight_decay as f32,
-            );
-            let first_moment = state
-                .first_moment
-                .multiply_device(Array::from_f32(beta1), &stream)
-                .and_then(|value| {
-                    gradient
-                        .multiply_device(&one_minus_beta1, &stream)
-                        .and_then(|scaled_gradient| value.add_device(&scaled_gradient, &stream))
-                })
-                .map_err(|error| format!("MLX Adam first moment update failed: {error}"))?;
-            let second_moment = state
-                .second_moment
-                .multiply_device(Array::from_f32(beta2), &stream)
-                .and_then(|value| {
-                    gradient
-                        .multiply_device(&gradient, &stream)
-                        .and_then(|squared_gradient| {
-                            squared_gradient.multiply_device(&one_minus_beta2, &stream)
-                        })
-                        .and_then(|scaled_gradient| value.add_device(&scaled_gradient, &stream))
-                })
-                .map_err(|error| format!("MLX Adam second moment update failed: {error}"))?;
-            let direction = first_moment
-                .divide_device(&correction1, &stream)
-                .and_then(|first| {
-                    second_moment
-                        .divide_device(&correction2, &stream)
-                        .and_then(|second| second.sqrt_device(&stream))
-                        .and_then(|denominator| {
-                            denominator.add_device(Array::from_f32(epsilon), &stream)
-                        })
-                        .and_then(|denominator| first.divide_device(&denominator, &stream))
-                })
-                .map_err(|error| format!("MLX Adam update failed: {error}"))?;
-            // AdamW's decoupled decay with the pre-update parameter; zero keeps
-            // the Adam expression exactly, as `0 * inf` would introduce a NaN.
-            let direction = if weight_decay != 0.0 {
-                parameter
-                    .multiply_device(Array::from_f32(weight_decay), &stream)
-                    .and_then(|decay| direction.add_device(&decay, &stream))
-                    .map_err(|error| format!("MLX AdamW decay failed: {error}"))?
-            } else {
-                direction
-            };
-            let updated_parameter = direction
-                .multiply_device(&learning_rate, &stream)
-                .and_then(|update| parameter.subtract_device(&update, &stream))
-                .map_err(|error| format!("MLX Adam parameter update failed: {error}"))?;
+            // The coefficients are formed in float64, as the host forms them,
+            // and rounded once to float32 scalars.
+            let coefficients = AdamCoefficients::new(
+                self.config.learning_rate,
+                beta1,
+                beta2,
+                epsilon,
+                weight_decay,
+                state.step,
+            )
+            .map(|value| Array::from_f32(value as f32));
+            let (updated_parameter, first_moment, second_moment) = adam_element(
+                &mut arith,
+                AdamOrder::Canonical,
+                &coefficients,
+                &parameter,
+                &gradient,
+                &state.first_moment,
+                &state.second_moment,
+            )
+            .map_err(|error| format!("MLX Adam update failed: {error}"))?;
             state.first_moment = first_moment;
             state.second_moment = second_moment;
             self.retained_inputs
@@ -476,6 +436,50 @@ impl MlxAdamPlan {
                 *dtype,
             ),
         )
+    }
+}
+
+/// MLX arithmetic of the shared optimizer rules: each operation is one lazy
+/// float32 array operation on `stream`, so a step stays one device graph.
+/// Coefficients are float32 scalar arrays.
+struct MlxArith<'a> {
+    stream: &'a StreamOrDevice,
+}
+
+impl AdamArith for MlxArith<'_> {
+    type Value = Array;
+    type Error = mlx_rs::error::Exception;
+
+    fn constant(&mut self, value: f64) -> Result<Array, Self::Error> {
+        Ok(Array::from_f32(value as f32))
+    }
+    fn add(&mut self, lhs: &Array, rhs: &Array) -> Result<Array, Self::Error> {
+        lhs.add_device(rhs, self.stream)
+    }
+    fn sub(&mut self, lhs: &Array, rhs: &Array) -> Result<Array, Self::Error> {
+        lhs.subtract_device(rhs, self.stream)
+    }
+    fn mul(&mut self, lhs: &Array, rhs: &Array) -> Result<Array, Self::Error> {
+        lhs.multiply_device(rhs, self.stream)
+    }
+    fn div(&mut self, lhs: &Array, rhs: &Array) -> Result<Array, Self::Error> {
+        lhs.divide_device(rhs, self.stream)
+    }
+    fn sqrt(&mut self, value: &Array) -> Result<Array, Self::Error> {
+        value.sqrt_device(self.stream)
+    }
+    fn if_nonzero(
+        &mut self,
+        flag: &Array,
+        value: Array,
+        update: impl FnOnce(&mut Self, &Array) -> Result<Array, Self::Error>,
+    ) -> Result<Array, Self::Error> {
+        // The flag is a host coefficient array; reading it evaluates no graph.
+        if flag.try_item::<f32>()? != 0.0 {
+            update(self, &value)
+        } else {
+            Ok(value)
+        }
     }
 }
 
@@ -1107,11 +1111,6 @@ impl MlxBackend {
                         .cloned()
                         .ok_or_else(|| format!("MLX Scan VJP JVP has no gradient for {name:?}"))
                 }
-                TensorOp::Tanh { input } => ops::tanh_device(mlx_value(&values, *input)?, &stream)
-                    .map_err(|error| error.to_string()),
-                TensorOp::Exp { input } => mlx_value(&values, *input)?
-                    .exp_device(&stream)
-                    .map_err(|error| error.to_string()),
                 TensorOp::Sqrt { input } => mlx_value(&values, *input)?
                     .sqrt_device(&stream)
                     .map_err(|error| error.to_string()),
@@ -1141,65 +1140,8 @@ impl MlxBackend {
                     ops::r#where_device(&origin, &zero, &domain, &stream)
                         .map_err(|error| error.to_string())
                 }
-                TensorOp::Sin { input } => mlx_value(&values, *input)?
-                    .sin_device(&stream)
-                    .map_err(|error| error.to_string()),
-                TensorOp::Cos { input } => mlx_value(&values, *input)?
-                    .cos_device(&stream)
-                    .map_err(|error| error.to_string()),
-                TensorOp::Log { input } => mlx_value(&values, *input)?
-                    .log_device(&stream)
-                    .map_err(|error| error.to_string()),
-                TensorOp::Log1p { input } => mlx_value(&values, *input)?
-                    .log1p_device(&stream)
-                    .map_err(|error| error.to_string()),
-                // MLX's own expm1 is off by up to several hundred float32 ulp, and
-                // exp(x) - 1 cancels near zero. Kahan's (u - 1) * x / log(u) with
-                // u = exp(x) keeps both within a few ulp: it is used for |x| < 0.5,
-                // where exp(x) - 1 loses precision, and returns x where u rounds to
-                // 1. Elsewhere exp(x) - 1 is accurate and handles +-inf, overflow
-                // and NaN.
-                TensorOp::Expm1 { input } => {
-                    let input = mlx_value(&values, *input)?;
-                    let fail = |error: mlx_rs::error::Exception| error.to_string();
-                    let one = Array::from_f32(1.0);
-                    let half = Array::from_f32(0.5);
-                    let two = Array::from_f32(2.0);
-                    let zero = Array::from_f32(0.0);
-                    let exp = input.exp_device(&stream).map_err(fail)?;
-                    let shifted = exp.subtract_device(&one, &stream).map_err(fail)?;
-                    let small = input
-                        .abs_device(&stream)
-                        .and_then(|magnitude| magnitude.lt_device(&half, &stream))
-                        .map_err(fail)?;
-                    let exact = shifted.eq_device(&zero, &stream).map_err(fail)?;
-                    let log = ops::r#where_device(&small, &exp, &two, &stream)
-                        .and_then(|base| base.log_device(&stream))
-                        .map_err(fail)?;
-                    let safe_log =
-                        ops::r#where_device(&exact, &one, &log, &stream).map_err(fail)?;
-                    let kahan = shifted
-                        .multiply_device(input, &stream)
-                        .and_then(|product| product.divide_device(&safe_log, &stream))
-                        .map_err(fail)?;
-                    let near_zero =
-                        ops::r#where_device(&exact, input, &kahan, &stream).map_err(fail)?;
-                    ops::r#where_device(&small, &near_zero, &shifted, &stream).map_err(fail)
-                }
-                TensorOp::Erf { input } => ops::erf_device(mlx_value(&values, *input)?, &stream)
-                    .map_err(|error| error.to_string()),
-                TensorOp::Erfc { input } => mlx_erfc(mlx_value(&values, *input)?, &stream)
-                    .map_err(|error| error.to_string()),
-                TensorOp::Atan2 { y, x } => {
-                    ops::atan2_device(mlx_value(&values, *y)?, mlx_value(&values, *x)?, &stream)
-                        .map_err(|error| error.to_string())
-                }
                 TensorOp::UnaryMath { input, kind } => {
                     mlx_unary_math(mlx_value(&values, *input)?, *kind, &stream)
-                        .map_err(|error| error.to_string())
-                }
-                TensorOp::Fmod { x, y } => {
-                    mlx_fmod(mlx_value(&values, *x)?, mlx_value(&values, *y)?, &stream)
                         .map_err(|error| error.to_string())
                 }
                 // AD happens on the IR before lowering, so the value is all
@@ -1229,9 +1171,13 @@ impl MlxBackend {
                         .power_device(&exponent, &stream)
                         .map_err(|error| error.to_string())
                 }
-                TensorOp::Pow { base, exponent } => mlx_value(&values, *base)?
-                    .power_device(mlx_value(&values, *exponent)?, &stream)
-                    .map_err(|error| error.to_string()),
+                TensorOp::BinaryMath { lhs, rhs, kind } => mlx_binary_math(
+                    mlx_value(&values, *lhs)?,
+                    mlx_value(&values, *rhs)?,
+                    *kind,
+                    &stream,
+                )
+                .map_err(|error| error.to_string()),
                 TensorOp::Matmul { lhs, rhs } => mlx_value(&values, *lhs)?
                     .matmul_device(mlx_value(&values, *rhs)?, &stream)
                     .map_err(|error| error.to_string()),
@@ -1468,9 +1414,7 @@ fn mlx_fori_value_and_vjp(
     external_captures: &BTreeMap<String, Array>,
     output_cotangent: Array,
 ) -> Result<MlxForiVjpEvaluation, String> {
-    let vjp = loop_plan.mlx_vjp.as_ref().ok_or_else(|| {
-        "MLX Fori VJP requires a body with supported symbolic reverse lowering".to_string()
-    })?;
+    let vjp = loop_plan.vjp_plan()?;
     let stream = StreamOrDevice::gpu();
     let steps = loop_plan.upper - loop_plan.lower;
     let evaluate = |offset, carry| {
@@ -1518,7 +1462,6 @@ fn mlx_fori_value_and_vjp(
                 .map(|value| (name.clone(), value))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let output_ids = vjp.gradient_node_ids.values().copied().collect::<Vec<_>>();
     loop {
         let block = if let Some(checkpoints) = &mut checkpoints {
             checkpoints.pop_block(evaluate)?
@@ -1539,27 +1482,17 @@ fn mlx_fori_value_and_vjp(
                     (loop_plan.lower + offset) as f64,
                 )?)?,
             );
-            body_inputs.insert(vjp.cotangent_name.clone(), carry_gradient);
-            let gradients = backend.execute_arrays_with_retained(
-                &vjp.plan,
-                &output_ids,
-                &BTreeMap::new(),
-                &body_inputs,
-            )?;
-            let gradients = vjp
-                .gradient_node_ids
-                .keys()
-                .cloned()
-                .zip(gradients)
-                .collect::<BTreeMap<_, _>>();
+            let gradients =
+                mlx_region_vjp_gradients(backend, vjp, &body_inputs, vec![carry_gradient])?;
             carry_gradient = gradients
                 .get(&loop_plan.carry_name)
                 .cloned()
                 .ok_or_else(|| "MLX Fori VJP body has no carry gradient".to_string())?;
             for name in loop_plan.external_captures.keys() {
-                let contribution = gradients
-                    .get(name)
-                    .ok_or_else(|| format!("MLX Fori VJP has no gradient for capture {name:?}"))?;
+                // A `bool` capture has no gradient and contributes zero.
+                let Some(contribution) = gradients.get(name) else {
+                    continue;
+                };
                 let accumulated = external_gradients
                     .get_mut(name)
                     .ok_or_else(|| format!("MLX Fori VJP gradient {name:?} is missing"))?;
@@ -1589,37 +1522,7 @@ fn mlx_fori_jvp(
     external_captures: &BTreeMap<String, Array>,
     external_tangents: &BTreeMap<String, Array>,
 ) -> Result<Array, String> {
-    let body = loop_plan.body.plan.as_ir();
-    let mut tangent_names = BTreeMap::new();
-    for (index, name) in loop_plan.body.captures.keys().enumerate() {
-        if name == &loop_plan.index_name {
-            continue;
-        }
-        let mut tangent_name = format!("__quabla_mlx_fori_jvp_tangent_{index}");
-        while loop_plan.body.captures.contains_key(&tangent_name)
-            || tangent_names
-                .values()
-                .any(|candidate| candidate == &tangent_name)
-        {
-            tangent_name.push('_');
-        }
-        tangent_names.insert(name.clone(), tangent_name);
-    }
-    let forward = body.symbolic_jvp_with_seed(
-        loop_plan.body.plan.output_node_id,
-        |graph, name, value, shape| {
-            tangent_names
-                .get(name)
-                .map(|tangent_name| {
-                    let dtype = graph.node_dtype(value)?;
-                    graph.input_typed(tangent_name.clone(), shape.to_vec(), dtype)
-                })
-                .transpose()
-        },
-    )?;
-    let (forward_plan, outputs) = forward
-        .graph
-        .compile_cpu_many(&[forward.value, forward.tangent])?;
+    let forward = loop_plan.forward_jvp_plan()?;
     let mut carry = initial_carry;
     let mut carry_tangent = initial_tangent;
     for index in loop_plan.lower..loop_plan.upper {
@@ -1629,7 +1532,7 @@ fn mlx_fori_jvp(
             loop_plan.index_name.clone(),
             mlx_array_from_dynamic(&DynamicTensor::filled(vec![], index as f64)?)?,
         );
-        for (name, tangent_name) in &tangent_names {
+        for (name, tangent_name) in &forward.tangent_names {
             let tangent = if name == &loop_plan.carry_name {
                 carry_tangent.clone()
             } else {
@@ -1641,8 +1544,8 @@ fn mlx_fori_jvp(
             inputs.insert(tangent_name.clone(), tangent);
         }
         let outputs = backend.execute_arrays_with_retained(
-            &forward_plan,
-            &outputs,
+            &forward.plan,
+            &forward.plan.output_node_ids,
             &BTreeMap::new(),
             &inputs,
         )?;
@@ -1671,6 +1574,8 @@ fn mlx_fori_vjp_jvp(
 ) -> Result<BTreeMap<String, Array>, String> {
     let stream = StreamOrDevice::gpu();
     let loop_plan = &plan.loop_plan;
+    let forward = loop_plan.forward_jvp_plan()?;
+    let vjp = loop_plan.vjp_plan()?;
     let steps = loop_plan.upper - loop_plan.lower;
     let evaluate = |offset, (carry, tangent): (Array, Array)| {
         let mut inputs = external_captures.clone();
@@ -1682,7 +1587,7 @@ fn mlx_fori_vjp_jvp(
                 (loop_plan.lower + offset) as f64,
             )?)?,
         );
-        for (name, tangent_name) in &plan.mlx_forward_jvp.tangent_names {
+        for (name, tangent_name) in &forward.tangent_names {
             let value = if name == &loop_plan.carry_name {
                 tangent.clone()
             } else {
@@ -1694,11 +1599,8 @@ fn mlx_fori_vjp_jvp(
             inputs.insert(tangent_name.clone(), value);
         }
         let values = backend.execute_arrays_with_retained(
-            &plan.mlx_forward_jvp.plan,
-            &[
-                plan.mlx_forward_jvp.value_node_id,
-                plan.mlx_forward_jvp.tangent_node_id,
-            ],
+            &forward.plan,
+            &forward.plan.output_node_ids,
             &BTreeMap::new(),
             &inputs,
         )?;
@@ -1759,15 +1661,8 @@ fn mlx_fori_vjp_jvp(
                     (loop_plan.lower + offset) as f64,
                 )?)?,
             );
-            let body_gradients = mlx_region_vjp_gradients(
-                backend,
-                loop_plan.mlx_vjp.as_ref().ok_or_else(|| {
-                    "MLX Fori VJP JVP requires a body with supported symbolic reverse lowering"
-                        .to_string()
-                })?,
-                &inputs,
-                carry_cotangent.clone(),
-            )?;
+            let body_gradients =
+                mlx_region_vjp_gradients(backend, vjp, &inputs, vec![carry_cotangent.clone()])?;
             let mut jvp_inputs = inputs;
             jvp_inputs.insert(plan.cotangent_name.clone(), carry_cotangent);
             for (name, tangent_name) in &plan.tangent_names {
@@ -1864,7 +1759,7 @@ fn mlx_scan_vjp_jvp(
                 (scan_plan.lower + offset) as f64,
             )?)?,
         );
-        for (name, tangent_name) in &plan.mlx_forward_jvp.tangent_names {
+        for (name, tangent_name) in &plan.forward_jvp.tangent_names {
             let value = if name == &scan_plan.carry_name {
                 tangent.clone()
             } else {
@@ -1876,11 +1771,8 @@ fn mlx_scan_vjp_jvp(
             inputs.insert(tangent_name.clone(), value);
         }
         let values = backend.execute_arrays_with_retained(
-            &plan.mlx_forward_jvp.plan,
-            &[
-                plan.mlx_forward_jvp.value_node_id,
-                plan.mlx_forward_jvp.tangent_node_id,
-            ],
+            &plan.forward_jvp.plan,
+            &plan.forward_jvp.plan.output_node_ids,
             &BTreeMap::new(),
             &inputs,
         )?;
@@ -1910,10 +1802,7 @@ fn mlx_scan_vjp_jvp(
         full_tape = Some(states);
     }
 
-    let vjp = scan_plan.mlx_vjp.as_ref().ok_or_else(|| {
-        "MLX Scan VJP JVP requires body outputs with supported symbolic reverse lowering"
-            .to_string()
-    })?;
+    let vjp = scan_plan.vjp_plan()?;
     let output_step_shape = scan_plan.body.output_shapes()[1].clone();
     let mut carry_cotangent = final_carry_cotangent;
     let mut carry_cotangent_tangent = final_carry_cotangent_tangent;
@@ -1958,13 +1847,11 @@ fn mlx_scan_vjp_jvp(
                 &output_step_shape,
                 &stream,
             )?;
-            let carry_gradients =
-                mlx_region_vjp_gradients(backend, &vjp.carry, &inputs, carry_cotangent.clone())?;
-            let output_gradients = mlx_region_vjp_gradients(
+            let primal_gradients = mlx_region_vjp_gradients(
                 backend,
-                &vjp.output,
+                vjp,
                 &inputs,
-                output_step_cotangent.clone(),
+                vec![carry_cotangent.clone(), output_step_cotangent.clone()],
             )?;
             let mut jvp_inputs = inputs;
             jvp_inputs.insert(plan.carry_cotangent_name.clone(), carry_cotangent);
@@ -2015,16 +1902,10 @@ fn mlx_scan_vjp_jvp(
                     .add_device(&contribution, &stream)
                     .map_err(|error| error.to_string())?;
             }
-            carry_cotangent = carry_gradients
+            carry_cotangent = primal_gradients
                 .get(&scan_plan.carry_name)
-                .ok_or_else(|| "MLX Scan carry VJP has no carry gradient".to_string())?
-                .add_device(
-                    output_gradients
-                        .get(&scan_plan.carry_name)
-                        .ok_or_else(|| "MLX Scan output VJP has no carry gradient".to_string())?,
-                    &stream,
-                )
-                .map_err(|error| error.to_string())?;
+                .cloned()
+                .ok_or_else(|| "MLX Scan VJP has no carry gradient".to_string())?;
         }
         if checkpoints.is_some() {
             transforms::eval(
@@ -2047,9 +1928,7 @@ fn mlx_scan_value_and_vjp(
     final_carry_cotangent: Array,
     output_cotangent: Array,
 ) -> Result<MlxScanVjpEvaluation, String> {
-    let vjp = scan_plan.mlx_vjp.as_ref().ok_or_else(|| {
-        "MLX Scan VJP requires body outputs with supported symbolic reverse lowering".to_string()
-    })?;
+    let vjp = scan_plan.vjp_plan()?;
     let stream = StreamOrDevice::gpu();
     let steps = scan_plan.upper - scan_plan.lower;
     let evaluate = |offset, carry| {
@@ -2125,34 +2004,27 @@ fn mlx_scan_value_and_vjp(
                 &output_step_shape,
                 &stream,
             )?;
-            let carry_gradients =
-                mlx_region_vjp_gradients(backend, &vjp.carry, &body_inputs, carry_gradient)?;
-            let output_gradients =
-                mlx_region_vjp_gradients(backend, &vjp.output, &body_inputs, output_gradient)?;
-            let carry_from_carry = carry_gradients
+            // One joint VJP of both body outputs, as on the CPU and the CUDA host loop.
+            let gradients = mlx_region_vjp_gradients(
+                backend,
+                vjp,
+                &body_inputs,
+                vec![carry_gradient, output_gradient],
+            )?;
+            carry_gradient = gradients
                 .get(&scan_plan.carry_name)
-                .ok_or_else(|| "MLX Scan carry VJP has no carry gradient".to_string())?;
-            let carry_from_output = output_gradients
-                .get(&scan_plan.carry_name)
-                .ok_or_else(|| "MLX Scan output VJP has no carry gradient".to_string())?;
-            carry_gradient = carry_from_carry
-                .add_device(carry_from_output, &stream)
-                .map_err(|error| error.to_string())?;
+                .cloned()
+                .ok_or_else(|| "MLX Scan VJP has no carry gradient".to_string())?;
             for name in scan_plan.external_captures.keys() {
-                let carry_contribution = carry_gradients
-                    .get(name)
-                    .ok_or_else(|| format!("MLX Scan carry VJP has no gradient for {name:?}"))?;
-                let output_contribution = output_gradients
-                    .get(name)
-                    .ok_or_else(|| format!("MLX Scan output VJP has no gradient for {name:?}"))?;
-                let contribution = carry_contribution
-                    .add_device(output_contribution, &stream)
-                    .map_err(|error| error.to_string())?;
+                // A `bool` capture has no gradient and contributes zero.
+                let Some(contribution) = gradients.get(name) else {
+                    continue;
+                };
                 let accumulated = external_gradients
                     .get_mut(name)
                     .ok_or_else(|| format!("MLX Scan VJP gradient {name:?} is missing"))?;
                 *accumulated = accumulated
-                    .add_device(&contribution, &stream)
+                    .add_device(contribution, &stream)
                     .map_err(|error| error.to_string())?;
             }
         }
@@ -2168,14 +2040,17 @@ fn mlx_scan_value_and_vjp(
     })
 }
 
+/// Runs a loop body's shared symbolic VJP with one cotangent per seeded output.
 fn mlx_region_vjp_gradients(
     backend: &MlxBackend,
-    vjp: &super::TensorMlxVjpPlan,
+    vjp: &super::TensorRegionVjpPlan,
     body_inputs: &BTreeMap<String, Array>,
-    cotangent: Array,
+    cotangents: Vec<Array>,
 ) -> Result<BTreeMap<String, Array>, String> {
     let mut inputs = body_inputs.clone();
-    inputs.insert(vjp.cotangent_name.clone(), cotangent);
+    for (name, cotangent) in vjp.cotangent_names.iter().zip(cotangents) {
+        inputs.insert(name.clone(), cotangent);
+    }
     let output_ids = vjp.gradient_node_ids.values().copied().collect::<Vec<_>>();
     let values =
         backend.execute_arrays_with_retained(&vjp.plan, &output_ids, &BTreeMap::new(), &inputs)?;
@@ -2340,16 +2215,26 @@ fn mlx_erfc(input: &Array, stream: &StreamOrDevice) -> Result<Array, mlx_rs::err
     ops::r#where_device(&negative, &reflected, &positive, stream)
 }
 
-/// `kind(input)` with MLX's own op for every kind except `cbrt`, which MLX
-/// lacks (see [`mlx_cbrt`]). The MLX kernels are compiled without fast math
-/// and call Metal's `precise` transcendental functions; `round` is Metal's
-/// `rint`, halfway cases to even.
+/// `kind(input)` with MLX's own op for every kind except `expm1`, `erfc`
+/// and `cbrt` (see [`mlx_expm1`], [`mlx_erfc`], [`mlx_cbrt`]). The MLX
+/// kernels are compiled without fast math and call Metal's `precise`
+/// transcendental functions; `round` is Metal's `rint`, halfway cases to
+/// even.
 fn mlx_unary_math(
     input: &Array,
     kind: UnaryMathKind,
     stream: &StreamOrDevice,
 ) -> Result<Array, mlx_rs::error::Exception> {
     match kind {
+        UnaryMathKind::Exp => input.exp_device(stream),
+        UnaryMathKind::Log => input.log_device(stream),
+        UnaryMathKind::Log1p => input.log1p_device(stream),
+        UnaryMathKind::Expm1 => mlx_expm1(input, stream),
+        UnaryMathKind::Erf => ops::erf_device(input, stream),
+        UnaryMathKind::Erfc => mlx_erfc(input, stream),
+        UnaryMathKind::Sin => input.sin_device(stream),
+        UnaryMathKind::Cos => input.cos_device(stream),
+        UnaryMathKind::Tanh => ops::tanh_device(input, stream),
         UnaryMathKind::Tan => ops::tan_device(input, stream),
         UnaryMathKind::Arcsin => ops::asin_device(input, stream),
         UnaryMathKind::Arccos => ops::acos_device(input, stream),
@@ -2366,6 +2251,47 @@ fn mlx_unary_math(
         UnaryMathKind::Ceil => ops::ceil_device(input, stream),
         UnaryMathKind::Round => ops::round_device(input, 0, stream),
     }
+}
+
+/// `kind(lhs, rhs)` with MLX's own op, except `fmod` (see [`mlx_fmod`]).
+fn mlx_binary_math(
+    lhs: &Array,
+    rhs: &Array,
+    kind: BinaryMathKind,
+    stream: &StreamOrDevice,
+) -> Result<Array, mlx_rs::error::Exception> {
+    match kind {
+        BinaryMathKind::Pow => lhs.power_device(rhs, stream),
+        BinaryMathKind::Atan2 => ops::atan2_device(lhs, rhs, stream),
+        BinaryMathKind::Fmod => mlx_fmod(lhs, rhs, stream),
+    }
+}
+
+/// `exp(x) - 1` on MLX. MLX's own expm1 is off by up to several hundred
+/// float32 ulp, and `exp(x) - 1` cancels near zero. Kahan's
+/// `(u - 1) * x / log(u)` with `u = exp(x)` keeps both within a few ulp: it
+/// is used for `|x| < 0.5`, where `exp(x) - 1` loses precision, and returns
+/// `x` where `u` rounds to 1. Elsewhere `exp(x) - 1` is accurate and handles
+/// +-inf, overflow and NaN.
+fn mlx_expm1(input: &Array, stream: &StreamOrDevice) -> Result<Array, mlx_rs::error::Exception> {
+    let one = Array::from_f32(1.0);
+    let half = Array::from_f32(0.5);
+    let two = Array::from_f32(2.0);
+    let zero = Array::from_f32(0.0);
+    let exp = input.exp_device(stream)?;
+    let shifted = exp.subtract_device(&one, stream)?;
+    let small = input
+        .abs_device(stream)
+        .and_then(|magnitude| magnitude.lt_device(&half, stream))?;
+    let exact = shifted.eq_device(&zero, stream)?;
+    let log =
+        ops::r#where_device(&small, &exp, &two, stream).and_then(|base| base.log_device(stream))?;
+    let safe_log = ops::r#where_device(&exact, &one, &log, stream)?;
+    let kahan = shifted
+        .multiply_device(input, stream)
+        .and_then(|product| product.divide_device(&safe_log, stream))?;
+    let near_zero = ops::r#where_device(&exact, input, &kahan, stream)?;
+    ops::r#where_device(&small, &near_zero, &shifted, stream)
 }
 
 /// The real cube root on MLX, which has no `cbrt`: `y = |x|^(1/3)` from
@@ -2512,26 +2438,15 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Cholesky { .. } => "cholesky",
         TensorOp::CholeskyAd { .. } => "cholesky_ad",
         TensorOp::Triangular { .. } => "triangular",
-        TensorOp::Tanh { .. } => "tanh",
-        TensorOp::Exp { .. } => "exp",
         TensorOp::Sqrt { .. } => "sqrt",
         TensorOp::SqrtDerivative { .. } => "sqrt_derivative",
         TensorOp::Reshape { .. } => "reshape",
         TensorOp::Mean { .. } => "mean",
         TensorOp::MeanAxis { .. } => "mean_axis",
-        TensorOp::Sin { .. } => "sin",
-        TensorOp::Cos { .. } => "cos",
         TensorOp::Powi { .. } => "powi",
-        TensorOp::Pow { .. } => "pow",
+        TensorOp::BinaryMath { kind, .. } => kind.name(),
         TensorOp::Transpose { .. } => "transpose",
-        TensorOp::Log { .. } => "log",
-        TensorOp::Log1p { .. } => "log1p",
-        TensorOp::Expm1 { .. } => "expm1",
-        TensorOp::Erf { .. } => "erf",
-        TensorOp::Erfc { .. } => "erfc",
-        TensorOp::Atan2 { .. } => "atan2",
         TensorOp::UnaryMath { kind, .. } => kind.name(),
-        TensorOp::Fmod { .. } => "fmod",
         TensorOp::StopGradient { .. } => "stop_gradient",
         TensorOp::Custom { .. } => "custom",
         TensorOp::CumSum { .. } => "cumsum",

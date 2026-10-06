@@ -11,11 +11,14 @@ pub use linalg::LinalgKind;
 mod custom;
 pub use custom::{TensorCustomRule, TensorCustomTangent};
 mod device_optimizer;
-pub use device_optimizer::{DeviceOptimizerConfig, DeviceUpdateRule};
+pub use device_optimizer::{
+    adam_element, sgd_element, AdamArith, AdamCoefficients, AdamOrder, AdamUpdate,
+    DeviceOptimizerConfig, DeviceUpdateRule, F64Arith,
+};
 mod eager;
 pub use eager::{EagerKernel, EagerOperand};
 mod elementwise;
-pub use elementwise::UnaryMathKind;
+pub use elementwise::{BinaryMathKind, UnaryMathKind};
 mod extremum;
 pub use extremum::TensorExtremum;
 mod host_storage;
@@ -735,12 +738,6 @@ enum TensorOp {
         input: TensorNodeId,
         kind: LinalgKind,
     },
-    Tanh {
-        input: TensorNodeId,
-    },
-    Exp {
-        input: TensorNodeId,
-    },
     Sqrt {
         input: TensorNodeId,
     },
@@ -758,76 +755,31 @@ enum TensorOp {
         input: TensorNodeId,
         axis: usize,
     },
-    Sin {
-        input: TensorNodeId,
-    },
-    Cos {
-        input: TensorNodeId,
-    },
     Powi {
         input: TensorNodeId,
         exponent: u32,
-    },
-    /// Elementwise `base ** exponent` with `f64::powf` semantics and
-    /// broadcasting. Its derivative conventions at `base <= 0` are documented
-    /// on `DynamicTensor::pow_base_derivative`.
-    Pow {
-        base: TensorNodeId,
-        exponent: TensorNodeId,
     },
     Transpose {
         input: TensorNodeId,
         axes: Vec<usize>,
     },
-    Log {
-        input: TensorNodeId,
-    },
-    /// Elementwise `ln(1 + x)`, accurate for small `|x|`. Unlike `Log`, it
-    /// follows IEEE semantics on every backend and never raises: `-1` maps to
-    /// `-inf` and `x < -1` to `NaN`. Its derivative is `1 / (1 + x)`.
-    Log1p {
-        input: TensorNodeId,
-    },
-    /// Elementwise `exp(x) - 1`, accurate for small `|x|`, with IEEE
-    /// semantics. Its derivative is `exp(x)`.
-    Expm1 {
-        input: TensorNodeId,
-    },
-    /// Elementwise error function (the f64 musl `erf` of the `libm` crate on
-    /// the CPU). Its derivative is `2 / sqrt(pi) * exp(-x^2)`.
-    Erf {
-        input: TensorNodeId,
-    },
-    /// Elementwise complementary error function `1 - erf(x)` (the f64 musl
-    /// `erfc` of the `libm` crate on the CPU), which keeps full relative
-    /// accuracy where `erf(x)` is close to one. Its derivative is
-    /// `-2 / sqrt(pi) * exp(-x^2)`.
-    Erfc {
-        input: TensorNodeId,
-    },
-    /// Elementwise four-quadrant `atan2(y, x)` with `f64::atan2` semantics and
-    /// broadcasting. The partials `x / (x^2 + y^2)` and `-y / (x^2 + y^2)`
-    /// are formed after scaling by `|x| + |y|`, so they neither overflow nor
-    /// underflow, and are defined as `0` where `|x| + |y|` is `0` or
-    /// infinite; see `atan2_derivatives`.
-    Atan2 {
-        y: TensorNodeId,
-        x: TensorNodeId,
-    },
     /// Elementwise `kind(input)` for the math functions of
-    /// [`UnaryMathKind`] (`tan`, the inverse trigonometric and hyperbolic
-    /// functions, `log2`, `cbrt`, `floor`, ...), with IEEE semantics: NaN
-    /// outside the domain, never an error.
+    /// [`UnaryMathKind`] (`exp`, `log`, `sin`, `tanh`, `erf`, the inverse
+    /// trigonometric and hyperbolic functions, `cbrt`, `floor`, ...), with
+    /// IEEE semantics: NaN outside the domain, never an error. Every rule of
+    /// a kind (value, derivatives, CUDA and MLX lowering, folding) lives in
+    /// `elementwise.rs`.
     UnaryMath {
         input: TensorNodeId,
         kind: UnaryMathKind,
     },
-    /// Elementwise C `fmod(x, y)` (the result has the sign of `x`) with
-    /// broadcasting. Its partials are `1` and `-trunc(x / y)`; see
-    /// `TensorIr::fmod`.
-    Fmod {
-        x: TensorNodeId,
-        y: TensorNodeId,
+    /// Elementwise `kind(lhs, rhs)` with broadcasting for the math
+    /// functions of [`BinaryMathKind`] (`pow`, `atan2`, `fmod`), whose rules
+    /// live in `elementwise.rs` like those of `UnaryMath`.
+    BinaryMath {
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+        kind: BinaryMathKind,
     },
     /// The identity on values whose derivative is zero in every AD mode: its
     /// JVP tangent is zero and its VJP sends no cotangent to `input`.
@@ -1130,8 +1082,7 @@ pub struct TensorForiExecutionPlan {
     carry_name: String,
     index_name: String,
     external_captures: BTreeMap<String, Vec<usize>>,
-    #[cfg(feature = "mlx")]
-    mlx_vjp: Option<TensorMlxVjpPlan>,
+    derivatives: Arc<TensorLoopDerivatives>,
 }
 
 /// A loop with a traced termination predicate (`while_loop`).
@@ -1151,14 +1102,40 @@ pub struct TensorWhileExecutionPlan {
     external_captures: BTreeMap<String, Vec<usize>>,
 }
 
-/// Precompiled body reverse plan used by device backends that execute fixed
-/// loop iterations through host-side dispatch.
+/// The compiled symbolic VJP of a loop body.
+///
+/// The plan reads the body inputs plus one cotangent input per seeded body
+/// output and returns the summed VJP for the carry and every external
+/// capture; `bool` inputs have no gradient and no output. The CPU and MLX
+/// loop executors run this one plan per iteration, so a loop derivative is
+/// the same derivative graph as `unroll=True` and the CUDA host loop.
 #[derive(Clone, Debug)]
-#[cfg(feature = "mlx")]
-struct TensorMlxVjpPlan {
+struct TensorRegionVjpPlan {
     plan: TensorExecutionPlan,
-    cotangent_name: String,
+    cotangent_names: Vec<String>,
+    /// Gradient outputs by input name, in plan output order.
     gradient_node_ids: BTreeMap<String, TensorNodeId>,
+}
+
+/// The compiled symbolic forward-mode transform of one loop body output.
+///
+/// The plan reads the body inputs plus one tangent input per entry of
+/// `tangent_names` (the index and `bool` inputs have zero tangents) and
+/// returns the output value and its tangent, in that output order.
+#[derive(Clone, Debug)]
+struct TensorRegionJvpPlan {
+    plan: TensorExecutionPlan,
+    /// Capture name to tangent input name.
+    tangent_names: BTreeMap<String, String>,
+}
+
+/// Symbolic derivative plans of a loop body, compiled on first use and
+/// shared by every clone of the loop plan, so a region differentiates its
+/// body once instead of on every call. A failed build keeps its error.
+#[derive(Debug, Default)]
+struct TensorLoopDerivatives {
+    vjp: std::sync::OnceLock<Result<TensorRegionVjpPlan, String>>,
+    forward_jvp: std::sync::OnceLock<Result<TensorRegionJvpPlan, String>>,
 }
 
 /// The forward carry sequence for one fixed-bound `Fori` invocation.
@@ -1169,21 +1146,6 @@ struct TensorMlxVjpPlan {
 #[derive(Clone, Debug)]
 pub struct TensorForiTape {
     carries: Vec<DynamicTensor>,
-}
-
-/// A fixed-bound region loop with several independently shaped carries.
-///
-/// The body has one output per carry, in `carry_names` order. It is not yet a
-/// parent Tensor IR node; the initial use is reverse-loop lowering where the
-/// carry contains a cotangent plus capture-gradient accumulators.
-#[derive(Clone, Debug)]
-pub struct TensorForiMultiExecutionPlan {
-    lower: usize,
-    upper: usize,
-    body: TensorMultiRegion,
-    carry_names: Vec<String>,
-    index_name: String,
-    external_captures: BTreeMap<String, Vec<usize>>,
 }
 
 /// A fixed-bound carry/output region scan.
@@ -1198,15 +1160,7 @@ pub struct TensorScanExecutionPlan {
     carry_name: String,
     index_name: String,
     external_captures: BTreeMap<String, Vec<usize>>,
-    #[cfg(feature = "mlx")]
-    mlx_vjp: Option<TensorScanMlxVjpPlan>,
-}
-
-#[derive(Clone, Debug)]
-#[cfg(feature = "mlx")]
-struct TensorScanMlxVjpPlan {
-    carry: TensorMlxVjpPlan,
-    output: TensorMlxVjpPlan,
+    derivatives: Arc<TensorLoopDerivatives>,
 }
 
 /// Compiled forward-over-reverse transform for one fixed-bound `Fori` VJP.
@@ -1222,8 +1176,6 @@ pub struct TensorForiVjpJvpExecutionPlan {
     cotangent_name: String,
     tangent_names: BTreeMap<String, String>,
     gradient_tangent_plans: BTreeMap<String, TensorExecutionPlan>,
-    #[cfg(feature = "mlx")]
-    mlx_forward_jvp: TensorForiMlxForwardJvpPlan,
 }
 
 /// Compiled forward-over-reverse transform for one fixed-bound `Scan` VJP.
@@ -1242,26 +1194,9 @@ pub struct TensorScanVjpJvpExecutionPlan {
     tangent_names: BTreeMap<String, String>,
     carry_gradient_tangent_plans: BTreeMap<String, TensorExecutionPlan>,
     output_gradient_tangent_plans: BTreeMap<String, TensorExecutionPlan>,
-    #[cfg(feature = "mlx")]
-    mlx_forward_jvp: TensorScanMlxForwardJvpPlan,
-}
-
-#[derive(Clone, Debug)]
-#[cfg(feature = "mlx")]
-struct TensorScanMlxForwardJvpPlan {
-    plan: TensorExecutionPlan,
-    value_node_id: TensorNodeId,
-    tangent_node_id: TensorNodeId,
-    tangent_names: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug)]
-#[cfg(feature = "mlx")]
-struct TensorForiMlxForwardJvpPlan {
-    plan: TensorExecutionPlan,
-    value_node_id: TensorNodeId,
-    tangent_node_id: TensorNodeId,
-    tangent_names: BTreeMap<String, String>,
+    /// The carry output's forward JVP, which replays the primal and
+    /// directional carry tapes.
+    forward_jvp: TensorRegionJvpPlan,
 }
 
 #[derive(Clone, Debug)]
@@ -1279,12 +1214,6 @@ type TensorScanCheckpointVjpResult = (
 pub type TensorScanJvpResult = (
     (DynamicTensor, DynamicTensor),
     (DynamicTensor, DynamicTensor),
-);
-
-pub type TensorForiMultiVjpResult = (
-    Vec<DynamicTensor>,
-    Vec<DynamicTensor>,
-    BTreeMap<String, DynamicTensor>,
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -2157,13 +2086,6 @@ impl DynamicTensor {
         Self::new(shape, data)
     }
 
-    fn reciprocal(&self) -> Result<Self, String> {
-        Self::new(
-            self.shape.clone(),
-            self.data.iter().map(|value| 1.0 / value).collect(),
-        )
-    }
-
     fn scale(&self, factor: f64) -> Result<Self, String> {
         Self::new(
             self.shape.clone(),
@@ -2225,20 +2147,6 @@ impl DynamicTensor {
         }
 
         Self::new(target_shape.to_vec(), data)
-    }
-
-    fn tanh(&self) -> Result<Self, String> {
-        Self::new(
-            self.shape.clone(),
-            self.data.iter().map(|value| value.tanh()).collect(),
-        )
-    }
-
-    fn exp(&self) -> Result<Self, String> {
-        Self::new(
-            self.shape.clone(),
-            self.data.iter().map(|value| value.exp()).collect(),
-        )
     }
 
     fn sqrt(&self) -> Result<Self, String> {
@@ -2432,20 +2340,6 @@ impl DynamicTensor {
         self.sum_all()?.scale(1.0 / self.data.len() as f64)
     }
 
-    fn sin(&self) -> Result<Self, String> {
-        Self::new(
-            self.shape.clone(),
-            self.data.iter().map(|value| value.sin()).collect(),
-        )
-    }
-
-    fn cos(&self) -> Result<Self, String> {
-        Self::new(
-            self.shape.clone(),
-            self.data.iter().map(|value| value.cos()).collect(),
-        )
-    }
-
     fn powi(&self, exponent: u32) -> Result<Self, String> {
         let exponent = i32::try_from(exponent)
             .map_err(|_| "powi exponent must fit in a signed 32-bit integer".to_string())?;
@@ -2455,57 +2349,8 @@ impl DynamicTensor {
         )
     }
 
-    /// Elementwise `self ** exponent` with `f64::powf` semantics.
-    fn pow(&self, exponent: &Self) -> Result<Self, String> {
-        self.elementwise(exponent, f64::powf)
-    }
-
-    /// `d pow(x, y) / dx` under the conventions of `pow_base_derivative`.
-    fn pow_base_derivative(&self, exponent: &Self) -> Result<Self, String> {
-        self.elementwise(exponent, pow_base_derivative)
-    }
-
-    /// `d pow(x, y) / dy` under the conventions of `pow_exponent_derivative`.
-    fn pow_exponent_derivative(&self, exponent: &Self) -> Result<Self, String> {
-        self.elementwise(exponent, pow_exponent_derivative)
-    }
-
-    fn log(&self) -> Result<Self, String> {
-        Self::new(
-            self.shape.clone(),
-            self.data.iter().map(|value| value.ln()).collect(),
-        )
-    }
-
-    /// `ln(1 + x)` with IEEE semantics: `-1` gives `-inf` and `x < -1` gives
-    /// `NaN`, so it never fails.
-    fn log1p(&self) -> Result<Self, String> {
-        Self::new(
-            self.shape.clone(),
-            self.data.iter().map(f64::ln_1p).collect(),
-        )
-    }
-
-    /// `d log1p(x) / dx = 1 / (1 + x)` with IEEE semantics (`+inf` at `-1`).
-    fn log1p_derivative(&self) -> Result<Self, String> {
-        Self::new(
-            self.shape.clone(),
-            self.data.iter().map(|value| 1.0 / (1.0 + value)).collect(),
-        )
-    }
-
     fn map_f64(&self, f: impl Fn(f64) -> f64) -> Result<Self, String> {
         Self::new(self.shape.clone(), self.data.iter().map(f).collect())
-    }
-
-    /// `y.atan2(x)` with `self` as `y`, broadcasting like the binary ops.
-    fn atan2(&self, x: &Self) -> Result<Self, String> {
-        self.elementwise(x, f64::atan2)
-    }
-
-    /// Entry `index` of [`atan2_derivatives`] of `self` (as `y`) and `x`.
-    fn atan2_derivative(&self, x: &Self, index: usize) -> Result<Self, String> {
-        self.elementwise(x, |y, x| atan2_derivatives(y, x)[index])
     }
 
     /// Inclusive prefix sums along `axis` (from the last entry when
@@ -2539,23 +2384,6 @@ impl DynamicTensor {
             }
         }
         Self::new(self.shape.clone(), data)
-    }
-
-    fn tanh_derivative_from_output(&self) -> Result<Self, String> {
-        Self::new(
-            self.shape.clone(),
-            self.data.iter().map(|value| 1.0 - value * value).collect(),
-        )
-    }
-
-    fn tanh_second_derivative_from_output(&self) -> Result<Self, String> {
-        Self::new(
-            self.shape.clone(),
-            self.data
-                .iter()
-                .map(|value| -2.0 * value * (1.0 - value * value))
-                .collect(),
-        )
     }
 
     fn matmul(&self, rhs: &Self) -> Result<Self, String> {
@@ -3260,18 +3088,9 @@ impl TensorIr {
         let rank = node.shape.len();
         let op = match &node.op {
             TensorOp::Cast { .. }
-            | TensorOp::Tanh { .. }
-            | TensorOp::Exp { .. }
             | TensorOp::Sqrt { .. }
             | TensorOp::SqrtDerivative { .. }
-            | TensorOp::Sin { .. }
-            | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
-            | TensorOp::Log { .. }
-            | TensorOp::Log1p { .. }
-            | TensorOp::Expm1 { .. }
-            | TensorOp::Erf { .. }
-            | TensorOp::Erfc { .. }
             | TensorOp::UnaryMath { .. }
             | TensorOp::StopGradient { .. }
             | TensorOp::Triangular { .. }
@@ -3283,9 +3102,7 @@ impl TensorIr {
             | TensorOp::Mul { .. }
             | TensorOp::Greater { .. }
             | TensorOp::Compare { .. }
-            | TensorOp::Pow { .. }
-            | TensorOp::Atan2 { .. }
-            | TensorOp::Fmod { .. }
+            | TensorOp::BinaryMath { .. }
             | TensorOp::Where { .. }
             | TensorOp::Matmul { .. }
             | TensorOp::Broadcast { .. } => {
@@ -4004,19 +3821,6 @@ impl TensorIr {
                         "symbolic JVP through a Scan VJP JVP result is not implemented".to_string(),
                     );
                 }
-                TensorOp::Tanh { input } => {
-                    let (input_value, input_tangent) = pairs[*input];
-                    let value = transformed.tanh(input_value)?;
-                    let one = transformed.scalar_constant(1.0);
-                    let squared = transformed.mul(value, value)?;
-                    let derivative = transformed.sub(one, squared)?;
-                    (value, transformed.mul(input_tangent, derivative)?)
-                }
-                TensorOp::Exp { input } => {
-                    let (input_value, input_tangent) = pairs[*input];
-                    let value = transformed.exp(input_value)?;
-                    (value, transformed.mul(input_tangent, value)?)
-                }
                 TensorOp::Sqrt { input } => {
                     let (input_value, input_tangent) = pairs[*input];
                     let value = transformed.sqrt(input_value)?;
@@ -4032,90 +3836,15 @@ impl TensorIr {
                     let derivative = transformed.sqrt_derivative(input_value, next_order)?;
                     (value, transformed.mul(input_tangent, derivative)?)
                 }
-                TensorOp::Sin { input } => {
-                    let (input_value, input_tangent) = pairs[*input];
-                    let value = transformed.sin(input_value)?;
-                    let derivative = transformed.cos(input_value)?;
-                    (value, transformed.mul(input_tangent, derivative)?)
-                }
-                TensorOp::Cos { input } => {
-                    let (input_value, input_tangent) = pairs[*input];
-                    let value = transformed.cos(input_value)?;
-                    let derivative = transformed.sin(input_value)?;
-                    let tangent = transformed.mul(input_tangent, derivative)?;
-                    let zero = transformed.scalar_constant(0.0);
-                    (value, transformed.sub(zero, tangent)?)
-                }
-                TensorOp::Log { input } => {
-                    let (input_value, input_tangent) = pairs[*input];
-                    (
-                        transformed.log(input_value)?,
-                        transformed.div(input_tangent, input_value)?,
-                    )
-                }
-                TensorOp::Log1p { input } => {
-                    let (input_value, input_tangent) = pairs[*input];
-                    let one = transformed.scalar_constant(1.0);
-                    let shifted = transformed.add(one, input_value)?;
-                    (
-                        transformed.log1p(input_value)?,
-                        transformed.div(input_tangent, shifted)?,
-                    )
-                }
-                TensorOp::Expm1 { input } => {
-                    let (input_value, input_tangent) = pairs[*input];
-                    let derivative = transformed.exp(input_value)?;
-                    (
-                        transformed.expm1(input_value)?,
-                        transformed.mul(input_tangent, derivative)?,
-                    )
-                }
-                TensorOp::Erf { input } => {
-                    let (input_value, input_tangent) = pairs[*input];
-                    let derivative = transformed.erf_derivative(input_value)?;
-                    (
-                        transformed.erf(input_value)?,
-                        transformed.mul(input_tangent, derivative)?,
-                    )
-                }
-                TensorOp::Erfc { input } => {
-                    let (input_value, input_tangent) = pairs[*input];
-                    let derivative = transformed.erfc_derivative(input_value)?;
-                    (
-                        transformed.erfc(input_value)?,
-                        transformed.mul(input_tangent, derivative)?,
-                    )
-                }
-                TensorOp::Atan2 { y, x } => {
-                    let (y_value, y_tangent) = pairs[*y];
-                    let (x_value, x_tangent) = pairs[*x];
-                    let (y_partial, x_partial) = transformed.atan2_partials(y_value, x_value)?;
-                    let y_term = transformed.mul(y_tangent, y_partial)?;
-                    let x_term = transformed.mul(x_tangent, x_partial)?;
-                    (
-                        transformed.atan2(y_value, x_value)?,
-                        transformed.add(y_term, x_term)?,
-                    )
-                }
                 TensorOp::UnaryMath { input, kind } => {
                     let (input_value, input_tangent) = pairs[*input];
-                    let value = transformed.unary_math(input_value, *kind)?;
-                    let tangent =
-                        match transformed.unary_math_derivative(*kind, input_value, value)? {
-                            Some(derivative) => transformed.mul(input_tangent, derivative)?,
-                            None => symbolic_zero_like(&mut transformed, value)?,
-                        };
+                    let (value, tangent) =
+                        transformed.unary_math_jvp(*kind, input_value, input_tangent)?;
+                    let tangent = match tangent {
+                        Some(tangent) => tangent,
+                        None => symbolic_zero_like(&mut transformed, value)?,
+                    };
                     (value, tangent)
-                }
-                // d fmod = dx - trunc(x / y) dy; the x tangent passes through
-                // unscaled (broadcast by the add).
-                TensorOp::Fmod { x, y } => {
-                    let (x_value, x_tangent) = pairs[*x];
-                    let (y_value, y_tangent) = pairs[*y];
-                    let value = transformed.fmod(x_value, y_value)?;
-                    let y_partial = transformed.fmod_y_partial(x_value, y_value, value)?;
-                    let y_term = transformed.mul(y_tangent, y_partial)?;
-                    (value, transformed.add(x_tangent, y_term)?)
                 }
                 TensorOp::StopGradient { input } => {
                     let (input_value, _) = pairs[*input];
@@ -4249,18 +3978,8 @@ impl TensorIr {
                     };
                     (value, tangent)
                 }
-                TensorOp::Pow { base, exponent } => {
-                    let (base_value, base_tangent) = pairs[*base];
-                    let (exponent_value, exponent_tangent) = pairs[*exponent];
-                    (
-                        transformed.pow(base_value, exponent_value)?,
-                        transformed.pow_tangent(
-                            base_value,
-                            base_tangent,
-                            exponent_value,
-                            exponent_tangent,
-                        )?,
-                    )
+                TensorOp::BinaryMath { lhs, rhs, kind } => {
+                    transformed.binary_math_jvp(*kind, pairs[*lhs], pairs[*rhs])?
                 }
                 TensorOp::Concat { inputs, axis } => {
                     let values = inputs.iter().map(|input| pairs[*input].0).collect();
@@ -4642,8 +4361,6 @@ impl TensorIr {
                 TensorOp::Triangular { input, lower } => {
                     transformed.triangular(values[*input], *lower)?
                 }
-                TensorOp::Tanh { input } => transformed.tanh(values[*input])?,
-                TensorOp::Exp { input } => transformed.exp(values[*input])?,
                 TensorOp::Sqrt { input } => transformed.sqrt(values[*input])?,
                 TensorOp::SqrtDerivative { input, order } => {
                     transformed.sqrt_derivative(values[*input], *order)?
@@ -4655,28 +4372,19 @@ impl TensorIr {
                 TensorOp::MeanAxis { input, axis } => {
                     transformed.mean_axis(values[*input], *axis as isize)?
                 }
-                TensorOp::Sin { input } => transformed.sin(values[*input])?,
-                TensorOp::Cos { input } => transformed.cos(values[*input])?,
                 TensorOp::Powi { input, exponent } => {
                     transformed.powi(values[*input], *exponent)?
                 }
-                TensorOp::Pow { base, exponent } => {
-                    transformed.pow(values[*base], values[*exponent])?
+                TensorOp::BinaryMath { lhs, rhs, kind } => {
+                    transformed.binary_math(values[*lhs], values[*rhs], *kind)?
                 }
                 TensorOp::Transpose { input, axes } => transformed.transpose(
                     values[*input],
                     Some(axes.iter().map(|axis| *axis as isize).collect()),
                 )?,
-                TensorOp::Log { input } => transformed.log(values[*input])?,
-                TensorOp::Log1p { input } => transformed.log1p(values[*input])?,
-                TensorOp::Expm1 { input } => transformed.expm1(values[*input])?,
-                TensorOp::Erf { input } => transformed.erf(values[*input])?,
-                TensorOp::Erfc { input } => transformed.erfc(values[*input])?,
-                TensorOp::Atan2 { y, x } => transformed.atan2(values[*y], values[*x])?,
                 TensorOp::UnaryMath { input, kind } => {
                     transformed.unary_math(values[*input], *kind)?
                 }
-                TensorOp::Fmod { x, y } => transformed.fmod(values[*x], values[*y])?,
                 TensorOp::StopGradient { input } => transformed.stop_gradient(values[*input])?,
                 TensorOp::CumSum {
                     input,
@@ -5210,29 +4918,6 @@ impl TensorIr {
                         )?;
                     }
                 }
-                TensorOp::Tanh { input } => {
-                    let one = transformed.scalar_constant(1.0);
-                    let squared = transformed.mul(values[node_id], values[node_id])?;
-                    let derivative = transformed.sub(one, squared)?;
-                    let contribution = transformed.mul(upstream, derivative)?;
-                    let contribution = symbolic_reduce_to_shape(
-                        &mut transformed,
-                        contribution,
-                        &node.shape,
-                        &self.node(*input)?.shape,
-                    )?;
-                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
-                }
-                TensorOp::Exp { input } => {
-                    let contribution = transformed.mul(upstream, values[node_id])?;
-                    let contribution = symbolic_reduce_to_shape(
-                        &mut transformed,
-                        contribution,
-                        &node.shape,
-                        &self.node(*input)?.shape,
-                    )?;
-                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
-                }
                 TensorOp::Sqrt { input } => {
                     let derivative = transformed.sqrt_derivative(values[*input], 1)?;
                     let contribution = transformed.mul(upstream, derivative)?;
@@ -5283,30 +4968,6 @@ impl TensorIr {
                     let contribution = transformed.mul(contribution, scale)?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
                 }
-                TensorOp::Sin { input } => {
-                    let derivative = transformed.cos(values[*input])?;
-                    let contribution = transformed.mul(upstream, derivative)?;
-                    let contribution = symbolic_reduce_to_shape(
-                        &mut transformed,
-                        contribution,
-                        &node.shape,
-                        &self.node(*input)?.shape,
-                    )?;
-                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
-                }
-                TensorOp::Cos { input } => {
-                    let derivative = transformed.sin(values[*input])?;
-                    let product = transformed.mul(upstream, derivative)?;
-                    let zero = transformed.scalar_constant(0.0);
-                    let contribution = transformed.sub(zero, product)?;
-                    let contribution = symbolic_reduce_to_shape(
-                        &mut transformed,
-                        contribution,
-                        &node.shape,
-                        &self.node(*input)?.shape,
-                    )?;
-                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
-                }
                 TensorOp::Powi { input, exponent } => {
                     if *exponent != 0 {
                         let coefficient = transformed.scalar_constant(*exponent as f64);
@@ -5327,42 +4988,32 @@ impl TensorIr {
                         )?;
                     }
                 }
-                // A constant operand receives no cotangent, so its derivative expression is not
-                // emitted at all.
-                TensorOp::Pow { base, exponent } => {
-                    let base_value = values[*base];
-                    let exponent_value = values[*exponent];
-                    let operands = [
-                        (*base, self.scalar_constant_value(*base).is_none(), true),
-                        (
-                            *exponent,
-                            self.scalar_constant_value(*exponent).is_none(),
-                            false,
-                        ),
-                    ];
-                    for (operand, differentiable, is_base) in operands {
-                        if !differentiable {
-                            continue;
-                        }
-                        let derivative = if is_base {
-                            transformed.pow_base_derivative(base_value, exponent_value)?
-                        } else {
-                            transformed.pow_exponent_derivative(base_value, exponent_value)?
-                        };
-                        let contribution = transformed.mul(upstream, derivative)?;
-                        let contribution = symbolic_reduce_to_shape(
-                            &mut transformed,
-                            contribution,
-                            &node.shape,
-                            &self.node(operand)?.shape,
-                        )?;
-                        symbolic_accumulate(
-                            &mut transformed,
-                            &mut cotangents,
-                            operand,
-                            contribution,
-                        )?;
-                    }
+                // A scalar constant operand receives no cotangent, so its
+                // partial is not emitted.
+                TensorOp::BinaryMath { lhs, rhs, kind } => {
+                    let operands = [*lhs, *rhs];
+                    let differentiable =
+                        operands.map(|operand| self.scalar_constant_value(operand).is_none());
+                    transformed.binary_math_vjp(
+                        *kind,
+                        (values[*lhs], values[*rhs], values[node_id]),
+                        upstream,
+                        differentiable,
+                        |transformed, index, contribution| {
+                            let contribution = symbolic_reduce_to_shape(
+                                transformed,
+                                contribution,
+                                &node.shape,
+                                &self.node(operands[index])?.shape,
+                            )?;
+                            symbolic_accumulate(
+                                transformed,
+                                &mut cotangents,
+                                operands[index],
+                                contribution,
+                            )
+                        },
+                    )?;
                 }
                 TensorOp::Transpose { input, axes } => {
                     let inverse = inverse_permutation(axes)?;
@@ -5372,72 +5023,13 @@ impl TensorIr {
                     )?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
                 }
-                TensorOp::Log { input } => {
-                    let contribution = transformed.div(upstream, values[*input])?;
-                    let contribution = symbolic_reduce_to_shape(
-                        &mut transformed,
-                        contribution,
-                        &node.shape,
-                        &self.node(*input)?.shape,
-                    )?;
-                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
-                }
-                TensorOp::Log1p { input } => {
-                    let one = transformed.scalar_constant(1.0);
-                    let shifted = transformed.add(one, values[*input])?;
-                    let contribution = transformed.div(upstream, shifted)?;
-                    let contribution = symbolic_reduce_to_shape(
-                        &mut transformed,
-                        contribution,
-                        &node.shape,
-                        &self.node(*input)?.shape,
-                    )?;
-                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
-                }
-                TensorOp::Expm1 { input } | TensorOp::Erf { input } | TensorOp::Erfc { input } => {
-                    let derivative = match &node.op {
-                        TensorOp::Expm1 { .. } => transformed.exp(values[*input])?,
-                        TensorOp::Erf { .. } => transformed.erf_derivative(values[*input])?,
-                        _ => transformed.erfc_derivative(values[*input])?,
-                    };
-                    let contribution = transformed.mul(upstream, derivative)?;
-                    let contribution = symbolic_reduce_to_shape(
-                        &mut transformed,
-                        contribution,
-                        &node.shape,
-                        &self.node(*input)?.shape,
-                    )?;
-                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
-                }
-                // A scalar constant operand receives no cotangent, so its
-                // partial is not emitted.
-                TensorOp::Atan2 { y, x } => {
-                    let (y_partial, x_partial) =
-                        transformed.atan2_partials(values[*y], values[*x])?;
-                    for (operand, partial) in [(*y, y_partial), (*x, x_partial)] {
-                        if self.scalar_constant_value(operand).is_some() {
-                            continue;
-                        }
-                        let contribution = transformed.mul(upstream, partial)?;
-                        let contribution = symbolic_reduce_to_shape(
-                            &mut transformed,
-                            contribution,
-                            &node.shape,
-                            &self.node(operand)?.shape,
-                        )?;
-                        symbolic_accumulate(
-                            &mut transformed,
-                            &mut cotangents,
-                            operand,
-                            contribution,
-                        )?;
-                    }
-                }
                 TensorOp::UnaryMath { input, kind } => {
-                    if let Some(derivative) =
-                        transformed.unary_math_derivative(*kind, values[*input], values[node_id])?
-                    {
-                        let contribution = transformed.mul(upstream, derivative)?;
+                    let chain = transformed.unary_math_chain(
+                        *kind,
+                        values[*input],
+                        Some(values[node_id]),
+                    )?;
+                    if let Some(contribution) = transformed.apply_unary_chain(chain, upstream)? {
                         let contribution = symbolic_reduce_to_shape(
                             &mut transformed,
                             contribution,
@@ -5450,32 +5042,6 @@ impl TensorIr {
                             *input,
                             contribution,
                         )?;
-                    }
-                }
-                // `x` receives the cotangent itself (partial 1) and `y` its
-                // product with `-trunc(x / y)`; a scalar constant operand
-                // receives nothing.
-                TensorOp::Fmod { x, y } => {
-                    if self.scalar_constant_value(*x).is_none() {
-                        let contribution = symbolic_reduce_to_shape(
-                            &mut transformed,
-                            upstream,
-                            &node.shape,
-                            &self.node(*x)?.shape,
-                        )?;
-                        symbolic_accumulate(&mut transformed, &mut cotangents, *x, contribution)?;
-                    }
-                    if self.scalar_constant_value(*y).is_none() {
-                        let partial =
-                            transformed.fmod_y_partial(values[*x], values[*y], values[node_id])?;
-                        let contribution = transformed.mul(upstream, partial)?;
-                        let contribution = symbolic_reduce_to_shape(
-                            &mut transformed,
-                            contribution,
-                            &node.shape,
-                            &self.node(*y)?.shape,
-                        )?;
-                        symbolic_accumulate(&mut transformed, &mut cotangents, *y, contribution)?;
                     }
                 }
                 // The value passes through, but no cotangent does.
@@ -7435,13 +7001,11 @@ impl TensorIr {
     }
 
     pub fn tanh(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
-        let shape = self.node(input)?.shape.clone();
-        self.push_derived(TensorOp::Tanh { input }, shape)
+        self.unary_math(input, UnaryMathKind::Tanh)
     }
 
     pub fn exp(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
-        let shape = self.node(input)?.shape.clone();
-        self.push_derived(TensorOp::Exp { input }, shape)
+        self.unary_math(input, UnaryMathKind::Exp)
     }
 
     pub fn sqrt(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
@@ -7484,13 +7048,11 @@ impl TensorIr {
     }
 
     pub fn sin(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
-        let shape = self.node(input)?.shape.clone();
-        self.push_derived(TensorOp::Sin { input }, shape)
+        self.unary_math(input, UnaryMathKind::Sin)
     }
 
     pub fn cos(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
-        let shape = self.node(input)?.shape.clone();
-        self.push_derived(TensorOp::Cos { input }, shape)
+        self.unary_math(input, UnaryMathKind::Cos)
     }
 
     pub fn powi(&mut self, input: TensorNodeId, exponent: u32) -> Result<TensorNodeId, String> {
@@ -7499,32 +7061,6 @@ impl TensorIr {
         }
         let shape = self.node(input)?.shape.clone();
         self.push_derived(TensorOp::Powi { input, exponent }, shape)
-    }
-
-    /// Elementwise `base ** exponent` with `f64::powf` semantics: NaN for a
-    /// negative base with a non-integer exponent, `0 ** 0 == 1`, and IEEE
-    /// results for infinities and NaN. Operands broadcast and promote like
-    /// arithmetic operands, so a weak scalar exponent adopts the base dtype.
-    /// `Bool` operands are rejected, as by the unary math ops, instead of
-    /// being promoted to 0/1.
-    pub fn pow(
-        &mut self,
-        base: TensorNodeId,
-        exponent: TensorNodeId,
-    ) -> Result<TensorNodeId, String> {
-        for operand in [base, exponent] {
-            if self.node(operand)?.dtype == TensorDType::Bool {
-                return Err(
-                    "pow is not defined for bool tensors; use logical_and/logical_or/logical_not \
-                     (& | ~) or convert explicitly with astype"
-                        .to_string(),
-                );
-            }
-        }
-        self.binary("pow", base, exponent, |base, exponent| TensorOp::Pow {
-            base,
-            exponent,
-        })
     }
 
     /// The value of `id` when it is a scalar constant, possibly behind the
@@ -7540,113 +7076,6 @@ impl TensorIr {
         }
     }
 
-    /// `exponent - 1`, folded to a constant of the same dtype and weakness
-    /// when the exponent is a constant, so nested derivatives of a constant
-    /// exponent keep recognizing it.
-    fn pow_lowered_exponent(&mut self, exponent: TensorNodeId) -> Result<TensorNodeId, String> {
-        if let Some(value) = self.scalar_constant_value(exponent) {
-            let node = self.node(exponent)?;
-            let (dtype, weak) = (node.dtype, node.weak);
-            return Ok(self.constant_like(dtype.round(value - 1.0), dtype, weak));
-        }
-        let one = self.scalar_constant(1.0);
-        self.sub(exponent, one)
-    }
-
-    /// Symbolic `d pow(x, y) / dx` with the conventions of the free function
-    /// `pow_base_derivative`: `where(m, 0, y * pow(where(m, 1, x), y - 1))`
-    /// with `m = (x == 0) & (y < 1)`. Masking the inner base keeps `0 * inf`
-    /// out of the reverse pass through this expression, so Hessians stay
-    /// finite at the origin. A constant exponent decides `y < 1` statically.
-    fn pow_base_derivative(
-        &mut self,
-        base: TensorNodeId,
-        exponent: TensorNodeId,
-    ) -> Result<TensorNodeId, String> {
-        let zero = self.scalar_constant(0.0);
-        let one = self.scalar_constant(1.0);
-        let singular = match self.scalar_constant_value(exponent) {
-            // No point is singular unless `y < 1` (a NaN exponent is never singular).
-            Some(value) if !pow_base_is_singular(0.0, value) => None,
-            Some(_) => Some(self.compare(base, zero, TensorComparison::Equal)?),
-            None => {
-                let at_origin = self.compare(base, zero, TensorComparison::Equal)?;
-                let below_one = self.compare(exponent, one, TensorComparison::Less)?;
-                Some(self.logical_and(at_origin, below_one)?)
-            }
-        };
-        let safe_base = match singular {
-            Some(mask) => self.where_select(mask, one, base)?,
-            None => base,
-        };
-        let lowered = self.pow_lowered_exponent(exponent)?;
-        let power = self.pow(safe_base, lowered)?;
-        let derivative = self.mul(exponent, power)?;
-        match singular {
-            Some(mask) => self.where_select(mask, zero, derivative),
-            None => Ok(derivative),
-        }
-    }
-
-    /// Symbolic `d pow(x, y) / dy` with the conventions of the free function
-    /// `pow_exponent_derivative`: `pow(s, y) * log(s)` with
-    /// `s = where(x <= 0, 1, x)`, which is exactly `0` for `x <= 0` and keeps
-    /// the checked-domain `log` away from non-positive values.
-    fn pow_exponent_derivative(
-        &mut self,
-        base: TensorNodeId,
-        exponent: TensorNodeId,
-    ) -> Result<TensorNodeId, String> {
-        if let Some(value) = self.scalar_constant_value(base) {
-            if value <= 0.0 {
-                return Ok(self.scalar_constant(0.0));
-            }
-            // A positive constant base reuses the primal `pow(base, y)` (CSE)
-            // and folds its logarithm.
-            let node = self.node(base)?;
-            let (dtype, weak) = (node.dtype, node.weak);
-            let log = self.constant_like(dtype.round(value.ln()), dtype, weak);
-            let power = self.pow(base, exponent)?;
-            return self.mul(power, log);
-        }
-        let zero = self.scalar_constant(0.0);
-        let one = self.scalar_constant(1.0);
-        let non_positive = self.compare(base, zero, TensorComparison::LessEqual)?;
-        let safe_base = self.where_select(non_positive, one, base)?;
-        let power = self.pow(safe_base, exponent)?;
-        let log = self.log(safe_base)?;
-        self.mul(power, log)
-    }
-
-    /// Tangent of `pow(x, y)`; the term of an operand whose tangent is the
-    /// constant zero (a constant operand) is left out rather than multiplied
-    /// by a derivative that may be non-finite.
-    fn pow_tangent(
-        &mut self,
-        base: TensorNodeId,
-        base_tangent: TensorNodeId,
-        exponent: TensorNodeId,
-        exponent_tangent: TensorNodeId,
-    ) -> Result<TensorNodeId, String> {
-        let mut tangent = None;
-        if self.scalar_constant_value(base_tangent) != Some(0.0) {
-            let derivative = self.pow_base_derivative(base, exponent)?;
-            tangent = Some(self.mul(base_tangent, derivative)?);
-        }
-        if self.scalar_constant_value(exponent_tangent) != Some(0.0) {
-            let derivative = self.pow_exponent_derivative(base, exponent)?;
-            let term = self.mul(exponent_tangent, derivative)?;
-            tangent = Some(match tangent {
-                Some(tangent) => self.add(tangent, term)?,
-                None => term,
-            });
-        }
-        Ok(match tangent {
-            Some(tangent) => tangent,
-            None => self.scalar_constant(0.0),
-        })
-    }
-
     pub fn transpose(
         &mut self,
         input: TensorNodeId,
@@ -7659,49 +7088,27 @@ impl TensorIr {
     }
 
     pub fn log(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
-        let shape = self.node(input)?.shape.clone();
-        self.push_derived(TensorOp::Log { input }, shape)
+        self.unary_math(input, UnaryMathKind::Log)
     }
 
-    /// Elementwise `ln(1 + x)`; see [`TensorOp::Log1p`] for its IEEE
-    /// semantics at and below `-1`.
+    /// Elementwise `log1p`; see [`UnaryMathKind::Log1p`].
     pub fn log1p(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
-        let shape = self.node(input)?.shape.clone();
-        self.push_derived(TensorOp::Log1p { input }, shape)
+        self.unary_math(input, UnaryMathKind::Log1p)
     }
 
-    /// Elementwise `exp(x) - 1`; see [`TensorOp::Expm1`].
+    /// Elementwise `expm1`; see [`UnaryMathKind::Expm1`].
     pub fn expm1(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
-        let shape = self.node(input)?.shape.clone();
-        self.push_derived(TensorOp::Expm1 { input }, shape)
+        self.unary_math(input, UnaryMathKind::Expm1)
     }
 
-    /// Elementwise error function; see [`TensorOp::Erf`].
+    /// Elementwise `erf`; see [`UnaryMathKind::Erf`].
     pub fn erf(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
-        let shape = self.node(input)?.shape.clone();
-        self.push_derived(TensorOp::Erf { input }, shape)
+        self.unary_math(input, UnaryMathKind::Erf)
     }
 
-    /// Elementwise complementary error function; see [`TensorOp::Erfc`].
+    /// Elementwise `erfc`; see [`UnaryMathKind::Erfc`].
     pub fn erfc(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
-        let shape = self.node(input)?.shape.clone();
-        self.push_derived(TensorOp::Erfc { input }, shape)
-    }
-
-    /// Elementwise `atan2(y, x)`; operands broadcast and promote like
-    /// arithmetic operands, and `Bool` operands are rejected. See
-    /// [`TensorOp::Atan2`].
-    pub fn atan2(&mut self, y: TensorNodeId, x: TensorNodeId) -> Result<TensorNodeId, String> {
-        for operand in [y, x] {
-            if self.node(operand)?.dtype == TensorDType::Bool {
-                return Err(
-                    "atan2 is not defined for bool tensors; use logical_and/logical_or/logical_not \
-                     (& | ~) or convert explicitly with astype"
-                        .to_string(),
-                );
-            }
-        }
-        self.binary("atan2", y, x, |y, x| TensorOp::Atan2 { y, x })
+        self.unary_math(input, UnaryMathKind::Erfc)
     }
 
     /// `input` with a zero derivative; see [`TensorOp::StopGradient`]. `Bool`
@@ -7772,72 +7179,6 @@ impl TensorIr {
         }
         shape.remove(axis);
         self.reshape(current, shape)
-    }
-
-    /// Symbolic `erf'(x) = 2 / sqrt(pi) * exp(-(x * x))`.
-    fn erf_derivative(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
-        let squared = self.mul(input, input)?;
-        let zero = self.scalar_constant(0.0);
-        let negated = self.sub(zero, squared)?;
-        let decay = self.exp(negated)?;
-        let scale = self.scalar_constant(std::f64::consts::FRAC_2_SQRT_PI);
-        self.mul(scale, decay)
-    }
-
-    /// Symbolic `erfc'(x) = -2 / sqrt(pi) * exp(-(x * x))`.
-    fn erfc_derivative(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
-        let squared = self.mul(input, input)?;
-        let zero = self.scalar_constant(0.0);
-        let negated = self.sub(zero, squared)?;
-        let decay = self.exp(negated)?;
-        let scale = self.scalar_constant(-std::f64::consts::FRAC_2_SQRT_PI);
-        self.mul(scale, decay)
-    }
-
-    /// Symbolic `(d atan2(y, x) / dy, d atan2(y, x) / dx)` with the scaling
-    /// and conventions of the free function `atan2_derivatives`. Where
-    /// `s = |x| + |y|` is `0` or infinite, the operands, `s` and `q` are
-    /// replaced by the constants `0`, `1` and `1`, so both partials are
-    /// exactly `0` there, every unselected branch stays finite, and the
-    /// derivatives of the partials are `0` as well.
-    fn atan2_partials(
-        &mut self,
-        y: TensorNodeId,
-        x: TensorNodeId,
-    ) -> Result<(TensorNodeId, TensorNodeId), String> {
-        let zero = self.scalar_constant(0.0);
-        let one = self.scalar_constant(1.0);
-        let magnitude = |graph: &mut Self, value: TensorNodeId| {
-            let negative = graph.compare(value, zero, TensorComparison::Less)?;
-            let negated = graph.sub(zero, value)?;
-            graph.where_select(negative, negated, value)
-        };
-        let x_magnitude = magnitude(self, x)?;
-        let y_magnitude = magnitude(self, y)?;
-        let scale = self.add(x_magnitude, y_magnitude)?;
-        // `s == inf` as "not finite and not NaN", without an infinite
-        // constant, which device programs cannot bind.
-        let at_origin = self.compare(scale, zero, TensorComparison::Equal)?;
-        let finite = self.isfinite(scale)?;
-        let infinite_or_nan = self.logical_not(finite)?;
-        let number = self.compare(scale, scale, TensorComparison::Equal)?;
-        let unbounded = self.logical_and(infinite_or_nan, number)?;
-        let degenerate = self.logical_or(at_origin, unbounded)?;
-        let safe_scale = self.where_select(degenerate, one, scale)?;
-        let safe_x = self.where_select(degenerate, zero, x)?;
-        let safe_y = self.where_select(degenerate, zero, y)?;
-        let scaled_x = self.div(safe_x, safe_scale)?;
-        let scaled_y = self.div(safe_y, safe_scale)?;
-        let x_squared = self.mul(scaled_x, scaled_x)?;
-        let y_squared = self.mul(scaled_y, scaled_y)?;
-        let q = self.add(x_squared, y_squared)?;
-        let safe_q = self.where_select(degenerate, one, q)?;
-        let y_partial = self.div(scaled_x, safe_q)?;
-        let y_partial = self.div(y_partial, safe_scale)?;
-        let negated_y = self.sub(zero, scaled_y)?;
-        let x_partial = self.div(negated_y, safe_q)?;
-        let x_partial = self.div(x_partial, safe_scale)?;
-        Ok((y_partial, x_partial))
     }
 
     pub fn concat(
@@ -8428,7 +7769,7 @@ impl TensorIr {
                     captures,
                 } => {
                     let external = tensor_forward_capture_values(captures, &values)?;
-                    let (_, carry_gradient, external_gradients) = loop_plan.value_and_vjp(
+                    let (_, carry_gradient, external_gradients) = loop_plan.runtime_value_and_vjp(
                         values
                             .get(*carry)
                             .and_then(Option::as_ref)
@@ -8524,7 +7865,7 @@ impl TensorIr {
                             None => DynamicTensor::filled(scan_plan.output_shape()?, 0.0)?,
                         };
                         let external_inputs = tensor_forward_capture_values(captures, &values)?;
-                        let (carry_gradient, external_gradients) = scan_plan.vjp(
+                        let (carry_gradient, external_gradients) = scan_plan.runtime_vjp(
                             values
                                 .get(*carry)
                                 .and_then(Option::as_ref)
@@ -8669,26 +8010,6 @@ impl TensorIr {
                     )?;
                     accumulate(&mut cotangents[*input], contribution)?;
                 }
-                TensorOp::Tanh { input } => {
-                    let output_value = values
-                        .get(node_id)
-                        .and_then(Option::as_ref)
-                        .ok_or_else(|| format!("node {node_id} has no evaluated value"))?;
-                    let contribution = cotangent
-                        .mul(&output_value.tanh_derivative_from_output()?)?
-                        .reduce_to_shape(&self.node(*input)?.shape)?;
-                    accumulate(&mut cotangents[*input], contribution)?;
-                }
-                TensorOp::Exp { input } => {
-                    let output_value = values
-                        .get(node_id)
-                        .and_then(Option::as_ref)
-                        .ok_or_else(|| format!("node {node_id} has no evaluated value"))?;
-                    let contribution = cotangent
-                        .mul(output_value)?
-                        .reduce_to_shape(&self.node(*input)?.shape)?;
-                    accumulate(&mut cotangents[*input], contribution)?;
-                }
                 TensorOp::Sqrt { input } => {
                     let input_value = values
                         .get(*input)
@@ -8731,27 +8052,6 @@ impl TensorIr {
                         .scale(1.0 / input_shape[*axis] as f64)?;
                     accumulate(&mut cotangents[*input], contribution)?;
                 }
-                TensorOp::Sin { input } => {
-                    let input_value = values
-                        .get(*input)
-                        .and_then(Option::as_ref)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let contribution = cotangent
-                        .mul(&input_value.cos()?)?
-                        .reduce_to_shape(&self.node(*input)?.shape)?;
-                    accumulate(&mut cotangents[*input], contribution)?;
-                }
-                TensorOp::Cos { input } => {
-                    let input_value = values
-                        .get(*input)
-                        .and_then(Option::as_ref)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let contribution = cotangent
-                        .mul(&input_value.sin()?)?
-                        .neg()?
-                        .reduce_to_shape(&self.node(*input)?.shape)?;
-                    accumulate(&mut cotangents[*input], contribution)?;
-                }
                 TensorOp::Powi { input, exponent } => {
                     if *exponent == 0 {
                         continue;
@@ -8766,119 +8066,49 @@ impl TensorIr {
                         .reduce_to_shape(&self.node(*input)?.shape)?;
                     accumulate(&mut cotangents[*input], contribution)?;
                 }
-                TensorOp::Pow { base, exponent } => {
-                    let base_value = values
-                        .get(*base)
+                TensorOp::BinaryMath { lhs, rhs, kind } => {
+                    let lhs_value = values
+                        .get(*lhs)
                         .and_then(Option::as_ref)
-                        .ok_or_else(|| format!("node {base} has no evaluated value"))?;
-                    let exponent_value = values
-                        .get(*exponent)
+                        .ok_or_else(|| format!("node {lhs} has no evaluated value"))?;
+                    let rhs_value = values
+                        .get(*rhs)
                         .and_then(Option::as_ref)
-                        .ok_or_else(|| format!("node {exponent} has no evaluated value"))?;
+                        .ok_or_else(|| format!("node {rhs} has no evaluated value"))?;
                     // Constant operands are skipped, as in the symbolic rule.
-                    if self.scalar_constant_value(*base).is_none() {
-                        let contribution = cotangent
-                            .mul(&base_value.pow_base_derivative(exponent_value)?)?
-                            .reduce_to_shape(&base_value.shape)?;
-                        accumulate(&mut cotangents[*base], contribution)?;
-                    }
-                    if self.scalar_constant_value(*exponent).is_none() {
-                        let contribution = cotangent
-                            .mul(&base_value.pow_exponent_derivative(exponent_value)?)?
-                            .reduce_to_shape(&exponent_value.shape)?;
-                        accumulate(&mut cotangents[*exponent], contribution)?;
+                    for (index, operand) in [*lhs, *rhs].into_iter().enumerate() {
+                        if self.scalar_constant_value(operand).is_some() {
+                            continue;
+                        }
+                        let shape = &self.node(operand)?.shape;
+                        let contribution =
+                            match kind.numeric_partial(index, lhs_value, rhs_value)? {
+                                Some(partial) => cotangent.mul(&partial)?.reduce_to_shape(shape)?,
+                                None => cotangent.reduce_to_shape(shape)?,
+                            };
+                        accumulate(&mut cotangents[operand], contribution)?;
                     }
                 }
                 TensorOp::Transpose { input, axes } => {
                     let contribution = cotangent.transpose(&inverse_permutation(axes)?)?;
                     accumulate(&mut cotangents[*input], contribution)?;
                 }
-                TensorOp::Log { input } => {
-                    let input_value = values
-                        .get(*input)
-                        .and_then(Option::as_ref)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let contribution = cotangent
-                        .mul(&input_value.reciprocal()?)?
-                        .reduce_to_shape(&self.node(*input)?.shape)?;
-                    accumulate(&mut cotangents[*input], contribution)?;
-                }
-                TensorOp::Log1p { input } => {
-                    let input_value = values
-                        .get(*input)
-                        .and_then(Option::as_ref)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let contribution = cotangent
-                        .mul(&input_value.log1p_derivative()?)?
-                        .reduce_to_shape(&self.node(*input)?.shape)?;
-                    accumulate(&mut cotangents[*input], contribution)?;
-                }
-                TensorOp::Expm1 { input } | TensorOp::Erf { input } | TensorOp::Erfc { input } => {
-                    let input_value = values
-                        .get(*input)
-                        .and_then(Option::as_ref)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let derivative = match &self.nodes[node_id].op {
-                        TensorOp::Expm1 { .. } => input_value.exp()?,
-                        TensorOp::Erf { .. } => input_value.map_f64(erf_derivative)?,
-                        _ => input_value.map_f64(|x| -erf_derivative(x))?,
-                    };
-                    let contribution = cotangent
-                        .mul(&derivative)?
-                        .reduce_to_shape(&self.node(*input)?.shape)?;
-                    accumulate(&mut cotangents[*input], contribution)?;
-                }
-                TensorOp::Atan2 { y, x } => {
-                    let y_value = values
-                        .get(*y)
-                        .and_then(Option::as_ref)
-                        .ok_or_else(|| format!("node {y} has no evaluated value"))?;
-                    let x_value = values
-                        .get(*x)
-                        .and_then(Option::as_ref)
-                        .ok_or_else(|| format!("node {x} has no evaluated value"))?;
-                    // Constant operands are skipped, as in the symbolic rule.
-                    for (operand, index) in [(*y, 0), (*x, 1)] {
-                        if self.scalar_constant_value(operand).is_some() {
-                            continue;
-                        }
-                        let contribution = cotangent
-                            .mul(&y_value.atan2_derivative(x_value, index)?)?
-                            .reduce_to_shape(&self.node(operand)?.shape)?;
-                        accumulate(&mut cotangents[operand], contribution)?;
-                    }
-                }
                 TensorOp::UnaryMath { input, kind } => {
-                    if !kind.is_piecewise_constant() {
-                        let input_value = values
-                            .get(*input)
-                            .and_then(Option::as_ref)
-                            .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                        let contribution = cotangent
-                            .mul(&input_value.map_f64(|x| kind.derivative(x))?)?
-                            .reduce_to_shape(&self.node(*input)?.shape)?;
-                        accumulate(&mut cotangents[*input], contribution)?;
-                    }
-                }
-                TensorOp::Fmod { x, y } => {
-                    let x_value = values
-                        .get(*x)
+                    let input_value = values
+                        .get(*input)
                         .and_then(Option::as_ref)
-                        .ok_or_else(|| format!("node {x} has no evaluated value"))?;
-                    let y_value = values
-                        .get(*y)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let output_value = values
+                        .get(node_id)
                         .and_then(Option::as_ref)
-                        .ok_or_else(|| format!("node {y} has no evaluated value"))?;
-                    // Constant operands are skipped, as in the symbolic rule.
-                    if self.scalar_constant_value(*x).is_none() {
-                        let contribution = cotangent.reduce_to_shape(&x_value.shape)?;
-                        accumulate(&mut cotangents[*x], contribution)?;
-                    }
-                    if self.scalar_constant_value(*y).is_none() {
-                        let contribution = cotangent
-                            .mul(&x_value.elementwise(y_value, elementwise::fmod_y_partial)?)?
-                            .reduce_to_shape(&y_value.shape)?;
-                        accumulate(&mut cotangents[*y], contribution)?;
+                        .ok_or_else(|| format!("node {node_id} has no evaluated value"))?;
+                    if let Some(contribution) =
+                        kind.numeric_chain(&cotangent, input_value, output_value)?
+                    {
+                        accumulate(
+                            &mut cotangents[*input],
+                            contribution.reduce_to_shape(&self.node(*input)?.shape)?,
+                        )?;
                     }
                 }
                 TensorOp::StopGradient { .. } => {}
@@ -9210,7 +8440,7 @@ impl TensorIr {
                     let external_inputs = tensor_fori_capture_values(captures, &values)?;
                     let external_tangents = tensor_fori_capture_values(captures, &tangents)?;
                     loop_plan
-                        .jvp(
+                        .runtime_jvp(
                             values
                                 .get(*carry)
                                 .cloned()
@@ -9383,24 +8613,6 @@ impl TensorIr {
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
                     .triangular(*lower)?,
-                TensorOp::Tanh { input } => {
-                    let input_tangent = tangents
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated tangent"))?;
-                    let output_value = values
-                        .get(node_id)
-                        .ok_or_else(|| format!("node {node_id} has no evaluated value"))?;
-                    input_tangent.mul(&output_value.tanh_derivative_from_output()?)?
-                }
-                TensorOp::Exp { input } => {
-                    let input_tangent = tangents
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated tangent"))?;
-                    let output_value = values
-                        .get(node_id)
-                        .ok_or_else(|| format!("node {node_id} has no evaluated value"))?;
-                    input_tangent.mul(output_value)?
-                }
                 TensorOp::Sqrt { input } => {
                     let input_tangent = tangents
                         .get(*input)
@@ -9434,24 +8646,6 @@ impl TensorIr {
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
                     .reduce_axis(*axis, 1.0 / self.node(*input)?.shape[*axis] as f64)?,
-                TensorOp::Sin { input } => {
-                    let input_tangent = tangents
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated tangent"))?;
-                    let input_value = values
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    input_tangent.mul(&input_value.cos()?)?
-                }
-                TensorOp::Cos { input } => {
-                    let input_tangent = tangents
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated tangent"))?;
-                    let input_value = values
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    input_tangent.mul(&input_value.sin()?)?.neg()?
-                }
                 TensorOp::Powi { input, exponent } => {
                     if *exponent == 0 {
                         DynamicTensor::filled(node.shape.clone(), 0.0)?
@@ -9467,31 +8661,26 @@ impl TensorIr {
                             .scale(*exponent as f64)?
                     }
                 }
-                TensorOp::Pow { base, exponent } => {
-                    let base_value = values
-                        .get(*base)
-                        .ok_or_else(|| format!("node {base} has no evaluated value"))?;
-                    let exponent_value = values
-                        .get(*exponent)
-                        .ok_or_else(|| format!("node {exponent} has no evaluated value"))?;
+                TensorOp::BinaryMath { lhs, rhs, kind } => {
+                    let lhs_value = values
+                        .get(*lhs)
+                        .ok_or_else(|| format!("node {lhs} has no evaluated value"))?;
+                    let rhs_value = values
+                        .get(*rhs)
+                        .ok_or_else(|| format!("node {rhs} has no evaluated value"))?;
                     // Constant operands are skipped, as in the symbolic rule.
                     let mut tangent = DynamicTensor::filled(node.shape.clone(), 0.0)?;
-                    if self.scalar_constant_value(*base).is_none() {
-                        let base_tangent = tangents
-                            .get(*base)
-                            .ok_or_else(|| format!("node {base} has no evaluated tangent"))?;
-                        tangent = tangent.add(
-                            &base_tangent.mul(&base_value.pow_base_derivative(exponent_value)?)?,
-                        )?;
-                    }
-                    if self.scalar_constant_value(*exponent).is_none() {
-                        let exponent_tangent = tangents
-                            .get(*exponent)
-                            .ok_or_else(|| format!("node {exponent} has no evaluated tangent"))?;
-                        tangent = tangent.add(
-                            &exponent_tangent
-                                .mul(&base_value.pow_exponent_derivative(exponent_value)?)?,
-                        )?;
+                    for (index, operand) in [*lhs, *rhs].into_iter().enumerate() {
+                        if self.scalar_constant_value(operand).is_some() {
+                            continue;
+                        }
+                        let operand_tangent = tangents
+                            .get(operand)
+                            .ok_or_else(|| format!("node {operand} has no evaluated tangent"))?;
+                        tangent = match kind.numeric_partial(index, lhs_value, rhs_value)? {
+                            Some(partial) => tangent.add(&operand_tangent.mul(&partial)?)?,
+                            None => tangent.add(operand_tangent)?,
+                        };
                     }
                     tangent
                 }
@@ -9499,63 +8688,6 @@ impl TensorIr {
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
                     .transpose(axes)?,
-                TensorOp::Log { input } => {
-                    let input_tangent = tangents
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated tangent"))?;
-                    let input_value = values
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    input_tangent.mul(&input_value.reciprocal()?)?
-                }
-                TensorOp::Log1p { input } => {
-                    let input_tangent = tangents
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated tangent"))?;
-                    let input_value = values
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    input_tangent.mul(&input_value.log1p_derivative()?)?
-                }
-                TensorOp::Expm1 { input } | TensorOp::Erf { input } | TensorOp::Erfc { input } => {
-                    let input_tangent = tangents
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated tangent"))?;
-                    let input_value = values
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let derivative = match &node.op {
-                        TensorOp::Expm1 { .. } => input_value.exp()?,
-                        TensorOp::Erf { .. } => input_value.map_f64(erf_derivative)?,
-                        _ => input_value.map_f64(|x| -erf_derivative(x))?,
-                    };
-                    input_tangent.mul(&derivative)?
-                }
-                TensorOp::Atan2 { y, x } => {
-                    let y_value = values
-                        .get(*y)
-                        .ok_or_else(|| format!("node {y} has no evaluated value"))?;
-                    let x_value = values
-                        .get(*x)
-                        .ok_or_else(|| format!("node {x} has no evaluated value"))?;
-                    // Constant operands are skipped, as in the symbolic rule.
-                    let mut tangent = DynamicTensor::filled(node.shape.clone(), 0.0)?;
-                    for (operand, index) in [(*y, 0), (*x, 1)] {
-                        if self.scalar_constant_value(operand).is_some() {
-                            continue;
-                        }
-                        let operand_tangent = tangents
-                            .get(operand)
-                            .ok_or_else(|| format!("node {operand} has no evaluated tangent"))?;
-                        tangent = tangent.add(
-                            &operand_tangent.mul(&y_value.atan2_derivative(x_value, index)?)?,
-                        )?;
-                    }
-                    tangent
-                }
-                TensorOp::UnaryMath { kind, .. } if kind.is_piecewise_constant() => {
-                    DynamicTensor::filled(node.shape.clone(), 0.0)?
-                }
                 TensorOp::UnaryMath { input, kind } => {
                     let input_tangent = tangents
                         .get(*input)
@@ -9563,33 +8695,13 @@ impl TensorIr {
                     let input_value = values
                         .get(*input)
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    input_tangent.mul(&input_value.map_f64(|x| kind.derivative(x))?)?
-                }
-                TensorOp::Fmod { x, y } => {
-                    let x_value = values
-                        .get(*x)
-                        .ok_or_else(|| format!("node {x} has no evaluated value"))?;
-                    let y_value = values
-                        .get(*y)
-                        .ok_or_else(|| format!("node {y} has no evaluated value"))?;
-                    // Constant operands are skipped, as in the symbolic rule.
-                    let mut tangent = DynamicTensor::filled(node.shape.clone(), 0.0)?;
-                    if self.scalar_constant_value(*x).is_none() {
-                        let x_tangent = tangents
-                            .get(*x)
-                            .ok_or_else(|| format!("node {x} has no evaluated tangent"))?;
-                        tangent = tangent.add(x_tangent)?;
+                    let output_value = values
+                        .get(node_id)
+                        .ok_or_else(|| format!("node {node_id} has no evaluated value"))?;
+                    match kind.numeric_chain(input_tangent, input_value, output_value)? {
+                        Some(tangent) => tangent,
+                        None => DynamicTensor::filled(node.shape.clone(), 0.0)?,
                     }
-                    if self.scalar_constant_value(*y).is_none() {
-                        let y_tangent = tangents
-                            .get(*y)
-                            .ok_or_else(|| format!("node {y} has no evaluated tangent"))?;
-                        tangent = tangent
-                            .add(&y_tangent.mul(
-                                &x_value.elementwise(y_value, elementwise::fmod_y_partial)?,
-                            )?)?;
-                    }
-                    tangent
                 }
                 TensorOp::StopGradient { .. } => DynamicTensor::filled(node.shape.clone(), 0.0)?,
                 TensorOp::Custom { rule, .. } => {
@@ -9886,6 +8998,10 @@ impl TensorIr {
     ) -> Result<bool, String> {
         if self.nodes.iter().any(|node| {
             node.dtype != TensorDType::F64
+                || matches!(
+                    node.op,
+                    TensorOp::UnaryMath { kind, .. } if kind.second_order_bounds(0.0).is_none()
+                )
                 || !matches!(
                     node.op,
                     TensorOp::Input { .. }
@@ -9895,10 +9011,7 @@ impl TensorIr {
                         | TensorOp::Sub { .. }
                         | TensorOp::Mul { .. }
                         | TensorOp::Powi { .. }
-                        | TensorOp::Sin { .. }
-                        | TensorOp::Cos { .. }
-                        | TensorOp::Tanh { .. }
-                        | TensorOp::Exp { .. }
+                        | TensorOp::UnaryMath { .. }
                         | TensorOp::Matmul { .. }
                         | TensorOp::Sum { .. }
                         | TensorOp::SumAxis { .. }
@@ -9979,9 +9092,10 @@ impl TensorIr {
                         unary(*input, first, second)
                     }
                 }
-                TensorOp::Sin { input } | TensorOp::Cos { input } => unary(*input, 1.0, 1.0),
-                TensorOp::Tanh { input } => unary(*input, 1.0, 2.0),
-                TensorOp::Exp { input } => unary(*input, magnitude, magnitude),
+                TensorOp::UnaryMath { input, kind } => match kind.second_order_bounds(magnitude) {
+                    Some((first, second)) => unary(*input, first, second),
+                    None => return Ok(false),
+                },
                 TensorOp::Sum { input } | TensorOp::Mean { input } => {
                     let (_, linear, mixed) = bounds[*input];
                     let count = values[*input].data.len() as f64;
@@ -10196,12 +9310,6 @@ impl TensorIr {
                     if *lower { "tril" } else { "triu" },
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::Tanh { input } => {
-                    format!("%{id} = tanh(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
-                }
-                TensorOp::Exp { input } => {
-                    format!("%{id} = exp(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
-                }
                 TensorOp::Sqrt { input } => {
                     format!("%{id} = sqrt(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
                 }
@@ -10219,50 +9327,22 @@ impl TensorIr {
                     "%{id} = mean(%{input}, axis={axis}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::Sin { input } => {
-                    format!("%{id} = sin(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
-                }
-                TensorOp::Cos { input } => {
-                    format!("%{id} = cos(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
-                }
                 TensorOp::Powi { input, exponent } => format!(
                     "%{id} = powi(%{input}, {exponent}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::Pow { base, exponent } => format!(
-                    "%{id} = pow(%{base}, %{exponent}) : {}",
+                TensorOp::BinaryMath { lhs, rhs, kind } => format!(
+                    "%{id} = {}(%{lhs}, %{rhs}) : {}",
+                    kind.name(),
                     format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Transpose { input, axes } => format!(
                     "%{id} = transpose(%{input}, axes={axes:?}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::Log { input } => {
-                    format!("%{id} = log(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
-                }
-                TensorOp::Log1p { input } => {
-                    format!("%{id} = log1p(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
-                }
-                TensorOp::Expm1 { input } => {
-                    format!("%{id} = expm1(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
-                }
-                TensorOp::Erf { input } => {
-                    format!("%{id} = erf(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
-                }
-                TensorOp::Erfc { input } => {
-                    format!("%{id} = erfc(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
-                }
-                TensorOp::Atan2 { y, x } => format!(
-                    "%{id} = atan2(%{y}, %{x}) : {}",
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
                 TensorOp::UnaryMath { input, kind } => format!(
                     "%{id} = {}(%{input}) : {}",
                     kind.name(),
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::Fmod { x, y } => format!(
-                    "%{id} = fmod(%{x}, %{y}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::StopGradient { input } => format!(
@@ -10389,14 +9469,18 @@ impl TensorIr {
                     values[rhs],
                     tensor_type(node)
                 ),
-                TensorOp::Pow { base, exponent } => format!(
-                    "%v{id} = stablehlo.power {}, {} : {}",
-                    values[base],
-                    values[exponent],
-                    tensor_type(node)
-                ),
-                TensorOp::Tanh { input } => format!(
-                    "%v{id} = stablehlo.tanh {} : {}",
+                TensorOp::BinaryMath { lhs, rhs, kind } if kind.stablehlo_name().is_some() => {
+                    format!(
+                        "%v{id} = {} {}, {} : {}",
+                        kind.stablehlo_name().unwrap_or_default(),
+                        values[lhs],
+                        values[rhs],
+                        tensor_type(node)
+                    )
+                }
+                TensorOp::UnaryMath { input, kind } if kind.stablehlo_name().is_some() => format!(
+                    "%v{id} = {} {} : {}",
+                    kind.stablehlo_name().unwrap_or_default(),
                     values[input],
                     tensor_type(node)
                 ),
@@ -11111,16 +10195,6 @@ impl TensorIr {
                         .and_then(Option::as_ref)
                         .ok_or_else(|| format!("node {input} has no evaluated value"))?,
                 )?,
-                TensorOp::Tanh { input } => values
-                    .get(*input)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
-                    .tanh()?,
-                TensorOp::Exp { input } => values
-                    .get(*input)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
-                    .exp()?,
                 TensorOp::Sqrt { input } => values
                     .get(*input)
                     .and_then(Option::as_ref)
@@ -11146,87 +10220,32 @@ impl TensorIr {
                     .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .reduce_axis(*axis, 1.0 / nodes[*input].shape[*axis] as f64)?,
-                TensorOp::Sin { input } => values
-                    .get(*input)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
-                    .sin()?,
-                TensorOp::Cos { input } => values
-                    .get(*input)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
-                    .cos()?,
                 TensorOp::Powi { input, exponent } => values
                     .get(*input)
                     .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .powi(*exponent)?,
-                TensorOp::Pow { base, exponent } => values
-                    .get(*base)
+                TensorOp::BinaryMath { lhs, rhs, kind } => values
+                    .get(*lhs)
                     .and_then(Option::as_ref)
-                    .ok_or_else(|| format!("node {base} has no evaluated value"))?
-                    .pow(
+                    .ok_or_else(|| format!("node {lhs} has no evaluated value"))?
+                    .elementwise(
                         values
-                            .get(*exponent)
+                            .get(*rhs)
                             .and_then(Option::as_ref)
-                            .ok_or_else(|| format!("node {exponent} has no evaluated value"))?,
+                            .ok_or_else(|| format!("node {rhs} has no evaluated value"))?,
+                        kind.function(),
                     )?,
                 TensorOp::Transpose { input, axes } => values
                     .get(*input)
                     .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .transpose(axes)?,
-                TensorOp::Log { input } => values
-                    .get(*input)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
-                    .log()?,
-                TensorOp::Log1p { input } => values
-                    .get(*input)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
-                    .log1p()?,
-                TensorOp::Expm1 { input } => values
-                    .get(*input)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
-                    .map_f64(f64::exp_m1)?,
-                TensorOp::Erf { input } => values
-                    .get(*input)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
-                    .map_f64(libm::erf)?,
-                TensorOp::Erfc { input } => values
-                    .get(*input)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
-                    .map_f64(libm::erfc)?,
-                TensorOp::Atan2 { y, x } => values
-                    .get(*y)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| format!("node {y} has no evaluated value"))?
-                    .atan2(
-                        values
-                            .get(*x)
-                            .and_then(Option::as_ref)
-                            .ok_or_else(|| format!("node {x} has no evaluated value"))?,
-                    )?,
                 TensorOp::UnaryMath { input, kind } => values
                     .get(*input)
                     .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .map_f64(|x| kind.evaluate(x))?,
-                TensorOp::Fmod { x, y } => values
-                    .get(*x)
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| format!("node {x} has no evaluated value"))?
-                    .elementwise(
-                        values
-                            .get(*y)
-                            .and_then(Option::as_ref)
-                            .ok_or_else(|| format!("node {y} has no evaluated value"))?,
-                        elementwise::fmod,
-                    )?,
                 TensorOp::StopGradient { input } | TensorOp::Custom { value: input, .. } => values
                     .get(*input)
                     .and_then(Option::as_ref)
@@ -11398,180 +10417,12 @@ impl TensorIr {
                         value,
                     }
                 }
-                TensorOp::Log { input } => {
-                    let input = values
+                TensorOp::UnaryMath { input, kind } => kind.numeric_mixed(
+                    values
                         .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let reciprocal = input.value.reciprocal()?;
-                    let reciprocal_squared = reciprocal.mul(&reciprocal)?;
-                    MixedTangent {
-                        value: input.value.log()?,
-                        first: input.first.mul(&reciprocal)?,
-                        second: input.second.mul(&reciprocal)?,
-                        mixed: input
-                            .mixed
-                            .mul(&reciprocal)?
-                            .sub(&input.first.mul(&input.second)?.mul(&reciprocal_squared)?)?,
-                    }
-                }
-                TensorOp::Log1p { input } => {
-                    let input = values
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let derivative = input.value.log1p_derivative()?;
-                    let derivative_squared = derivative.mul(&derivative)?;
-                    MixedTangent {
-                        value: input.value.log1p()?,
-                        first: input.first.mul(&derivative)?,
-                        second: input.second.mul(&derivative)?,
-                        mixed: input
-                            .mixed
-                            .mul(&derivative)?
-                            .sub(&input.first.mul(&input.second)?.mul(&derivative_squared)?)?,
-                    }
-                }
-                TensorOp::Expm1 { input } | TensorOp::Erf { input } | TensorOp::Erfc { input } => {
-                    let input = values
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let (value, derivative, second_derivative) = match &node.op {
-                        TensorOp::Expm1 { .. } => {
-                            let exp = input.value.exp()?;
-                            (input.value.map_f64(f64::exp_m1)?, exp.clone(), exp)
-                        }
-                        TensorOp::Erfc { .. } => (
-                            input.value.map_f64(libm::erfc)?,
-                            input.value.map_f64(|x| -erf_derivative(x))?,
-                            input.value.map_f64(|x| -erf_second_derivative(x))?,
-                        ),
-                        _ => (
-                            input.value.map_f64(libm::erf)?,
-                            input.value.map_f64(erf_derivative)?,
-                            input.value.map_f64(erf_second_derivative)?,
-                        ),
-                    };
-                    MixedTangent {
-                        value,
-                        first: input.first.mul(&derivative)?,
-                        second: input.second.mul(&derivative)?,
-                        mixed: input.mixed.mul(&derivative)?.add(
-                            &input
-                                .first
-                                .mul(&input.second)?
-                                .mul(&second_derivative)?,
-                        )?,
-                    }
-                }
-                // `first`, `second` and `mixed` use the partials of the
-                // non-constant operands, as the symbolic rule does.
-                TensorOp::Atan2 { y, x } => {
-                    let y_tangent = values
-                        .get(*y)
-                        .ok_or_else(|| format!("node {y} has no evaluated value"))?;
-                    let x_tangent = values
-                        .get(*x)
-                        .ok_or_else(|| format!("node {x} has no evaluated value"))?;
-                    let (y_value, x_value) = (&y_tangent.value, &x_tangent.value);
-                    let partial = |index| y_value.atan2_derivative(x_value, index);
-                    let operands = [
-                        (y_tangent, self.scalar_constant_value(*y).is_none()),
-                        (x_tangent, self.scalar_constant_value(*x).is_none()),
-                    ];
-                    let mut first = DynamicTensor::filled(node.shape.clone(), 0.0)?;
-                    let mut second = first.clone();
-                    let mut mixed = first.clone();
-                    for (index, (operand, varies)) in operands.iter().enumerate() {
-                        if !varies {
-                            continue;
-                        }
-                        let derivative = partial(index)?;
-                        first = first.add(&operand.first.mul(&derivative)?)?;
-                        second = second.add(&operand.second.mul(&derivative)?)?;
-                        mixed = mixed.add(&operand.mixed.mul(&derivative)?)?;
-                        for (other_index, (other, other_varies)) in operands.iter().enumerate() {
-                            if !other_varies {
-                                continue;
-                            }
-                            // Entries 2, 3 and 4 hold d/dy d/dy, the mixed
-                            // partial and d/dx d/dx.
-                            let second_partial = partial(2 + index + other_index)?;
-                            mixed = mixed
-                                .add(&operand.first.mul(&other.second)?.mul(&second_partial)?)?;
-                        }
-                    }
-                    MixedTangent {
-                        value: y_value.atan2(x_value)?,
-                        first,
-                        second,
-                        mixed,
-                    }
-                }
-                TensorOp::UnaryMath { input, kind } => {
-                    let input = values
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let value = input.value.map_f64(|x| kind.evaluate(x))?;
-                    if kind.is_piecewise_constant() {
-                        let zero = DynamicTensor::filled(node.shape.clone(), 0.0)?;
-                        MixedTangent {
-                            value,
-                            first: zero.clone(),
-                            second: zero.clone(),
-                            mixed: zero,
-                        }
-                    } else {
-                        let derivative = input.value.map_f64(|x| kind.derivative(x))?;
-                        let second_derivative =
-                            input.value.map_f64(|x| kind.second_derivative(x))?;
-                        MixedTangent {
-                            value,
-                            first: input.first.mul(&derivative)?,
-                            second: input.second.mul(&derivative)?,
-                            mixed: input.mixed.mul(&derivative)?.add(
-                                &input
-                                    .first
-                                    .mul(&input.second)?
-                                    .mul(&second_derivative)?,
-                            )?,
-                        }
-                    }
-                }
-                // Both partials are piecewise constant, so the second-order
-                // terms vanish and each output tangent is linear in the
-                // operand tangents; constant operands are skipped as in the
-                // symbolic rule.
-                TensorOp::Fmod { x, y } => {
-                    let x_tangent = values
-                        .get(*x)
-                        .ok_or_else(|| format!("node {x} has no evaluated value"))?;
-                    let y_tangent = values
-                        .get(*y)
-                        .ok_or_else(|| format!("node {y} has no evaluated value"))?;
-                    let mut first = DynamicTensor::filled(node.shape.clone(), 0.0)?;
-                    let mut second = first.clone();
-                    let mut mixed = first.clone();
-                    if self.scalar_constant_value(*x).is_none() {
-                        first = first.add(&x_tangent.first)?;
-                        second = second.add(&x_tangent.second)?;
-                        mixed = mixed.add(&x_tangent.mixed)?;
-                    }
-                    if self.scalar_constant_value(*y).is_none() {
-                        let partial = x_tangent
-                            .value
-                            .elementwise(&y_tangent.value, elementwise::fmod_y_partial)?;
-                        first = first.add(&y_tangent.first.mul(&partial)?)?;
-                        second = second.add(&y_tangent.second.mul(&partial)?)?;
-                        mixed = mixed.add(&y_tangent.mixed.mul(&partial)?)?;
-                    }
-                    MixedTangent {
-                        value: x_tangent
-                            .value
-                            .elementwise(&y_tangent.value, elementwise::fmod)?,
-                        first,
-                        second,
-                        mixed,
-                    }
-                }
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?,
+                    &node.shape,
+                )?,
                 TensorOp::Custom { rule, .. } => {
                     return Err(custom_rule_numeric_error(rule));
                 }
@@ -11639,39 +10490,6 @@ impl TensorIr {
                         mixed: input.mixed.reduce_axis(*axis, scale)?,
                     }
                 }
-                TensorOp::Sin { input } => {
-                    let input = values
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let value = input.value.sin()?;
-                    let cosine = input.value.cos()?;
-                    MixedTangent {
-                        first: input.first.mul(&cosine)?,
-                        second: input.second.mul(&cosine)?,
-                        mixed: input
-                            .mixed
-                            .mul(&cosine)?
-                            .sub(&input.first.mul(&input.second)?.mul(&value)?)?,
-                        value,
-                    }
-                }
-                TensorOp::Cos { input } => {
-                    let input = values
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let value = input.value.cos()?;
-                    let sine = input.value.sin()?;
-                    MixedTangent {
-                        first: input.first.mul(&sine)?.neg()?,
-                        second: input.second.mul(&sine)?.neg()?,
-                        mixed: input
-                            .mixed
-                            .mul(&sine)?
-                            .neg()?
-                            .sub(&input.first.mul(&input.second)?.mul(&value)?)?,
-                        value,
-                    }
-                }
                 TensorOp::Powi { input, exponent } => {
                     let input = values
                         .get(*input)
@@ -11715,21 +10533,6 @@ impl TensorIr {
                         first: input.first.transpose(axes)?,
                         second: input.second.transpose(axes)?,
                         mixed: input.mixed.transpose(axes)?,
-                    }
-                }
-                TensorOp::Exp { input } => {
-                    let input = values
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let value = input.value.exp()?;
-                    MixedTangent {
-                        first: input.first.mul(&value)?,
-                        second: input.second.mul(&value)?,
-                        mixed: input
-                            .mixed
-                            .add(&input.first.mul(&input.second)?)?
-                            .mul(&value)?,
-                        value,
                     }
                 }
                 TensorOp::Sqrt { input } => {
@@ -11877,49 +10680,19 @@ impl TensorIr {
                             .add(&lhs.value.mul(&rhs.mixed)?)?,
                     }
                 }
-                // Second-order forward rule matching the composed symbolic rules: `first` and
-                // `second` use the first partials, and `mixed` adds `sum_ij d_i d_j pow` over the
-                // non-constant operands, with the mixed partials in composition order.
-                TensorOp::Pow { base, exponent } => {
-                    let base_tangent = values
-                        .get(*base)
-                        .ok_or_else(|| format!("node {base} has no evaluated value"))?;
-                    let exponent_tangent = values
-                        .get(*exponent)
-                        .ok_or_else(|| format!("node {exponent} has no evaluated value"))?;
-                    let (x, y) = (&base_tangent.value, &exponent_tangent.value);
-                    let operands = [
-                        (base_tangent, self.scalar_constant_value(*base).is_none()),
-                        (exponent_tangent, self.scalar_constant_value(*exponent).is_none()),
-                    ];
-                    let derivatives = [x.pow_base_derivative(y)?, x.pow_exponent_derivative(y)?];
-                    let mut first = DynamicTensor::filled(node.shape.clone(), 0.0)?;
-                    let mut second = first.clone();
-                    let mut mixed = first.clone();
-                    for (index, (operand, varies)) in operands.iter().enumerate() {
-                        if !varies {
-                            continue;
-                        }
-                        let derivative = &derivatives[index];
-                        first = first.add(&operand.first.mul(derivative)?)?;
-                        second = second.add(&operand.second.mul(derivative)?)?;
-                        mixed = mixed.add(&operand.mixed.mul(derivative)?)?;
-                        for (other_index, (other, other_varies)) in operands.iter().enumerate() {
-                            if !other_varies {
-                                continue;
-                            }
-                            let partial = x.elementwise(y, |base, exponent| {
-                                pow_second_derivatives(base, exponent)[2 * index + other_index]
-                            })?;
-                            mixed = mixed.add(&operand.first.mul(&other.second)?.mul(&partial)?)?;
-                        }
-                    }
-                    MixedTangent {
-                        value: x.pow(y)?,
-                        first,
-                        second,
-                        mixed,
-                    }
+                // Second-order forward rule matching the composed symbolic rules:
+                // the partials of the non-constant operands, see `numeric_mixed`.
+                TensorOp::BinaryMath { lhs, rhs, kind } => {
+                    let operand = |id: TensorNodeId| {
+                        values
+                            .get(id)
+                            .ok_or_else(|| format!("node {id} has no evaluated value"))
+                    };
+                    kind.numeric_mixed(
+                        [operand(*lhs)?, operand(*rhs)?],
+                        [*lhs, *rhs].map(|id| self.scalar_constant_value(id).is_none()),
+                        &node.shape,
+                    )?
                 }
                 TensorOp::Greater { lhs, rhs } => {
                     let lhs = values
@@ -12191,23 +10964,6 @@ impl TensorIr {
                         first: input.first.triangular(*lower)?,
                         second: input.second.triangular(*lower)?,
                         mixed: input.mixed.triangular(*lower)?,
-                    }
-                }
-                TensorOp::Tanh { input } => {
-                    let input = values
-                        .get(*input)
-                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
-                    let value = input.value.tanh()?;
-                    let derivative = value.tanh_derivative_from_output()?;
-                    let second_derivative = value.tanh_second_derivative_from_output()?;
-                    MixedTangent {
-                        first: input.first.mul(&derivative)?,
-                        second: input.second.mul(&derivative)?,
-                        mixed: input
-                            .mixed
-                            .mul(&derivative)?
-                            .add(&input.first.mul(&input.second)?.mul(&second_derivative)?)?,
-                        value,
                     }
                 }
                 TensorOp::Concat { inputs, axis } => {
@@ -13705,35 +12461,130 @@ impl TensorCondExecutionPlan {
     }
 }
 
-#[cfg(feature = "mlx")]
-fn build_tensor_fori_mlx_vjp_plan(
-    body_plan: &TensorExecutionPlan,
-    captures: &BTreeMap<String, Vec<usize>>,
-    output_node_id: TensorNodeId,
-    carry_name: &str,
-    external_captures: &BTreeMap<String, Vec<usize>>,
-) -> Option<TensorMlxVjpPlan> {
-    let mut cotangent_name = "__quabla_mlx_fori_cotangent".to_string();
-    while captures.contains_key(&cotangent_name) {
-        cotangent_name.push('_');
+impl TensorRegionVjpPlan {
+    /// Differentiates the body `outputs` jointly, one cotangent input each,
+    /// with respect to every body input except the loop index.
+    fn new(
+        body: &TensorExecutionPlan,
+        outputs: &[TensorNodeId],
+        captures: &BTreeMap<String, Vec<usize>>,
+        index_name: &str,
+    ) -> Result<Self, String> {
+        let cotangent_names = (0..outputs.len())
+            .map(|index| {
+                let mut name = format!("__quabla_loop_cotangent_{index}");
+                while captures.contains_key(&name) {
+                    name.push('_');
+                }
+                name
+            })
+            .collect::<Vec<_>>();
+        let ir = body.as_ir();
+        let (graph, gradients) = if let [output] = outputs {
+            let vjp = ir.symbolic_vjp(*output, &cotangent_names[0])?;
+            (vjp.graph, vjp.gradients)
+        } else {
+            let seeds = outputs
+                .iter()
+                .zip(&cotangent_names)
+                .map(|(output, name)| (*output, SymbolicCotangent::Input(name.clone())))
+                .collect::<Vec<_>>();
+            let vjp = ir.symbolic_vjp_many(&seeds)?;
+            (vjp.graph, vjp.gradients)
+        };
+        let (names, ids): (Vec<_>, Vec<_>) = gradients
+            .into_iter()
+            .filter(|(name, _)| name != index_name)
+            .unzip();
+        let (plan, ids) = graph.compile_cpu_many(&ids)?;
+        Ok(Self {
+            plan,
+            cotangent_names,
+            gradient_node_ids: names.into_iter().zip(ids).collect(),
+        })
     }
-    let symbolic = body_plan
-        .as_ir()
-        .symbolic_vjp(output_node_id, &cotangent_name)
-        .ok()?;
-    let mut names = vec![carry_name.to_string()];
-    names.extend(external_captures.keys().cloned());
-    let output_node_ids = names
-        .iter()
-        .map(|name| symbolic.gradients.get(name).copied())
-        .collect::<Option<Vec<_>>>()?;
-    let (plan, output_node_ids) = symbolic.graph.compile_cpu_many(&output_node_ids).ok()?;
-    let gradient_node_ids = names.into_iter().zip(output_node_ids).collect();
-    Some(TensorMlxVjpPlan {
-        plan,
-        cotangent_name,
-        gradient_node_ids,
-    })
+
+    /// Evaluates the VJP on the CPU for one iteration's body `inputs` and one
+    /// cotangent per seeded output.
+    fn evaluate(
+        &self,
+        mut inputs: BTreeMap<String, DynamicTensor>,
+        cotangents: impl IntoIterator<Item = DynamicTensor>,
+    ) -> Result<BTreeMap<String, DynamicTensor>, String> {
+        for (name, cotangent) in self.cotangent_names.iter().zip(cotangents) {
+            inputs.insert(name.clone(), cotangent);
+        }
+        let values = self.plan.evaluate_many(&inputs)?;
+        Ok(self.gradient_node_ids.keys().cloned().zip(values).collect())
+    }
+}
+
+impl TensorRegionJvpPlan {
+    fn new(
+        body: &TensorExecutionPlan,
+        output: TensorNodeId,
+        tangent_names: BTreeMap<String, String>,
+    ) -> Result<Self, String> {
+        let transformed = body
+            .as_ir()
+            .symbolic_jvp_with_tangent_inputs(output, &tangent_names)?;
+        let (plan, _) = transformed
+            .graph
+            .compile_cpu_many(&[transformed.value, transformed.tangent])?;
+        Ok(Self {
+            plan,
+            tangent_names,
+        })
+    }
+
+    /// The forward JVP of a loop body output with a fresh tangent input for
+    /// every differentiable input except the index.
+    fn for_loop_body(
+        body: &TensorExecutionPlan,
+        output: TensorNodeId,
+        captures: &BTreeMap<String, Vec<usize>>,
+        index_name: &str,
+    ) -> Result<Self, String> {
+        let mut tangent_names = BTreeMap::new();
+        for (index, name) in captures.keys().enumerate() {
+            if name == index_name || body.input_dtype(name)? == TensorDType::Bool {
+                continue;
+            }
+            let mut tangent_name = format!("__quabla_loop_tangent_{index}");
+            while captures.contains_key(&tangent_name) {
+                tangent_name.push('_');
+            }
+            tangent_names.insert(name.clone(), tangent_name);
+        }
+        Self::new(body, output, tangent_names)
+    }
+
+    /// Evaluates one iteration on the CPU: `carry_tangent` is the tangent of
+    /// `carry_name` and `external_tangents` holds the other captures'.
+    fn evaluate(
+        &self,
+        mut inputs: BTreeMap<String, DynamicTensor>,
+        carry_name: &str,
+        carry_tangent: DynamicTensor,
+        external_tangents: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<(DynamicTensor, DynamicTensor), String> {
+        for (name, tangent_name) in &self.tangent_names {
+            let tangent = if name == carry_name {
+                carry_tangent.clone()
+            } else {
+                external_tangents
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| format!("loop JVP lacks a tangent for capture {name:?}"))?
+            };
+            inputs.insert(tangent_name.clone(), tangent);
+        }
+        let mut values = self.plan.evaluate_many(&inputs)?.into_iter();
+        match (values.next(), values.next()) {
+            (Some(value), Some(tangent)) => Ok((value, tangent)),
+            _ => Err("loop JVP plan did not return a value and a tangent".to_string()),
+        }
+    }
 }
 
 // VJP consumers need block boundaries rather than the public complete carry tape.
@@ -13864,14 +12715,6 @@ impl TensorForiExecutionPlan {
             .filter(|(name, _)| *name != &carry_name && *name != &index_name)
             .map(|(name, shape)| (name.clone(), shape.clone()))
             .collect::<BTreeMap<_, _>>();
-        #[cfg(feature = "mlx")]
-        let mlx_vjp = build_tensor_fori_mlx_vjp_plan(
-            &body.plan,
-            &body.captures,
-            body.plan.output_node_id,
-            &carry_name,
-            &external_captures,
-        );
         Ok(Self {
             lower,
             upper,
@@ -13879,9 +12722,40 @@ impl TensorForiExecutionPlan {
             carry_name,
             index_name,
             external_captures,
-            #[cfg(feature = "mlx")]
-            mlx_vjp,
+            derivatives: Arc::default(),
         })
+    }
+
+    /// The body's symbolic VJP, compiled on first use.
+    fn vjp_plan(&self) -> Result<&TensorRegionVjpPlan, String> {
+        self.derivatives
+            .vjp
+            .get_or_init(|| {
+                TensorRegionVjpPlan::new(
+                    &self.body.plan,
+                    &[self.body.plan.output_node_id],
+                    &self.body.captures,
+                    &self.index_name,
+                )
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// The body's symbolic forward JVP, compiled on first use.
+    fn forward_jvp_plan(&self) -> Result<&TensorRegionJvpPlan, String> {
+        self.derivatives
+            .forward_jvp
+            .get_or_init(|| {
+                TensorRegionJvpPlan::for_loop_body(
+                    &self.body.plan,
+                    self.body.plan.output_node_id,
+                    &self.body.captures,
+                    &self.index_name,
+                )
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     pub fn carry_shape(&self) -> Result<Vec<usize>, String> {
@@ -13943,12 +12817,66 @@ impl TensorForiExecutionPlan {
         Ok((carry, TensorForiTape { carries }))
     }
 
+    /// Forward-mode derivative through the loop; each iteration runs the
+    /// body's compiled symbolic JVP.
     pub fn jvp(
         &self,
         initial_carry: DynamicTensor,
         initial_tangent: DynamicTensor,
         external_inputs: &BTreeMap<String, DynamicTensor>,
         external_tangents: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<(DynamicTensor, DynamicTensor), String> {
+        self.jvp_with(
+            initial_carry,
+            initial_tangent,
+            external_inputs,
+            external_tangents,
+            |inputs, tangent| {
+                self.forward_jvp_plan()?.evaluate(
+                    inputs,
+                    &self.carry_name,
+                    tangent,
+                    external_tangents,
+                )
+            },
+        )
+    }
+
+    /// The `Fori` rule of the v0.1 runtime JVP engine, which keeps
+    /// differentiating the body with that engine so v0.1 results stay
+    /// unchanged; it goes away with the engine.
+    fn runtime_jvp(
+        &self,
+        initial_carry: DynamicTensor,
+        initial_tangent: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+        external_tangents: &BTreeMap<String, DynamicTensor>,
+    ) -> Result<(DynamicTensor, DynamicTensor), String> {
+        self.jvp_with(
+            initial_carry,
+            initial_tangent,
+            external_inputs,
+            external_tangents,
+            |inputs, tangent| {
+                self.body
+                    .plan
+                    .jvp(&inputs, &self.body_tangents(tangent, external_tangents)?)
+            },
+        )
+    }
+
+    /// Runs the tangent recurrence with `step(body_inputs, carry_tangent)`
+    /// returning the next carry and its tangent.
+    fn jvp_with(
+        &self,
+        initial_carry: DynamicTensor,
+        initial_tangent: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+        external_tangents: &BTreeMap<String, DynamicTensor>,
+        mut step: impl FnMut(
+            BTreeMap<String, DynamicTensor>,
+            DynamicTensor,
+        ) -> Result<(DynamicTensor, DynamicTensor), String>,
     ) -> Result<(DynamicTensor, DynamicTensor), String> {
         self.validate_external_inputs(external_inputs)?;
         self.validate_external_inputs(external_tangents)?;
@@ -13961,20 +12889,70 @@ impl TensorForiExecutionPlan {
         let mut carry = initial_carry;
         let mut tangent = initial_tangent;
         for index in self.lower..self.upper {
-            let inputs = self.body_inputs(carry, index, external_inputs)?;
-            let tangents = self.body_tangents(tangent, external_tangents)?;
-            let (next_carry, next_tangent) = self.body.plan.jvp(&inputs, &tangents)?;
-            carry = next_carry;
-            tangent = next_tangent;
+            (carry, tangent) = step(self.body_inputs(carry, index, external_inputs)?, tangent)?;
         }
         Ok((carry, tangent))
     }
 
+    /// Reverse-mode derivative through the loop with checkpointed carries;
+    /// each iteration runs the body's compiled symbolic VJP.
     pub fn value_and_vjp(
         &self,
         initial_carry: DynamicTensor,
         external_inputs: &BTreeMap<String, DynamicTensor>,
         output_cotangent: DynamicTensor,
+    ) -> Result<
+        (
+            DynamicTensor,
+            DynamicTensor,
+            BTreeMap<String, DynamicTensor>,
+        ),
+        String,
+    > {
+        self.value_and_vjp_with(
+            initial_carry,
+            external_inputs,
+            output_cotangent,
+            |inputs, cotangent| self.vjp_plan()?.evaluate(inputs, [cotangent]),
+        )
+    }
+
+    /// The `Fori` rule of the v0.1 runtime VJP engine, which keeps
+    /// differentiating the body with that engine so v0.1 results stay
+    /// unchanged; it goes away with the engine.
+    fn runtime_value_and_vjp(
+        &self,
+        initial_carry: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+        output_cotangent: DynamicTensor,
+    ) -> Result<
+        (
+            DynamicTensor,
+            DynamicTensor,
+            BTreeMap<String, DynamicTensor>,
+        ),
+        String,
+    > {
+        self.value_and_vjp_with(
+            initial_carry,
+            external_inputs,
+            output_cotangent,
+            |inputs, cotangent| Ok(self.body.plan.value_and_vjp(&inputs, cotangent)?.1),
+        )
+    }
+
+    /// Runs the reverse recurrence with `step(body_inputs, carry_cotangent)`
+    /// returning the body gradients by input name. A capture without a
+    /// gradient (a `bool` input in the symbolic VJP) contributes zero.
+    fn value_and_vjp_with(
+        &self,
+        initial_carry: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+        output_cotangent: DynamicTensor,
+        mut step: impl FnMut(
+            BTreeMap<String, DynamicTensor>,
+            DynamicTensor,
+        ) -> Result<BTreeMap<String, DynamicTensor>, String>,
     ) -> Result<
         (
             DynamicTensor,
@@ -14039,8 +13017,8 @@ impl TensorForiExecutionPlan {
             for (local_offset, carry) in carries.into_iter().enumerate().rev() {
                 let offset = start + local_offset;
                 let index = self.lower + offset;
-                let (_, gradients) = self.body.plan.value_and_vjp(
-                    &self.body_inputs(carry, index, external_inputs)?,
+                let gradients = step(
+                    self.body_inputs(carry, index, external_inputs)?,
                     carry_cotangent,
                 )?;
                 carry_cotangent = gradients
@@ -14048,9 +13026,9 @@ impl TensorForiExecutionPlan {
                     .cloned()
                     .ok_or_else(|| "fori loop body did not return a carry gradient".to_string())?;
                 for name in self.external_captures.keys() {
-                    let contribution = gradients.get(name).ok_or_else(|| {
-                        format!("fori loop body did not return a gradient for capture {name:?}")
-                    })?;
+                    let Some(contribution) = gradients.get(name) else {
+                        continue;
+                    };
                     let accumulated = external_gradients.get_mut(name).ok_or_else(|| {
                         format!("fori loop external gradient {name:?} is missing")
                     })?;
@@ -14309,20 +13287,6 @@ impl TensorForiVjpJvpExecutionPlan {
             }
             tangent_names.insert(name.clone(), tangent_name);
         }
-        #[cfg(feature = "mlx")]
-        let mlx_forward_jvp = {
-            let transformed =
-                body.symbolic_jvp_with_tangent_inputs(body_plan.output_node_id, &tangent_names)?;
-            let (plan, output_node_ids) = transformed
-                .graph
-                .compile_cpu_many(&[transformed.value, transformed.tangent])?;
-            TensorForiMlxForwardJvpPlan {
-                plan,
-                value_node_id: output_node_ids[0],
-                tangent_node_id: output_node_ids[1],
-                tangent_names: tangent_names.clone(),
-            }
-        };
         let mut jvp_tangent_names = tangent_names.clone();
         let mut cotangent_tangent_name = format!("{namespace}_cotangent_tangent");
         while loop_plan
@@ -14359,8 +13323,6 @@ impl TensorForiVjpJvpExecutionPlan {
             cotangent_name,
             tangent_names: jvp_tangent_names,
             gradient_tangent_plans,
-            #[cfg(feature = "mlx")]
-            mlx_forward_jvp,
         })
     }
 
@@ -14392,11 +13354,11 @@ impl TensorForiVjpJvpExecutionPlan {
                 self.loop_plan.lower + offset,
                 external_inputs,
             )?;
-            let tangents = self.loop_plan.body_tangents(tangent, external_tangents)?;
-            self.loop_plan.body.plan.as_ir().jvp(
-                self.loop_plan.body.plan.output_node_id,
-                &inputs,
-                &tangents,
+            self.loop_plan.forward_jvp_plan()?.evaluate(
+                inputs,
+                &self.loop_plan.carry_name,
+                tangent,
+                external_tangents,
             )
         };
         let mut checkpoints = None;
@@ -14443,10 +13405,8 @@ impl TensorForiVjpJvpExecutionPlan {
                 )?;
                 let body_gradients = self
                     .loop_plan
-                    .body
-                    .plan
-                    .value_and_vjp(&inputs, carry_cotangent.clone())?
-                    .1;
+                    .vjp_plan()?
+                    .evaluate(inputs.clone(), [carry_cotangent.clone()])?;
                 let mut jvp_inputs = inputs;
                 jvp_inputs.insert(self.cotangent_name.clone(), carry_cotangent.clone());
                 let mut jvp_tangents = BTreeMap::new();
@@ -14580,27 +13540,15 @@ impl TensorScanVjpJvpExecutionPlan {
             compile_gradient_tangents(carry_vjp, &carry_cotangent_name)?;
         let output_gradient_tangent_plans =
             compile_gradient_tangents(output_vjp, &output_cotangent_name)?;
-        #[cfg(feature = "mlx")]
-        let mlx_forward_jvp = {
-            let forward_tangent_names = tangent_names
+        let forward_jvp = TensorRegionJvpPlan::new(
+            body_plan,
+            body_plan.output_node_ids[0],
+            tangent_names
                 .iter()
                 .filter(|(name, _)| scan_plan.body.captures.contains_key(*name))
                 .map(|(name, tangent_name)| (name.clone(), tangent_name.clone()))
-                .collect::<BTreeMap<_, _>>();
-            let transformed = body.symbolic_jvp_with_tangent_inputs(
-                body_plan.output_node_ids[0],
-                &forward_tangent_names,
-            )?;
-            let (plan, output_node_ids) = transformed
-                .graph
-                .compile_cpu_many(&[transformed.value, transformed.tangent])?;
-            TensorScanMlxForwardJvpPlan {
-                plan,
-                value_node_id: output_node_ids[0],
-                tangent_node_id: output_node_ids[1],
-                tangent_names: forward_tangent_names,
-            }
-        };
+                .collect(),
+        )?;
         Ok(Self {
             scan_plan,
             namespace: namespace.to_string(),
@@ -14609,8 +13557,7 @@ impl TensorScanVjpJvpExecutionPlan {
             tangent_names,
             carry_gradient_tangent_plans,
             output_gradient_tangent_plans,
-            #[cfg(feature = "mlx")]
-            mlx_forward_jvp,
+            forward_jvp,
         })
     }
 
@@ -14647,11 +13594,11 @@ impl TensorScanVjpJvpExecutionPlan {
             let inputs =
                 self.scan_plan
                     .inputs(carry, self.scan_plan.lower + offset, external_inputs)?;
-            let tangents = self.scan_plan.tangents(tangent, external_tangents)?;
-            self.scan_plan.body.plan.as_ir().jvp(
-                self.scan_plan.body.plan.output_node_ids[0],
-                &inputs,
-                &tangents,
+            self.forward_jvp.evaluate(
+                inputs,
+                &self.scan_plan.carry_name,
+                tangent,
+                external_tangents,
             )
         };
         let mut checkpoints = None;
@@ -14701,9 +13648,9 @@ impl TensorScanVjpJvpExecutionPlan {
                 let output_step_cotangent_tangent = output_cotangent_tangent
                     .slice_axis(0, offset, 1)?
                     .reshape(output_step_shape.clone())?;
-                let (_, primal_gradients) = self.scan_plan.body.plan.value_and_vjp_many(
-                    &inputs,
-                    vec![carry_cotangent.clone(), output_step_cotangent.clone()],
+                let primal_gradients = self.scan_plan.vjp_plan()?.evaluate(
+                    inputs.clone(),
+                    [carry_cotangent.clone(), output_step_cotangent.clone()],
                 )?;
                 let mut jvp_inputs = inputs;
                 jvp_inputs.insert(self.carry_cotangent_name.clone(), carry_cotangent.clone());
@@ -14833,26 +13780,6 @@ impl TensorScanExecutionPlan {
             .filter(|(name, _)| *name != &carry_name && *name != &index_name)
             .map(|(name, shape)| (name.clone(), shape.clone()))
             .collect::<BTreeMap<_, _>>();
-        #[cfg(feature = "mlx")]
-        let mlx_vjp = match (
-            build_tensor_fori_mlx_vjp_plan(
-                &body.plan,
-                body.captures(),
-                body.plan.output_node_ids[0],
-                &carry_name,
-                &external_captures,
-            ),
-            build_tensor_fori_mlx_vjp_plan(
-                &body.plan,
-                body.captures(),
-                body.plan.output_node_ids[1],
-                &carry_name,
-                &external_captures,
-            ),
-        ) {
-            (Some(carry), Some(output)) => Some(TensorScanMlxVjpPlan { carry, output }),
-            _ => None,
-        };
         Ok(Self {
             lower,
             upper,
@@ -14860,9 +13787,25 @@ impl TensorScanExecutionPlan {
             carry_name,
             index_name,
             external_captures,
-            #[cfg(feature = "mlx")]
-            mlx_vjp,
+            derivatives: Arc::default(),
         })
+    }
+
+    /// The body's joint symbolic VJP of `(next_carry, output)`, with the
+    /// carry cotangent then the step-output cotangent, compiled on first use.
+    fn vjp_plan(&self) -> Result<&TensorRegionVjpPlan, String> {
+        self.derivatives
+            .vjp
+            .get_or_init(|| {
+                TensorRegionVjpPlan::new(
+                    &self.body.plan,
+                    &self.body.plan.output_node_ids,
+                    self.body.captures(),
+                    &self.index_name,
+                )
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     pub fn carry_shape(&self) -> Result<Vec<usize>, String> {
@@ -14996,6 +13939,10 @@ impl TensorScanExecutionPlan {
             final_carry_cotangent,
             output_cotangent,
             true,
+            |inputs, carry_cotangent, output_cotangent| {
+                self.vjp_plan()?
+                    .evaluate(inputs, [carry_cotangent, output_cotangent])
+            },
         )?;
         Ok((
             carry,
@@ -15019,10 +13966,45 @@ impl TensorScanExecutionPlan {
             final_carry_cotangent,
             output_cotangent,
             false,
+            |inputs, carry_cotangent, output_cotangent| {
+                self.vjp_plan()?
+                    .evaluate(inputs, [carry_cotangent, output_cotangent])
+            },
         )?;
         Ok((gradient, captures))
     }
 
+    /// The `Scan` rule of the v0.1 runtime VJP engine, which keeps
+    /// differentiating the body with that engine so v0.1 results stay
+    /// unchanged; it goes away with the engine.
+    fn runtime_vjp(
+        &self,
+        initial_carry: DynamicTensor,
+        external_inputs: &BTreeMap<String, DynamicTensor>,
+        final_carry_cotangent: DynamicTensor,
+        output_cotangent: DynamicTensor,
+    ) -> Result<(DynamicTensor, BTreeMap<String, DynamicTensor>), String> {
+        let (_, _, gradient, captures) = self.value_and_vjp_internal(
+            initial_carry,
+            external_inputs,
+            final_carry_cotangent,
+            output_cotangent,
+            false,
+            |inputs, carry_cotangent, output_cotangent| {
+                Ok(self
+                    .body
+                    .plan
+                    .value_and_vjp_many(&inputs, vec![carry_cotangent, output_cotangent])?
+                    .1)
+            },
+        )?;
+        Ok((gradient, captures))
+    }
+
+    /// Runs the reverse recurrence with `step(body_inputs, carry_cotangent,
+    /// step_output_cotangent)` returning the body gradients by input name. A
+    /// capture without a gradient (a `bool` input in the symbolic VJP)
+    /// contributes zero.
     fn value_and_vjp_internal(
         &self,
         initial_carry: DynamicTensor,
@@ -15030,6 +14012,11 @@ impl TensorScanExecutionPlan {
         final_carry_cotangent: DynamicTensor,
         output_cotangent: DynamicTensor,
         keep_outputs: bool,
+        mut step: impl FnMut(
+            BTreeMap<String, DynamicTensor>,
+            DynamicTensor,
+            DynamicTensor,
+        ) -> Result<BTreeMap<String, DynamicTensor>, String>,
     ) -> Result<TensorScanCheckpointVjpResult, String> {
         self.validate(initial_carry.clone(), external_inputs)?;
         let steps = self.upper - self.lower;
@@ -15120,18 +14107,15 @@ impl TensorScanExecutionPlan {
                     .slice_axis(0, offset, 1)?
                     .reshape(output_shape.clone())?;
                 let inputs = self.inputs(carry, self.lower + offset, external_inputs)?;
-                let (_, gradients) = self
-                    .body
-                    .plan
-                    .value_and_vjp_many(&inputs, vec![carry_cotangent, output_gradient])?;
+                let gradients = step(inputs, carry_cotangent, output_gradient)?;
                 carry_cotangent = gradients
                     .get(&self.carry_name)
                     .cloned()
                     .ok_or_else(|| "scan body has no carry gradient".to_string())?;
                 for name in self.external_captures.keys() {
-                    let contribution = gradients
-                        .get(name)
-                        .ok_or_else(|| format!("scan body has no gradient for {name:?}"))?;
+                    let Some(contribution) = gradients.get(name) else {
+                        continue;
+                    };
                     let accumulated = external_gradients
                         .get_mut(name)
                         .ok_or_else(|| format!("scan gradient {name:?} is missing"))?;
@@ -15204,259 +14188,6 @@ fn stack_scan_outputs(outputs: Vec<DynamicTensor>) -> Result<DynamicTensor, Stri
         .map(|value| value.reshape(shape.clone()))
         .collect::<Result<Vec<_>, _>>()?;
     DynamicTensor::concat(&reshaped.iter().collect::<Vec<_>>(), 0)
-}
-
-impl TensorForiMultiExecutionPlan {
-    pub fn new(
-        lower: usize,
-        upper: usize,
-        body: TensorExecutionPlan,
-        carry_names: Vec<String>,
-        index_name: impl Into<String>,
-    ) -> Result<Self, String> {
-        if upper < lower {
-            return Err(format!(
-                "multi-carry fori loop requires upper >= lower, got {upper} < {lower}"
-            ));
-        }
-        if carry_names.is_empty() {
-            return Err("multi-carry fori loop requires at least one carry".to_string());
-        }
-        let index_name = index_name.into();
-        let mut names = BTreeSet::new();
-        for name in &carry_names {
-            if name == &index_name || !names.insert(name.as_str()) {
-                return Err(
-                    "multi-carry fori names must be distinct from the index and each other"
-                        .to_string(),
-                );
-            }
-        }
-        let body = TensorMultiRegion::new(body)?;
-        if body.output_shapes().len() != carry_names.len() {
-            return Err(format!(
-                "multi-carry fori body has {} outputs, expected {}",
-                body.output_shapes().len(),
-                carry_names.len()
-            ));
-        }
-        for (name, output_shape) in carry_names.iter().zip(body.output_shapes()) {
-            let carry_shape = body
-                .captures()
-                .get(name)
-                .ok_or_else(|| format!("multi-carry fori body does not capture carry {name:?}"))?;
-            if carry_shape != output_shape {
-                return Err(format!(
-                    "multi-carry fori output for {name:?} has shape {output_shape:?}, expected {carry_shape:?}"
-                ));
-            }
-        }
-        check_loop_region_inputs(&body.plan, "multi-carry fori")?;
-        for (name, output) in carry_names.iter().zip(&body.plan.output_node_ids) {
-            check_region_output_dtype(&body.plan, *output, name, "multi-carry fori")?;
-        }
-        let index_shape = body.captures().get(&index_name).ok_or_else(|| {
-            format!("multi-carry fori body does not capture index {index_name:?}")
-        })?;
-        if !index_shape.is_empty() {
-            return Err(format!(
-                "multi-carry fori index capture must be scalar, got shape {index_shape:?}"
-            ));
-        }
-        let external_captures = body
-            .captures()
-            .iter()
-            .filter(|(name, _)| *name != &index_name && !carry_names.contains(*name))
-            .map(|(name, shape)| (name.clone(), shape.clone()))
-            .collect();
-        Ok(Self {
-            lower,
-            upper,
-            body,
-            carry_names,
-            index_name,
-            external_captures,
-        })
-    }
-
-    pub fn carry_names(&self) -> &[String] {
-        &self.carry_names
-    }
-
-    pub fn external_captures(&self) -> &BTreeMap<String, Vec<usize>> {
-        &self.external_captures
-    }
-
-    pub fn evaluate(
-        &self,
-        initial_carries: Vec<DynamicTensor>,
-        external_inputs: &BTreeMap<String, DynamicTensor>,
-    ) -> Result<Vec<DynamicTensor>, String> {
-        if initial_carries.len() != self.carry_names.len() {
-            return Err(format!(
-                "multi-carry fori received {} carries, expected {}",
-                initial_carries.len(),
-                self.carry_names.len()
-            ));
-        }
-        self.validate_external_inputs(external_inputs)?;
-        for (carry, name) in initial_carries.iter().zip(&self.carry_names) {
-            let shape = self
-                .body
-                .captures()
-                .get(name)
-                .ok_or_else(|| format!("multi-carry fori carry {name:?} is missing"))?;
-            if &carry.shape != shape {
-                return Err(format!(
-                    "multi-carry fori initial carry {name:?} has shape {:?}, expected {shape:?}",
-                    carry.shape
-                ));
-            }
-        }
-        let mut carries = initial_carries;
-        for index in self.lower..self.upper {
-            let mut inputs = external_inputs.clone();
-            inputs.insert(
-                self.index_name.clone(),
-                DynamicTensor::new(vec![], vec![index as f64])?,
-            );
-            for (name, carry) in self.carry_names.iter().zip(&carries) {
-                inputs.insert(name.clone(), carry.clone());
-            }
-            carries = self.body.evaluate(&inputs)?;
-        }
-        Ok(carries)
-    }
-
-    /// Executes a multi-carry loop and reverses all body outputs together.
-    ///
-    /// This is the reverse-loop primitive needed by symbolic `Fori` VJP. The
-    /// body plan receives one joint reverse pass per iteration rather than one
-    /// pass per carry, preserving shared-subgraph work.
-    pub fn value_and_vjp(
-        &self,
-        initial_carries: Vec<DynamicTensor>,
-        external_inputs: &BTreeMap<String, DynamicTensor>,
-        output_cotangents: Vec<DynamicTensor>,
-    ) -> Result<TensorForiMultiVjpResult, String> {
-        if output_cotangents.len() != self.carry_names.len() {
-            return Err(format!(
-                "multi-carry fori received {} output cotangents, expected {}",
-                output_cotangents.len(),
-                self.carry_names.len()
-            ));
-        }
-        if initial_carries.len() != self.carry_names.len() {
-            return Err(format!(
-                "multi-carry fori received {} carries, expected {}",
-                initial_carries.len(),
-                self.carry_names.len()
-            ));
-        }
-        self.validate_external_inputs(external_inputs)?;
-        for ((carry, cotangent), name) in initial_carries
-            .iter()
-            .zip(&output_cotangents)
-            .zip(&self.carry_names)
-        {
-            let shape = self
-                .body
-                .captures()
-                .get(name)
-                .ok_or_else(|| format!("multi-carry fori carry {name:?} is missing"))?;
-            if &carry.shape != shape || &cotangent.shape != shape {
-                return Err(format!(
-                    "multi-carry fori carry and cotangent for {name:?} must have shape {shape:?}"
-                ));
-            }
-        }
-
-        let mut tape = Vec::with_capacity(self.upper - self.lower + 1);
-        let mut carries = initial_carries;
-        tape.push(carries.clone());
-        for index in self.lower..self.upper {
-            carries = self
-                .body
-                .evaluate(&self.body_inputs(carries, index, external_inputs)?)?;
-            tape.push(carries.clone());
-        }
-        let outputs = carries;
-        let mut carry_cotangents = output_cotangents;
-        let mut external_gradients = self
-            .external_captures
-            .iter()
-            .map(|(name, shape)| {
-                DynamicTensor::filled(shape.clone(), 0.0).map(|value| (name.clone(), value))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        for offset in (0..self.upper - self.lower).rev() {
-            let index = self.lower + offset;
-            let (_, gradients) = self.body.plan.value_and_vjp_many(
-                &self.body_inputs(tape[offset].clone(), index, external_inputs)?,
-                carry_cotangents,
-            )?;
-            carry_cotangents = self
-                .carry_names
-                .iter()
-                .map(|name| {
-                    gradients
-                        .get(name)
-                        .cloned()
-                        .ok_or_else(|| format!("multi-carry body has no gradient for {name:?}"))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            for name in self.external_captures.keys() {
-                let gradient = gradients.get(name).ok_or_else(|| {
-                    format!("multi-carry body has no gradient for external capture {name:?}")
-                })?;
-                let slot = external_gradients.get_mut(name).ok_or_else(|| {
-                    format!("multi-carry external gradient slot {name:?} is missing")
-                })?;
-                *slot = slot.add(gradient)?;
-            }
-        }
-        Ok((outputs, carry_cotangents, external_gradients))
-    }
-
-    fn body_inputs(
-        &self,
-        carries: Vec<DynamicTensor>,
-        index: usize,
-        external_inputs: &BTreeMap<String, DynamicTensor>,
-    ) -> Result<BTreeMap<String, DynamicTensor>, String> {
-        let mut inputs = external_inputs.clone();
-        inputs.insert(
-            self.index_name.clone(),
-            DynamicTensor::new(vec![], vec![index as f64])?,
-        );
-        for (name, carry) in self.carry_names.iter().zip(carries) {
-            inputs.insert(name.clone(), carry);
-        }
-        Ok(inputs)
-    }
-
-    fn validate_external_inputs(
-        &self,
-        external_inputs: &BTreeMap<String, DynamicTensor>,
-    ) -> Result<(), String> {
-        if external_inputs.len() != self.external_captures.len() {
-            return Err(
-                "multi-carry fori external inputs must match body captures exactly".to_string(),
-            );
-        }
-        for (name, expected_shape) in &self.external_captures {
-            let value = external_inputs
-                .get(name)
-                .ok_or_else(|| format!("missing multi-carry fori external input {name:?}"))?;
-            if &value.shape != expected_shape {
-                return Err(format!(
-                    "multi-carry fori external input {name:?} has shape {:?}, expected {expected_shape:?}",
-                    value.shape
-                ));
-            }
-        }
-        Ok(())
-    }
 }
 
 impl TensorForiTape {
@@ -16397,8 +15128,6 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                 TensorOp::Triangular { input, lower } => {
                     specialized.triangular(mapped(*input)?, *lower)?
                 }
-                TensorOp::Tanh { input } => specialized.tanh(mapped(*input)?)?,
-                TensorOp::Exp { input } => specialized.exp(mapped(*input)?)?,
                 TensorOp::Sqrt { input } => specialized.sqrt(mapped(*input)?)?,
                 TensorOp::SqrtDerivative { input, order } => {
                     specialized.sqrt_derivative(mapped(*input)?, *order)?
@@ -16410,28 +15139,19 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                 TensorOp::MeanAxis { input, axis } => {
                     specialized.mean_axis(mapped(*input)?, *axis as isize)?
                 }
-                TensorOp::Sin { input } => specialized.sin(mapped(*input)?)?,
-                TensorOp::Cos { input } => specialized.cos(mapped(*input)?)?,
                 TensorOp::Powi { input, exponent } => {
                     specialized.powi(mapped(*input)?, *exponent)?
                 }
-                TensorOp::Pow { base, exponent } => {
-                    specialized.pow(mapped(*base)?, mapped(*exponent)?)?
+                TensorOp::BinaryMath { lhs, rhs, kind } => {
+                    specialized.binary_math(mapped(*lhs)?, mapped(*rhs)?, *kind)?
                 }
                 TensorOp::Transpose { input, axes } => specialized.transpose(
                     mapped(*input)?,
                     Some(axes.iter().map(|axis| *axis as isize).collect()),
                 )?,
-                TensorOp::Log { input } => specialized.log(mapped(*input)?)?,
-                TensorOp::Log1p { input } => specialized.log1p(mapped(*input)?)?,
-                TensorOp::Expm1 { input } => specialized.expm1(mapped(*input)?)?,
-                TensorOp::Erf { input } => specialized.erf(mapped(*input)?)?,
-                TensorOp::Erfc { input } => specialized.erfc(mapped(*input)?)?,
-                TensorOp::Atan2 { y, x } => specialized.atan2(mapped(*y)?, mapped(*x)?)?,
                 TensorOp::UnaryMath { input, kind } => {
                     specialized.unary_math(mapped(*input)?, *kind)?
                 }
-                TensorOp::Fmod { x, y } => specialized.fmod(mapped(*x)?, mapped(*y)?)?,
                 TensorOp::StopGradient { input } => specialized.stop_gradient(mapped(*input)?)?,
                 TensorOp::CumSum {
                     input,
@@ -16603,6 +15323,9 @@ fn cuda_dag_statements(
     Ok(source)
 }
 
+/// One node of a whole-plan or region fusion kernel, its operands read from
+/// the SSA values `child` names. Only the ops fusion admits
+/// (`is_fusable_elementwise_compute_op`) are spelled.
 fn cuda_scalar_expression(
     nodes: &[TensorNode],
     node_id: TensorNodeId,
@@ -16611,6 +15334,11 @@ fn cuda_scalar_expression(
     let node = nodes
         .get(node_id)
         .ok_or_else(|| format!("CUDA lowering references missing node {node_id}"))?;
+    if is_fusable_elementwise_compute_op(&node.op) {
+        if let Some(expression) = cuda_elementwise_formula(&node.op, |_, id| child(id))? {
+            return Ok(expression);
+        }
+    }
     match &node.op {
         TensorOp::Input { .. } => Ok(format!("input_{node_id}[quabla_offset_{node_id}(index)]")),
         TensorOp::ScalarConstant { value } if value.is_finite() => Ok(cuda_scalar_literal(*value)),
@@ -16624,92 +15352,80 @@ fn cuda_scalar_expression(
         }
         // f32 and f64 both execute as float on CUDA (TensorDeviceBackend::execution_dtype), so cast
         // is the identity.
-        TensorOp::Cast { input } => child(*input),
-        TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Greater { lhs, rhs } => Ok(format!(
-            "(({} > {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            child(*rhs)?
-        )),
-        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
-            "(({} {} {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            kind.operator(),
-            child(*rhs)?
-        )),
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => Ok(format!(
-            "(({} != 0.0f) ? {} : {})",
-            child(*condition)?,
-            child(*on_true)?,
-            child(*on_false)?
-        )),
-        TensorOp::Tanh { input } => Ok(format!("tanhf({})", child(*input)?)),
-        TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
-        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
-        TensorOp::SqrtDerivative { input, order } => {
-            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
-        }
-        TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
-        TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
-        TensorOp::Powi { input, exponent } => {
-            Ok(format!("quabla_powi({}, {}U)", child(*input)?, exponent))
-        }
-        TensorOp::Pow { base, exponent } => {
-            Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
-        }
-        TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
-        TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
-        TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
-        TensorOp::Erfc { input } => Ok(format!("erfcf({})", child(*input)?)),
-        TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
-        TensorOp::UnaryMath { input, kind } => {
-            Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
-        }
-        TensorOp::Fmod { x, y } => Ok(format!("fmodf({}, {})", child(*x)?, child(*y)?)),
-        TensorOp::StopGradient { input } => child(*input),
-        TensorOp::Div { .. } | TensorOp::Log { .. } => {
-            Err("CUDA loop-body lowering does not yet support div or log".to_string())
-        }
-        TensorOp::Sum { .. }
-        | TensorOp::CumSum { .. }
-        | TensorOp::SumAxis { .. }
-        | TensorOp::ExtremumAxis { .. }
-        | TensorOp::Matmul { .. }
-        | TensorOp::Solve { .. }
-        | TensorOp::Linalg { .. }
-        | TensorOp::Cholesky { .. }
-        | TensorOp::CholeskyAd { .. }
-        | TensorOp::Triangular { .. }
-        | TensorOp::Reshape { .. }
-        | TensorOp::Mean { .. }
-        | TensorOp::MeanAxis { .. }
-        | TensorOp::Transpose { .. }
-        | TensorOp::Concat { .. }
-        | TensorOp::Slice { .. }
-        | TensorOp::PadSlice { .. }
-        | TensorOp::Gather { .. }
-        | TensorOp::ScatterAdd { .. }
-        | TensorOp::Broadcast { .. }
-        | TensorOp::Cond { .. }
-        | TensorOp::While { .. }
-        | TensorOp::Fori { .. }
-        | TensorOp::ForiJvp { .. }
-        | TensorOp::ForiVjp { .. }
-        | TensorOp::ForiVjpJvp { .. }
-        | TensorOp::Scan { .. }
-        | TensorOp::ScanVjp { .. }
-        | TensorOp::ScanVjpJvp { .. }
-        | TensorOp::Custom { .. } => Err(format!(
+        TensorOp::Cast { input } | TensorOp::StopGradient { input } => child(*input),
+        _ => Err(format!(
             "CUDA lowering does not yet support {}",
             tensor_op_name(&node.op)
         )),
     }
+}
+
+/// The CUDA `float` expression of one elementwise compute node: the single
+/// table of CUDA spellings that every generator shares (the per-node
+/// kernels, whole-plan and region fusion, and the fused loop bodies).
+/// `operand(position, node)` spells operand `position` of `op`, which is
+/// the only thing the generators do differently (a buffer read at a
+/// broadcast offset, a register, a capture, or another SSA value); operands
+/// are spelled in order, so a generator that emits statements as it goes
+/// numbers them deterministically. `Ok(None)` is returned for the ops a
+/// generator resolves itself: inputs, constants, the identities (`cast`,
+/// `stop_gradient`, and the layout ops) and everything that is not
+/// elementwise.
+fn cuda_elementwise_formula(
+    op: &TensorOp,
+    operand: impl Fn(usize, TensorNodeId) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let binary = |symbol: &str, lhs: TensorNodeId, rhs: TensorNodeId| {
+        Ok::<_, String>(format!(
+            "({} {symbol} {})",
+            operand(0, lhs)?,
+            operand(1, rhs)?
+        ))
+    };
+    Ok(Some(match op {
+        TensorOp::Add { lhs, rhs } => binary("+", *lhs, *rhs)?,
+        TensorOp::Sub { lhs, rhs } => binary("-", *lhs, *rhs)?,
+        TensorOp::Mul { lhs, rhs } => binary("*", *lhs, *rhs)?,
+        TensorOp::Div { lhs, rhs } => binary("/", *lhs, *rhs)?,
+        TensorOp::Greater { lhs, rhs } => format!(
+            "(({} > {}) ? 1.0f : 0.0f)",
+            operand(0, *lhs)?,
+            operand(1, *rhs)?
+        ),
+        TensorOp::Compare { lhs, rhs, kind } => format!(
+            "(({} {} {}) ? 1.0f : 0.0f)",
+            operand(0, *lhs)?,
+            kind.operator(),
+            operand(1, *rhs)?
+        ),
+        TensorOp::Where {
+            condition,
+            on_true,
+            on_false,
+        } => format!(
+            "(({} != 0.0f) ? {} : {})",
+            operand(0, *condition)?,
+            operand(1, *on_true)?,
+            operand(2, *on_false)?
+        ),
+        TensorOp::Sqrt { input } => format!("sqrtf({})", operand(0, *input)?),
+        TensorOp::SqrtDerivative { input, order } => {
+            cuda_sqrt_derivative_expression(&operand(0, *input)?, *order)
+        }
+        TensorOp::Powi { input, exponent } => {
+            format!("quabla_powi({}, {exponent}U)", operand(0, *input)?)
+        }
+        TensorOp::UnaryMath { input, kind } => {
+            format!("{}({})", kind.cuda_function(), operand(0, *input)?)
+        }
+        TensorOp::BinaryMath { lhs, rhs, kind } => format!(
+            "{}({}, {})",
+            kind.cuda_function(),
+            operand(0, *lhs)?,
+            operand(1, *rhs)?
+        ),
+        _ => return Ok(None),
+    }))
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
@@ -16811,27 +15527,26 @@ fn is_fusable_elementwise_subgraph(nodes: &[TensorNode], node_id: TensorNodeId) 
     eligible[node_id]
 }
 
+/// Whether whole-plan and region fusion inline `op` into one CUDA
+/// elementwise kernel; an elementwise math op answers through its kind.
 fn is_fusable_elementwise_compute_op(op: &TensorOp) -> bool {
-    matches!(
-        op,
-        TensorOp::Add { .. }
-            | TensorOp::Sub { .. }
-            | TensorOp::Mul { .. }
-            | TensorOp::Greater { .. }
-            | TensorOp::Compare { .. }
-            | TensorOp::Where { .. }
-            | TensorOp::Tanh { .. }
-            | TensorOp::Exp { .. }
-            | TensorOp::Sqrt { .. }
-            | TensorOp::SqrtDerivative { .. }
-            | TensorOp::Sin { .. }
-            | TensorOp::Cos { .. }
-            | TensorOp::Powi { .. }
-            | TensorOp::Pow { .. }
-            | TensorOp::UnaryMath { .. }
-            | TensorOp::Fmod { .. }
-            | TensorOp::Cast { .. }
-    )
+    match op {
+        TensorOp::UnaryMath { kind, .. } => kind.cuda_fusable(),
+        TensorOp::BinaryMath { kind, .. } => kind.cuda_fusable(),
+        _ => matches!(
+            op,
+            TensorOp::Add { .. }
+                | TensorOp::Sub { .. }
+                | TensorOp::Mul { .. }
+                | TensorOp::Greater { .. }
+                | TensorOp::Compare { .. }
+                | TensorOp::Where { .. }
+                | TensorOp::Sqrt { .. }
+                | TensorOp::SqrtDerivative { .. }
+                | TensorOp::Powi { .. }
+                | TensorOp::Cast { .. }
+        ),
+    }
 }
 
 /// The error of the numeric (CPU evaluator) AD paths, which do not apply
@@ -16859,7 +15574,7 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         | TensorOp::Matmul { lhs, rhs } => {
             vec![*lhs, *rhs]
         }
-        TensorOp::Pow { base, exponent } => vec![*base, *exponent],
+        TensorOp::BinaryMath { lhs, rhs, .. } => vec![*lhs, *rhs],
         TensorOp::Solve { matrix, rhs } => vec![*matrix, *rhs],
         TensorOp::CholeskyAd { inputs, .. } => inputs.clone(),
         TensorOp::Cholesky { input }
@@ -16960,22 +15675,13 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         TensorOp::Sum { input }
         | TensorOp::SumAxis { input, .. }
         | TensorOp::ExtremumAxis { input, .. }
-        | TensorOp::Tanh { input }
-        | TensorOp::Exp { input }
         | TensorOp::Sqrt { input }
         | TensorOp::SqrtDerivative { input, .. }
         | TensorOp::Reshape { input }
         | TensorOp::Mean { input }
         | TensorOp::MeanAxis { input, .. }
-        | TensorOp::Sin { input }
-        | TensorOp::Cos { input }
         | TensorOp::Powi { input, .. }
         | TensorOp::Transpose { input, .. }
-        | TensorOp::Log { input }
-        | TensorOp::Log1p { input }
-        | TensorOp::Expm1 { input }
-        | TensorOp::Erf { input }
-        | TensorOp::Erfc { input }
         | TensorOp::UnaryMath { input, .. }
         | TensorOp::StopGradient { input }
         | TensorOp::CumSum { input, .. }
@@ -16986,8 +15692,6 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
         | TensorOp::Cast { input } => {
             vec![*input]
         }
-        TensorOp::Atan2 { y, x } => vec![*y, *x],
-        TensorOp::Fmod { x, y } => vec![*x, *y],
         TensorOp::ScatterAdd { base, updates, .. } => vec![*base, *updates],
         TensorOp::Concat { inputs, .. } => inputs.clone(),
         // The operands are inputs for reachability and inlining, so a rule
@@ -17102,14 +15806,6 @@ fn reuse_forward_unary(
     };
     type UnaryOperation = Option<fn(f64) -> f64>;
     let (input, operation): (usize, UnaryOperation) = match node.op {
-        TensorOp::Sin { input } => (input, Some(f64::sin)),
-        TensorOp::Cos { input } => (input, Some(f64::cos)),
-        TensorOp::Tanh { input } => (input, Some(f64::tanh)),
-        TensorOp::Exp { input } => (input, Some(f64::exp)),
-        TensorOp::Log1p { input } => (input, Some(f64::ln_1p)),
-        TensorOp::Expm1 { input } => (input, Some(f64::exp_m1)),
-        TensorOp::Erf { input } => (input, Some(libm::erf)),
-        TensorOp::Erfc { input } => (input, Some(libm::erfc)),
         TensorOp::UnaryMath { input, kind } => (input, Some(kind.function())),
         TensorOp::Reshape { input } | TensorOp::StopGradient { input } => (input, None),
         _ => return Ok(None),
@@ -17256,7 +15952,7 @@ mod forward_storage_reuse_tests {
             let mut ir = TensorIr::new();
             let input = ir.input_typed("x", vec![4], dtype).unwrap();
             let output = ir.sin(input).unwrap();
-            let expected = original.sin().unwrap().into_dtype(dtype);
+            let expected = original.map_f64(f64::sin).unwrap().into_dtype(dtype);
             let mut values = vec![Some(original)];
             let address = match &values[0].as_ref().unwrap().data {
                 HostTensorStorage::F64(data) => data.as_ptr() as usize,
@@ -17440,9 +16136,7 @@ fn infer_tensor_placement(
         | TensorOp::Mul { lhs, rhs }
         | TensorOp::Greater { lhs, rhs }
         | TensorOp::Compare { lhs, rhs, .. } => merge(&[*lhs, *rhs]),
-        TensorOp::Pow { base, exponent } => merge(&[*base, *exponent]),
-        TensorOp::Atan2 { y, x } => merge(&[*y, *x]),
-        TensorOp::Fmod { x, y } => merge(&[*x, *y]),
+        TensorOp::BinaryMath { lhs, rhs, .. } => merge(&[*lhs, *rhs]),
         TensorOp::Where {
             condition,
             on_true,
@@ -17461,18 +16155,9 @@ fn infer_tensor_placement(
             "kernel node {node_id} contains {} regions; placement propagation requires explicit region lowering",
             tensor_op_name(&node.op)
         )),
-        TensorOp::Tanh { input }
-        | TensorOp::Exp { input }
-        | TensorOp::Sqrt { input }
+        TensorOp::Sqrt { input }
         | TensorOp::SqrtDerivative { input, .. }
-        | TensorOp::Sin { input }
-        | TensorOp::Cos { input }
         | TensorOp::Powi { input, .. }
-        | TensorOp::Log { input }
-        | TensorOp::Log1p { input }
-        | TensorOp::Expm1 { input }
-        | TensorOp::Erf { input }
-        | TensorOp::Erfc { input }
         | TensorOp::UnaryMath { input, .. }
         | TensorOp::StopGradient { input }
         | TensorOp::Cast { input } => unary(*input),
@@ -17945,26 +16630,15 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Cholesky { .. } => "cholesky",
         TensorOp::CholeskyAd { .. } => "cholesky_ad",
         TensorOp::Triangular { .. } => "triangular",
-        TensorOp::Tanh { .. } => "tanh",
-        TensorOp::Exp { .. } => "exp",
         TensorOp::Sqrt { .. } => "sqrt",
         TensorOp::SqrtDerivative { .. } => "sqrt_derivative",
         TensorOp::Reshape { .. } => "reshape",
         TensorOp::Mean { .. } => "mean",
         TensorOp::MeanAxis { .. } => "mean_axis",
-        TensorOp::Sin { .. } => "sin",
-        TensorOp::Cos { .. } => "cos",
         TensorOp::Powi { .. } => "powi",
-        TensorOp::Pow { .. } => "pow",
+        TensorOp::BinaryMath { kind, .. } => kind.name(),
         TensorOp::Transpose { .. } => "transpose",
-        TensorOp::Log { .. } => "log",
-        TensorOp::Log1p { .. } => "log1p",
-        TensorOp::Expm1 { .. } => "expm1",
-        TensorOp::Erf { .. } => "erf",
-        TensorOp::Erfc { .. } => "erfc",
-        TensorOp::Atan2 { .. } => "atan2",
         TensorOp::UnaryMath { kind, .. } => kind.name(),
-        TensorOp::Fmod { .. } => "fmod",
         TensorOp::StopGradient { .. } => "stop_gradient",
         TensorOp::CumSum { .. } => "cumsum",
         TensorOp::Concat { .. } => "concat",
@@ -18007,26 +16681,14 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
         // The caller rounds to the target dtype, so f64->f32->f64 keeps the f32 rounding error
         // instead of cancelling it.
         TensorOp::Cast { input } => scalar(*input),
-        TensorOp::Tanh { input } => Some(scalar(*input)?.tanh()),
-        TensorOp::Exp { input } => Some(scalar(*input)?.exp()),
-        TensorOp::Sin { input } => Some(scalar(*input)?.sin()),
-        TensorOp::Cos { input } => Some(scalar(*input)?.cos()),
         TensorOp::Powi { input, exponent } => {
             let exponent = i32::try_from(*exponent).ok()?;
             Some(scalar(*input)?.powi(exponent))
         }
-        TensorOp::Pow { base, exponent } => Some(scalar(*base)?.powf(scalar(*exponent)?)),
-        TensorOp::Log { input } => {
-            let value = scalar(*input)?;
-            (value > 0.0).then(|| value.ln())
+        TensorOp::BinaryMath { lhs, rhs, kind } => {
+            Some(kind.evaluate(scalar(*lhs)?, scalar(*rhs)?))
         }
-        TensorOp::Log1p { input } => Some(scalar(*input)?.ln_1p()),
-        TensorOp::Expm1 { input } => Some(scalar(*input)?.exp_m1()),
-        TensorOp::Erf { input } => Some(libm::erf(scalar(*input)?)),
-        TensorOp::Erfc { input } => Some(libm::erfc(scalar(*input)?)),
-        TensorOp::Atan2 { y, x } => Some(scalar(*y)?.atan2(scalar(*x)?)),
-        TensorOp::UnaryMath { input, kind } => Some(kind.evaluate(scalar(*input)?)),
-        TensorOp::Fmod { x, y } => Some(elementwise::fmod(scalar(*x)?, scalar(*y)?)),
+        TensorOp::UnaryMath { input, kind } => kind.fold_scalar(scalar(*input)?),
         _ => None,
     }
 }
@@ -18073,22 +16735,11 @@ fn fold_tensor_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<Dynami
             constant(*lhs)?.compare(&*constant(*rhs)?, *kind).ok()
         }
         TensorOp::Cast { input } => Some(constant(*input)?.into_owned()),
-        TensorOp::Tanh { input } => constant(*input)?.tanh().ok(),
-        TensorOp::Exp { input } => constant(*input)?.exp().ok(),
-        TensorOp::Sin { input } => constant(*input)?.sin().ok(),
-        TensorOp::Cos { input } => constant(*input)?.cos().ok(),
         TensorOp::Powi { input, exponent } => constant(*input)?.powi(*exponent).ok(),
-        TensorOp::Pow { base, exponent } => constant(*base)?.pow(&*constant(*exponent)?).ok(),
-        TensorOp::Log { input } => constant(*input)?.log().ok(),
-        TensorOp::Log1p { input } => constant(*input)?.log1p().ok(),
-        TensorOp::Expm1 { input } => constant(*input)?.map_f64(f64::exp_m1).ok(),
-        TensorOp::Erf { input } => constant(*input)?.map_f64(libm::erf).ok(),
-        TensorOp::Erfc { input } => constant(*input)?.map_f64(libm::erfc).ok(),
-        TensorOp::Atan2 { y, x } => constant(*y)?.atan2(&*constant(*x)?).ok(),
-        TensorOp::UnaryMath { input, kind } => constant(*input)?.map_f64(kind.function()).ok(),
-        TensorOp::Fmod { x, y } => constant(*x)?
-            .elementwise(&*constant(*y)?, elementwise::fmod)
+        TensorOp::BinaryMath { lhs, rhs, kind } => constant(*lhs)?
+            .elementwise(&*constant(*rhs)?, kind.function())
             .ok(),
+        TensorOp::UnaryMath { input, kind } => constant(*input)?.map_f64(kind.function()).ok(),
         _ => None,
     }
 }
@@ -18459,15 +17110,14 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         | TensorOp::Div { lhs, rhs }
         | TensorOp::Greater { lhs, rhs }
         | TensorOp::Matmul { lhs, rhs }
-        | TensorOp::Solve { matrix: lhs, rhs }
-        | TensorOp::Pow {
-            base: lhs,
-            exponent: rhs,
-        }
-        | TensorOp::Atan2 { y: lhs, x: rhs }
-        | TensorOp::Fmod { x: lhs, y: rhs } => {
+        | TensorOp::Solve { matrix: lhs, rhs } => {
             arguments[0] = *lhs as u64;
             arguments[1] = *rhs as u64;
+        }
+        TensorOp::BinaryMath { lhs, rhs, kind } => {
+            arguments[0] = *lhs as u64;
+            arguments[1] = *rhs as u64;
+            arguments[2] = *kind as u64;
         }
         TensorOp::Compare { lhs, rhs, kind } => {
             arguments[0] = *lhs as u64;
@@ -18485,18 +17135,9 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         }
         TensorOp::Cast { input }
         | TensorOp::Sum { input }
-        | TensorOp::Tanh { input }
-        | TensorOp::Exp { input }
         | TensorOp::Sqrt { input }
         | TensorOp::Reshape { input }
         | TensorOp::Mean { input }
-        | TensorOp::Sin { input }
-        | TensorOp::Cos { input }
-        | TensorOp::Log { input }
-        | TensorOp::Log1p { input }
-        | TensorOp::Expm1 { input }
-        | TensorOp::Erf { input }
-        | TensorOp::Erfc { input }
         | TensorOp::StopGradient { input }
         | TensorOp::Broadcast { input }
         | TensorOp::Cholesky { input } => arguments[0] = *input as u64,
@@ -18583,6 +17224,7 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
     let argument_count = match op {
         TensorOp::Slice { .. } => 4,
         TensorOp::Compare { .. }
+        | TensorOp::BinaryMath { .. }
         | TensorOp::Where { .. }
         | TensorOp::PadSlice { .. }
         | TensorOp::ScatterAdd { .. }
@@ -18598,9 +17240,6 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         | TensorOp::Solve { .. }
         | TensorOp::Cholesky { .. }
         | TensorOp::CholeskyAd { .. }
-        | TensorOp::Pow { .. }
-        | TensorOp::Atan2 { .. }
-        | TensorOp::Fmod { .. }
         | TensorOp::UnaryMath { .. }
         | TensorOp::SumAxis { .. }
         | TensorOp::MeanAxis { .. }
@@ -18936,12 +17575,6 @@ fn remap_tensor_op(
             input: remap_node(*input)?,
             lower: *lower,
         }),
-        TensorOp::Tanh { input } => Ok(TensorOp::Tanh {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::Exp { input } => Ok(TensorOp::Exp {
-            input: remap_node(*input)?,
-        }),
         TensorOp::Sqrt { input } => Ok(TensorOp::Sqrt {
             input: remap_node(*input)?,
         }),
@@ -18959,50 +17592,22 @@ fn remap_tensor_op(
             input: remap_node(*input)?,
             axis: *axis,
         }),
-        TensorOp::Sin { input } => Ok(TensorOp::Sin {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::Cos { input } => Ok(TensorOp::Cos {
-            input: remap_node(*input)?,
-        }),
         TensorOp::Powi { input, exponent } => Ok(TensorOp::Powi {
             input: remap_node(*input)?,
             exponent: *exponent,
         }),
-        TensorOp::Pow { base, exponent } => Ok(TensorOp::Pow {
-            base: remap_node(*base)?,
-            exponent: remap_node(*exponent)?,
+        TensorOp::BinaryMath { lhs, rhs, kind } => Ok(TensorOp::BinaryMath {
+            lhs: remap_node(*lhs)?,
+            rhs: remap_node(*rhs)?,
+            kind: *kind,
         }),
         TensorOp::Transpose { input, axes } => Ok(TensorOp::Transpose {
             input: remap_node(*input)?,
             axes: axes.clone(),
         }),
-        TensorOp::Log { input } => Ok(TensorOp::Log {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::Log1p { input } => Ok(TensorOp::Log1p {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::Expm1 { input } => Ok(TensorOp::Expm1 {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::Erf { input } => Ok(TensorOp::Erf {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::Erfc { input } => Ok(TensorOp::Erfc {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::Atan2 { y, x } => Ok(TensorOp::Atan2 {
-            y: remap_node(*y)?,
-            x: remap_node(*x)?,
-        }),
         TensorOp::UnaryMath { input, kind } => Ok(TensorOp::UnaryMath {
             input: remap_node(*input)?,
             kind: *kind,
-        }),
-        TensorOp::Fmod { x, y } => Ok(TensorOp::Fmod {
-            x: remap_node(*x)?,
-            y: remap_node(*y)?,
         }),
         TensorOp::StopGradient { input } => Ok(TensorOp::StopGradient {
             input: remap_node(*input)?,
@@ -19125,122 +17730,6 @@ fn input_tangent_or_zero(
         }
         None => DynamicTensor::filled(shape.to_vec(), 0.0),
     }
-}
-
-/// `d pow(x, y) / dx = y * x^(y-1)`, defined as `0` where `x == 0` and `y < 1`.
-///
-/// Those are the points where the derivative is infinite (`0 < y < 1`) or the
-/// value itself is (`y < 0`), or where the formula is `0 * inf` (`y == 0`).
-/// The zero subgradient matches `sqrt` at the origin (`SqrtDerivative`), so
-/// `pow(x, 0.5)` and `sqrt(x)` agree there. For `y >= 1` the finite limit is
-/// kept (`1` for `y == 1`, `0` above), so `x ** 2.0` keeps the derivative
-/// `2x` and the second derivative `2` at the origin. A negative base with an
-/// integer-valued exponent follows `powf` and stays finite; with a
-/// non-integer exponent the value and this derivative are NaN.
-///
-/// The symbolic rule (`TensorIr::pow_base_derivative`) evaluates the same
-/// expression with the singular points masked out of the inner power, so its
-/// own derivatives stay finite there instead of producing `0 * inf`.
-fn pow_base_derivative(base: f64, exponent: f64) -> f64 {
-    if pow_base_is_singular(base, exponent) {
-        0.0
-    } else {
-        exponent * base.powf(exponent - 1.0)
-    }
-}
-
-fn pow_base_is_singular(base: f64, exponent: f64) -> bool {
-    base == 0.0 && exponent < 1.0
-}
-
-/// `d pow(x, y) / dy = x^y * ln(x)` for `x > 0`, defined as `0` for `x <= 0`.
-///
-/// At `x == 0` the formula is `0 * -inf` or `inf * -inf`; the power is
-/// piecewise constant along `y` there (`inf`, `1` at `y == 0`, then `0`), so
-/// zero is its derivative everywhere except at the jump. For `x < 0` the real power exists only at
-/// integer exponents, so no derivative in `y` exists; unlike JAX, which
-/// returns NaN there, the gradient is `0`, keeping the backward pass finite
-/// for a learnable exponent at an integer value with negative bases (the
-/// value itself is NaN at every non-integer exponent). A NaN base propagates.
-fn pow_exponent_derivative(base: f64, exponent: f64) -> f64 {
-    if base <= 0.0 {
-        0.0
-    } else {
-        base.powf(exponent) * base.ln()
-    }
-}
-
-/// Second partial derivatives of `pow` as the symbolic rules compose them:
-/// `(d/dx d/dx, d/dy d/dx, d/dx d/dy, d/dy d/dy)`. Each zero region of a
-/// first derivative is also a zero region of its derivatives, so the two
-/// mixed partials may differ at `x <= 0`, where the conventions apply.
-fn pow_second_derivatives(base: f64, exponent: f64) -> [f64; 4] {
-    let (base_base, base_exponent) = if pow_base_is_singular(base, exponent) {
-        (0.0, 0.0)
-    } else {
-        (
-            exponent * pow_base_derivative(base, exponent - 1.0),
-            base.powf(exponent - 1.0) + exponent * pow_exponent_derivative(base, exponent - 1.0),
-        )
-    };
-    let (exponent_base, exponent_exponent) = if base <= 0.0 {
-        (0.0, 0.0)
-    } else {
-        let log = base.ln();
-        (
-            pow_base_derivative(base, exponent) * log + base.powf(exponent) / base,
-            base.powf(exponent) * log * log,
-        )
-    };
-    [base_base, base_exponent, exponent_base, exponent_exponent]
-}
-
-/// `d erf(x) / dx = 2 / sqrt(pi) * exp(-x^2)`, which underflows to `0` for
-/// large `|x|` instead of overflowing.
-fn erf_derivative(value: f64) -> f64 {
-    std::f64::consts::FRAC_2_SQRT_PI * (-(value * value)).exp()
-}
-
-/// `d^2 erf(x) / dx^2 = -2x * erf'(x)`, the product the symbolic rule forms
-/// by differentiating `erf'`; like it, this is NaN at `x = +-inf`.
-fn erf_second_derivative(value: f64) -> f64 {
-    -2.0 * value * erf_derivative(value)
-}
-
-/// First and second partials of `atan2(y, x)`:
-/// `[d/dy, d/dx, d/dy d/dy, d/dx d/dy, d/dx d/dx]`, that is `x / r^2`,
-/// `-y / r^2`, `-2xy / r^4`, `(y^2 - x^2) / r^4` and `2xy / r^4` with
-/// `r^2 = x^2 + y^2`.
-///
-/// Both operands are first divided by `s = |x| + |y|`, so `q = (x/s)^2 +
-/// (y/s)^2` lies in `[1/2, 1]` and each `1 / r^2` factor is applied as
-/// `/ q / s`: no square of an input is formed, so nothing overflows or
-/// underflows before the true result does. The function is singular at the
-/// origin, where every partial is defined as `0` (JAX's `x / (x^2 + y^2)`
-/// is NaN there and also for tiny nonzero inputs whose squares underflow).
-/// Where `s` is infinite the partials tend to `0` (or have no limit when
-/// both operands are infinite) and are defined as `0`; a NaN operand gives
-/// NaN. The symbolic rule (`TensorIr::atan2_partials`) builds the same
-/// expression from IR ops.
-fn atan2_derivatives(y: f64, x: f64) -> [f64; 5] {
-    let scale = x.abs() + y.abs();
-    if scale.is_nan() {
-        return [f64::NAN; 5];
-    }
-    if scale == 0.0 || scale.is_infinite() {
-        return [0.0; 5];
-    }
-    let (x, y) = (x / scale, y / scale);
-    let q = x * x + y * y;
-    let first = |numerator: f64| numerator / q / scale;
-    let second = |numerator: f64| first(numerator) / q / scale;
-    [
-        first(x),
-        first(-y),
-        second(-2.0 * x * y),
-        second(y * y - x * x),
-        second(2.0 * x * y),
-    ]
 }
 
 /// The `order`-th derivative of `sqrt` (order 0 is `sqrt` itself), the CPU
@@ -19745,8 +18234,20 @@ mod structural_key_tests {
             )
         );
         assert_ne!(
-            key(TensorOp::Sin { input: 1 }, &[2]),
-            key(TensorOp::Cos { input: 1 }, &[2])
+            key(
+                TensorOp::UnaryMath {
+                    input: 1,
+                    kind: UnaryMathKind::Sin
+                },
+                &[2]
+            ),
+            key(
+                TensorOp::UnaryMath {
+                    input: 1,
+                    kind: UnaryMathKind::Cos
+                },
+                &[2]
+            )
         );
         assert_ne!(
             key(TensorOp::Reshape { input: 1 }, &[2, 3]),

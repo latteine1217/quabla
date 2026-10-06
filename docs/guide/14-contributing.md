@@ -116,15 +116,21 @@ def square(x):
 ## 14.5 Adding an IR Op
 
 A native op must be implemented end to end: every transform and every
-backend, or an explicit rejection. Commit `a961aca` (native trigonometric,
-hyperbolic, rounding, and `fmod` ops) is a complete worked example; read its
-diff alongside this list.
+backend, or an explicit rejection.
+
+An elementwise math function of one or two operands is a new kind of
+`UnaryMathKind` or `BinaryMathKind` in `tensor_ir/elementwise.rs`, not a new
+op. Adding the variant makes the compiler ask for every rule of the
+function there (name, `f64` value, numeric and symbolic derivatives, CUDA
+spelling) and for its MLX lowering in `mlx_unary_math` or
+`mlx_binary_math`; the questions with a default (CUDA fusion and loop
+admission, folding, StableHLO) are answered next to them. Nothing else in
+steps 1 to 9 below changes; the Python surface and the tests (steps 10 to
+15) still do.
 
 **Core IR** (`crates/quabla-core/src/tensor_ir.rs`):
 
-1. Add the `TensorOp` variant (or a new kind of an existing family such as
-   `UnaryMathKind` in `tensor_ir/elementwise.rs`, which is far less work for
-   a unary function).
+1. Add the `TensorOp` variant.
 2. A builder method on `TensorIr` that computes the output shape and dtype.
 3. CPU evaluation in `evaluate_tensor_nodes_with_outputs`, computed in `f64`
    and rounded through `TensorDType::round`.
@@ -141,9 +147,11 @@ diff alongside this list.
 
 **Backends**:
 
-8. CUDA (`tensor_ir/cuda.rs`): per-node launch, the fused elementwise
-   expression (`cuda_scalar_expression`, `is_fusable_elementwise_compute_op`),
-   loop-body lowerability checks and expressions, and the `float64` forms.
+8. CUDA (`tensor_ir/cuda.rs`): per-node launch, the elementwise formula
+   that every CUDA generator shares (`cuda_elementwise_formula` in
+   `tensor_ir.rs`), fusion
+   admission (`is_fusable_elementwise_compute_op`), loop-body lowerability,
+   and the `float64` forms.
 9. MLX (`tensor_ir/mlx.rs`): lowering in `lower_arrays_with_retained` and
    the op name. If MLX lacks the function, implement it from MLX ops within
    a stated accuracy (as `cbrt` and `erfc` are) or reject it explicitly.

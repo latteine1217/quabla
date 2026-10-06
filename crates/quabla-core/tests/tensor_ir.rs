@@ -7,9 +7,9 @@ use quabla_core::tensor_ir::{
     CpuBackend, DynamicTensor, SymbolicCotangent, TensorBackend, TensorBufferSlot,
     TensorCondExecutionPlan, TensorCustomRule, TensorDType, TensorDeviceBackend, TensorDeviceId,
     TensorDeviceMesh, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan,
-    TensorForiMultiExecutionPlan, TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr,
-    TensorNodeId, TensorPartitionSpec, TensorPlacement, TensorReplicaReduction,
-    TensorScanExecutionPlan, TensorShardingPlan, UnaryMathKind,
+    TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr, TensorNodeId, TensorPartitionSpec,
+    TensorPlacement, TensorReplicaReduction, TensorScanExecutionPlan, TensorShardingPlan,
+    UnaryMathKind,
 };
 use quabla_core::{QuablaCompiler, QuablaMultiOutputProgram, QuablaPrecision, QuablaTarget};
 
@@ -1045,56 +1045,6 @@ fn fori_region_allows_an_unused_index_input() {
         .as_ref(),
         &[7.0]
     );
-}
-
-#[test]
-fn multi_carry_fori_region_preserves_ordered_outputs_and_external_captures() {
-    let mut body = TensorIr::new();
-    let position = must!(body.input("position", vec![]));
-    let energy = must!(body.input("energy", vec![1]));
-    let index = must!(body.input("index", vec![]));
-    let scale = must!(body.input("scale", vec![1]));
-    let next_position = must!(body.add(position, index));
-    let next_energy = must!(body.mul(energy, scale));
-    let (body_plan, _) = must!(body.compile_cpu_many(&[next_position, next_energy]));
-    let loop_plan = must!(TensorForiMultiExecutionPlan::new(
-        0,
-        2,
-        body_plan,
-        vec!["position".to_string(), "energy".to_string()],
-        "index",
-    ));
-    assert_eq!(loop_plan.carry_names(), &["position", "energy"]);
-    let carries = must!(loop_plan.evaluate(
-        vec![
-            must!(DynamicTensor::new(vec![], vec![1.0])),
-            must!(DynamicTensor::new(vec![1], vec![2.0])),
-        ],
-        &BTreeMap::from([(
-            "scale".to_string(),
-            must!(DynamicTensor::new(vec![1], vec![3.0])),
-        )]),
-    ));
-    assert_eq!(carries[0].data().as_ref(), &[2.0]);
-    assert_eq!(carries[1].data().as_ref(), &[18.0]);
-
-    let (_, initial_gradients, external_gradients) = must!(loop_plan.value_and_vjp(
-        vec![
-            must!(DynamicTensor::new(vec![], vec![1.0])),
-            must!(DynamicTensor::new(vec![1], vec![2.0])),
-        ],
-        &BTreeMap::from([(
-            "scale".to_string(),
-            must!(DynamicTensor::new(vec![1], vec![3.0])),
-        )]),
-        vec![
-            must!(DynamicTensor::new(vec![], vec![1.0])),
-            must!(DynamicTensor::new(vec![1], vec![1.0])),
-        ],
-    ));
-    assert_eq!(initial_gradients[0].data().as_ref(), &[1.0]);
-    assert_eq!(initial_gradients[1].data().as_ref(), &[9.0]);
-    assert_eq!(external_gradients["scale"].data().as_ref(), &[12.0]);
 }
 
 #[test]
@@ -12785,9 +12735,19 @@ fn atan2_derivatives_avoid_overflow_and_vanish_at_the_origin() {
 }
 
 /// The f64 function each `UnaryMathKind` must evaluate: Rust std, and the
-/// musl ports of the `libm` crate for the inverse hyperbolic functions.
+/// musl ports of the `libm` crate for the error functions and the inverse
+/// hyperbolic functions.
 fn unary_math_reference(kind: UnaryMathKind) -> fn(f64) -> f64 {
     match kind {
+        UnaryMathKind::Exp => f64::exp,
+        UnaryMathKind::Log => f64::ln,
+        UnaryMathKind::Log1p => f64::ln_1p,
+        UnaryMathKind::Expm1 => f64::exp_m1,
+        UnaryMathKind::Erf => libm::erf,
+        UnaryMathKind::Erfc => libm::erfc,
+        UnaryMathKind::Sin => f64::sin,
+        UnaryMathKind::Cos => f64::cos,
+        UnaryMathKind::Tanh => f64::tanh,
         UnaryMathKind::Tan => f64::tan,
         UnaryMathKind::Arcsin => f64::asin,
         UnaryMathKind::Arccos => f64::acos,
@@ -12910,7 +12870,17 @@ fn unary_math_and_fmod_values_follow_the_f64_reference() {
     // inside the others'.
     let shifted = must!(fused.add(x, one));
     let mut total = x;
-    for kind in UnaryMathKind::ALL {
+    // Every kind except those whole-plan fusion does not admit yet.
+    for kind in UnaryMathKind::ALL.into_iter().filter(|kind| {
+        !matches!(
+            kind,
+            UnaryMathKind::Log
+                | UnaryMathKind::Log1p
+                | UnaryMathKind::Expm1
+                | UnaryMathKind::Erf
+                | UnaryMathKind::Erfc
+        )
+    }) {
         let operand = if kind == UnaryMathKind::Arccosh {
             shifted
         } else {
@@ -12929,8 +12899,9 @@ fn unary_math_and_fmod_values_follow_the_f64_reference() {
     assert_eq!(value, must!(fused.evaluate(output, &inputs)));
     let source = must!(plan.cuda_source());
     for function in [
-        "tanf(", "asinf(", "acosf(", "atanf(", "sinhf(", "coshf(", "asinhf(", "acoshf(", "atanhf(",
-        "log2f(", "log10f(", "cbrtf(", "floorf(", "ceilf(", "rintf(", "fmodf(",
+        "expf(", "sinf(", "cosf(", "tanhf(", "tanf(", "asinf(", "acosf(", "atanf(", "sinhf(",
+        "coshf(", "asinhf(", "acoshf(", "atanhf(", "log2f(", "log10f(", "cbrtf(", "floorf(",
+        "ceilf(", "rintf(", "fmodf(",
     ] {
         assert!(
             source.contains(function),
