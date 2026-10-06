@@ -265,6 +265,159 @@ fn nested_loops_batch_the_inner_region_inside_the_outer_body() -> Result<(), Str
     Ok(())
 }
 
+/// `while sum(carry) > limit: carry *= scale`, or with `limit_only` the
+/// predicate `limit < 0`, which reads only the limit.
+fn while_plan(limit_only: bool) -> Result<TensorWhileExecutionPlan, String> {
+    let mut predicate = TensorIr::new();
+    let limit = predicate.input("limit", vec![])?;
+    let running = if limit_only {
+        let zero = predicate.scalar_constant(0.0);
+        predicate.compare(limit, zero, TensorComparison::Less)?
+    } else {
+        let carry = predicate.input("carry", vec![3])?;
+        let total = predicate.sum(carry)?;
+        predicate.compare(total, limit, TensorComparison::Greater)?
+    };
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![3])?;
+    let scale = body.input("scale", vec![3])?;
+    let next = body.mul(carry, scale)?;
+    TensorWhileExecutionPlan::new(
+        predicate.compile_cpu(running)?,
+        body.compile_cpu(next)?,
+        "carry",
+    )
+}
+
+/// `while_plan(limit_only)` over inputs `x` (carry), `s` (scale), and `l`
+/// (limit) batched with `mapped` inputs mapped: the batched graph, its
+/// `While` node, and whether that node is mapped.
+fn batched_while(
+    limit_only: bool,
+    mapped: &[(&str, bool)],
+) -> Result<(TensorIr, TensorNodeId, bool), String> {
+    let mut callee = TensorIr::new();
+    let x = callee.input("x", vec![3])?;
+    let s = callee.input("s", vec![3])?;
+    let l = callee.input("l", vec![])?;
+    let looped = callee.while_loop(
+        x,
+        while_plan(limit_only)?,
+        vec![("scale".to_string(), s), ("limit".to_string(), l)],
+    )?;
+    let (graph, results) = batched(&callee, mapped, &[looped])?;
+    Ok((graph, results[0].0, results[0].1))
+}
+
+/// The loop plan, carry operand, and captures of the `While` node `node`.
+fn while_parts(
+    graph: &TensorIr,
+    node: TensorNodeId,
+) -> (
+    &TensorWhileExecutionPlan,
+    TensorNodeId,
+    &[(String, TensorNodeId)],
+) {
+    let TensorOp::While {
+        loop_plan,
+        carry,
+        captures,
+    } = &graph.nodes[node].op
+    else {
+        panic!("expected a batched while node");
+    };
+    (loop_plan, *carry, captures)
+}
+
+fn has_where(plan: &TensorExecutionPlan) -> bool {
+    plan.nodes
+        .iter()
+        .any(|node| matches!(node.op, TensorOp::Where { .. }))
+}
+
+#[test]
+fn a_while_with_an_unmapped_predicate_keeps_one_trip_count() -> Result<(), String> {
+    // A mapped carry and scale, but the predicate reads only the unmapped
+    // limit: the predicate region is unchanged and the body is not masked.
+    let mapped = [("x", true), ("s", true), ("l", false)];
+    let (graph, node, result_mapped) = batched_while(true, &mapped)?;
+    let (plan, _, captures) = while_parts(&graph, node);
+    assert!(result_mapped);
+    assert_eq!(plan.carry_shape()?, vec![BATCH, 3]);
+    assert!(plan.predicate_plan().output_shape()?.is_empty());
+    assert!(!plan.predicate_plan().input_nodes.contains_key("carry"));
+    assert!(!has_where(plan.body_plan()));
+    let limit = captures.iter().find(|(name, _)| name == "limit").unwrap().1;
+    assert!(
+        graph.nodes[limit].shape.is_empty(),
+        "the limit stays unbatched"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_mapped_predicate_maps_the_carry_and_masks_the_body() -> Result<(), String> {
+    // Only the limit is mapped: the predicate is per example, so the carry is
+    // mapped (broadcast from the unmapped initial carry), the predicate is
+    // `any` over the batch, and the body selects per example.
+    let mapped = [("x", false), ("s", false), ("l", true)];
+    let (graph, node, result_mapped) = batched_while(false, &mapped)?;
+    let (plan, carry, captures) = while_parts(&graph, node);
+    assert!(result_mapped);
+    assert_eq!(plan.carry_shape()?, vec![BATCH, 3]);
+    assert!(plan.predicate_plan().output_shape()?.is_empty());
+    assert!(has_where(plan.body_plan()));
+    // The body recomputes the per-example predicate, so it reads the limit.
+    assert_eq!(plan.body_plan().input_shape("limit")?, vec![BATCH]);
+    let scale = captures.iter().find(|(name, _)| name == "scale").unwrap().1;
+    assert_eq!(
+        graph.nodes[scale].shape,
+        vec![3],
+        "the scale stays unbatched"
+    );
+    assert!(matches!(graph.nodes[carry].op, TensorOp::Broadcast { .. }));
+    Ok(())
+}
+
+#[test]
+fn a_masked_while_keeps_finished_examples_and_stops_when_all_are_done() -> Result<(), String> {
+    // Halving `[4, 4, 4]` until its sum is at most the limit: examples with
+    // limits 100, 6, 1, and 12 stop after 0, 1, 4, and 0 iterations.
+    let mut callee = TensorIr::new();
+    let x = callee.input("x", vec![3])?;
+    let s = callee.input("s", vec![3])?;
+    let l = callee.input("l", vec![])?;
+    let looped = callee.while_loop(
+        x,
+        while_plan(false)?,
+        vec![("scale".to_string(), s), ("limit".to_string(), l)],
+    )?;
+    let mut graph = TensorIr::new();
+    let bindings = bind(
+        &mut graph,
+        &callee,
+        &[("x", false), ("s", false), ("l", true)],
+    )?;
+    let batched = graph
+        .inline_batched(&callee, &bindings, BATCH, &[looped])
+        .map_err(|error| error.to_string())?;
+    let inputs = BTreeMap::from([
+        ("x".to_string(), DynamicTensor::new(vec![3], vec![4.0; 3])?),
+        ("s".to_string(), DynamicTensor::new(vec![3], vec![0.5; 3])?),
+        (
+            "l".to_string(),
+            DynamicTensor::new(vec![BATCH], vec![100.0, 6.0, 1.0, 12.0])?,
+        ),
+    ]);
+    let result = graph.evaluate(batched[0].0, &inputs)?;
+    let expected = [4.0, 2.0, 0.25, 4.0]
+        .iter()
+        .flat_map(|value| [*value; 3])
+        .collect::<Vec<_>>();
+    assert_eq!(result.data().to_vec(), expected);
+    Ok(())
+}
+
 #[test]
 fn cond_and_while_regions_report_that_they_have_no_rule_yet() -> Result<(), String> {
     let mut on_true = TensorIr::new();

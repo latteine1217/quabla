@@ -1047,7 +1047,7 @@ pub struct SymbolicVjpMany {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BatchingError {
     /// A node that depends on a mapped input has no batching rule; `op` is
-    /// its IR op name (a `cond` or `while` region node).
+    /// its IR op name (a `cond` region node).
     Unsupported { op: &'static str },
     /// Invalid bindings, outputs, or batch size.
     Invalid(String),
@@ -1056,10 +1056,6 @@ pub enum BatchingError {
 impl std::fmt::Display for BatchingError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unsupported { op: "while" } => formatter.write_str(
-                "vmap cannot batch a while_loop: its trip count could differ per batch \
-                 element; use a bounded fori_loop whose body masks finished elements with where",
-            ),
             Self::Unsupported { op: "cond" } => formatter.write_str(
                 "vmap cannot batch a cond whose predicate or operands depend on a mapped \
                  argument: cond has no batching rule yet; compute both branches and select \
@@ -3118,12 +3114,14 @@ impl TensorIr {
     /// the batch. The result is an ordinary graph, so it can be batched again
     /// (nested `vmap`), differentiated, and inlined. `solve` broadcasts an
     /// unmapped operand over the batch like `concat`. Loop region nodes
-    /// (`fori`, `scan`, and their JVP, VJP, and forward-over-reverse nodes)
-    /// batch their body regions recursively (see `region_batching.rs`); a
-    /// loop result that does not depend on a mapped operand stays unmapped,
-    /// and a scan's stacked outputs are `[B, T, *y]`. A mapped `cond` or
-    /// `while` node is [`BatchingError::Unsupported`]; unmapped region nodes
-    /// are copied unchanged.
+    /// (`fori`, `scan`, and their JVP, VJP, and forward-over-reverse nodes,
+    /// and `while`) batch their body regions recursively (see
+    /// `region_batching.rs`); a loop result that does not depend on a mapped
+    /// operand stays unmapped, a scan's stacked outputs are `[B, T, *y]`, and
+    /// a `while` with a mapped predicate runs until every example is done,
+    /// freezing finished examples' carries. A mapped `cond` node is
+    /// [`BatchingError::Unsupported`]; unmapped region nodes are copied
+    /// unchanged.
     pub fn inline_batched(
         &mut self,
         callee: &TensorIr,
@@ -3524,10 +3522,11 @@ impl TensorIr {
             | TensorOp::ForiVjpJvp { .. }
             | TensorOp::Scan { .. }
             | TensorOp::ScanVjp { .. }
-            | TensorOp::ScanVjpJvp { .. } => {
+            | TensorOp::ScanVjpJvp { .. }
+            | TensorOp::While { .. } => {
                 return self.push_batched_loop(node, (remap, mapped), batch_size, loop_groups)
             }
-            TensorOp::Cond { .. } | TensorOp::While { .. } => {
+            TensorOp::Cond { .. } => {
                 return Err(BatchingError::Unsupported {
                     op: tensor_op_name(&node.op),
                 })

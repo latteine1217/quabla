@@ -319,8 +319,11 @@ decorator: `@qb.jit(device="mlx", static_argnums=1)`, `@qb.grad(argnums=1)`.
   from the first iteration, unmapped captures stay unbatched, and a scan's
   stacked outputs are `[B, length, ...]`; a reverse-mode loop region maps
   every input once any operand is mapped, since its gradients are per
-  example. A mapped `cond` or `while_loop` raises
-  `quabla.UnsupportedOperationError`.
+  example. A `while_loop` batches as in JAX: when its predicate depends on a
+  mapped value, the batched loop runs while any example's predicate holds
+  and keeps every finished example's carry unchanged, so each example stops
+  at its own trip count; otherwise the batch shares one trip count. A mapped
+  `cond` raises `quabla.UnsupportedOperationError`.
 - Closures and constants: an eager array (`Tensor` or `TensorView`,
   including a result such as `qb.sin(math.pi * 0.3)`) that meets a traced
   value becomes a constant of the graph. This covers arithmetic in either
@@ -785,7 +788,15 @@ same loop over a packed primal/tangent carry. Reverse mode (`grad`, `vjp`,
 and the reverse-mode `jacobian`/`hessian`) raises an error naming
 `fori_loop`, as in JAX: a data-dependent trip count leaves no fixed tape, so
 write a bounded `fori_loop` whose body masks finished iterations with
-`where` instead. `vmap` over a while loop is rejected for the same reason.
+`where` instead. A body or predicate may ignore its carry. `vmap` batches a
+while loop as `jax.vmap` does: when the predicate depends on a mapped value,
+the predicate region becomes "any example continues" and the body selects
+`where(pred, body(carry), carry)` per example, so a finished example keeps
+its carry (and forward-mode tangent) bit for bit while the others iterate,
+and whatever the body computes for it meanwhile, `NaN` or `inf` included,
+is discarded. The body still runs on finished examples, so a batch costs
+the trip count of its slowest example; backends still read back one scalar
+flag per iteration.
 
 `qb.linalg` holds dense linear algebra over the last two axes, batched over
 leading axes that broadcast like NumPy's. Every function takes eager or
@@ -931,11 +942,17 @@ respect to `b` and the array leaves of `args` follow the implicit function
 theorem at the solution, one adjoint solve, instead of differentiating the
 iterations; `x0` gets no gradient. Pass every array the operator depends on
 through `args`: values a Python function closes over are not differentiated.
-Reverse mode composes twice (`grad(grad(...))`); forward mode and `vmap`
-of a solution are not supported, and a solve cannot run inside a `cond`,
-`fori_loop`, or `scan` body. An eager solve that does not converge raises
-`RuntimeError`; `info=True` returns `(x, info)` with `"iterations"`,
-`"residual_norm"`, and `"success"`, the only report under `jit`.
+Reverse mode composes twice (`grad(grad(...))`, and the reverse-mode
+`jacobian` and `hessian` of a solution); forward mode (`jvp`) is not
+supported, and a solve cannot run inside a `cond`, `fori_loop`, or `scan`
+body. `vmap` batches a solve over `b`, `x0`, and the leaves of `args`, and
+composes with the derivatives in both orders (`vmap(grad(...))`,
+`grad` of a loss over `vmap`): each example stops at its own tolerance,
+because the batched loop freezes an example's state once it has converged,
+so the batch costs the iterations of its slowest example. An eager solve
+that does not converge raises `RuntimeError`; `info=True` returns
+`(x, info)` with `"iterations"`, `"residual_norm"`, and `"success"`, per
+example under `vmap`, and the only report under `jit` and `vmap`.
 
 `qb.ode.odeint(f, y0, (t0, t1), steps=n, method="rk4", args=(), save=False, saveat=None)`
 integrates `dy/dt = f(y, t, *args)` with `n` equal steps of classical RK4,
@@ -1664,8 +1681,10 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - StableHLO export (`stablehlo_text`) covers only a small inspection subset
   and is not an execution path.
 - The legacy 2D `Matrix`/`TraceGraph` API is not migrated to the facade.
-- `quabla.vmap` cannot batch `cond` or `while_loop` regions over a mapped
-  argument (`fori_loop` and `scan` regions batch). On CUDA, the
+- `quabla.vmap` cannot batch `cond` regions over a mapped argument
+  (`fori_loop`, `scan`, and `while_loop` regions batch). A batched
+  `while_loop` whose predicate is per example runs its body on every
+  example until the slowest one finishes. On CUDA, the
   forward-mode `scan` region inside a batched directional derivative (a
   forward-mode `jacobian` or `hessian` through `scan`) runs host-driven:
   its packed `[primal, tangent]` carry gains a leading batch axis, which the

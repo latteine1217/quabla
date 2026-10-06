@@ -14,8 +14,8 @@ not in it.
 | --- | --- | --- |
 | 1 | Batching rule for `fori_loop` and `scan` regions and their derivative regions (JVP, VJP, forward-over-reverse HVP): mapped captures and carries batch the body region, unmapped operands stay unbatched | Done: every loop region node batches on CPU, CUDA, and MLX, with the carry fixed point; `vmap`, `jacobian`, and `hessian` through `fori_loop`/`scan` and `vmap` of `odeint` (every method, `saveat`) work |
 | 2 | Batching rule for `cond`: an unmapped predicate batches both branch regions; a mapped predicate evaluates both branches and selects per element, as JAX does | Planned |
-| 3 | Batching rule for `while_loop`: an unmapped predicate batches the body; a mapped predicate runs until every element is done and freezes finished elements' carries, as JAX does | Planned |
-| 4 | What the rules unlock, on CPU, CUDA, and MLX: `hessian` and `jacobian` through loops, `vmap` of `odeint` for every method, and `vmap` of `linalg.cg`, `linalg.gmres`, and `newton` | Planned |
+| 3 | Batching rule for `while_loop`: an unmapped predicate batches the body; a mapped predicate runs until every element is done and freezes finished elements' carries, as JAX does | Done: on CPU, CUDA, and MLX, including the forward-mode while regions of `jvp` and forward `jacobian`; finished elements keep their carry and tangent bit for bit, and CUDA still reads back one flag per iteration |
+| 4 | What the rules unlock, on CPU, CUDA, and MLX: `hessian` and `jacobian` through loops, `vmap` of `odeint` for every method, and `vmap` of `linalg.cg`, `linalg.gmres`, and `newton` | Done: `hessian` and `jacobian` through loops and `vmap` of `odeint` with item 1; `vmap` of `cg`, `gmres`, and `newton` over `b`, `x0`, and `args` with item 3, each element stopping at its own tolerance with per-element `info`, composed with their derivatives (`vmap(grad(...))`, `grad` of `vmap`), and the reverse-mode `jacobian`/`hessian` of `cg` and `gmres` solutions |
 
 Release follow-ups carried into v0.5: the two-GPU NCCL validation with
 NVRTC 12.6 that v0.4.0 skipped, and the first PyPI upload once TestPyPI

@@ -6429,10 +6429,8 @@ pub fn tensor_fori_loop_region(
     let loop_plan = TensorForiExecutionPlan::new(
         lower,
         upper,
-        body_graph
-            .compile_cpu_plan(output.node_id)
-            .map_err(PyValueError::new_err)?
-            .plan,
+        compile_loop_body(&body_graph, output.node_id, "__quabla_fori_carry")
+            .map_err(PyValueError::new_err)?,
         "__quabla_fori_carry",
         "__quabla_fori_index",
     )
@@ -6461,6 +6459,38 @@ pub fn tensor_fori_loop_region(
         shape,
         init.batch_axis,
     ))
+}
+
+/// Compiles a single-output loop body whose output is the next carry.
+///
+/// A body whose result does not read the carry is valid, as in JAX, but a
+/// compiled region drops the inputs it never reads, and every loop plan binds
+/// its carry by name. Such a body is recompiled as `where(false, carry,
+/// next)`: the select returns `next` bit for bit (NaN payloads and signed
+/// zeros included), never reads the carry's values, and gives the carry a
+/// zero derivative, while keeping the carry an input of the region.
+fn compile_loop_body(
+    graph: &TensorTraceGraph,
+    next: TensorNodeId,
+    carry_name: &str,
+) -> Result<TensorExecutionPlan, String> {
+    let plan = graph.compile_cpu_plan(next)?.plan;
+    if region_input_names(&plan)
+        .iter()
+        .any(|name| name == carry_name)
+    {
+        return Ok(plan);
+    }
+    let retained = {
+        let mut ir = graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let carry = ir.input_node_id(carry_name)?;
+        let never = ir.scalar_constant(0.0);
+        ir.where_select(never, carry, next)?
+    };
+    Ok(graph.compile_cpu_plan(retained)?.plan)
 }
 
 /// Traces one `while_loop` region over the carry and operand inputs.
@@ -6521,8 +6551,8 @@ pub fn tensor_while_loop_region(
 ) -> PyResult<TraceTensor> {
     if init.batch_axis.is_some() || operands.iter().any(|operand| operand.batch_axis.is_some()) {
         return Err(PyValueError::new_err(
-            "while_loop cannot be vmapped: the trip count would differ per batch element; \
-             use a bounded fori_loop whose body masks finished elements with where",
+            "the tensor_vmap_* helpers cannot batch a while_loop; quabla.vmap batches it, \
+             stopping each batch element at its own trip count",
         ));
     }
     for operand in &operands {
@@ -6550,10 +6580,8 @@ pub fn tensor_while_loop_region(
             .compile_cpu_plan(predicate.node_id)
             .map_err(PyValueError::new_err)?
             .plan,
-        body_graph
-            .compile_cpu_plan(output.node_id)
-            .map_err(PyValueError::new_err)?
-            .plan,
+        compile_loop_body(&body_graph, output.node_id, "__quabla_while_carry")
+            .map_err(PyValueError::new_err)?,
         "__quabla_while_carry",
     )
     .map_err(PyValueError::new_err)?;
@@ -6695,13 +6723,35 @@ pub fn tensor_scan_region(
     }
     reject_custom_rules(&body_graph, &[next.node_id, output.node_id], "a scan body")
         .map_err(PyValueError::new_err)?;
-    let body_plan = body_graph
-        .ir
-        .lock()
-        .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
-        .compile_cpu_many(&[next.node_id, output.node_id])
-        .map_err(PyValueError::new_err)?
-        .0;
+    let body_plan = {
+        let mut ir = body_graph
+            .ir
+            .lock()
+            .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?;
+        let mut plan = ir
+            .compile_cpu_many(&[next.node_id, output.node_id])
+            .map_err(PyValueError::new_err)?
+            .0;
+        // A body that reads its carry in neither result keeps it as an input
+        // through `where(false, carry, next)`, as `compile_loop_body` does.
+        if !region_input_names(&plan)
+            .iter()
+            .any(|name| name == "__quabla_scan_carry")
+        {
+            let carry = ir
+                .input_node_id("__quabla_scan_carry")
+                .map_err(PyValueError::new_err)?;
+            let never = ir.scalar_constant(0.0);
+            let retained = ir
+                .where_select(never, carry, next.node_id)
+                .map_err(PyValueError::new_err)?;
+            plan = ir
+                .compile_cpu_many(&[retained, output.node_id])
+                .map_err(PyValueError::new_err)?
+                .0;
+        }
+        plan
+    };
     let scan_plan = TensorScanExecutionPlan::new(
         lower,
         upper,

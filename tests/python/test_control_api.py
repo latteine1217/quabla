@@ -562,7 +562,7 @@ def test_while_loop_forward_mode_matches_the_analytic_derivative():
     assert qb.jvp(scaled, (qb.array(1.0),), (qb.array(1.0),))[1].item() == 81.0
 
 
-def test_while_loop_reverse_mode_and_vmap_are_rejected_clearly():
+def test_while_loop_reverse_mode_is_rejected_clearly():
     def power(scale):
         return while_loop(
             lambda c, s: c < 50.0, lambda c, s: c * s, qb.array(1.0), operands=(scale,)
@@ -571,13 +571,9 @@ def test_while_loop_reverse_mode_and_vmap_are_rejected_clearly():
     for transform in (qb.grad, lambda f: qb.jit(qb.grad(f))):
         error = assert_raises(Exception, transform(power), qb.array(2.0))
         assert "while_loop" in str(error) and "fori_loop" in str(error), str(error)
+    # Batched, each example stops at its own trip count: 2^6 and 3^4.
     for transform in (qb.vmap, lambda f: qb.jit(qb.vmap(f))):
-        assert_raises(
-            qb.UnsupportedOperationError,
-            transform(power),
-            qb.array([2.0, 3.0]),
-            match="vmap cannot batch a while_loop",
-        )
+        assert_close(transform(power)(qb.array([2.0, 3.0])), [64.0, 81.0])
 
 
 def test_optional_device_while_loop_parity():
@@ -598,6 +594,281 @@ def test_optional_device_while_loop_parity():
         value, tangent = qb.jit(forward, device=device)(scale)
         assert_close(value, cpu_value, 1e-4)
         assert_close(tangent, cpu_tangent, 1e-3 * abs(cpu_tangent.to_flat_list()[0]))
+
+
+# ---- vmap of while_loop ----
+
+
+def halving(carry, limit):
+    # Halves the carry until its sum is at most `limit`; a carry already
+    # below the limit runs no iteration.
+    return while_loop(lambda c, n: c.sum() > n, lambda c, n: c * 0.5, carry, operands=(limit,))
+
+
+def heron(target, start):
+    # Heron's square root. For target 0 from start 0 the loop stops at once,
+    # but its body would compute 0 / 0.
+    return while_loop(
+        lambda c, a: (c * c - a).abs() > 1e-6 * a,
+        lambda c, a: 0.5 * (c + a / c),
+        start,
+        operands=(target,),
+    )
+
+
+def squaring(carry):
+    # Squares the carry until it reaches 1e3; for an example that starts
+    # above it, the body would overflow to inf.
+    return while_loop(lambda c: c < 1e3, lambda c: c * c, carry)
+
+
+def nested_whiles(carry, limit):
+    # Slot 0 counts the outer iterations down; each runs `halving` on the
+    # rest, so the inner trip count differs per outer iteration and example.
+    def outer(c, n):
+        inner = halving(c[1:], n)
+        return qb.concat([c[:1] - 1.0, inner + 1.0], 0)
+
+    return while_loop(lambda c, n: c[0] > 0.0, outer, carry, operands=(limit,))
+
+
+def while_in_fori(carry, limit):
+    return fori_loop(0, 3, lambda i, c, n: halving(c + i, n), carry, operands=(limit,))
+
+
+def fori_in_while(carry, limit):
+    return while_loop(
+        lambda c, n: c.sum() > n,
+        lambda c, n: fori_loop(0, 2, lambda i, d: d * 0.75, c),
+        carry,
+        operands=(limit,),
+    )
+
+
+def never_runs(carry, flag):
+    # The predicate reads only `flag`: unmapped, every example shares one
+    # (zero) trip count even though the carry is mapped.
+    return while_loop(lambda c, f: f > 0.0, lambda c, f: c * 2.0, carry, operands=(flag,))
+
+
+def while_arguments(dtype):
+    carries = qb.array(
+        [[1.0, 2.0, 0.5], [100.0, 3.0, 7.0], [0.1, 0.1, 0.1], [40.0, -1.0, 2.0]], dtype=dtype
+    )
+    limits = qb.array([0.5, 1.0, 2.0, 1e-3], dtype=dtype)
+    return carries, limits
+
+
+def test_vmap_batches_while_loop_like_a_loop_over_examples():
+    for dtype, tolerance in ((qb.float64, 1e-13), (qb.float32, 1e-6)):
+        carries, limits = while_arguments(dtype)
+        counted = qb.concat([qb.array([[3.0], [1.0], [0.0], [2.0]], dtype=dtype), carries], 1)
+        cases = [
+            # A mapped predicate through the carry, the operand, or both.
+            (halving, (carries, limits), (0, 0)),
+            (halving, (carries, limits[1]), (0, None)),
+            (halving, (carries[1], limits), (None, 0)),
+            (heron, (limits * 10.0, limits * 10.0), (0, 0)),
+            (nested_whiles, (counted, limits), (0, 0)),
+            (nested_whiles, (counted, limits[0]), (0, None)),
+            (while_in_fori, (carries, limits), (0, 0)),
+            (fori_in_while, (carries, limits), (0, 0)),
+            (never_runs, (carries, qb.array(0.0, dtype=dtype)), (0, None)),
+            # A batch axis that is not leading.
+            (halving, (carries.transpose(), limits), (1, 0)),
+        ]
+        for function, args, in_axes in cases:
+            assert_vmap_matches_examples(function, args, in_axes, tolerance)
+        # The trip counts do differ per example: slot 0 counts them.
+        def counted_halving(c, n):
+            return while_loop(
+                lambda s, n: s[1:].sum() > n,
+                lambda s, n: qb.concat([s[:1] + 1.0, s[1:] * 0.5], 0),
+                qb.concat([qb.zeros([1], dtype), c], 0),
+                operands=(n,),
+            )[0]
+
+        trips = qb.vmap(counted_halving)(carries, limits)
+        assert trips.tolist() == [3.0, 7.0, 0.0, 16.0], trips.tolist()
+        # Nested vmap: the outer map batches the inner map's while again.
+        pairs = qb.stack([carries, carries * 3.0], 0)
+        assert_tree_close(
+            qb.vmap(qb.vmap(halving, in_axes=(0, None)), in_axes=(0, 0))(pairs, limits[:2]),
+            per_example(
+                lambda c, n: per_example(halving, (c, n), (0, None)), (pairs, limits[:2]), (0, 0)
+            ),
+            tolerance,
+        )
+
+
+def test_vmap_of_while_loop_freezes_finished_examples():
+    for dtype in (qb.float64, qb.float32):
+        targets = qb.array([0.0, 2.0, 1e6, 0.25], dtype=dtype)
+        values = qb.vmap(heron)(targets, targets)
+        assert values.tolist()[0] == 0.0
+        assert_tree_close(values, per_example(heron, (targets, targets), (0, 0)), 0.0)
+
+        # The tangent of the finished example is its initial tangent, not
+        # the NaN its masked body computes.
+        def root_and_tangent(a):
+            return qb.jvp(lambda a: heron(a, a), (a,), (qb.ones([], dtype),))
+
+        pairs = qb.vmap(root_and_tangent)(targets)
+        assert_tree_close(pairs, per_example(root_and_tangent, (targets,), (0,)), 0.0)
+        assert pairs[1].tolist()[0] == 1.0
+        assert all(value == value for value in pairs[1].tolist()), pairs[1].tolist()
+        big = 1e200 if dtype == qb.float64 else 1e30
+        starts = qb.array([1.5, big, 2.0], dtype=dtype)
+        squares = qb.vmap(squaring)(starts)
+        assert squares.tolist()[1] == starts.tolist()[1]
+        assert_tree_close(squares, per_example(squaring, (starts,), (0,)), 0.0)
+
+
+def test_vmap_of_while_loop_derivatives_matches_per_example_derivatives():
+    for dtype, tolerance in ((qb.float64, 1e-12), (qb.float32, 1e-5)):
+        carries = qb.array([[1.0, -2.0], [3.0, 0.5], [0.2, 0.1]], dtype=dtype)
+        limits = qb.array([100.0, 30.0, 5e3], dtype=dtype)
+        scales = qb.array([1.5, 2.0, 1.1], dtype=dtype)
+        cases = [
+            # Forward mode with mapped primals and tangents.
+            (
+                lambda c, n, s, t: qb.jvp(
+                    collatz_like, (c, n, s), (qb.zeros_like(c), qb.zeros_like(n), t)
+                ),
+                (carries, limits, scales, scales * 0.5),
+                (0, 0, 0, 0),
+            ),
+            # Only the tangent mapped, as a forward-mode Jacobian maps it.
+            (
+                lambda t, c, n, s: qb.jvp(
+                    collatz_like, (c, n, s), (t, qb.zeros_like(n), qb.zeros_like(s))
+                )[1],
+                (carries, carries[0], limits[0], scales[0]),
+                (0, None, None, None),
+            ),
+            (qb.jacobian(collatz_like), (carries, limits, scales), (0, 0, 0)),
+            (qb.jacobian(collatz_like, argnums=2), (carries, limits, scales), (0, 0, 0)),
+        ]
+        for function, args, in_axes in cases:
+            assert_vmap_matches_examples(function, args, in_axes, tolerance)
+        # The JVP of a vmapped while.
+        _, tangent = qb.jvp(
+            qb.vmap(collatz_like),
+            (carries, limits, scales),
+            (qb.zeros_like(carries), qb.zeros_like(limits), qb.ones_like(scales)),
+        )
+        expected = per_example(
+            lambda c, n, s: qb.jvp(
+                collatz_like, (c, n, s), (qb.zeros_like(c), qb.zeros_like(n), qb.ones_like(s))
+            )[1],
+            (carries, limits, scales),
+            (0, 0, 0),
+        )
+        assert_tree_close(tangent, expected, tolerance)
+
+        # A forward-mode Jacobian through a while and a fori loop together.
+        def chained(c, s):
+            start = collatz_like(c, limits[0], s)
+            return fori_loop(0, 3, lambda i, d, s: (d * s).sin(), start, operands=(s,))
+
+        directions = [qb.eye(2, dtype=dtype)[k] for k in range(2)]
+        forward = qb.stack(
+            [
+                qb.jvp(chained, (carries[0], scales[0]), (d, qb.zeros([], dtype)))[1]
+                for d in directions
+            ],
+            1,
+        )
+        assert_tree_close(qb.jacobian(chained)(carries[0], scales[0]), forward, tolerance)
+        assert_tree_close(qb.jit(qb.jacobian(chained))(carries[0], scales[0]), forward, tolerance)
+
+
+def test_loop_bodies_may_ignore_their_carry():
+    # A body whose result does not read the carry is valid, as in JAX: it
+    # returns the same value every iteration.
+    x, y = qb.array([1.0, 2.0]), qb.array([3.0, -0.0])
+    cases = (
+        (lambda x, y: fori_loop(0, 3, lambda i, c, y: y * 2.0, x, operands=(y,)), [6.0, -0.0]),
+        (lambda x, y: fori_loop(0, 3, lambda i, c, y: y * i, x, operands=(y,)), [6.0, -0.0]),
+        (lambda x, y: fori_loop(0, 3, lambda i, c, y: qb.ones([2]), x, operands=(y,)), [1.0, 1.0]),
+        (lambda x, y: fori_loop(0, 0, lambda i, c, y: y, x, operands=(y,)), [1.0, 2.0]),
+        (
+            lambda x, y: scan(lambda c, i, y: (y * 2.0, y), x, length=3, operands=(y,))[0],
+            [6.0, -0.0],
+        ),
+        (
+            lambda x, y: while_loop(
+                lambda c, y: c[0] < 3.0, lambda c, y: y * 2.0, x, operands=(y,)
+            ),
+            [6.0, -0.0],
+        ),
+    )
+    for function, expected in cases:
+        for transform in (lambda f: f, qb.jit):
+            result = transform(function)(x, y).tolist()
+            # The signed zero survives: the retained carry never reaches the
+            # value.
+            assert [str(value) for value in result] == [str(value) for value in expected], result
+
+    # The carry gets a zero derivative and the operand its own.
+    def loss(x, y):
+        return fori_loop(0, 3, lambda i, c, y: y * y, x, operands=(y,)).sum()
+
+    gx, gy = qb.grad(loss, argnums=(0, 1))(x, qb.array([3.0, 1.0]))
+    assert gx.tolist() == [0.0, 0.0] and gy.tolist() == [6.0, 2.0]
+    assert_close(
+        qb.vmap(lambda x, y: fori_loop(0, 3, lambda i, c, y: y * y, x, operands=(y,)))(
+            qb.stack([x, x]), qb.stack([y, 2.0 * y])
+        ),
+        [[9.0, 0.0], [36.0, 0.0]],
+    )
+
+
+def test_optional_device_vmap_of_while_loop_matches_cpu():
+    devices = [
+        (device, precision)
+        for device, flag, precisions in (
+            ("mlx", "QUABLA_MLX_TEST", (None,)),
+            ("cuda", "QUABLA_CUDA_TEST", (None, "float64")),
+        )
+        if os.environ.get(flag) == "1"
+        for precision in precisions
+    ]
+    for device, precision in devices:
+        dtype = qb.float64 if precision == "float64" else qb.float32
+        tolerance = 1e-11 if precision == "float64" else 1e-5
+        carries, limits = while_arguments(dtype)
+        counted = qb.concat([qb.array([[3.0], [1.0], [0.0], [2.0]], dtype=dtype), carries], 1)
+        targets = qb.array([0.0, 2.0, 1e6, 0.25], dtype=dtype)
+        rotating = qb.array(
+            [[0.3, -0.2, 0.5, 0.1, -0.4], [0.2, 0.1, -0.3, 0.6, 0.0], [-0.5, 0.4, 0.2, -0.1, 0.3]],
+            dtype=dtype,
+        )
+        rotation_scale = qb.array([0.9, 1.1, 0.8, 1.05, 0.95], dtype=dtype)
+        scales = qb.array([1.5, 2.0, 1.1, 1.3], dtype=dtype)
+        operations = {
+            "halving": (qb.vmap(halving), (carries, limits)),
+            "halving capture": (qb.vmap(halving, in_axes=(None, 0)), (carries[1], limits)),
+            "heron": (qb.vmap(heron), (targets, targets)),
+            "heron jvp": (
+                qb.vmap(lambda a: qb.jvp(lambda a: heron(a, a), (a,), (qb.ones([], dtype),))),
+                (targets,),
+            ),
+            "nested": (qb.vmap(nested_whiles), (counted, limits)),
+            "while in fori": (qb.vmap(while_in_fori), (carries, limits)),
+            "rotating": (qb.vmap(host_driven_while, in_axes=(0, None)), (rotating, rotation_scale)),
+            "jacobian": (
+                qb.vmap(qb.jacobian(collatz_like, argnums=2)),
+                (carries[:, :2], limits * 1e4 + 50.0, scales),
+            ),
+        }
+        for name, (operation, args) in operations.items():
+            expected = qb.jit(operation)(*args)
+            options = {"device": device}
+            if precision is not None:
+                options["precision"] = precision
+            actual = qb.jit(operation, **options)(*args)
+            assert_tree_close(actual, expected, tolerance)
 
 
 # ---- vmap of fori_loop and scan regions ----

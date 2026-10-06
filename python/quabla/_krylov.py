@@ -388,15 +388,20 @@ def cg(matvec, b, *, args=(), x0=None, tol=1e-5, atol=0.0, maxiter=None, M=None,
     `A` depends on through `args` (a tuple of arrays or pytrees): values a
     Python `matvec` closes over are not differentiated, and under a
     transform closing over a traced value raises. Reverse mode composes
-    twice (`grad(grad(...))`); forward mode (`jvp`, `jacfwd`, `hessian`),
-    `vmap`, and reverse `jacobian` of the solution are not supported,
-    because the loop has no batching rule. The solve cannot run inside a
-    `cond`, `fori_loop`, or `scan` body (use `fori_loop(..., unroll=True)`).
+    twice (`grad(grad(...))`, and the reverse-mode `jacobian` and `hessian`
+    of the solution); forward mode (`jvp`) is not supported. `vmap`
+    batches the solve over `b`, `x0`, and `args` and composes with these
+    derivatives in both orders: each example stops at its own tolerance,
+    because the batched loop freezes an example's state once it converges,
+    so a batch costs the iterations of its slowest example. The solve
+    cannot run inside a `cond`, `fori_loop`, or `scan` body (use
+    `fori_loop(..., unroll=True)`).
 
     An eager solve that does not converge raises `RuntimeError`; with
     `info=True` it returns `(x, info)` instead, where `info` holds
     `"iterations"`, `"residual_norm"` (the true `||b - A x||`) and
-    `"success"`, which is the only report under `jit`.
+    `"success"`, per example under `vmap`, which is the only report under
+    `jit` and `vmap`.
     """
     apply, precondition, flat_b, flat_x0, shape, tol, atol = _setup(
         "cg", matvec, b, x0, args, tol, atol, M

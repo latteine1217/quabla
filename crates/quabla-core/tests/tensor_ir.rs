@@ -10770,6 +10770,401 @@ fn inline_batched_loops_batch_again_for_nested_vmap() {
     assert!(flags.iter().all(|flag| *flag));
 }
 
+/// The inputs of [`while_batching_fixture`] with their example shapes.
+const WHILE_BATCHING_INPUTS: [(&str, &[usize]); 3] = [("x", &[3]), ("s", &[3]), ("l", &[])];
+
+/// `while sum(c * c) > limit: c *= 0.55 + 0.1 * tanh(shift)`: the factor lies
+/// in (0.45, 0.65), so the loop ends after a number of iterations that
+/// depends on the carry, `shift`, and `limit`.
+fn shrinking_while_plan(
+    dtype: TensorDType,
+) -> Result<quabla_core::tensor_ir::TensorWhileExecutionPlan, String> {
+    let mut predicate = TensorIr::new();
+    let carry = predicate.input_typed("carry", vec![3], dtype)?;
+    let limit = predicate.input_typed("limit", vec![], dtype)?;
+    let squared = predicate.mul(carry, carry)?;
+    let norm = predicate.sum(squared)?;
+    let running = predicate.compare(norm, limit, TensorComparison::Greater)?;
+    let mut body = TensorIr::new();
+    let carry = body.input_typed("carry", vec![3], dtype)?;
+    let shift = body.input_typed("shift", vec![3], dtype)?;
+    let wave = body.tanh(shift)?;
+    let tenth = body.scalar_constant(0.1);
+    let wave = body.mul(wave, tenth)?;
+    let base = body.scalar_constant(0.55);
+    let factor = body.add(wave, base)?;
+    let next = body.mul(carry, factor)?;
+    quabla_core::tensor_ir::TensorWhileExecutionPlan::new(
+        predicate.compile_cpu(running)?,
+        body.compile_cpu(next)?,
+        "carry",
+    )
+}
+
+/// A callee over `x` (initial carries), `s` (the shrink shift), and `l` (the
+/// stopping limit `1e-4 + 0.01 l^2`) with three while loops: the shrinking
+/// loop; an outer loop over `[counter, c]` whose body runs the shrinking loop
+/// and adds `0.3 tanh(s)`, counting down from `1 + 2 l^2` by at least one per
+/// iteration; and a loop whose predicate `limit < 0` reads only the limit, so
+/// it never runs and stays unmapped unless `l` is mapped. Returns the loops'
+/// results and the scalar total of their squares.
+fn while_batching_fixture(
+    dtype: TensorDType,
+) -> Result<(TensorIr, Vec<TensorNodeId>, TensorNodeId), String> {
+    let mut outer_predicate = TensorIr::new();
+    let carry = outer_predicate.input_typed("carry", vec![4], dtype)?;
+    let counter = outer_predicate.slice_axis(carry, 0, 0, 1)?;
+    let counter = outer_predicate.reshape(counter, vec![])?;
+    let zero = outer_predicate.scalar_constant(0.0);
+    let running = outer_predicate.compare(counter, zero, TensorComparison::Greater)?;
+    let mut outer_body = TensorIr::new();
+    let carry = outer_body.input_typed("carry", vec![4], dtype)?;
+    let shift = outer_body.input_typed("shift", vec![3], dtype)?;
+    let limit = outer_body.input_typed("limit", vec![], dtype)?;
+    let counter = outer_body.slice_axis(carry, 0, 0, 1)?;
+    let state = outer_body.slice_axis(carry, 0, 1, 4)?;
+    let inner = outer_body.while_loop(
+        state,
+        shrinking_while_plan(dtype)?,
+        vec![("shift".to_string(), shift), ("limit".to_string(), limit)],
+    )?;
+    let push = outer_body.tanh(shift)?;
+    let weight = outer_body.scalar_constant(0.3);
+    let push = outer_body.mul(push, weight)?;
+    let state = outer_body.add(inner, push)?;
+    let squared = outer_body.mul(inner, inner)?;
+    let spent = outer_body.sum(squared)?;
+    let one = outer_body.scalar_constant(1.0);
+    let spent = outer_body.add(spent, one)?;
+    let spent = outer_body.reshape(spent, vec![1])?;
+    let counter = outer_body.sub(counter, spent)?;
+    let next = outer_body.concat(vec![counter, state], 0)?;
+    let outer_plan = quabla_core::tensor_ir::TensorWhileExecutionPlan::new(
+        outer_predicate.compile_cpu(running)?,
+        outer_body.compile_cpu(next)?,
+        "carry",
+    )?;
+
+    let mut never_predicate = TensorIr::new();
+    let limit = never_predicate.input_typed("limit", vec![], dtype)?;
+    let zero = never_predicate.scalar_constant(0.0);
+    let never = never_predicate.compare(limit, zero, TensorComparison::Less)?;
+    let mut never_body = TensorIr::new();
+    let carry = never_body.input_typed("carry", vec![3], dtype)?;
+    let shift = never_body.input_typed("shift", vec![3], dtype)?;
+    let next = never_body.mul(carry, shift)?;
+    let never_plan = quabla_core::tensor_ir::TensorWhileExecutionPlan::new(
+        never_predicate.compile_cpu(never)?,
+        never_body.compile_cpu(next)?,
+        "carry",
+    )?;
+
+    let mut graph = TensorIr::new();
+    let x = graph.input_typed("x", vec![3], dtype)?;
+    let s = graph.input_typed("s", vec![3], dtype)?;
+    let l = graph.input_typed("l", vec![], dtype)?;
+    let squared = graph.mul(l, l)?;
+    let hundredth = graph.scalar_constant(0.01);
+    let scaled = graph.mul(squared, hundredth)?;
+    let floor = graph.scalar_constant(1e-4);
+    let limit = graph.add(scaled, floor)?;
+    let captures = vec![("shift".to_string(), s), ("limit".to_string(), limit)];
+    let shrunk = graph.while_loop(x, shrinking_while_plan(dtype)?, captures.clone())?;
+    let two = graph.scalar_constant(2.0);
+    let counter = graph.mul(squared, two)?;
+    let one = graph.scalar_constant(1.0);
+    let counter = graph.add(counter, one)?;
+    let counter = graph.reshape(counter, vec![1])?;
+    let counted = graph.concat(vec![counter, x], 0)?;
+    let nested = graph.while_loop(counted, outer_plan, captures.clone())?;
+    let never = graph.while_loop(x, never_plan, captures)?;
+    let mut total = None;
+    for value in [shrunk, nested, never] {
+        let power = graph.mul(value, value)?;
+        let sum = graph.sum(power)?;
+        total = Some(match total {
+            Some(total) => graph.add(total, sum)?,
+            None => sum,
+        });
+    }
+    let total = total.expect("the fixture sums three terms");
+    Ok((graph, vec![shrunk, nested, never, total], total))
+}
+
+fn while_batching_inputs() -> Vec<(String, Vec<usize>)> {
+    WHILE_BATCHING_INPUTS
+        .iter()
+        .map(|(name, shape)| (name.to_string(), shape.to_vec()))
+        .collect()
+}
+
+#[test]
+fn inline_batched_while_loops_match_per_example_loops_for_every_mapping() {
+    let (callee, outputs, _) = must!(while_batching_fixture(TensorDType::F64));
+    let inputs = while_batching_inputs();
+    // Outputs: shrinking loop, nested loops, never-running loop, total. A
+    // mapped `l` maps every predicate (and so every carry); a mapped `x` or
+    // `s` maps the carries through the body while the never-running loop's
+    // predicate stays unmapped.
+    for mapped in [vec!["x", "s", "l"], vec!["x"], vec!["s"], vec!["l"]] {
+        let flags = must!(batched_loop_outputs_match_examples(
+            &callee, &outputs, &inputs, &mapped
+        ));
+        assert_eq!(flags, [true; 4], "mapped {mapped:?}");
+    }
+    // The examples run different numbers of iterations: the shrinking loop
+    // stops at a per-example trip count, checked here by counting them.
+    let mut trips = BTreeSet::new();
+    for salt in 0..3 {
+        let x = must!(loop_batching_value(&[3], salt));
+        let s = must!(loop_batching_value(&[3], salt + 7));
+        let limit = 1e-4 + 0.01 * must!(loop_batching_value(&[], salt + 3)).data()[0].powi(2);
+        let (mut norm, mut count) = (x.data().iter().map(|v| v * v).sum::<f64>(), 0);
+        let factors = s
+            .data()
+            .iter()
+            .map(|v| 0.55 + 0.1 * v.tanh())
+            .collect::<Vec<_>>();
+        let mut state = x.data().to_vec();
+        while norm > limit {
+            for (value, factor) in state.iter_mut().zip(&factors) {
+                *value *= factor;
+            }
+            norm = state.iter().map(|v| v * v).sum();
+            count += 1;
+        }
+        trips.insert(count);
+    }
+    assert!(
+        trips.len() > 1,
+        "trip counts {trips:?} should differ per example"
+    );
+}
+
+#[test]
+fn inline_batched_while_jvps_match_per_example_jvps() {
+    // `While` is forward-mode only; its JVP is another `While` over a packed
+    // `[primal, tangent]` carry, batched by the same rule.
+    let (callee, _, total) = must!(while_batching_fixture(TensorDType::F64));
+    let inputs = while_batching_inputs();
+    let names = ["x", "s", "l"];
+    let tangent_names = names
+        .iter()
+        .map(|name| (name.to_string(), format!("{name}_tangent")))
+        .collect::<BTreeMap<_, _>>();
+    let mut tangent_inputs = inputs.clone();
+    tangent_inputs.extend(
+        inputs
+            .iter()
+            .map(|(name, shape)| (format!("{name}_tangent"), shape.clone())),
+    );
+    let forward = must!(callee.symbolic_jvp_with_tangent_inputs(total, &tangent_names));
+    for mapped in [
+        // Only the tangents, as a forward-mode Jacobian batches them.
+        vec!["x_tangent", "s_tangent", "l_tangent"],
+        vec!["s", "s_tangent"],
+        vec!["l", "x_tangent"],
+        vec!["x", "s", "l", "x_tangent", "s_tangent", "l_tangent"],
+    ] {
+        let flags = must!(batched_loop_outputs_match_examples(
+            &forward.graph,
+            &[forward.value, forward.tangent],
+            &tangent_inputs,
+            &mapped
+        ));
+        assert!(flags[1], "mapped {mapped:?}");
+    }
+}
+
+#[test]
+fn inline_batched_while_freezes_finished_examples_bit_for_bit() {
+    // Heron's square root `c <- (c + a / c) / 2` while `(c^2 - a)^2 >
+    // (1e-12 a)^2`, from `c = a`. For `a = 0` the loop stops at once, but the
+    // batched body still evaluates `0 / 0` for that example while the others
+    // iterate; the select must keep its carry (and tangent) unchanged.
+    let mut predicate = TensorIr::new();
+    let carry = must!(predicate.input("carry", vec![]));
+    let target = must!(predicate.input("target", vec![]));
+    let square = must!(predicate.mul(carry, carry));
+    let residual = must!(predicate.sub(square, target));
+    let residual = must!(predicate.mul(residual, residual));
+    let tolerance = predicate.scalar_constant(1e-12);
+    let bound = must!(predicate.mul(target, tolerance));
+    let bound = must!(predicate.mul(bound, bound));
+    let running = must!(predicate.compare(residual, bound, TensorComparison::Greater));
+    let mut body = TensorIr::new();
+    let carry = must!(body.input("carry", vec![]));
+    let target = must!(body.input("target", vec![]));
+    let ratio = must!(body.div(target, carry));
+    let sum = must!(body.add(carry, ratio));
+    let half = body.scalar_constant(0.5);
+    let next = must!(body.mul(sum, half));
+    let plan = must!(quabla_core::tensor_ir::TensorWhileExecutionPlan::new(
+        must!(predicate.compile_cpu(running)),
+        must!(body.compile_cpu(next)),
+        "carry",
+    ));
+    let mut callee = TensorIr::new();
+    let a = must!(callee.input("a", vec![]));
+    let root = must!(callee.while_loop(a, plan, vec![("target".to_string(), a)]));
+    let forward = must!(callee.symbolic_jvp_with_tangent_inputs(
+        root,
+        &BTreeMap::from([("a".to_string(), "a_tangent".to_string())])
+    ));
+
+    let targets = [0.0, 2.0, 1e6, 0.25];
+    let mut graph = TensorIr::new();
+    let a = must!(graph.input("a", vec![4]));
+    let a_tangent = must!(graph.input("a_tangent", vec![]));
+    let batched = must!(graph
+        .inline_batched(
+            &forward.graph,
+            &BTreeMap::from([
+                ("a".to_string(), (a, true)),
+                ("a_tangent".to_string(), (a_tangent, false)),
+            ]),
+            4,
+            &[forward.value, forward.tangent],
+        )
+        .map_err(|error| error.to_string()));
+    let inputs = BTreeMap::from([
+        (
+            "a".to_string(),
+            must!(DynamicTensor::new(vec![4], targets.to_vec())),
+        ),
+        (
+            "a_tangent".to_string(),
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ),
+    ]);
+    let values = must!(graph.evaluate(batched[0].0, &inputs));
+    let tangents = must!(graph.evaluate(batched[1].0, &inputs));
+    for (index, target) in targets.iter().enumerate() {
+        let example = BTreeMap::from([
+            (
+                "a".to_string(),
+                must!(DynamicTensor::new(vec![], vec![*target])),
+            ),
+            (
+                "a_tangent".to_string(),
+                must!(DynamicTensor::new(vec![], vec![1.0])),
+            ),
+        ]);
+        let value = must!(forward.graph.evaluate(forward.value, &example)).data()[0];
+        let tangent = must!(forward.graph.evaluate(forward.tangent, &example)).data()[0];
+        assert_eq!(
+            values.data()[index].to_bits(),
+            value.to_bits(),
+            "a = {target}"
+        );
+        assert_eq!(
+            tangents.data()[index].to_bits(),
+            tangent.to_bits(),
+            "a = {target}"
+        );
+        assert!(value.is_finite() && tangent.is_finite(), "a = {target}");
+        // d sqrt(a) / da = 1 / (2 sqrt(a)); for a = 0 the loop never runs,
+        // so the tangent is the initial tangent.
+        if *target > 0.0 {
+            assert!((value - target.sqrt()).abs() <= 1e-12 * target.sqrt());
+            assert!((tangent - 0.5 / target.sqrt()).abs() <= 1e-9 / target.sqrt());
+        } else {
+            assert_eq!((value, tangent), (0.0, 1.0));
+        }
+    }
+}
+
+/// The while fixture and its JVP batched over three examples with every
+/// input mapped, for device parity against the CPU.
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn batched_while_program(
+    dtype: TensorDType,
+) -> Result<(QuablaMultiOutputProgram, BTreeMap<String, DynamicTensor>), String> {
+    let (callee, _, total) = while_batching_fixture(dtype)?;
+    let tangent_names = ["x", "s", "l"]
+        .iter()
+        .map(|name| (name.to_string(), format!("{name}_tangent")))
+        .collect::<BTreeMap<_, _>>();
+    let forward = callee.symbolic_jvp_with_tangent_inputs(total, &tangent_names)?;
+    let mut graph = TensorIr::new();
+    let mut bindings = BTreeMap::new();
+    let mut inputs = BTreeMap::new();
+    for (salt, (name, shape)) in WHILE_BATCHING_INPUTS
+        .iter()
+        .map(|(name, shape)| (name.to_string(), shape.to_vec()))
+        .chain(
+            WHILE_BATCHING_INPUTS
+                .iter()
+                .map(|(name, shape)| (format!("{name}_tangent"), shape.to_vec())),
+        )
+        .enumerate()
+    {
+        let shape = std::iter::once(3).chain(shape).collect::<Vec<_>>();
+        let node = graph.input_typed(name.clone(), shape.clone(), dtype)?;
+        bindings.insert(name.clone(), (node, true));
+        let value = loop_batching_value(&shape, salt)?;
+        inputs.insert(
+            name,
+            DynamicTensor::with_dtype(shape, value.data().to_vec(), dtype)?,
+        );
+    }
+    let outputs = graph
+        .inline_batched(
+            &forward.graph,
+            &bindings,
+            3,
+            &[forward.value, forward.tangent],
+        )
+        .map_err(|error| error.to_string())?;
+    let outputs = outputs.into_iter().map(|(node, _)| node).collect();
+    Ok((QuablaMultiOutputProgram::new(graph, outputs)?, inputs))
+}
+
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn assert_batched_while_parity(target: QuablaTarget, precision: QuablaPrecision) {
+    let dtype = match precision {
+        QuablaPrecision::Float64 => TensorDType::F64,
+        _ => TensorDType::F32,
+    };
+    let tolerance = match precision {
+        QuablaPrecision::Float64 => 1e-12,
+        _ => 1e-5,
+    };
+    let (program, inputs) = must!(batched_while_program(dtype));
+    let compiler = QuablaCompiler;
+    let cpu = must!(must!(compiler.compile_many(&program, QuablaTarget::Cpu)).execute(&inputs));
+    let device = must!(must!(compiler
+        .compile_many_checked_with_precision(&program, target, precision)
+        .map_err(|error| format!("{error:?}")))
+    .execute(&inputs));
+    let error = max_scaled_error(&device, &cpu);
+    println!("{target:?} {precision:?} batched while: error vs CPU {error:e}");
+    assert!(error <= tolerance, "device vs CPU error {error:e}");
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_batched_while_loops_match_the_cpu() {
+    assert_batched_while_parity(QuablaTarget::Mlx, QuablaPrecision::Default);
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_batched_while_loops_match_the_cpu_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    let target = QuablaTarget::Cuda { device_ordinal: 0 };
+    assert_batched_while_parity(target, QuablaPrecision::Default);
+    assert_batched_while_parity(target, QuablaPrecision::Float64);
+}
+
 fn log1p_input(values: &[f64]) -> Result<BTreeMap<String, DynamicTensor>, String> {
     Ok(BTreeMap::from([(
         "x".to_string(),

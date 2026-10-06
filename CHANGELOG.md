@@ -20,11 +20,35 @@ deprecated names keep working until 1.0 (see
   `[B, length, ...]`. `vmap`, `jacobian` in both modes, and `hessian` now
   work through loops, nested loops, and loops inside `jit`, and `vmap` of
   `ode.odeint` works for every method, with `save` and `saveat`.
+- `vmap` batches `while_loop` regions (and the forward-mode `while_loop`
+  regions of `jvp` and forward `jacobian`) on the CPU, CUDA, and MLX, with
+  JAX's semantics: a predicate that depends on a mapped value runs the loop
+  while any example continues, and the body selects
+  `where(pred, body(carry), carry)` per example, so each example stops at
+  its own trip count and a finished example's carry and tangent stay bit
+  for bit what an unbatched loop returns (`NaN` or `inf` that the body
+  computes for it is discarded); a predicate that reads only unmapped
+  values keeps one trip count for the batch. The batched predicate stays
+  one scalar, so CUDA still reads back one flag per iteration.
+- `vmap` of `linalg.cg`, `linalg.gmres`, and `newton` over the right-hand
+  side, the initial guess, and `args`, composed with their implicit
+  derivatives in both orders (`vmap(grad(...))` and `grad` of a loss over
+  `vmap`): each example stops at its own tolerance, and `info=True` reports
+  per-example `iterations`, `residual_norm`, and `success`. The
+  reverse-mode `jacobian` and `hessian` of a `cg` or `gmres` solution, which
+  batch the adjoint solve, work too.
 
 ### Changed
 
-- The `UnsupportedOperationError` of `vmap` names only `cond` and
-  `while_loop` regions, the ones that still have no batching rule.
+- The `UnsupportedOperationError` of `vmap` names only `cond` regions, the
+  ones that still have no batching rule.
+
+### Fixed
+
+- A `fori_loop`, `scan`, or `while_loop` body whose result does not read
+  the carry (it depends only on the operands or the index, or is a
+  constant) no longer fails at trace time; as in JAX, it returns that value
+  every iteration, and the carry gets a zero derivative.
 
 ## [0.4.0] - 2026-10-06
 
