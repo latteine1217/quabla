@@ -11,7 +11,7 @@ traced integer indexing (`sort`, `argmax`, `x[idx]`, `.at[]`) are not in it.
 | --- | --- | --- |
 | 1 | Native elementwise ops: `tan`, `arcsin`, `arccos`, `arctan`, `sinh`, `cosh`, `arcsinh`, `arccosh`, `arctanh`, `log2`, `log10`, `cbrt`, `floor`, `ceil`, `round`, `fmod` (with floor `mod`), on every backend with derivatives | Planned |
 | 2 | jax.numpy compositions: `flip`, `roll`, `pad`, `tile`, `repeat`, `moveaxis`, `swapaxes`, `ravel`, `diag`, `diagonal`, `trace`, `outer`, `dot`, `tensordot`, `kron`, `cross`, `diff`, `trapezoid`, `interp`, `polyval`, `logaddexp`, `hypot`, `exp2`, `isinf`, `nan_to_num`; `linalg.norm` (`ord`, `axis`), `linalg.matrix_power`, `linalg.pinv` | Planned |
-| 3 | Stiff ODEs and `saveat`: an adaptive L-stable Rosenbrock method in `odeint`, and states at requested times through each method's dense output | Planned |
+| 3 | Stiff ODEs and `saveat`: an adaptive L-stable Rosenbrock method in `odeint`, and states at requested times through each method's dense output | Done: `method="rosenbrock23"` (CPU and CUDA) and `saveat` for every method |
 | 4 | Iterative and implicit solvers: matrix-free `linalg.cg` and `linalg.gmres`, Newton root finding, each with an implicit-function-theorem gradient instead of differentiating the iterations | `cg` and `gmres` done (reverse mode, twice composable; no forward mode or `vmap`, and not inside `cond`/`fori_loop`/`scan` bodies); the Newton root finder is implemented and tested but not exported until its public location is chosen |
 | 5 | MLX factorizations: `solve`, `det`/`slogdet`, `inv`, `eigh`, `qr`, `svd`, `lstsq` through MLX's CPU stream instead of an error | Planned |
 | 6 | Device `Trainer` parity: AdamW and global-norm clipping on CUDA and MLX, `float64` on CUDA | Planned |

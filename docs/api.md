@@ -776,7 +776,7 @@ as in JAX, while the eigenvalue derivative stays defined. MLX rejects
 `UnsupportedOperationError`, because MLX's factorizations only run on its
 CPU stream.
 
-`qb.ode.odeint(f, y0, (t0, t1), steps=n, method="rk4", args=(), save=False)`
+`qb.ode.odeint(f, y0, (t0, t1), steps=n, method="rk4", args=(), save=False, saveat=None)`
 integrates `dy/dt = f(y, t, *args)` with `n` equal steps of classical RK4,
 Heun's method (`"heun"`), or forward Euler (`"euler"`), at times
 `t0 + i * dt` so long integrations do not drift. A traced state forms one
@@ -806,6 +806,33 @@ piecewise smooth across accept/reject changes. An eager solve stops at
 `t1` and raises `RuntimeError` when `max_steps` attempts do not reach it;
 under `jit` it cannot raise, and `info=True` returns `(y, info)` with
 `t`, `accepted_steps`, `rejected_steps`, and a bool `success`.
+
+`qb.ode.odeint(f, y0, (t0, t1), method="rosenbrock23", rtol=1e-6,
+atol=1e-9, max_steps=512, info=False)` is the adaptive, L-stable Rosenbrock
+2(3) method of Shampine and Reichelt (MATLAB's ode23s) for stiff problems:
+`W = I - h d J` with `d = 1 / (2 + sqrt(2))`, a second-order solution, and
+a third-order error estimate. Each step forms `J = df/dy` and `df/dt` at
+the current point in one batched forward-mode pass of `y0.size + 1`
+tangents, so `f` needs no hand-written Jacobian, and solves three linear
+systems with `W` through `solve` (LU with partial pivoting). Step control,
+tolerances, `max_steps`, `info`, and the eager and `jit` behavior are those
+of `dopri5`, with the controller gains over the error order 3. Gradients
+differentiate through the Jacobian and the solves, so they are those of the
+discrete scheme. It runs on the CPU and CUDA; MLX rejects `solve`. An
+exactly singular `W` raises like `solve`.
+
+`saveat=ts` (any method) returns the states at the times `ts` stacked on
+axis zero instead of the final state. `ts` is a 1-D array ordered from `t0`
+to `t1` and inside the span (checked when it is concrete); under `jit`, a
+time outside the span or one the bounded loop did not reach is NaN. The
+states come from each method's continuous extension, written with masked
+updates inside the loop, so adaptive steps are not shortened to land on
+the save times: Shampine's fourth-order interpolant for `dopri5` (Hairer's
+CONTD5 form), the method's own second-order interpolant for
+`rosenbrock23`, and cubic Hermite interpolation of each step's end values
+and slopes for the fixed-step methods, which keeps their order. Saved
+states differentiate with respect to `y0`, `args`, the span, and the save
+times. `saveat` cannot be combined with `save=True`.
 
 `qb.distributed.value_and_grad(fun, devices=["cuda:0", "cuda:1"], shard_argnums=(1,),
 argnums=0, reduction="mean")` is experimental single-node CUDA/NCCL execution.
