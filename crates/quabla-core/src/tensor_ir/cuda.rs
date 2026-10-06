@@ -44,6 +44,8 @@ mod cholesky_backend;
 mod decompositions;
 #[path = "cuda_host_loop.rs"]
 mod host_loop;
+#[path = "cuda_optimizer.rs"]
+mod optimizer;
 #[path = "cuda_real.rs"]
 mod real;
 
@@ -175,6 +177,7 @@ struct CudaExecutionState<T: CudaReal> {
     values: Vec<Option<CudaSlice<T>>>,
     free_buffers: CudaBufferPool<T>,
     adam: BTreeMap<String, CudaAdamState<T>>,
+    global_norm: optimizer::CudaGlobalNormScratch,
 }
 
 #[derive(Debug, Default)]
@@ -507,6 +510,7 @@ impl CudaBackend {
         let mut source = source;
         if fused_elementwise {
             source.push_str(CUDA_OPTIMIZER_SOURCE);
+            source.push_str(optimizer::CUDA_TRAINING_SOURCE);
         }
         if matmul_bias_tanh.is_some() {
             source.push_str(CUDA_MATMUL_BIAS_TANH_SOURCE);
@@ -7875,6 +7879,7 @@ fn cuda_program_source(
     return result;\n}\n",
     );
     source.push_str(CUDA_OPTIMIZER_SOURCE);
+    source.push_str(optimizer::CUDA_TRAINING_SOURCE);
     source.push_str(
         "extern \"C\" __global__ void quabla_transpose_copy(const float* input, float* output, unsigned long long batch, unsigned long long rows, unsigned long long columns) {\n\\
     unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\

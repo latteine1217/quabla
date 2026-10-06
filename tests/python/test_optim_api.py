@@ -262,19 +262,46 @@ def test_cpu_failed_step_preserves_latest_data_parameters_and_state():
     assert trainer._state["step"] == 0
 
 
-def test_device_trainer_rejects_sgd():
-    for device in ("mlx", "cuda:0"):
-        raises(
-            qb.UnsupportedOperationError,
-            Trainer,
-            lambda p: p.sum(),
-            qb.array([1.0]),
-            SGD(),
-            device=device,
-        )
+def test_trainer_precision_is_validated_like_jit():
+    from quabla.optim import AdamW
+
+    for device in ("cpu", "mlx", "cuda:0"):
+        for bad in ("float32", "fp64", 64):
+            raises(
+                ValueError,
+                Trainer,
+                lambda p: p.sum(),
+                qb.array([1.0]),
+                Adam(),
+                device=device,
+                precision=bad,
+            )
+    # MLX has no float64 arithmetic; rejected before any device is touched.
+    raises(
+        qb.UnsupportedOperationError,
+        Trainer,
+        lambda p: p.sum(),
+        qb.array([1.0]),
+        Adam(),
+        device="mlx",
+        precision="float64",
+    )
+    # The CPU already trains in float64, so the opt-in changes nothing.
+    params = {"layers": [qb.array([0.5])], "bias": qb.array([-0.25])}
+    x, target = qb.array([-1.0, 1.0]), qb.array([-1.0, 3.0])
+    default = Trainer(loss, params, AdamW(0.05, clip_norm=0.5), x, target)
+    explicit = Trainer(
+        loss, params, AdamW(0.05, clip_norm=0.5), x, target, precision="float64"
+    )
+    for _ in range(5):
+        default.step()
+        explicit.step()
+    assert default.params["bias"].tolist() == explicit.params["bias"].tolist()
 
 
 def test_device_factory_retains_only_fixed_data_and_reuses_native_step():
+    from quabla.optim import AdamW
+
     calls = []
 
     class Executor:
@@ -286,22 +313,64 @@ def test_device_factory_retains_only_fixed_data_and_reuses_native_step():
 
     captured = {}
 
-    def factory(traced, names, inputs, lr, retained, b1, b2, eps):
+    def factory(traced, names, inputs, retained, **options):
         captured.update(
             parameters=names,
             inputs=inputs,
             retained=retained,
-            hyperparameters=(lr, b1, b2, eps),
+            options=options,
         )
         return Executor()
 
     def objective(params, fixed, batch):
         return ((params["layers"][0] * batch["x"] + fixed).powi(2)).mean()
 
+    adam_options = {
+        "optimizer": "adam",
+        "learning_rate": 0.05,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "epsilon": 1e-8,
+        "weight_decay": 0.0,
+        "clip_norm": None,
+    }
     with (
         patch("quabla._devices.require_device", return_value=("mlx", 0)),
-        patch.object(qb._quabla, "mlx_adam_loss_optimizer", factory),
+        patch.object(qb._quabla, "_mlx_trainer_optimizer", factory),
     ):
+        # AdamW's decay, SGD, and clip_norm reach the native executor as is.
+        for optimizer, options in (
+            (
+                AdamW(0.01, weight_decay=0.2, clip_norm=3.0),
+                dict(
+                    adam_options,
+                    learning_rate=0.01,
+                    weight_decay=0.2,
+                    clip_norm=3.0,
+                ),
+            ),
+            (
+                SGD(0.5, clip_norm=1.5),
+                dict(
+                    adam_options,
+                    optimizer="sgd",
+                    learning_rate=0.5,
+                    beta1=0.0,
+                    beta2=0.0,
+                    epsilon=1.0,
+                    clip_norm=1.5,
+                ),
+            ),
+        ):
+            Trainer(
+                objective,
+                {"layers": [qb.array([1.0])]},
+                optimizer,
+                qb.array([2.0]),
+                {"x": qb.array([3.0])},
+                device="mlx",
+            )
+            assert captured["options"] == options, captured["options"]
         trainer = Trainer(
             objective,
             {"layers": [qb.array([1.0])]},
@@ -313,7 +382,7 @@ def test_device_factory_retains_only_fixed_data_and_reuses_native_step():
         )
         assert captured["parameters"] == ["params/layers/0"]
         assert captured["retained"] == ["fixed"]
-        assert captured["hyperparameters"] == (0.05, 0.9, 0.999, 1e-8)
+        assert captured["options"] == adam_options, captured["options"]
         trainer.step({"x": qb.array([4.0])})
         assert set(calls[-1][0]) == {"batch/x"}
         assert scalar(calls[-1][0]["batch/x"]) == 4
@@ -326,13 +395,21 @@ def test_device_factory_retains_only_fixed_data_and_reuses_native_step():
 
 
 def test_mlx_trainer_convergence():
+    from quabla.optim import AdamW
+
     if os.environ.get("QUABLA_MLX_TEST") == "1":
         train("mlx", Adam(0.05))
+        train("mlx", AdamW(0.05, weight_decay=1e-5, clip_norm=1.0))
+        train("mlx", SGD(0.05, clip_norm=5.0))
 
 
 def test_cuda_trainer_convergence():
+    from quabla.optim import AdamW
+
     if os.environ.get("QUABLA_CUDA_TEST") == "1":
         train("cuda:0", Adam(0.05))
+        train("cuda:0", AdamW(0.05, weight_decay=1e-5, clip_norm=1.0))
+        train("cuda:0", SGD(0.05, clip_norm=5.0))
 
 
 def test_device_trainer_keeps_parameters_the_loss_ignores():
@@ -600,19 +677,8 @@ def test_cpu_trainer_adamw_and_schedules():
     assert rates == list(range(300)) and trainer._state == {"step": 300}
 
 
-def test_device_trainer_sets_scheduled_rates_and_rejects_unsupported():
-    from quabla.optim import AdamW, piecewise_constant
-
-    for device in ("mlx", "cuda:0"):
-        for optimizer in (AdamW(), Adam(clip_norm=1.0)):
-            raises(
-                qb.UnsupportedOperationError,
-                Trainer,
-                lambda p: p.sum(),
-                qb.array([1.0]),
-                optimizer,
-                device=device,
-            )
+def test_device_trainer_sets_scheduled_rates():
+    from quabla.optim import piecewise_constant
 
     events = []
 
@@ -626,13 +692,13 @@ def test_device_trainer_sets_scheduled_rates_and_rejects_unsupported():
         def step(self, *args):
             events.append(("step", self.learning_rate))
 
-    def factory(traced, names, inputs, lr, retained, b1, b2, eps):
-        events.append(("create", lr))
+    def factory(traced, names, inputs, retained, **options):
+        events.append(("create", options["learning_rate"]))
         return Executor()
 
     with (
         patch("quabla._devices.require_device", return_value=("mlx", 0)),
-        patch.object(qb._quabla, "mlx_adam_loss_optimizer", factory),
+        patch.object(qb._quabla, "_mlx_trainer_optimizer", factory),
     ):
         trainer = Trainer(
             lambda p, x: (p * x).sum(),
@@ -700,6 +766,246 @@ def test_cuda_trainer_schedule():
         assert math.isclose(scalar(got), scalar(want), rel_tol=1e-5), (got, want)
     raises(ValueError, setattr, cuda._executor, "learning_rate", math.nan)
     train("cuda:0", Adam(warmup_cosine_decay(0.0, 0.08, 20, 400, end_value=0.01)))
+
+
+def enabled_devices():
+    return [
+        device
+        for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda:0", "QUABLA_CUDA_TEST"))
+        if os.environ.get(flag) == "1"
+    ]
+
+
+def pinn_model(params, x):
+    hidden = qb.tanh(params["w1"] * x + params["b1"])
+    return (hidden * params["w2"]).sum() + params["b2"]
+
+
+def pinn_loss(params, xs):
+    """1-D Poisson residual u'' = -pi^2 sin(pi x) with u(0) = u(1) = 0.
+
+    ``params["ignored"]`` never enters the loss: its gradient is zero and the
+    device plans prune it (the v0.2.3 regression).
+    """
+    second = qb.vmap(lambda x: qb.grad(qb.grad(lambda z: pinn_model(params, z)))(x))(xs)
+    residual = second + math.pi**2 * qb.sin(math.pi * xs)
+    zero, one = qb.array(0.0, dtype=xs.dtype), qb.array(1.0, dtype=xs.dtype)
+    boundary = pinn_model(params, zero) ** 2 + pinn_model(params, one) ** 2
+    return (residual**2).mean() + boundary
+
+
+def pinn_problem(dtype):
+    width = 6
+    params = {
+        "w1": qb.array([0.9 - 0.3 * i for i in range(width)], dtype=dtype),
+        "b1": qb.array([0.1 * i - 0.2 for i in range(width)], dtype=dtype),
+        "w2": qb.array([0.5 * (-1) ** i + 0.05 * i for i in range(width)], dtype=dtype),
+        "b2": qb.array(0.05, dtype=dtype),
+        "ignored": qb.array([1.5, -2.0], dtype=dtype),
+    }
+    batches = [
+        qb.array([0.1 * i + 0.05 for i in range(10)], dtype=dtype),
+        qb.array([0.1 * i + 0.02 for i in range(10)], dtype=dtype),
+    ]
+    return params, batches
+
+
+def assert_trainers_agree(expected, actual, rel, absolute, label):
+    for name, want in expected.params.items():
+        got = actual.params[name]
+        assert got.dtype == want.dtype, (label, name, got.dtype, want.dtype)
+        for a, b in zip(got.reshape(-1).tolist(), want.reshape(-1).tolist()):
+            assert math.isclose(a, b, rel_tol=rel, abs_tol=absolute), (label, name, a, b)
+
+
+def pinn_parity_configs(norm):
+    """Optimizer factories with clipping above and below the first global norm."""
+    from quabla.optim import AdamW, warmup_cosine_decay
+
+    def schedule():
+        return warmup_cosine_decay(0.0, 0.02, 2, 10, end_value=0.002)
+
+    return {
+        "adam": lambda: Adam(0.01),
+        "adam, clip not triggered": lambda: Adam(0.01, clip_norm=100 * norm),
+        "adam, clip triggered": lambda: Adam(0.01, clip_norm=norm / 4),
+        "adamw": lambda: AdamW(0.01, weight_decay=0.1),
+        "adamw, clip not triggered": lambda: AdamW(
+            0.01, weight_decay=0.1, clip_norm=100 * norm
+        ),
+        "adamw, clip triggered": lambda: AdamW(
+            0.01, weight_decay=0.1, clip_norm=norm / 4
+        ),
+        "adam, schedule, clip": lambda: Adam(schedule(), clip_norm=norm / 3),
+        "adamw, schedule, clip": lambda: AdamW(
+            schedule(), weight_decay=0.05, clip_norm=norm / 3
+        ),
+        "sgd, schedule": lambda: SGD(schedule()),
+        "sgd, clip triggered": lambda: SGD(0.001, clip_norm=norm / 4),
+    }
+
+
+def run_pinn_parity(device, dtype, rel, absolute, **options):
+    from quabla.optim import clip_by_global_norm
+
+    params, batches = pinn_problem(dtype)
+    _, norm = clip_by_global_norm(qb.grad(pinn_loss)(params, batches[0]), 1.0)
+    assert norm > 1.0, norm
+    for label, make in pinn_parity_configs(norm).items():
+        cpu = Trainer(pinn_loss, params, make(), batches[0], batch_argnums=(0,))
+        device_trainer = Trainer(
+            pinn_loss,
+            params,
+            make(),
+            batches[0],
+            device=device,
+            batch_argnums=(0,),
+            **options,
+        )
+        for step in range(8):
+            # Replace the collocation batch on some steps, reuse it on others.
+            batch = () if step % 3 else (batches[step % 2],)
+            cpu.step(*batch)
+            device_trainer.step(*batch)
+            want, got = scalar(cpu.loss()), scalar(device_trainer.loss())
+            assert math.isclose(got, want, rel_tol=rel), (label, step, got, want)
+            assert_trainers_agree(cpu, device_trainer, rel, absolute, (label, step))
+        ignored = device_trainer.params["ignored"].tolist()
+        if "adamw" in label:
+            # AdamW decays even parameters the loss ignores, like the CPU.
+            assert ignored != params["ignored"].tolist(), label
+        else:
+            assert ignored == params["ignored"].tolist(), label
+
+
+def test_device_trainer_matches_cpu_for_every_optimizer():
+    # float32 device plans agree with the float64-accumulating CPU trainer to
+    # float32 rounding; the trajectories differ by a few ulps per step.
+    for device in enabled_devices():
+        run_pinn_parity(device, qb.float32, rel=1e-6, absolute=1e-6)
+
+
+def test_cuda_trainer_float64_precision():
+    if os.environ.get("QUABLA_CUDA_TEST") != "1":
+        return
+    # Native double agrees with the CPU to double rounding, far below float32.
+    run_pinn_parity("cuda:0", qb.float64, rel=1e-12, absolute=1e-13, precision="float64")
+    params, batches = pinn_problem(qb.float64)
+    trainer = Trainer(
+        pinn_loss, params, Adam(0.01), batches[0], device="cuda:0", precision="float64"
+    )
+    trainer.step()
+    # Parameters stay float64 on the device: no value is a float32 rounding.
+    values = trainer.params["w1"].tolist()
+    assert any(value != float(qb.array(value).astype(qb.float32)) for value in values)
+    # One plan has one floating element type: float32 data cannot join a
+    # float64 lowering, exactly as for jit.
+    raises(
+        qb.UnsupportedOperationError,
+        Trainer,
+        lambda p, x: ((p * x.astype(qb.float64)) ** 2).sum(),
+        qb.array([1.0, 2.0]),
+        Adam(0.01),
+        qb.array([3.0, 4.0], dtype=qb.float32),
+        device="cuda:0",
+        precision="float64",
+    )
+
+
+def test_device_clip_norm_edge_cases_match_cpu():
+    from quabla.optim import AdamW
+
+    f32 = qb.float32
+
+    def nan_gradient(p):
+        return qb.sqrt(p["a"]).sum() + (p["b"] ** 2).sum()
+
+    def infinite_gradient(p):
+        return (1.0 / p["a"]).sum() + (p["b"] ** 2).sum()
+
+    def scaled_quadratic(scale):
+        return lambda p: scale * ((p["a"] ** 2).sum() + 1.5 * (p["b"] ** 2).sum())
+
+    def two_parameters(a):
+        # "ignored" never enters a loss: a non-finite clipped norm still makes
+        # its zero gradient NaN on the CPU, which devices must reproduce.
+        return {
+            "a": qb.array(a, dtype=f32),
+            "b": qb.array([2.0, 3.0], dtype=f32),
+            "ignored": qb.array([0.5], dtype=f32),
+        }
+
+    cases = [
+        # A NaN or infinite global norm turns every gradient into NaN; without
+        # clipping only the non-finite parameter becomes NaN.
+        ("nan, clipped", nan_gradient, two_parameters([-1.0]), Adam(0.1, clip_norm=1.0)),
+        ("nan, unclipped", nan_gradient, two_parameters([-1.0]), Adam(0.1)),
+        ("inf, clipped", infinite_gradient, two_parameters([0.0]), SGD(0.1, clip_norm=1.0)),
+        # A zero norm leaves the gradients unchanged (no division by zero).
+        (
+            "zero norm",
+            lambda p: ((p["a"] - 1.0) ** 2).sum(),
+            {"a": qb.array([1.0, 1.0], dtype=f32)},
+            AdamW(0.1, weight_decay=0.1, clip_norm=1.0),
+        ),
+        # |g| ~ 1e30: a float32 sum of squares would overflow to inf.
+        (
+            "huge gradients",
+            scaled_quadratic(1e30),
+            two_parameters([1.0, -0.5]),
+            SGD(0.1, clip_norm=1.0),
+        ),
+        # |g| ~ 1e-25: a float32 sum of squares would underflow to zero and
+        # skip the clip.
+        (
+            "tiny gradients",
+            scaled_quadratic(1e-25),
+            two_parameters([1.0, -0.5]),
+            SGD(1e24, clip_norm=1e-25),
+        ),
+    ]
+    for device in enabled_devices():
+        for label, objective, params, optimizer in cases:
+            cpu = Trainer(objective, params, optimizer)
+            device_trainer = Trainer(objective, params, optimizer, device=device)
+            for _ in range(2):
+                cpu.step()
+                device_trainer.step()
+            for name, want in cpu.params.items():
+                got = device_trainer.params[name].tolist()
+                for a, b in zip(got, want.tolist()):
+                    assert (math.isnan(a) and math.isnan(b)) or math.isclose(
+                        a, b, rel_tol=1e-6, abs_tol=1e-6
+                    ), (device, label, name, got, want.tolist())
+        # Clipping changed the tiny-gradient step (factor 1e-25 / 1.1e-24):
+        # unclipped SGD moves b by 0.6, clipped by 0.054, so the reduction did
+        # not underflow to a zero norm.
+        tiny = Trainer(scaled_quadratic(1e-25), two_parameters([1.0, -0.5]), SGD(1e24))
+        tiny.step()
+        clipped = Trainer(
+            scaled_quadratic(1e-25),
+            two_parameters([1.0, -0.5]),
+            SGD(1e24, clip_norm=1e-25),
+            device=device,
+        )
+        clipped.step()
+        assert scalar(clipped.params["b"]) > scalar(tiny.params["b"]) + 0.1, device
+
+        # A parameter larger than one reduction grid (256 blocks of 256
+        # threads) exercises the grid-stride partial sums.
+        size = 70_000
+        weights = qb.array([math.sin(i) for i in range(size)], dtype=f32)
+
+        def wide(p):
+            return ((p["w"] - 0.5) ** 2).sum() + (p["v"] ** 2).sum()
+
+        params = {"w": weights, "v": qb.array([3.0], dtype=f32)}
+        cpu = Trainer(wide, params, SGD(0.01, clip_norm=10.0))
+        device_trainer = Trainer(wide, params, SGD(0.01, clip_norm=10.0), device=device)
+        for _ in range(3):
+            cpu.step()
+            device_trainer.step()
+        assert_trainers_agree(cpu, device_trainer, 1e-5, 1e-6, (device, "wide"))
 
 
 def rosenbrock(p):

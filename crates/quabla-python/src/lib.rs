@@ -541,6 +541,16 @@ fn quabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tensor_trace::cuda_adam_optimizer, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::cuda_adam_vjp_optimizer, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::cuda_adam_loss_optimizer, m)?)?;
+    // `Trainer`'s private executors: plain attributes, so they stay out of
+    // `__all__` and the public type stub.
+    m.setattr(
+        "_cuda_trainer_optimizer",
+        wrap_pyfunction!(tensor_trace::cuda_trainer_optimizer, m)?,
+    )?;
+    m.setattr(
+        "_mlx_trainer_optimizer",
+        wrap_pyfunction!(tensor_trace::mlx_trainer_optimizer, m)?,
+    )?;
     m.add_function(wrap_pyfunction!(py_where, m)?)?;
     m.add_function(wrap_pyfunction!(py_concat, m)?)?;
     m.add_function(wrap_pyfunction!(py_stack, m)?)?;

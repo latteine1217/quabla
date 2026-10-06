@@ -17,9 +17,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
-    sqrt_derivative_coefficient, DynamicTensor, TensorBackend, TensorComparison, TensorConstant,
-    TensorDType, TensorDeviceBackend, TensorExecutionPlan, TensorForiExecutionPlan, TensorOp,
-    UnaryMathKind,
+    sqrt_derivative_coefficient, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor,
+    TensorBackend, TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend,
+    TensorExecutionPlan, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
 };
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
@@ -94,10 +94,13 @@ struct MlxScanVjpJvpEvaluation {
     gradients: BTreeMap<String, Array>,
 }
 
-/// A scalar-loss MLX training plan with retained parameters and Adam state.
+/// A scalar-loss MLX training plan with retained parameters and optimizer
+/// state: Adam, AdamW, or SGD, optionally with global-norm clipping (see
+/// [`DeviceOptimizerConfig`]).
 ///
 /// `step` only evaluates gradients, updated parameters, and moment buffers on
-/// MLX's GPU stream. Host materialization is limited to explicit diagnostics.
+/// MLX's GPU stream; the clip factor is part of the same lazy graph. Host
+/// materialization is limited to explicit diagnostics.
 #[derive(Debug)]
 pub struct MlxAdamPlan {
     plan: TensorExecutionPlan,
@@ -110,10 +113,7 @@ pub struct MlxAdamPlan {
     parameter_layouts: BTreeMap<String, (Vec<usize>, TensorDType)>,
     retained_inputs: MlxRetainedInputs,
     adam: BTreeMap<String, MlxAdamState>,
-    learning_rate: f32,
-    beta1: f32,
-    beta2: f32,
-    epsilon: f32,
+    config: DeviceOptimizerConfig,
 }
 
 impl MlxRetainedInputs {
@@ -172,9 +172,6 @@ impl MlxAdamPlan {
         beta2: f32,
         epsilon: f32,
     ) -> Result<Self, String> {
-        if gradient_node_ids.is_empty() {
-            return Err("MLX Adam requires at least one parameter gradient".to_string());
-        }
         // A zero learning rate is valid: learning-rate schedules start or end
         // at zero, and a zero step still advances the moments.
         if !(learning_rate.is_finite()
@@ -191,6 +188,37 @@ impl MlxAdamPlan {
                     .to_string(),
             );
         }
+        Self::with_config(
+            plan,
+            loss_node_id,
+            gradient_node_ids,
+            inputs,
+            retained_input_names,
+            DeviceOptimizerConfig::adam(
+                learning_rate.into(),
+                beta1.into(),
+                beta2.into(),
+                epsilon.into(),
+            ),
+        )
+    }
+
+    /// [`Self::new`] with any device optimizer configuration. MLX computes in
+    /// float32, so the hyperparameters are rounded to float32 when used.
+    pub fn with_config(
+        plan: TensorExecutionPlan,
+        loss_node_id: usize,
+        gradient_node_ids: BTreeMap<String, usize>,
+        inputs: &BTreeMap<String, DynamicTensor>,
+        retained_input_names: impl IntoIterator<Item = String>,
+        config: DeviceOptimizerConfig,
+    ) -> Result<Self, String> {
+        if gradient_node_ids.is_empty() {
+            return Err("MLX Adam requires at least one parameter gradient".to_string());
+        }
+        config
+            .validate()
+            .map_err(|error| format!("MLX optimizer: {error}"))?;
         let mut names = retained_input_names.into_iter().collect::<Vec<_>>();
         names.extend(gradient_node_ids.keys().cloned());
         names.sort();
@@ -223,15 +251,12 @@ impl MlxAdamPlan {
             parameter_layouts,
             retained_inputs,
             adam: BTreeMap::new(),
-            learning_rate,
-            beta1,
-            beta2,
-            epsilon,
+            config,
         })
     }
 
     pub fn learning_rate(&self) -> f32 {
-        self.learning_rate
+        self.config.learning_rate as f32
     }
 
     /// Replace the learning rate used by later steps, as a host schedule does
@@ -241,7 +266,7 @@ impl MlxAdamPlan {
         if !(learning_rate.is_finite() && learning_rate >= 0.0) {
             return Err("MLX Adam learning_rate must be finite and nonnegative".to_string());
         }
-        self.learning_rate = learning_rate;
+        self.config.learning_rate = learning_rate.into();
         Ok(())
     }
 
@@ -264,6 +289,13 @@ impl MlxAdamPlan {
             self.retained_inputs.arrays(),
         )?;
         let stream = StreamOrDevice::gpu();
+        let clip_factor = self
+            .config
+            .clip_norm
+            .map(|clip_norm| mlx_global_norm_clip_factor(&gradients, clip_norm as f32, &stream))
+            .transpose()
+            .map_err(|error| format!("MLX global-norm clipping failed: {error}"))?;
+        let learning_rate = Array::from_f32(self.config.learning_rate as f32);
         for (parameter_name, gradient) in parameter_names.iter().zip(gradients) {
             let parameter = self
                 .retained_inputs
@@ -278,6 +310,29 @@ impl MlxAdamPlan {
                     "MLX Adam parameter {parameter_name:?} and gradient shapes differ"
                 ));
             }
+            // As clip_by_global_norm, scale before the update and the moments.
+            let gradient = match &clip_factor {
+                Some(factor) => gradient
+                    .multiply_device(factor, &stream)
+                    .map_err(|error| format!("MLX gradient clipping failed: {error}"))?,
+                None => gradient,
+            };
+            let DeviceUpdateRule::Adam {
+                beta1,
+                beta2,
+                epsilon,
+                weight_decay,
+            } = self.config.rule
+            else {
+                let updated_parameter = gradient
+                    .multiply_device(&learning_rate, &stream)
+                    .and_then(|step| parameter.subtract_device(&step, &stream))
+                    .map_err(|error| format!("MLX SGD parameter update failed: {error}"))?;
+                self.retained_inputs
+                    .values
+                    .insert(parameter_name.clone(), updated_parameter);
+                continue;
+            };
             if !self.adam.contains_key(parameter_name) {
                 let shape = parameter.shape();
                 let first_moment = Array::zeros_device::<f32>(shape, &stream)
@@ -303,11 +358,24 @@ impl MlxAdamPlan {
                 .step
                 .checked_add(1)
                 .ok_or_else(|| "MLX Adam step counter overflow".to_string())?;
-            let one_minus_beta1 = Array::from_f32(1.0 - self.beta1);
-            let one_minus_beta2 = Array::from_f32(1.0 - self.beta2);
+            // `1 - beta` and the bias corrections are formed from the float64
+            // betas and rounded once, as the host computes them; `1 - beta2`
+            // of the float32-rounded 0.999 is 1.3e-5 relative off.
+            let (correction1, correction2) =
+                DeviceOptimizerConfig::adam_corrections(beta1, beta2, state.step);
+            let correction1 = Array::from_f32(correction1 as f32);
+            let correction2 = Array::from_f32(correction2 as f32);
+            let one_minus_beta1 = Array::from_f32((1.0 - beta1) as f32);
+            let one_minus_beta2 = Array::from_f32((1.0 - beta2) as f32);
+            let (beta1, beta2, epsilon, weight_decay) = (
+                beta1 as f32,
+                beta2 as f32,
+                epsilon as f32,
+                weight_decay as f32,
+            );
             let first_moment = state
                 .first_moment
-                .multiply_device(Array::from_f32(self.beta1), &stream)
+                .multiply_device(Array::from_f32(beta1), &stream)
                 .and_then(|value| {
                     gradient
                         .multiply_device(&one_minus_beta1, &stream)
@@ -316,7 +384,7 @@ impl MlxAdamPlan {
                 .map_err(|error| format!("MLX Adam first moment update failed: {error}"))?;
             let second_moment = state
                 .second_moment
-                .multiply_device(Array::from_f32(self.beta2), &stream)
+                .multiply_device(Array::from_f32(beta2), &stream)
                 .and_then(|value| {
                     gradient
                         .multiply_device(&gradient, &stream)
@@ -326,25 +394,31 @@ impl MlxAdamPlan {
                         .and_then(|scaled_gradient| value.add_device(&scaled_gradient, &stream))
                 })
                 .map_err(|error| format!("MLX Adam second moment update failed: {error}"))?;
-            let correction1 = Array::from_f32(1.0 - self.beta1.powf(state.step as f32));
-            let correction2 = Array::from_f32(1.0 - self.beta2.powf(state.step as f32));
-            let update = first_moment
+            let direction = first_moment
                 .divide_device(&correction1, &stream)
                 .and_then(|first| {
                     second_moment
                         .divide_device(&correction2, &stream)
                         .and_then(|second| second.sqrt_device(&stream))
                         .and_then(|denominator| {
-                            denominator.add_device(Array::from_f32(self.epsilon), &stream)
+                            denominator.add_device(Array::from_f32(epsilon), &stream)
                         })
                         .and_then(|denominator| first.divide_device(&denominator, &stream))
                 })
-                .and_then(|normalized| {
-                    normalized.multiply_device(Array::from_f32(self.learning_rate), &stream)
-                })
                 .map_err(|error| format!("MLX Adam update failed: {error}"))?;
-            let updated_parameter = parameter
-                .subtract_device(&update, &stream)
+            // AdamW's decoupled decay with the pre-update parameter; zero keeps
+            // the Adam expression exactly, as `0 * inf` would introduce a NaN.
+            let direction = if weight_decay != 0.0 {
+                parameter
+                    .multiply_device(Array::from_f32(weight_decay), &stream)
+                    .and_then(|decay| direction.add_device(&decay, &stream))
+                    .map_err(|error| format!("MLX AdamW decay failed: {error}"))?
+            } else {
+                direction
+            };
+            let updated_parameter = direction
+                .multiply_device(&learning_rate, &stream)
+                .and_then(|update| parameter.subtract_device(&update, &stream))
                 .map_err(|error| format!("MLX Adam parameter update failed: {error}"))?;
             state.first_moment = first_moment;
             state.second_moment = second_moment;
@@ -403,6 +477,59 @@ impl MlxAdamPlan {
             ),
         )
     }
+}
+
+/// The factor `min(1, clip_norm / norm)` of `clip_by_global_norm` over all
+/// gradients, as a lazy scalar array, NaN when the norm is not finite.
+///
+/// The norm is `m * sqrt(sum((g / m)^2))` with `m` the largest `|g|`: every
+/// term is at most one, so the float32 sum cannot overflow for large
+/// gradients. A NaN or infinite gradient makes the sum non-finite whatever the
+/// maximum reduction does with NaN, so the factor is NaN exactly when the
+/// host norm is not finite.
+fn mlx_global_norm_clip_factor(
+    gradients: &[Array],
+    clip_norm: f32,
+    stream: &StreamOrDevice,
+) -> Result<Array, mlx_rs::error::Exception> {
+    let present = gradients
+        .iter()
+        .filter(|gradient| gradient.size() != 0)
+        .collect::<Vec<_>>();
+    let mut peak = Array::from_f32(0.0);
+    for gradient in &present {
+        let largest = gradient.abs_device(stream)?.max_device(None, stream)?;
+        peak = ops::maximum_device(&peak, &largest, stream)?;
+    }
+    let usable = ops::logical_and_device(
+        peak.is_finite_device(stream)?,
+        peak.gt_device(Array::from_f32(0.0), stream)?,
+        stream,
+    )?;
+    let scale = ops::r#where_device(&usable, &peak, Array::from_f32(1.0), stream)?;
+    let mut total = Array::from_f32(0.0);
+    for gradient in &present {
+        let squares = gradient
+            .divide_device(&scale, stream)?
+            .square_device(stream)?
+            .sum_device(None, stream)?;
+        total = total.add_device(&squares, stream)?;
+    }
+    let norm = scale.multiply_device(total.sqrt_device(stream)?, stream)?;
+    let bound = Array::from_f32(clip_norm);
+    let ratio = bound.divide_device(&norm, stream)?;
+    let ratio = ops::r#where_device(
+        norm.is_finite_device(stream)?,
+        &ratio,
+        Array::from_f32(f32::NAN),
+        stream,
+    )?;
+    ops::r#where_device(
+        norm.le_device(&bound, stream)?,
+        Array::from_f32(1.0),
+        &ratio,
+        stream,
+    )
 }
 
 impl MlxBackend {

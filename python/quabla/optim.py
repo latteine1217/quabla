@@ -312,18 +312,44 @@ class Trainer:
     ``step(*batch)`` replaces those arguments in the declared order. An empty
     call reuses the latest batch; ``loss()`` evaluates the current parameters.
     Device plans keep parameter and moment buffers on the device until readback.
-    The CPU accepts Adam, AdamW, and SGD; devices accept Adam without
-    ``clip_norm``, and a schedule sets the native rate before every step.
+    Every device accepts Adam, AdamW, and SGD with the CPU's update rules,
+    including ``clip_norm``: the global norm and its clip factor are reduced on
+    the device, so gradients are never read back. A schedule is evaluated on
+    the host and sets the native rate before every step. Device plans compute
+    in float32 by default and agree with the CPU trainer up to that rounding.
+
+    ``precision`` is ``jit``'s opt-in: ``"float64"`` on CUDA runs a float64
+    loss natively in double and keeps parameters and moments in float64 on
+    the device. The CPU already trains in float64, and MLX, which has no
+    float64 arithmetic, rejects it.
     """
 
-    def __init__(self, loss, params, optimizer, *data, device="cpu", batch_argnums=()):
+    def __init__(
+        self,
+        loss,
+        params,
+        optimizer,
+        *data,
+        device="cpu",
+        batch_argnums=(),
+        precision=None,
+    ):
         from ._devices import parse_device, require_device
 
         if not callable(loss):
             raise TypeError("loss must be callable")
         if not isinstance(optimizer, (Adam, AdamW, SGD)):
             raise TypeError("optimizer must be Adam, AdamW, or SGD")
+        if precision not in (None, "float64"):
+            raise ValueError(f'precision must be None or "float64", got {precision!r}')
         target, ordinal = parse_device(device)
+        if precision == "float64" and target == "mlx":
+            raise _UnsupportedOperationError(
+                'MLX has no float64 arithmetic; precision="float64" is supported on '
+                "the CPU and CUDA",
+                op="float64",
+                device=device,
+            )
         parameters, self._param_def = _parameters(params)
         if isinstance(batch_argnums, int):
             batch_argnums = (batch_argnums,)
@@ -347,19 +373,6 @@ class Trainer:
             self._value_and_grad = _jit(_value_and_grad(loss), device="cpu")
             self._evaluate_loss = _jit(loss, device="cpu")
             return
-        if not isinstance(optimizer, Adam):
-            # AdamW's decay and SGD have no device-resident kernels.
-            raise _UnsupportedOperationError(
-                "device Trainer supports Adam only", op="Trainer", device=device
-            )
-        if optimizer.clip_norm is not None:
-            # Clipping needs the global norm of all gradients between the
-            # gradient and update kernels, which the device plans fuse.
-            raise _UnsupportedOperationError(
-                "device Trainer does not support clip_norm",
-                op="Trainer",
-                device=device,
-            )
         require_device(device, "Trainer")
         arguments = (params, *self._data)
         leaves, definition = _tree.flatten(arguments)
@@ -389,18 +402,34 @@ class Trainer:
                 retained.extend(argument_names)
             self._batch_names.append(argument_names)
             offset += count
-        factory = getattr(_quabla, f"{target}_adam_loss_optimizer")
-        kwargs = {"device_ordinal": ordinal} if target == "cuda" else {}
+        factory = getattr(_quabla, f"_{target}_trainer_optimizer")
+        if isinstance(optimizer, SGD):
+            # The native SGD rule ignores the Adam hyperparameters.
+            rule = {
+                "optimizer": "sgd",
+                "beta1": 0.0,
+                "beta2": 0.0,
+                "epsilon": 1.0,
+                "weight_decay": 0.0,
+            }
+        else:
+            rule = {
+                "optimizer": "adam",
+                "beta1": optimizer.b1,
+                "beta2": optimizer.b2,
+                "epsilon": optimizer.eps,
+                "weight_decay": optimizer.weight_decay,
+            }
+        if target == "cuda":
+            rule.update(precision=precision, device_ordinal=ordinal)
         self._executor = factory(
             staged.outputs[0],
             self._parameter_names,
             dict(zip(names, leaves)),
-            _rate_at(optimizer.learning_rate, 0),
             retained,
-            optimizer.b1,
-            optimizer.b2,
-            optimizer.eps,
-            **kwargs,
+            learning_rate=_rate_at(optimizer.learning_rate, 0),
+            clip_norm=optimizer.clip_norm,
+            **rule,
         )
         # Completed device steps, at which a host schedule is evaluated.
         self._device_steps = 0

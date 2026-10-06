@@ -82,9 +82,33 @@ deprecated names keep working until 1.0 (see
   composed from `fmod` as NumPy does.
 - `examples/benchmark_host_loop_cuda.py` measures the per-iteration cost of
   host-driven CUDA loops and compares two builds bit for bit.
+- Device `optim.Trainer` parity: CUDA and MLX accept `AdamW`, `SGD`, and
+  `clip_norm` (previously `UnsupportedOperationError`), with the CPU's update
+  definitions and operation order, including AdamW's decay of parameters the
+  loss ignores. Global-norm clipping is computed on the device without
+  reading gradients back: `m * sqrt(sum((g / m)^2))` with `m = max |g|` over
+  all parameters (accumulated in float64 on CUDA, in float32 on MLX; every
+  term is at most one, so neither overflows), then the factor
+  `min(1, clip_norm / norm)` scales every gradient before the moment updates;
+  a zero norm leaves gradients unchanged and a non-finite norm makes every
+  parameter NaN, as on the CPU. Over eight steps of a small PINN, float32
+  device parameters agree with the CPU trainer to about `6e-8`.
+- `Trainer(..., precision="float64")`, validated as in `jit`: on CUDA a
+  float64 loss trains natively in double with float64 parameters and moments
+  on the device (agreeing with the CPU trainer to about `1e-16` over eight
+  PINN steps); a no-op on the CPU; `UnsupportedOperationError` on MLX.
 
 ### Changed
 
+- The device Adam updates behind `Trainer` and the deprecated
+  `cuda_adam_loss_optimizer`, `cuda_adam_vjp_optimizer`, and
+  `mlx_adam_loss_optimizer` follow the CPU's operation order and form
+  `1 - beta` and the bias corrections in float64, rounding them once.
+  `Trainer` passes its hyperparameters in float64 (the deprecated factories
+  still take float32), so device runs use the CPU's exact betas instead of
+  their float32 roundings. Device Adam trajectories change at the float32
+  rounding level. The `learning_rate` attribute of a CUDA executor holds the
+  float64 value that was set rather than its float32 rounding.
 - `quabla.trace` is the array `trace(a, offset=0, axis1=0, axis2=1)`. The
   v0.1 call form `trace(function, input_specs)` keeps working and warns on
   the call, as `grad` and `jit` do, instead of on attribute access.
