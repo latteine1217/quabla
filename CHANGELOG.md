@@ -62,6 +62,13 @@ deprecated names keep working until 1.0 (see
   the carry (it depends only on the operands or the index, or is a
   constant) no longer fails at trace time; as in JAX, it returns that value
   every iteration, and the carry gets a zero derivative.
+- Reverse mode through a `scan` region that uses only its final carry or
+  only its stacked outputs, such as a `cond` branch returning
+  `scan(...)[0]`, failed with "symbolic Scan group ... has no output
+  result" (or "no carry result"), eagerly and under `jit`, and so did
+  `hessian` through a `fori_loop` whose body runs such a scan. Compiling a
+  region removes the unused result, while the symbolic VJP required both;
+  the discarded result now contributes a zero cotangent.
 
 ## [0.4.0] - 2026-10-06
 

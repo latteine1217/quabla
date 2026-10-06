@@ -1341,6 +1341,122 @@ def test_hessian_and_jacobian_through_cond_match_per_direction_calls():
         assert_tree_close(qb.jacobian(summary)(xs[0]), reverse, tolerance)
 
 
+def scan_final_carry(v, w):
+    # Keeps the final carry v w^2 and discards the stacked outputs [v, v w].
+    return scan(lambda c, i, w: (c * w[0], c), v, length=2, operands=(w,))[0]
+
+
+def scan_output_sum(v, w):
+    # Keeps the outputs [v w, v w^2], summed to v (w + w^2), and discards the
+    # final carry.
+    return scan(lambda c, i, w: (c * w[0], c * w[0]), v, length=2, operands=(w,))[1].sum(0)
+
+
+def discarding_scan_losses(branch):
+    """Squared losses around a scan region that drops one of its results."""
+
+    def in_cond(v, w):
+        return (cond(v.sum() > 0, branch, lambda v, w: v * w[0], v, w) ** 2).sum()
+
+    def at_top(v, w):
+        return (branch(v, w) ** 2).sum()
+
+    def in_fori(v, w):
+        looped = fori_loop(0, 2, lambda i, c, w: branch(c, w), v, operands=(w,))
+        return (looped**2).sum()
+
+    return {"cond": in_cond, "top": at_top, "fori": in_fori}
+
+
+def discarding_scan_closed_form(keep_outputs, kind, v, w):
+    """(loss, dloss/dv, dloss/dw, d2loss/dv2, d2loss/dw2) for scalar v and w."""
+    # The kept scan result is g = v s(w); the cond's false branch is v w.
+    s, ds, d2s = (w + w * w, 1 + 2 * w, 2.0) if keep_outputs else (w * w, 2 * w, 2.0)
+    if kind == "cond" and v <= 0:
+        s, ds, d2s = w, 1.0, 0.0
+    if kind == "fori":
+        # Two applications: v s^2.
+        s, ds, d2s = s * s, 2 * s * ds, 2 * (ds * ds + s * d2s)
+    g, g_v, g_w, g_ww = v * s, s, v * ds, v * d2s
+    return g * g, 2 * g * g_v, 2 * g * g_w, 2 * g_v * g_v, 2 * (g_w * g_w + g * g_ww)
+
+
+def test_reverse_mode_through_a_scan_that_discards_a_result():
+    # Regression: a scan region whose final carry or stacked outputs were
+    # unused (and so removed from the traced region) failed reverse mode
+    # with "symbolic Scan group ... has no output result".
+    def f(v):
+        return cond(v.sum() > 0, scan_final_carry, lambda v, w: v * 2.0, v, qb.array([3.0])).sum()
+
+    for call in (qb.grad(f), qb.jit(qb.grad(f))):
+        assert_close(call(qb.array([1.0])), [9.0], 0.0)
+        assert_close(call(qb.array([-1.0])), [2.0], 0.0)
+
+    for keep_outputs, branch in ((False, scan_final_carry), (True, scan_output_sum)):
+        for kind, loss in discarding_scan_losses(branch).items():
+            for dtype, tolerance in ((qb.float64, 1e-12), (qb.float32, 1e-5)):
+                for v0 in (0.5, -1.0):
+                    w0 = 1.5
+                    value, d_v, d_w, h_v, h_w = discarding_scan_closed_form(
+                        keep_outputs, kind, v0, w0
+                    )
+                    v = qb.array([v0], dtype=dtype)
+                    w = qb.array([w0], dtype=dtype)
+                    scale = max(abs(value), abs(d_v), abs(d_w), abs(h_v), abs(h_w), 1.0)
+                    tol = tolerance * scale
+                    gradient = qb.value_and_grad(loss, argnums=(0, 1))
+                    for call in (gradient, qb.jit(gradient)):
+                        actual, (g_v, g_w) = call(v, w)
+                        assert_close(actual, value, tol)
+                        assert_close(g_v, [d_v], tol)
+                        assert_close(g_w, [d_w], tol)
+                    for argnums, expected in ((0, h_v), (1, h_w)):
+                        hessian = qb.hessian(loss, argnums=argnums)
+                        assert_close(hessian(v, w), [[expected]], tol)
+                        assert_close(qb.jit(hessian)(v, w), [[expected]], tol)
+                    # Forward-over-reverse directly: the JVP of the gradient.
+                    _, h_vw = qb.jvp(
+                        qb.grad(loss, argnums=1), (v, w), (qb.zeros_like(v), qb.ones_like(w))
+                    )
+                    assert_close(h_vw, [h_w], tol)
+                    if dtype == qb.float32:
+                        continue
+                    # Central differences of the eager CPU primal; the step
+                    # never crosses the cond predicate at v = 0.
+                    step = 1e-6
+                    for index in (0, 1):
+                        shift = [qb.array([0.0]), qb.array([0.0])]
+                        shift[index] = qb.array([step])
+                        upper = loss(v + shift[0], w + shift[1])
+                        lower = loss(v - shift[0], w - shift[1])
+                        fd = (upper - lower) / (2 * step)
+                        assert_close(fd, (d_v, d_w)[index], 1e-6 * scale)
+
+
+def test_optional_device_discarded_scan_result_parity():
+    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
+        if os.environ.get(flag) != "1":
+            continue
+        w = qb.array([1.5], dtype=qb.float32)
+        vs = (qb.array([0.5], dtype=qb.float32), qb.array([-1.0], dtype=qb.float32))
+        for branch in (scan_final_carry, scan_output_sum):
+            for kind, loss in discarding_scan_losses(branch).items():
+                operations = (
+                    qb.value_and_grad(loss, argnums=(0, 1)),
+                    qb.hessian(loss, argnums=0),
+                    qb.hessian(loss, argnums=1),
+                )
+                for operation in operations:
+                    for v in vs:
+                        cpu = qb.jit(operation)(v, w)
+                        actual = qb.jit(operation, device=device)(v, w)
+                        cpu_leaves, _ = qb.tree.flatten(cpu)
+                        actual_leaves, _ = qb.tree.flatten(actual)
+                        for value, expected in zip(actual_leaves, cpu_leaves):
+                            scale = max(1.0, abs(expected.item()))
+                            assert_close(value, expected, 1e-4 * scale)
+
+
 def safe_log(x):
     # log on the positive side, sqrt(1 - x) elsewhere. Each branch is NaN or
     # infinite on the other side: log(0) = -inf with derivative inf,

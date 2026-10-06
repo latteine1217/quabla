@@ -4899,6 +4899,31 @@ impl TensorIr {
                                 }
                             }
                         }
+                        // Dead-code elimination drops a sibling whose value is
+                        // unused, e.g. the stacked outputs of a scan whose region
+                        // returns only the final carry. A discarded result
+                        // contributes an exact zero cotangent, typed as the scan
+                        // body would type that result.
+                        let final_carry_upstream = match carry_upstream {
+                            Some(upstream) => upstream,
+                            None => {
+                                let dtype =
+                                    scan_plan.body.plan.input_dtype(&scan_plan.carry_name)?;
+                                let zero = transformed.constant_like(0.0, dtype, false);
+                                transformed.broadcast_to(zero, scan_plan.carry_shape()?)?
+                            }
+                        };
+                        let output_upstream = match output_upstream {
+                            Some(upstream) => upstream,
+                            None => {
+                                let dtype = scan_plan
+                                    .body
+                                    .plan
+                                    .node_dtype(scan_plan.body.plan.output_node_ids[1])?;
+                                let zero = transformed.constant_like(0.0, dtype, false);
+                                transformed.broadcast_to(zero, scan_plan.output_shape()?)?
+                            }
+                        };
                         symbolic_vjp_scan(
                             &mut transformed,
                             scan_plan,
@@ -4907,12 +4932,8 @@ impl TensorIr {
                                 carry: values[*carry],
                                 captures,
                                 values: &values,
-                                final_carry_upstream: carry_upstream.ok_or_else(|| {
-                                    format!("symbolic Scan group {group} has no carry result")
-                                })?,
-                                output_upstream: output_upstream.ok_or_else(|| {
-                                    format!("symbolic Scan group {group} has no output result")
-                                })?,
+                                final_carry_upstream,
+                                output_upstream,
                             },
                             &mut cotangents,
                             *group,

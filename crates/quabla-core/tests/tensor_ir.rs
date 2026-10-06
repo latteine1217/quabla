@@ -1493,6 +1493,242 @@ fn hessian_scalar_propagates_through_nonlinear_scan_vjp_jvp() {
     assert!((hvp.data()[0] - finite_difference).abs() < 2e-5);
 }
 
+/// A plan that runs a two-step `Scan` with body `(carry, w) -> (carry * w,
+/// output)` from `v` and returns only one of its results, so dead-code
+/// elimination drops the other `Scan` sibling from the plan. With
+/// `keep_outputs = false` it returns the final carry `v w^2` (the stacked
+/// outputs `[v, v w]` are discarded); with `keep_outputs = true` the outputs
+/// are `[v w, v w^2]` and it returns their sum `v (w + w^2)` (the final carry
+/// is discarded).
+fn pruned_scan_region(keep_outputs: bool) -> Result<TensorExecutionPlan, String> {
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![])?;
+    let scale = body.input("w", vec![])?;
+    let next = body.mul(carry, scale)?;
+    let output = if keep_outputs { next } else { carry };
+    let (body_plan, _) = body.compile_cpu_many(&[next, output])?;
+    let scan_plan = TensorScanExecutionPlan::new(0, 2, body_plan, "carry", "index")?;
+    let mut region = TensorIr::new();
+    let v = region.input("v", vec![])?;
+    let w = region.input("w", vec![])?;
+    let (final_carry, outputs) = region.scan(v, scan_plan, vec![("w".to_string(), w)])?;
+    let kept = if keep_outputs {
+        region.sum(outputs)?
+    } else {
+        final_carry
+    };
+    let plan = region.compile_cpu(kept)?;
+    // The regression needs the unused sibling to be gone, not merely unused.
+    if plan.lower_text().matches("scan(group=").count() != 1 {
+        return Err(format!(
+            "expected one surviving Scan result, got:\n{}",
+            plan.lower_text()
+        ));
+    }
+    Ok(plan)
+}
+
+/// `loss = g^2` where `g = cond(x > 0, pruned_scan_region, x w)`, so the true
+/// branch is `x w^2` (final carry only) or `x (w + w^2)` (stacked outputs
+/// only) and the false branch is `x w`.
+fn pruned_scan_cond_graph(keep_outputs: bool) -> Result<(TensorIr, TensorNodeId), String> {
+    let mut on_false = TensorIr::new();
+    let false_v = on_false.input("v", vec![])?;
+    let false_w = on_false.input("w", vec![])?;
+    let false_output = on_false.mul(false_v, false_w)?;
+    let branches = TensorCondExecutionPlan::new(
+        pruned_scan_region(keep_outputs)?,
+        on_false.compile_cpu(false_output)?,
+    )?;
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![])?;
+    let w = graph.input("w", vec![])?;
+    let zero = graph.scalar_constant(0.0);
+    let predicate = graph.greater(x, zero)?;
+    let selected = graph.cond_with_captures(
+        predicate,
+        branches,
+        vec![("v".to_string(), x), ("w".to_string(), w)],
+    )?;
+    let loss = graph.mul(selected, selected)?;
+    Ok((graph, loss))
+}
+
+/// `loss = h^2` where `h` runs two `Fori` steps of [`pruned_scan_region`]
+/// from `x`, so `h = x s(w)^2` with `s = w^2` or `s = w + w^2`.
+fn pruned_scan_fori_graph(keep_outputs: bool) -> Result<(TensorIr, TensorNodeId), String> {
+    let loop_plan =
+        TensorForiExecutionPlan::new(0, 2, pruned_scan_region(keep_outputs)?, "v", "index")?;
+    let mut graph = TensorIr::new();
+    let carry = graph.input("x", vec![])?;
+    let scale = graph.input("w", vec![])?;
+    let looped = graph.fori(carry, loop_plan, vec![("w".to_string(), scale)])?;
+    let loss = graph.mul(looped, looped)?;
+    Ok((graph, loss))
+}
+
+/// `(g, dg/dx, dg/dw, d2g/dw2)` for the selected branch of
+/// [`pruned_scan_cond_graph`]; `g` is linear in `x`.
+fn pruned_scan_branch_closed_form(keep_outputs: bool, x: f64, w: f64) -> [f64; 4] {
+    match (x > 0.0, keep_outputs) {
+        (true, false) => [x * w * w, w * w, 2.0 * x * w, 2.0 * x],
+        (true, true) => [x * (w + w * w), w + w * w, x * (1.0 + 2.0 * w), 2.0 * x],
+        (false, _) => [x * w, w, x, 0.0],
+    }
+}
+
+fn scalar_inputs(values: &[(&str, f64)]) -> BTreeMap<String, DynamicTensor> {
+    values
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.to_string(),
+                DynamicTensor::new(vec![], vec![*value]).expect("scalar tensor is valid"),
+            )
+        })
+        .collect()
+}
+
+fn assert_relative_close(label: &str, actual: f64, expected: f64, tolerance: f64) {
+    assert!(
+        (actual - expected).abs() <= tolerance * expected.abs().max(1.0),
+        "{label}: {actual} versus {expected}"
+    );
+}
+
+#[test]
+fn symbolic_ad_differentiates_cond_branch_scan_with_a_pruned_sibling_result() {
+    // Regression: the symbolic VJP of a Scan group required both its carry and
+    // stacked-output result nodes, but a branch region that returns only one
+    // of them has the other removed by DCE ("symbolic Scan group has no output
+    // result"). The discarded result must contribute a zero cotangent.
+    let w = 3.0;
+    for keep_outputs in [false, true] {
+        let (graph, loss) = must!(pruned_scan_cond_graph(keep_outputs));
+        let vjp = must!(graph.symbolic_vjp(loss, "seed"));
+        let jvp_x = must!(graph.symbolic_jvp(loss, "x"));
+        let jvp_w = must!(graph.symbolic_jvp(loss, "w"));
+        for x in [1.0, 0.5, -1.0] {
+            let [g, dg_dx, dg_dw, d2g_dw2] = pruned_scan_branch_closed_form(keep_outputs, x, w);
+            let inputs = scalar_inputs(&[("x", x), ("w", w), ("seed", 1.0)]);
+            let label = format!("keep_outputs={keep_outputs} x={x}");
+            let evaluate = |graph: &TensorIr, node| {
+                graph
+                    .evaluate(node, &inputs)
+                    .expect("pruned Scan derivative evaluates")
+                    .data()[0]
+            };
+            assert_relative_close(&label, evaluate(&vjp.graph, vjp.value), g * g, 1e-14);
+            let gradient_x = evaluate(&vjp.graph, vjp.gradients["x"]);
+            let gradient_w = evaluate(&vjp.graph, vjp.gradients["w"]);
+            assert_relative_close(&label, gradient_x, 2.0 * g * dg_dx, 1e-14);
+            assert_relative_close(&label, gradient_w, 2.0 * g * dg_dw, 1e-14);
+            assert_relative_close(
+                &label,
+                evaluate(&jvp_x.graph, jvp_x.tangent),
+                gradient_x,
+                1e-14,
+            );
+            assert_relative_close(
+                &label,
+                evaluate(&jvp_w.graph, jvp_w.tangent),
+                gradient_w,
+                1e-14,
+            );
+
+            // Central differences of the CPU primal; the step never crosses x = 0.
+            let step = 1e-6;
+            let loss_at = |x: f64, w: f64| {
+                graph
+                    .evaluate(loss, &scalar_inputs(&[("x", x), ("w", w)]))
+                    .expect("pruned Scan loss evaluates")
+                    .data()[0]
+            };
+            let fd_x = (loss_at(x + step, w) - loss_at(x - step, w)) / (2.0 * step);
+            let fd_w = (loss_at(x, w + step) - loss_at(x, w - step)) / (2.0 * step);
+            assert_relative_close(&label, gradient_x, fd_x, 1e-7);
+            assert_relative_close(&label, gradient_w, fd_w, 1e-7);
+
+            // Forward-over-reverse: d2(g^2)/dx2 = 2 (dg/dx)^2 because g is
+            // linear in x, and d2(g^2)/dw2 = 2 ((dg/dw)^2 + g d2g/dw2).
+            let primal = scalar_inputs(&[("x", x), ("w", w)]);
+            assert_eq!(
+                must!(graph.hessian_scalar(loss, "x", &primal)),
+                vec![vec![2.0 * dg_dx * dg_dx]],
+                "{label}"
+            );
+            let hvp_w = must!(graph.hvp_scalar(
+                loss,
+                "w",
+                &primal,
+                must!(DynamicTensor::new(vec![], vec![1.0])),
+            ));
+            assert_relative_close(
+                &label,
+                hvp_w.data()[0],
+                2.0 * (dg_dw * dg_dw + g * d2g_dw2),
+                1e-14,
+            );
+        }
+    }
+}
+
+#[test]
+fn compiled_plans_differentiate_scan_regions_with_a_pruned_sibling_result() {
+    // The same pruned Scan group reached without a Cond: as a compiled
+    // top-level plan, and as the body of a Fori region (whose forward-over-
+    // reverse rule differentiates the body plan symbolically).
+    let (x, w) = (0.5, 3.0);
+    for keep_outputs in [false, true] {
+        let region = must!(pruned_scan_region(keep_outputs));
+        let [g, _, dg_dw, d2g_dw2] = pruned_scan_branch_closed_form(keep_outputs, x, w);
+        let inputs = scalar_inputs(&[("v", x), ("w", w)]);
+        // g is linear in v, so its Hessian in v is exactly zero.
+        assert_eq!(must!(region.hessian_scalar("v", &inputs)), vec![vec![0.0]]);
+        let hvp_w =
+            must!(region.hvp_scalar("w", &inputs, must!(DynamicTensor::new(vec![], vec![1.0])),));
+        assert_relative_close("top-level hvp_w", hvp_w.data()[0], d2g_dw2, 1e-14);
+        let (_, tangent) = must!(region.jvp(&inputs, &scalar_inputs(&[("v", 0.0), ("w", 1.0)])));
+        assert_relative_close("top-level jvp_w", tangent.data()[0], dg_dw, 1e-14);
+
+        // Two Fori steps of the region: h(x, w) = x s(w)^2 with s = g / x.
+        let (graph, loss) = must!(pruned_scan_fori_graph(keep_outputs));
+        let (s, ds, d2s) = (g / x, dg_dw / x, d2g_dw2 / x);
+        let h = x * s * s;
+        let dh_dx = s * s;
+        let dh_dw = 2.0 * x * s * ds;
+        let d2h_dw2 = 2.0 * x * (ds * ds + s * d2s);
+        let primal = scalar_inputs(&[("x", x), ("w", w)]);
+        let label = format!("fori keep_outputs={keep_outputs}");
+        assert_relative_close(
+            &label,
+            must!(graph.hessian_scalar(loss, "x", &primal))[0][0],
+            2.0 * dh_dx * dh_dx,
+            1e-14,
+        );
+        let hvp_w = must!(graph.hvp_scalar(
+            loss,
+            "w",
+            &primal,
+            must!(DynamicTensor::new(vec![], vec![1.0])),
+        ));
+        assert_relative_close(
+            &label,
+            hvp_w.data()[0],
+            2.0 * (dh_dw * dh_dw + h * d2h_dw2),
+            1e-14,
+        );
+        let vjp = must!(graph.symbolic_vjp(loss, "seed"));
+        let seeded = scalar_inputs(&[("x", x), ("w", w), ("seed", 1.0)]);
+        assert_relative_close(
+            &label,
+            must!(vjp.graph.evaluate(vjp.gradients["w"], &seeded)).data()[0],
+            2.0 * h * dh_dw,
+            1e-14,
+        );
+    }
+}
+
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
 fn mlx_backend_executes_nonlinear_scan_forward_over_reverse_hvp() {
@@ -2049,6 +2285,18 @@ fn cuda_backend_executes_only_the_selected_cond_region_with_ad_parity_when_enabl
     must!(assert_log_guard_cond_matches_cpu("CUDA", |plan, inputs| {
         CudaBackend::new(0).compile(plan.clone())?.execute(inputs)
     }));
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_backend_differentiates_scan_regions_with_a_pruned_sibling_result_when_enabled() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    must!(assert_pruned_scan_regions_match_cpu(
+        "CUDA",
+        |plan, inputs| { CudaBackend::new(0).compile(plan.clone())?.execute(inputs) }
+    ));
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
@@ -3657,12 +3905,80 @@ fn assert_log_guard_cond_matches_cpu(
     Ok(())
 }
 
+/// Compares a device executor with CPU for Cond- and Fori-wrapped Scan
+/// regions whose unused Scan sibling result was pruned: the primal, its
+/// symbolic VJP and JVP, and the forward-over-reverse second derivatives.
+#[cfg(any(
+    all(feature = "mlx", target_os = "macos"),
+    all(feature = "cuda", target_os = "linux")
+))]
+fn assert_pruned_scan_regions_match_cpu(
+    backend: &str,
+    execute: impl Fn(
+        &quabla_core::tensor_ir::TensorExecutionPlan,
+        &BTreeMap<String, DynamicTensor>,
+    ) -> Result<DynamicTensor, String>,
+) -> Result<(), String> {
+    for keep_outputs in [false, true] {
+        for (kind, (graph, loss)) in [
+            ("cond", pruned_scan_cond_graph(keep_outputs)?),
+            ("fori", pruned_scan_fori_graph(keep_outputs)?),
+        ] {
+            let vjp = graph.symbolic_vjp(loss, "seed")?;
+            let jvp = graph.symbolic_jvp(loss, "x")?;
+            let second_x = vjp.graph.symbolic_jvp(vjp.gradients["x"], "x")?;
+            let second_w = vjp.graph.symbolic_jvp(vjp.gradients["w"], "w")?;
+            let cases = [
+                ("value", &graph, loss),
+                ("vjp_x", &vjp.graph, vjp.gradients["x"]),
+                ("vjp_w", &vjp.graph, vjp.gradients["w"]),
+                ("jvp_x", &jvp.graph, jvp.tangent),
+                ("second_x", &second_x.graph, second_x.tangent),
+                ("second_w", &second_w.graph, second_w.tangent),
+            ];
+            for x in [0.5, -1.0] {
+                let inputs = scalar_inputs(&[("x", x), ("w", 1.5), ("seed", 1.0)]);
+                for (label, case_graph, node) in cases {
+                    let cpu = case_graph.evaluate(node, &inputs)?;
+                    let device = execute(&case_graph.compile_cpu(node)?, &inputs)?;
+                    if device.shape() != cpu.shape() {
+                        return Err(format!(
+                            "{backend} {kind} keep_outputs={keep_outputs} {label} at x={x} \
+                             changed shape"
+                        ));
+                    }
+                    for (actual, expected) in device.data().iter().zip(cpu.data().iter()) {
+                        if !actual.is_finite()
+                            || (actual - expected).abs() > 1e-4 * expected.abs().max(1.0)
+                        {
+                            return Err(format!(
+                                "{backend} {kind} keep_outputs={keep_outputs} {label} at x={x}: \
+                                 {actual} versus CPU {expected}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
 fn mlx_backend_executes_only_the_selected_cond_region_with_ad_parity() {
     must!(assert_log_guard_cond_matches_cpu("MLX", |plan, inputs| {
         MlxBackend.execute(plan, inputs)
     }));
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_backend_differentiates_scan_regions_with_a_pruned_sibling_result() {
+    must!(assert_pruned_scan_regions_match_cpu(
+        "MLX",
+        |plan, inputs| { MlxBackend.execute(plan, inputs) }
+    ));
 }
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
