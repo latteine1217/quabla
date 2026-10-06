@@ -13,13 +13,14 @@
 //! group, the op names, and the frozen plans. The derivative rules, the
 //! evaluators, and the batching rules match on the kind.
 
-use super::{TensorExecutionPlan, TensorNodeId, TensorOp, TensorWhileExecutionPlan};
+use super::{
+    TensorCondExecutionPlan, TensorExecutionPlan, TensorNodeId, TensorOp, TensorWhileExecutionPlan,
+};
 
 /// Matches every region node of [`TensorOp`].
 macro_rules! region_op {
     () => {
-        TensorOp::Cond { .. }
-            | TensorOp::Fori { .. }
+        TensorOp::Fori { .. }
             | TensorOp::ForiJvp { .. }
             | TensorOp::ForiVjp { .. }
             | TensorOp::ForiVjpJvp { .. }
@@ -51,6 +52,12 @@ pub(super) struct RegionNode {
 /// nodes share one execution, the selected result and the group.
 #[derive(Clone, Debug)]
 pub(super) enum RegionKind {
+    /// A scalar-predicate lazy branch. The regions own their input captures
+    /// and are evaluated only after the predicate has been materialized.
+    Cond {
+        predicate: TensorNodeId,
+        branches: TensorCondExecutionPlan,
+    },
     /// A data-dependent loop: the body runs while the predicate region
     /// returns true. Only the final carry is produced.
     While {
@@ -63,6 +70,7 @@ impl RegionNode {
     /// The IR op name, as `lower_text` and error messages print it.
     pub(super) fn name(&self) -> &'static str {
         match self.kind {
+            RegionKind::Cond { .. } => "cond",
             RegionKind::While { .. } => "while",
         }
     }
@@ -70,6 +78,7 @@ impl RegionNode {
     /// The node kind as prose ("Fori VJP JVP"), for diagnostics.
     pub(super) fn label(&self) -> &'static str {
         match self.kind {
+            RegionKind::Cond { .. } => "Cond",
             RegionKind::While { .. } => "While",
         }
     }
@@ -77,6 +86,7 @@ impl RegionNode {
     /// The fixed operand slots in role order.
     fn slots(&self) -> Vec<TensorNodeId> {
         match self.kind {
+            RegionKind::Cond { predicate, .. } => vec![predicate],
             RegionKind::While { carry, .. } => vec![carry],
         }
     }
@@ -93,6 +103,7 @@ impl RegionNode {
     /// Mutable references to every operand, in [`Self::operands`] order.
     pub(super) fn operands_mut(&mut self) -> Vec<&mut TensorNodeId> {
         let mut operands: Vec<&mut TensorNodeId> = match &mut self.kind {
+            RegionKind::Cond { predicate, .. } => vec![predicate],
             RegionKind::While { carry, .. } => vec![carry],
         };
         operands.extend(self.captures.iter_mut().map(|(_, node_id)| node_id));
@@ -116,6 +127,9 @@ impl RegionNode {
     /// `Cond`, the predicate and body of a `While`, the body of a loop.
     pub(super) fn regions(&self) -> Vec<&TensorExecutionPlan> {
         match &self.kind {
+            RegionKind::Cond { branches, .. } => {
+                vec![&branches.on_true.plan, &branches.on_false.plan]
+            }
             RegionKind::While { loop_plan, .. } => {
                 vec![&loop_plan.predicate.plan, &loop_plan.body.plan]
             }
@@ -152,7 +166,6 @@ impl<'a> RegionView<'a> {
     /// The IR op name, as `lower_text` and error messages print it.
     pub(super) fn name(self) -> &'static str {
         match self.op {
-            TensorOp::Cond { .. } => "cond",
             TensorOp::Fori { .. } => "fori",
             TensorOp::ForiJvp { .. } => "fori_jvp",
             TensorOp::ForiVjp { .. } => "fori_vjp",
@@ -168,7 +181,6 @@ impl<'a> RegionView<'a> {
     /// The node kind as prose ("Fori VJP JVP"), for diagnostics.
     pub(super) fn label(self) -> &'static str {
         match self.op {
-            TensorOp::Cond { .. } => "Cond",
             TensorOp::Fori { .. } => "Fori",
             TensorOp::ForiJvp { .. } => "Fori JVP",
             TensorOp::ForiVjp { .. } => "Fori VJP",
@@ -190,7 +202,6 @@ impl<'a> RegionView<'a> {
     /// The named operands bound to the body inputs of the same name.
     pub(super) fn captures(self) -> &'a [(String, TensorNodeId)] {
         match self.op {
-            TensorOp::Cond { captures, .. } => captures,
             TensorOp::Fori { captures, .. } => captures,
             TensorOp::ForiJvp { captures, .. } => captures,
             TensorOp::ForiVjp { captures, .. } => captures,
@@ -225,7 +236,6 @@ impl<'a> RegionView<'a> {
     /// captures.
     pub(super) fn operands(self) -> Vec<TensorNodeId> {
         let mut operands = match *self.op {
-            TensorOp::Cond { predicate, .. } => vec![predicate],
             TensorOp::Fori { carry, .. } => vec![carry],
             TensorOp::ForiJvp {
                 carry,
@@ -299,9 +309,6 @@ impl<'a> RegionView<'a> {
     /// `Cond`, the predicate and body of a `While`, the body of a loop.
     pub(super) fn regions(self) -> Vec<&'a TensorExecutionPlan> {
         match self.op {
-            TensorOp::Cond { branches, .. } => {
-                vec![&branches.on_true.plan, &branches.on_false.plan]
-            }
             TensorOp::Fori { loop_plan, .. } => vec![&loop_plan.body.plan],
             TensorOp::ForiJvp { loop_plan, .. } => vec![&loop_plan.body.plan],
             TensorOp::ForiVjp { loop_plan, .. } => vec![&loop_plan.body.plan],
@@ -333,11 +340,6 @@ impl<'a> RegionView<'a> {
 /// [`RegionView::operands`] order; `None` when it is not a region node.
 pub(super) fn region_operands_mut(op: &mut TensorOp) -> Option<Vec<&mut TensorNodeId>> {
     let (mut operands, captures, tangent_captures): (Vec<&mut TensorNodeId>, _, _) = match op {
-        TensorOp::Cond {
-            predicate,
-            captures,
-            ..
-        } => (vec![predicate], captures, None),
         TensorOp::Fori {
             carry, captures, ..
         } => (vec![carry], captures, None),

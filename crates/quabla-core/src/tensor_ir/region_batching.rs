@@ -807,11 +807,15 @@ impl TensorIr {
         (remap, mapped): (&HashMap<TensorNodeId, TensorNodeId>, &[bool]),
         batch_size: usize,
     ) -> Result<(TensorNodeId, bool), BatchingError> {
-        let TensorOp::Cond {
-            predicate,
-            branches,
+        let TensorOp::Region(RegionNode {
+            kind:
+                RegionKind::Cond {
+                    predicate,
+                    branches,
+                },
             captures,
-        } = &node.op
+            ..
+        }) = &node.op
         else {
             return Err(BatchingError::Invalid(format!(
                 "{} is not a cond region node",

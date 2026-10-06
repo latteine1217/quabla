@@ -485,10 +485,15 @@ impl CudaBackend {
         ensure_nvrtc_runtime_available()?;
         // The fused epilogue binds only uploaded inputs and never runs `Cond` first; region plans
         // need the per-node program.
-        let has_cond = plan
-            .nodes
-            .iter()
-            .any(|node| matches!(node.op, TensorOp::Cond { .. }));
+        let has_cond = plan.nodes.iter().any(|node| {
+            matches!(
+                node.op,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Cond { .. },
+                    ..
+                })
+            )
+        });
         let matmul_bias_tanh = if region_context.is_none() && !has_cond {
             cuda_matmul_bias_tanh_epilogue(&plan)
         } else {
@@ -544,7 +549,11 @@ impl CudaBackend {
         let solver = cuda_solver(context.default_stream())?;
         let mut cond_branches = BTreeMap::new();
         for (node_id, node) in plan.nodes.iter().enumerate() {
-            let TensorOp::Cond { branches, .. } = &node.op else {
+            let TensorOp::Region(RegionNode {
+                kind: RegionKind::Cond { branches, .. },
+                ..
+            }) = &node.op
+            else {
                 continue;
             };
             let compile_region = |region: &TensorExecutionPlan| {
@@ -2195,11 +2204,11 @@ fn execute_cuda_device_program<T: CudaReal>(
                     "CUDA While node {node_id} reached execution without validation"
                 ))
             }
-            TensorOp::Cond {
-                predicate,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Cond { predicate, .. },
                 captures,
                 ..
-            } => {
+            }) => {
                 let branches = cond_branches
                     .get(&node_id)
                     .ok_or_else(|| format!("CUDA Cond node {node_id} has no compiled regions"))?;
@@ -7843,7 +7852,7 @@ fn cuda_program_source(
             TensorOp::CholeskyAd { kind, .. } => cholesky_backend::ad_source(&function, *node.shape.last().expect("matrix shape"), *kind),
             TensorOp::Solve { .. }
             | TensorOp::Linalg { .. }
-            | TensorOp::Cond { .. }
+            | TensorOp::Region(RegionNode { kind: RegionKind::Cond { .. }, .. })
             | TensorOp::Region(RegionNode { kind: RegionKind::While { .. }, .. }) => {
                 String::new()
             }

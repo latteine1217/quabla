@@ -750,11 +750,15 @@ impl MlxBackend {
                     &stream,
                 )
                 .map_err(|error| error.to_string()),
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => {
+                    ..
+                }) => {
                     // Host synchronization point: the scalar predicate is read back once and only
                     // the selected branch runs on the GPU stream. Computing both branches with
                     // `where` is avoided so NaN/Inf from the unselected branch cannot leak into

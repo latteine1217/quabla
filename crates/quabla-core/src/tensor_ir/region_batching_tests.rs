@@ -473,9 +473,11 @@ fn an_unmapped_predicate_keeps_one_cond_with_one_output_batchedness() -> Result<
     let (node, mapped) = results[0];
     assert!(mapped);
     assert_eq!(graph.nodes[node].shape, vec![BATCH, 3]);
-    let TensorOp::Cond {
-        branches, captures, ..
-    } = &graph.nodes[node].op
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::Cond { branches, .. },
+        captures,
+        ..
+    }) = &graph.nodes[node].op
     else {
         panic!("an unmapped predicate keeps the lazy cond");
     };
@@ -519,10 +521,13 @@ fn a_mapped_predicate_selects_between_both_batched_branches() -> Result<(), Stri
     };
     // The [B] predicate is broadcast over the output's trailing axis.
     assert_eq!(graph.nodes[*condition].shape, vec![BATCH, 1]);
-    assert!(graph
-        .nodes
-        .iter()
-        .all(|node| !matches!(node.op, TensorOp::Cond { .. })));
+    assert!(graph.nodes.iter().all(|node| !matches!(
+        node.op,
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::Cond { .. },
+            ..
+        })
+    )));
     // The mapped x enters each branch once behind a gradient mask; the
     // unmapped s and w are bound as they are.
     let frozen = |name: &str| -> Result<usize, String> {

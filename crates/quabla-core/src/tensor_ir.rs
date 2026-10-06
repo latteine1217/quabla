@@ -612,13 +612,6 @@ enum TensorOp {
         on_true: TensorNodeId,
         on_false: TensorNodeId,
     },
-    /// A scalar-predicate lazy branch. The regions own their input captures
-    /// and are evaluated only after the predicate has been materialized.
-    Cond {
-        predicate: TensorNodeId,
-        branches: TensorCondExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-    },
     Fori {
         carry: TensorNodeId,
         loop_plan: TensorForiExecutionPlan,
@@ -1060,7 +1053,7 @@ pub struct TensorMultiRegion {
 
 /// Two shape-compatible CPU branch regions selected by a host boolean.
 ///
-/// `TensorOp::Cond` materializes its scalar predicate before selecting a
+/// A `Cond` region node materializes its scalar predicate before selecting a
 /// region. MLX and CUDA read a device predicate back once and execute only the
 /// selected region on the device; CUDA compiles both regions ahead of time and
 /// rejects `Cond` inside fused device loop bodies.
@@ -3344,9 +3337,10 @@ impl TensorIr {
                 kind: RegionKind::While { .. },
                 ..
             }) => return self.push_batched_loop(node, (remap, mapped), batch_size, loop_groups),
-            TensorOp::Cond { .. } => {
-                return self.push_batched_cond(node, (remap, mapped), batch_size)
-            }
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Cond { .. },
+                ..
+            }) => return self.push_batched_cond(node, (remap, mapped), batch_size),
             TensorOp::Input { .. }
             | TensorOp::ScalarConstant { .. }
             | TensorOp::Constant { .. } => {
@@ -3703,11 +3697,15 @@ impl TensorIr {
                         transformed.where_select(condition_value, true_tangent, false_tangent)?,
                     )
                 }
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => symbolic_jvp_cond(
+                    ..
+                }) => symbolic_jvp_cond(
                     &mut transformed,
                     pairs[*predicate].0,
                     branches,
@@ -4264,11 +4262,15 @@ impl TensorIr {
                     values[*on_true],
                     values[*on_false],
                 )?,
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => symbolic_clone_cond(
+                    ..
+                }) => symbolic_clone_cond(
                     &mut transformed,
                     values[*predicate],
                     branches,
@@ -4509,11 +4511,15 @@ impl TensorIr {
                         )?;
                     }
                 }
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => symbolic_vjp_cond(
+                    ..
+                }) => symbolic_vjp_cond(
                     &mut transformed,
                     values[*predicate],
                     branches,
@@ -5557,11 +5563,14 @@ impl TensorIr {
         let shape = branches.output_shape()?;
         let dtype = branches.on_true.plan.output_dtype()?;
         Ok(self.push_node(
-            TensorOp::Cond {
-                predicate,
-                branches,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Cond {
+                    predicate,
+                    branches,
+                },
                 captures,
-            },
+                tangent_captures: Vec::new(),
+            }),
             shape,
             dtype,
             false,
@@ -7746,11 +7755,15 @@ impl TensorIr {
                     accumulate(&mut cotangents[*on_true], true_contribution)?;
                     accumulate(&mut cotangents[*on_false], false_contribution)?;
                 }
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let predicate = tensor_scalar_predicate(
                         values
                             .get(*predicate)
@@ -8428,11 +8441,15 @@ impl TensorIr {
                             .get(*on_false)
                             .ok_or_else(|| format!("node {on_false} has no evaluated tangent"))?,
                     )?,
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let predicate = tensor_scalar_predicate(
                         values
                             .get(*predicate)
@@ -8821,7 +8838,11 @@ impl TensorIr {
         if self.nodes.iter().any(|node| {
             matches!(
                 node.op,
-                TensorOp::Cond { .. } | TensorOp::Fori { .. } | TensorOp::Scan { .. }
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Cond { .. },
+                    ..
+                }) | TensorOp::Fori { .. }
+                    | TensorOp::Scan { .. }
             )
         }) {
             return self.symbolic_hessian_scalar_through_regions(output, input_name, inputs);
@@ -8913,7 +8934,11 @@ impl TensorIr {
         if self.nodes.iter().any(|node| {
             matches!(
                 node.op,
-                TensorOp::Cond { .. } | TensorOp::Fori { .. } | TensorOp::Scan { .. }
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::Cond { .. },
+                    ..
+                }) | TensorOp::Fori { .. }
+                    | TensorOp::Scan { .. }
             )
         }) {
             return self.symbolic_hvp_scalar_through_regions(
@@ -9194,11 +9219,7 @@ impl TensorIr {
                     "%{id} = scan_vjp_jvp(group={group}, target={target:?}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::Cond {
-                    predicate,
-                    branches,
-                    captures,
-                } => format!(
+                TensorOp::Region(RegionNode { kind: RegionKind::Cond { predicate, branches }, captures, .. }) => format!(
                     "%{id} = cond(%{predicate}, captures={captures:?}, true_nodes={}, false_nodes={}) : {}",
                     branches.true_node_count(),
                     branches.false_node_count(),
@@ -9812,11 +9833,15 @@ impl TensorIr {
                             .and_then(Option::as_ref)
                             .ok_or_else(|| format!("node {on_false} has no evaluated value"))?,
                     )?,
-                TensorOp::Cond {
-                    predicate,
-                    branches,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Cond {
+                            predicate,
+                            branches,
+                        },
                     captures,
-                } => {
+                    ..
+                }) => {
                     let predicate = tensor_scalar_predicate(
                         values
                             .get(*predicate)
@@ -10758,7 +10783,7 @@ impl TensorIr {
                     }
                 }
                 TensorOp::Region(RegionNode { kind: RegionKind::While { .. }, .. }) => return Err(WHILE_LOOP_REVERSE_MODE_ERROR.to_string()),
-                TensorOp::Cond { .. } => return Err(
+                TensorOp::Region(RegionNode { kind: RegionKind::Cond { .. }, .. }) => return Err(
                     "mixed second-order differentiation through Cond regions is not implemented"
                         .to_string(),
                 ),
