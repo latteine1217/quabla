@@ -17,6 +17,20 @@ deprecated names keep working until 1.0 (see
   and MLX backends). Both provide the `quabla` package; install one per
   environment. Wheels cover CPython 3.10 to 3.14. Version tags publish to
   TestPyPI and then PyPI through trusted publishing.
+- `quabla.ode.odeint(method="rosenbrock23")`: the adaptive, L-stable
+  Rosenbrock 2(3) method of Shampine and Reichelt (MATLAB's ode23s) for
+  stiff problems. It forms `df/dy` and `df/dt` by one batched forward-mode
+  pass per step and solves with `W = I - h d J` by LU; step control,
+  `rtol`/`atol`, `max_steps`, `info`, and the eager and `jit` behavior match
+  `dopri5`. It runs on the CPU and CUDA (MLX rejects `solve`) and is
+  reverse-mode differentiable, through the Jacobian, with respect to the
+  initial state, time span, and parameters.
+- `odeint(saveat=ts)` for every method: the states at the times `ts`,
+  stacked on axis zero, from each method's continuous extension (Shampine's
+  fourth-order interpolant for `dopri5`, the method's own for
+  `rosenbrock23`, cubic Hermite for the fixed-step methods), written by
+  masked updates inside the loop so adaptive steps are not shortened, and
+  differentiable.
 
 ### Fixed
 
