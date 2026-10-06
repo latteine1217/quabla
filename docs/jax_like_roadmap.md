@@ -1,5 +1,22 @@
 # Rust SciML Runtime Roadmap
 
+## v0.6 Plan (2026-10-07)
+
+v0.6 lets custom derivative rules compose with control flow and pays down
+two structural costs the 2026-10-07 architecture review found. Scope chosen
+by the owner on 2026-10-07; integer dtypes, complex dtypes with FFT, sparse
+matrices, CUDA fusion unification, and MLX fused loop kernels are not in it.
+
+| # | Item | Status |
+| --- | --- | --- |
+| 1 | One region node: the nine region variants (`Fori`, `ForiJvp`, `ForiVjp`, `ForiVjpJvp`, `Scan`, `ScanVjp`, `ScanVjpJvp`, `While`, `Cond`) become one `RegionNode` with a kind, operand slots, captures, plans, and group result, so the sites that treat regions alike (operands, remapping, CSE, placement, validation, batching) handle them once; migrated kind by kind against a bitwise golden corpus, with the `lower_text` format unchanged. A shared loop driver across backends is not part of it | Planned |
+| 2 | A fused CPU evaluator: chains of elementwise nodes run as one pass over the elements with no intermediate buffers, bit for bit equal to node-by-node evaluation, for CPU `jit` and the eager composite ops (`relu`, `sigmoid`, `softplus`, `abs`, ...) that became slower when eager moved onto the evaluator | Planned |
+| 3 | Custom rules inside control flow: `custom_vjp` and `custom_jvp` functions may run inside `cond`, `fori_loop`, `scan`, and `while_loop` bodies; `linalg.cg`, `linalg.gmres`, and `newton` gain forward mode; `hessian` through a `custom_vjp` solver composed with a loop (reverse mode over a loop VJP) works | Planned |
+
+Order: item 1 lands before item 3, which builds on the region node; item 2
+is independent. Carried release work: the two-GPU NCCL validation with
+NVRTC 12.6 and the first PyPI upload.
+
 ## Before v1.0: Retiring the v0.1 Derivative Engines (2026-10-07)
 
 Releases stay at 0.x until the items below are done; v1.0 follows them.
