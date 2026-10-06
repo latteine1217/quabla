@@ -3553,9 +3553,12 @@ impl TensorIr {
                     };
                     (value, tangent)
                 }
+                // The zero tangent keeps the constant's dtype and weakness: a
+                // strong `f32` constant (such as the ones seed of `grad`) can
+                // be bound to a region input, which requires an exact dtype.
                 TensorOp::ScalarConstant { value } => (
                     transformed.constant_like(*value, node.dtype, node.weak),
-                    transformed.scalar_constant(0.0),
+                    transformed.constant_like(0.0, node.dtype, node.weak),
                 ),
                 TensorOp::Constant { value } => {
                     let primal = transformed.push_node(

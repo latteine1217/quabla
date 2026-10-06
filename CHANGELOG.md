@@ -123,6 +123,13 @@ deprecated names keep working until 1.0 (see
   cuSOLVER handles, which synchronizes the device and invalidated a graph
   recording in progress; the loop then silently fell back to launching every
   kernel from the host. Handle destruction now waits for running recordings.
+- Forward-over-reverse derivatives (`hessian`, `jvp(grad(f))`) of a
+  `float32` function whose `cond` result is the loss raised `ValueError:
+  conditional binds "..._tangent_..." of dtype f64 to a region input of
+  dtype f32`; `float64` worked. The forward-mode tangent of a scalar
+  constant, such as the ones seed of `grad` that the reverse-mode `cond`
+  binds as a capture, was a `float64` zero whatever the constant's dtype;
+  it now has the constant's dtype. Values are unchanged where it worked.
 
 ## [0.5.0] - 2026-10-06
 

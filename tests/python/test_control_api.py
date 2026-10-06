@@ -1572,6 +1572,112 @@ def test_optional_device_vmap_of_loops_matches_cpu():
             assert_tree_close(actual, expected, tolerance)
 
 
+def second_order_region_losses(unroll):
+    """Scalar losses whose region result is the loss itself, so the ones
+    seed of `grad` (a strong scalar constant) becomes a region capture."""
+
+    def branchy(w):
+        return qb.cond(w.sum() > 0, lambda v: qb.exp(v).sum(), lambda v: (v * v).sum(), w)
+
+    def looped(w):
+        return fori_loop(
+            0, 4, lambda i, c, w: qb.sin(c) * w + 0.5 * c, w, operands=(w,), unroll=unroll
+        ).sum()
+
+    def scanned(w):
+        carry, outputs = scan(
+            lambda c, i, w: (qb.sin(c) * w + 0.5 * c, c * c),
+            w,
+            length=3,
+            operands=(w,),
+            unroll=unroll,
+        )
+        return carry.sum() + outputs.sum()
+
+    def cond_in_loop(w):
+        def body(i, c, w):
+            return qb.cond(c.sum() > 0, lambda c, w: c * w, lambda c, w: c + w * w, c, w)
+
+        return fori_loop(0, 3, body, w, operands=(w,), unroll=unroll).sum()
+
+    def grown(w):
+        return while_loop(
+            lambda c, w: c.sum() < 10.0, lambda c, w: c * 1.5 + w * w, w, operands=(w,)
+        ).sum()
+
+    return {
+        "cond": branchy,
+        "fori": looped,
+        "scan": scanned,
+        "cond in fori": cond_in_loop,
+        "while": grown,
+    }
+
+
+def second_order_derivatives(loss, w, v, kind):
+    """Forward-over-reverse, reverse-over-forward, and forward-over-forward
+    derivatives of `loss` in direction `v`, as far as the region kind has
+    them (`while_loop` is forward-mode only; a `fori_loop` JVP has no
+    second-order rule)."""
+    derivatives = {}
+    if kind != "while":
+        derivatives["hvp"] = qb.jvp(qb.grad(loss), (w,), (v,))[1]
+        derivatives["hessian"] = qb.hessian(loss)(w)
+    if kind in ("cond", "scan"):
+        derivatives["grad of jvp"] = qb.grad(lambda w: qb.jvp(loss, (w,), (v,))[1])(w)
+    if kind in ("cond", "scan", "while"):
+        derivatives["jvp of jvp"] = qb.jvp(lambda w: qb.jvp(loss, (w,), (v,))[1], (w,), (v,))[1]
+    return derivatives
+
+
+def test_float32_second_order_derivatives_through_regions():
+    # The zero tangent of a strong float32 scalar constant (the seed of
+    # `grad`) used to be a float64 constant, which a region capture rejects:
+    # `hessian` of a float32 cond whose result is the loss raised.
+    region_losses = second_order_region_losses(False)
+    unrolled_losses = second_order_region_losses(True)
+    for dtype, tolerance in ((qb.float64, 1e-12), (qb.float32, 2e-5)):
+        v = qb.array([0.3, 0.7, -0.2], dtype=dtype)
+        # Weights whose sums select the true and the false branch of `cond`.
+        for values, positive in (([0.9, -1.3, 0.7], True), ([0.2, -1.1, 0.4], False)):
+            w = qb.array(values, dtype=dtype)
+            for kind, loss in region_losses.items():
+                actual = second_order_derivatives(loss, w, v, kind)
+                expected = second_order_derivatives(unrolled_losses[kind], w, v, kind)
+                for name, value in actual.items():
+                    assert value.dtype == dtype, (kind, name, value.dtype)
+                    assert_tree_close(value, expected[name], tolerance)
+            # The closed form of the cond: the Hessian of sum(exp(w)) on the
+            # true branch and of sum(w * w) on the false one.
+            hessian = qb.hessian(region_losses["cond"])(w)
+            diagonal = [math.exp(value) if positive else 2.0 for value in values]
+            expected = [[d if i == j else 0.0 for j in range(3)] for i, d in enumerate(diagonal)]
+            assert_tree_close(hessian, qb.array(expected, dtype=dtype), tolerance)
+
+
+def test_optional_device_float32_second_order_derivatives_through_regions():
+    precisions = {"mlx": (None,), "cuda": (None, "float64")}
+    runs = [(device, precision) for device in devices(*precisions) for precision in precisions[device]]
+    region_losses = second_order_region_losses(False)
+    for device, precision in runs:
+        dtype = qb.float64 if precision == "float64" else qb.float32
+        tolerance = 1e-11 if precision == "float64" else 2e-5
+        options = {"device": device}
+        if precision is not None:
+            options["precision"] = precision
+        v = qb.array([0.3, 0.7, -0.2], dtype=dtype)
+        for values in ([0.9, -1.3, 0.7], [0.2, -1.1, 0.4]):
+            w = qb.array(values, dtype=dtype)
+            for kind, loss in region_losses.items():
+
+                def derivatives(w, v, loss=loss, kind=kind):
+                    return second_order_derivatives(loss, w, v, kind)
+
+                expected = qb.jit(derivatives)(w, v)
+                actual = qb.jit(derivatives, **options)(w, v)
+                assert_tree_close(actual, expected, tolerance)
+
+
 def test_eager_cond_predicate_matches_the_traced_rule():
     # A floating predicate selects the true branch when nonzero, eagerly as
     # under jit; it used to be decided by `bool(Tensor)`, which is always true

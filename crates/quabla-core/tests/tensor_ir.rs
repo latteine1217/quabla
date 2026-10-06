@@ -966,6 +966,54 @@ fn hessian_and_hvp_support_cond_regions_through_symbolic_ad() {
 }
 
 #[test]
+fn forward_over_reverse_binds_a_float32_seed_tangent_to_a_cond_region() {
+    // The `Ones` seed of a float32 scalar loss is a strong float32 constant
+    // that the cond VJP binds as a capture; its zero tangent must stay
+    // float32, or the forward-over-reverse cond rejects the binding.
+    let mut on_true = TensorIr::new();
+    let true_capture = must!(on_true.input_typed("captured", vec![2], TensorDType::F32));
+    let true_exp = must!(on_true.exp(true_capture));
+    let true_output = must!(on_true.sum(true_exp));
+    let mut on_false = TensorIr::new();
+    let false_capture = must!(on_false.input_typed("captured", vec![2], TensorDType::F32));
+    let false_square = must!(on_false.mul(false_capture, false_capture));
+    let false_output = must!(on_false.sum(false_square));
+    let branches = must!(TensorCondExecutionPlan::new(
+        must!(on_true.compile_cpu(true_output)),
+        must!(on_false.compile_cpu(false_output)),
+    ));
+    let mut graph = TensorIr::new();
+    let predicate = must!(graph.input_typed("predicate", vec![], TensorDType::F32));
+    let w = must!(graph.input_typed("w", vec![2], TensorDType::F32));
+    let loss =
+        must!(graph.cond_with_captures(predicate, branches, vec![("captured".to_string(), w)]));
+    let reverse = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    let gradient = reverse.gradients["w"];
+    let hvp = must!(reverse.graph.symbolic_jvp(gradient, "w"));
+    assert_eq!(must!(hvp.graph.node_dtype(hvp.tangent)), TensorDType::F32);
+    for (flag, expected) in [
+        (
+            1.0,
+            vec![0.5_f64.exp() as f32 as f64, (-1.0_f64).exp() as f32 as f64],
+        ),
+        (0.0, vec![2.0, 2.0]),
+    ] {
+        let inputs = BTreeMap::from([
+            (
+                "predicate".to_string(),
+                must!(DynamicTensor::new(vec![], vec![flag])),
+            ),
+            (
+                "w".to_string(),
+                must!(DynamicTensor::new(vec![2], vec![0.5, -1.0])),
+            ),
+        ]);
+        let value = must!(hvp.graph.evaluate(hvp.tangent, &inputs));
+        assert_eq!(value.data().as_ref(), expected.as_slice());
+    }
+}
+
+#[test]
 fn fori_region_executes_and_differentiates_without_static_unrolling() {
     let mut body = TensorIr::new();
     let carry = must!(body.input("carry", vec![]));
