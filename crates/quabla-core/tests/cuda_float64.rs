@@ -1,6 +1,8 @@
 #![cfg(all(feature = "cuda", target_os = "linux"))]
 //! The opt-in `QuablaPrecision::Float64` CUDA lowering against the CPU.
 
+mod support;
+
 use std::collections::BTreeMap;
 
 use quabla_core::compiler::QuablaCompileError;
@@ -29,7 +31,7 @@ fn run(
 
 #[test]
 fn float64_lowering_keeps_double_constants_and_wide_reductions() -> Result<(), String> {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return Ok(());
     }
     let build = || -> Result<(TensorIr, Vec<usize>), String> {
@@ -83,7 +85,7 @@ fn float64_lowering_keeps_double_constants_and_wide_reductions() -> Result<(), S
 
 #[test]
 fn float64_precision_only_changes_programs_with_float64_nodes() -> Result<(), String> {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return Ok(());
     }
     let tenth = |dtype: TensorDType| -> Result<(TensorIr, Vec<usize>), String> {
@@ -122,7 +124,7 @@ fn float64_precision_only_changes_programs_with_float64_nodes() -> Result<(), St
 
 #[test]
 fn float64_precision_rejects_float32_nodes() -> Result<(), String> {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return Ok(());
     }
     let mut graph = TensorIr::new();
@@ -149,7 +151,7 @@ type ProgramBuilder<'a> = dyn Fn() -> Result<(TensorIr, Vec<usize>), String> + '
 
 #[test]
 fn float64_extremum_axis_matches_the_cpu_bitwise() -> Result<(), String> {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return Ok(());
     }
     // Entries only double precision separates (1 + 2^-40 vs 1, magnitudes

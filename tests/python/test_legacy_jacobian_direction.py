@@ -13,6 +13,8 @@ if args.site:
 quabla = importlib.import_module("quabla")
 qb = importlib.import_module("quabla.legacy")
 
+from _support import run  # noqa: E402
+
 
 def test_numeric_expansion_and_callback_count():
     calls = []
@@ -60,6 +62,4 @@ def test_tiny_division_under_comparison_keeps_reverse_success():
 
 
 if __name__ == "__main__":
-    test_numeric_expansion_and_callback_count()
-    test_tiny_division_under_comparison_keeps_reverse_success()
-    print("PASS legacy numeric blocks/callback/alias and tiny-Gt reverse contract")
+    run(globals())

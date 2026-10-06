@@ -1,5 +1,23 @@
 # Rust SciML Runtime Roadmap
 
+## Before v1.0: Retiring the v0.1 Derivative Engines (2026-10-07)
+
+Releases stay at 0.x until the items below are done; v1.0 follows them.
+The 0.x compatibility promise keeps every v0.1 call form with unchanged
+behaviour, so these changes, which alter v0.1 results at the ulp level or
+change where non-finite values appear, wait for v1.0. Decided by the owner
+on 2026-10-07 after an architecture review.
+
+The modern API differentiates with the symbolic JVP/VJP engines. Three more
+derivative engines exist only for deprecated v0.1 entry points:
+
+| # | Item | Effect on v0.1 results |
+| --- | --- | --- |
+| S3 | The runtime VJP (`value_and_vjp_many`) and JVP (`jvp_many`) engines in `tensor_ir.rs` serve only the deprecated `tensor_*` functions and pyclasses (`TensorValueAndGradFunction`, `TensorVjpFunction`, `TensorJvpFunction`, `TensorJacobianFunction`, and the others listed in `_compat.py`). Rebuild those entry points as adapters over compiled symbolic plans, make the Rust `TensorIr::vjp`/`jvp` test oracles symbolic adapters, and delete the runtime engines (about 1,900 lines). | ulp-level changes in `float64`; `float32` derivatives round per operation instead of once |
+| S4 | The mixed second-order evaluator (`hessian_scalar`/`hvp_scalar`, `evaluate_mixed*`, `MixedTangent`, `SolveReplayPlan`) serves only the deprecated `tensor_hessian_scalar_fn`/`tensor_hvp_scalar_fn`. Move them onto symbolic second derivatives and delete it (about 1,470 lines). | At a non-finite or domain-edge input, NaN appears only in the affected entries instead of every entry |
+| S5 | The legacy `Matrix`/`TraceGraph` engine in `crates/quabla-python/src/trace.rs` (its own trace, AD, and evaluation, about 780 lines of AD) is independent of `TensorIr`. Lower `quabla.legacy` onto `TensorIr` or remove it with the deprecated names. | Depends on the `quabla.legacy` decision for v1.0 |
+| A1 | `_quabla.Adam.step` (and so `optim.Adam.step`) and the legacy CUDA `cuda_adam_*` kernels keep the v0.1 update order and, on CUDA, `float32` bias corrections, as an explicitly named variant of the shared Adam rule. Switch them to the canonical rule. | ulp-level parameter changes; `optim.Adam.step` and `optim.Adam.update` then agree bit for bit |
+
 ## v0.5 Plan (2026-10-06)
 
 v0.5 makes `vmap` compose with control flow. In v0.4, `vmap` rejects any

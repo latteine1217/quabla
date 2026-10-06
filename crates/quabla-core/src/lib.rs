@@ -9,6 +9,11 @@ pub mod optim;
 pub mod tensor;
 pub mod tensor_ir;
 
+// The integration tests' hardware gates, so unit tests read them the same way.
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
+
 pub use autodiff::{Dual, ForwardGradient};
 pub use compiler::{
     QuablaCapability, QuablaCompiler, QuablaExecutable, QuablaJvpProgram,

@@ -8,31 +8,11 @@ iterative solve itself.
 """
 
 import math
-import os
 
 import quabla as qb
 from quabla import newton
 
-
-def raises(kind, function, *args, match=None, **kwargs):
-    try:
-        function(*args, **kwargs)
-    except kind as error:
-        if match is not None:
-            assert match in str(error), str(error)
-        return
-    raise AssertionError(f"expected {kind.__name__}")
-
-
-def assert_close(actual, expected, tolerance):
-    actual = actual.tolist() if hasattr(actual, "tolist") else actual
-    expected = expected.tolist() if hasattr(expected, "tolist") else expected
-    if isinstance(actual, list):
-        assert len(actual) == len(expected), (actual, expected)
-        for got, want in zip(actual, expected):
-            assert_close(got, want, tolerance)
-        return
-    assert abs(actual - expected) <= tolerance * max(1.0, abs(expected)), (actual, expected)
+from _support import assert_close, devices, raises, run
 
 
 def matrix(rows, columns, seed):
@@ -714,9 +694,7 @@ def test_solvers_compose_with_odeint_and_loops_under_vmap():
 
 
 def test_optional_device_solvers_match_cpu():
-    devices = [device for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")) if os.environ.get(gate) == "1"]
-    if not devices:
-        return
+    targets = devices()
     a32, n32 = spd(8).astype(qb.float32), nonsymmetric(8).astype(qb.float32)
     b32 = vector(8).astype(qb.float32)
     p32 = qb.array(2.0, dtype=qb.float32)
@@ -736,7 +714,7 @@ def test_optional_device_solvers_match_cpu():
         (qb.value_and_grad(gmres_loss, argnums=(0, 1)), (b32, n32)),
         (qb.value_and_grad(root_loss), (p32,)),
     )
-    for device in devices:
+    for device in targets:
         for function, arguments in cases:
             expected = qb.tree.leaves(qb.jit(function)(*arguments))
             actual = qb.tree.leaves(qb.jit(function, device=device)(*arguments))
@@ -745,16 +723,9 @@ def test_optional_device_solvers_match_cpu():
 
 
 def test_optional_device_vmap_of_solvers_matches_cpu():
-    devices = [
-        (device, precision)
-        for device, gate, precisions in (
-            ("mlx", "QUABLA_MLX_TEST", (None,)),
-            ("cuda", "QUABLA_CUDA_TEST", (None, "float64")),
-        )
-        if os.environ.get(gate) == "1"
-        for precision in precisions
-    ]
-    for device, precision in devices:
+    precisions = {"mlx": (None,), "cuda": (None, "float64")}
+    runs = [(device, precision) for device in devices(*precisions) for precision in precisions[device]]
+    for device, precision in runs:
         dtype = qb.float64 if precision == "float64" else qb.float32
         tolerance = 1e-10 if precision == "float64" else 1e-4
         tol = 1e-10 if precision == "float64" else 1e-5
@@ -824,7 +795,4 @@ def test_optional_device_vmap_of_solvers_matches_cpu():
 
 
 if __name__ == "__main__":
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
-            print(f"PASS {name}")
+    run(globals())

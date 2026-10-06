@@ -8,7 +8,6 @@ eigenvalue gaps above ~0.3, so a float64 solve is accurate to ~1e-13 and a
 central difference with step 1e-6 to ~1e-8.
 """
 
-import os
 import warnings
 
 try:
@@ -18,6 +17,8 @@ except ImportError:  # NumPy is an optional dependency; the suite needs it.
 
 import quabla as qb
 
+from _support import devices, raises, require, run
+
 
 def assert_close(actual, expected, tolerance):
     actual = np.asarray(actual, dtype=np.float64)
@@ -26,15 +27,6 @@ def assert_close(actual, expected, tolerance):
     error = np.max(np.abs(actual - expected), initial=0.0)
     scale = max(1.0, np.max(np.abs(expected), initial=0.0))
     assert error <= tolerance * scale, (error, tolerance * scale)
-
-
-def raises(kind, function, *args, match=None, **kwargs):
-    try:
-        function(*args, **kwargs)
-    except kind as error:
-        assert match is None or match in str(error), str(error)
-        return error
-    raise AssertionError(f"expected {kind.__name__}")
 
 
 def well_conditioned(rng, shape):
@@ -586,9 +578,7 @@ def test_optional_device_parity():
         (lambda m: tuple(qb.linalg.eigh(m)), (symmetric,)),
         (qb.grad(lambda m: (qb.linalg.eigh(m).eigenvectors ** 3).sum()), (symmetric,)),
     )
-    for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(gate) != "1":
-            continue
+    for device in devices():
         for function, arguments in functions:
             assert_device_matches_cpu(device, function, arguments, 5e-4)
         singular = np.array([[1.0, 2.0], [2.0, 4.0]], dtype=np.float32)
@@ -626,8 +616,7 @@ def test_mlx_linalg_matches_the_cpu():
     accuracy. Unless stated otherwise every matrix has a condition number
     below about 100 and eigenvalue or singular value gaps above about 0.1.
     """
-    if os.environ.get("QUABLA_MLX_TEST") != "1":
-        return
+    require("mlx")
     rng = np.random.default_rng(15)
 
     def f32(x):
@@ -783,10 +772,4 @@ def test_mlx_linalg_matches_the_cpu():
 
 
 if __name__ == "__main__":
-    if np is None:
-        print("skipped test_linalg_api: numpy is not installed")
-        raise SystemExit(0)
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
-            print(f"PASS {name}")
+    run(globals(), skip_reason="numpy is not installed" if np is None else None)

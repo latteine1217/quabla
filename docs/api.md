@@ -1,6 +1,6 @@
 # Quabla API Reference
 
-This document is the reference companion to the [README](../README.md). It
+This document is the reference companion to the [README](https://github.com/latteine1217/quabla/blob/main/README.md). It
 describes the Python API on `main` in two layers:
 
 - The **core API** released in v0.2.0 (slices S0-S9 of
@@ -1060,7 +1060,7 @@ layer of the v0.2 design, for explicit compilation and inspection from
 name-keyed input specs on CPU, CUDA and MLX. Integrations that need a
 compiled program should use this facade instead of coupling to a
 backend-specific execution plan class; the legacy 2D `Matrix` tracer is
-intentionally outside it. The [Quickstart](../README.md#quickstart) shows the
+intentionally outside it. The [Quickstart](https://github.com/latteine1217/quabla/blob/main/README.md#quickstart) shows the
 lifecycle end to end.
 
 `Program.jvp(input_name)` and `Program.vjp(cotangent_name)` produce new
@@ -1544,7 +1544,7 @@ name keeps working through 0.x.
   only host diagnostics. It is not a JIT,
   and unsupported reverse graphs return an explicit error rather than falling
   back to the host. Build requirements are listed under
-  [Installation From Source](../README.md#installation-from-source).
+  [Installation From Source](https://github.com/latteine1217/quabla/blob/main/README.md#installation-from-source).
 - Python `Adam` updates immutable dictionaries of named rank-N `Tensor`
   parameters from VJP gradients, including the gradient dictionaries that
   `qb.grad` and `qb.value_and_grad` return for a flat dict of parameters

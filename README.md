@@ -8,6 +8,10 @@ traced program on CPU, CUDA, and Apple silicon.**
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation)
 [![Release v0.5.0](https://img.shields.io/badge/release-v0.5.0-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.5.0)
+[![Docs](https://img.shields.io/badge/docs-developer%20guide-blue)](https://latteine1217.github.io/quabla/guide/)
+
+**Documentation: [Developer Guide](https://latteine1217.github.io/quabla/guide/)
+· [API Reference](https://latteine1217.github.io/quabla/api.html)**
 
 ![A tanh MLP trained with Quabla matches the exact solution of a 1D Poisson problem; its training loss falls from about 50 to 2.5e-4.](docs/assets/pinn_poisson.png)
 
@@ -349,6 +353,9 @@ The full list is in [docs/api.md](docs/api.md#known-limitations).
 
 ## Documentation
 
+- [Developer Guide](https://latteine1217.github.io/quabla/guide/) (source in
+  [docs/guide/](docs/guide/README.md)): a chapter-by-chapter walkthrough of
+  the API, a PINN tutorial, and the architecture for contributors.
 - [docs/api.md](docs/api.md): function transforms, device execution, the
   compiler facade, the v0.1 API reference, and the full list of known
   limitations.

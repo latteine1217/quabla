@@ -6,7 +6,6 @@ import importlib
 import importlib.machinery
 import inspect
 import math
-import os
 import pathlib
 import pickle
 import struct
@@ -22,6 +21,9 @@ try:
     import numpy as np
 except ImportError:
     np = None
+
+from _support import assert_close, enabled, require, run, skip
+from _support import raises as assert_raises
 
 # The 132 non-underscore names of `dir(quabla)` on the v0.1 build, generated
 # before the move to the mixed Rust/Python layout. Every later build must keep
@@ -110,22 +112,11 @@ def test_dtype_reprs_are_unchanged():
 def requires_numpy(test):
     def run():
         if np is None:
-            print(f"skipped {test.__name__}: numpy is not installed")
-            return
+            skip("numpy is not installed")
         test()
 
     run.__name__ = test.__name__
     return run
-
-
-def assert_raises(error, function, *args, match=None, **kwargs):
-    try:
-        function(*args, **kwargs)
-    except error as exc:
-        if match is not None:
-            assert match in str(exc), f"{match!r} not in {str(exc)!r}"
-        return exc
-    raise AssertionError(f"{function} did not raise {error.__name__}")
 
 
 def assert_tensor(tensor, values, dtype):
@@ -479,16 +470,6 @@ def test_numpy_round_trip_of_a_million_values_is_fast():
         timings.append(time.perf_counter() - start)
     assert np.array_equal(result, source)
     assert min(timings) < 0.005, timings
-
-
-def assert_close(actual, expected, tolerance=1e-12):
-    actual, expected = qb.asarray(actual), qb.asarray(expected)
-    assert actual.shape == expected.shape, (actual.shape, expected.shape)
-    for lhs, rhs in zip(actual.to_flat_list(), expected.to_flat_list()):
-        assert abs(lhs - rhs) <= tolerance * max(1.0, abs(rhs)), (
-            actual.tolist(),
-            expected.tolist(),
-        )
 
 
 def traced(function, *arrays):
@@ -1098,14 +1079,12 @@ def assert_power_device_parity(value_and_grad_fn):
 
 
 def test_mlx_power_matches_cpu():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
     assert_power_device_parity(qb.tensor_value_and_grad_mlx_fn)
 
 
 def test_cuda_power_matches_cpu():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
     assert_power_device_parity(
         lambda loss, specs, names: qb.tensor_value_and_grad_cuda_fn(
             loss, specs, names, 0
@@ -2165,14 +2144,12 @@ def assert_constant_device_parity(value_and_grad_fn):
 
 
 def test_mlx_captured_constants_match_cpu():
-    if os.environ.get("QUABLA_MLX_TEST") is None:
-        return
+    require("mlx")
     assert_constant_device_parity(qb.tensor_value_and_grad_mlx_fn)
 
 
 def test_cuda_captured_constants_match_cpu():
-    if os.environ.get("QUABLA_CUDA_TEST") is None:
-        return
+    require("cuda")
     assert_constant_device_parity(
         lambda loss, specs, names: qb.tensor_value_and_grad_cuda_fn(
             loss, specs, names, 0
@@ -3099,8 +3076,7 @@ def test_jit_gather_and_scatter_add_are_constant_size_and_match_eager():
     # Values and derivatives match eager for repeated indices on both axes.
     # Dyadic data keeps every sum exact, so equality holds in any order.
     x = qb.array([[0.25 * i - 0.5 * j for j in range(5)] for i in range(4)])
-    devices = ["cpu"] + (["mlx"] if os.environ.get("QUABLA_MLX_TEST") == "1" else [])
-    devices += ["cuda"] if os.environ.get("QUABLA_CUDA_TEST") == "1" else []
+    devices = ["cpu"] + [device for device in ("mlx", "cuda") if enabled(device)]
     for axis, indices in ((0, [3, 1, 3, 0, 3]), (1, [4, 0, 4, 4, 2, 1])):
         shape = [4, 5]
         shape[axis] = len(indices)
@@ -3854,7 +3830,7 @@ def test_cumsum_matches_numpy_and_differentiates_by_reversal():
 
 def test_narrow_buffer_import_regressions():
     if np is None:
-        return
+        skip("numpy is not installed")
     script = pathlib.Path(__file__).with_name("test_buffer_narrow_import.py")
     subprocess.run([sys.executable, str(script)], check=True)
 
@@ -4306,7 +4282,4 @@ def test_prod_is_exact_with_zeros_and_differentiates_without_division():
 
 
 if __name__ == "__main__":
-    # Run every test_* function in definition order so new tests cannot be left out of a manual list
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
+    run(globals())

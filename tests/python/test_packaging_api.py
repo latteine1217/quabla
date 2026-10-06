@@ -13,14 +13,7 @@ import typing
 
 import quabla as qb
 
-
-def raises(kind, fun, *args, match=None, **kwargs):
-    try:
-        fun(*args, **kwargs)
-    except kind as error:
-        assert match is None or match in str(error), str(error)
-        return
-    raise AssertionError(f"expected {kind.__name__}")
+from _support import raises, run, skip
 
 
 def bits(tensor):
@@ -108,8 +101,7 @@ def test_repr_formats_elements_like_numpy_when_available():
     try:
         import numpy as np
     except ImportError:
-        print("skipped: NumPy is not installed")
-        return
+        skip("numpy is not installed")
 
     def elements(text):
         body = text[text.index("(") + 1 :]
@@ -281,7 +273,4 @@ def test_load_rejects_malformed_files():
 
 
 if __name__ == "__main__":
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
-            print(f"PASS {name}")
+    run(globals())
