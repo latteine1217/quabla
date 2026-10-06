@@ -875,8 +875,8 @@ broadcast case, `ScanVjp` and `ScanVjpJvp` aggregate output cotangents, and
 their tangents for HVP, back to each carry lane before reverse replay;
 broadcast capture gradients use device-side atomic reduction. General
 unequal-count output graphs and indexed bodies have no fused `ScanVjpJvp`
-kernel and remain explicit CUDA rejections; their primal Scan and first-order
-`ScanVjp` run as host-driven region loops.
+kernel; like their primal Scan and first-order `ScanVjp`, they run as
+host-driven region loops.
 
 Current migration status:
 
@@ -1059,20 +1059,31 @@ name keeps working through 0.x.
   captures and matching carry/output shapes,
   plus a per-step output that directly broadcasts a carry-shaped value; the
   latter aggregates primal and tangent output cotangents per carry lane.
-  Every loop node outside these fused subsets except `ScanVjpJvp` (bodies
-  that slice, concatenate, reshape across lanes, reduce, contain `Cond` or
-  array constants; capture gradients that reduce over broadcast axes inside
-  the body VJP; `While`) runs as a host-driven region loop instead: each
-  region (body, predicate, body JVP or body VJP) is compiled once to the
-  per-node CUDA program, and the host launches it once per iteration on
-  device-resident carry buffers, with no host copy per iteration except the
-  `While` predicate. Reverse passes keep the carry tape on the device, in
-  full for short loops and as square-root checkpoint blocks replayed in
-  reverse otherwise (the CPU scheme), and accumulate each capture gradient
-  once per iteration in reverse order, its broadcast axes reduced inside the
-  body VJP; float32 results differ from the CPU only by rounding order.
-  Launch cost dominates small bodies: a 1000-step loop over 1024 lanes takes
-  about 0.1 ms fused versus about 80 ms host-driven on a GTX 1660 SUPER.
+  Every loop node outside these fused subsets (bodies that slice,
+  concatenate, reshape across lanes, reduce, contain `Cond` or array
+  constants; capture gradients that reduce over broadcast axes inside the
+  body VJP; `While`; Hessian-vector products through such a `Scan`) runs as
+  a host-driven region loop instead: each region (body, predicate, body JVP
+  or body VJP) is compiled once to the per-node CUDA program, and the host
+  launches it once per iteration on device-resident carry buffers, with no
+  host copy per iteration except the `While` predicate. Loop-invariant
+  captures are bound once per loop execution. After two eager iterations, a
+  region whose program only launches NVRTC kernels, device copies and cuBLAS
+  products (no `Cond`, nested loop or cuSOLVER call) is recorded once as a
+  CUDA graph, and every later iteration retargets the graph's input and
+  output copies and launches it as one graph; the replay runs the same
+  kernels in the same order, so results are bit-identical to eager
+  iterations. Reverse passes keep the carry tape on the device, in full for
+  short loops and as square-root checkpoint blocks replayed in reverse
+  otherwise (the CPU scheme), and accumulate each capture gradient once per
+  iteration in reverse order, its broadcast axes reduced inside the body
+  VJP; float32 results differ from the CPU only by rounding order. Launch
+  cost still dominates small bodies: on a GTX 1660 SUPER (WSL) a small
+  rotating body costs about 30-50 µs per `fori_loop` or `scan` iteration
+  (120-180 µs before graph replay), about 100 µs per `while_loop` iteration
+  (which waits for its predicate), and about 120-140 µs per iteration of
+  their reverse passes; `examples/benchmark_host_loop_cuda.py` measures
+  them.
   `tensor_scan_region(lower, upper, body, init, operands)` applies the same
   one-time region tracing contract to a `(next_carry, output)` body and returns
   the final carry plus a leading-axis stack of fixed-shape outputs.

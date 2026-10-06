@@ -182,6 +182,10 @@ struct CudaBufferPool<T: CudaReal> {
     buffers: BTreeMap<usize, Vec<CudaSlice<T>>>,
     elements: usize,
     budget: usize,
+    /// Set while a host-driven loop records a region into a CUDA graph: the
+    /// pool then neither allocates (an allocation would become a graph node)
+    /// nor frees (the graph keeps referring to every buffer it recorded).
+    capturing: bool,
 }
 
 impl<T: CudaReal> CudaBufferPool<T> {
@@ -201,6 +205,11 @@ impl<T: CudaReal> CudaBufferPool<T> {
 
     fn recycle(&mut self, buffer: CudaSlice<T>) {
         let count = buffer.len();
+        if self.capturing {
+            self.elements += count;
+            self.buffers.entry(count).or_default().push(buffer);
+            return;
+        }
         if count > self.budget {
             return;
         }
@@ -507,8 +516,20 @@ impl CudaBackend {
         }
         let context = match region_context {
             Some(context) => context.clone(),
-            None => CudaContext::new(self.device_ordinal)
-                .map_err(|error| format!("failed to create CUDA context: {error:?}"))?,
+            None => {
+                let context = CudaContext::new(self.device_ordinal)
+                    .map_err(|error| format!("failed to create CUDA context: {error:?}"))?;
+                // SAFETY: called before this context allocates anything, so no buffer of it
+                // carries events. A plan issues all of its work on the context's default
+                // stream; the only other stream, a host-driven loop's graph capture stream
+                // (`host_loop`), records work without executing it, and the recorded graphs
+                // are launched on the default stream. No buffer is therefore used by two
+                // executing streams, which is the synchronization event tracking provides.
+                // Without events, buffers can also be read inside a stream capture, where a
+                // wait on an event recorded outside the capture is an error.
+                unsafe { context.disable_event_tracking() };
+                context
+            }
         };
         let ptx = compile_ptx(T::program_source(source)?).map_err(|error| {
             format!("failed to compile CUDA device program with NVRTC: {error:?}")
@@ -881,15 +902,11 @@ pub(super) fn validate_cuda_plan(plan: &TensorExecutionPlan) -> Result<(), (Stri
             continue;
         };
         // A loop the fused per-lane kernel cannot lower runs as a host-driven region loop when
-        // each of its regions lowers on its own; `ScanVjpJvp` has no such fallback.
-        let fallback = if matches!(node.op, TensorOp::ScanVjpJvp { .. }) {
-            String::new()
-        } else {
-            match host_loop::validate_cuda_host_loop(&node.op) {
-                Ok(()) => continue,
-                Err((_, region_error)) => {
-                    format!("; its host-driven region loop cannot lower either: {region_error}")
-                }
+        // each of its regions lowers on its own.
+        let fallback = match host_loop::validate_cuda_host_loop(&node.op) {
+            Ok(()) => continue,
+            Err((_, region_error)) => {
+                format!("; its host-driven region loop cannot lower either: {region_error}")
             }
         };
         return Err((
@@ -1276,6 +1293,7 @@ impl<T: CudaReal> CudaExecutionPlan<T> {
                 cond_branches: &self.cond_branches,
                 host_loops: &self.host_loops,
                 region_captures: captures,
+                prebound_inputs: false,
                 constant_uploads: &self.constant_uploads,
             },
             values,
@@ -1350,6 +1368,7 @@ impl<T: CudaReal> CudaExecutionPlan<T> {
                     cond_branches: &self.cond_branches,
                     host_loops: &self.host_loops,
                     region_captures: &BTreeMap::new(),
+                    prebound_inputs: false,
                     constant_uploads: &self.constant_uploads,
                 },
                 values,
@@ -1776,6 +1795,9 @@ struct CudaProgramRuntime<'a, T: CudaReal> {
     /// When non-empty, this program is a `Cond` region: every input is bound to a parent-plan
     /// device buffer.
     region_captures: &'a BTreeMap<String, &'a CudaSlice<T>>,
+    /// The program is a host-driven loop region whose input buffers the loop has already
+    /// written into the value table (see `host_loop`); inputs are neither uploaded nor copied.
+    prebound_inputs: bool,
     /// Counts the array-constant uploads of the plan that owns `values`.
     constant_uploads: &'a AtomicUsize,
 }
@@ -1844,6 +1866,11 @@ fn take_cuda_buffer<T: CudaReal>(
 ) -> Result<CudaSlice<T>, String> {
     if let Some(buffer) = free_buffers.take(count) {
         return Ok(buffer);
+    }
+    if free_buffers.capturing {
+        return Err(format!(
+            "CUDA node {node_id} needs a new buffer while its loop region is recorded as a graph"
+        ));
     }
     stream
         .alloc_zeros::<T>(count)
@@ -1960,12 +1987,16 @@ fn execute_cuda_device_program<T: CudaReal>(
         cond_branches,
         host_loops,
         region_captures,
+        prebound_inputs,
         constant_uploads,
     } = runtime;
-    if region_captures.is_empty() {
-        validate_cuda_program_inputs(plan, inputs)?;
-    } else {
-        validate_cuda_region_captures(plan, region_captures)?;
+    // A host-driven loop validates every binding when it writes it (`host_loop`).
+    if !prebound_inputs {
+        if region_captures.is_empty() {
+            validate_cuda_program_inputs(plan, inputs)?;
+        } else {
+            validate_cuda_region_captures(plan, region_captures)?;
+        }
     }
     if values.len() != plan.nodes.len() {
         *values = std::iter::repeat_with(|| None)
@@ -2050,6 +2081,12 @@ fn execute_cuda_device_program<T: CudaReal>(
         }
         match &node.op {
             TensorOp::Input { name } => {
+                if prebound_inputs {
+                    if values.get(node_id).is_none_or(Option::is_none) {
+                        return Err(format!("CUDA loop region input {name:?} is not bound"));
+                    }
+                    continue;
+                }
                 if let Some(capture) = region_captures.get(name) {
                     // Region captures are copied on the device; the parent plan keeps ownership of
                     // the original buffer.
@@ -3563,8 +3600,11 @@ fn launch_cuda_node<T: CudaReal>(
         _ => None,
     };
     if matches!(op, TensorOp::Sum { .. } | TensorOp::Mean { .. }) {
+        // All-zero bits are +0.0 in both precisions. A device memset needs no host
+        // staging buffer, and a CUDA graph can record it (a copy from a temporary host
+        // value could not be replayed).
         stream
-            .memcpy_htod(&[T::from_f64(0.0)], output)
+            .memset_zeros(output)
             .map_err(|error| format!("failed to clear CUDA reduction output: {error:?}"))?;
     }
     let mut launch = stream.launch_builder(kernel);
@@ -9192,6 +9232,336 @@ mod loop_checkpoint_tests {
                         println!("{{\"scan\":{scan},\"directional\":{directional},\"steps\":{steps},\"full\":{full},\"tape_bytes\":{},\"median_ns\":{}}}",CUDA_LOOP_TEST_TAPE_BYTES.with(|value| value.get()),times[3]);
                         LOOP_CHECKPOINT_TEST_FULL_TAPE.with(|value| value.set(false));
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod host_loop_graph_tests {
+    use super::host_loop::{CUDA_LOOP_GRAPHS_DISABLED, CUDA_LOOP_GRAPH_LAUNCHES};
+    use super::*;
+    use crate::tensor_ir::{TensorComparison, TensorIr, TensorWhileExecutionPlan};
+
+    const LANES: usize = 6;
+
+    /// `roll(c) * scale + rate * sum(c)`, plus `reshape(c, [2, 3]) @ weight`
+    /// with `matmul` (a cuBLAS product): the roll and the reduction make a loop
+    /// body host-driven.
+    fn rotate(
+        body: &mut TensorIr,
+        carry: TensorNodeId,
+        matmul: bool,
+    ) -> Result<TensorNodeId, String> {
+        let scale = body.input("scale", vec![LANES])?;
+        let rate = body.input("rate", vec![])?;
+        let head = body.slice_axis(carry, 0, 0, 1)?;
+        let tail = body.slice_axis(carry, 0, 1, LANES)?;
+        let rolled = body.concat(vec![tail, head], 0)?;
+        let scaled = body.mul(rolled, scale)?;
+        let total = body.sum(carry)?;
+        let drift = body.mul(total, rate)?;
+        let next = body.add(scaled, drift)?;
+        if !matmul {
+            return Ok(next);
+        }
+        let weight = body.input("weight", vec![3, 3])?;
+        let matrix = body.reshape(carry, vec![2, 3])?;
+        let mixed = body.matmul(matrix, weight)?;
+        let mixed = body.reshape(mixed, vec![LANES])?;
+        body.add(next, mixed)
+    }
+
+    /// `tanh(rotate(c) + 0.001 * i)`.
+    fn rotate_step(body: &mut TensorIr, matmul: bool) -> Result<TensorNodeId, String> {
+        let carry = body.input("carry", vec![LANES])?;
+        let index = body.input("index", vec![])?;
+        let next = rotate(body, carry, matmul)?;
+        let step = body.scalar_constant(0.001);
+        let step = body.mul(index, step)?;
+        let next = body.add(next, step)?;
+        body.tanh(next)
+    }
+
+    fn square_sum(graph: &mut TensorIr, value: TensorNodeId) -> Result<TensorNodeId, String> {
+        let squared = graph.mul(value, value)?;
+        graph.sum(squared)
+    }
+
+    /// Loss of a Fori or Scan loop of `steps` iterations over the graph inputs
+    /// `initial`, `scale`, `rate` and, with `matmul`, `weight`.
+    fn loop_loss(
+        scan: bool,
+        matmul: bool,
+        steps: usize,
+    ) -> Result<(TensorIr, TensorNodeId), String> {
+        let mut body = TensorIr::new();
+        let next = rotate_step(&mut body, matmul)?;
+        let mut graph = TensorIr::new();
+        let initial = graph.input("initial", vec![LANES])?;
+        let scale = graph.input("scale", vec![LANES])?;
+        let rate = graph.input("rate", vec![])?;
+        let mut captures = vec![("scale".to_string(), scale), ("rate".to_string(), rate)];
+        if matmul {
+            captures.push(("weight".to_string(), graph.input("weight", vec![3, 3])?));
+        }
+        let loss = if scan {
+            // A two-lane step output, so carry and output lanes differ.
+            let head = body.slice_axis(next, 0, 0, 2)?;
+            let tail = body.slice_axis(next, 0, 1, 3)?;
+            let output = body.mul(head, tail)?;
+            let plan = TensorScanExecutionPlan::new(
+                2,
+                2 + steps,
+                body.compile_cpu_many(&[next, output])?.0,
+                "carry",
+                "index",
+            )?;
+            let (carry, outputs) = graph.scan(initial, plan, captures)?;
+            let carry = square_sum(&mut graph, carry)?;
+            let outputs = square_sum(&mut graph, outputs)?;
+            graph.add(carry, outputs)?
+        } else {
+            let plan = TensorForiExecutionPlan::new(
+                2,
+                2 + steps,
+                body.compile_cpu(next)?,
+                "carry",
+                "index",
+            )?;
+            let output = graph.fori(initial, plan, captures)?;
+            square_sum(&mut graph, output)?
+        };
+        Ok((graph, loss))
+    }
+
+    /// `[counter, carry...]` stepped by the rotation while `counter < limit`.
+    fn while_output() -> Result<(TensorIr, TensorNodeId), String> {
+        let mut predicate = TensorIr::new();
+        let carry = predicate.input("carry", vec![LANES + 1])?;
+        let limit = predicate.input("limit", vec![])?;
+        let counter = predicate.slice_axis(carry, 0, 0, 1)?;
+        let counter = predicate.reshape(counter, vec![])?;
+        let keep_going = predicate.compare(counter, limit, TensorComparison::Less)?;
+        let mut body = TensorIr::new();
+        let carry = body.input("carry", vec![LANES + 1])?;
+        let counter = body.slice_axis(carry, 0, 0, 1)?;
+        let one = body.scalar_constant(1.0);
+        let counter = body.add(counter, one)?;
+        let state = body.slice_axis(carry, 0, 1, LANES + 1)?;
+        let state = rotate(&mut body, state, false)?;
+        let state = body.tanh(state)?;
+        let next = body.concat(vec![counter, state], 0)?;
+        let plan = TensorWhileExecutionPlan::new(
+            predicate.compile_cpu(keep_going)?,
+            body.compile_cpu(next)?,
+            "carry",
+        )?;
+        let mut graph = TensorIr::new();
+        let initial = graph.input("counted", vec![LANES + 1])?;
+        let mut captures = Vec::new();
+        for (name, shape) in [("scale", vec![LANES]), ("rate", vec![]), ("limit", vec![])] {
+            captures.push((name.to_string(), graph.input(name, shape)?));
+        }
+        let output = graph.while_loop(initial, plan, captures)?;
+        Ok((graph, output))
+    }
+
+    fn tangents(matmul: bool) -> BTreeMap<String, String> {
+        ["initial", "scale", "rate", "weight"]
+            .into_iter()
+            .take(if matmul { 4 } else { 3 })
+            .map(|name| (name.to_string(), format!("{name}_tangent")))
+            .collect()
+    }
+
+    /// Programs of every host-driven loop kind, with and without a cuBLAS
+    /// product in the body: the loss (`Fori`/`Scan`), its forward derivative
+    /// (`ForiJvp`/a packed `Scan`), its gradient (`ForiVjp`/`ScanVjp`), the
+    /// Hessian-vector product (`ForiVjpJvp`/`ScanVjpJvp`), and a `While` loop
+    /// with its forward derivative.
+    fn programs(steps: usize) -> Result<Vec<(String, TensorExecutionPlan)>, String> {
+        let mut programs = Vec::new();
+        for (scan, matmul) in [(false, false), (true, false), (false, true), (true, true)] {
+            let kind = match (scan, matmul) {
+                (false, false) => "fori",
+                (true, false) => "scan",
+                (false, true) => "fori matmul",
+                (true, true) => "scan matmul",
+            };
+            let tangents = tangents(matmul);
+            let (graph, loss) = loop_loss(scan, matmul, steps)?;
+            programs.push((format!("{kind} value"), graph.compile_cpu(loss)?));
+            let forward = graph.symbolic_jvp_with_tangent_inputs(loss, &tangents)?;
+            programs.push((
+                format!("{kind} jvp"),
+                forward.graph.compile_cpu(forward.tangent)?,
+            ));
+            let vjp = graph.symbolic_vjp(loss, "seed")?;
+            let gradients = tangents
+                .keys()
+                .map(|name| vjp.gradients[name])
+                .collect::<Vec<_>>();
+            programs.push((
+                format!("{kind} vjp"),
+                vjp.graph.compile_cpu_many(&gradients)?.0,
+            ));
+            let hvp = vjp
+                .graph
+                .symbolic_jvp_many_with_tangent_inputs(&gradients, &tangents)?;
+            programs.push((
+                format!("{kind} hvp"),
+                hvp.graph.compile_cpu_many(&hvp.tangents)?.0,
+            ));
+        }
+        let (graph, output) = while_output()?;
+        programs.push(("while value".to_string(), graph.compile_cpu(output)?));
+        let forward = graph.symbolic_jvp_with_tangent_inputs(
+            output,
+            &BTreeMap::from([("scale".to_string(), "scale_tangent".to_string())]),
+        )?;
+        programs.push((
+            "while jvp".to_string(),
+            forward.graph.compile_cpu(forward.tangent)?,
+        ));
+        Ok(programs)
+    }
+
+    fn inputs(steps: usize) -> Result<BTreeMap<String, DynamicTensor>, String> {
+        let lanes = |values: Vec<f64>| DynamicTensor::new(vec![LANES], values);
+        let scalar = |value: f64| DynamicTensor::new(vec![], vec![value]);
+        let initial = (0..LANES)
+            .map(|i| (i as f64 - 2.5) * 0.3)
+            .collect::<Vec<_>>();
+        let mut counted = vec![0.0];
+        counted.extend(&initial);
+        Ok(BTreeMap::from([
+            ("initial".to_string(), lanes(initial)?),
+            (
+                "counted".to_string(),
+                DynamicTensor::new(vec![LANES + 1], counted)?,
+            ),
+            (
+                "scale".to_string(),
+                lanes((0..LANES).map(|i| 0.9 + i as f64 * 0.04).collect())?,
+            ),
+            ("rate".to_string(), scalar(-0.07)?),
+            ("limit".to_string(), scalar(steps as f64)?),
+            ("seed".to_string(), scalar(1.0)?),
+            (
+                "initial_tangent".to_string(),
+                lanes((0..LANES).map(|i| 0.5 - i as f64 * 0.2).collect())?,
+            ),
+            (
+                "scale_tangent".to_string(),
+                lanes((0..LANES).map(|i| (i % 3) as f64 - 1.0).collect())?,
+            ),
+            ("rate_tangent".to_string(), scalar(0.75)?),
+            (
+                "weight".to_string(),
+                DynamicTensor::new(
+                    vec![3, 3],
+                    (0..9).map(|i| ((i * 7) % 9) as f64 * 0.05 - 0.2).collect(),
+                )?,
+            ),
+            (
+                "weight_tangent".to_string(),
+                DynamicTensor::new(vec![3, 3], (0..9).map(|i| 0.1 * i as f64).collect())?,
+            ),
+        ]))
+    }
+
+    fn bits(outputs: &[DynamicTensor]) -> Vec<Vec<u64>> {
+        outputs
+            .iter()
+            .map(|output| output.data().iter().map(|value| value.to_bits()).collect())
+            .collect()
+    }
+
+    /// Runs `program` with graphs disabled and then enabled, each compiled
+    /// once and executed twice (the second execution reuses the regions'
+    /// value tables), and returns both results and the enabled run's graph
+    /// launches.
+    fn run_both<P>(
+        program: &TensorExecutionPlan,
+        compile: impl Fn(TensorExecutionPlan) -> Result<P, String>,
+        execute: impl Fn(&P) -> Result<Vec<DynamicTensor>, String>,
+    ) -> Result<(Vec<DynamicTensor>, Vec<DynamicTensor>, usize), String> {
+        let mut results = Vec::new();
+        for disabled in [true, false] {
+            CUDA_LOOP_GRAPHS_DISABLED.with(|value| value.set(disabled));
+            CUDA_LOOP_GRAPH_LAUNCHES.with(|value| value.set(0));
+            let result = compile(program.clone()).and_then(|plan| {
+                execute(&plan)?;
+                execute(&plan)
+            });
+            CUDA_LOOP_GRAPHS_DISABLED.with(|value| value.set(false));
+            results.push(result?);
+        }
+        let launches = CUDA_LOOP_GRAPH_LAUNCHES.with(|value| value.get());
+        let enabled = results.pop().expect("two runs");
+        let eager = results.pop().expect("two runs");
+        Ok((eager, enabled, launches))
+    }
+
+    fn assert_close(name: &str, actual: &[DynamicTensor], expected: &[DynamicTensor], tol: f64) {
+        assert_eq!(actual.len(), expected.len(), "{name}");
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.shape(), expected.shape(), "{name}");
+            for (a, e) in actual.data().iter().zip(expected.data().iter()) {
+                assert!(
+                    (a - e).abs() <= tol * e.abs().max(1.0),
+                    "{name}: {a} vs {e} (tolerance {tol})"
+                );
+            }
+        }
+    }
+
+    /// Graph replays launch the eager per-node sequence unchanged, so every
+    /// host-driven loop kind gives bit-identical results with and without
+    /// them, in both precisions; both also match the CPU reference.
+    #[test]
+    fn host_loop_graph_replays_match_eager_runs_bit_for_bit() -> Result<(), String> {
+        if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+            return Ok(());
+        }
+        // One step never records; three record at the last step; 17 and 64
+        // replay, 64 through checkpoint blocks in the reverse passes.
+        for steps in [1, 2, 3, 17, 64] {
+            let inputs = inputs(steps)?;
+            for (name, program) in programs(steps)? {
+                let cpu = program
+                    .output_node_ids()
+                    .iter()
+                    .map(|output| program.as_ir().compile_cpu(*output)?.evaluate(&inputs))
+                    .collect::<Result<Vec<_>, String>>()?;
+                let backend = CudaBackend::new(0);
+                let (eager, graph, launches) = run_both(
+                    &program,
+                    |plan| backend.compile(plan),
+                    |plan| plan.execute_many(&inputs),
+                )?;
+                assert_eq!(bits(&eager), bits(&graph), "{name} float32 steps={steps}");
+                assert_close(&format!("{name} float32 steps={steps}"), &graph, &cpu, 1e-4);
+                let (eager, graph, launches64) = run_both(
+                    &program,
+                    |plan| backend.compile_float64(plan),
+                    |plan| plan.execute_many(&inputs),
+                )?;
+                assert_eq!(bits(&eager), bits(&graph), "{name} float64 steps={steps}");
+                assert_close(
+                    &format!("{name} float64 steps={steps}"),
+                    &graph,
+                    &cpu,
+                    1e-11,
+                );
+                if steps >= 17 {
+                    assert!(launches > 0 && launches64 > 0, "{name} replayed no graph");
+                } else if steps == 1 {
+                    // At most two runs per region (a `While` predicate runs twice).
+                    assert_eq!((launches, launches64), (0, 0), "{name} steps={steps}");
                 }
             }
         }

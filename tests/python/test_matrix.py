@@ -1037,7 +1037,7 @@ def test_cuda_value_and_grad_reexecutes_grouped_scan_vjp_plan():
                 )
 
 
-def test_compiler_facade_cuda_rejects_indexed_unequal_lane_scan_hvp():
+def test_compiler_facade_cuda_runs_indexed_unequal_lane_scan_hvp_host_driven():
     if os.environ.get("QUABLA_CUDA_TEST") is None:
         return
 
@@ -1057,13 +1057,17 @@ def test_compiler_facade_cuda_rejects_indexed_unequal_lane_scan_hvp():
     program = quabla.Compiler().trace(
         scan_loss, [("initial", [2, 1]), ("scale", [2, 1])]
     )
+    # The fused kernel needs the output to broadcast the carry directly; this
+    # one adds the index after the broadcast, so the HVP runs host-driven.
     hvp = program.vjp("loss_cotangent")["scale"].jvp("scale")
-    try:
-        hvp.compile("cuda")
-    except ValueError as error:
-        assert "requires a direct broadcast from the carry shape" in str(error)
-    else:
-        raise AssertionError("CUDA Scan HVP accepted an indexed unequal-lane output")
+    inputs = {
+        "initial": quabla.Tensor([2, 1], [0.4, -0.6]),
+        "scale": quabla.Tensor([2, 1], [0.8, 1.1]),
+        "loss_cotangent": quabla.Tensor([], [1.0]),
+    }
+    cpu = hvp.compile("cpu")(inputs)
+    cuda = hvp.compile("cuda")(inputs)
+    assert_close_rows([cuda.to_flat_list()], [cpu.to_flat_list()], tol=3e-5)
 
 
 def test_compiler_facade_cuda_executes_packed_pair_scan_bodies():
@@ -1164,10 +1168,9 @@ def test_compiler_facade_cuda_runs_non_fused_scan_forms_as_host_driven_loops():
             current * capture + index,
             current * capture + index,
         )
-    # The fused per-lane Scan kernel lowers none of these forms. Primal Scan
-    # and first-order ScanVjp then run as host-driven region loops and must
-    # match the CPU; forward-over-reverse ScanVjpJvp has no such fallback and
-    # keeps its explicit rejection.
+    # The fused per-lane Scan kernel lowers none of these forms. Primal Scan,
+    # first-order ScanVjp and forward-over-reverse ScanVjpJvp then run as
+    # host-driven region loops and must match the CPU.
     cases = [
         # Primal Scan: lane shapes and capture shapes.
         (
@@ -1268,15 +1271,7 @@ def test_compiler_facade_cuda_runs_non_fused_scan_forms_as_host_driven_loops():
         count = math.prod(shape)
         return quabla.Tensor(shape, [0.3 + offset + 0.1 * k for k in range(count)])
 
-    for label, (program, carry_shape, capture_shape), expected in cases:
-        if label.startswith("HVP"):
-            try:
-                program.compile("cuda")
-            except ValueError as error:
-                assert expected in str(error), f"{label}: {error}"
-            else:
-                raise AssertionError(f"CUDA accepted unsupported Scan form: {label}")
-            continue
+    for label, (program, carry_shape, capture_shape), _ in cases:
         inputs = {
             "initial": tensor(carry_shape, 0.0),
             "capture": tensor(capture_shape, 0.5),

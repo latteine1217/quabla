@@ -15,7 +15,7 @@ traced integer indexing (`sort`, `argmax`, `x[idx]`, `.at[]`) are not in it.
 | 4 | Iterative and implicit solvers: matrix-free `linalg.cg` and `linalg.gmres`, Newton root finding, each with an implicit-function-theorem gradient instead of differentiating the iterations | Planned |
 | 5 | MLX factorizations: `solve`, `det`/`slogdet`, `inv`, `eigh`, `qr`, `svd`, `lstsq` through MLX's CPU stream instead of an error | Planned |
 | 6 | Device `Trainer` parity: AdamW and global-norm clipping on CUDA and MLX, `float64` on CUDA | Planned |
-| 7 | CUDA loops: lower the per-iteration cost of host-driven loops (about 80 us in v0.3) and an HVP fallback for Scan bodies that are not elementwise | Planned |
+| 7 | CUDA loops: lower the per-iteration cost of host-driven loops (about 80 us in v0.3) and an HVP fallback for Scan bodies that are not elementwise | Done: one CUDA graph launch per iteration (about fourfold faster, bit-identical); host-driven `ScanVjpJvp` |
 
 Not yet done from v0.3: the first PyPI upload, waiting on TestPyPI
 registration.

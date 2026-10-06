@@ -17,9 +17,27 @@ deprecated names keep working until 1.0 (see
   and MLX backends). Both provide the `quabla` package; install one per
   environment. Wheels cover CPython 3.10 to 3.14. Version tags publish to
   TestPyPI and then PyPI through trusted publishing.
+- `examples/benchmark_host_loop_cuda.py` measures the per-iteration cost of
+  host-driven CUDA loops and compares two builds bit for bit.
+
+### Changed
+
+- Host-driven CUDA loops (bodies that are not elementwise) run each
+  iteration as one CUDA graph launch: after two eager iterations a region
+  whose program only launches NVRTC kernels, device copies and cuBLAS
+  products is recorded once, and later iterations retarget its input and
+  output copies. Loop-invariant captures are bound once per loop instead of
+  every iteration, and the loop index is bound without an intermediate copy.
+  On a GTX 1660 SUPER a small `fori_loop` or `scan` iteration drops from
+  about 120-180 µs to about 30-50 µs, a `while_loop` iteration from about
+  220 µs to about 100 µs, and reverse-pass iterations about fourfold; results
+  are bit-identical to the previous implementation.
 
 ### Fixed
 
+- Hessian-vector products (forward over reverse) through a `scan` whose body
+  is not elementwise, or whose step output has a different lane count than
+  its carry, run on CUDA as host-driven loops instead of being rejected.
 - A CUDA request on a host without the NVIDIA driver library, or a
   data-parallel request without NCCL, raises an error naming the missing
   library instead of a Rust panic.
