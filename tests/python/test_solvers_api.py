@@ -344,7 +344,6 @@ def test_linear_solver_unsupported_transforms_raise():
         (b,),
         match="forward-mode differentiation",
     )
-    raises(Exception, qb.vmap(lambda b: qb.linalg.cg(matvec, b, args=(a,))), qb.stack([b, b]), match="while_loop")
     # A third reverse pass reaches the plain iteration.
     raises(
         ValueError,
@@ -483,6 +482,234 @@ def test_root_reports_non_convergence():
     )
 
 
+# -- vmap -------------------------------------------------------------------------
+
+
+def per_example(function, args, in_axes):
+    """The meaning of `vmap`: unbatched calls on each example, stacked."""
+    batch = next(arg.shape[0] for arg, axis in zip(args, in_axes) if axis is not None)
+    results = [
+        function(*[arg if axis is None else arg[index] for arg, axis in zip(args, in_axes)])
+        for index in range(batch)
+    ]
+    return qb.tree.map(lambda *leaves: qb.stack(list(leaves), 0), *results)
+
+
+def assert_tree_close(actual, expected, tolerance):
+    actual, expected = qb.tree.leaves(actual), qb.tree.leaves(expected)
+    assert len(actual) == len(expected)
+    for got, want in zip(actual, expected):
+        assert got.dtype == want.dtype and list(got.shape) == list(want.shape)
+        assert_close(got, want, tolerance)
+
+
+def linear_batch(dtype):
+    """Four systems whose solves take very different iteration counts: a
+    scaled identity (one iteration), two well-conditioned SPD matrices, and
+    a zero right-hand side, which needs no iteration and whose masked body
+    computes 0 / 0 while the others iterate; the last matrix is graded over
+    three decades, the slowest."""
+    n = 10
+    graded = qb.diag(qb.array([10.0 ** (k / 3.0) for k in range(n)])) + 0.1 * spd(n, 2.0)
+    matrices = qb.stack([3.0 * qb.eye(n), spd(n, 1.0), spd(n, 4.0), graded])
+    rhs = qb.stack([vector(n, 0.3), vector(n, 1.3), qb.zeros([n]), vector(n, 2.3)])
+    return matrices.astype(dtype), rhs.astype(dtype)
+
+
+# GMRES with a short restart, so that its iteration counts spread as widely
+# as CG's (one to over a hundred Arnoldi steps here).
+LINEAR_SOLVERS = ((qb.linalg.cg, {}), (qb.linalg.gmres, {"restart": 5}))
+
+
+def test_vmap_of_linear_solvers_matches_per_example_solves():
+    for dtype, tol, tolerance in ((qb.float64, 1e-10, 1e-12), (qb.float32, 1e-5, 1e-5)):
+        matrices, rhs = linear_batch(dtype)
+        for solver, options in LINEAR_SOLVERS:
+
+            def solve(b, a, solver=solver, options=options):
+                return solver(matvec, b, args=(a,), tol=tol, info=True, **options)
+
+            for in_axes, args in (
+                ((0, 0), (rhs, matrices)),
+                ((0, None), (rhs, matrices[3])),
+                ((None, 0), (rhs[3], matrices)),
+            ):
+                expected = per_example(solve, args, in_axes)
+                for transform in (lambda f: f, qb.jit):
+                    x, info = transform(qb.vmap(solve, in_axes=in_axes))(*args)
+                    assert_tree_close(x, expected[0], tolerance)
+                    # Each example stops at its own tolerance and reports its
+                    # own iterations, residual, and success.
+                    assert info["iterations"].tolist() == expected[1]["iterations"].tolist()
+                    assert info["success"].tolist() == expected[1]["success"].tolist()
+                    assert_close(info["residual_norm"], expected[1]["residual_norm"], tolerance)
+            x, info = qb.vmap(solve)(rhs, matrices)
+            iterations = info["iterations"].tolist()
+            assert iterations[0] == 1.0 and iterations[2] == 0.0, iterations
+            assert len(set(iterations)) == 4 and all(info["success"].tolist()), iterations
+            assert x[2].tolist() == [0.0] * 10
+            # The solutions solve their own systems.
+            dense = qb.stack([qb.linalg.solve(matrices[i], rhs[i]) for i in range(4)], 0)
+            assert_close(x, dense, 100 * tol)
+
+
+def test_vmap_and_grad_of_linear_solvers_compose():
+    target = vector(10, 4.0)
+    for dtype, tolerance in ((qb.float64, 1e-9), (qb.float32, 1e-4)):
+        matrices, rhs = linear_batch(dtype)
+        goal = target.astype(dtype)
+        for solver, options in LINEAR_SOLVERS:
+
+            def loss(b, a, solver=solver, options=options):
+                tol = 1e-12 if dtype == qb.float64 else 1e-6
+                x = solver(matvec, b, args=(a,), tol=tol, **options)
+                return ((x - goal) * (x - goal)).sum()
+
+            gradient = qb.grad(loss, argnums=(0, 1))
+            expected = per_example(gradient, (rhs, matrices), (0, 0))
+            # vmap of grad, and grad of a vmapped solve: per-example gradients.
+            assert_tree_close(qb.vmap(gradient)(rhs, matrices), expected, tolerance)
+            assert_tree_close(qb.jit(qb.vmap(gradient))(rhs, matrices), expected, tolerance)
+            batched_total = qb.grad(lambda b, a: qb.vmap(loss)(b, a).sum(), argnums=(0, 1))
+            assert_tree_close(batched_total(rhs, matrices), expected, tolerance)
+            # A matrix shared by the batch receives the sum of the examples'
+            # gradients.
+            shared = qb.grad(
+                lambda b, a: qb.vmap(loss, in_axes=(0, None))(b, a).sum(), argnums=1
+            )(rhs, matrices[1])
+            summed = per_example(lambda b: qb.grad(loss, argnums=1)(b, matrices[1]), (rhs,), (0,))
+            assert_close(shared, summed.sum(axis=0), tolerance)
+            # Against the dense solve's gradients.
+            dense = per_example(
+                qb.grad(
+                    lambda b, a: ((qb.linalg.solve(a, b) - goal) ** 2).sum(), argnums=(0, 1)
+                ),
+                (rhs, matrices),
+                (0, 0),
+            )
+            assert_tree_close(qb.vmap(gradient)(rhs, matrices), dense, 10 * tolerance)
+
+
+def test_reverse_jacobian_and_hessian_of_linear_solvers_match_the_dense_solve():
+    # Both batch the adjoint solve over the output cotangents, a vmapped
+    # while_loop inside the solver's backward pass.
+    b = vector(6, 1.0)
+    for solver, a in ((qb.linalg.cg, spd(6, 2.0)), (qb.linalg.gmres, nonsymmetric(6, 3.0))):
+
+        def solution(b, a, solver=solver):
+            return solver(matvec, b, args=(a,), tol=1e-13)
+
+        def loss(b, a, solver=solver):
+            return (solution(b, a) ** 2).sum()
+
+        for argnums in (0, 1):
+            dense = qb.jacobian(lambda b, a: qb.linalg.solve(a, b), argnums=argnums)(b, a)
+            assert_close(qb.jacobian(solution, argnums=argnums)(b, a), dense, 1e-10)
+        dense = qb.hessian(lambda b, a: (qb.linalg.solve(a, b) ** 2).sum())(b, a)
+        assert_close(qb.hessian(loss)(b, a), dense, 1e-10)
+        assert_close(qb.jit(qb.hessian(loss))(b, a), dense, 1e-10)
+
+
+def test_vmap_of_newton_matches_per_example_roots():
+    for dtype, tolerance in ((qb.float64, 1e-13), (qb.float32, 1e-6)):
+        # p = -1 has no real root: that example stalls and reports failure
+        # while the others converge in their own iteration counts.
+        p = qb.array([2.0, 0.5, 400.0, -1.0], dtype=dtype)
+        q = qb.array([0.5, 1.0, -3.0, 0.2], dtype=dtype)
+        starts = qb.array([[1.0, 1.0], [-1.0, -2.0], [5.0, 5.0], [0.3, 0.7]], dtype=dtype)
+
+        def root(x0, p, q):
+            return newton(circle_and_line, x0, args=(p, q), info=True)
+
+        for in_axes, args in (
+            ((None, 0, 0), (starts[0], p, q)),
+            ((0, None, None), (starts, p[0], q[0])),
+            ((0, 0, 0), (starts, p, q)),
+        ):
+            expected = per_example(root, args, in_axes)
+            for transform in (lambda f: f, qb.jit):
+                x, info = transform(qb.vmap(root, in_axes=in_axes))(*args)
+                assert_tree_close(x, expected[0], tolerance)
+                assert info["iterations"].tolist() == expected[1]["iterations"].tolist()
+                assert info["success"].tolist() == expected[1]["success"].tolist()
+                assert_close(info["residual_norm"], expected[1]["residual_norm"], tolerance)
+        _, info = qb.vmap(root)(starts, p, q)
+        assert info["success"].tolist() == [True, True, True, False]
+        assert len(set(info["iterations"].tolist()[:3])) > 1, info["iterations"].tolist()
+
+
+def test_vmap_and_grad_of_newton_compose():
+    # sum(x) = (1 + q) sqrt(p / (1 + q^2)) at the root with y > 0.
+    x0 = qb.array([1.0, 1.0])
+
+    def total(p, q):
+        return newton(circle_and_line, x0, args=(p, q)).sum()
+
+    def closed_form(p, q):
+        return (1.0 + q) * (p / (1.0 + q * q)).sqrt()
+
+    p, q = qb.array([2.0, 0.5, 400.0]), qb.array([0.5, 1.0, 3.0])
+    gradient = qb.grad(total, argnums=(0, 1))
+    expected = per_example(qb.grad(closed_form, argnums=(0, 1)), (p, q), (0, 0))
+    assert_tree_close(qb.vmap(gradient)(p, q), expected, 1e-11)
+    assert_tree_close(qb.jit(qb.vmap(gradient))(p, q), expected, 1e-11)
+    assert_tree_close(
+        qb.grad(lambda p, q: qb.vmap(total)(p, q).sum(), argnums=(0, 1))(p, q), expected, 1e-11
+    )
+    # Second order composes too: the vmapped Hessian in (p, q).
+    def stacked(pq, function):
+        return function(pq[0], pq[1])
+
+    points = qb.stack([p, q], 1)
+    assert_tree_close(
+        qb.vmap(qb.hessian(lambda pq: stacked(pq, total)))(points),
+        per_example(qb.hessian(lambda pq: stacked(pq, closed_form)), (points,), (0,)),
+        1e-9,
+    )
+
+
+def test_solvers_compose_with_odeint_and_loops_under_vmap():
+    # A root whose parameter comes from an ODE solve (a fori_loop region):
+    # p(k) = y(1) for y' = -k y, y(0) = 2. The gradient in k goes through the
+    # solver's implicit rule and the loop's reverse rule, and matches the
+    # closed-form root at the same integrated p. (A second reverse pass would
+    # need the reverse mode of the loop's own reverse pass, which no loop
+    # has; the Hessian of a solve alone composes, see above.)
+    x0 = qb.array([1.0, 1.0])
+
+    def decayed(k):
+        return qb.ode.odeint(
+            lambda y, t, k: -k * y, qb.array([2.0]), (0.0, 1.0), steps=16, args=(k,)
+        )[0]
+
+    def total(k):
+        return newton(circle_and_line, x0, args=(decayed(k), qb.array(0.5))).sum()
+
+    def closed_form(k):
+        return 1.5 * (decayed(k) / 1.25).sqrt()
+
+    rates = qb.array([0.2, 0.7, 1.5])
+    expected = per_example(qb.grad(closed_form), (rates,), (0,))
+    assert_tree_close(qb.vmap(qb.grad(total))(rates), expected, 1e-12)
+    assert_tree_close(qb.jit(qb.vmap(qb.grad(total)))(rates), expected, 1e-12)
+    # The Hessian of the integrated parameter itself is forward over reverse
+    # through the loop, also under vmap.
+    assert_tree_close(
+        qb.vmap(qb.hessian(decayed))(rates), per_example(qb.hessian(decayed), (rates,), (0,)), 1e-12
+    )
+
+    # A forward-mode Jacobian through an ODE solve followed by a while loop,
+    # under vmap: halve the state until its sum is below one.
+    def halved(y0):
+        y = qb.ode.odeint(lambda y, t: -0.5 * y, y0, (0.0, 1.0), steps=8)
+        return qb.while_loop(lambda c: c.sum() > 1.0, lambda c: c * 0.5, y)
+
+    starts = qb.array([[3.0, 4.0], [0.5, 0.25], [40.0, 1.0]])
+    assert_tree_close(
+        qb.vmap(qb.jacobian(halved))(starts), per_example(qb.jacobian(halved), (starts,), (0,)), 1e-12
+    )
+
+
 # -- devices ----------------------------------------------------------------------
 
 
@@ -515,6 +742,85 @@ def test_optional_device_solvers_match_cpu():
             actual = qb.tree.leaves(qb.jit(function, device=device)(*arguments))
             for got, want in zip(actual, expected):
                 assert_close(got, want, 1e-4)
+
+
+def test_optional_device_vmap_of_solvers_matches_cpu():
+    devices = [
+        (device, precision)
+        for device, gate, precisions in (
+            ("mlx", "QUABLA_MLX_TEST", (None,)),
+            ("cuda", "QUABLA_CUDA_TEST", (None, "float64")),
+        )
+        if os.environ.get(gate) == "1"
+        for precision in precisions
+    ]
+    for device, precision in devices:
+        dtype = qb.float64 if precision == "float64" else qb.float32
+        tolerance = 1e-10 if precision == "float64" else 1e-4
+        tol = 1e-10 if precision == "float64" else 1e-5
+        # Without the graded system: its condition number (about 1e3) turns
+        # float32 rounding differences into solution differences near the
+        # tolerance, which says nothing about the device.
+        matrices, rhs = (value[:3] for value in linear_batch(dtype))
+        p = qb.array([2.0, 0.5, 400.0, -1.0], dtype=dtype)
+        q = qb.array([0.5, 1.0, -3.0, 0.2], dtype=dtype)
+        starts = qb.array([[1.0, 1.0], [-1.0, -2.0], [5.0, 5.0], [0.3, 0.7]], dtype=dtype)
+        x0 = qb.array([1.0, 1.0], dtype=dtype)
+
+        def reported(result):
+            # The iteration count may differ by one where a device's rounding
+            # moves a residual across the threshold, so it is checked apart.
+            x, info = result
+            return (x, info["residual_norm"], info["success"]), info["iterations"]
+
+        operations = {}
+        for solver, options in LINEAR_SOLVERS:
+
+            def solve(b, a, solver=solver, options=options):
+                return reported(solver(matvec, b, args=(a,), tol=tol, info=True, **options))
+
+            def loss(b, a, solver=solver, options=options):
+                return (solver(matvec, b, args=(a,), tol=tol, **options) ** 2).sum()
+
+            name = solver.__name__
+            operations[name] = (qb.vmap(solve), (rhs, matrices))
+            operations[f"{name} shared matrix"] = (
+                qb.vmap(solve, in_axes=(0, None)),
+                (rhs, matrices[1]),
+            )
+            operations[f"{name} vmap grad"] = (
+                qb.vmap(qb.grad(loss, argnums=(0, 1))),
+                (rhs, matrices),
+            )
+        operations["newton"] = (
+            qb.vmap(
+                lambda x0, p, q: reported(newton(circle_and_line, x0, args=(p, q), info=True))
+            ),
+            # Without p = -1: where a solve without a root stalls depends on
+            # rounding.
+            (starts[:3], p[:3], q[:3]),
+        )
+        operations["newton grad"] = (
+            qb.grad(
+                lambda p, q: qb.vmap(
+                    lambda p, q: newton(circle_and_line, x0, args=(p, q)).sum()
+                )(p, q).sum(),
+                argnums=(0, 1),
+            ),
+            (p[:3], q[:3]),
+        )
+        for name, (operation, arguments) in operations.items():
+            expected = qb.jit(operation)(*arguments)
+            options = {"device": device}
+            if precision is not None:
+                options["precision"] = precision
+            actual = qb.jit(operation, **options)(*arguments)
+            if "grad" not in name:
+                assert_close(actual[1], expected[1], 1.0)
+                actual, expected = actual[0], expected[0]
+            for got, want in zip(qb.tree.leaves(actual), qb.tree.leaves(expected)):
+                assert got.dtype == want.dtype, (name, got.dtype, want.dtype)
+                assert_close(got, want, tolerance)
 
 
 if __name__ == "__main__":

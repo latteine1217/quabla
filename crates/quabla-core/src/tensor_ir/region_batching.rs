@@ -44,7 +44,8 @@
 //! axis, so the batched body's `[B, *y]` steps stack to `[T, B, *y]`; the
 //! rule moves the batch axis to the front (`[B, T, *y]`) and moves it back
 //! (`[T, B, *y]`) on a stacked output cotangent before a batched reverse scan
-//! consumes it. Loop trip counts are static, so no example needs masking.
+//! consumes it. `Fori` and `Scan` trip counts are static, so no example
+//! needs masking.
 //!
 //! `Cond` has no carry and no derivative node kinds of its own (its JVP and
 //! VJP are again `Cond` nodes over derived branch regions), so one rule,
@@ -54,9 +55,14 @@
 //! mapped predicate it evaluates both branches batched and selects per
 //! example with `where`, as JAX does.
 //!
-//! `While` is not batched yet. Its rule closes its carry with
-//! [`batch_loop_body`] and batches the predicate region over the resulting
-//! mapped inputs.
+//! `While` closes its carry with [`batch_loop_body`] and batches the
+//! predicate region over the resulting mapped inputs. An unmapped predicate
+//! keeps one trip count for the batch; a mapped one is reduced with `any`,
+//! and the body freezes every example whose own predicate is false with a
+//! per-example select, as JAX does ([`batch_while_plan`]). `While` is
+//! forward-mode only, and its JVP is another `While` over a packed
+//! `(primal, tangent)` carry, so this one rule batches every while-derived
+//! node.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -65,7 +71,7 @@ use super::{
     TensorForiExecutionPlan, TensorForiVjpJvpBindings, TensorForiVjpJvpExecutionPlan,
     TensorForiVjpTarget, TensorIr, TensorNode, TensorNodeId, TensorOp, TensorScanExecutionPlan,
     TensorScanTarget, TensorScanVjpBindings, TensorScanVjpJvpBindings,
-    TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget,
+    TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget, TensorWhileExecutionPlan,
 };
 
 /// Which result of a batched loop group a member node selects.
@@ -192,6 +198,112 @@ fn body_inputs_except(body: &TensorExecutionPlan, index_name: &str) -> BTreeSet<
         .filter(|name| name.as_str() != index_name)
         .cloned()
         .collect()
+}
+
+/// A `while_loop` batched with the inputs in `mapped_inputs` mapped, with
+/// its batched body, whose mapped inputs are the loop's (carry included).
+///
+/// The body is closed under the carry fixed point by [`batch_loop_body`] and
+/// the predicate is batched over the resulting mapped inputs. An unmapped
+/// predicate reads only unmapped values, so every example has the same trip
+/// count and the loop is the batched body under the unchanged predicate. A
+/// mapped predicate gives each example its own trip count; as `jax.vmap` of
+/// `lax.while_loop` does, the batched loop then runs while any example's
+/// predicate holds and selects `where(pred, body(carry), carry)` per example
+/// ([`masked_while_plan`]). That select makes the next carry depend on the
+/// predicate, so a mapped predicate maps the carry: the second fixed point,
+/// after which the predicate stays mapped (mapping more inputs never unmaps
+/// a value), so this needs at most one more pass.
+fn batch_while_plan(
+    loop_plan: &TensorWhileExecutionPlan,
+    mut mapped_inputs: BTreeSet<String>,
+    batch_size: usize,
+) -> Result<(TensorWhileExecutionPlan, BatchedBody), BatchingError> {
+    let carry_name = loop_plan.carry_name();
+    loop {
+        let body = batch_loop_body(
+            loop_plan.body_plan(),
+            carry_name,
+            mapped_inputs,
+            batch_size,
+            false,
+        )?;
+        let (predicate, predicate_mapped) = batch_region_plan(
+            loop_plan.predicate_plan(),
+            &body.mapped_inputs,
+            batch_size,
+            &[false],
+        )?;
+        if predicate_mapped[0] && !body.maps(carry_name) {
+            mapped_inputs = body.mapped_inputs;
+            mapped_inputs.insert(carry_name.to_string());
+            continue;
+        }
+        let plan = if predicate_mapped[0] {
+            masked_while_plan(&predicate, &body.plan, carry_name, batch_size)?
+        } else {
+            TensorWhileExecutionPlan::new(predicate, body.plan.clone(), carry_name)?
+        };
+        return Ok((plan, body));
+    }
+}
+
+/// The loop of a batched while with a mapped predicate (`predicate` returns
+/// `[B]` bools, `body` the mapped next carry `[B, *carry]`): the new
+/// predicate is `any(predicate)`, and the new body recomputes the per-example
+/// predicate and selects `where(predicate, body(carry), carry)`. An example
+/// whose predicate is false keeps its carry bit for bit while the others
+/// iterate, so its result is the one an unbatched loop stops at; whatever
+/// the body computes for it meanwhile (NaN or inf from a converged state,
+/// such as `0 / 0`) is discarded by the select and never reaches the carry
+/// or, through the select's tangent rule, a forward-mode tangent. Recomputing
+/// the predicate in the body costs one more predicate evaluation per
+/// iteration, as in JAX; the predicate stays a scalar region, so every
+/// backend still reads back one flag per iteration.
+fn masked_while_plan(
+    predicate: &TensorExecutionPlan,
+    body: &TensorExecutionPlan,
+    carry_name: &str,
+    batch_size: usize,
+) -> Result<TensorWhileExecutionPlan, BatchingError> {
+    let mut graph = TensorIr::new();
+    let mut inputs = BTreeMap::new();
+    for region in [predicate, body] {
+        for (name, &id) in region.input_nodes.iter() {
+            if !inputs.contains_key(name) {
+                let node = &region.nodes[id];
+                let input = graph.input_typed(name.clone(), node.shape.clone(), node.dtype)?;
+                inputs.insert(name.clone(), input);
+            }
+        }
+    }
+    let splice = |graph: &mut TensorIr, region: &TensorExecutionPlan| {
+        let bindings = region
+            .input_nodes
+            .keys()
+            .map(|name| (name.clone(), inputs[name]))
+            .collect::<BTreeMap<_, _>>();
+        graph
+            .inline(&region.as_ir(), &bindings, &[region.output_node_id])
+            .map(|spliced| spliced[0])
+    };
+    let running = splice(&mut graph, predicate)?;
+    let next = splice(&mut graph, body)?;
+    let carry = *inputs.get(carry_name).ok_or_else(|| {
+        BatchingError::Invalid(format!("batched while body lost its carry {carry_name:?}"))
+    })?;
+    // `[B]` -> `[B, 1, ...]`: broadcasting aligns trailing axes, so the batch
+    // axis of the mask must be made to lead explicitly.
+    let mut mask_shape = vec![1; graph.node(carry)?.shape.len()];
+    mask_shape[0] = batch_size;
+    let mask = graph.reshape(running, mask_shape)?;
+    let selected = graph.where_select(mask, next, carry)?;
+    let any_running = graph.any(running)?;
+    Ok(TensorWhileExecutionPlan::new(
+        graph.compile_cpu(any_running)?,
+        graph.compile_cpu(selected)?,
+        carry_name,
+    )?)
 }
 
 impl TensorForiExecutionPlan {
@@ -559,6 +671,21 @@ impl TensorIr {
                     Ok(members)
                 },
             ),
+            TensorOp::While {
+                carry,
+                loop_plan,
+                captures,
+            } => {
+                let mut inputs = mapped_names(captures);
+                if mapped[*carry] {
+                    inputs.insert(loop_plan.carry_name().to_string());
+                }
+                let (plan, body) = batch_while_plan(loop_plan, inputs, batch_size)?;
+                let carry_mapped = body.maps(loop_plan.carry_name());
+                let carry = self.bind_batched(operand(*carry)?, carry_mapped, batch_size)?;
+                let captures = self.bind_batched_captures(captures, &body, &operand, batch_size)?;
+                Ok((self.while_loop(carry, plan, captures)?, carry_mapped))
+            }
             _ => Err(BatchingError::Invalid(format!(
                 "{} is not a loop region node",
                 super::tensor_op_name(&node.op)

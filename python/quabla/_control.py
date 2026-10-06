@@ -139,6 +139,15 @@ def _same_carry(initial, result):
     return result
 
 
+def _traced_like(carry, result):
+    """`result` bound to the trace of `carry`: a body that returns a constant
+    (it ignores its carry and operands) binds to the region through its
+    carry, as a constant `while_loop` predicate does."""
+    if isinstance(carry, TraceTensor) and not isinstance(result, TraceTensor):
+        return _bindings((carry, result))[1]
+    return result
+
+
 def fori_loop(lower, upper, body_fun, init_val, *, operands=(), unroll=False):
     """Apply `body_fun(i, carry, *operands)` over static [lower, upper).
 
@@ -151,7 +160,7 @@ def fori_loop(lower, upper, body_fun, init_val, *, operands=(), unroll=False):
     initial, *captures = _bindings((_carry(init_val), *operands))
 
     def body(index, carry, *values):
-        return _same_carry(initial, body_fun(index, carry, *values))
+        return _traced_like(carry, _same_carry(initial, body_fun(index, carry, *values)))
 
     if isinstance(initial, TraceTensor):
         if unroll:
@@ -180,13 +189,16 @@ def while_loop(cond_fun, body_fun, init_val, *, operands=()):
     derivatives (`jvp`, `jacfwd`) pass through the loop; reverse mode is
     rejected because the trip count is data dependent, as in JAX: use a
     bounded `fori_loop` whose body masks finished iterations with `where`.
+    `vmap` batches the loop as JAX does: with a per-example predicate it
+    runs while any example continues and keeps each finished example's
+    carry unchanged.
     """
     if not callable(cond_fun) or not callable(body_fun):
         raise TypeError("while_loop requires callable cond_fun and body_fun")
     initial, *captures = _bindings((_carry(init_val), *operands))
 
     def body(carry, *values):
-        return _same_carry(initial, body_fun(carry, *values))
+        return _traced_like(carry, _same_carry(initial, body_fun(carry, *values)))
 
     if isinstance(initial, TraceTensor):
 
@@ -230,7 +242,10 @@ def scan(f, init, *, length, operands=(), unroll=False):
         result = f(carry, index, *values)
         if not isinstance(result, tuple) or len(result) != 2:
             raise TypeError("scan body must return a (carry, output) tuple")
-        return _same_carry(initial, result[0]), _carry(result[1])
+        return (
+            _traced_like(carry, _same_carry(initial, result[0])),
+            _traced_like(carry, _carry(result[1])),
+        )
 
     if isinstance(initial, TraceTensor):
         if unroll:

@@ -196,14 +196,18 @@ def newton(f, x0, *, args=(), tol=None, maxiter=50, info=False):
     `args`: values a Python `f` closes over are not differentiated, and
     under a transform closing over a traced value raises. Reverse mode
     composes twice (`grad(grad(...))`, `hessian` through `jacobian`'s
-    reverse mode); forward mode (`jvp`) and `vmap` of the root are not
-    supported. The solve cannot run inside a `cond`, `fori_loop`, or `scan`
-    body (use `fori_loop(..., unroll=True)`).
+    reverse mode); forward mode (`jvp`) is not supported. `vmap` batches
+    the solve over `x0` and `args` and composes with these derivatives in
+    both orders: each example stops at its own convergence test, because
+    the batched loop freezes an example's iterate once it has converged or
+    stalled, so a batch costs the iterations of its slowest example. The
+    solve cannot run inside a `cond`, `fori_loop`, or `scan` body (use
+    `fori_loop(..., unroll=True)`).
 
     An eager solve that does not converge raises `RuntimeError`; with
     `info=True` it returns `(x, info)` instead, where `info` holds
-    `"iterations"`, `"residual_norm"` (`||f(x)||`) and `"success"`, which is
-    the only report under `jit`.
+    `"iterations"`, `"residual_norm"` (`||f(x)||`) and `"success"`, per
+    example under `vmap`, which is the only report under `jit` and `vmap`.
     """
     if not callable(f):
         raise TypeError("newton requires a callable f(x, *args)")
