@@ -60,8 +60,8 @@ Two matrix-free iterative solvers take a function `matvec(x, *args)`
 instead of a matrix (see `_krylov.py`): `cg` for symmetric positive-definite
 operators and `gmres` for general ones. They differ from the functions
 above: their derivatives come from the implicit function theorem at the
-solution, in reverse mode only (composable twice), and they do not support
-`vmap` or forward mode.
+solution, in forward and reverse mode (any two passes), not from the
+iterations.
 """
 
 import collections

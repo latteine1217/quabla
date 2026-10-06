@@ -660,6 +660,18 @@ impl TensorTraceGraph {
         }
     }
 
+    /// Compiles the body of a control-flow region, keeping the custom rule
+    /// nodes its derivatives need (see [`TensorIr::compile_region`]).
+    pub(crate) fn compile_region_plan(
+        &self,
+        output_node_id: TensorNodeId,
+    ) -> Result<TensorExecutionPlan, String> {
+        self.ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+            .compile_region(output_node_id)
+    }
+
     pub(crate) fn compile_cuda_plan(
         &self,
         output_node_id: TensorNodeId,
@@ -3049,9 +3061,30 @@ impl TensorTraceGraph {
     /// Freezes a custom differentiation rule from staged graphs (see
     /// `TensorCustomRule`): `forward_outputs` are tracers of `forward`,
     /// `backward_outputs` (one per operand, `None` for no cotangent) of
-    /// `backward`, and `tangent_outputs` of `tangent`, if given.
+    /// `backward`, and `tangent_outputs` of `tangent`, if given, whose
+    /// inputs `output_names` (one per output, or none) read the call's
+    /// outputs. `prefer_reverse` (default: no tangent graph) asks `jacobian`
+    /// and `hessian` for reverse mode.
     #[staticmethod]
     #[pyo3(name = "_custom_rule")]
+    #[pyo3(signature = (
+        name,
+        forward,
+        operand_names,
+        output_count,
+        forward_outputs,
+        backward,
+        residual_names,
+        cotangent_names,
+        backward_outputs,
+        tangent,
+        tangent_names,
+        tangent_outputs,
+        rematerialize,
+        *,
+        output_names = Vec::new(),
+        prefer_reverse = None,
+    ))]
     #[allow(clippy::too_many_arguments)]
     fn py_custom_rule(
         name: String,
@@ -3067,6 +3100,8 @@ impl TensorTraceGraph {
         tangent_names: Vec<Option<String>>,
         tangent_outputs: Vec<TraceTensor>,
         rematerialize: bool,
+        output_names: Vec<String>,
+        prefer_reverse: Option<bool>,
     ) -> PyResult<PyCustomRule> {
         let snapshot = |graph: &TensorTraceGraph, tensors: &[&TraceTensor]| {
             graph.ensure_owns(tensors)?;
@@ -3085,17 +3120,20 @@ impl TensorTraceGraph {
                 &backward_outputs.iter().flatten().collect::<Vec<_>>(),
             )?;
             let tangent = match tangent {
-                Some(graph) => Some(TensorCustomTangent::new(
-                    snapshot(&graph, &tangent_outputs.iter().collect::<Vec<_>>())?,
-                    tangent_names,
-                    tangent_outputs
-                        .iter()
-                        .map(|output| output.node_id)
-                        .collect(),
-                )),
+                Some(graph) => Some(
+                    TensorCustomTangent::new(
+                        snapshot(&graph, &tangent_outputs.iter().collect::<Vec<_>>())?,
+                        tangent_names,
+                        tangent_outputs
+                            .iter()
+                            .map(|output| output.node_id)
+                            .collect(),
+                    )
+                    .with_output_inputs(output_names),
+                ),
                 None => None,
             };
-            TensorCustomRule::new(
+            let rule = TensorCustomRule::new(
                 name,
                 forward_ir,
                 operand_names,
@@ -3113,7 +3151,11 @@ impl TensorTraceGraph {
                     .collect(),
                 tangent,
                 rematerialize,
-            )
+            )?;
+            Ok::<_, String>(match prefer_reverse {
+                Some(prefer_reverse) => rule.with_prefer_reverse(prefer_reverse),
+                None => rule,
+            })
         })()
         .map_err(PyValueError::new_err)?;
         Ok(PyCustomRule {
@@ -3205,6 +3247,18 @@ impl TensorTraceGraph {
             .lock()
             .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
             .has_reverse_only_custom_rule())
+    }
+
+    /// Whether `jacobian` and `hessian` use reverse mode for the graph
+    /// because it calls a `custom_vjp` function (see
+    /// `TensorIr::prefers_reverse_mode`).
+    #[getter(_prefers_reverse_mode)]
+    fn py_prefers_reverse_mode(&self) -> PyResult<bool> {
+        Ok(self
+            .ir
+            .lock()
+            .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
+            .prefers_reverse_mode())
     }
 
     #[getter(_has_f32_nodes)]
@@ -6130,10 +6184,9 @@ pub fn trace_tensor_python_function(
 fn compile_cpu_region(
     traced: &TensorTraceResult,
 ) -> Result<(&TensorTraceResult, TensorExecutionPlan), String> {
-    reject_custom_rules(&traced.graph, &[traced.output.node_id], "a cond branch")?;
     Ok((
         traced,
-        traced.graph.compile_cpu_plan(traced.output.node_id)?.plan,
+        traced.graph.compile_region_plan(traced.output.node_id)?,
     ))
 }
 
@@ -6143,30 +6196,6 @@ fn region_input_names(plan: &TensorExecutionPlan) -> Vec<String> {
         .keys()
         .cloned()
         .collect()
-}
-
-/// Rejects a control-flow body that calls a function with a custom
-/// differentiation rule: the body is frozen into a compiled region, which no
-/// longer carries the rule, so differentiating the region would silently use
-/// the primal computation's derivative instead.
-fn reject_custom_rules(
-    graph: &TensorTraceGraph,
-    outputs: &[TensorNodeId],
-    context: &str,
-) -> Result<(), String> {
-    let name = graph
-        .ir
-        .lock()
-        .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
-        .custom_rule_name(outputs)?;
-    match name {
-        Some(name) => Err(format!(
-            "{context} calls {name}, which has a custom differentiation rule; functions \
-             with custom_vjp, custom_jvp, or checkpoint rules are not supported inside \
-             cond, fori_loop, or scan bodies"
-        )),
-        None => Ok(()),
-    }
 }
 
 /// Recompiles a region whose output also references `names`, or returns the
@@ -6184,7 +6213,7 @@ fn retain_region_inputs(
         .lock()
         .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
         .retain_inputs(names, traced.output.node_id)?;
-    Ok(traced.graph.compile_cpu_plan(output)?.plan)
+    traced.graph.compile_region_plan(output)
 }
 
 /// Traces a lazy scalar conditional into the parent Tensor IR.
@@ -6539,8 +6568,6 @@ pub fn tensor_fori_loop_region(
             init.shape, output.shape
         )));
     }
-    reject_custom_rules(&body_graph, &[output.node_id], "a fori_loop body")
-        .map_err(PyValueError::new_err)?;
     let loop_plan = TensorForiExecutionPlan::new(
         lower,
         upper,
@@ -6589,7 +6616,7 @@ fn compile_loop_body(
     next: TensorNodeId,
     carry_name: &str,
 ) -> Result<TensorExecutionPlan, String> {
-    let plan = graph.compile_cpu_plan(next)?.plan;
+    let plan = graph.compile_region_plan(next)?;
     if region_input_names(&plan)
         .iter()
         .any(|name| name == carry_name)
@@ -6605,7 +6632,7 @@ fn compile_loop_body(
         let never = ir.scalar_constant(0.0);
         ir.where_select(never, carry, next)?
     };
-    Ok(graph.compile_cpu_plan(retained)?.plan)
+    graph.compile_region_plan(retained)
 }
 
 /// Traces one `while_loop` region over the carry and operand inputs.
@@ -6692,9 +6719,8 @@ pub fn tensor_while_loop_region(
     }
     let loop_plan = TensorWhileExecutionPlan::new(
         predicate_graph
-            .compile_cpu_plan(predicate.node_id)
-            .map_err(PyValueError::new_err)?
-            .plan,
+            .compile_region_plan(predicate.node_id)
+            .map_err(PyValueError::new_err)?,
         compile_loop_body(&body_graph, output.node_id, "__quabla_while_carry")
             .map_err(PyValueError::new_err)?,
         "__quabla_while_carry",
@@ -6836,15 +6862,13 @@ pub fn tensor_scan_region(
             init.shape, next.shape
         )));
     }
-    reject_custom_rules(&body_graph, &[next.node_id, output.node_id], "a scan body")
-        .map_err(PyValueError::new_err)?;
     let body_plan = {
         let mut ir = body_graph
             .ir
             .lock()
             .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?;
         let mut plan = ir
-            .compile_cpu_many(&[next.node_id, output.node_id])
+            .compile_region_many(&[next.node_id, output.node_id])
             .map_err(PyValueError::new_err)?
             .0;
         // A body that reads its carry in neither result keeps it as an input
@@ -6861,7 +6885,7 @@ pub fn tensor_scan_region(
                 .where_select(never, carry, next.node_id)
                 .map_err(PyValueError::new_err)?;
             plan = ir
-                .compile_cpu_many(&[retained, output.node_id])
+                .compile_region_many(&[retained, output.node_id])
                 .map_err(PyValueError::new_err)?
                 .0;
         }

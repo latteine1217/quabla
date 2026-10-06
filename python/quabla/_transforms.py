@@ -1828,13 +1828,14 @@ class _Jacobian(_Transform):
         pieces = [[[] for _ in selected] for _ in traced]
         output_sizes = [_size(output.shape) for output in traced]
         output_total = sum(output_sizes)
-        # A custom_vjp call has no forward-mode rule, so its graph always
-        # uses reverse mode, as jax.jacrev would.
+        # A graph that calls a custom_vjp function always uses reverse mode,
+        # as jax.jacrev would: its primary rule is the backward pass, and most
+        # such functions have no forward-mode rule.
         reverse = (
             0 < output_total
             and all(output.dtype != bool_ for output in traced)
             and (
-                staged.graph._has_reverse_only_custom_rule
+                staged.graph._prefers_reverse_mode
                 or (
                     output_total < total
                     and (

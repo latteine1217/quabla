@@ -314,23 +314,129 @@ def test_linear_solver_second_derivatives():
         assert_close(curvature(iterative), curvature(direct), 1e-8)
 
 
-def test_linear_solver_unsupported_transforms_raise():
+def test_linear_solver_forward_mode_matches_the_dense_solve():
+    # x_dot = A^-1 (b_dot - A_dot x) from the implicit rule, against forward
+    # mode through the dense solve, for perturbations of b and of the
+    # operator's parameters (a pytree), in both dtypes and under jit.
+    for dtype, tolerance in ((qb.float64, 1e-10), (qb.float32, 2e-4)):
+        b = vector(9, 1.0).astype(dtype)
+        b_dot = vector(9, 6.0).astype(dtype)
+        for solver, a in ((qb.linalg.cg, spd(9, 2.0)), (qb.linalg.gmres, nonsymmetric(9, 3.0))):
+            a = a.astype(dtype)
+            a_dot = matrix(9, 9, 8.0).astype(dtype)
+            if solver is qb.linalg.cg:
+                a_dot = a_dot + a_dot.T
+            params = {"a": a, "s": qb.array(2.0, dtype=dtype)}
+            params_dot = {"a": a_dot, "s": qb.array(-0.5, dtype=dtype)}
+            tol = 1e-12 if dtype == qb.float64 else 1e-6
+
+            def iterative(b, p, solver=solver, tol=tol):
+                return solver(lambda x, p: matvec(x, p["a"]) * p["s"], b, args=(p,), tol=tol)
+
+            def direct(b, p):
+                return qb.linalg.solve(p["a"] * p["s"], b)
+
+            expected = qb.jvp(direct, (b, params), (b_dot, params_dot))
+            for transform in (lambda f: f, qb.jit):
+                actual = transform(lambda b, p: qb.jvp(iterative, (b, p), (b_dot, params_dot)))(
+                    b, params
+                )
+                for got, want in zip(actual, expected):
+                    assert got.dtype == dtype
+                    assert_close(got, want, tolerance)
+            # The initial guess does not move the solution.
+            x0 = qb.ones([9], dtype)
+            _, tangent = qb.jvp(
+                lambda x0: solver(matvec, b, args=(a,), x0=x0, tol=tol), (x0,), (b_dot,)
+            )
+            assert_close(tangent, qb.zeros([9], dtype), 0.0)
+
+
+def test_linear_solver_forward_jacobian_and_second_derivatives():
+    b = vector(6, 1.0)
+    for solver, a in ((qb.linalg.cg, spd(6, 2.0)), (qb.linalg.gmres, nonsymmetric(6, 3.0))):
+
+        def solve(b, a, solver=solver):
+            return solver(matvec, b, args=(a,), tol=1e-13)
+
+        # The forward-mode Jacobian (vmap of jvp) is A^-1.
+        jacobian = qb.vmap(lambda t: qb.jvp(lambda b: solve(b, a), (b,), (t,))[1])(qb.eye(6))
+        assert_close(jacobian.T, qb.linalg.inv(a), 1e-10)
+        # Forward over reverse, reverse over forward, and forward over
+        # forward match the dense solve.
+        direction = matrix(6, 6, 9.0)
+        if solver is qb.linalg.cg:
+            direction = direction + direction.T
+
+        def scaled(t, solve):
+            return solve(b * (1.0 + t), a + t * direction)
+
+        def dense(b, a):
+            return qb.linalg.solve(a, b)
+
+        def loss(t, solve):
+            x = scaled(t, solve)
+            return (x * x).sum()
+
+        t = qb.array(0.3)
+        one = qb.array(1.0)
+        for second in (
+            lambda f: qb.jvp(qb.grad(f), (t,), (one,))[1],
+            lambda f: qb.grad(lambda t: qb.jvp(f, (t,), (one,))[1])(t),
+            lambda f: qb.jvp(lambda t: qb.jvp(f, (t,), (one,))[1], (t,), (one,))[1],
+        ):
+            assert_close(
+                second(lambda t: loss(t, solve)), second(lambda t: loss(t, dense)), 1e-9
+            )
+            assert_close(
+                qb.jit(lambda t: second(lambda t: loss(t, solve)))(t),
+                second(lambda t: loss(t, dense)),
+                1e-9,
+            )
+        # The second derivative of the solution itself, x'' along the path.
+        curvature = qb.jvp(
+            lambda t: qb.jvp(lambda t: scaled(t, solve), (t,), (one,))[1], (t,), (one,)
+        )[1]
+        dense_curvature = qb.jvp(
+            lambda t: qb.jvp(lambda t: scaled(t, dense), (t,), (one,))[1], (t,), (one,)
+        )[1]
+        assert_close(curvature, dense_curvature, 1e-9)
+        # Central differences of the iterative tangent.
+        def tangent(t, solve=solve):
+            return qb.jvp(lambda t: loss(t, solve), (t,), (one,))[1]
+
+        second_derivative = qb.jvp(tangent, (t,), (one,))[1].item()
+        difference = central_difference(lambda t: tangent(qb.array(t)).item(), 0.3, 1e-5)
+        assert abs(second_derivative - difference) < 1e-6 * max(1.0, abs(second_derivative))
+
+
+def test_linear_solver_derivative_depth():
+    # Every combination of two forward and reverse passes uses the implicit
+    # rules (above); a third reverse pass still does, and a third pass that
+    # involves forward mode raises instead of differentiating the iterations.
     a, b = spd(4), vector(4)
+
+    def solution(t):
+        return qb.linalg.cg(matvec, b, args=(a * t,), tol=1e-13).sum()
+
+    def dense(t):
+        return qb.linalg.solve(a * t, b).sum()
+
+    t, one = qb.array(1.0), qb.array(1.0)
+    third = qb.grad(qb.grad(qb.grad(solution)))(t)
+    assert_close(third, qb.grad(qb.grad(qb.grad(dense)))(t), 1e-9)
+    # A fourth reverse pass reaches the plain iteration.
     raises(
         ValueError,
-        qb.jvp,
-        lambda b: qb.linalg.cg(matvec, b, args=(a,)),
-        (b,),
-        (b,),
-        match="forward-mode differentiation",
-    )
-    # A third reverse pass reaches the plain iteration.
-    raises(
-        ValueError,
-        qb.grad(qb.grad(qb.grad(lambda t: qb.linalg.cg(matvec, b, args=(a * t,)).sum()))),
-        qb.array(1.0),
+        qb.grad(qb.grad(qb.grad(qb.grad(solution)))),
+        t,
         match="while_loop",
     )
+    for third_order in (
+        lambda: qb.jvp(qb.grad(qb.grad(solution)), (t,), (one,)),
+        lambda: qb.jvp(lambda t: qb.jvp(lambda t: qb.jvp(solution, (t,), (one,))[1], (t,), (one,))[1], (t,), (one,)),
+    ):
+        raises(ValueError, third_order, match="beyond its supported derivative order")
 
 
 def test_linear_solver_argument_validation():
@@ -452,14 +558,50 @@ def test_root_reports_non_convergence():
     raises(TypeError, newton, no_root, qb.array(1.0), args=1.0)
     raises(ValueError, newton, lambda x: x[:1], qb.array([1.0, 2.0]), match="shape")
     raises(ValueError, newton, no_root, qb.array(1.0), maxiter=0)
-    raises(
-        ValueError,
-        qb.jvp,
-        lambda a: newton(lambda x, a: x * x - a, qb.array(1.0), args=(a,)),
-        (qb.array(2.0),),
-        (qb.array(1.0),),
-        match="forward-mode differentiation",
-    )
+
+
+def test_root_forward_mode_matches_closed_forms():
+    # dx = -J^-1 (df/dargs) dargs at the root, by the rule's tangent graph.
+    def cube_root(a):
+        return newton(lambda x, a: x * x * x - a, qb.array(1.0), args=(a,))
+
+    a, one = qb.array(8.0), qb.array(1.0)
+    value, tangent = qb.jvp(cube_root, (a,), (one,))
+    assert_close(value, 2.0, 1e-15)
+    assert_close(tangent, 1.0 / 12.0, 1e-14)
+    # d^2 a^(1/3) = -2 a^(-5/3) / 9, in every combination of two passes.
+    second = -2.0 / (9.0 * 32.0)
+    assert_close(qb.jvp(lambda a: qb.jvp(cube_root, (a,), (one,))[1], (a,), (one,))[1], second, 1e-13)
+    assert_close(qb.jvp(qb.grad(cube_root), (a,), (one,))[1], second, 1e-13)
+    assert_close(qb.grad(lambda a: qb.jvp(cube_root, (a,), (one,))[1])(a), second, 1e-13)
+    assert_close(qb.jit(lambda a: qb.jvp(cube_root, (a,), (one,)))(a)[1], 1.0 / 12.0, 1e-14)
+
+    # A system: sum(x) = (1 + q) sqrt(p / (1 + q^2)); its forward Jacobian
+    # (vmap of jvp) and forward-over-reverse Hessian match the closed form.
+    x0 = qb.array([1.0, 0.5])
+
+    def total(pq):
+        return newton(circle_and_line, x0, args=(pq[0], pq[1])).sum()
+
+    def closed_form(pq):
+        p, q = pq[0], pq[1]
+        return (1.0 + q) * (p / (1.0 + q * q)).sqrt()
+
+    point = qb.array([2.0, 1.0])
+    basis = qb.eye(2)
+    forward = qb.vmap(lambda v: qb.jvp(total, (point,), (v,))[1])(basis)
+    assert_close(forward, qb.grad(closed_form)(point), 1e-12)
+    hvps = qb.vmap(lambda v: qb.jvp(qb.grad(total), (point,), (v,))[1])(basis)
+    assert_close(hvps, qb.hessian(closed_form)(point), 1e-11)
+    # Batched roots: vmap of the forward mode against per-example calls.
+    points = qb.array([[2.0, 1.0], [0.5, -0.3], [3.0, 2.0]])
+    batched = qb.vmap(lambda pq: qb.jvp(total, (pq,), (qb.array([1.0, -1.0]),))[1])(points)
+    for index in range(3):
+        expected = qb.jvp(total, (points[index],), (qb.array([1.0, -1.0]),))[1]
+        assert_close(batched[index], expected, 1e-13)
+    # The initial guess does not move the root.
+    _, tangent = qb.jvp(lambda x0: newton(circle_and_line, x0, args=(point[0], point[1])), (x0,), (qb.ones([2]),))
+    assert_close(tangent, [0.0, 0.0], 0.0)
 
 
 # -- vmap -------------------------------------------------------------------------
@@ -652,9 +794,7 @@ def test_solvers_compose_with_odeint_and_loops_under_vmap():
     # A root whose parameter comes from an ODE solve (a fori_loop region):
     # p(k) = y(1) for y' = -k y, y(0) = 2. The gradient in k goes through the
     # solver's implicit rule and the loop's reverse rule, and matches the
-    # closed-form root at the same integrated p. (A second reverse pass would
-    # need the reverse mode of the loop's own reverse pass, which no loop
-    # has; the Hessian of a solve alone composes, see above.)
+    # closed-form root at the same integrated p.
     x0 = qb.array([1.0, 1.0])
 
     def decayed(k):
@@ -672,6 +812,25 @@ def test_solvers_compose_with_odeint_and_loops_under_vmap():
     expected = per_example(qb.grad(closed_form), (rates,), (0,))
     assert_tree_close(qb.vmap(qb.grad(total))(rates), expected, 1e-12)
     assert_tree_close(qb.jit(qb.vmap(qb.grad(total)))(rates), expected, 1e-12)
+    # The Hessian goes through the solver's rule and reverse mode over the
+    # loop's reverse pass (hessian uses reverse mode for a custom_vjp
+    # solver); it matches the closed form, forward over reverse, and central
+    # differences of the gradient, also under jit and vmap.
+    for rate in (0.2, 1.5):
+        k = qb.array([rate])
+        expected = qb.hessian(closed_form)(k)
+        assert_tree_close(qb.hessian(total)(k), expected, 1e-11)
+        assert_tree_close(qb.jit(qb.hessian(total))(k), expected, 1e-11)
+        forward_over_reverse = qb.jvp(qb.grad(total), (k,), (qb.ones([1]),))[1]
+        assert_tree_close(forward_over_reverse, expected.reshape([1]), 1e-11)
+        step = 1e-5
+        difference = (qb.grad(total)(k + step) - qb.grad(total)(k - step)) / (2 * step)
+        assert abs(difference.item() - expected.item()) < 1e-7
+    assert_tree_close(
+        qb.vmap(qb.hessian(lambda k: total(k.reshape([1]))))(rates),
+        per_example(qb.hessian(lambda k: closed_form(k.reshape([1]))), (rates,), (0,)),
+        1e-11,
+    )
     # The Hessian of the integrated parameter itself is forward over reverse
     # through the loop, also under vmap.
     assert_tree_close(
@@ -713,6 +872,12 @@ def test_optional_device_solvers_match_cpu():
         (qb.value_and_grad(cg_loss, argnums=(0, 1)), (b32, a32)),
         (qb.value_and_grad(gmres_loss, argnums=(0, 1)), (b32, n32)),
         (qb.value_and_grad(root_loss), (p32,)),
+        # Forward mode (the implicit rules' tangent graphs) and forward over
+        # reverse.
+        (lambda b, a: qb.jvp(cg_loss, (b, a), (b * 0.5, a * 0.1)), (b32, a32)),
+        (lambda b, a: qb.jvp(gmres_loss, (b, a), (b * 0.5, a * 0.1)), (b32, n32)),
+        (lambda p: qb.jvp(root_loss, (p,), (qb.ones_like(p),)), (p32,)),
+        (lambda p: qb.jvp(qb.grad(root_loss), (p,), (qb.ones_like(p),)), (p32,)),
     )
     for device in targets:
         for function, arguments in cases:

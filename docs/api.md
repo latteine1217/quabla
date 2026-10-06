@@ -293,8 +293,12 @@ decorator: `@qb.jit(device="mlx", static_argnums=1)`, `@qb.grad(argnums=1)`.
   `jacobian` and `hessian` are forward mode vectorized with `vmap` over the
   input elements (as `jax.jacfwd`), so they compose too, for example
   `grad(lambda x: qb.sum(qb.hessian(f)(x)))` or `vmap(hessian(f))`.
-  Second-order reverse mode through `fori`/`scan` regions is rejected with
-  a `ValueError`.
+  Second-order derivatives through `fori`/`scan` regions work in every
+  combination of modes except forward over forward through a `fori_loop`
+  (a `fori_loop` JVP has no forward-mode rule); reverse mode over a loop's
+  reverse pass uses the loop body's forward mode, so a body that calls a
+  `custom_vjp` function needs its forward-mode rule. A third derivative
+  pass through a loop raises.
 - `vmap(fun, in_axes=0, out_axes=0)` vectorizes `fun`, which sees one
   example, with JAX semantics. `in_axes` is an int (the mapped axis,
   negative counts from the end), `None` (an argument shared by every
@@ -476,6 +480,12 @@ layer = qb.checkpoint(lambda h: qb.tanh(h @ w + b))
   later reverse pass (`grad(vmap(f))`). A call of the function itself
   inside its own `fwd`, `bwd`, or JVP rule evaluates `fun` without the
   rule.
+- The functions may be called inside `cond`, `fori_loop`, `scan`, and
+  `while_loop` bodies, nested to any depth. The compiled region keeps the
+  rule, so the region's derivatives (`grad`, `jvp`, `hessian`, and `vmap`
+  of them) are those of the rule, as with `unroll=True`; forward mode
+  through a `custom_vjp` function raises there too, and a `while_loop`
+  body is differentiated in forward mode only.
 - Arguments at `nondiff_argnums` (`static_argnums` for `checkpoint`) are
   passed through unchanged and not differentiated; they must not hold
   traced arrays. Python scalars in other arguments are constants. `fun`,
@@ -950,13 +960,19 @@ Each runs eagerly in Python or, under `jit`, as one `while_loop` region that
 stops at convergence (`||b - A x|| <= max(tol * ||b||, atol)` for the linear
 solvers, `||dx|| <= tol * (1 + ||x||)` for `newton`). Derivatives with
 respect to `b` and the array leaves of `args` follow the implicit function
-theorem at the solution, one adjoint solve, instead of differentiating the
-iterations; `x0` gets no gradient. Pass every array the operator depends on
-through `args`: values a Python function closes over are not differentiated.
-Reverse mode composes twice (`grad(grad(...))`, and the reverse-mode
-`jacobian` and `hessian` of a solution); forward mode (`jvp`) is not
-supported, and a solve cannot run inside a `cond`, `fori_loop`, or `scan`
-body. `vmap` batches a solve over `b`, `x0`, and the leaves of `args`, and
+theorem at the solution instead of differentiating the iterations: reverse
+mode solves one adjoint system, and forward mode (`jvp`, or `vmap` of `jvp`
+for a forward-mode Jacobian) one tangent system, `x_dot = A^-1 (b_dot -
+A_dot x)` for the linear solvers and `x_dot = -J^-1 (df/dargs) args_dot`
+for `newton`; `x0` gets no derivative. Pass every array the operator
+depends on through `args`: values a Python function closes over are not
+differentiated. Every combination of two derivative passes uses these rules
+(`grad(grad(...))`, `jvp(grad(...))`, `grad` of `jvp`, `jvp(jvp(...))`),
+and so does a third reverse pass; a third pass involving forward mode
+raises. `jacobian` and `hessian` of a solution use reverse mode. A solve
+may run inside `cond`, `fori_loop`, `scan`, and `while_loop` bodies, such as
+an implicit time step in a `fori_loop`, and the loop's derivatives apply
+the rules. `vmap` batches a solve over `b`, `x0`, and the leaves of `args`, and
 composes with the derivatives in both orders (`vmap(grad(...))`,
 `grad` of a loss over `vmap`): each example stops at its own tolerance,
 because the batched loop freezes an example's state once it has converged,
@@ -1705,8 +1721,7 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - `qb.linalg` has no `eig` (non-symmetric). Batched CUDA solves and decompositions issue one cuSOLVER call per
   batch element. Derivatives at exactly singular matrices raise instead of
   returning non-finite values.
-- `custom_vjp`, `custom_jvp`, and `checkpoint` functions cannot be called
-  inside control-flow bodies, and their rules cannot close over tracers of
-  an enclosing transform (`checkpoint` can).
+- The rules of `custom_vjp`, `custom_jvp`, and `checkpoint` functions cannot
+  close over tracers of an enclosing transform (`checkpoint` can).
   `jacobian` and `hessian` are dense: their basis constant and result grow
   quadratically with the number of input elements.

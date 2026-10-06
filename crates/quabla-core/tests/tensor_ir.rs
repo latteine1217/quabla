@@ -5,11 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use quabla_core::compiler::QuablaCompileError;
 use quabla_core::tensor_ir::{
     CpuBackend, DynamicTensor, SymbolicCotangent, TensorBackend, TensorBufferSlot,
-    TensorCondExecutionPlan, TensorCustomRule, TensorDType, TensorDeviceBackend, TensorDeviceId,
-    TensorDeviceMesh, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan,
-    TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr, TensorNodeId, TensorPartitionSpec,
-    TensorPlacement, TensorReplicaReduction, TensorScanExecutionPlan, TensorShardingPlan,
-    UnaryMathKind,
+    TensorCondExecutionPlan, TensorCustomRule, TensorCustomTangent, TensorDType,
+    TensorDeviceBackend, TensorDeviceId, TensorDeviceMesh, TensorExecutionPlan, TensorExtremum,
+    TensorForiExecutionPlan, TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr,
+    TensorNodeId, TensorPartitionSpec, TensorPlacement, TensorReplicaReduction,
+    TensorScanExecutionPlan, TensorShardingPlan, UnaryMathKind,
 };
 use quabla_core::{QuablaCompiler, QuablaMultiOutputProgram, QuablaPrecision, QuablaTarget};
 
@@ -963,6 +963,128 @@ fn hessian_and_hvp_support_cond_regions_through_symbolic_ad() {
             &[expected]
         );
     }
+}
+
+#[test]
+fn forward_over_reverse_binds_a_float32_seed_tangent_to_a_cond_region() {
+    // The `Ones` seed of a float32 scalar loss is a strong float32 constant
+    // that the cond VJP binds as a capture; its zero tangent must stay
+    // float32, or the forward-over-reverse cond rejects the binding.
+    let mut on_true = TensorIr::new();
+    let true_capture = must!(on_true.input_typed("captured", vec![2], TensorDType::F32));
+    let true_exp = must!(on_true.exp(true_capture));
+    let true_output = must!(on_true.sum(true_exp));
+    let mut on_false = TensorIr::new();
+    let false_capture = must!(on_false.input_typed("captured", vec![2], TensorDType::F32));
+    let false_square = must!(on_false.mul(false_capture, false_capture));
+    let false_output = must!(on_false.sum(false_square));
+    let branches = must!(TensorCondExecutionPlan::new(
+        must!(on_true.compile_cpu(true_output)),
+        must!(on_false.compile_cpu(false_output)),
+    ));
+    let mut graph = TensorIr::new();
+    let predicate = must!(graph.input_typed("predicate", vec![], TensorDType::F32));
+    let w = must!(graph.input_typed("w", vec![2], TensorDType::F32));
+    let loss =
+        must!(graph.cond_with_captures(predicate, branches, vec![("captured".to_string(), w)]));
+    let reverse = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    let gradient = reverse.gradients["w"];
+    let hvp = must!(reverse.graph.symbolic_jvp(gradient, "w"));
+    assert_eq!(must!(hvp.graph.node_dtype(hvp.tangent)), TensorDType::F32);
+    for (flag, expected) in [
+        (
+            1.0,
+            vec![0.5_f64.exp() as f32 as f64, (-1.0_f64).exp() as f32 as f64],
+        ),
+        (0.0, vec![2.0, 2.0]),
+    ] {
+        let inputs = BTreeMap::from([
+            (
+                "predicate".to_string(),
+                must!(DynamicTensor::new(vec![], vec![flag])),
+            ),
+            (
+                "w".to_string(),
+                must!(DynamicTensor::new(vec![2], vec![0.5, -1.0])),
+            ),
+        ]);
+        let value = must!(hvp.graph.evaluate(hvp.tangent, &inputs));
+        assert_eq!(value.data().as_ref(), expected.as_slice());
+    }
+}
+
+/// `fori(0, 3, carry * scale)` over a vector carry and scale: the final
+/// carry is `c s^3`.
+fn cubed_fori_graph() -> Result<(TensorIr, TensorNodeId), String> {
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![2])?;
+    body.input("index", vec![])?;
+    let scale = body.input("scale", vec![2])?;
+    let next = body.mul(carry, scale)?;
+    let loop_plan =
+        TensorForiExecutionPlan::new(0, 3, body.compile_region(next)?, "carry", "index")?;
+    let mut graph = TensorIr::new();
+    let c = graph.input("c", vec![2])?;
+    let s = graph.input("s", vec![2])?;
+    let output = graph.fori(c, loop_plan, vec![("scale".to_string(), s)])?;
+    Ok((graph, output))
+}
+
+#[test]
+fn reverse_mode_over_loop_vjp_and_jvp_nodes_matches_closed_forms() {
+    let (graph, output) = must!(cubed_fori_graph());
+    let inputs = BTreeMap::from([
+        (
+            "c".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![0.5, -2.0])),
+        ),
+        (
+            "s".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![1.5, 0.75])),
+        ),
+        (
+            "ds".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![1.0, -1.0])),
+        ),
+    ]);
+    let evaluate = |graph: &TensorIr, node: TensorNodeId| -> Result<Vec<f64>, String> {
+        Ok(graph.compile_cpu(node)?.evaluate(&inputs)?.data().to_vec())
+    };
+    let mut graph = graph;
+    let loss = must!(graph.sum(output));
+    // First pass: the gradient in s is 3 c s^2 (ForiVjp nodes).
+    let first = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    let mut reversed = first.graph.clone();
+    let gradient_sum = must!(reversed.sum(first.gradients["s"]));
+    // Second reverse pass over the ForiVjp group: d/ds = 6 c s, d/dc = 3 s^2.
+    let second = must!(reversed.symbolic_vjp_many(&[(gradient_sum, SymbolicCotangent::Ones)]));
+    assert_eq!(
+        must!(evaluate(&second.graph, second.gradients["s"])),
+        vec![6.0 * 0.5 * 1.5, 6.0 * -2.0 * 0.75]
+    );
+    assert_eq!(
+        must!(evaluate(&second.graph, second.gradients["c"])),
+        vec![3.0 * 1.5 * 1.5, 3.0 * 0.75 * 0.75]
+    );
+    // Reverse mode over the ForiJvp tangent 3 c s^2 ds: d/ds = 6 c s ds,
+    // d/dc = 3 s^2 ds, and d/dds = 3 c s^2.
+    let tangents = BTreeMap::from([("s".to_string(), "ds".to_string())]);
+    let forward = must!(graph.symbolic_jvp_many_with_tangent_inputs(&[loss], &tangents));
+    let over = must!(forward
+        .graph
+        .symbolic_vjp_many(&[(forward.tangents[0], SymbolicCotangent::Ones)]));
+    assert_eq!(
+        must!(evaluate(&over.graph, over.gradients["s"])),
+        vec![6.0 * 0.5 * 1.5, -(6.0 * -2.0 * 0.75)]
+    );
+    assert_eq!(
+        must!(evaluate(&over.graph, over.gradients["c"])),
+        vec![3.0 * 1.5 * 1.5, -3.0 * 0.75 * 0.75]
+    );
+    assert_eq!(
+        must!(evaluate(&over.graph, over.gradients["ds"])),
+        vec![3.0 * 0.5 * 1.5 * 1.5, 3.0 * -2.0 * 0.75 * 0.75]
+    );
 }
 
 #[test]
@@ -14077,6 +14199,159 @@ fn custom_rule_node_batches_with_its_rule() {
         )),
     )]);
     assert_eq!(must!(plan.evaluate(&inputs)).data().to_vec(), vec![3.0; 6]);
+}
+
+/// `fori(0, 3, carry + custom_square(x))` with `x` a capture: the body is
+/// compiled as a region, which keeps its `Custom` node.
+fn fori_with_custom_body() -> Result<(TensorIr, TensorNodeId), String> {
+    let rule = custom_square_rule()?;
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![2])?;
+    body.input("index", vec![])?;
+    let x = body.input("x", vec![2])?;
+    let value = body.mul(x, x)?;
+    let wrapped = body.custom(rule, &[value], &[x])?;
+    let next = body.add(carry, wrapped[0])?;
+    let plan = body.compile_region(next)?;
+    if !plan.lower_text().contains("custom") {
+        return Err(format!(
+            "region body lost its custom node:\n{}",
+            plan.lower_text()
+        ));
+    }
+    let loop_plan = TensorForiExecutionPlan::new(0, 3, plan, "carry", "index")?;
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![2])?;
+    let output = graph.fori(x, loop_plan, vec![("x".to_string(), x)])?;
+    let loss = graph.sum(output)?;
+    Ok((graph, loss))
+}
+
+#[test]
+fn custom_rule_in_a_loop_body_is_applied_by_the_loop_derivatives() {
+    let (graph, loss) = must!(fori_with_custom_body());
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![2], vec![2.0, -1.0])),
+    )]);
+    // The value is x + 3 x^2; the node is the identity on its value.
+    let plan = must!(graph.compile_cpu(loss));
+    assert_eq!(must!(plan.evaluate(&inputs)).data().to_vec(), vec![16.0]);
+    // d/dx: 1 from the initial carry plus the rule's 3 per iteration, not
+    // the 2 x of the function.
+    let vjp = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    let plan = must!(vjp.graph.compile_cpu(vjp.gradients["x"]));
+    assert_eq!(
+        must!(plan.evaluate(&inputs)).data().to_vec(),
+        vec![10.0, 10.0]
+    );
+    // The rule has no tangent graph, so forward mode through the loop fails
+    // as it does at the top level (when the loop JVP plan is built, on first
+    // use).
+    let tangents = BTreeMap::from([("x".to_string(), "dx".to_string())]);
+    let mut tangent_inputs = inputs.clone();
+    tangent_inputs.insert(
+        "dx".to_string(),
+        must!(DynamicTensor::new(vec![2], vec![1.0, 1.0])),
+    );
+    let error = graph
+        .symbolic_jvp_many_with_tangent_inputs(&[loss], &tangents)
+        .and_then(|jvp| jvp.graph.compile_cpu(jvp.tangents[0]))
+        .and_then(|plan| plan.evaluate(&tangent_inputs))
+        .err()
+        .unwrap_or_default();
+    assert!(error.contains("forward-mode differentiation"), "{error}");
+    // vmap batches the body's rule.
+    let mut batched = TensorIr::new();
+    let xs = must!(batched.input("xs", vec![3, 2]));
+    let bindings = BTreeMap::from([("x".to_string(), (xs, true))]);
+    let losses = must!(batched.inline_batched(&graph, &bindings, 3, &[loss]));
+    let total = must!(batched.sum(losses[0].0));
+    let vjp = must!(batched.symbolic_vjp_many(&[(total, SymbolicCotangent::Ones)]));
+    let plan = must!(vjp.graph.compile_cpu(vjp.gradients["xs"]));
+    let inputs = BTreeMap::from([(
+        "xs".to_string(),
+        must!(DynamicTensor::new(
+            vec![3, 2],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        )),
+    )]);
+    assert_eq!(must!(plan.evaluate(&inputs)).data().to_vec(), vec![10.0; 6]);
+}
+
+/// `exp(x)` with a reverse rule and a tangent graph that reads the output
+/// (`exp(x) t`), as the implicit solvers' rules read the solution.
+fn custom_exp_rule_reading_its_output() -> Result<std::sync::Arc<TensorCustomRule>, String> {
+    let mut forward = TensorIr::new();
+    let x = forward.input("x", vec![2])?;
+    let y = forward.exp(x)?;
+    let mut backward = TensorIr::new();
+    let residual = backward.input("residual", vec![2])?;
+    let g = backward.input("g", vec![2])?;
+    let scaled = backward.mul(g, residual)?;
+    let mut tangent = TensorIr::new();
+    tangent.input("x", vec![2])?;
+    let t = tangent.input("t", vec![2])?;
+    let output = tangent.input("y", vec![2])?;
+    let product = tangent.mul(output, t)?;
+    let rule = TensorCustomRule::new(
+        "custom_exp".to_string(),
+        forward,
+        vec!["x".to_string()],
+        1,
+        vec![y, y],
+        backward,
+        vec!["residual".to_string()],
+        vec!["g".to_string()],
+        vec![Some(scaled)],
+        Some(
+            TensorCustomTangent::new(tangent, vec![Some("t".to_string())], vec![product])
+                .with_output_inputs(vec!["y".to_string()]),
+        ),
+        false,
+    )?;
+    Ok(std::sync::Arc::new(rule.with_prefer_reverse(true)))
+}
+
+#[test]
+fn custom_tangent_graph_reads_the_call_outputs() {
+    let rule = must!(custom_exp_rule_reading_its_output());
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2]));
+    let value = must!(graph.exp(x));
+    let wrapped = must!(graph.custom(rule, &[value], &[x]));
+    let loss = must!(graph.sum(wrapped[0]));
+    assert!(graph.prefers_reverse_mode());
+    assert!(!graph.has_reverse_only_custom_rule());
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![0.5, -1.0])),
+        ),
+        (
+            "dx".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![2.0, 3.0])),
+        ),
+    ]);
+    let expected = [2.0 * 0.5_f64.exp(), 3.0 * (-1.0_f64).exp()];
+    let tangents = BTreeMap::from([("x".to_string(), "dx".to_string())]);
+    let jvp = must!(graph.symbolic_jvp_many_with_tangent_inputs(&[wrapped[0]], &tangents));
+    let plan = must!(jvp.graph.compile_cpu(jvp.tangents[0]));
+    assert_eq!(
+        must!(plan.evaluate(&inputs)).data().to_vec(),
+        expected.to_vec()
+    );
+    // Forward over reverse reads the rebuilt output inside the backward
+    // graph's residual and the tangent graph alike: the HVP of sum(exp(x)).
+    let vjp = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    let hvp = must!(vjp
+        .graph
+        .symbolic_jvp_many_with_tangent_inputs(&[vjp.gradients["x"]], &tangents));
+    let plan = must!(hvp.graph.compile_cpu(hvp.tangents[0]));
+    assert_eq!(
+        must!(plan.evaluate(&inputs)).data().to_vec(),
+        expected.to_vec()
+    );
 }
 
 #[test]

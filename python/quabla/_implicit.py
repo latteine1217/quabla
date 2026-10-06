@@ -9,15 +9,27 @@ the computed solution: for `F(x, theta) = 0`, `theta_bar = -(dF/dtheta)^T
 lambda` with `(dF/dx)^T lambda = x_bar`. The backward pass solves that
 adjoint system itself, so it costs about one more solve.
 
-A `custom_vjp` backward pass that reads the solution as a residual can be
-differentiated again only if the solution's own dependence on the operands
-also goes through a rule. `implicit` therefore nests the rule: at order `k`
-the forward pass computes the solution with the order `k - 1` function and
-the backward pass solves the adjoint system with order `k - 1` solves,
-down to the plain iteration at order 0. Rules are built when a call is
-staged (there are no lazy rules), so the depth is bounded by `ORDER`:
-reverse mode composes `ORDER` times (`grad(grad(...))`), and one more
-reverse pass reaches a `while_loop` and raises.
+Forward mode applies the same theorem: the rule also carries a tangent
+graph (`custom_vjp._defjvp`), `x_dot = -(dF/dx)^-1 (dF/dtheta) theta_dot`,
+which reads the computed solution and solves one more system with
+`dF/dx`. Reverse mode keeps using the backward pass, so adding the tangent
+changes no reverse-mode result.
+
+A rule that reads the solution (the backward pass keeps it as a residual,
+the tangent graph as an input) can be differentiated again only if the
+solution's own dependence on the operands also goes through a rule, and
+the systems the rule solves must be differentiable the same way.
+`implicit` therefore nests the rule: at order `k >= 1` the forward pass
+computes the solution with the order `k - 1` function, and the backward
+pass and the tangent graph solve with order `k - 1` solves. Order 0 is a
+reverse-only rule over the plain iteration: its backward pass solves with
+plain iterations and it has no tangent graph, so a derivative of an order
+beyond the supported depth raises (forward mode names the rule, reverse
+mode reaches a `while_loop`) instead of differentiating the iterations.
+Rules are built when a call is staged (there are no lazy rules), so the
+depth is bounded by `ORDER`: every combination of `ORDER` forward and
+reverse passes (`grad(grad(...))`, `jvp(grad(...))`, `jvp(jvp(...))`, ...)
+uses the rules, and so does one more reverse pass.
 """
 
 import operator
@@ -25,25 +37,37 @@ import operator
 from . import tree
 from ._custom import custom_vjp
 from ._quabla import Tensor, TraceTensor, bool_
-from ._transforms import vjp
+from ._transforms import jvp, vjp
 
-# Reverse-mode passes the solvers support: first derivatives and
-# `grad(grad(...))`. Each level traces the solve about twice more when a
-# call is staged, and nothing extra runs unless that level is differentiated.
+# Derivative passes the solvers support: first and second derivatives in
+# any combination of forward and reverse mode. Each level traces the solve
+# about three times more when a call is staged, and nothing extra runs
+# unless that level is differentiated.
 ORDER = 2
 
 
-def implicit(name, solve, adjoint, order=ORDER):
-    """`solve(*operands) -> (x, stats)` with reverse-mode derivatives of
-    `order` passes. `adjoint(order, x, operands, x_bar)` returns one
-    cotangent per operand (a pytree, `None` for zero), using solves of the
-    given order. `stats` is a floating vector of solver statistics, whose
-    cotangent is ignored."""
-    if order == 0:
+def implicit(name, solve, adjoint, tangent, order=ORDER):
+    """`solve(*operands) -> (x, stats)` with derivatives of `order` passes
+    (see the module notes; a negative order is the plain `solve`).
+    `adjoint(order, x, operands, x_bar)` returns one cotangent per operand
+    (a pytree, `None` for zero) and `tangent(order, x, operands, tangents)`
+    the tangent of `x` (`None` for zero) for the tangents of the leaves of
+    `operands` (`tree.leaves` order, `None` for a leaf without one), both
+    using solves of the given order. `stats` is a floating vector of solver
+    statistics, whose cotangent is ignored and whose tangent is zero."""
+    if order < 0:
         return solve
-    inner = implicit(name, solve, adjoint, order - 1)
+    inner = implicit(name, solve, adjoint, tangent, order - 1)
     solve.__qualname__ = name
-    rule = custom_vjp(solve)
+    if order == 0:
+
+        def beyond(*operands):
+            return solve(*operands)
+
+        beyond.__qualname__ = f"{name} beyond its supported derivative order"
+        rule = custom_vjp(beyond)
+    else:
+        rule = custom_vjp(solve)
 
     def forward(*operands):
         x, stats = inner(*operands)
@@ -54,6 +78,12 @@ def implicit(name, solve, adjoint, order=ORDER):
         return tuple(adjoint(order - 1, x, operands, cotangents[0]))
 
     rule.defvjp(forward, backward)
+    if order > 0:
+
+        def forward_mode(primals, tangents, outputs):
+            return tangent(order - 1, outputs[0], primals, tangents), None
+
+        rule._defjvp(forward_mode)
     return rule
 
 
@@ -82,6 +112,35 @@ def args_vjp(function, args, cotangent):
     for position, gradient in zip(positions, gradients):
         full[position] = gradient
     return tuple(structure.unflatten(full))
+
+
+def args_jvp(function, args, tangents):
+    """The tangent of `function(*args)` (a tuple `args`) for the tangents of
+    the leaves of `args` (`tree.leaves` order, `None` for a leaf without
+    one), or `None` when no array leaf has a tangent."""
+    leaves, structure = tree.flatten(args)
+    positions = [
+        position
+        for position, leaf in enumerate(leaves)
+        if isinstance(leaf, (Tensor, TraceTensor))
+        and leaf.dtype != bool_
+        and tangents[position] is not None
+    ]
+    if not positions:
+        return None
+
+    def of_leaves(*selected):
+        full = list(leaves)
+        for position, value in zip(positions, selected):
+            full[position] = value
+        return function(*structure.unflatten(full))
+
+    _, output_tangent = jvp(
+        of_leaves,
+        tuple(leaves[position] for position in positions),
+        tuple(tangents[position] for position in positions),
+    )
+    return output_tangent
 
 
 def split_args(args):

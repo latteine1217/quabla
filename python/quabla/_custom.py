@@ -42,6 +42,7 @@ __all__ = ["checkpoint", "custom_jvp", "custom_vjp", "remat"]
 _RESIDUAL_PREFIX = "__quabla_residual/"
 _COTANGENT_PREFIX = "__quabla_cotangent/"
 _TANGENT_PREFIX = "__quabla_tangent/"
+_OUTPUT_PREFIX = "__quabla_output/"
 
 
 def _name(fun):
@@ -258,12 +259,27 @@ class custom_vjp:
         self.nondiff_argnums = tuple(nondiff_argnums)
         self.fwd = None
         self.bwd = None
+        self._jvp = None
 
     def defvjp(self, fwd, bwd):
         if not callable(fwd) or not callable(bwd):
             raise TypeError("defvjp expects callables fwd and bwd")
         self.fwd = fwd
         self.bwd = bwd
+
+    def _defjvp(self, jvp):
+        """Also gives the function a forward-mode rule (private; the implicit
+        solvers use it). `jvp(*nondiff_args, primals, tangents, outputs)`
+        returns the output tangents with the structure of the outputs
+        (`None` for zero), linear in the tangents: `primals` are the
+        differentiable arguments, `tangents` a tuple with one tangent per
+        leaf of `primals` in `tree.leaves` order (`None` for a leaf without
+        one), and `outputs` the function's outputs at `primals`, so the rule
+        does not recompute them. Reverse mode still applies `fwd` and `bwd`,
+        and `jacobian` and `hessian` keep choosing reverse mode."""
+        if not callable(jvp):
+            raise TypeError("_defjvp expects a callable")
+        self._jvp = jvp
 
     def __call__(self, *args):
         what = f"custom_vjp function {_name(self.fun)}"
@@ -365,6 +381,12 @@ class custom_vjp:
                     f"the cotangent bwd of {what} returns for {call.names[position]}",
                 )
             )
+        if self._jvp is None:
+            tangent, tangent_names, tangent_outputs, output_names = None, [], [], []
+        else:
+            tangent, tangent_names, tangent_outputs, output_names = _trace_output_tangent(
+                call, staged, wrapped, what, self._jvp
+            )
         return TensorTraceGraph._custom_rule(
             what,
             forward.graph,
@@ -375,11 +397,68 @@ class custom_vjp:
             residual_names,
             cotangent_names,
             backward_outputs,
-            None,
-            [],
-            [],
+            tangent,
+            tangent_names,
+            tangent_outputs,
             False,
+            output_names=output_names,
+            prefer_reverse=True,
         )
+
+
+def _trace_output_tangent(call, staged, wrapped, what, rule):
+    """The forward-mode graph of a `custom_vjp._defjvp` rule: inputs named
+    like the primal graph's, one tangent input per floating-point operand,
+    and one input per wrapped output (bound to the call's outputs); returns
+    `(graph, tangent_names, tangent_outputs, output_names)`."""
+    operands = _operand_positions(call)
+    leaves = list(call.leaves)
+    names = list(call.names)
+    tangent_names = []
+    for position, leaf in enumerate(call.leaves):
+        if position in operands and leaf.dtype != bool_:
+            name = f"{_TANGENT_PREFIX}{call.names[position]}"
+            leaves.append(_Aval(leaf.shape, leaf.dtype))
+            names.append(name)
+            tangent_names.append(name)
+        else:
+            if position in operands:
+                tangent_names.append(None)
+            leaves.append(_Static(None))
+            names.append(None)
+    output_names = []
+    wrapped_set = set(wrapped)
+    for position, output in enumerate(staged.outputs):
+        if position in wrapped_set:
+            name = f"{_OUTPUT_PREFIX}{len(output_names)}"
+            leaves.append(_Aval(output.shape, output.dtype))
+            names.append(name)
+            output_names.append(name)
+        else:
+            leaves.append(_Static(output))
+            names.append(None)
+    nondiff = call.nondiff_values
+    flat = (tuple, tuple([_LEAF] * len(call.leaves)))
+    tangent = _trace(
+        lambda primals, tangents, outputs: rule(*nondiff, primals, tangents, outputs),
+        (tuple, (call.in_node, flat, staged.out_node)),
+        leaves,
+        names,
+    )
+    _reject_captures(tangent, what, "JVP rule")
+    tangent_leaves = _match_leaves(
+        tangent.out_node, staged.out_node, iter(tangent.outputs), f"the tangent output of {what}"
+    )
+    tangent_outputs = [
+        _as_graph_leaf(
+            tangent.graph,
+            tangent_leaves[position],
+            staged.outputs[position],
+            f"the tangent output of {what}",
+        )
+        for position in wrapped
+    ]
+    return tangent.graph, tangent_names, tangent_outputs, output_names
 
 
 class custom_jvp:

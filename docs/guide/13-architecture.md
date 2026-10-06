@@ -147,7 +147,12 @@ for evaluation. Its `TensorCustomRule` carries the forward graph (outputs and
 residuals), the backward graph, an optional tangent graph, and a
 `rematerialize` flag for `checkpoint`. The symbolic transforms splice these
 graphs in place of differentiating `value`; plan compilation aliases the
-node to `value`, so no custom node reaches a backend.
+node to `value`. Region bodies are the exception: they are compiled with
+`compile_region`, which keeps their `Custom` nodes, because a region's
+derivatives are built from its frozen body later, so the loop JVP, VJP,
+and HVP of a body that calls a function with a custom rule are those of
+the rule. Every backend evaluates a `Custom` node in a region body as the
+identity on its value, as it does `stop_gradient`.
 
 ## 13.4 Autodiff
 
@@ -186,8 +191,15 @@ The reverse pass of a loop needs every carry. `TensorCarryCheckpoints` stores
 one carry per block of about `sqrt(T)` iterations during the forward pass,
 then re-runs each block forward and consumes it in reverse. Short loops keep
 the full tape. Reverse mode through `While` is rejected because its trip
-count is not fixed. Reverse-over-reverse through loop regions is rejected;
-forward-over-reverse (`ForiVjpJvp`, `ScanVjpJvp`) is supported.
+count is not fixed. Forward-over-reverse is `ForiVjpJvp`/`ScanVjpJvp`.
+Reverse mode over a `ForiVjp` group, the gradient `G(x, g) = J(x)^T g` of
+`g . Phi(x)`, needs no new kind: for cotangents `u` on the gradients,
+`(dG/dx)^T u = H u = (dG/dx) u` by the symmetry of the Hessian, a
+`ForiVjpJvp` in the direction `u`, and `(dG/dg)^T u = J u`, a `ForiJvp`
+(`ScanVjp` alike, with the scan's forward mode). Reverse mode over a
+`ForiJvp` is a `ForiVjp` and a `ForiVjpJvp` the same way. The derivatives
+of `ForiVjpJvp`/`ScanVjpJvp` (third order) and the forward mode of a
+`ForiJvp` are not implemented.
 
 ## 13.5 Batching (`vmap`)
 

@@ -307,15 +307,181 @@ def test_checkpoint_higher_order_forward_mode_and_static_arguments():
     assert_close(qb.grad(lambda v: h(v, 3))(x), [3.0 * 0.09, 3.0 * 0.49])
 
 
-def test_custom_rules_inside_control_flow_bodies_raise():
-    def body(i, carry):
-        return log1pexp(carry)
+# -- custom rules inside control-flow bodies ------------------------------------
 
+
+@qb.custom_jvp
+def tripled(x):
+    return qb.sin(x)
+
+
+@tripled.defjvp
+def tripled_jvp(primals, tangents):
+    # Deliberately not the derivative of sin, so a test can tell the rule
+    # from the derivative of the function.
+    (x,), (t,) = primals, tangents
+    return qb.sin(x), 3.0 * t
+
+
+@qb.custom_vjp
+def tripled_back(x):
+    return qb.sin(x)
+
+
+tripled_back.defvjp(lambda x: (qb.sin(x), x), lambda x, g: (3.0 * g,))
+
+
+def custom_region_losses(rule, unroll):
+    """Losses whose control-flow bodies call `rule`, by region kind; the
+    `fori_loop` and `scan` bodies run as regions or unrolled."""
+
+    def looped(x):
+        return qb.fori_loop(
+            0, 3, lambda i, c, x: 0.5 * c + rule(x * c), x, operands=(x,), unroll=unroll
+        ).sum()
+
+    def scanned(x):
+        carry, outputs = qb.scan(
+            lambda c, i, x: (0.5 * c + rule(x * c), rule(c)),
+            x,
+            length=3,
+            operands=(x,),
+            unroll=unroll,
+        )
+        return carry.sum() + outputs.sum()
+
+    def branchy(x):
+        return qb.cond(x.sum() > 0, lambda x: rule(x) * x, lambda x: x * x, x).sum()
+
+    def nested(x):
+        # A custom call inside a cond inside a fori_loop.
+        def body(i, c, x):
+            return qb.cond(c.sum() > 0, lambda c, x: rule(c * x), lambda c, x: c - x, c, x)
+
+        return qb.fori_loop(0, 3, body, x, operands=(x,), unroll=unroll).sum()
+
+    return {"fori": looped, "scan": scanned, "cond": branchy, "cond in fori": nested}
+
+
+def test_custom_rules_inside_control_flow_bodies_use_the_rule():
+    x = qb.array([0.3, 0.5])
+    # Closed forms: each of 3 iterations adds rule(x), whose derivative is
+    # the rule's 3, not cos(x).
+    for rule in (tripled, tripled_back):
+
+        def accumulate(x, rule=rule):
+            return qb.fori_loop(0, 3, lambda i, c, x: c + rule(x), x, operands=(x,)).sum()
+
+        assert_close(accumulate(x), qb.sum(x + 3.0 * qb.sin(x)), 1e-14)
+        assert_close(qb.grad(accumulate)(x), [10.0, 10.0], 1e-14)
+        assert_close(qb.jit(qb.grad(accumulate))(x), [10.0, 10.0], 1e-14)
+    assert_close(qb.jvp(lambda x: qb.fori_loop(0, 3, lambda i, c, x: c + tripled(x), x, operands=(x,)), (x,), (qb.ones_like(x),))[1], [10.0, 10.0], 1e-14)
+    # Regions match the unrolled loops, which apply the rule as top-level
+    # calls do: reverse mode for both rules, forward mode for custom_jvp.
+    for rule in (tripled, tripled_back):
+        regions = custom_region_losses(rule, False)
+        unrolled = custom_region_losses(rule, True)
+        for kind, loss in regions.items():
+            assert_close(loss(x), unrolled[kind](x), 1e-14)
+            assert_close(qb.grad(loss)(x), qb.grad(unrolled[kind])(x), 1e-13)
+            assert_close(qb.jit(qb.grad(loss))(x), qb.grad(unrolled[kind])(x), 1e-13)
+            if rule is tripled:
+                direction = qb.array([1.0, -2.0])
+                assert_close(
+                    qb.jvp(loss, (x,), (direction,))[1],
+                    qb.jvp(unrolled[kind], (x,), (direction,))[1],
+                    1e-13,
+                )
+            else:
+                raises(
+                    ValueError,
+                    lambda loss=loss: qb.jvp(loss, (x,), (qb.ones_like(x),)),
+                    match="defines only a reverse-mode rule",
+                )
+
+
+def test_custom_rules_in_loop_bodies_fix_a_nan_gradient():
+    # The carry reaches 0, where the naive derivative of sin(x) / x is NaN;
+    # sinc's rule keeps every derivative of the loop finite.
+    def loss(w, rule):
+        return qb.fori_loop(0, 4, lambda i, c, w: rule(c * w), w, operands=(w,)).sum()
+
+    w = qb.array([0.0, 0.7])
+    naive = qb.grad(lambda w: loss(w, sinc.fun))(w).tolist()
+    assert math.isnan(naive[0])
+    gradient = qb.grad(lambda w: loss(w, sinc))(w)
+    unrolled = qb.grad(
+        lambda w: qb.fori_loop(0, 4, lambda i, c, w: sinc(c * w), w, operands=(w,), unroll=True).sum()
+    )(w)
+    assert all(math.isfinite(value) for value in gradient.tolist())
+    assert_close(gradient, unrolled, 1e-13)
+
+
+def test_second_derivatives_of_loops_with_custom_rules():
+    # Consistent rules (sinc's custom_jvp, a checkpointed body) give the
+    # second derivatives of the unrolled loop and of finite differences.
+    def loss(w, unroll):
+        def body(i, c, w):
+            return qb.checkpoint(lambda c, w: sinc(c * w) + 0.25 * c)(c, w)
+
+        return qb.fori_loop(0, 3, body, w, operands=(w,), unroll=unroll).sum()
+
+    w = qb.array([0.4, -0.9, 1.3])
+    v = qb.array([0.5, 0.2, -1.0])
+    hessian = qb.hessian(lambda w: loss(w, False))(w)
+    assert_close(hessian, qb.hessian(lambda w: loss(w, True))(w), 1e-12)
+    hvp = qb.jvp(qb.grad(lambda w: loss(w, False)), (w,), (v,))[1]
+    assert_close(hvp, (hessian @ v.reshape([3, 1])).reshape([3]), 1e-12)
+    # Central differences of the gradient.
+    step = 1e-5
+    gradient = qb.grad(lambda w: loss(w, False))
+    difference = (gradient(w + step * v) - gradient(w - step * v)) / (2.0 * step)
+    assert_close(hvp, difference, 1e-8)
+    # Reverse over reverse (the VJP of the loop's VJP) gives the same.
+    assert_close(qb.vjp(gradient, w)[1](v)[0], hvp, 1e-12)
+
+
+def test_hessian_through_a_loop_needs_the_body_forward_mode():
+    # Reverse mode over a loop's reverse pass differentiates the body in
+    # forward mode, which a custom_vjp function without a forward-mode rule
+    # does not have.
+    def loss(x):
+        return qb.fori_loop(0, 3, lambda i, c, x: 0.5 * c + tripled_back(x * c), x, operands=(x,)).sum()
+
+    x = qb.array([0.3, 0.5])
+    raises(ValueError, qb.hessian(loss), x, match="reverse mode over a loop's reverse pass")
+    raises(ValueError, qb.hessian(loss), x, match="defines only a reverse-mode rule")
+
+
+def test_vmap_of_loops_with_custom_rules_matches_per_example_calls():
+    xs = qb.array([[0.3, 0.5], [1.1, -0.4], [-0.6, 0.2]])
+    for rule in (tripled, tripled_back):
+        for kind, loss in custom_region_losses(rule, False).items():
+            for transform in (lambda f: f, qb.grad):
+                batched = qb.vmap(transform(loss))(xs)
+                for index in range(3):
+                    assert_close(batched[index], transform(loss)(xs[index]), 1e-13)
+
+
+def test_while_loop_bodies_apply_custom_jvp_rules():
+    # Forward mode through a while_loop body uses the rule (3 per
+    # iteration, not cos(x)); it used to differentiate the function.
+    def grow(x, rule):
+        return qb.while_loop(lambda c, x: c.sum() < 3.0, lambda c, x: c + rule(x), x, operands=(x,))
+
+    x = qb.array([0.3, 0.5])
+    trips = 0
+    carry = x.tolist()
+    while sum(carry) < 3.0:
+        carry = [c + math.sin(value) for c, value in zip(carry, x.tolist())]
+        trips += 1
+    value, tangent = qb.jvp(lambda x: grow(x, tripled), (x,), (qb.ones_like(x),))
+    assert_close(value, carry, 1e-14)
+    assert_close(tangent, [1.0 + 3.0 * trips] * 2, 1e-14)
     raises(
         ValueError,
-        qb.grad(lambda x: qb.fori_loop(0, 2, body, x)),
-        qb.array(0.5),
-        match="custom differentiation rule",
+        lambda: qb.jvp(lambda x: grow(x, tripled_back), (x,), (qb.ones_like(x),)),
+        match="defines only a reverse-mode rule",
     )
 
 
@@ -335,6 +501,36 @@ def test_custom_rules_on_devices_match_cpu():
             for got, want in zip(actual, expected):
                 assert_close(got, want, 1e-5)
 
+
+
+def test_custom_rules_inside_control_flow_on_devices_match_cpu():
+    precisions = {"mlx": (None,), "cuda": (None, "float64")}
+    runs = [(device, precision) for device in devices(*precisions) for precision in precisions[device]]
+    for device, precision in runs:
+        dtype = qb.float64 if precision == "float64" else qb.float32
+        tolerance = 1e-11 if precision == "float64" else 2e-5
+        options = {"device": device}
+        if precision is not None:
+            options["precision"] = precision
+        x = qb.array([0.3, 0.5], dtype=dtype)
+        xs = qb.array([[0.3, 0.5], [1.1, -0.4]], dtype=dtype)
+        direction = qb.array([1.0, -2.0], dtype=dtype)
+        functions = []
+        for rule in (tripled, tripled_back):
+            for loss in custom_region_losses(rule, False).values():
+                functions.append((loss, x))
+                functions.append((qb.grad(loss), x))
+                functions.append((qb.vmap(qb.grad(loss)), xs))
+                if rule is tripled:
+                    functions.append((lambda x, loss=loss: qb.jvp(loss, (x,), (direction,)), x))
+                    functions.append((qb.hessian(loss), x))
+        for function, argument in functions:
+            expected = qb.tree.leaves(qb.jit(function)(argument))
+            actual = qb.tree.leaves(qb.jit(function, **options)(argument))
+            for got, want in zip(actual, expected):
+                assert got.dtype == want.dtype
+                scale = max([1.0] + [abs(value) for value in want.to_flat_list()])
+                assert_close(got, want, tolerance * scale)
 
 if __name__ == "__main__":
     run(globals())

@@ -5081,6 +5081,7 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
             | TensorOp::SqrtDerivative { .. }
             | TensorOp::Powi { .. }
             | TensorOp::StopGradient { .. }
+            | TensorOp::Custom { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
             TensorOp::UnaryMath { kind, .. } if kind.cuda_loop_lowerable() => {}
@@ -5170,6 +5171,7 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
             | TensorOp::SqrtDerivative { .. }
             | TensorOp::Powi { .. }
             | TensorOp::StopGradient { .. }
+            | TensorOp::Custom { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
             TensorOp::UnaryMath { kind, .. } if kind.cuda_loop_lowerable() => {}
@@ -5383,11 +5385,12 @@ fn cuda_fori_body_expression_inner(
         }
         TensorOp::ScalarConstant { value } => Ok(cuda_scalar_literal(*value)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
-        // already run, so stop_gradient is the identity too.
+        // already run, so stop_gradient and a custom rule node are the identity too.
         TensorOp::Broadcast { input }
         | TensorOp::Reshape { input }
         | TensorOp::Cast { input }
-        | TensorOp::StopGradient { input } => child(*input),
+        | TensorOp::StopGradient { input }
+        | TensorOp::Custom { value: input, .. } => child(*input),
         op => cuda_loop_formula(op, child)?.ok_or_else(|| {
             format!(
                 "CUDA Fori body {} is not elementwise-lowerable",
@@ -5507,11 +5510,12 @@ fn cuda_scan_body_expression_in_half_inner(
         }
         TensorOp::ScalarConstant { value } => Ok(cuda_scalar_literal(*value)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
-        // already run, so stop_gradient is the identity too.
+        // already run, so stop_gradient and a custom rule node are the identity too.
         TensorOp::Broadcast { input }
         | TensorOp::Reshape { input }
         | TensorOp::Cast { input }
-        | TensorOp::StopGradient { input } => child(*input),
+        | TensorOp::StopGradient { input }
+        | TensorOp::Custom { value: input, .. } => child(*input),
         // The lowerability check restricts slices to one packed half of a
         // carry-shaped value, so the slice reads that half at the same lane.
         TensorOp::Slice { input, start, .. } => {
@@ -5621,11 +5625,12 @@ fn cuda_elementwise_plan_expression_with_index_inner(
         },
         TensorOp::ScalarConstant { value } if value.is_finite() => Ok(cuda_scalar_literal(*value)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
-        // already run, so stop_gradient is the identity too.
+        // already run, so stop_gradient and a custom rule node are the identity too.
         TensorOp::Broadcast { input }
         | TensorOp::Reshape { input }
         | TensorOp::Cast { input }
-        | TensorOp::StopGradient { input } => child(*input),
+        | TensorOp::StopGradient { input }
+        | TensorOp::Custom { value: input, .. } => child(*input),
         op => cuda_loop_formula(op, child)?.ok_or_else(|| {
             format!(
                 "CUDA Fori VJP body uses unsupported {} operation",

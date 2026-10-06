@@ -179,9 +179,12 @@ qb.vmap(total)(qb.array([1.0, 2.0]))               # [60., 30.]
 
 Other rules:
 
-- Reverse mode composes twice (`grad(grad(...))`, reverse-mode `jacobian`
-  and `hessian`). Forward mode (`jvp`) is not supported. `x0` gets no
-  gradient.
+- Forward mode uses the same theorem: `jvp` solves one tangent system,
+  `x_dot = A^-1 (b_dot - A_dot x)`, and `vmap` of `jvp` gives a forward-mode
+  Jacobian. Every combination of two derivative passes uses the rules
+  (`grad(grad(...))`, `jvp(grad(...))`, `jvp(jvp(...))`, `hessian`), and so
+  does a third reverse pass; a third pass involving forward mode raises.
+  `jacobian` and `hessian` use reverse mode. `x0` gets no derivative.
 - Eagerly the solver runs in Python; under `jit` it is one `while_loop`
   region that stops at convergence: `||b - A x|| <= max(tol * ||b||, atol)`
   for the linear solvers.
@@ -190,7 +193,9 @@ Other rules:
 - An eager solve that does not converge raises `RuntimeError`. Under `jit`
   it cannot raise; pass `info=True` to get `iterations`, `residual_norm`,
   and `success` (per example under `vmap`).
-- A solver cannot run inside a `cond`, `fori_loop`, or `scan` body.
+- A solver may run inside `cond`, `fori_loop`, `scan`, and `while_loop`
+  bodies, such as an implicit time step in a `fori_loop`; the loop's
+  derivatives apply the solver's rules.
 
 `gmres` is restarted, right-preconditioned GMRES with a twice-applied
 classical Gram-Schmidt Arnoldi process:

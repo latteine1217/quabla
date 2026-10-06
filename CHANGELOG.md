@@ -9,7 +9,53 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Added
+
+- `custom_vjp`, `custom_jvp`, and `checkpoint` functions may be called
+  inside `cond`, `fori_loop`, `scan`, and `while_loop` bodies, nested to any
+  depth; this used to raise `ValueError` (`while_loop` bodies were accepted
+  but their rules ignored, see Fixed). A compiled region body keeps the
+  custom rule nodes of the functions it calls, so the region's derivatives
+  (loop JVP, VJP, and Hessian-vector products, and `vmap` of them) apply the
+  rules exactly as `unroll=True` does. Values are evaluated on CPU, MLX,
+  and CUDA (fused, host-driven, and graph-replayed loops) as before; a
+  custom rule node is the identity on its value, like `stop_gradient`.
+- Forward mode for `linalg.cg`, `linalg.gmres`, and `newton`: `jvp` used
+  to raise. The tangent follows the implicit function theorem at the
+  computed solution, as the gradient does: one more solve, `x_dot = A^-1
+  (b_dot - A_dot x)` with the same Krylov method for the linear solvers and
+  `x_dot = -J^-1 (df/dargs) args_dot` with the dense Jacobian at the root
+  for `newton`. Every combination of two derivative passes now uses the
+  rules (`jvp(grad(...))`, `grad` of `jvp`, `jvp(jvp(...))`, and `vmap` of
+  them, which gives forward-mode Jacobians), and a third reverse pass
+  (`grad(grad(grad(...)))`) works too; a third pass involving forward mode
+  raises instead of differentiating the iterations. Each solver keeps its
+  `custom_vjp` rule and gains a forward-mode rule beside it, so every
+  reverse-mode result is unchanged, and `jacobian` and `hessian` of a
+  solution still use reverse mode.
+- Reverse mode over a loop's reverse pass: `grad(grad(f))` with a
+  `fori_loop` or `scan` inside `f`, `hessian` of a function that calls a
+  `custom_vjp` solver after a loop (for example `newton` with `args`
+  computed by `odeint`) or inside one (an implicit time stepper calling
+  `linalg.cg` every step), and `grad` of a `jvp` through a `fori_loop`
+  used to raise "symbolic VJP through a Fori VJP (or JVP) result is not
+  implemented". For the gradient `G = J^T g` of a loop `Phi` with output
+  cotangent `g`, the reverse pass with cotangents `u` is `H u`, by the
+  symmetry of the Hessian the existing forward-over-reverse loop in the
+  direction `u`, and `J u`, the loop's forward mode; reverse mode over a
+  loop JVP uses the same two. So it reuses the loop derivatives and their
+  checkpointing on every backend and composes with `vmap`; the loop body
+  needs a forward-mode rule (a `custom_vjp` function without one raises).
+  Forward mode over a `fori_loop` JVP and third derivatives through loops
+  still raise.
+
 ### Changed
+
+- Staging a `linalg.cg`, `linalg.gmres`, or `newton` call (the first call
+  of a `jit` function, or of a transform) traces the solver's new
+  forward-mode rules too: about 3 to 6 times longer than before for the
+  Krylov solvers (a float64 `gmres` of size 8 under `jit`: 7 ms before, 29
+  ms after), with no change to the compiled plans' run time.
 
 - Eager `Tensor` ops no longer carry their own numerics: each evaluates
   the Tensor IR nodes that a trace of it records with the core's CPU
@@ -150,6 +196,18 @@ deprecated names keep working until 1.0 (see
   cuSOLVER handles, which synchronizes the device and invalidated a graph
   recording in progress; the loop then silently fell back to launching every
   kernel from the host. Handle destruction now waits for running recordings.
+- Forward-over-reverse derivatives (`hessian`, `jvp(grad(f))`) of a
+  `float32` function whose `cond` result is the loss raised `ValueError:
+  conditional binds "..._tangent_..." of dtype f64 to a region input of
+  dtype f32`; `float64` worked. The forward-mode tangent of a scalar
+  constant, such as the ones seed of `grad` that the reverse-mode `cond`
+  binds as a capture, was a `float64` zero whatever the constant's dtype;
+  it now has the constant's dtype. Values are unchanged where it worked.
+- A `while_loop` body that called a `custom_jvp`, `custom_vjp`, or
+  `checkpoint` function was differentiated (in forward mode) through the
+  function instead of its rule: the compiled body dropped the rule. Forward
+  mode now applies a `custom_jvp` rule, and raises for a `custom_vjp`
+  function without a forward-mode rule, as it does outside a loop.
 
 ## [0.5.0] - 2026-10-06
 
