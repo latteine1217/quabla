@@ -10,6 +10,8 @@ mod linalg;
 pub use linalg::{evaluate_eager as evaluate_linalg, LinalgKind};
 mod custom;
 pub use custom::{TensorCustomRule, TensorCustomTangent};
+mod device_optimizer;
+pub use device_optimizer::{DeviceOptimizerConfig, DeviceUpdateRule};
 mod elementwise;
 pub use elementwise::UnaryMathKind;
 mod host_storage;
@@ -111,6 +113,17 @@ impl MlxAdamPlan {
         _beta1: f32,
         _beta2: f32,
         _epsilon: f32,
+    ) -> Result<Self, String> {
+        Err("MLX backend is unavailable: build Quabla on macOS with --features mlx".to_string())
+    }
+
+    pub fn with_config(
+        _plan: TensorExecutionPlan,
+        _loss_node_id: usize,
+        _gradient_node_ids: BTreeMap<String, usize>,
+        _inputs: &BTreeMap<String, DynamicTensor>,
+        _retained_input_names: impl IntoIterator<Item = String>,
+        _config: DeviceOptimizerConfig,
     ) -> Result<Self, String> {
         Err("MLX backend is unavailable: build Quabla on macOS with --features mlx".to_string())
     }
@@ -384,6 +397,24 @@ impl<T> CudaExecutionPlan<T> {
         _beta2: f32,
         _epsilon: f32,
     ) -> Result<(), String> {
+        Err(format!(
+            "CUDA backend is unavailable for device {}: build Quabla on Linux with --features cuda",
+            self.device_ordinal
+        ))
+    }
+
+    pub fn optimizer_step(
+        &self,
+        _gradients: &BTreeMap<String, TensorNodeId>,
+        _config: &DeviceOptimizerConfig,
+    ) -> Result<(), String> {
+        Err(format!(
+            "CUDA backend is unavailable for device {}: build Quabla on Linux with --features cuda",
+            self.device_ordinal
+        ))
+    }
+
+    pub fn nonfinite_clip_seen(&self) -> Result<bool, String> {
         Err(format!(
             "CUDA backend is unavailable for device {}: build Quabla on Linux with --features cuda",
             self.device_ordinal

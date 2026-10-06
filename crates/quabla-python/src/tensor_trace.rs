@@ -8,11 +8,11 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use quabla_core::tensor_ir::{
     BatchingError, CudaBackend, CudaDataParallelExecutionPlan, CudaDataParallelTiming,
-    CudaExecutionPlan, DynamicTensor, MlxAdamPlan, MlxBackend, MlxRetainedInputs,
-    SymbolicCotangent, TensorBackend, TensorComparison, TensorCondExecutionPlan, TensorCustomRule,
-    TensorCustomTangent, TensorDType, TensorExecutionPlan, TensorForiExecutionPlan, TensorIr,
-    TensorNodeId, TensorRegion, TensorReplicaReduction, TensorScanExecutionPlan,
-    TensorWhileExecutionPlan, UnaryMathKind,
+    CudaExecutionPlan, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, MlxAdamPlan,
+    MlxBackend, MlxRetainedInputs, SymbolicCotangent, TensorBackend, TensorComparison,
+    TensorCondExecutionPlan, TensorCustomRule, TensorCustomTangent, TensorDType,
+    TensorExecutionPlan, TensorForiExecutionPlan, TensorIr, TensorNodeId, TensorRegion,
+    TensorReplicaReduction, TensorScanExecutionPlan, TensorWhileExecutionPlan, UnaryMathKind,
 };
 use quabla_core::{
     QuablaCompiler, QuablaExecutable, QuablaMultiOutputExecutable, QuablaMultiOutputProgram,
@@ -149,10 +149,7 @@ pub struct TensorCudaAdamOptimizer {
     frozen_parameters: BTreeMap<String, DynamicTensor>,
     inputs: BTreeMap<String, DynamicTensor>,
     retained_inputs: BTreeSet<String>,
-    learning_rate: f32,
-    beta1: f32,
-    beta2: f32,
-    epsilon: f32,
+    config: DeviceOptimizerConfig,
 }
 
 #[pyclass(name = "TensorMlxAdamOptimizer", unsendable, skip_from_py_object)]
@@ -164,8 +161,65 @@ pub struct TensorMlxAdamOptimizer {
 
 #[derive(Clone, Debug)]
 struct SharedCudaAdamPlan {
-    plan: TensorCudaExecutionPlan,
+    plan: CudaTrainingPlan,
     gradient_node_ids: BTreeMap<String, TensorNodeId>,
+}
+
+/// The value-and-gradient plan of a device trainer in its element type: the
+/// default float32 lowering, or the opt-in float64 one that keeps parameters
+/// and optimizer moments in double on the device.
+#[derive(Clone, Debug)]
+enum CudaTrainingPlan {
+    Float32(CudaExecutionPlan),
+    Float64(CudaExecutionPlan<f64>),
+}
+
+macro_rules! with_cuda_training_plan {
+    ($plan:expr, $inner:ident => $body:expr) => {
+        match $plan {
+            CudaTrainingPlan::Float32($inner) => $body,
+            CudaTrainingPlan::Float64($inner) => $body,
+        }
+    };
+}
+
+impl CudaTrainingPlan {
+    fn plan(&self) -> &TensorExecutionPlan {
+        with_cuda_training_plan!(self, plan => plan.plan())
+    }
+
+    fn step(
+        &self,
+        gradient_node_ids: &BTreeMap<String, TensorNodeId>,
+        values: &BTreeMap<String, DynamicTensor>,
+        retained: &BTreeSet<String>,
+        config: &DeviceOptimizerConfig,
+    ) -> Result<(), String> {
+        with_cuda_training_plan!(self, plan => {
+            plan.execute_retaining_without_output(values, retained)?;
+            plan.optimizer_step(gradient_node_ids, config)
+        })
+    }
+
+    fn retained_input_to_host(&self, name: &str) -> Result<DynamicTensor, String> {
+        with_cuda_training_plan!(self, plan => plan.retained_input_to_host(name))
+    }
+
+    fn nonfinite_clip_seen(&self) -> Result<bool, String> {
+        with_cuda_training_plan!(self, plan => plan.nonfinite_clip_seen())
+    }
+
+    fn device_buffer_count(&self) -> Result<usize, String> {
+        with_cuda_training_plan!(self, plan => plan.device_buffer_count())
+    }
+
+    fn execute_primary_retaining(
+        &self,
+        values: &BTreeMap<String, DynamicTensor>,
+        retained: &BTreeSet<String>,
+    ) -> Result<DynamicTensor, String> {
+        with_cuda_training_plan!(self, plan => plan.execute_primary_retaining(values, retained))
+    }
 }
 
 #[pyclass(name = "TensorGradScalarFunction", skip_from_py_object)]
@@ -7417,6 +7471,50 @@ fn compile_cuda_scalar_value_and_grad(
     Ok((plan, loss_node_id, gradient_node_ids))
 }
 
+/// [`compile_cuda_scalar_value_and_grad`] through the checked facade with an
+/// explicit `precision`, as `jit(..., precision=...)` compiles: `float64`
+/// lowers a program with float64 nodes to `f64` device buffers, and a program
+/// without them compiles as the default.
+fn compile_cuda_scalar_value_and_grad_with_precision(
+    py: Python<'_>,
+    loss: &TensorTraceResult,
+    parameter_names: Vec<String>,
+    device_ordinal: usize,
+    precision: QuablaPrecision,
+) -> PyResult<(CudaTrainingPlan, BTreeMap<String, TensorNodeId>)> {
+    use quabla_core::compiler::QuablaCompileError;
+
+    let (program, parameter_names) =
+        build_cuda_scalar_value_and_grad_program(loss, parameter_names)?;
+    let target = QuablaTarget::Cuda { device_ordinal };
+    let executable = QuablaCompiler
+        .compile_many_checked_with_precision(&program, target, precision)
+        .map_err(|error| match error {
+            QuablaCompileError::Unavailable(message) => {
+                crate::errors::device_operation_error(py, message, "Trainer", target.name())
+            }
+            QuablaCompileError::Unsupported { op, message } => {
+                crate::errors::device_operation_error(py, message, &op, target.name())
+            }
+            QuablaCompileError::InvalidProgram(message) | QuablaCompileError::Backend(message) => {
+                PyValueError::new_err(message)
+            }
+        })?;
+    let (_, gradient_node_ids) =
+        value_and_named_outputs(executable.output_node_ids(), parameter_names);
+    let plan = match executable.into_executable() {
+        QuablaExecutable::Cuda(plan) => CudaTrainingPlan::Float32(plan),
+        QuablaExecutable::CudaFloat64(plan) => CudaTrainingPlan::Float64(plan),
+        executable => {
+            return Err(PyValueError::new_err(unexpected_executable(
+                target,
+                &executable,
+            )))
+        }
+    };
+    Ok((plan, gradient_node_ids))
+}
+
 /// Splits the frozen output ids of a program ordered as a value followed by
 /// one gradient per name, as the value-and-gradient and vmap VJP helpers
 /// build them.
@@ -7843,14 +7941,102 @@ pub fn mlx_adam_loss_optimizer(
     beta2: f32,
     epsilon: f32,
 ) -> PyResult<TensorMlxAdamOptimizer> {
+    build_mlx_loss_optimizer(
+        "mlx_adam_loss_optimizer",
+        loss,
+        parameter_names,
+        inputs,
+        retained_input_names,
+        |plan, loss_node_id, gradient_node_ids, values, retained_inputs| {
+            MlxAdamPlan::new(
+                plan,
+                loss_node_id,
+                gradient_node_ids,
+                values,
+                retained_inputs,
+                learning_rate,
+                beta1,
+                beta2,
+                epsilon,
+            )
+        },
+    )
+}
+
+/// The executor behind `quabla.optim.Trainer(..., device="mlx")`: as
+/// `mlx_adam_loss_optimizer` with the full device optimizer configuration
+/// (see `_cuda_trainer_optimizer`). MLX has no float64, so there is no
+/// `precision`; `Trainer` rejects it first. It is private: `Trainer` is the
+/// public entry.
+#[pyfunction]
+#[pyo3(name = "_mlx_trainer_optimizer", signature = (loss, parameter_names, inputs, retained_input_names, optimizer, learning_rate, beta1, beta2, epsilon, weight_decay, clip_norm))]
+#[allow(clippy::too_many_arguments)]
+pub fn mlx_trainer_optimizer(
+    loss: &Bound<'_, PyAny>,
+    parameter_names: Vec<String>,
+    inputs: &Bound<'_, PyDict>,
+    retained_input_names: Vec<String>,
+    optimizer: &str,
+    learning_rate: f64,
+    beta1: f64,
+    beta2: f64,
+    epsilon: f64,
+    weight_decay: f64,
+    clip_norm: Option<f64>,
+) -> PyResult<TensorMlxAdamOptimizer> {
+    let config = trainer_optimizer_config(
+        optimizer,
+        learning_rate,
+        beta1,
+        beta2,
+        epsilon,
+        weight_decay,
+        clip_norm,
+    )?;
+    build_mlx_loss_optimizer(
+        "Trainer",
+        loss,
+        parameter_names,
+        inputs,
+        Some(retained_input_names),
+        |plan, loss_node_id, gradient_node_ids, values, retained_inputs| {
+            MlxAdamPlan::with_config(
+                plan,
+                loss_node_id,
+                gradient_node_ids,
+                values,
+                retained_inputs,
+                config,
+            )
+        },
+    )
+}
+
+/// Compiles the scalar loss and its parameter gradients into one MLX plan
+/// and hands it to `make_plan` with the bound inputs and the retained input
+/// names. `function` names the caller in error messages.
+fn build_mlx_loss_optimizer(
+    function: &str,
+    loss: &Bound<'_, PyAny>,
+    parameter_names: Vec<String>,
+    inputs: &Bound<'_, PyDict>,
+    retained_input_names: Option<Vec<String>>,
+    make_plan: impl FnOnce(
+        TensorExecutionPlan,
+        usize,
+        BTreeMap<String, usize>,
+        &BTreeMap<String, DynamicTensor>,
+        BTreeSet<String>,
+    ) -> Result<MlxAdamPlan, String>,
+) -> PyResult<TensorMlxAdamOptimizer> {
     let loss = if let Ok(loss) = loss.extract::<PyRef<'_, TensorTraceResult>>() {
         loss.clone()
     } else if let Ok(loss) = loss.extract::<PyRef<'_, TraceTensor>>() {
         TensorTraceResult::new(loss.graph.clone(), loss.clone())
     } else {
-        return Err(PyTypeError::new_err(
-            "mlx_adam_loss_optimizer loss must be a TraceTensor or TensorTraceResult",
-        ));
+        return Err(PyTypeError::new_err(format!(
+            "{function} loss must be a TraceTensor or TensorTraceResult"
+        )));
     };
     let (plan, loss_node_id, gradient_node_ids) =
         compile_mlx_scalar_value_and_grad(&loss, parameter_names)?;
@@ -7858,7 +8044,7 @@ pub fn mlx_adam_loss_optimizer(
     let mut values = extract_tensor_map(inputs)?;
     if values.contains_key(MLX_LOSS_COTANGENT_NAME) {
         return Err(PyValueError::new_err(format!(
-            "mlx_adam_loss_optimizer reserves input name {MLX_LOSS_COTANGENT_NAME:?}"
+            "{function} reserves input name {MLX_LOSS_COTANGENT_NAME:?}"
         )));
     }
     values.insert(
@@ -7871,16 +8057,12 @@ pub fn mlx_adam_loss_optimizer(
         .collect::<BTreeSet<_>>();
     retained_inputs.insert(MLX_LOSS_COTANGENT_NAME.to_string());
     retained_inputs.extend(parameter_names.iter().cloned());
-    let plan = MlxAdamPlan::new(
+    let plan = make_plan(
         plan.plan,
         loss_node_id,
         gradient_node_ids,
         &values,
         retained_inputs,
-        learning_rate,
-        beta1,
-        beta2,
-        epsilon,
     )
     .map_err(PyValueError::new_err)?;
     Ok(TensorMlxAdamOptimizer {
@@ -8559,30 +8741,34 @@ fn execute_cuda_adam_step(
     Ok(())
 }
 
-fn execute_shared_cuda_adam_step(
-    shared_plan: &SharedCudaAdamPlan,
-    values: &BTreeMap<String, DynamicTensor>,
-    retained: &BTreeSet<String>,
-    learning_rate: f32,
-    beta1: f32,
-    beta2: f32,
-    epsilon: f32,
-) -> Result<(), String> {
-    shared_plan
-        .plan
-        .plan
-        .execute_retaining_without_output(values, retained)?;
-    for (parameter_name, gradient_node_id) in &shared_plan.gradient_node_ids {
-        shared_plan.plan.plan.adam_step_input_from_node(
-            parameter_name,
-            *gradient_node_id,
-            learning_rate,
-            beta1,
-            beta2,
-            epsilon,
-        )?;
+impl TensorCudaAdamOptimizer {
+    /// Applies AdamW's decoupled decay to the parameters the loss ignores.
+    ///
+    /// Their gradient and moments are zero, so the host update reduces to
+    /// `p - (0 + weight_decay * p) * learning_rate`, evaluated here in float64
+    /// and rounded once, exactly as the CPU trainer does (the `0 +` keeps its
+    /// signed-zero result). Plain Adam and SGD leave them unchanged.
+    fn decay_frozen_parameters(&mut self) -> Result<(), String> {
+        let DeviceUpdateRule::Adam { weight_decay, .. } = self.config.rule else {
+            return Ok(());
+        };
+        if weight_decay == 0.0 {
+            return Ok(());
+        }
+        let learning_rate = self.config.learning_rate;
+        for value in self.frozen_parameters.values_mut() {
+            let decayed = value
+                .data()
+                .iter()
+                .map(|parameter| parameter - (0.0 + weight_decay * parameter) * learning_rate)
+                .collect();
+            *value = DynamicTensor::from_storage(
+                value.shape().to_vec(),
+                quabla_core::tensor_ir::HostTensorStorage::from_f64(decayed, value.dtype()),
+            )?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[pymethods]
@@ -8600,51 +8786,86 @@ impl TensorCudaAdamOptimizer {
         }
         retained_inputs.extend(self.parameter_names.iter().cloned());
         let result = if let Some(shared_plan) = &self.shared_plan {
-            execute_shared_cuda_adam_step(
-                shared_plan,
+            shared_plan.plan.step(
+                &shared_plan.gradient_node_ids,
                 &self.inputs,
                 &retained_inputs,
-                self.learning_rate,
-                self.beta1,
-                self.beta2,
-                self.epsilon,
+                &self.config,
             )
-        } else {
+        } else if let DeviceUpdateRule::Adam {
+            beta1,
+            beta2,
+            epsilon,
+            ..
+        } = self.config.rule
+        {
+            // Per-parameter plans come only from `cuda_adam_optimizer`, which
+            // keeps the v0.1 float32 Adam kernel.
             execute_cuda_adam_step(
                 &self.parameter_plans,
                 &self.inputs,
                 &retained_inputs,
-                self.learning_rate,
-                self.beta1,
-                self.beta2,
-                self.epsilon,
+                self.config.learning_rate as f32,
+                beta1 as f32,
+                beta2 as f32,
+                epsilon as f32,
             )
+        } else {
+            Err("per-parameter CUDA plans support Adam only".to_string())
         };
-        result.map_err(PyValueError::new_err)
+        result.map_err(PyValueError::new_err)?;
+        self.decay_frozen_parameters()
+            .map_err(PyValueError::new_err)
     }
 
     /// Learning rate of the next step; host schedules set it between steps.
     #[getter]
-    fn learning_rate(&self) -> f32 {
-        self.learning_rate
+    fn learning_rate(&self) -> f64 {
+        self.config.learning_rate
     }
 
     #[setter]
-    fn set_learning_rate(&mut self, learning_rate: f32) -> PyResult<()> {
+    fn set_learning_rate(&mut self, learning_rate: f64) -> PyResult<()> {
         if !(learning_rate.is_finite() && learning_rate >= 0.0) {
             return Err(PyValueError::new_err(
                 "CUDA Adam learning_rate must be finite and nonnegative",
             ));
         }
-        self.learning_rate = learning_rate;
+        self.config.learning_rate = learning_rate;
         Ok(())
     }
 
     fn parameters(&self) -> PyResult<BTreeMap<String, PyTensor>> {
+        // A clipped step with a NaN or infinite global norm turns every
+        // gradient into NaN on the CPU, also the zero gradients of the
+        // parameters the loss ignores, which then stay NaN.
+        let poisoned = match &self.shared_plan {
+            Some(shared_plan)
+                if self.config.clip_norm.is_some() && !self.frozen_parameters.is_empty() =>
+            {
+                shared_plan
+                    .plan
+                    .nonfinite_clip_seen()
+                    .map_err(PyValueError::new_err)?
+            }
+            _ => false,
+        };
         let frozen = self.frozen_parameters.iter().map(|(name, value)| {
+            let value = if poisoned {
+                DynamicTensor::from_storage(
+                    value.shape().to_vec(),
+                    quabla_core::tensor_ir::HostTensorStorage::from_f64(
+                        vec![f64::NAN; value.data().len()],
+                        value.dtype(),
+                    ),
+                )
+                .map_err(PyValueError::new_err)?
+            } else {
+                value.clone()
+            };
             Ok((
                 name.clone(),
-                PyTensor::from_dynamic_tensor(value.clone()).map_err(PyValueError::new_err)?,
+                PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)?,
             ))
         });
         if let Some(shared_plan) = &self.shared_plan {
@@ -8653,7 +8874,6 @@ impl TensorCudaAdamOptimizer {
                 .iter()
                 .map(|name| {
                     let value = shared_plan
-                        .plan
                         .plan
                         .retained_input_to_host(name)
                         .map_err(PyValueError::new_err)?;
@@ -8684,7 +8904,6 @@ impl TensorCudaAdamOptimizer {
     fn device_buffer_count(&self) -> PyResult<usize> {
         if let Some(shared_plan) = &self.shared_plan {
             return shared_plan
-                .plan
                 .plan
                 .device_buffer_count()
                 .map_err(PyValueError::new_err);
@@ -8725,7 +8944,6 @@ impl TensorCudaAdamOptimizer {
         retained_inputs.extend(self.parameter_names.iter().cloned());
         let loss = shared_plan
             .plan
-            .plan
             .execute_primary_retaining(&self.inputs, &retained_inputs)
             .map_err(PyValueError::new_err)?;
         PyTensor::from_dynamic_tensor(loss).map_err(PyValueError::new_err)
@@ -8765,10 +8983,12 @@ pub fn cuda_adam_optimizer(
         parameter_names,
         frozen_parameters: BTreeMap::new(),
         inputs: extract_tensor_map(inputs)?,
-        learning_rate,
-        beta1,
-        beta2,
-        epsilon,
+        config: DeviceOptimizerConfig::adam(
+            learning_rate.into(),
+            beta1.into(),
+            beta2.into(),
+            epsilon.into(),
+        ),
     })
 }
 
@@ -8813,7 +9033,7 @@ pub fn cuda_adam_vjp_optimizer(
     Ok(TensorCudaAdamOptimizer {
         parameter_plans: Vec::new(),
         shared_plan: Some(SharedCudaAdamPlan {
-            plan,
+            plan: CudaTrainingPlan::Float32(plan.plan),
             gradient_node_ids,
         }),
         shared_plan_includes_loss: false,
@@ -8821,10 +9041,12 @@ pub fn cuda_adam_vjp_optimizer(
         frozen_parameters: BTreeMap::new(),
         inputs: extract_tensor_map(inputs)?,
         retained_inputs,
-        learning_rate,
-        beta1,
-        beta2,
-        epsilon,
+        config: DeviceOptimizerConfig::adam(
+            learning_rate.into(),
+            beta1.into(),
+            beta2.into(),
+            epsilon.into(),
+        ),
     })
 }
 
@@ -8832,6 +9054,7 @@ pub fn cuda_adam_vjp_optimizer(
 #[pyo3(signature = (loss, parameter_names, inputs, learning_rate, retained_input_names = None, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8, device_ordinal = 0))]
 #[allow(clippy::too_many_arguments)]
 pub fn cuda_adam_loss_optimizer(
+    py: Python<'_>,
     loss: &Bound<'_, PyAny>,
     parameter_names: Vec<String>,
     inputs: &Bound<'_, PyDict>,
@@ -8842,37 +9065,168 @@ pub fn cuda_adam_loss_optimizer(
     epsilon: f32,
     device_ordinal: usize,
 ) -> PyResult<TensorCudaAdamOptimizer> {
+    build_cuda_loss_optimizer(
+        py,
+        "cuda_adam_loss_optimizer",
+        loss,
+        parameter_names,
+        inputs,
+        retained_input_names,
+        DeviceOptimizerConfig::adam(
+            learning_rate.into(),
+            beta1.into(),
+            beta2.into(),
+            epsilon.into(),
+        ),
+        device_ordinal,
+        QuablaPrecision::Default,
+    )
+}
+
+/// The executor behind `quabla.optim.Trainer(..., device="cuda")`.
+///
+/// Unlike `cuda_adam_loss_optimizer` it takes the full device optimizer
+/// configuration (`optimizer` is `"adam"` or `"sgd"`; a nonzero
+/// `weight_decay` makes Adam AdamW) and `jit`'s `precision`, and keeps the
+/// hyperparameters in float64. It is private: `Trainer` is the public entry.
+#[pyfunction]
+#[pyo3(name = "_cuda_trainer_optimizer", signature = (loss, parameter_names, inputs, retained_input_names, optimizer, learning_rate, beta1, beta2, epsilon, weight_decay, clip_norm, precision, device_ordinal))]
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_trainer_optimizer(
+    py: Python<'_>,
+    loss: &Bound<'_, PyAny>,
+    parameter_names: Vec<String>,
+    inputs: &Bound<'_, PyDict>,
+    retained_input_names: Vec<String>,
+    optimizer: &str,
+    learning_rate: f64,
+    beta1: f64,
+    beta2: f64,
+    epsilon: f64,
+    weight_decay: f64,
+    clip_norm: Option<f64>,
+    precision: Option<&str>,
+    device_ordinal: usize,
+) -> PyResult<TensorCudaAdamOptimizer> {
+    let config = trainer_optimizer_config(
+        optimizer,
+        learning_rate,
+        beta1,
+        beta2,
+        epsilon,
+        weight_decay,
+        clip_norm,
+    )?;
+    let precision = match precision {
+        None => QuablaPrecision::Default,
+        Some("float64") => QuablaPrecision::Float64,
+        Some(other) => {
+            return Err(PyValueError::new_err(format!(
+                "precision must be None or \"float64\", got {other:?}"
+            )))
+        }
+    };
+    build_cuda_loss_optimizer(
+        py,
+        "Trainer",
+        loss,
+        parameter_names,
+        inputs,
+        Some(retained_input_names),
+        config,
+        device_ordinal,
+        precision,
+    )
+}
+
+/// The validated device configuration of a `Trainer` optimizer.
+pub(crate) fn trainer_optimizer_config(
+    optimizer: &str,
+    learning_rate: f64,
+    beta1: f64,
+    beta2: f64,
+    epsilon: f64,
+    weight_decay: f64,
+    clip_norm: Option<f64>,
+) -> PyResult<DeviceOptimizerConfig> {
+    let rule = match optimizer {
+        "adam" => DeviceUpdateRule::Adam {
+            beta1,
+            beta2,
+            epsilon,
+            weight_decay,
+        },
+        "sgd" => DeviceUpdateRule::Sgd,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "device optimizer must be \"adam\" or \"sgd\", got {other:?}"
+            )))
+        }
+    };
+    let config = DeviceOptimizerConfig {
+        rule,
+        learning_rate,
+        clip_norm,
+    };
+    config.validate().map_err(PyValueError::new_err)?;
+    Ok(config)
+}
+
+/// Compiles the scalar loss and its parameter gradients into one shared
+/// CUDA plan and wraps it with the optimizer state. `function` names the
+/// caller in error messages.
+#[allow(clippy::too_many_arguments)]
+fn build_cuda_loss_optimizer(
+    py: Python<'_>,
+    function: &str,
+    loss: &Bound<'_, PyAny>,
+    parameter_names: Vec<String>,
+    inputs: &Bound<'_, PyDict>,
+    retained_input_names: Option<Vec<String>>,
+    config: DeviceOptimizerConfig,
+    device_ordinal: usize,
+    precision: QuablaPrecision,
+) -> PyResult<TensorCudaAdamOptimizer> {
     let loss = if let Ok(loss) = loss.extract::<PyRef<'_, TensorTraceResult>>() {
         loss.clone()
     } else if let Ok(loss) = loss.extract::<PyRef<'_, TraceTensor>>() {
         TensorTraceResult::new(loss.graph.clone(), loss.clone())
     } else {
-        return Err(PyTypeError::new_err(
-            "cuda_adam_loss_optimizer loss must be a TraceTensor or TensorTraceResult",
-        ));
+        return Err(PyTypeError::new_err(format!(
+            "{function} loss must be a TraceTensor or TensorTraceResult"
+        )));
     };
-    let (plan, _, mut gradient_node_ids) =
-        compile_cuda_scalar_value_and_grad(&loss, parameter_names, device_ordinal)?;
+    let (plan, mut gradient_node_ids) = if precision == QuablaPrecision::Default {
+        let (plan, _, gradient_node_ids) =
+            compile_cuda_scalar_value_and_grad(&loss, parameter_names, device_ordinal)?;
+        (CudaTrainingPlan::Float32(plan.plan), gradient_node_ids)
+    } else {
+        compile_cuda_scalar_value_and_grad_with_precision(
+            py,
+            &loss,
+            parameter_names,
+            device_ordinal,
+            precision,
+        )?
+    };
     let mut values = extract_tensor_map(inputs)?;
     let frozen_names = gradient_node_ids
         .keys()
-        .filter(|name| plan.plan.plan().input_shape(name).is_err())
+        .filter(|name| plan.plan().input_shape(name).is_err())
         .cloned()
         .collect::<Vec<_>>();
     let mut frozen_parameters = BTreeMap::new();
     for name in frozen_names {
         gradient_node_ids.remove(&name);
         let value = values.get(&name).cloned().ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "cuda_adam_loss_optimizer parameter {name:?} has no value"
-            ))
+            PyValueError::new_err(format!("{function} parameter {name:?} has no value"))
         })?;
         frozen_parameters.insert(name, value);
     }
     let parameter_names = gradient_node_ids.keys().cloned().collect::<BTreeSet<_>>();
     if values.contains_key(CUDA_LOSS_COTANGENT_NAME) {
         return Err(PyValueError::new_err(format!(
-            "cuda_adam_loss_optimizer reserves input name {CUDA_LOSS_COTANGENT_NAME:?}"
+            "{function} reserves input name {CUDA_LOSS_COTANGENT_NAME:?}"
         )));
     }
     values.insert(
@@ -8895,10 +9249,7 @@ pub fn cuda_adam_loss_optimizer(
         frozen_parameters,
         inputs: values,
         retained_inputs,
-        learning_rate,
-        beta1,
-        beta2,
-        epsilon,
+        config,
     })
 }
 

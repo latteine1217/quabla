@@ -658,8 +658,9 @@ compiles as with the default. The argument is a no-op on the CPU, which
 already runs float64 natively, raises `UnsupportedOperationError` on MLX,
 which has no float64 arithmetic, and is part of the trace-cache
 configuration, so the two precisions never share a compiled program. Other
-values than `None` and `"float64"` are `ValueError`. `qb.optim.Trainer` and
-the NCCL data-parallel paths keep float32 device execution.
+values than `None` and `"float64"` are `ValueError`. `qb.optim.Trainer`
+takes the same `precision` keyword; the NCCL data-parallel paths keep
+float32 device execution.
 
 `qb.jit(fun).lower(*args)` accepts arrays or `qb.ShapeDtype(shape, dtype)`
 inside pytrees and traces without execution. The lowered object exposes
@@ -725,11 +726,26 @@ its floor of 1, so small PINN losses are not stopped early), `max_iterations`,
 `max_evaluations`, or `line_search_failed` (usual at the float32 resolution
 limit).
 
-`qb.optim.Trainer(loss, params, optimizer, *data, device="cpu", batch_argnums=())`
-traces `loss(params, *data)`. CPU supports Adam, AdamW, and SGD, with
-schedules and `clip_norm`. Devices support Adam with a constant rate or a
-schedule, which sets the native optimizer's `learning_rate` before each step;
-AdamW and `clip_norm` raise `UnsupportedOperationError` on devices.
+`qb.optim.Trainer(loss, params, optimizer, *data, device="cpu", batch_argnums=(), precision=None)`
+traces `loss(params, *data)`. Every device supports Adam, AdamW, and SGD
+with a constant rate or a schedule, and with `clip_norm`. A schedule is
+evaluated on the host and sets the native optimizer's `learning_rate` before
+each step. Device updates follow the CPU definitions in the CPU's operation
+order: AdamW's decay `weight_decay * p` uses the pre-update `p` and is scaled
+by the scheduled rate, and the bias corrections and `1 - beta` are formed in
+float64. `clip_norm` reduces the global norm on the device, without reading
+gradients back: `m * sqrt(sum((g / m) ** 2))` with `m = max |g|` over all
+parameters, accumulated in float64 on CUDA and in float32 on MLX (every term
+is at most one, so neither overflows), then every gradient is scaled by
+`min(1, clip_norm / norm)` before the moment updates. As on the CPU, a zero
+norm leaves the gradients unchanged and a NaN or infinite norm makes every
+parameter NaN. A parameter the loss ignores has a zero gradient: it changes
+only by AdamW's decay, or to NaN after a non-finite clipped norm, as on the
+CPU. Device plans compute in float32 by default and agree with the CPU
+trainer to float32 rounding. `precision="float64"` (validated as in `jit`)
+runs a float64 loss natively on CUDA with float64 parameters and moments,
+agreeing with the CPU to float64 rounding; it is a no-op on the CPU and
+raises `UnsupportedOperationError` on MLX.
 `batch_argnums` indexes data positions, excluding params. `step(*batch)`
 replaces them in the declared order, with unchanged pytree/shapes/dtypes;
 `step()` reuses data without Python flattening on devices. Device parameters
@@ -1576,8 +1592,8 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
   symbolic dimensions.
 - Dtypes are `float32`, `float64`, and `bool`. `float16`/`bfloat16`, integer
   tensors, and mixed-precision training are not implemented. Native device
-  `f64` is opt-in on CUDA through `jit(precision="float64")` and unavailable
-  on MLX and in `Trainer`. Host storage is physically typed F64/F32/Bool; narrow
+  `f64` is opt-in on CUDA through `jit(precision="float64")` and
+  `Trainer(precision="float64")`, and unavailable on MLX. Host storage is physically typed F64/F32/Bool; narrow
   storage widens transiently only when an F64 view is requested.
 - `gather`/`scatter_add` take static Python integer indices; dynamic index
   tensors, boolean-mask indexing, and empty slices are unsupported.
