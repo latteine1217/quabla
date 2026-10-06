@@ -1319,6 +1319,20 @@ thread_local! {
     /// Counts region graph launches, so tests can check that replays happened.
     pub(super) static CUDA_LOOP_GRAPH_LAUNCHES: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// Errors of the region recordings that failed on this thread. A failed
+    /// recording silently falls back to eager runs, which give the same
+    /// results, so tests read these to see that recordings succeed and why
+    /// one did not.
+    pub(super) static CUDA_LOOP_GRAPH_RECORDING_ERRORS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Records why a region recording failed; the region then runs eagerly.
+fn note_recording_failure(error: String) {
+    #[cfg(test)]
+    CUDA_LOOP_GRAPH_RECORDING_ERRORS.with(|errors| errors.borrow_mut().push(error));
+    #[cfg(not(test))]
+    drop(error);
 }
 
 fn find_binding<'b, 'v, T>(
@@ -1667,6 +1681,9 @@ fn capture_region<T: CudaReal>(
     // cuBLAS calls are recorded only when issued on the capture stream. The handle belongs to
     // this region alone and is restored before anything executes on it again.
     set_blas_stream(region, capture)?;
+    // No cuBLAS or cuSOLVER handle is destroyed, on any thread, while this stream captures:
+    // that synchronizes the device and would invalidate the recording.
+    let gate = super::cuda_graph_recording_guard();
     if let Err(error) =
         capture.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
     {
@@ -1686,6 +1703,7 @@ fn capture_region<T: CudaReal>(
     let ended = capture.end_capture(
         sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
     );
+    drop(gate);
     free_buffers.capturing = false;
     set_blas_stream(region, stream)?;
     recorded?;
@@ -1895,7 +1913,10 @@ impl<'a, T: CudaReal> HostRun<'a, T> {
             );
             run.graph = match recorded {
                 Ok(graph) => GraphState::Ready(graph),
-                Err(_) => GraphState::Eager,
+                Err(error) => {
+                    note_recording_failure(error);
+                    GraphState::Eager
+                }
             };
         }
         match &mut run.graph {

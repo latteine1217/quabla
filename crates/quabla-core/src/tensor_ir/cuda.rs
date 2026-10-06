@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 #[cfg(feature = "cuda-nccl")]
@@ -74,7 +76,7 @@ pub struct CudaExecutionPlan<T: CudaReal = f32> {
     device_ordinal: usize,
     context: Arc<CudaContext>,
     module: Arc<CudaModule>,
-    blas: Option<Arc<Mutex<CudaBlas>>>,
+    blas: Option<Arc<Mutex<CudaLibraryHandle<CudaBlas>>>>,
     solver: Option<Arc<Mutex<CudaSolver<T>>>>,
     state: Arc<Mutex<CudaExecutionState<T>>>,
     cond_branches: BTreeMap<TensorNodeId, CudaCondBranches<T>>,
@@ -1792,7 +1794,7 @@ impl CudaBackend {
 struct CudaProgramRuntime<'a, T: CudaReal> {
     stream: &'a Arc<CudaStream>,
     module: &'a Arc<CudaModule>,
-    blas: Option<&'a Arc<Mutex<CudaBlas>>>,
+    blas: Option<&'a Arc<Mutex<CudaLibraryHandle<CudaBlas>>>>,
     solver: Option<&'a Arc<Mutex<CudaSolver<T>>>>,
     cond_branches: &'a BTreeMap<TensorNodeId, CudaCondBranches<T>>,
     host_loops: &'a BTreeMap<TensorNodeId, host_loop::CudaHostLoop<T>>,
@@ -3543,7 +3545,7 @@ struct CudaNodeLaunch<'a, T: CudaReal> {
     count: usize,
     launch_count: u32,
     output_shape: &'a [usize],
-    blas: Option<&'a Arc<Mutex<CudaBlas>>>,
+    blas: Option<&'a Arc<Mutex<CudaLibraryHandle<CudaBlas>>>>,
 }
 
 fn launch_cuda_node<T: CudaReal>(
@@ -4204,18 +4206,78 @@ fn use_cublas_rank_two_matmul(
     lhs_shape.len() == 2 && rhs_shape.len() == 2 && output_shape.len() == 2
 }
 
-fn cuda_blas(stream: Arc<CudaStream>) -> Result<Option<Arc<Mutex<CudaBlas>>>, String> {
+/// Orders CUDA graph recordings (`host_loop::capture_region`) against the
+/// destruction of cuBLAS and cuSOLVER handles.
+///
+/// Destroying either handle synchronizes the device (documented for
+/// `cublasDestroy`; observed for `cusolverDnDestroy`), and synchronizing a
+/// device or context while one of its streams is captured is invalid in every
+/// capture mode: the driver invalidates that capture. Every plan of a process
+/// shares the device's primary context, so a plan dropped on one thread would
+/// otherwise abort a region recording on another, which then silently falls
+/// back to eager runs. Recordings hold the gate shared, handle destruction
+/// exclusively. Creating handles, allocating, freeing, and work on other
+/// streams leave a capture of the non-blocking capture stream valid and are not
+/// gated.
+static CUDA_GRAPH_RECORDING_GATE: RwLock<()> = RwLock::new(());
+
+/// Held while a region is recorded; see `CUDA_GRAPH_RECORDING_GATE`.
+fn cuda_graph_recording_guard() -> RwLockReadGuard<'static, ()> {
+    // The gate guards no data, so a panic while it was held leaves nothing inconsistent.
+    CUDA_GRAPH_RECORDING_GATE
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A cuBLAS or cuSOLVER handle that is destroyed outside every CUDA graph
+/// recording (`CUDA_GRAPH_RECORDING_GATE`).
+#[derive(Debug)]
+struct CudaLibraryHandle<H>(ManuallyDrop<H>);
+
+impl<H> CudaLibraryHandle<H> {
+    fn new(handle: H) -> Self {
+        Self(ManuallyDrop::new(handle))
+    }
+}
+
+impl<H> Deref for CudaLibraryHandle<H> {
+    type Target = H;
+
+    fn deref(&self) -> &H {
+        &self.0
+    }
+}
+
+impl<H> DerefMut for CudaLibraryHandle<H> {
+    fn deref_mut(&mut self) -> &mut H {
+        &mut self.0
+    }
+}
+
+impl<H> Drop for CudaLibraryHandle<H> {
+    fn drop(&mut self) {
+        let _gate = CUDA_GRAPH_RECORDING_GATE
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: `drop` runs once, and the handle is never used after it.
+        unsafe { ManuallyDrop::drop(&mut self.0) }
+    }
+}
+
+fn cuda_blas(
+    stream: Arc<CudaStream>,
+) -> Result<Option<Arc<Mutex<CudaLibraryHandle<CudaBlas>>>>, String> {
     if !cuda_library_available("cublas") {
         return Ok(None);
     }
     CudaBlas::new(stream)
-        .map(|blas| Some(Arc::new(Mutex::new(blas))))
+        .map(|blas| Some(Arc::new(Mutex::new(CudaLibraryHandle::new(blas)))))
         .map_err(|error| format!("failed to initialize cuBLAS: {error:?}"))
 }
 
 #[derive(Debug)]
 struct CudaSolver<T: CudaReal> {
-    handle: DnHandle,
+    handle: CudaLibraryHandle<DnHandle>,
     /// Keyed by `(batch, n, rhs_columns)`.
     workspaces: BTreeMap<(usize, usize, usize), CudaSolveWorkspace<T>>,
 }
@@ -4238,7 +4300,7 @@ fn cuda_solver<T: CudaReal>(
     DnHandle::new(stream)
         .map(|handle| {
             Some(Arc::new(Mutex::new(CudaSolver {
-                handle,
+                handle: CudaLibraryHandle::new(handle),
                 workspaces: BTreeMap::new(),
             })))
         })
@@ -4744,7 +4806,7 @@ fn launch_cusolver_linalg<T: CudaReal>(
 }
 
 fn launch_cublas_rank_two_matmul<T: CudaReal>(
-    blas: &Arc<Mutex<CudaBlas>>,
+    blas: &Arc<Mutex<CudaLibraryHandle<CudaBlas>>>,
     lhs: &CudaSlice<T>,
     rhs: &CudaSlice<T>,
     output: &mut CudaSlice<T>,
@@ -4847,7 +4909,7 @@ fn cublas_batch_stride(input_shape: &[usize], output_batch_shape: &[usize]) -> O
 }
 
 fn launch_cublas_batched_matmul<T: CudaReal>(
-    blas: &Arc<Mutex<CudaBlas>>,
+    blas: &Arc<Mutex<CudaLibraryHandle<CudaBlas>>>,
     lhs: &CudaSlice<T>,
     rhs: &CudaSlice<T>,
     output: &mut CudaSlice<T>,
@@ -9130,7 +9192,9 @@ mod loop_checkpoint_tests {
 
 #[cfg(test)]
 mod host_loop_graph_tests {
-    use super::host_loop::{CUDA_LOOP_GRAPHS_DISABLED, CUDA_LOOP_GRAPH_LAUNCHES};
+    use super::host_loop::{
+        CUDA_LOOP_GRAPHS_DISABLED, CUDA_LOOP_GRAPH_LAUNCHES, CUDA_LOOP_GRAPH_RECORDING_ERRORS,
+    };
     use super::*;
     use crate::tensor_ir::{TensorComparison, TensorIr, TensorWhileExecutionPlan};
 
@@ -9382,6 +9446,7 @@ mod host_loop_graph_tests {
         for disabled in [true, false] {
             CUDA_LOOP_GRAPHS_DISABLED.with(|value| value.set(disabled));
             CUDA_LOOP_GRAPH_LAUNCHES.with(|value| value.set(0));
+            CUDA_LOOP_GRAPH_RECORDING_ERRORS.with(|errors| errors.borrow_mut().clear());
             let result = compile(program.clone()).and_then(|plan| {
                 execute(&plan)?;
                 execute(&plan)
@@ -9393,6 +9458,12 @@ mod host_loop_graph_tests {
         let enabled = results.pop().expect("two runs");
         let eager = results.pop().expect("two runs");
         Ok((eager, enabled, launches))
+    }
+
+    /// The errors of the region recordings that failed on this thread since
+    /// the last call.
+    fn recording_errors() -> Vec<String> {
+        CUDA_LOOP_GRAPH_RECORDING_ERRORS.with(|errors| std::mem::take(&mut *errors.borrow_mut()))
     }
 
     fn assert_close(name: &str, actual: &[DynamicTensor], expected: &[DynamicTensor], tol: f64) {
@@ -9446,6 +9517,8 @@ mod host_loop_graph_tests {
                     &cpu,
                     1e-11,
                 );
+                let errors = recording_errors();
+                assert!(errors.is_empty(), "{name} steps={steps}: {errors:?}");
                 if steps >= 17 {
                     assert!(launches > 0 && launches64 > 0, "{name} replayed no graph");
                 } else if steps == 1 {
@@ -9522,9 +9595,81 @@ mod host_loop_graph_tests {
                 |plan| plan.execute_many(&inputs),
             )?;
             assert_eq!(bits(&eager), bits(&replayed), "{name}");
+            let errors = recording_errors();
+            assert!(errors.is_empty(), "{name}: {errors:?}");
             assert!(launches > 0, "{name} replayed no graph");
         }
         Ok(())
+    }
+
+    /// Destroying a cuBLAS or cuSOLVER handle synchronizes the device, which
+    /// invalidates a stream capture in progress anywhere in the context, and
+    /// every plan of the process shares the device's primary context. One
+    /// thread records the region of a host-driven loop (with a cuBLAS product)
+    /// on every execution while another creates and drops library handles, as
+    /// plans compiled and dropped by other threads do; every recording must
+    /// succeed and replay bit-identically to the eager runs.
+    #[test]
+    fn host_loop_graph_recordings_survive_concurrent_library_handle_drops() -> Result<(), String> {
+        if !crate::test_support::Gate::Cuda.enabled() {
+            return Ok(());
+        }
+        const EXECUTIONS: usize = 40;
+        let steps = 17;
+        let inputs = inputs(steps)?;
+        let (graph, loss) = loop_loss(false, true, steps)?;
+        let program = graph.compile_cpu(loss)?;
+        let backend = CudaBackend::new(0);
+        CUDA_LOOP_GRAPHS_DISABLED.with(|value| value.set(true));
+        let eager = backend
+            .compile(program.clone())
+            .and_then(|plan| plan.execute_many(&inputs));
+        CUDA_LOOP_GRAPHS_DISABLED.with(|value| value.set(false));
+        let eager = eager?;
+        let plan = backend.compile(program)?;
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let churn = scope.spawn(|| -> Result<usize, String> {
+                let context = CudaContext::new(0)
+                    .map_err(|error| format!("failed to create CUDA context: {error:?}"))?;
+                let mut drops = 0;
+                while !done.load(Ordering::Relaxed) {
+                    let blas = cuda_blas(context.default_stream())?;
+                    let solver = cuda_solver::<f32>(context.default_stream())?;
+                    drop((blas, solver));
+                    drops += 1;
+                }
+                Ok(drops)
+            });
+            // Failures are returned rather than asserted here, so that the churn thread is
+            // always stopped and joined.
+            let recorded = (|| -> Result<(), String> {
+                for execution in 0..EXECUTIONS {
+                    CUDA_LOOP_GRAPH_LAUNCHES.with(|value| value.set(0));
+                    let replayed = plan.execute_many(&inputs)?;
+                    let errors = recording_errors();
+                    if !errors.is_empty() {
+                        return Err(format!(
+                            "execution {execution} recorded no graph: {errors:?}"
+                        ));
+                    }
+                    if CUDA_LOOP_GRAPH_LAUNCHES.with(|value| value.get()) == 0 {
+                        return Err(format!("execution {execution} replayed no graph"));
+                    }
+                    if bits(&eager) != bits(&replayed) {
+                        return Err(format!("execution {execution} differs from the eager runs"));
+                    }
+                }
+                Ok(())
+            })();
+            done.store(true, Ordering::Relaxed);
+            let drops = churn
+                .join()
+                .map_err(|_| "the handle churn thread panicked".to_string())??;
+            recorded?;
+            assert!(drops > 0, "no handle was dropped during the recordings");
+            Ok(())
+        })
     }
 }
 

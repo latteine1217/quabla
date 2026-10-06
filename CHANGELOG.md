@@ -109,6 +109,11 @@ deprecated names keep working until 1.0 (see
     dtypes ...` instead of `tensor + operands have mismatched dtypes ...`,
     and `isnan requires a floating operand, got dtype bool` for a `bool`
     tensor.
+- Host-driven CUDA loops record their CUDA graphs reliably in multi-threaded
+  processes. Dropping a CUDA plan on another thread destroys its cuBLAS and
+  cuSOLVER handles, which synchronizes the device and invalidated a graph
+  recording in progress; the loop then silently fell back to launching every
+  kernel from the host. Handle destruction now waits for running recordings.
 
 ## [0.5.0] - 2026-10-06
 
