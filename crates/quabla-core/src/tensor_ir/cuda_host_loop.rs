@@ -529,7 +529,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
                 vec![carry_body, reverse],
             ))
         }
-        TensorOp::ScanVjpJvp { plan, .. } => {
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::ScanVjpJvp { plan, .. },
+            ..
+        }) => {
             let scan_plan = &plan.scan_plan;
             let body = &scan_plan.body.plan;
             let [carry_output, step_output] = body.output_node_ids() else {
@@ -1015,17 +1018,21 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 reverse_tangents,
                 reverse,
             } => {
-                let TensorOp::ScanVjpJvp {
-                    carry,
-                    carry_tangent,
-                    final_carry_cotangent,
-                    final_carry_cotangent_tangent,
-                    output_cotangent: output_cotangents,
-                    output_cotangent_tangent: output_cotangent_tangents,
-                    plan: hvp,
+                let TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ScanVjpJvp {
+                            carry,
+                            carry_tangent,
+                            final_carry_cotangent,
+                            final_carry_cotangent_tangent,
+                            output_cotangent: output_cotangents,
+                            output_cotangent_tangent: output_cotangent_tangents,
+                            plan: hvp,
+                            ..
+                        },
                     tangent_captures,
                     ..
-                } = op
+                }) = op
                 else {
                     return Err(mismatch(node_id));
                 };
@@ -1212,7 +1219,10 @@ fn scan_vjp_results<T: CudaReal>(
                     kind: RegionKind::ScanVjp { target, .. },
                     ..
                 })
-                | TensorOp::ScanVjpJvp { target, .. } => target,
+                | TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjpJvp { target, .. },
+                    ..
+                }) => target,
                 _ => return Err(mismatch(*member)),
             };
             let name = match target {

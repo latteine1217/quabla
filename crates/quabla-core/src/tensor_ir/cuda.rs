@@ -872,7 +872,11 @@ pub(super) fn validate_cuda_plan(plan: &TensorExecutionPlan) -> Result<(), (Stri
             continue;
         }
         let op = region.label();
-        if let TensorOp::ScanVjpJvp { group, .. } = &node.op {
+        if let TensorOp::Region(RegionNode {
+            kind: RegionKind::ScanVjpJvp { group, .. },
+            ..
+        }) = &node.op
+        {
             cuda_scan_vjp_jvp_group(plan, *group).map_err(|error| {
                 (
                     op.to_string(),
@@ -937,7 +941,10 @@ pub(super) fn cuda_fused_loop_lowering(op: &TensorOp) -> Option<Result<(), Strin
             },
             ..
         }) => cuda_scan_vjp_plans(scan_plan, target).map(|_| ()),
-        TensorOp::ScanVjpJvp { plan, .. } => cuda_scan_vjp_jvp_is_lowerable(plan),
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::ScanVjpJvp { plan, .. },
+            ..
+        }) => cuda_scan_vjp_jvp_is_lowerable(plan),
         _ => return None,
     })
 }
@@ -2827,19 +2834,23 @@ fn execute_cuda_device_program<T: CudaReal>(
                 )?;
                 continue;
             }
-            TensorOp::ScanVjpJvp {
-                carry,
-                carry_tangent,
-                final_carry_cotangent,
-                final_carry_cotangent_tangent,
-                output_cotangent,
-                output_cotangent_tangent,
-                plan: scan_hvp,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ScanVjpJvp {
+                        carry,
+                        carry_tangent,
+                        final_carry_cotangent,
+                        final_carry_cotangent_tangent,
+                        output_cotangent,
+                        output_cotangent_tangent,
+                        plan: scan_hvp,
+                        group,
+                        ..
+                    },
                 captures,
                 tangent_captures,
-                group,
                 ..
-            } => {
+            }) => {
                 let (before, current_and_after) = values.split_at_mut(node_id);
                 let slot = current_and_after.first_mut().ok_or_else(|| {
                     format!("CUDA Scan VJP JVP node {node_id} is missing its buffer slot")
@@ -6224,19 +6235,23 @@ fn cuda_scan_vjp_jvp_group(
     let mut members = Vec::new();
     let mut signature = None;
     for (node_id, node) in plan.nodes.iter().enumerate() {
-        let TensorOp::ScanVjpJvp {
-            carry,
-            carry_tangent,
-            final_carry_cotangent,
-            final_carry_cotangent_tangent,
-            output_cotangent,
-            output_cotangent_tangent,
+        let TensorOp::Region(RegionNode {
+            kind:
+                RegionKind::ScanVjpJvp {
+                    carry,
+                    carry_tangent,
+                    final_carry_cotangent,
+                    final_carry_cotangent_tangent,
+                    output_cotangent,
+                    output_cotangent_tangent,
+                    target,
+                    group: node_group,
+                    ..
+                },
             captures,
             tangent_captures,
-            target,
-            group: node_group,
             ..
-        } = &node.op
+        }) = &node.op
         else {
             continue;
         };
@@ -7938,12 +7953,7 @@ fn cuda_program_source(
                     cuda_scan_vjp_group_kernel_source(node_id, scan_plan, captures, &targets)?
                 }
             }
-            TensorOp::ScanVjpJvp {
-                plan: scan_hvp,
-                captures,
-                group,
-                ..
-            } => {
+            TensorOp::Region(RegionNode { kind: RegionKind::ScanVjpJvp { plan: scan_hvp, group, .. }, captures, .. }) => {
                 let members = cuda_scan_vjp_jvp_group(plan, *group)?;
                 if members.first().map(|(member_id, _)| *member_id) != Some(node_id) {
                     continue;
@@ -9687,7 +9697,10 @@ mod region_batching_tests {
                                 }) | TensorOp::Region(RegionNode {
                                     kind: RegionKind::ScanVjp { .. },
                                     ..
-                                }) | TensorOp::ScanVjpJvp { .. }
+                                }) | TensorOp::Region(RegionNode {
+                                    kind: RegionKind::ScanVjpJvp { .. },
+                                    ..
+                                })
                             )
                         })
                         .count();
