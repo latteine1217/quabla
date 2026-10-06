@@ -382,7 +382,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
                 vec![forward],
             ))
         }
-        TensorOp::ForiVjp { loop_plan, .. } => {
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::ForiVjp { loop_plan, .. },
+            ..
+        }) => {
             let body = &loop_plan.body.plan;
             let mut taken = loop_plan.body.captures().keys().cloned().collect();
             let cotangent = fresh_name("__quabla_cuda_loop_cotangent", &taken);
@@ -748,11 +751,15 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 Ok(vec![(node_id, tangent)])
             }
             HostLoopKind::ForiVjp { names, reverse } => {
-                let TensorOp::ForiVjp {
-                    carry,
-                    output_cotangent,
+                let TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiVjp {
+                            carry,
+                            output_cotangent,
+                            ..
+                        },
                     ..
-                } = op
+                }) = op
                 else {
                     return Err(mismatch(node_id));
                 };
@@ -1157,7 +1164,11 @@ fn fori_vjp_results<T: CudaReal>(
         .iter()
         .map(|member| {
             let target = match &plan.nodes[*member].op {
-                TensorOp::ForiVjp { target, .. } | TensorOp::ForiVjpJvp { target, .. } => target,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjp { target, .. },
+                    ..
+                })
+                | TensorOp::ForiVjpJvp { target, .. } => target,
                 _ => return Err(mismatch(*member)),
             };
             let name = match target {

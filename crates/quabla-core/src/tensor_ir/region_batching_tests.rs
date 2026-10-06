@@ -197,14 +197,18 @@ fn reverse_pass_members_share_one_batched_group_with_every_input_mapped() -> Res
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            TensorOp::ForiVjp {
-                carry,
-                output_cotangent,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ForiVjp {
+                        carry,
+                        output_cotangent,
+                        loop_plan,
+                        group,
+                        ..
+                    },
                 captures,
-                group,
                 ..
-            } => Some((
+            }) => Some((
                 *carry,
                 *output_cotangent,
                 captures.clone(),

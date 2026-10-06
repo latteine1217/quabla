@@ -874,14 +874,18 @@ impl MlxBackend {
                         &tangents,
                     )
                 }
-                TensorOp::ForiVjp {
-                    carry,
-                    output_cotangent,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiVjp {
+                            carry,
+                            output_cotangent,
+                            loop_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !fori_vjp_cache.contains_key(group) {
                         let captures = captures
                             .iter()
