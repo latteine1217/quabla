@@ -4,10 +4,10 @@ use quabla_core::compiler::QuablaCompileError;
 use quabla_core::tensor_ir::{
     CpuBackend, DynamicTensor, SymbolicCotangent, TensorBackend, TensorBufferSlot,
     TensorCondExecutionPlan, TensorCustomRule, TensorDType, TensorDeviceBackend, TensorDeviceId,
-    TensorDeviceMesh, TensorExecutionPlan, TensorForiExecutionPlan, TensorForiMultiExecutionPlan,
-    TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr, TensorNodeId, TensorPartitionSpec,
-    TensorPlacement, TensorReplicaReduction, TensorScanExecutionPlan, TensorShardingPlan,
-    UnaryMathKind,
+    TensorDeviceMesh, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan,
+    TensorForiMultiExecutionPlan, TensorForiVjpJvpExecutionPlan, TensorFusionRegion, TensorIr,
+    TensorNodeId, TensorPartitionSpec, TensorPlacement, TensorReplicaReduction,
+    TensorScanExecutionPlan, TensorShardingPlan, UnaryMathKind,
 };
 use quabla_core::{QuablaCompiler, QuablaMultiOutputProgram, QuablaPrecision, QuablaTarget};
 
@@ -11869,6 +11869,373 @@ fn cumsum_rounds_every_running_sum_and_differentiates_by_reversal() {
         let inputs = must!(shaped_inputs(&[("x", vec![3], vec![0.5, -1.0, 2.0])]));
         assert_hessian_routes(&graph, total, "x", &inputs, &expected, 0.0);
     }
+}
+
+/// The reference for `ExtremumAxis` along the last axis of `lines` rows:
+/// NaN if any entry is NaN, otherwise the largest (smallest) value with
+/// `-0 < +0`, found by sorting on `f64::total_cmp`, which orders `-0` before
+/// `+0` (an independent route from the op's left fold).
+fn extremum_reference(values: &[f64], extent: usize, maximum: bool) -> Vec<f64> {
+    values
+        .chunks(extent)
+        .map(|line| {
+            if line.iter().any(|value| value.is_nan()) {
+                return f64::NAN;
+            }
+            let mut sorted = line.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            if maximum {
+                sorted[extent - 1]
+            } else {
+                sorted[0]
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn extremum_axis_values_propagate_nan_and_order_signed_zeros() {
+    let nan = f64::NAN;
+    let inf = f64::INFINITY;
+    // One line per edge case, reduced along axis 1; the transposed layout
+    // checks axis 0 with the same lines as columns.
+    let lines = [
+        [1.0, 3.0, 2.0, 3.0],
+        [nan, 1.0, 2.0, 0.5],
+        [1.0, 2.0, 3.0, nan],
+        [-inf, -inf, -inf, -inf],
+        [inf, -inf, 1.0, -2.0],
+        [-0.0, 0.0, -0.0, -1.0],
+        [0.0, -0.0, 1e-300, -1e-300],
+        [-0.0, -0.0, -0.0, -0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [1e300, -1e300, 5e-324, -5e-324],
+    ];
+    let (rows, columns) = (lines.len(), 4);
+    let values = lines.concat();
+    let transposed = (0..columns * rows)
+        .map(|index| values[(index % rows) * columns + index / rows])
+        .collect::<Vec<_>>();
+    for dtype in [TensorDType::F64, TensorDType::F32] {
+        let rounded = must!(DynamicTensor::with_dtype(
+            vec![values.len()],
+            values.clone(),
+            dtype
+        ))
+        .data()
+        .to_vec();
+        for (maximum, kind) in [(true, TensorExtremum::Max), (false, TensorExtremum::Min)] {
+            let expected = extremum_reference(&rounded, columns, maximum);
+            for (axis, shape, data) in [
+                (1, vec![rows, columns], &values),
+                (0, vec![columns, rows], &transposed),
+            ] {
+                let mut graph = TensorIr::new();
+                let x = must!(graph.input_typed("x", shape.clone(), dtype));
+                let reduced = must!(graph.extremum_axis(x, axis, kind));
+                let inputs = BTreeMap::from([(
+                    "x".to_string(),
+                    must!(DynamicTensor::with_dtype(shape, data.clone(), dtype)),
+                )]);
+                assert_same_bits(&must!(graph.evaluate(reduced, &inputs)).data(), &expected);
+                let plan = must!(graph.compile_cpu(reduced));
+                assert_same_bits(&must!(plan.evaluate(&inputs)).data(), &expected);
+            }
+        }
+    }
+
+    // Max and min of one input are distinct nodes after CSE, negative axes
+    // normalize, and the IR text names the reduction.
+    let mut graph = TensorIr::new();
+    let x = must!(graph.input("x", vec![2, 3]));
+    let largest = must!(graph.extremum_axis(x, -1, TensorExtremum::Max));
+    let smallest = must!(graph.extremum_axis(x, 1, TensorExtremum::Min));
+    let difference = must!(graph.sub(largest, smallest));
+    let inputs = must!(shaped_inputs(&[(
+        "x",
+        vec![2, 3],
+        vec![1.0, 5.0, -2.0, 0.5, 0.25, 4.0]
+    )]));
+    let plan = must!(graph.compile_cpu(difference));
+    assert_eq!(must!(plan.evaluate(&inputs)).data().as_ref(), &[7.0, 3.75]);
+    let text = graph.lower_text();
+    assert!(text.contains("max(%0, axis=1)"), "{text}");
+    assert!(text.contains("min(%0, axis=1)"), "{text}");
+
+    let mut graph = TensorIr::new();
+    let mask = must!(graph.input_typed("mask", vec![3], TensorDType::Bool));
+    assert!(graph.extremum_axis(mask, 0, TensorExtremum::Max).is_err());
+    let x = must!(graph.input("x", vec![3]));
+    assert!(graph.extremum_axis(x, 1, TensorExtremum::Max).is_err());
+}
+
+#[test]
+fn extremum_axis_derivatives_split_ties_and_compose() {
+    // d sum(w * max(x, axis=1)) / dx: row 0 ties three ways at 3, row 1 has
+    // a single maximum, row 2 ties -0 with two +0.
+    let x = vec![
+        3.0, 1.0, 3.0, 3.0, -1.0, 2.0, 0.5, -4.0, -0.0, 0.0, -1.0, 0.0,
+    ];
+    let w = [1.5, -2.0, 0.75];
+    for (kind, expected) in [
+        (
+            TensorExtremum::Max,
+            vec![
+                0.5, 0.0, 0.5, 0.5, 0.0, -2.0, 0.0, 0.0, 0.25, 0.25, 0.0, 0.25,
+            ],
+        ),
+        (
+            TensorExtremum::Min,
+            vec![0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 0.0, -2.0, 0.0, 0.0, 0.75, 0.0],
+        ),
+    ] {
+        let mut graph = TensorIr::new();
+        let input = must!(graph.input("x", vec![3, 4]));
+        let weights = must!(graph.input("w", vec![3]));
+        let reduced = must!(graph.extremum_axis(input, 1, kind));
+        let weighted = must!(graph.mul(reduced, weights));
+        let total = must!(graph.sum(weighted));
+        let inputs = must!(shaped_inputs(&[
+            ("x", vec![3, 4], x.clone()),
+            ("w", vec![3], w.to_vec()),
+        ]));
+        assert_gradient_routes(&graph, total, &inputs, &[("x", expected)], 0.0);
+    }
+
+    // max(x)^2 with a two-way tie: the gradient 2 m e and the Hessian
+    // 2 e e^T with e the chooser weights (1/2 on the tied entries); every
+    // derivative order is an ordinary graph.
+    let mut graph = TensorIr::new();
+    let input = must!(graph.input("x", vec![3]));
+    let reduced = must!(graph.extremum_axis(input, 0, TensorExtremum::Max));
+    let squared = must!(graph.powi(reduced, 2));
+    let inputs = must!(shaped_inputs(&[("x", vec![3], vec![2.0, -1.0, 2.0])]));
+    assert_gradient_routes(&graph, squared, &inputs, &[("x", vec![2.0, 0.0, 2.0])], 0.0);
+    assert_hessian_routes(
+        &graph,
+        squared,
+        "x",
+        &inputs,
+        &[0.5, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.5],
+        0.0,
+    );
+
+    // A NaN extremum equals no entry: every derivative is NaN, not an error.
+    let mut graph = TensorIr::new();
+    let input = must!(graph.input("x", vec![3]));
+    let reduced = must!(graph.extremum_axis(input, 0, TensorExtremum::Min));
+    let inputs = must!(shaped_inputs(&[("x", vec![3], vec![1.0, f64::NAN, -2.0])]));
+    assert_gradient_routes(&graph, reduced, &inputs, &[("x", vec![f64::NAN; 3])], 0.0);
+
+    // Against central differences of the CPU reference away from ties.
+    let mut graph = TensorIr::new();
+    let input = must!(graph.input("x", vec![2, 3]));
+    let largest = must!(graph.extremum_axis(input, 0, TensorExtremum::Max));
+    let sines = must!(graph.sin(largest));
+    let total = must!(graph.sum(sines));
+    let point = vec![0.3, -1.2, 0.8, -0.4, 0.9, 0.1];
+    let inputs = must!(shaped_inputs(&[("x", vec![2, 3], point.clone())]));
+    let shifted = |index: usize, delta: f64| -> Result<f64, String> {
+        let mut data = point.clone();
+        data[index] += delta;
+        let inputs = shaped_inputs(&[("x", vec![2, 3], data)])?;
+        Ok(graph.evaluate(total, &inputs)?.data()[0])
+    };
+    let gradient = must!(graph.vjp(total, &inputs, must!(DynamicTensor::filled(vec![], 1.0))));
+    for (index, actual) in gradient["x"].data().iter().enumerate() {
+        let numeric = (must!(shifted(index, 1e-6)) - must!(shifted(index, -1e-6))) / 2e-6;
+        assert!((actual - numeric).abs() <= 1e-9, "{actual} vs {numeric}");
+    }
+}
+
+#[test]
+fn inline_batched_maps_extremum_axis_and_its_gradient() {
+    let mut callee = TensorIr::new();
+    must!(callee.input("x", vec![]));
+    let v = must!(callee.input("v", vec![3]));
+    must!(callee.input("w", vec![3]));
+    let m = must!(callee.input("m", vec![3, 2]));
+    let a = must!(callee.input("a", vec![2, 2]));
+    let rows = must!(callee.extremum_axis(a, 1, TensorExtremum::Max));
+    let columns = must!(callee.extremum_axis(a, 0, TensorExtremum::Min));
+    let line = must!(callee.extremum_axis(v, 0, TensorExtremum::Max));
+    let fixed = must!(callee.extremum_axis(m, 0, TensorExtremum::Max));
+    assert_batched_matches_examples(
+        &callee,
+        &[rows, columns, line, fixed],
+        &[true, true, true, false],
+    );
+    let rows_total = must!(callee.sum(rows));
+    let columns_total = must!(callee.sum(columns));
+    let partial = must!(callee.add(rows_total, columns_total));
+    let total = must!(callee.add(partial, line));
+    let vjp = must!(callee.symbolic_vjp_many(&[(total, SymbolicCotangent::Ones)]));
+    let outputs = [vjp.gradients["a"], vjp.gradients["v"]];
+    assert_batched_matches_examples(&vjp.graph, &outputs, &[true, true]);
+}
+
+/// Device plans for `ExtremumAxis` in float32: values with NaN, infinities,
+/// signed zeros, and ties along short and long (one block per output) axes,
+/// lines of zeros only, the gradient of a spread `max - min` with ties, and
+/// a Fori whose body reduces (six iterations, so CUDA also replays the body
+/// as a recorded graph).
+#[cfg(any(
+    all(feature = "cuda", target_os = "linux"),
+    all(feature = "mlx", target_os = "macos")
+))]
+fn extremum_device_plans() -> Result<Vec<PlanWithInputs>, String> {
+    let entry = |index: usize| match index % 97 {
+        0 => -0.0,
+        1 => 0.0,
+        2 => f64::INFINITY,
+        3 => f64::NEG_INFINITY,
+        _ => ((index * 7919 % 1000) as f64 - 500.0) * 1.37e-3,
+    };
+    let mut plans = Vec::new();
+    for (shape, poison) in [
+        (vec![5, 7], None),
+        (vec![3, 700], Some(1_500)),
+        (vec![700, 3], Some(5)),
+        (vec![4, 300], None),
+    ] {
+        let count = shape.iter().product::<usize>();
+        let mut values = (0..count).map(entry).collect::<Vec<_>>();
+        if let Some(index) = poison {
+            values[index] = f64::NAN;
+        }
+        let inputs = BTreeMap::from([(
+            "x".to_string(),
+            DynamicTensor::with_dtype(shape.clone(), values, TensorDType::F32)?,
+        )]);
+        for axis in 0..2 {
+            for kind in [TensorExtremum::Max, TensorExtremum::Min] {
+                let mut graph = TensorIr::new();
+                let x = graph.input_typed("x", shape.clone(), TensorDType::F32)?;
+                let reduced = graph.extremum_axis(x, axis, kind)?;
+                plans.push((graph.compile_cpu(reduced)?, inputs.clone()));
+            }
+        }
+    }
+    // Lines of zeros only: the sign of the result is all there is to get right.
+    let mixed = (0..12)
+        .map(|index| if index % 3 == 0 { -0.0 } else { 0.0 })
+        .collect::<Vec<_>>();
+    for values in [mixed, vec![-0.0; 12], vec![0.0; 12]] {
+        for axis in 0..2 {
+            for kind in [TensorExtremum::Max, TensorExtremum::Min] {
+                let mut graph = TensorIr::new();
+                let x = graph.input_typed("x", vec![3, 4], TensorDType::F32)?;
+                let reduced = graph.extremum_axis(x, axis, kind)?;
+                let inputs = BTreeMap::from([(
+                    "x".to_string(),
+                    DynamicTensor::with_dtype(vec![3, 4], values.clone(), TensorDType::F32)?,
+                )]);
+                plans.push((graph.compile_cpu(reduced)?, inputs));
+            }
+        }
+    }
+
+    let mut graph = TensorIr::new();
+    let x = graph.input_typed("x", vec![2, 300], TensorDType::F32)?;
+    let w = graph.input_typed("w", vec![2], TensorDType::F32)?;
+    let largest = graph.extremum_axis(x, 1, TensorExtremum::Max)?;
+    let smallest = graph.extremum_axis(x, 1, TensorExtremum::Min)?;
+    let spread = graph.sub(largest, smallest)?;
+    let weighted = graph.mul(spread, w)?;
+    let loss = graph.sum(weighted)?;
+    let reverse = graph.symbolic_vjp(loss, "cotangent")?;
+    // Three-way ties at the maximum of each row, two-way at the minimum.
+    let values = (0..600)
+        .map(|index| match index % 300 {
+            7 | 150 | 299 => 2.5,
+            0 | 31 => -3.0,
+            column => (column as f64 * 0.01).sin(),
+        })
+        .collect::<Vec<_>>();
+    let gradient_inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            DynamicTensor::with_dtype(vec![2, 300], values, TensorDType::F32)?,
+        ),
+        (
+            "w".to_string(),
+            DynamicTensor::with_dtype(vec![2], vec![1.5, -0.75], TensorDType::F32)?,
+        ),
+        (
+            "cotangent".to_string(),
+            DynamicTensor::with_dtype(vec![], vec![1.0], TensorDType::F32)?,
+        ),
+    ]);
+    plans.push((
+        reverse.graph.compile_cpu(reverse.gradients["x"])?,
+        gradient_inputs,
+    ));
+
+    let mut body = TensorIr::new();
+    let carry = body.input_typed("carry", vec![4, 3], TensorDType::F32)?;
+    body.input_typed("index", vec![], TensorDType::F32)?;
+    let rows = body.extremum_axis(carry, 1, TensorExtremum::Max)?;
+    let column = body.reshape(rows, vec![4, 1])?;
+    let half = body.scalar_constant(0.5);
+    let shift = body.mul(column, half)?;
+    let next = body.sub(carry, shift)?;
+    let loop_plan = TensorForiExecutionPlan::new(0, 6, body.compile_cpu(next)?, "carry", "index")?;
+    let mut looped = TensorIr::new();
+    let initial = looped.input_typed("x", vec![4, 3], TensorDType::F32)?;
+    let output = looped.fori(initial, loop_plan, vec![])?;
+    let loop_inputs = BTreeMap::from([(
+        "x".to_string(),
+        DynamicTensor::with_dtype(
+            vec![4, 3],
+            vec![
+                1.0, 4.0, -2.0, 0.5, 0.5, 0.25, -1.0, -3.0, -0.5, 8.0, 2.0, 8.0,
+            ],
+            TensorDType::F32,
+        )?,
+    )]);
+    plans.push((looped.compile_cpu(output)?, loop_inputs));
+    Ok(plans)
+}
+
+/// Device and CPU values agree bit for bit (NaN with NaN), twice: the
+/// reduction only selects entries, and the chooser gradients divide exact
+/// counts.
+#[cfg(any(
+    all(feature = "cuda", target_os = "linux"),
+    all(feature = "mlx", target_os = "macos")
+))]
+fn assert_extremum_device_parity(
+    execute: impl Fn(
+        &TensorExecutionPlan,
+        &BTreeMap<String, DynamicTensor>,
+    ) -> Result<DynamicTensor, String>,
+) {
+    for (plan, inputs) in must!(extremum_device_plans()) {
+        let cpu = must!(plan.evaluate(&inputs));
+        let device = must!(execute(&plan, &inputs));
+        assert_eq!(device.shape(), cpu.shape());
+        assert_same_bits(&device.data(), &cpu.data());
+        let again = must!(execute(&plan, &inputs));
+        assert_same_bits(&again.data(), &device.data());
+    }
+}
+
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+#[test]
+fn mlx_extremum_axis_matches_cpu_bitwise() {
+    if std::env::var_os("QUABLA_MLX_TEST").is_none() {
+        return;
+    }
+    assert_extremum_device_parity(|plan, inputs| MlxBackend.execute(plan, inputs));
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_extremum_axis_matches_cpu_bitwise() {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return;
+    }
+    assert_extremum_device_parity(|plan, inputs| CudaBackend::new(0).execute(plan, inputs));
 }
 
 /// A callee over the [`batching_inputs`] example shapes that uses every new

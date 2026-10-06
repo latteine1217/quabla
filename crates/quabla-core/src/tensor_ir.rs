@@ -14,6 +14,8 @@ mod device_optimizer;
 pub use device_optimizer::{DeviceOptimizerConfig, DeviceUpdateRule};
 mod elementwise;
 pub use elementwise::UnaryMathKind;
+mod extremum;
+pub use extremum::TensorExtremum;
 mod host_storage;
 pub use host_storage::HostTensorStorage;
 
@@ -691,6 +693,15 @@ enum TensorOp {
     SumAxis {
         input: TensorNodeId,
         axis: usize,
+    },
+    /// The maximum or minimum of `input` along `axis`, which is removed.
+    /// NaN propagates and the sign of zero is ordered (`-0 < +0`, IEEE 754-2019
+    /// `maximum`), so the result does not depend on the reduction order; ties
+    /// share the derivative equally (JAX's chooser rule). See `extremum.rs`.
+    ExtremumAxis {
+        input: TensorNodeId,
+        axis: usize,
+        kind: TensorExtremum,
     },
     Matmul {
         lhs: TensorNodeId,
@@ -3296,6 +3307,11 @@ impl TensorIr {
                 input: target(*input)?,
                 axis: axis + 1,
             },
+            TensorOp::ExtremumAxis { input, axis, kind } => TensorOp::ExtremumAxis {
+                input: target(*input)?,
+                axis: axis + 1,
+                kind: *kind,
+            },
             TensorOp::MeanAxis { input, axis } => TensorOp::MeanAxis {
                 input: target(*input)?,
                 axis: axis + 1,
@@ -4166,6 +4182,13 @@ impl TensorIr {
                         transformed.sum_axis(tangent, *axis as isize)?,
                     )
                 }
+                TensorOp::ExtremumAxis { input, axis, kind } => {
+                    let (input_value, input_tangent) = pairs[*input];
+                    let value = transformed.extremum_axis(input_value, *axis as isize, *kind)?;
+                    let tangent =
+                        transformed.extremum_axis_jvp(input_value, value, input_tangent, *axis)?;
+                    (value, tangent)
+                }
                 TensorOp::MeanAxis { input, axis } => {
                     let (value, tangent) = pairs[*input];
                     (
@@ -4578,6 +4601,9 @@ impl TensorIr {
                 TensorOp::Sum { input } => transformed.sum(values[*input])?,
                 TensorOp::SumAxis { input, axis } => {
                     transformed.sum_axis(values[*input], *axis as isize)?
+                }
+                TensorOp::ExtremumAxis { input, axis, kind } => {
+                    transformed.extremum_axis(values[*input], *axis as isize, *kind)?
                 }
                 TensorOp::Matmul { lhs, rhs } => transformed.matmul(values[*lhs], values[*rhs])?,
                 TensorOp::Cholesky { input } => transformed.cholesky(values[*input])?,
@@ -5011,6 +5037,15 @@ impl TensorIr {
                         &mut transformed,
                         upstream,
                         values[*input],
+                        *axis,
+                    )?;
+                    symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
+                }
+                TensorOp::ExtremumAxis { input, axis, .. } => {
+                    let contribution = transformed.extremum_axis_vjp(
+                        values[*input],
+                        values[node_id],
+                        upstream,
                         *axis,
                     )?;
                     symbolic_accumulate(&mut transformed, &mut cotangents, *input, contribution)?;
@@ -8478,6 +8513,19 @@ impl TensorIr {
                         cotangent.expand_reduced_axis(&self.node(*input)?.shape, *axis)?;
                     accumulate(&mut cotangents[*input], contribution)?;
                 }
+                TensorOp::ExtremumAxis { input, axis, .. } => {
+                    let input_value = values
+                        .get(*input)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let output_value = values
+                        .get(node_id)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| format!("node {node_id} has no evaluated value"))?;
+                    let contribution =
+                        input_value.extremum_axis_cotangent(output_value, &cotangent, *axis)?;
+                    accumulate(&mut cotangents[*input], contribution)?;
+                }
                 TensorOp::Matmul { lhs, rhs } => {
                     let lhs_value = values
                         .get(*lhs)
@@ -9206,6 +9254,18 @@ impl TensorIr {
                     .get(*input)
                     .ok_or_else(|| format!("node {input} has no evaluated tangent"))?
                     .reduce_axis(*axis, 1.0)?,
+                TensorOp::ExtremumAxis { input, axis, .. } => values
+                    .get(*input)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .extremum_axis_tangent(
+                        values
+                            .get(node_id)
+                            .ok_or_else(|| format!("node {node_id} has no evaluated value"))?,
+                        tangents
+                            .get(*input)
+                            .ok_or_else(|| format!("node {input} has no evaluated tangent"))?,
+                        *axis,
+                    )?,
                 TensorOp::Matmul { lhs, rhs } => {
                     let lhs_tangent = tangents
                         .get(*lhs)
@@ -10057,6 +10117,11 @@ impl TensorIr {
                 }
                 TensorOp::SumAxis { input, axis } => format!(
                     "%{id} = sum(%{input}, axis={axis}) : {}",
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
+                TensorOp::ExtremumAxis { input, axis, kind } => format!(
+                    "%{id} = {}(%{input}, axis={axis}) : {}",
+                    kind.name(),
                     format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Matmul { lhs, rhs } => format!(
@@ -10941,6 +11006,11 @@ impl TensorIr {
                     .and_then(Option::as_ref)
                     .ok_or_else(|| format!("node {input} has no evaluated value"))?
                     .reduce_axis(*axis, 1.0)?,
+                TensorOp::ExtremumAxis { input, axis, kind } => values
+                    .get(*input)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| format!("node {input} has no evaluated value"))?
+                    .reduce_extremum_axis(*axis, *kind)?,
                 TensorOp::Matmul { lhs, rhs } => values
                     .get(*lhs)
                     .and_then(Option::as_ref)
@@ -11956,6 +12026,23 @@ impl TensorIr {
                         first: input.first.reduce_axis(*axis, 1.0)?,
                         second: input.second.reduce_axis(*axis, 1.0)?,
                         mixed: input.mixed.reduce_axis(*axis, 1.0)?,
+                    }
+                }
+                // Piecewise linear: every derivative, including the mixed
+                // second-order term, is the chooser average of the input's.
+                TensorOp::ExtremumAxis { input, axis, kind } => {
+                    let input = values
+                        .get(*input)
+                        .ok_or_else(|| format!("node {input} has no evaluated value"))?;
+                    let value = input.value.reduce_extremum_axis(*axis, *kind)?;
+                    let choose = |tangent: &DynamicTensor| {
+                        input.value.extremum_axis_tangent(&value, tangent, *axis)
+                    };
+                    MixedTangent {
+                        first: choose(&input.first)?,
+                        second: choose(&input.second)?,
+                        mixed: choose(&input.mixed)?,
+                        value,
                     }
                 }
                 TensorOp::Matmul { lhs, rhs } => {
@@ -16248,6 +16335,9 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                 TensorOp::SumAxis { input, axis } => {
                     specialized.sum_axis(mapped(*input)?, *axis as isize)?
                 }
+                TensorOp::ExtremumAxis { input, axis, kind } => {
+                    specialized.extremum_axis(mapped(*input)?, *axis as isize, *kind)?
+                }
                 TensorOp::Matmul { lhs, rhs } => {
                     specialized.matmul(mapped(*lhs)?, mapped(*rhs)?)?
                 }
@@ -16548,6 +16638,7 @@ fn cuda_scalar_expression(
         TensorOp::Sum { .. }
         | TensorOp::CumSum { .. }
         | TensorOp::SumAxis { .. }
+        | TensorOp::ExtremumAxis { .. }
         | TensorOp::Matmul { .. }
         | TensorOp::Solve { .. }
         | TensorOp::Linalg { .. }
@@ -16827,6 +16918,7 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
             .collect(),
         TensorOp::Sum { input }
         | TensorOp::SumAxis { input, .. }
+        | TensorOp::ExtremumAxis { input, .. }
         | TensorOp::Tanh { input }
         | TensorOp::Exp { input }
         | TensorOp::Sqrt { input }
@@ -17352,6 +17444,33 @@ fn infer_tensor_placement(
             }
             Ok(placement)
         }
+        // There is no max/min replica reduction: a sharded reduced axis needs explicit
+        // redistribution, as the per-element slices of the former traced chain did. Another
+        // sharded axis keeps its shard and shifts down past the removed axis.
+        TensorOp::ExtremumAxis { input, axis, .. } => match unary(*input)? {
+            TensorPlacement::Mesh {
+                mesh,
+                partition:
+                    TensorPartitionSpec::Sharded {
+                        tensor_axis,
+                        mesh_axis,
+                    },
+            } => {
+                if tensor_axis == *axis {
+                    return Err(format!(
+                        "kernel node {node_id} reduces a max/min along a sharded axis; explicit redistribution is required"
+                    ));
+                }
+                Ok(TensorPlacement::Mesh {
+                    mesh,
+                    partition: TensorPartitionSpec::Sharded {
+                        tensor_axis: tensor_axis - usize::from(tensor_axis > *axis),
+                        mesh_axis,
+                    },
+                })
+            }
+            placement => Ok(placement),
+        },
         TensorOp::Sum { input } => {
             let placement = unary(*input)?;
             plan_full_reduction_placement(
@@ -17775,6 +17894,10 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::ScanVjpJvp { .. } => "scan_vjp_jvp",
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
+        TensorOp::ExtremumAxis { kind, .. } => match kind {
+            TensorExtremum::Max => "max_axis",
+            TensorExtremum::Min => "min_axis",
+        },
         TensorOp::Matmul { .. } => "matmul",
         TensorOp::Solve { .. } => "solve",
         TensorOp::Linalg { kind, .. } => kind.name(),
@@ -18349,6 +18472,11 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
             arguments[0] = *input as u64;
             arguments[1] = *axis as u64;
         }
+        TensorOp::ExtremumAxis { input, axis, kind } => {
+            arguments[0] = *input as u64;
+            arguments[1] = *axis as u64;
+            arguments[2] = *kind as u64;
+        }
         TensorOp::Triangular { input, lower } => {
             arguments[0] = *input as u64;
             arguments[1] = u64::from(*lower);
@@ -18417,6 +18545,7 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         | TensorOp::Where { .. }
         | TensorOp::PadSlice { .. }
         | TensorOp::ScatterAdd { .. }
+        | TensorOp::ExtremumAxis { .. }
         | TensorOp::CumSum { .. } => 3,
         TensorOp::Gather { .. }
         | TensorOp::Add { .. }
@@ -18734,6 +18863,11 @@ fn remap_tensor_op(
         TensorOp::SumAxis { input, axis } => Ok(TensorOp::SumAxis {
             input: remap_node(*input)?,
             axis: *axis,
+        }),
+        TensorOp::ExtremumAxis { input, axis, kind } => Ok(TensorOp::ExtremumAxis {
+            input: remap_node(*input)?,
+            axis: *axis,
+            kind: *kind,
         }),
         TensorOp::Matmul { lhs, rhs } => Ok(TensorOp::Matmul {
             lhs: remap_node(*lhs)?,

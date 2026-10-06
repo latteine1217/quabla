@@ -746,9 +746,159 @@ def test_maximum_minimum_keep_nan_free_values_and_tie_gradients():
         assert dy.tolist() == [1.0 - m for m in mask], (function, dy.tolist())
     relu_gradient = qb.grad(lambda t: qb.sum(qb.relu(t)))(qb.array([-1.0, 0.0, 2.0]))
     assert relu_gradient.tolist() == [0.0, 0.0, 1.0]
-    # A max reduction routes ties to the later element.
+    # A max reduction splits a tie equally (JAX's chooser rule).
     gradient = qb.grad(lambda t: qb.max(t))(qb.array([3.0, 1.0, 3.0]))
-    assert gradient.tolist() == [0.0, 0.0, 1.0]
+    assert gradient.tolist() == [0.5, 0.0, 0.5]
+
+
+
+def extremum_cases():
+    """A [4, 3, 4] array for max/min checks: NaN, infinities, signed zeros, ties."""
+    nan, inf = math.nan, math.inf
+    return [
+        [[1.0, 3.0, 2.0, 3.0], [-1.0, -1.0, -4.0, 0.5], [0.25, 8.0, 8.0, -8.0]],
+        [[nan, 1.0, 2.0, 0.5], [1.0, 2.0, 3.0, nan], [-inf, -inf, -inf, -inf]],
+        [[inf, -inf, 1.0, -2.0], [-0.0, 0.0, -0.0, -1.0], [0.0, -0.0, 1e-30, -1e-30]],
+        [[-0.0, -0.0, -0.0, -0.0], [0.0, 0.0, 0.0, 0.0], [1e30, -1e30, 5.0, -5.0]],
+    ]
+
+
+def numpy_extremum(data, name, axis, keepdims):
+    """NumPy's max or min with the sign of a zero result set by -0 < +0
+    (IEEE 754-2019 maximum/minimum, NumPy's own result on arm64; its x86
+    builds keep whichever zero comes last)."""
+    result = getattr(data, name)(axis=axis, keepdims=keepdims)
+    zeros = data == 0
+    preferred = zeros & (np.signbit(data) == (name == "min"))
+    found = preferred.any(axis=axis, keepdims=keepdims)
+    zero = np.where(found == (name == "max"), 0.0, -0.0).astype(data.dtype)
+    return np.where(result == 0, zero, result)
+
+
+def test_traced_max_min_are_one_node_and_match_numpy():
+    # One ExtremumAxis node replaces a slice and a maximum per element, so a
+    # staged max, its gradient and the scaled norm keep their size for any
+    # input size.
+    def sized(count):
+        x = qb.arange(float(count))
+        return (
+            lowered_node_count(lambda v: v.max(), x),
+            lowered_node_count(qb.grad(lambda v: v.min()), x),
+            lowered_node_count(lambda v: qb.linalg.norm(v), x),
+        )
+
+    assert sized(6) == sized(600), (sized(6), sized(600))
+    assert sized(600)[0] <= 2, sized(600)
+
+    for function in [
+        lambda t: t.max(axis=(0, 0)),
+        lambda t: t.max(axis=2),
+        lambda t: (t > 0).max(),
+    ]:
+        assert_raises(ValueError, function, qb.ones([2, 2]))
+        assert_raises(ValueError, qb.jit(function), qb.ones([2, 2]))
+
+    if np is None:
+        print("SKIP traced max/min vs NumPy: numpy missing")
+        return
+    axes = [None, 0, 1, -1, 2, (0, 2), (1, 2), (0, 1, 2), (-1, 0), ()]
+    for dtype, np_dtype in [(qb.float64, np.float64), (qb.float32, np.float32)]:
+        data = np.array(extremum_cases(), dtype=np_dtype)
+        x = qb.array(data)
+        for name in ["max", "min"]:
+            for axis in axes:
+                for keepdims in [False, True]:
+                    expected = numpy_extremum(data, name, axis, keepdims)
+
+                    def reduce(t, name=name, axis=axis, keepdims=keepdims):
+                        return getattr(t, name)(axis=axis, keepdims=keepdims)
+
+                    for result in [reduce(x), qb.jit(reduce)(x)]:
+                        actual = np.asarray(result)
+                        assert result.dtype == dtype
+                        assert actual.shape == expected.shape, (name, axis, keepdims)
+                        # Equal values and NaNs, and the NumPy sign of each zero.
+                        assert np.array_equal(actual, expected, equal_nan=True), (name, axis)
+                        assert np.array_equal(np.signbit(actual), np.signbit(expected)), (
+                            name,
+                            axis,
+                        )
+        # vmap reduces each example's own axes.
+        batched = qb.jit(qb.vmap(lambda t: t.max(axis=(0, -1))))(x)
+        assert np.array_equal(np.asarray(batched), data.max(axis=(1, 2)), equal_nan=True)
+        batched = qb.vmap(lambda t: t.min(keepdims=True))(x)
+        expected = data.min(axis=(1, 2), keepdims=True)
+        assert np.array_equal(np.asarray(batched), expected, equal_nan=True)
+
+
+def f32_rows(rows):
+    """`rows` rounded to float32, without NumPy."""
+    return [[struct.unpack("<f", struct.pack("<f", value))[0] for value in row] for row in rows]
+
+
+def test_traced_max_min_gradients_split_ties_and_compose():
+    for dtype in [qb.float64, qb.float32]:
+        # A tie across both reduced axes shares the gradient three ways, as
+        # in JAX; reducing one axis after the other would split it unevenly.
+        x = qb.array([[1.0, 1.0], [1.0, 0.0]], dtype=dtype)
+        expected = [[1 / 3, 1 / 3], [1 / 3, 0.0]]
+        if dtype == qb.float32:
+            expected = f32_rows(expected)
+        for gradient in [qb.grad(lambda t: t.max())(x), qb.jit(qb.grad(lambda t: t.max()))(x)]:
+            assert gradient.dtype == dtype and gradient.tolist() == expected, gradient.tolist()
+        direction = qb.array([[3.0, 6.0], [9.0, 1.0]], dtype=dtype)
+        assert qb.jvp(lambda t: t.max(), (x,), (direction,))[1].item() == 6.0
+        # Per-axis reductions split within each line.
+        weights = qb.array([2.0, -4.0], dtype=dtype)
+        gradient = qb.grad(lambda t: (t.min(axis=0) * weights).sum())(x)
+        assert gradient.tolist() == [[1.0, 0.0], [1.0, -4.0]], gradient.tolist()
+
+        # max(x)^2 with a two-way tie: gradient 2 m e and Hessian 2 e e^T,
+        # with e = 1/2 on the tied entries, in every differentiation order.
+        v = qb.array([2.0, -1.0, 2.0], dtype=dtype)
+
+        def squared(t):
+            return t.max() ** 2
+
+        assert qb.grad(squared)(v).tolist() == [2.0, 0.0, 2.0]
+        hessian = [[0.5, 0.0, 0.5], [0.0, 0.0, 0.0], [0.5, 0.0, 0.5]]
+        assert qb.hessian(squared)(v).tolist() == hessian
+        assert qb.jit(qb.hessian(squared))(v).tolist() == hessian
+        assert qb.jacobian(qb.grad(squared))(v).tolist() == hessian
+
+        # A NaN extremum gives NaN derivatives instead of an error.
+        nan = qb.array([1.0, math.nan, -2.0], dtype=dtype)
+        for function in [lambda t: t.max(), lambda t: t.min()]:
+            for result in [qb.grad(function)(nan), qb.jit(qb.grad(function))(nan)]:
+                assert all(math.isnan(g) for g in result.tolist()), result.tolist()
+            ones = qb.ones([3], dtype=dtype)
+            assert math.isnan(qb.jvp(function, (nan,), (ones,))[1].item())
+
+    # Gradient and Hessian against central differences away from ties.
+    def loss(t):
+        return (qb.sin(t).max(axis=1) ** 3).sum() + (t * t).min(axis=0).sum()
+
+    x0 = qb.array([[0.3, -1.2, 0.8], [-0.4, 0.9, 0.1]])
+    gradient = qb.jit(qb.grad(loss))(x0).tolist()
+    hessian = qb.jit(qb.hessian(loss))(x0).tolist()
+    step = 1e-6
+    for row in range(2):
+        for column in range(3):
+            delta = qb.zeros([2, 3]).tolist()
+            delta[row][column] = step
+            delta = qb.array(delta)
+            estimate = (loss(x0 + delta).item() - loss(x0 - delta).item()) / (2 * step)
+            assert abs(gradient[row][column] - estimate) <= 1e-8, (row, column, estimate)
+            up = qb.grad(loss)(x0 + delta).tolist()
+            down = qb.grad(loss)(x0 - delta).tolist()
+            for r in range(2):
+                for c in range(3):
+                    estimate = (up[r][c] - down[r][c]) / (2 * step)
+                    assert abs(hessian[r][c][row][column] - estimate) <= 1e-6, (
+                        (r, c, row, column),
+                        hessian[r][c][row][column],
+                        estimate,
+                    )
 
 
 def test_module_level_shape_and_linear_algebra_ops():

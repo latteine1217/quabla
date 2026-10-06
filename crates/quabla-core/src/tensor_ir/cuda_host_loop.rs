@@ -119,6 +119,7 @@ fn cuda_graph_capturable<T: CudaReal>(region: &CudaExecutionPlan<T>) -> bool {
                     | TensorOp::Mean { .. }
                     | TensorOp::SumAxis { .. }
                     | TensorOp::MeanAxis { .. }
+                    | TensorOp::ExtremumAxis { .. }
                     | TensorOp::Transpose { .. }
                     | TensorOp::Concat { .. }
                     | TensorOp::Slice { .. }

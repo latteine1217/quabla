@@ -22,7 +22,7 @@ use cudarc::nccl::{group_end, group_start, Comm as NcclComm, ReduceOp as NcclRed
 use super::{
     contiguous_strides, cuda_sqrt_derivative_expression, element_count, tensor_op_inputs,
     DynamicTensor, LinalgKind, TensorBackend, TensorDType, TensorDeviceBackend,
-    TensorExecutionPlan, TensorForiExecutionPlan, TensorForiVjpJvpExecutionPlan,
+    TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorForiVjpJvpExecutionPlan,
     TensorForiVjpTarget, TensorFusionRegion, TensorNodeId, TensorOp, TensorReplicaReduction,
     TensorScanExecutionPlan, TensorScanTarget, TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget,
     TensorShardingPlan,
@@ -3019,6 +3019,7 @@ fn execute_cuda_device_program<T: CudaReal>(
             | TensorOp::Mean { .. }
             | TensorOp::SumAxis { .. }
             | TensorOp::MeanAxis { .. }
+            | TensorOp::ExtremumAxis { .. }
             | TensorOp::Transpose { .. }
             | TensorOp::Concat { .. }
             | TensorOp::Slice { .. }
@@ -3712,7 +3713,9 @@ fn launch_cuda_node<T: CudaReal>(
             launch.arg(output);
             launch.arg(&dimensions[0]);
         }
-        TensorOp::SumAxis { input, .. } | TensorOp::MeanAxis { input, .. } => {
+        TensorOp::SumAxis { input, .. }
+        | TensorOp::MeanAxis { input, .. }
+        | TensorOp::ExtremumAxis { input, .. } => {
             launch.arg(cuda_value(values, *input)?);
             launch.arg(output);
             launch.arg(&count);
@@ -3772,7 +3775,9 @@ fn launch_cuda_node<T: CudaReal>(
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         },
-        TensorOp::SumAxis { input, axis } | TensorOp::MeanAxis { input, axis }
+        TensorOp::SumAxis { input, axis }
+        | TensorOp::MeanAxis { input, axis }
+        | TensorOp::ExtremumAxis { input, axis, .. }
             if plan.nodes[*input].shape[*axis] >= CUDA_REDUCTION_BLOCK as usize =>
         {
             LaunchConfig {
@@ -8172,43 +8177,21 @@ fn cuda_program_source(
                         for (unsigned long long k = 1ULL; k < {extent}ULL; ++k) {{ position += {step}; running = __fadd_rn(running, input[position]); out[position] = running; }}\n}}\n"
                 )
             }
+            TensorOp::ExtremumAxis { input, axis, kind } => {
+                let input_shape = &plan.nodes[*input].shape;
+                let base = cuda_axis_reduction_base(node_id, input_shape, &node.shape, *axis)?;
+                cuda_extremum_axis_kernel_source(
+                    &function,
+                    &base,
+                    input_shape[*axis],
+                    contiguous_strides(input_shape)[*axis],
+                    *kind,
+                )
+            }
             TensorOp::SumAxis { input, axis } | TensorOp::MeanAxis { input, axis } => {
                 let input_shape = &plan.nodes[*input].shape;
-                if input_shape.is_empty() || *axis >= input_shape.len() {
-                    return Err(format!("CUDA axis reduction node {node_id} has an invalid axis"));
-                }
-                let expected_shape = input_shape
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(input_axis, extent)| (input_axis != *axis).then_some(*extent))
-                    .collect::<Vec<_>>();
-                if node.shape != expected_shape {
-                    return Err(format!(
-                        "CUDA axis reduction node {node_id} has shape {:?}, expected {:?}",
-                        node.shape, expected_shape
-                    ));
-                }
+                let base = cuda_axis_reduction_base(node_id, input_shape, &node.shape, *axis)?;
                 let input_strides = contiguous_strides(input_shape);
-                let base_terms = (0..input_shape.len())
-                    .filter(|input_axis| *input_axis != *axis)
-                    .map(|input_axis| {
-                        let output_axis = if input_axis < *axis {
-                            input_axis
-                        } else {
-                            input_axis - 1
-                        };
-                        let output_stride = node.shape[output_axis + 1..].iter().product::<usize>();
-                        format!(
-                            "((index / {output_stride}ULL) % {}ULL) * {}ULL",
-                            node.shape[output_axis], input_strides[input_axis]
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let base = if base_terms.is_empty() {
-                    "0ULL".to_string()
-                } else {
-                    base_terms.join(" + ")
-                };
                 let scale = if matches!(&node.op, TensorOp::MeanAxis { .. }) {
                     format!(" / {}.0f", input_shape[*axis])
                 } else {
@@ -8451,6 +8434,115 @@ fn cuda_node_function_name(node_id: usize) -> String {
     format!("quabla_node_{node_id}")
 }
 
+/// The input offset of the first entry of the line that output element
+/// `index` of an axis reduction reduces, after checking that the output
+/// shape is the input shape without `axis`.
+fn cuda_axis_reduction_base(
+    node_id: TensorNodeId,
+    input_shape: &[usize],
+    output_shape: &[usize],
+    axis: usize,
+) -> Result<String, String> {
+    if input_shape.is_empty() || axis >= input_shape.len() {
+        return Err(format!(
+            "CUDA axis reduction node {node_id} has an invalid axis"
+        ));
+    }
+    let expected_shape = input_shape
+        .iter()
+        .enumerate()
+        .filter_map(|(input_axis, extent)| (input_axis != axis).then_some(*extent))
+        .collect::<Vec<_>>();
+    if output_shape != expected_shape {
+        return Err(format!(
+            "CUDA axis reduction node {node_id} has shape {output_shape:?}, expected {expected_shape:?}"
+        ));
+    }
+    let input_strides = contiguous_strides(input_shape);
+    let base_terms = (0..input_shape.len())
+        .filter(|input_axis| *input_axis != axis)
+        .map(|input_axis| {
+            let output_axis = if input_axis < axis {
+                input_axis
+            } else {
+                input_axis - 1
+            };
+            let output_stride = output_shape[output_axis + 1..].iter().product::<usize>();
+            format!(
+                "((index / {output_stride}ULL) % {}ULL) * {}ULL",
+                output_shape[output_axis], input_strides[input_axis]
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(if base_terms.is_empty() {
+        "0ULL".to_string()
+    } else {
+        base_terms.join(" + ")
+    })
+}
+
+/// The kernel of `TensorOp::ExtremumAxis`, shaped like the sum-axis kernel:
+/// one thread folds one line of fewer than `CUDA_REDUCTION_BLOCK` entries,
+/// and a block of `CUDA_REDUCTION_BLOCK` threads owns each longer line, each
+/// thread folding a strided share before a shared-memory tree combines them.
+/// The fold (`TensorExtremum::cuda_fold`) is order independent, so both
+/// shapes return the CPU value bit for bit, deterministically, with no
+/// atomics; the double-precision rewrite keeps `isnan` and `signbit`, which
+/// are overloaded for `double`.
+fn cuda_extremum_axis_kernel_source(
+    function: &str,
+    base: &str,
+    extent: usize,
+    stride: usize,
+    kind: TensorExtremum,
+) -> String {
+    let fold_lane = kind.cuda_fold("value", "lane");
+    if extent >= CUDA_REDUCTION_BLOCK as usize {
+        let fold_partial = kind.cuda_fold("value", "partial[thread + width]");
+        // `extent >= 256`, so every thread starts from an entry of its own.
+        format!(
+            r#"extern "C" __global__ void {function}(const float* input, float* out, unsigned long long count) {{
+    unsigned long long index = blockIdx.x;
+    if (index >= count) return;
+    unsigned int thread = threadIdx.x;
+    unsigned long long base = {base};
+    __shared__ float partial[256];
+    float value = input[base + (unsigned long long)thread * {stride}ULL];
+    for (unsigned long long k = thread + 256ULL; k < {extent}ULL; k += 256ULL) {{
+        float lane = input[base + k * {stride}ULL];
+        {fold_lane}
+    }}
+    partial[thread] = value;
+    __syncthreads();
+    for (unsigned int width = 128U; width > 0U; width >>= 1U) {{
+        if (thread < width) {{
+            {fold_partial}
+            partial[thread] = value;
+        }}
+        __syncthreads();
+    }}
+    if (thread == 0U) out[index] = partial[0];
+}}
+"#
+        )
+    } else {
+        format!(
+            r#"extern "C" __global__ void {function}(const float* input, float* out, unsigned long long count) {{
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    unsigned long long base = {base};
+    float value = input[base];
+    for (unsigned long long k = 1ULL; k < {extent}ULL; ++k) {{
+        float lane = input[base + k * {stride}ULL];
+        {fold_lane}
+    }}
+    out[index] = value;
+}}
+"#
+        )
+    }
+}
+
 fn cuda_offset_expression(output_shape: &[usize], input_shape: &[usize]) -> String {
     cuda_offset_expression_with_index(output_shape, input_shape, "index")
 }
@@ -8580,6 +8672,10 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::ScanVjpJvp { .. } => "scan_vjp_jvp",
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
+        TensorOp::ExtremumAxis { kind, .. } => match kind {
+            TensorExtremum::Max => "max_axis",
+            TensorExtremum::Min => "min_axis",
+        },
         TensorOp::Matmul { .. } => "matmul",
         TensorOp::Solve { .. } => "solve",
         TensorOp::Linalg { kind, .. } => kind.name(),

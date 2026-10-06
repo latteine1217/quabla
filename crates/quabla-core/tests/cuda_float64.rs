@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use quabla_core::compiler::QuablaCompileError;
-use quabla_core::tensor_ir::{DynamicTensor, TensorDType, TensorIr};
+use quabla_core::tensor_ir::{DynamicTensor, TensorDType, TensorExtremum, TensorIr};
 use quabla_core::{QuablaCompiler, QuablaMultiOutputProgram, QuablaPrecision, QuablaTarget};
 
 const CUDA: QuablaTarget = QuablaTarget::Cuda { device_ordinal: 0 };
@@ -141,5 +141,84 @@ fn float64_precision_rejects_float32_nodes() -> Result<(), String> {
     };
     assert_eq!(op, "float32");
     assert!(message.contains("float32 node"), "{message}");
+    Ok(())
+}
+
+/// Builds a fresh graph and its outputs; programs consume their graph.
+type ProgramBuilder<'a> = dyn Fn() -> Result<(TensorIr, Vec<usize>), String> + 'a;
+
+#[test]
+fn float64_extremum_axis_matches_the_cpu_bitwise() -> Result<(), String> {
+    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        return Ok(());
+    }
+    // Entries only double precision separates (1 + 2^-40 vs 1, magnitudes
+    // beyond the f32 range), signed zeros, infinities and one NaN, along a
+    // short axis and a long one (one block per output).
+    let entry = |index: usize| match index % 11 {
+        0 => 1.0 + 2f64.powi(-40),
+        1 => 1.0,
+        2 => -0.0,
+        3 => 0.0,
+        4 => 1e300 * (index as f64).sin(),
+        5 => f64::NEG_INFINITY,
+        _ => 1e-300 * (index as f64).cos(),
+    };
+    for (shape, poison) in [(vec![6, 11], None), (vec![2, 1000], Some(1_234))] {
+        let count = shape.iter().product::<usize>();
+        let mut values = (0..count).map(entry).collect::<Vec<_>>();
+        if let Some(index) = poison {
+            values[index] = f64::NAN;
+        }
+        let inputs = BTreeMap::from([
+            ("x".to_string(), DynamicTensor::new(shape.clone(), values)?),
+            (
+                "cotangent".to_string(),
+                DynamicTensor::new(vec![], vec![1.0])?,
+            ),
+        ]);
+        let forward = || -> Result<(TensorIr, Vec<usize>), String> {
+            let mut graph = TensorIr::new();
+            let x = graph.input("x", shape.clone())?;
+            let mut outputs = Vec::new();
+            for axis in 0..2 {
+                for kind in [TensorExtremum::Max, TensorExtremum::Min] {
+                    outputs.push(graph.extremum_axis(x, axis, kind)?);
+                }
+            }
+            Ok((graph, outputs))
+        };
+        // The chooser gradient of the row maxima: ties share 1 / count.
+        let gradient = || -> Result<(TensorIr, Vec<usize>), String> {
+            let mut graph = TensorIr::new();
+            let x = graph.input("x", shape.clone())?;
+            let largest = graph.extremum_axis(x, 1, TensorExtremum::Max)?;
+            let total = graph.sum(largest)?;
+            let reverse = graph.symbolic_vjp(total, "cotangent")?;
+            let output = reverse.gradients["x"];
+            Ok((reverse.graph, vec![output]))
+        };
+        let builds: [&ProgramBuilder<'_>; 2] = [&forward, &gradient];
+        for build in builds {
+            let (graph, outputs) = build()?;
+            let device = run(graph, outputs, CUDA, QuablaPrecision::Float64, &inputs)?;
+            let (graph, outputs) = build()?;
+            let reference = run(
+                graph,
+                outputs,
+                QuablaTarget::Cpu,
+                QuablaPrecision::Default,
+                &inputs,
+            )?;
+            for (actual, expected) in device.iter().flatten().zip(reference.iter().flatten()) {
+                assert!(
+                    actual.to_bits() == expected.to_bits()
+                        || (actual.is_nan() && expected.is_nan()),
+                    "{actual} is not bitwise {expected}"
+                );
+            }
+            assert_eq!(device.concat().len(), reference.concat().len());
+        }
+    }
     Ok(())
 }

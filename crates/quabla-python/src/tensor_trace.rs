@@ -11,8 +11,9 @@ use quabla_core::tensor_ir::{
     CudaExecutionPlan, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, MlxAdamPlan,
     MlxBackend, MlxRetainedInputs, SymbolicCotangent, TensorBackend, TensorComparison,
     TensorCondExecutionPlan, TensorCustomRule, TensorCustomTangent, TensorDType,
-    TensorExecutionPlan, TensorForiExecutionPlan, TensorIr, TensorNodeId, TensorRegion,
-    TensorReplicaReduction, TensorScanExecutionPlan, TensorWhileExecutionPlan, UnaryMathKind,
+    TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorIr, TensorNodeId,
+    TensorRegion, TensorReplicaReduction, TensorScanExecutionPlan, TensorWhileExecutionPlan,
+    UnaryMathKind,
 };
 use quabla_core::{
     QuablaCompiler, QuablaExecutable, QuablaMultiOutputExecutable, QuablaMultiOutputProgram,
@@ -2284,6 +2285,11 @@ impl TraceTensor {
         reduced.binary(&scale, "mul")
     }
 
+    /// The max or min over the example `axes` (every example axis when
+    /// `None`) as one `ExtremumAxis` node: the reduced axes are moved last
+    /// and flattened into one, so the graph has O(1) nodes in the reduced
+    /// size and ties across all reduced axes share the derivative equally,
+    /// as in JAX. An empty `axes` returns `self`.
     fn extrema_axes_tensor(
         &self,
         axes: Option<Vec<isize>>,
@@ -2291,57 +2297,50 @@ impl TraceTensor {
         maximum: bool,
     ) -> Result<Self, String> {
         self.ensure_not_bool(if maximum { "max" } else { "min" })?;
-        let example_rank = self.shape.len() - usize::from(self.batch_axis.is_some());
-        let Some(axes) = axes else {
-            let mut reduced = self.clone();
-            for _ in 0..example_rank {
-                reduced = reduced.extrema_axis_tensor(-1, maximum)?;
-            }
-            return if keepdims {
-                reduced.reshape_tensor(vec![1; example_rank])
-            } else {
-                Ok(reduced)
-            };
-        };
-        let mut axes = normalize_reduction_axes(axes, example_rank)?;
-        axes.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
-        let mut reduced = self.clone();
-        for axis in axes {
-            reduced = reduced.extrema_axis_tensor(axis as isize, maximum)?;
-            if keepdims {
-                let batch_offset = usize::from(reduced.batch_axis.is_some());
-                let mut shape = reduced.shape[batch_offset..].to_vec();
-                shape.insert(axis, 1);
-                reduced = reduced.reshape_tensor(shape)?;
-            }
-        }
-        Ok(reduced)
-    }
-
-    fn extrema_axis_tensor(&self, axis: isize, maximum: bool) -> Result<Self, String> {
         let batch_offset = usize::from(self.batch_axis.is_some());
-        let actual_axis = usize::try_from(self.example_axis(axis)?)
-            .map_err(|_| "normalized tensor axis is negative".to_string())?;
-        let axis = actual_axis - batch_offset;
-        let axis_extent = self.shape[actual_axis];
-        if axis_extent == 0 {
-            return Err("max/min reduction requires a non-empty reduced axis".to_string());
-        }
-        let remove_axis = |tensor: Self| {
-            let mut shape = tensor.shape[batch_offset..].to_vec();
-            shape.remove(axis);
-            tensor.reshape_tensor(shape)
+        let example_shape = self.shape[batch_offset..].to_vec();
+        let axes = match axes {
+            Some(axes) => normalize_reduction_axes(axes, example_shape.len())?,
+            None => (0..example_shape.len()).collect(),
         };
-        let mut reduced = remove_axis(self.slice_tensor(axis as isize, 0, 1)?)?;
-        for index in 1..axis_extent {
-            let candidate = remove_axis(self.slice_tensor(axis as isize, index, index + 1)?)?;
-            reduced = if maximum {
-                reduced.maximum_tensor(&candidate)?
-            } else {
-                reduced.minimum_tensor(&candidate)?
-            };
+        if axes.is_empty() {
+            return Ok(self.clone());
         }
-        Ok(reduced)
+        let kept = (0..example_shape.len())
+            .filter(|axis| !axes.contains(axis))
+            .collect::<Vec<_>>();
+        let order = kept.iter().chain(&axes).copied().collect::<Vec<_>>();
+        let mut source = self.clone();
+        if order
+            .iter()
+            .enumerate()
+            .any(|(position, axis)| position != *axis)
+        {
+            source =
+                source.transpose_tensor(Some(order.iter().map(|axis| *axis as isize).collect()))?;
+        }
+        if axes.len() > 1 {
+            let mut flat_shape = kept
+                .iter()
+                .map(|axis| example_shape[*axis])
+                .collect::<Vec<_>>();
+            flat_shape.push(axes.iter().map(|axis| example_shape[*axis]).product());
+            source = source.reshape_tensor(flat_shape)?;
+        }
+        let kind = if maximum {
+            TensorExtremum::Max
+        } else {
+            TensorExtremum::Min
+        };
+        let reduced = source.apply(&[], |ir| ir.extremum_axis(source.node_id, -1, kind))?;
+        if !keepdims {
+            return Ok(reduced);
+        }
+        let mut shape = example_shape;
+        for axis in axes {
+            shape[axis] = 1;
+        }
+        reduced.reshape_tensor(shape)
     }
 
     fn sin_tensor(&self) -> Result<Self, String> {
