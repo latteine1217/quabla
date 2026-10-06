@@ -1,5 +1,6 @@
 """S7 eager, staged, and differentiated control-flow wrapper checks."""
 
+import math
 import os
 
 import quabla as qb
@@ -823,16 +824,353 @@ def test_hessian_through_a_linear_loop_matches_the_closed_form():
     assert_close(qb.hessian(loss, argnums=1)(x, s), expected_s, 1e-11)
 
 
-def test_vmap_of_while_loop_and_cond_still_reports_no_rule():
-    def branch(x):
-        return cond(x.sum() > 0.0, lambda t: t * 2.0, lambda t: -t, x)
+# ---- vmap of cond regions ----
 
-    assert_raises(
-        qb.UnsupportedOperationError,
-        qb.vmap(branch),
-        qb.array([[1.0], [-1.0]]),
-        match="vmap cannot batch a cond",
+
+def batched_cond_arguments(dtype):
+    # Row sums 0.6, -0.9, 1.2, 0.7 and flags 1, -1, 0.5, -0.2: data and flag
+    # predicates take both branches within the batch.
+    flags = qb.array([1.0, -1.0, 0.5, -0.2], dtype=dtype)
+    xs = qb.array(
+        [[0.3, -0.2, 0.5], [-0.4, 0.1, -0.6], [1.0, 0.2, 0.0], [-0.5, 0.9, 0.3]], dtype=dtype
     )
+    ws = qb.array(
+        [[0.9, 1.1, 0.8], [1.05, 0.95, 0.7], [0.5, 0.6, 1.2], [1.3, 0.8, 0.9]], dtype=dtype
+    )
+    return flags, xs, ws
+
+
+def piecewise(x, w):
+    # The predicate depends on the mapped data.
+    return cond(x.sum() > 0.0, lambda v, w: (v * w).sin() * 2.0, lambda v, w: v * v - w, x, w)
+
+
+def gated(flag, x, w):
+    # The predicate is its own argument, mapped or not independently of the
+    # operands.
+    return cond(flag > 0.0, lambda v, w: (v * w).tanh(), lambda v, w: v.cos() + w, x, w)
+
+
+def cond_with_loops(flag, x, w):
+    def scanned(v, w):
+        final, outputs = scan(lambda c, i, w: (c * w + 0.1, (c * w).sum()), v, length=2, operands=(w,))
+        return final + outputs.sum()
+
+    return cond(
+        flag > 0.0,
+        lambda v, w: fori_loop(0, 3, lambda i, c, w: (c * w).sin() + 0.1 * i, v, operands=(w,)),
+        scanned,
+        x,
+        w,
+    )
+
+
+def scan_carry_cond(flag, x, w):
+    # w reaches only the discarded scan outputs, so under an unmapped flag
+    # and a mapped w the true branch alone would be unmapped and the false
+    # branch mapped: the true branch is broadcast.
+    return cond(
+        flag > 0.0,
+        lambda v, w: scan(lambda c, i, w: (c * 0.9 + 0.1, c * w), v, length=2, operands=(w,))[0],
+        lambda v, w: v * w,
+        x,
+        w,
+    )
+
+
+def loops_with_conds(x, w):
+    # A cond on the loop index (never mapped) and one on the carry (mapped
+    # with the carry) inside a fori_loop body, and a cond inside a scan body.
+    def body(i, c, w):
+        stepped = cond(i < 1, lambda c, w: c * w, lambda c, w: c.sin() + w, c, w)
+        return cond(stepped.sum() > 0.0, lambda s: s * 0.9, lambda s: s.cos(), stepped)
+
+    def step(c, i, w):
+        nxt = cond(c.sum() > 0.5, lambda c, w: c * w, lambda c, w: c + 0.1 * w, c, w)
+        return nxt, nxt.sum()
+
+    looped = fori_loop(0, 3, body, x, operands=(w,))
+    final, outputs = scan(step, looped, length=3, operands=(w,))
+    return final, outputs
+
+
+def test_vmap_batches_cond_like_a_loop_over_examples():
+    for dtype, tolerance in ((qb.float64, 1e-13), (qb.float32, 1e-6)):
+        flags, xs, ws = batched_cond_arguments(dtype)
+        flag, x, w = flags[0], xs[0], ws[0]
+        cases = [
+            # Mapped data predicate.
+            (piecewise, (xs, ws), (0, 0)),
+            (piecewise, (xs, w), (0, None)),
+            # Unmapped data predicate with a mapped operand.
+            (piecewise, (x, ws), (None, 0)),
+            # A batch axis that is not leading.
+            (piecewise, (xs.transpose(), w), (1, None)),
+        ]
+        # Every mapping of the flag and the two operands.
+        for flag_axis in (0, None):
+            for x_axis in (0, None):
+                for w_axis in (0, None):
+                    if flag_axis is x_axis is w_axis is None:
+                        continue
+                    args = tuple(
+                        batched if axis == 0 else batched[0]
+                        for batched, axis in ((flags, flag_axis), (xs, x_axis), (ws, w_axis))
+                    )
+                    cases.append((gated, args, (flag_axis, x_axis, w_axis)))
+        cases += [
+            (cond_with_loops, (flags, xs, w), (0, 0, None)),
+            (cond_with_loops, (flag, x, ws), (None, None, 0)),
+            (cond_with_loops, (flags, x, w), (0, None, None)),
+            (scan_carry_cond, (flag, x, ws), (None, None, 0)),
+            (scan_carry_cond, (flags, x, ws), (0, None, 0)),
+            (loops_with_conds, (xs, w), (0, None)),
+            (loops_with_conds, (x, ws), (None, 0)),
+        ]
+        for function, args, in_axes in cases:
+            assert_vmap_matches_examples(function, args, in_axes, tolerance)
+        # Nested vmap: the inner map batches the flag, the outer one the data.
+        pairs = qb.stack([xs, xs * -0.5], 0)
+        inner = qb.vmap(gated, in_axes=(0, 0, None))
+        assert_tree_close(
+            qb.vmap(inner, in_axes=(None, 0, None))(flags, pairs, w),
+            per_example(lambda p: per_example(gated, (flags, p, w), (0, 0, None)), (pairs,), (0,)),
+            tolerance,
+        )
+
+
+def cond_losses():
+    def piecewise_loss(x, w):
+        return (piecewise(x, w) ** 2).sum()
+
+    def gated_loss(flag, x, w):
+        return (gated(flag, x, w) ** 2).sum() + gated(flag, x, w).sum()
+
+    def loops_loss(x, w):
+        final, outputs = loops_with_conds(x, w)
+        return (final**2).sum() + outputs.sum()
+
+    def cond_loops_loss(flag, x, w):
+        return (cond_with_loops(flag, x, w) ** 2).sum()
+
+    return piecewise_loss, gated_loss, loops_loss, cond_loops_loss
+
+
+def test_vmap_of_cond_gradients_and_jvps_matches_per_example_derivatives():
+    piecewise_loss, gated_loss, loops_loss, cond_loops_loss = cond_losses()
+    for dtype, tolerance in ((qb.float64, 1e-12), (qb.float32, 1e-5)):
+        flags, xs, ws = batched_cond_arguments(dtype)
+        flag, x, w = flags[0], xs[0], ws[0]
+        zeros = qb.zeros([3], dtype)
+        cases = [
+            (qb.grad(piecewise_loss, argnums=(0, 1)), (xs, ws), (0, 0)),
+            (qb.grad(piecewise_loss, argnums=(0, 1)), (x, ws), (None, 0)),
+            (qb.grad(gated_loss, argnums=(1, 2)), (flags, xs, w), (0, 0, None)),
+            (qb.grad(gated_loss, argnums=(1, 2)), (flags, x, w), (0, None, None)),
+            (qb.grad(gated_loss, argnums=(1, 2)), (flag, xs, w), (None, 0, None)),
+            (qb.grad(loops_loss, argnums=(0, 1)), (xs, w), (0, None)),
+            (qb.grad(cond_loops_loss, argnums=(1, 2)), (flags, xs, ws), (0, 0, 0)),
+            (
+                lambda f, a, b, t: qb.jvp(gated_loss, (f, a, b), (qb.zeros([], dtype), t, zeros)),
+                (flags, xs, w, ws),
+                (0, 0, None, 0),
+            ),
+            # Only the tangent is mapped, as a forward-mode Jacobian maps it.
+            (
+                lambda t, a, b: qb.jvp(piecewise_loss, (a, b), (t, zeros)),
+                (xs, x, w),
+                (0, None, None),
+            ),
+            (
+                lambda t, a, b: qb.jvp(qb.grad(loops_loss), (a, b), (t, zeros))[1],
+                (xs, x, w),
+                (0, None, None),
+            ),
+        ]
+        for function, args, in_axes in cases:
+            assert_vmap_matches_examples(function, args, in_axes, tolerance)
+        # Reverse mode over vmap: the mapped x gets one gradient per example,
+        # and the shared w the sum of the examples' gradients.
+        def batched_loss(x, w):
+            return qb.vmap(gated_loss, in_axes=(0, 0, None))(flags, x, w).sum()
+
+        gradients = [qb.grad(gated_loss, argnums=(1, 2))(flags[b], xs[b], w) for b in range(4)]
+        expected_x = qb.stack([gradient[0] for gradient in gradients], 0)
+        expected_w = sum((gradient[1] for gradient in gradients[1:]), gradients[0][1])
+        assert_tree_close(
+            qb.grad(batched_loss, argnums=(0, 1))(xs, w), (expected_x, expected_w), tolerance
+        )
+        assert_tree_close(
+            qb.jit(qb.grad(batched_loss, argnums=(0, 1)))(xs, w),
+            (expected_x, expected_w),
+            tolerance,
+        )
+
+
+def test_hessian_and_jacobian_through_cond_match_per_direction_calls():
+    piecewise_loss, gated_loss, loops_loss, cond_loops_loss = cond_losses()
+    for dtype, tolerance in ((qb.float64, 1e-12), (qb.float32, 1e-5)):
+        flags, xs, ws = batched_cond_arguments(dtype)
+        directions = basis(3, dtype)
+        losses = [
+            (piecewise_loss, (xs[0], ws[0])),
+            (piecewise_loss, (xs[1], ws[1])),
+            (lambda x, w: gated_loss(flags[1], x, w), (xs[1], ws[1])),
+            (loops_loss, (xs[0], ws[0])),
+            (lambda x, w: cond_loops_loss(flags[0], x, w), (xs[0], ws[0])),
+            (lambda x, w: cond_loops_loss(flags[1], x, w), (xs[0], ws[0])),
+        ]
+        for loss, arguments in losses:
+            for argnums in (0, 1):
+                expected = qb.stack(
+                    [
+                        qb.jvp(
+                            qb.grad(loss, argnums=argnums),
+                            arguments,
+                            tuple(
+                                direction if index == argnums else qb.zeros_like(value)
+                                for index, value in enumerate(arguments)
+                            ),
+                        )[1]
+                        for direction in directions
+                    ],
+                    0,
+                )
+                hessian = qb.hessian(loss, argnums=argnums)
+                assert_tree_close(hessian(*arguments), expected, tolerance)
+                assert_tree_close(qb.jit(hessian)(*arguments), expected, tolerance)
+
+        # Hessian of a loss over a vmap whose predicate is mapped: the sum of
+        # the examples' Hessians.
+        def batched_loss(w):
+            return qb.vmap(gated_loss, in_axes=(0, 0, None))(flags, xs, w).sum()
+
+        expected = qb.hessian(lambda w: gated_loss(flags[0], xs[0], w))(ws[0])
+        for b in range(1, 4):
+            expected = expected + qb.hessian(lambda w, b=b: gated_loss(flags[b], xs[b], w))(ws[0])
+        assert_tree_close(qb.hessian(batched_loss)(ws[0]), expected, tolerance)
+
+        # Forward-mode Jacobian (as many outputs as inputs): columns are JVPs.
+        for flag in (flags[0], flags[1]):
+            def outputs_of(w, flag=flag):
+                return gated(flag, xs[0], w)
+
+            forward = qb.stack(
+                [qb.jvp(outputs_of, (ws[0],), (direction,))[1] for direction in directions], 1
+            )
+            assert_tree_close(qb.jacobian(outputs_of)(ws[0]), forward, tolerance)
+
+        # Reverse-mode Jacobian (fewer outputs than inputs): rows are VJPs.
+        def summary(x):
+            final, outputs = loops_with_conds(x, ws[0])
+            return qb.stack([final.sum(), (outputs**2).sum()], 0)
+
+        _, pullback = qb.vjp(summary, xs[0])
+        reverse = qb.stack([pullback(direction)[0] for direction in basis(2, dtype)], 0)
+        assert_tree_close(qb.jacobian(summary)(xs[0]), reverse, tolerance)
+
+
+def safe_log(x):
+    # log on the positive side, sqrt(1 - x) elsewhere. Each branch is NaN or
+    # infinite on the other side: log(0) = -inf with derivative inf,
+    # log(-1) = NaN, and sqrt(1 - 2) = NaN with a NaN derivative.
+    return cond(x > 0.0, lambda v: qb.log(v), lambda v: qb.sqrt(1.0 - v), x)
+
+
+def test_vmap_of_cond_keeps_the_unselected_branch_out_of_values_and_derivatives():
+    for dtype, tolerance in ((qb.float64, 1e-14), (qb.float32, 1e-6)):
+        points = qb.array([2.0, 0.0, -1.0, 0.5], dtype=dtype)
+        value = [math.log(2.0), 1.0, math.sqrt(2.0), math.log(0.5)]
+        first = [0.5, -0.5, -0.5 / math.sqrt(2.0), 2.0]
+        second = [-0.25, -0.25, -0.25 / 2.0**1.5, -4.0]
+        diagonal = [[first[i] if i == j else 0.0 for j in range(4)] for i in range(4)]
+        hessian = [[second[i] if i == j else 0.0 for j in range(4)] for i in range(4)]
+        batched = qb.vmap(safe_log)
+
+        def total(x):
+            return batched(x).sum()
+
+        results = [
+            (batched(points), value),
+            (qb.jit(batched)(points), value),
+            (qb.vmap(qb.grad(safe_log))(points), first),
+            # Reverse mode through the select: the where VJP gives the
+            # unselected branch a zero cotangent, and its 0 * inf or 0 * NaN
+            # derivative is masked instead of added.
+            (qb.grad(total)(points), first),
+            (qb.jit(qb.grad(total))(points), first),
+            (qb.jvp(batched, (points,), (qb.ones_like(points),))[1], first),
+            (qb.jacobian(batched)(points), diagonal),
+            (qb.jacobian(lambda x: batched(x)[:2])(points), [row for row in diagonal[:2]]),
+            (qb.hessian(total)(points), hessian),
+            (qb.vmap(qb.grad(qb.grad(safe_log)))(points), second),
+        ]
+        for actual, expected in results:
+            assert actual.dtype == dtype, actual.dtype
+            assert all(math.isfinite(item) for item in actual.to_flat_list()), actual
+            assert_close(actual, qb.asarray(expected, dtype=dtype), tolerance * 4)
+
+
+def test_vmap_of_cond_with_a_float_predicate_selects_nonzero_examples():
+    def scaled(flag, x):
+        return cond(flag, lambda v: v * 2.0, lambda v: -v, x)
+
+    flags = qb.array([2.0, 0.0, -0.0, -3.0])
+    x = qb.array([1.0, 2.0, 3.0, 4.0])
+    assert_close(qb.vmap(scaled)(flags, x), [2.0, -2.0, -3.0, 8.0], 0.0)
+    # The reference is the traced cond (an eager float array is always
+    # truthy, so an eager cond would take the true branch for zero).
+    assert_close(qb.vmap(scaled)(flags, x), per_example(qb.jit(scaled), (flags, x), (0, 0)), 0.0)
+    # An unbatched cond rejects a non-finite predicate; a batched one cannot
+    # raise per example and returns NaN for it.
+    assert_raises(ValueError, qb.jit(scaled), qb.asarray(math.nan), x[0], match="finite")
+    result = qb.vmap(scaled)(qb.array([1.0, math.nan, math.inf]), x[:3]).to_flat_list()
+    assert result[0] == 2.0 and math.isnan(result[1]) and math.isnan(result[2]), result
+
+
+def test_optional_device_vmap_of_cond_matches_cpu():
+    piecewise_loss, gated_loss, loops_loss, _ = cond_losses()
+    devices = [
+        (device, precision)
+        for device, flag, precisions in (
+            ("mlx", "QUABLA_MLX_TEST", (None,)),
+            ("cuda", "QUABLA_CUDA_TEST", (None, "float64")),
+        )
+        if os.environ.get(flag) == "1"
+        for precision in precisions
+    ]
+    for device, precision in devices:
+        dtype = qb.float64 if precision == "float64" else qb.float32
+        tolerance = 1e-11 if precision == "float64" else 1e-5
+        flags, xs, ws = batched_cond_arguments(dtype)
+        points = qb.array([2.0, 0.0, -1.0, 0.5], dtype=dtype)
+        operations = {
+            # A mapped predicate: a select, no predicate readback.
+            "vmap mapped flag": (qb.vmap(gated), (flags, xs, ws)),
+            "vmap mapped data": (qb.vmap(piecewise, in_axes=(0, None)), (xs, ws[0])),
+            # An unmapped predicate: one cond with both regions batched.
+            "vmap unmapped flag": (qb.vmap(gated, in_axes=(None, 0, None)), (flags[1], xs, ws[0])),
+            "vmap grad": (qb.vmap(qb.grad(piecewise_loss, argnums=(0, 1))), (xs, ws)),
+            "grad over vmap": (
+                qb.grad(lambda x, w: qb.vmap(gated_loss, in_axes=(0, 0, None))(flags, x, w).sum(), argnums=(0, 1)),
+                (xs, ws[0]),
+            ),
+            "hessian": (qb.hessian(piecewise_loss), (xs[0], ws[0])),
+            "hessian unselected nan": (qb.hessian(lambda x: qb.vmap(safe_log)(x).sum()), (points,)),
+            "grad unselected nan": (qb.grad(lambda x: qb.vmap(safe_log)(x).sum()), (points,)),
+            "vmap loops with conds": (qb.vmap(loops_with_conds, in_axes=(0, None)), (xs, ws[0])),
+            "jacobian": (qb.jacobian(lambda w: gated(flags[0], xs[0], w)), (ws[0],)),
+        }
+        for name, (operation, args) in operations.items():
+            expected = qb.jit(operation)(*args)
+            options = {"device": device}
+            if precision is not None:
+                options["precision"] = precision
+            actual = qb.jit(operation, **options)(*args)
+            try:
+                assert_tree_close(actual, expected, tolerance)
+            except AssertionError as error:
+                raise AssertionError(f"{device} {precision} {name}") from error
 
 
 def test_optional_device_vmap_of_loops_matches_cpu():

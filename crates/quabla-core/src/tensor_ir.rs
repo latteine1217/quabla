@@ -1047,7 +1047,7 @@ pub struct SymbolicVjpMany {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BatchingError {
     /// A node that depends on a mapped input has no batching rule; `op` is
-    /// its IR op name (a `cond` or `while` region node).
+    /// its IR op name (a `while` region node).
     Unsupported { op: &'static str },
     /// Invalid bindings, outputs, or batch size.
     Invalid(String),
@@ -1059,11 +1059,6 @@ impl std::fmt::Display for BatchingError {
             Self::Unsupported { op: "while" } => formatter.write_str(
                 "vmap cannot batch a while_loop: its trip count could differ per batch \
                  element; use a bounded fori_loop whose body masks finished elements with where",
-            ),
-            Self::Unsupported { op: "cond" } => formatter.write_str(
-                "vmap cannot batch a cond whose predicate or operands depend on a mapped \
-                 argument: cond has no batching rule yet; compute both branches and select \
-                 per element with where",
             ),
             Self::Unsupported { op } => write!(
                 formatter,
@@ -3121,9 +3116,11 @@ impl TensorIr {
     /// (`fori`, `scan`, and their JVP, VJP, and forward-over-reverse nodes)
     /// batch their body regions recursively (see `region_batching.rs`); a
     /// loop result that does not depend on a mapped operand stays unmapped,
-    /// and a scan's stacked outputs are `[B, T, *y]`. A mapped `cond` or
-    /// `while` node is [`BatchingError::Unsupported`]; unmapped region nodes
-    /// are copied unchanged.
+    /// and a scan's stacked outputs are `[B, T, *y]`. A `cond` batches both
+    /// branch regions under an unmapped predicate and becomes a per-example
+    /// `where` of both branches under a mapped one. A mapped `while` node is
+    /// [`BatchingError::Unsupported`]; unmapped region nodes are copied
+    /// unchanged.
     pub fn inline_batched(
         &mut self,
         callee: &TensorIr,
@@ -3238,7 +3235,7 @@ impl TensorIr {
     /// Appends the batched form of a callee node with at least one mapped
     /// operand (see [`Self::inline_batched`]) and returns it with whether it
     /// is mapped; the node's dtype and weak flag are kept, and its shape gains
-    /// the leading batch axis. Only a loop region node can stay unmapped.
+    /// the leading batch axis. Only a region node can stay unmapped.
     ///
     /// A `Custom` node is batched with its rule (`TensorCustomRule::batched`),
     /// once per call: `custom_groups` maps a callee group id to the batched
@@ -3527,7 +3524,10 @@ impl TensorIr {
             | TensorOp::ScanVjpJvp { .. } => {
                 return self.push_batched_loop(node, (remap, mapped), batch_size, loop_groups)
             }
-            TensorOp::Cond { .. } | TensorOp::While { .. } => {
+            TensorOp::Cond { .. } => {
+                return self.push_batched_cond(node, (remap, mapped), batch_size)
+            }
+            TensorOp::While { .. } => {
                 return Err(BatchingError::Unsupported {
                     op: tensor_op_name(&node.op),
                 })
@@ -3859,7 +3859,9 @@ impl TensorIr {
                     let (lhs_value, _) = pairs[*lhs];
                     let (rhs_value, _) = pairs[*rhs];
                     let value = transformed.greater(lhs_value, rhs_value)?;
-                    let tangent = transformed.scalar_constant(0.0);
+                    // Shaped like the mask, so a reshape of it (a mapped
+                    // predicate broadcast by `vmap`) reshapes its tangent too.
+                    let tangent = symbolic_zero_tangent(&mut transformed, &node.shape)?;
                     (value, tangent)
                 }
                 // The tangent of a Bool result is a weak f64 zero shaped like the value, so data

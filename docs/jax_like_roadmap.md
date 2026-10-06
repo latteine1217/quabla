@@ -13,7 +13,7 @@ not in it.
 | # | Item | Status |
 | --- | --- | --- |
 | 1 | Batching rule for `fori_loop` and `scan` regions and their derivative regions (JVP, VJP, forward-over-reverse HVP): mapped captures and carries batch the body region, unmapped operands stay unbatched | Done: every loop region node batches on CPU, CUDA, and MLX, with the carry fixed point; `vmap`, `jacobian`, and `hessian` through `fori_loop`/`scan` and `vmap` of `odeint` (every method, `saveat`) work |
-| 2 | Batching rule for `cond`: an unmapped predicate batches both branch regions; a mapped predicate evaluates both branches and selects per element, as JAX does | Planned |
+| 2 | Batching rule for `cond`: an unmapped predicate batches both branch regions; a mapped predicate evaluates both branches and selects per element, as JAX does | Done: `cond` and its JVP and VJP regions batch on CPU, CUDA, and MLX; a mapped predicate is a `where` of both batched branches that keeps the unselected branch's NaN out of values and mapped-operand derivatives; `vmap`, `jacobian`, and `hessian` work through `cond`, conds in loop bodies, and loops in branches |
 | 3 | Batching rule for `while_loop`: an unmapped predicate batches the body; a mapped predicate runs until every element is done and freezes finished elements' carries, as JAX does | Planned |
 | 4 | What the rules unlock, on CPU, CUDA, and MLX: `hessian` and `jacobian` through loops, `vmap` of `odeint` for every method, and `vmap` of `linalg.cg`, `linalg.gmres`, and `newton` | Planned |
 

@@ -265,30 +265,122 @@ fn nested_loops_batch_the_inner_region_inside_the_outer_body() -> Result<(), Str
     Ok(())
 }
 
-#[test]
-fn cond_and_while_regions_report_that_they_have_no_rule_yet() -> Result<(), String> {
+/// Two branch regions over the captures `value`, `scale`, and `w` (all
+/// `[3]`): the final carry of [`scan_plan`] from `value`, in which `w` reaches
+/// only the discarded outputs, and `value * w * scale`.
+fn scan_carry_branches() -> Result<TensorCondExecutionPlan, String> {
     let mut on_true = TensorIr::new();
-    let value = on_true.input("value", vec![])?;
-    let squared = on_true.mul(value, value)?;
-    let mut on_false = TensorIr::new();
-    let value = on_false.input("value", vec![])?;
-    let negated = on_false.sub(value, value)?;
-    let branches = TensorCondExecutionPlan::new(
-        on_true.compile_cpu(squared)?,
-        on_false.compile_cpu(negated)?,
+    let value = on_true.input("value", vec![3])?;
+    let scale = on_true.input("scale", vec![3])?;
+    let w = on_true.input("w", vec![3])?;
+    let (carry, _) = on_true.scan(
+        value,
+        scan_plan()?,
+        vec![("scale".to_string(), scale), ("w".to_string(), w)],
     )?;
+    let mut on_false = TensorIr::new();
+    let value = on_false.input("value", vec![3])?;
+    let scale = on_false.input("scale", vec![3])?;
+    let w = on_false.input("w", vec![3])?;
+    let weighted = on_false.mul(value, w)?;
+    let product = on_false.mul(weighted, scale)?;
+    TensorCondExecutionPlan::new(on_true.compile_cpu(carry)?, on_false.compile_cpu(product)?)
+}
+
+/// `cond(p > 0, scan_carry_branches)` over the callee inputs `x`, `s`, `w`,
+/// and the scalar `p`.
+fn cond_callee() -> Result<(TensorIr, TensorNodeId), String> {
     let mut callee = TensorIr::new();
-    let x = callee.input("x", vec![])?;
+    let x = callee.input("x", vec![3])?;
+    let s = callee.input("s", vec![3])?;
+    let w = callee.input("w", vec![3])?;
+    let p = callee.input("p", vec![])?;
     let zero = callee.scalar_constant(0.0);
-    let predicate = callee.greater(x, zero)?;
-    let branched =
-        callee.cond_with_captures(predicate, branches, vec![("value".to_string(), x)])?;
-    let mut graph = TensorIr::new();
-    let bindings = bind(&mut graph, &callee, &[("x", true)])?;
-    let error = graph
-        .inline_batched(&callee, &bindings, BATCH, &[branched])
-        .expect_err("cond has no batching rule yet");
-    assert_eq!(error, BatchingError::Unsupported { op: "cond" });
-    assert!(error.to_string().contains("where"), "{error}");
+    let predicate = callee.greater(p, zero)?;
+    let branched = callee.cond_with_captures(
+        predicate,
+        scan_carry_branches()?,
+        vec![
+            ("value".to_string(), x),
+            ("scale".to_string(), s),
+            ("w".to_string(), w),
+        ],
+    )?;
+    Ok((callee, branched))
+}
+
+#[test]
+fn an_unmapped_predicate_keeps_one_cond_with_one_output_batchedness() -> Result<(), String> {
+    let (callee, branched) = cond_callee()?;
+    let (graph, results) = batched(
+        &callee,
+        &[("x", false), ("s", false), ("w", true), ("p", false)],
+        &[branched],
+    )?;
+    let (node, mapped) = results[0];
+    assert!(mapped);
+    assert_eq!(graph.nodes[node].shape, vec![BATCH, 3]);
+    let TensorOp::Cond {
+        branches, captures, ..
+    } = &graph.nodes[node].op
+    else {
+        panic!("an unmapped predicate keeps the lazy cond");
+    };
+    // Captures are bound as they are: only w is mapped.
+    for (name, input) in [("value", "x"), ("scale", "s"), ("w", "w")] {
+        let bound = captures
+            .iter()
+            .find(|(capture, _)| capture == name)
+            .ok_or_else(|| format!("capture {name} is missing"))?;
+        assert_eq!(bound.1, graph.input_node_id(input)?, "{name}");
+    }
+    for region in [&branches.on_true.plan, &branches.on_false.plan] {
+        assert_eq!(region.input_shape("value")?, vec![3]);
+        assert_eq!(region.input_shape("scale")?, vec![3]);
+        assert_eq!(region.input_shape("w")?, vec![BATCH, 3]);
+    }
+    assert_eq!(branches.output_shape()?, vec![BATCH, 3]);
+    // w does not reach the scan carry, so the true branch alone would stay
+    // unmapped; it is broadcast to the false branch's batchedness.
+    let on_true = &branches.on_true.plan;
+    assert!(matches!(
+        on_true.nodes[on_true.output_node_id].op,
+        TensorOp::Broadcast { .. }
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_mapped_predicate_selects_between_both_batched_branches() -> Result<(), String> {
+    let (callee, branched) = cond_callee()?;
+    let (graph, results) = batched(
+        &callee,
+        &[("x", true), ("s", false), ("w", false), ("p", true)],
+        &[branched],
+    )?;
+    let (node, mapped) = results[0];
+    assert!(mapped);
+    assert_eq!(graph.nodes[node].shape, vec![BATCH, 3]);
+    let TensorOp::Where { condition, .. } = &graph.nodes[node].op else {
+        panic!("a mapped predicate selects with where");
+    };
+    // The [B] predicate is broadcast over the output's trailing axis.
+    assert_eq!(graph.nodes[*condition].shape, vec![BATCH, 1]);
+    assert!(graph
+        .nodes
+        .iter()
+        .all(|node| !matches!(node.op, TensorOp::Cond { .. })));
+    // The mapped x enters each branch once behind a gradient mask; the
+    // unmapped s and w are bound as they are.
+    let frozen = |name: &str| -> Result<usize, String> {
+        let input = graph.input_node_id(name)?;
+        Ok(graph
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.op, TensorOp::StopGradient { input: source } if source == input))
+            .count())
+    };
+    assert_eq!(frozen("x")?, 2);
+    assert_eq!(frozen("s")? + frozen("w")?, 0);
     Ok(())
 }

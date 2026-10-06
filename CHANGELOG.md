@@ -20,11 +20,28 @@ deprecated names keep working until 1.0 (see
   `[B, length, ...]`. `vmap`, `jacobian` in both modes, and `hessian` now
   work through loops, nested loops, and loops inside `jit`, and `vmap` of
   `ode.odeint` works for every method, with `save` and `saveat`.
+- `vmap` batches `cond`, and with it the JVP and VJP of a `cond`, on the
+  CPU, CUDA, and MLX, with JAX's semantics. Under an unmapped predicate it
+  stays one lazy `cond` whose branches are batched over the mapped
+  operands, and its output is mapped when either branch maps it. Under a
+  mapped predicate both branches run for every example and `where` selects
+  each example's result, with no predicate readback; a branch's NaN or
+  infinite value or derivative on the examples that take the other branch
+  does not reach the result or the gradient with respect to a mapped
+  operand. `vmap`, `jacobian` in both modes, and `hessian` work through
+  `cond`, `cond` inside `fori_loop` and `scan` bodies, and loops inside
+  `cond` branches.
 
 ### Changed
 
-- The `UnsupportedOperationError` of `vmap` names only `cond` and
-  `while_loop` regions, the ones that still have no batching rule.
+- The `UnsupportedOperationError` of `vmap` names only `while_loop`
+  regions, the one that still has no batching rule.
+
+### Fixed
+
+- The forward-mode tangent of a legacy `TensorIr::greater` mask has the
+  mask's shape instead of a scalar, so forward-over-reverse
+  differentiation of a graph that reshapes such a mask no longer fails.
 
 ## [0.4.0] - 2026-10-06
 

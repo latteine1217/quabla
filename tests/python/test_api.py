@@ -2435,14 +2435,13 @@ def test_vmap_rejects_invalid_axes_and_unbatchable_ops():
         old({"initial": qb.array([1.0, 2.0]), "scale": qb.array([2.0, 3.0])}),
         [7.0, 11.0],
     )
-    # A mapped cond has no batching rule yet.
-    error = assert_raises(
-        qb.UnsupportedOperationError,
-        qb.vmap(lambda x: qb.cond(x > 0.0, lambda t: t * 2.0, lambda t: -t, x)),
-        qb.array([1.0, -2.0]),
-        match="cond",
+    # A mapped cond predicate selects each example's branch.
+    assert_close(
+        qb.vmap(lambda x: qb.cond(x > 0.0, lambda t: t * 2.0, lambda t: -t, x))(
+            qb.array([1.0, -2.0])
+        ),
+        [2.0, 2.0],
     )
-    assert error.op == "cond"
 
 
 def test_vmap_matches_the_tensor_vmap_helpers():

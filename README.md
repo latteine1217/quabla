@@ -335,8 +335,8 @@ and its gradients in one device plan, and `mlx_adam_loss_optimizer` and
   no `vmap` HVP lowering. Third and higher Cholesky
   derivatives use a scalar expansion that is slow beyond small matrices.
 - Data parallelism is single-node CUDA + NCCL only.
-- `quabla.vmap` cannot batch `cond`/`while` regions over a mapped
-  argument (`fori_loop` and `scan` regions batch); `while_loop` has no
+- `quabla.vmap` cannot batch `while_loop` regions over a mapped
+  argument (`cond`, `fori_loop`, and `scan` regions batch); `while_loop` has no
   reverse-mode derivative, as in JAX. `jacobian` selects reverse mode for fewer floating output than
   input elements, and forward mode otherwise; direction changes can affect
   final rounding. Mixed precision graphs with F64 output blocks keep forward

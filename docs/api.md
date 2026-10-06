@@ -319,7 +319,18 @@ decorator: `@qb.jit(device="mlx", static_argnums=1)`, `@qb.grad(argnums=1)`.
   from the first iteration, unmapped captures stay unbatched, and a scan's
   stacked outputs are `[B, length, ...]`; a reverse-mode loop region maps
   every input once any operand is mapped, since its gradients are per
-  example. A mapped `cond` or `while_loop` raises
+  example. A `cond` with an unmapped predicate stays one lazy `cond` whose
+  branches are batched over the mapped operands. A mapped predicate runs
+  both branches for every example and selects each example's result with
+  `where`, as `jax.vmap` does for `lax.cond`: it costs both branches, and a
+  branch runs on inputs it would not see unbatched (`log` of a negative
+  value, say), but its NaN or infinite values never reach the result, and
+  neither do its derivatives on those examples for a mapped operand. A
+  gradient with respect to an unmapped operand sums both branches'
+  contributions over the batch, so a non-finite derivative of the
+  unselected branch with respect to it propagates, as in JAX. A floating
+  predicate selects by `!= 0`; a non-finite one, which an unbatched `cond`
+  rejects, gives NaN for its example. A mapped `while_loop` raises
   `quabla.UnsupportedOperationError`.
 - Closures and constants: an eager array (`Tensor` or `TensorView`,
   including a result such as `qb.sin(math.pi * 0.3)`) that meets a traced
@@ -1651,7 +1662,8 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
   nested regions, and `cond` inside `fori`/`scan` are rejected. `cond`
   results and loop-region inputs must be floating, not `bool`.
 - Derivatives beyond forward-over-reverse of `fori`/`scan` regions are
-  explicit errors. Vmapped `cond` predicates are rejected at trace time.
+  explicit errors. The legacy `tensor_vmap_*` helpers reject a batched
+  `cond` predicate or operand at trace time; `quabla.vmap` batches `cond`.
 - MLX runs its factorizations on the CPU stream (see `quabla.linalg`), and
   `vmap` HVP has no MLX lowering. Triangular solves use the general LU
   `solve` on devices.
@@ -1664,8 +1676,8 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - StableHLO export (`stablehlo_text`) covers only a small inspection subset
   and is not an execution path.
 - The legacy 2D `Matrix`/`TraceGraph` API is not migrated to the facade.
-- `quabla.vmap` cannot batch `cond` or `while_loop` regions over a mapped
-  argument (`fori_loop` and `scan` regions batch). On CUDA, the
+- `quabla.vmap` cannot batch `while_loop` regions over a mapped argument
+  (`cond`, `fori_loop`, and `scan` regions batch). On CUDA, the
   forward-mode `scan` region inside a batched directional derivative (a
   forward-mode `jacobian` or `hessian` through `scan`) runs host-driven:
   its packed `[primal, tangent]` carry gains a leading batch axis, which the

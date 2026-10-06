@@ -46,20 +46,26 @@
 //! (`[T, B, *y]`) on a stacked output cotangent before a batched reverse scan
 //! consumes it. Loop trip counts are static, so no example needs masking.
 //!
-//! `Cond` and `While` are not batched yet. Their rules reuse these pieces:
-//! `Cond` batches both branches with [`batch_region_plan`] over the same
-//! mapped inputs and forces an output mapped when either branch maps it;
-//! `While` closes its carry with [`batch_loop_body`] and batches the predicate
-//! region over the resulting mapped inputs.
+//! `Cond` has no carry and no derivative node kinds of its own (its JVP and
+//! VJP are again `Cond` nodes over derived branch regions), so one rule,
+//! [`TensorIr::push_batched_cond`], covers it. Under an unmapped predicate it
+//! batches both branches with [`batch_region_plan`] over the same mapped
+//! inputs and forces the output mapped when either branch maps it; under a
+//! mapped predicate it evaluates both branches batched and selects per
+//! example with `where`, as JAX does.
+//!
+//! `While` is not batched yet. Its rule closes its carry with
+//! [`batch_loop_body`] and batches the predicate region over the resulting
+//! mapped inputs.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::{
-    batched_shape, BatchingError, TensorExecutionPlan, TensorForiExecutionPlan,
-    TensorForiVjpJvpBindings, TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget, TensorIr,
-    TensorNode, TensorNodeId, TensorOp, TensorScanExecutionPlan, TensorScanTarget,
-    TensorScanVjpBindings, TensorScanVjpJvpBindings, TensorScanVjpJvpExecutionPlan,
-    TensorScanVjpTarget,
+    batched_shape, BatchingError, TensorComparison, TensorCondExecutionPlan, TensorExecutionPlan,
+    TensorForiExecutionPlan, TensorForiVjpJvpBindings, TensorForiVjpJvpExecutionPlan,
+    TensorForiVjpTarget, TensorIr, TensorNode, TensorNodeId, TensorOp, TensorScanExecutionPlan,
+    TensorScanTarget, TensorScanVjpBindings, TensorScanVjpJvpBindings,
+    TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget,
 };
 
 /// Which result of a batched loop group a member node selects.
@@ -651,6 +657,189 @@ impl TensorIr {
             dtype,
             weak,
         ))
+    }
+}
+
+impl TensorIr {
+    /// Appends the batched form of a `Cond` node with at least one mapped
+    /// operand (see the module documentation) and returns it with whether it
+    /// is mapped.
+    ///
+    /// Under an unmapped predicate every example takes the same branch, so
+    /// the node stays one lazy `Cond` that reads its predicate once. Both
+    /// branch regions are batched over the inputs bound to mapped operands,
+    /// which are bound unchanged; the output is mapped when either branch
+    /// maps it, and the branch that does not is batched again with its
+    /// output broadcast, so both regions keep one output shape and the cond
+    /// one batchedness. Under a mapped predicate the examples may take
+    /// different branches; see [`Self::push_selected_cond`].
+    pub(super) fn push_batched_cond(
+        &mut self,
+        node: &TensorNode,
+        (remap, mapped): (&HashMap<TensorNodeId, TensorNodeId>, &[bool]),
+        batch_size: usize,
+    ) -> Result<(TensorNodeId, bool), BatchingError> {
+        let TensorOp::Cond {
+            predicate,
+            branches,
+            captures,
+        } = &node.op
+        else {
+            return Err(BatchingError::Invalid(format!(
+                "{} is not a cond region node",
+                super::tensor_op_name(&node.op)
+            )));
+        };
+        let operand = |id: TensorNodeId| -> Result<(TensorNodeId, bool), BatchingError> {
+            remap
+                .get(&id)
+                .map(|spliced| (*spliced, mapped[id]))
+                .ok_or_else(|| {
+                    BatchingError::Invalid(format!("node {id} is missing from the vmap remap"))
+                })
+        };
+        let captures = captures
+            .iter()
+            .map(|(name, id)| Ok((name.clone(), operand(*id)?)))
+            .collect::<Result<Vec<_>, BatchingError>>()?;
+        let (predicate, predicate_mapped) = operand(*predicate)?;
+        if predicate_mapped {
+            let selected =
+                self.push_selected_cond(node, predicate, branches, &captures, batch_size)?;
+            return Ok((selected, true));
+        }
+        let inputs = captures
+            .iter()
+            .filter(|(_, (_, mapped))| *mapped)
+            .map(|(name, _)| name.clone())
+            .collect::<BTreeSet<_>>();
+        let batch = |region: &TensorExecutionPlan, force: bool| {
+            batch_region_plan(region, &inputs, batch_size, &[force])
+        };
+        let (mut on_true, true_mapped) = batch(&branches.on_true.plan, false)?;
+        let (mut on_false, false_mapped) = batch(&branches.on_false.plan, false)?;
+        let output_mapped = true_mapped[0] || false_mapped[0];
+        if output_mapped && !true_mapped[0] {
+            on_true = batch(&branches.on_true.plan, true)?.0;
+        }
+        if output_mapped && !false_mapped[0] {
+            on_false = batch(&branches.on_false.plan, true)?.0;
+        }
+        let captures = captures
+            .into_iter()
+            .map(|(name, (node, _))| (name, node))
+            .collect();
+        let branches = TensorCondExecutionPlan::new(on_true, on_false)?;
+        let batched = self.cond_with_captures(predicate, branches, captures)?;
+        Ok((batched, output_mapped))
+    }
+
+    /// A cond with a mapped `[B]` predicate as `jax.vmap` lowers it: both
+    /// branches are spliced into this graph batched, and
+    /// `where(predicate, on_true, on_false)`, the predicate broadcast over
+    /// the output's trailing axes, takes each example's result from the
+    /// branch its predicate selects. No predicate is read back to the host.
+    ///
+    /// Both branches now run for every example. That costs the work of both,
+    /// and a branch that would raise or produce NaN or inf on the inputs of
+    /// the examples that take the other branch (`log` of a negative value,
+    /// say) now executes on them; the select keeps those values out of the
+    /// result. Derivatives need one more step. `where` gives the unselected
+    /// branch a zero cotangent, but that branch's own derivative can be
+    /// infinite or NaN there (`log` at zero, `sqrt` below zero), and
+    /// `0 * inf` is NaN, which would be added to the selected branch's
+    /// gradient. So a mapped floating operand `x` enters the true branch as
+    /// `where(predicate, x, stop_gradient(x))` and the false branch as
+    /// `where(predicate, stop_gradient(x), x)`: the same values, but each
+    /// branch's cotangent for `x` is selected by the example's predicate
+    /// again after that branch's derivative, which drops a NaN of the
+    /// unselected branch instead of adding it. Every derivative of a `where`
+    /// is a `where` with the same condition, so higher orders stay clean, and
+    /// forward mode is clean already because the output select comes after
+    /// both tangents. An unmapped operand is shared by every example and its
+    /// gradient sums the contributions of both branches over the batch, so a
+    /// non-finite derivative of the unselected branch with respect to it
+    /// still propagates, as in JAX; masking it would need a copy of it per
+    /// example.
+    ///
+    /// A floating predicate selects by `!= 0`, as `where` does; an unbatched
+    /// cond rejects a non-finite predicate, which cannot raise per example
+    /// here, so it makes that example's output NaN instead.
+    fn push_selected_cond(
+        &mut self,
+        node: &TensorNode,
+        predicate: TensorNodeId,
+        branches: &TensorCondExecutionPlan,
+        captures: &[(String, (TensorNodeId, bool))],
+        batch_size: usize,
+    ) -> Result<TensorNodeId, BatchingError> {
+        let rank = node.shape.len();
+        let mut outputs = Vec::with_capacity(2);
+        for (region, taken) in [
+            (&branches.on_true.plan, true),
+            (&branches.on_false.plan, false),
+        ] {
+            let mut bindings = BTreeMap::new();
+            for (name, (value, mapped)) in captures {
+                let source = self.node(*value)?;
+                let value = if *mapped && source.dtype.is_floating() {
+                    let (shape, dtype, weak) = (source.shape.clone(), source.dtype, source.weak);
+                    let condition = self.pad_batched(predicate, shape.len() - 1)?;
+                    let frozen = self.push_node(
+                        TensorOp::StopGradient { input: *value },
+                        shape.clone(),
+                        dtype,
+                        weak,
+                    );
+                    let (on_true, on_false) = if taken {
+                        (*value, frozen)
+                    } else {
+                        (frozen, *value)
+                    };
+                    self.push_node(
+                        TensorOp::Where {
+                            condition,
+                            on_true,
+                            on_false,
+                        },
+                        shape,
+                        dtype,
+                        weak,
+                    )
+                } else {
+                    *value
+                };
+                bindings.insert(name.clone(), (value, *mapped));
+            }
+            let spliced = self.inline_batched(
+                &region.as_ir(),
+                &bindings,
+                batch_size,
+                &[region.output_node_id],
+            )?;
+            outputs.push(self.bind_batched(spliced[0], true, batch_size)?);
+        }
+        let condition = self.pad_batched(predicate, rank)?;
+        let selected = self.push_node(
+            TensorOp::Where {
+                condition,
+                on_true: outputs[0],
+                on_false: outputs[1],
+            },
+            batched_shape(batch_size, &node.shape),
+            node.dtype,
+            node.weak,
+        );
+        if !self.node(predicate)?.dtype.is_floating() {
+            return Ok(selected);
+        }
+        // `p * 0 == 0` holds exactly for a finite `p`.
+        let zero = self.scalar_constant(0.0);
+        let probe = self.mul(predicate, zero)?;
+        let finite = self.compare(probe, zero, TensorComparison::Equal)?;
+        let finite = self.pad_batched(finite, rank)?;
+        let nan = self.scalar_constant(f64::NAN);
+        Ok(self.where_select(finite, selected, nan)?)
     }
 }
 

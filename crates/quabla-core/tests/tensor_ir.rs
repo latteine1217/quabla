@@ -10354,7 +10354,7 @@ fn inline_batched_graphs_batch_again_for_nested_vmap() {
 }
 
 #[test]
-fn inline_batched_batches_solve_and_rejects_cond_and_invalid_bindings() {
+fn inline_batched_batches_solve_and_regions_and_rejects_invalid_bindings() {
     use quabla_core::tensor_ir::BatchingError;
     let mut callee = TensorIr::new();
     let matrix = must!(callee.input("matrix", vec![2, 2]));
@@ -10406,23 +10406,19 @@ fn inline_batched_batches_solve_and_rejects_cond_and_invalid_bindings() {
     ));
     assert!(!copied[0].1);
 
-    // The fixture's scan and fori batch, but its cond, whose predicate
-    // depends on the mapped x, has no batching rule yet; unmapped region
-    // nodes are copied.
+    // The fixture's scan, fori, and cond (whose predicate depends on the
+    // mapped x) batch; unmapped region nodes are copied.
     let (regions, loss) = must!(inline_region_fixture());
     let mut graph = TensorIr::new();
     let x = must!(graph.input("x", vec![4]));
     let s = must!(graph.input("s", vec![]));
-    let error = graph
-        .inline_batched(
-            &regions,
-            &BTreeMap::from([("x".to_string(), (x, true)), ("s".to_string(), (s, false))]),
-            4,
-            &[loss],
-        )
-        .expect_err("a mapped cond has no batching rule");
-    assert_eq!(error, BatchingError::Unsupported { op: "cond" });
-    assert!(error.to_string().contains("vmap cannot batch"), "{error}");
+    let batched = must!(graph.inline_batched(
+        &regions,
+        &BTreeMap::from([("x".to_string(), (x, true)), ("s".to_string(), (s, false))]),
+        4,
+        &[loss],
+    ));
+    assert!(batched[0].1);
     let x_single = must!(graph.input("x_single", vec![]));
     let copied = must!(graph.inline_batched(
         &regions,
@@ -10466,6 +10462,469 @@ fn inline_batched_batches_solve_and_rejects_cond_and_invalid_bindings() {
         )
         .expect_err("a zero batch must be rejected");
     assert!(error.to_string().contains("above zero"), "{error}");
+}
+
+/// The inputs of [`cond_batching_fixture`] with their example shapes.
+const COND_BATCHING_INPUTS: [(&str, &[usize]); 4] =
+    [("x", &[3]), ("s", &[3]), ("w", &[3]), ("p", &[])];
+
+/// Branch regions over `value` and `scale`: a fori loop from `value` with
+/// shift `scale`, and `value * scale`.
+fn cond_loop_branches() -> Result<TensorCondExecutionPlan, String> {
+    let mut on_true = TensorIr::new();
+    let value = on_true.input("value", vec![3])?;
+    let scale = on_true.input("scale", vec![3])?;
+    let looped = on_true.fori(
+        value,
+        batching_fori_plan()?,
+        vec![("shift".to_string(), scale)],
+    )?;
+    let mut on_false = TensorIr::new();
+    let value = on_false.input("value", vec![3])?;
+    let scale = on_false.input("scale", vec![3])?;
+    let product = on_false.mul(value, scale)?;
+    TensorCondExecutionPlan::new(on_true.compile_cpu(looped)?, on_false.compile_cpu(product)?)
+}
+
+/// Branch regions over `value` and `w`: `tanh(value * w)` and
+/// `value * value - w`.
+fn cond_elementwise_branches() -> Result<TensorCondExecutionPlan, String> {
+    let mut on_true = TensorIr::new();
+    let value = on_true.input("value", vec![3])?;
+    let w = on_true.input("w", vec![3])?;
+    let product = on_true.mul(value, w)?;
+    let wave = on_true.tanh(product)?;
+    let mut on_false = TensorIr::new();
+    let value = on_false.input("value", vec![3])?;
+    let w = on_false.input("w", vec![3])?;
+    let square = on_false.mul(value, value)?;
+    let difference = on_false.sub(square, w)?;
+    TensorCondExecutionPlan::new(
+        on_true.compile_cpu(wave)?,
+        on_false.compile_cpu(difference)?,
+    )
+}
+
+/// Branch regions over `value`, `scale`, and `w`: the final carry of a scan
+/// from `value` in which `w` reaches only the discarded per-step outputs,
+/// and `value * w`. With only `w` mapped the true branch is unmapped and the
+/// false branch mapped.
+fn cond_scan_carry_branches() -> Result<TensorCondExecutionPlan, String> {
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![3])?;
+    let scale = body.input("scale", vec![3])?;
+    let w = body.input("w", vec![3])?;
+    let index = body.input("index", vec![])?;
+    let product = body.mul(carry, scale)?;
+    let tenth = body.scalar_constant(0.1);
+    let offset = body.mul(index, tenth)?;
+    let shifted = body.add(product, offset)?;
+    let next = body.tanh(shifted)?;
+    let output = body.mul(next, w)?;
+    let scan_plan = TensorScanExecutionPlan::new(
+        0,
+        4,
+        body.compile_cpu_many(&[next, output])?.0,
+        "carry",
+        "index",
+    )?;
+    let mut on_true = TensorIr::new();
+    let value = on_true.input("value", vec![3])?;
+    let scale = on_true.input("scale", vec![3])?;
+    let w = on_true.input("w", vec![3])?;
+    let (final_carry, _) = on_true.scan(
+        value,
+        scan_plan,
+        vec![("scale".to_string(), scale), ("w".to_string(), w)],
+    )?;
+    let mut on_false = TensorIr::new();
+    let value = on_false.input("value", vec![3])?;
+    let _ = on_false.input("scale", vec![3])?;
+    let w = on_false.input("w", vec![3])?;
+    let product = on_false.mul(value, w)?;
+    let product = on_false.retain_inputs(&["scale".to_string()], product)?;
+    TensorCondExecutionPlan::new(
+        on_true.compile_cpu(final_carry)?,
+        on_false.compile_cpu(product)?,
+    )
+}
+
+/// A fori body whose step runs two conds: one on the unmapped loop index
+/// (`index < 1.5`) and one on the carry (`sum(c) > 0`).
+fn cond_in_loop_plan() -> Result<TensorForiExecutionPlan, String> {
+    let mut first = TensorIr::new();
+    let value = first.input("value", vec![3])?;
+    let scale = first.input("scale", vec![3])?;
+    let product = first.mul(value, scale)?;
+    let mut second = TensorIr::new();
+    let value = second.input("value", vec![3])?;
+    let _ = second.input("scale", vec![3])?;
+    let wave = second.sin(value)?;
+    let wave = second.retain_inputs(&["scale".to_string()], wave)?;
+    let by_index =
+        TensorCondExecutionPlan::new(first.compile_cpu(product)?, second.compile_cpu(wave)?)?;
+
+    let mut damped = TensorIr::new();
+    let value = damped.input("value", vec![3])?;
+    let factor = damped.scalar_constant(0.9);
+    let damped_value = damped.mul(value, factor)?;
+    let mut cosine = TensorIr::new();
+    let value = cosine.input("value", vec![3])?;
+    let cosine_value = cosine.cos(value)?;
+    let by_sign = TensorCondExecutionPlan::new(
+        damped.compile_cpu(damped_value)?,
+        cosine.compile_cpu(cosine_value)?,
+    )?;
+
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![3])?;
+    let shift = body.input("shift", vec![3])?;
+    let index = body.input("index", vec![])?;
+    let bound = body.scalar_constant(1.5);
+    let early = body.compare(index, bound, TensorComparison::Less)?;
+    let stepped = body.cond_with_captures(
+        early,
+        by_index,
+        vec![("value".to_string(), carry), ("scale".to_string(), shift)],
+    )?;
+    let total = body.sum(stepped)?;
+    let zero = body.scalar_constant(0.0);
+    let positive = body.greater(total, zero)?;
+    let next = body.cond_with_captures(positive, by_sign, vec![("value".to_string(), stepped)])?;
+    TensorForiExecutionPlan::new(0, 3, body.compile_cpu(next)?, "carry", "index")
+}
+
+/// A callee over `x`, `s`, `w` (`[3]`) and the scalar `p` with a cond on
+/// the predicate input (`p < 0.5`) whose true branch runs a loop, a cond on
+/// the data (`sum(x) > 0.04`), a cond whose branches differ in batchedness,
+/// a fori loop whose body runs conds, and the scalar total.
+fn cond_batching_fixture() -> Result<(TensorIr, Vec<TensorNodeId>, TensorNodeId), String> {
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![3])?;
+    let s = graph.input("s", vec![3])?;
+    let w = graph.input("w", vec![3])?;
+    let p = graph.input("p", vec![])?;
+    let half = graph.scalar_constant(0.5);
+    let by_input = graph.compare(p, half, TensorComparison::Less)?;
+    let total_x = graph.sum(x)?;
+    let threshold = graph.scalar_constant(0.04);
+    let by_data = graph.greater(total_x, threshold)?;
+    let looped = graph.cond_with_captures(
+        by_input,
+        cond_loop_branches()?,
+        vec![("value".to_string(), x), ("scale".to_string(), s)],
+    )?;
+    let elementwise = graph.cond_with_captures(
+        by_data,
+        cond_elementwise_branches()?,
+        vec![("value".to_string(), x), ("w".to_string(), w)],
+    )?;
+    let scan_carry = graph.cond_with_captures(
+        by_input,
+        cond_scan_carry_branches()?,
+        vec![
+            ("value".to_string(), x),
+            ("scale".to_string(), s),
+            ("w".to_string(), w),
+        ],
+    )?;
+    let in_loop = graph.fori(x, cond_in_loop_plan()?, vec![("shift".to_string(), s)])?;
+    let mut total = None;
+    for (value, exponent) in [(looped, 2), (elementwise, 2), (scan_carry, 3), (in_loop, 2)] {
+        let power = graph.powi(value, exponent)?;
+        let sum = graph.sum(power)?;
+        total = Some(match total {
+            Some(total) => graph.add(total, sum)?,
+            None => sum,
+        });
+    }
+    let total = total.expect("the fixture sums four terms");
+    Ok((
+        graph,
+        vec![looped, elementwise, scan_carry, in_loop, total],
+        total,
+    ))
+}
+
+fn cond_batching_inputs() -> Vec<(String, Vec<usize>)> {
+    COND_BATCHING_INPUTS
+        .iter()
+        .map(|(name, shape)| (name.to_string(), shape.to_vec()))
+        .collect()
+}
+
+#[test]
+fn inline_batched_conds_match_per_example_conds_for_every_mapping() {
+    let (callee, outputs, _) = must!(cond_batching_fixture());
+    let inputs = cond_batching_inputs();
+    // The batched p is [-0.73, 0.22, 0.68] and the batched x sums to
+    // [0.046, 0.037, 0.035], so mapped predicates take both branches.
+    // Outputs: loop cond, elementwise cond, scan-carry cond, fori, total.
+    for (mapped, expected) in [
+        (vec!["x", "s", "w", "p"], [true; 5]),
+        (vec!["x"], [true; 5]),
+        (vec!["s"], [true, false, true, true, true]),
+        // Only the false branch of the scan-carry cond maps w; the true
+        // branch is broadcast so the cond has one batchedness.
+        (vec!["w"], [false, true, true, false, true]),
+        // A mapped predicate with unmapped operands selects between two
+        // broadcast branch results.
+        (vec!["p"], [true, false, true, false, true]),
+        (vec!["p", "w"], [true, true, true, false, true]),
+    ] {
+        let flags = must!(batched_loop_outputs_match_examples(
+            &callee, &outputs, &inputs, &mapped
+        ));
+        assert_eq!(flags, expected, "mapped {mapped:?}");
+    }
+}
+
+#[test]
+fn inline_batched_cond_derivatives_match_per_example_derivatives() {
+    let (mut callee, outputs, _) = must!(cond_batching_fixture());
+    // The scan-carry cond is left out: reverse mode through a cond branch
+    // that keeps only a scan's final carry is not supported, batched or not.
+    let mut total = None;
+    for value in [outputs[0], outputs[1], outputs[3]] {
+        let square = must!(callee.powi(value, 2));
+        let sum = must!(callee.sum(square));
+        total = Some(match total {
+            Some(total) => must!(callee.add(total, sum)),
+            None => sum,
+        });
+    }
+    let total = total.expect("three terms");
+    let inputs = cond_batching_inputs();
+    let names = ["x", "s", "w"];
+    let reverse = must!(callee.symbolic_vjp_many(&[(total, SymbolicCotangent::Ones)]));
+    let gradients = names
+        .iter()
+        .map(|name| reverse.gradients[*name])
+        .collect::<Vec<_>>();
+    for mapped in [
+        vec!["x"],
+        vec!["s"],
+        vec!["w"],
+        vec!["p"],
+        vec!["x", "p"],
+        vec!["x", "s", "w", "p"],
+    ] {
+        must!(batched_loop_outputs_match_examples(
+            &reverse.graph,
+            &gradients,
+            &inputs,
+            &mapped
+        ));
+    }
+
+    let tangent_names = names
+        .iter()
+        .map(|name| (name.to_string(), format!("{name}_tangent")))
+        .collect::<BTreeMap<_, _>>();
+    let mut tangent_inputs = inputs.clone();
+    tangent_inputs.extend(
+        names
+            .iter()
+            .map(|name| (format!("{name}_tangent"), vec![3])),
+    );
+    let forward = must!(callee.symbolic_jvp_with_tangent_inputs(total, &tangent_names));
+    for mapped in [
+        vec!["x_tangent", "s_tangent", "w_tangent"],
+        vec!["p", "x_tangent"],
+        vec!["x", "p", "s_tangent"],
+    ] {
+        let flags = must!(batched_loop_outputs_match_examples(
+            &forward.graph,
+            &[forward.value, forward.tangent],
+            &tangent_inputs,
+            &mapped
+        ));
+        assert!(flags[1], "mapped {mapped:?}");
+    }
+
+    // Forward over reverse: a Hessian batches the tangents of the gradient
+    // graph, whose cond VJP regions are differentiated again.
+    let hvp = must!(reverse
+        .graph
+        .symbolic_jvp_many_with_tangent_inputs(&gradients, &tangent_names));
+    for mapped in [
+        vec!["x_tangent", "s_tangent", "w_tangent"],
+        vec!["p", "w_tangent"],
+        vec!["x", "p", "s_tangent"],
+    ] {
+        let flags = must!(batched_loop_outputs_match_examples(
+            &hvp.graph,
+            &hvp.tangents,
+            &tangent_inputs,
+            &mapped
+        ));
+        assert!(flags.iter().all(|flag| *flag), "mapped {mapped:?}");
+    }
+}
+
+#[test]
+fn inline_batched_conds_batch_again_for_nested_vmap() {
+    let (callee, outputs, _) = must!(cond_batching_fixture());
+    let mut inner = TensorIr::new();
+    let mut bindings = BTreeMap::new();
+    let mut inner_inputs = Vec::new();
+    for (name, shape) in COND_BATCHING_INPUTS {
+        let is_mapped = name == "p" || name == "w";
+        let shape: Vec<usize> = if is_mapped {
+            std::iter::once(2).chain(shape.iter().copied()).collect()
+        } else {
+            shape.to_vec()
+        };
+        let node = must!(inner.input(name, shape.clone()));
+        bindings.insert(name.to_string(), (node, is_mapped));
+        inner_inputs.push((name.to_string(), shape));
+    }
+    let batched = must!(inner.inline_batched(&callee, &bindings, 2, &outputs));
+    let inner_outputs = batched.iter().map(|(node, _)| *node).collect::<Vec<_>>();
+    must!(batched_loop_outputs_match_examples(
+        &inner,
+        &inner_outputs,
+        &inner_inputs,
+        &["x", "p"]
+    ));
+}
+
+/// Batches `callee` (inputs `x` and `q`, both `[]`) over `x` and `q`.
+fn batched_scalar_cond(
+    callee: &TensorIr,
+    output: TensorNodeId,
+    batch: usize,
+) -> Result<(TensorIr, TensorNodeId), String> {
+    let mut graph = TensorIr::new();
+    let mut bindings = BTreeMap::new();
+    for name in ["x", "q"] {
+        if callee.input_node_id(name).is_ok() {
+            bindings.insert(name.to_string(), (graph.input(name, vec![batch])?, true));
+        }
+    }
+    let batched = graph
+        .inline_batched(callee, &bindings, batch, &[output])
+        .map_err(|error| error.to_string())?;
+    assert!(batched[0].1);
+    Ok((graph, batched[0].0))
+}
+
+#[test]
+fn a_mapped_floating_predicate_selects_by_nonzero_and_poisons_non_finite_examples() {
+    let mut on_true = TensorIr::new();
+    let value = must!(on_true.input("value", vec![]));
+    let wave = must!(on_true.sin(value));
+    let mut on_false = TensorIr::new();
+    let value = must!(on_false.input("value", vec![]));
+    let two = on_false.scalar_constant(2.0);
+    let doubled = must!(on_false.mul(value, two));
+    let branches = must!(TensorCondExecutionPlan::new(
+        must!(on_true.compile_cpu(wave)),
+        must!(on_false.compile_cpu(doubled)),
+    ));
+    let mut callee = TensorIr::new();
+    let x = must!(callee.input("x", vec![]));
+    let q = must!(callee.input("q", vec![]));
+    let branched = must!(callee.cond_with_captures(q, branches, vec![("value".to_string(), x)]));
+    let (graph, output) = must!(batched_scalar_cond(&callee, branched, 5));
+    let result = must!(graph.evaluate(
+        output,
+        &BTreeMap::from([
+            (
+                "x".to_string(),
+                must!(DynamicTensor::new(vec![5], vec![0.5, 0.5, 0.5, 0.5, 0.5]))
+            ),
+            (
+                "q".to_string(),
+                must!(DynamicTensor::new(
+                    vec![5],
+                    vec![1.5, 0.0, -0.0, f64::NAN, f64::NEG_INFINITY]
+                ))
+            ),
+        ]),
+    ));
+    let data = result.data();
+    assert_eq!(data[0], 0.5f64.sin());
+    assert_eq!(&data[1..3], &[1.0, 1.0]);
+    // An unbatched cond rejects a non-finite predicate; its example is NaN.
+    assert!(data[3].is_nan() && data[4].is_nan(), "{data:?}");
+}
+
+#[test]
+fn a_mapped_predicate_keeps_nan_of_the_unselected_branch_out_of_values_and_derivatives() {
+    // cond(x > 0, log(x), sqrt(1 - x)) at x = [2, 0, -1]: the unselected log
+    // is -inf and NaN with derivatives inf and -1, and the unselected sqrt is
+    // NaN with a NaN derivative at x = 2.
+    let mut on_true = TensorIr::new();
+    let value = must!(on_true.input("value", vec![]));
+    let logarithm = must!(on_true.log(value));
+    let mut on_false = TensorIr::new();
+    let value = must!(on_false.input("value", vec![]));
+    let one = on_false.scalar_constant(1.0);
+    let complement = must!(on_false.sub(one, value));
+    let root = must!(on_false.sqrt(complement));
+    let branches = must!(TensorCondExecutionPlan::new(
+        must!(on_true.compile_cpu(logarithm)),
+        must!(on_false.compile_cpu(root)),
+    ));
+    let mut callee = TensorIr::new();
+    let x = must!(callee.input("x", vec![]));
+    let zero = callee.scalar_constant(0.0);
+    let positive = must!(callee.greater(x, zero));
+    let branched =
+        must!(callee.cond_with_captures(positive, branches, vec![("value".to_string(), x)]));
+    let (mut graph, output) = must!(batched_scalar_cond(&callee, branched, 3));
+    let loss = must!(graph.sum(output));
+    let points = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![3], vec![2.0, 0.0, -1.0])),
+    )]);
+    let expected_value = [2f64.ln(), 1.0, 2f64.sqrt()];
+    let expected_first = [0.5, -0.5, -0.5 / 2f64.sqrt()];
+    let expected_second = [-0.25, -0.25, -0.25 / 2f64.powf(1.5)];
+    let close = |value: DynamicTensor, expected: &[f64], label: &str| {
+        for (actual, expected) in value.data().iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 1e-14,
+                "{label}: {actual:?} != {expected:?}"
+            );
+        }
+    };
+    close(
+        must!(graph.evaluate(output, &points)),
+        &expected_value,
+        "value",
+    );
+    // Reverse mode: the where VJP gives the unselected branch a zero
+    // cotangent, and the gradient mask drops its 0 * inf and 0 * NaN.
+    let reverse = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    let gradient = reverse.gradients["x"];
+    close(
+        must!(reverse.graph.evaluate(gradient, &points)),
+        &expected_first,
+        "gradient",
+    );
+    // Forward mode, and forward over reverse (the Hessian diagonal).
+    let tangent_names = BTreeMap::from([("x".to_string(), "x_tangent".to_string())]);
+    let mut tangent_points = points.clone();
+    tangent_points.insert(
+        "x_tangent".to_string(),
+        must!(DynamicTensor::new(vec![3], vec![1.0, 1.0, 1.0])),
+    );
+    let forward = must!(graph.symbolic_jvp_with_tangent_inputs(output, &tangent_names));
+    close(
+        must!(forward.graph.evaluate(forward.tangent, &tangent_points)),
+        &expected_first,
+        "tangent",
+    );
+    let hvp = must!(reverse
+        .graph
+        .symbolic_jvp_many_with_tangent_inputs(&[gradient], &tangent_names));
+    close(
+        must!(hvp.graph.evaluate(hvp.tangents[0], &tangent_points)),
+        &expected_second,
+        "hessian",
+    );
 }
 
 /// The inputs of [`loop_batching_fixture`] with their example shapes.
