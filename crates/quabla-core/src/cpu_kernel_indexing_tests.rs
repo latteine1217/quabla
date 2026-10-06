@@ -175,7 +175,7 @@ fn broadcasting_errors_precede_fast_paths_and_division_follows_ieee() {
         assert!(lhs
             .sub(&rhs)
             .unwrap()
-            .log()
+            .map_f64(f64::ln)
             .unwrap()
             .data()
             .iter()

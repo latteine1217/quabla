@@ -18,9 +18,9 @@ use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
     adam_element, sgd_element, sqrt_derivative_coefficient, AdamArith, AdamCoefficients, AdamOrder,
-    DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, TensorBackend, TensorComparison,
-    TensorConstant, TensorDType, TensorDeviceBackend, TensorExecutionPlan, TensorExtremum,
-    TensorForiExecutionPlan, TensorOp, UnaryMathKind,
+    BinaryMathKind, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, TensorBackend,
+    TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend, TensorExecutionPlan,
+    TensorExtremum, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
 };
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
@@ -1111,11 +1111,6 @@ impl MlxBackend {
                         .cloned()
                         .ok_or_else(|| format!("MLX Scan VJP JVP has no gradient for {name:?}"))
                 }
-                TensorOp::Tanh { input } => ops::tanh_device(mlx_value(&values, *input)?, &stream)
-                    .map_err(|error| error.to_string()),
-                TensorOp::Exp { input } => mlx_value(&values, *input)?
-                    .exp_device(&stream)
-                    .map_err(|error| error.to_string()),
                 TensorOp::Sqrt { input } => mlx_value(&values, *input)?
                     .sqrt_device(&stream)
                     .map_err(|error| error.to_string()),
@@ -1145,65 +1140,8 @@ impl MlxBackend {
                     ops::r#where_device(&origin, &zero, &domain, &stream)
                         .map_err(|error| error.to_string())
                 }
-                TensorOp::Sin { input } => mlx_value(&values, *input)?
-                    .sin_device(&stream)
-                    .map_err(|error| error.to_string()),
-                TensorOp::Cos { input } => mlx_value(&values, *input)?
-                    .cos_device(&stream)
-                    .map_err(|error| error.to_string()),
-                TensorOp::Log { input } => mlx_value(&values, *input)?
-                    .log_device(&stream)
-                    .map_err(|error| error.to_string()),
-                TensorOp::Log1p { input } => mlx_value(&values, *input)?
-                    .log1p_device(&stream)
-                    .map_err(|error| error.to_string()),
-                // MLX's own expm1 is off by up to several hundred float32 ulp, and
-                // exp(x) - 1 cancels near zero. Kahan's (u - 1) * x / log(u) with
-                // u = exp(x) keeps both within a few ulp: it is used for |x| < 0.5,
-                // where exp(x) - 1 loses precision, and returns x where u rounds to
-                // 1. Elsewhere exp(x) - 1 is accurate and handles +-inf, overflow
-                // and NaN.
-                TensorOp::Expm1 { input } => {
-                    let input = mlx_value(&values, *input)?;
-                    let fail = |error: mlx_rs::error::Exception| error.to_string();
-                    let one = Array::from_f32(1.0);
-                    let half = Array::from_f32(0.5);
-                    let two = Array::from_f32(2.0);
-                    let zero = Array::from_f32(0.0);
-                    let exp = input.exp_device(&stream).map_err(fail)?;
-                    let shifted = exp.subtract_device(&one, &stream).map_err(fail)?;
-                    let small = input
-                        .abs_device(&stream)
-                        .and_then(|magnitude| magnitude.lt_device(&half, &stream))
-                        .map_err(fail)?;
-                    let exact = shifted.eq_device(&zero, &stream).map_err(fail)?;
-                    let log = ops::r#where_device(&small, &exp, &two, &stream)
-                        .and_then(|base| base.log_device(&stream))
-                        .map_err(fail)?;
-                    let safe_log =
-                        ops::r#where_device(&exact, &one, &log, &stream).map_err(fail)?;
-                    let kahan = shifted
-                        .multiply_device(input, &stream)
-                        .and_then(|product| product.divide_device(&safe_log, &stream))
-                        .map_err(fail)?;
-                    let near_zero =
-                        ops::r#where_device(&exact, input, &kahan, &stream).map_err(fail)?;
-                    ops::r#where_device(&small, &near_zero, &shifted, &stream).map_err(fail)
-                }
-                TensorOp::Erf { input } => ops::erf_device(mlx_value(&values, *input)?, &stream)
-                    .map_err(|error| error.to_string()),
-                TensorOp::Erfc { input } => mlx_erfc(mlx_value(&values, *input)?, &stream)
-                    .map_err(|error| error.to_string()),
-                TensorOp::Atan2 { y, x } => {
-                    ops::atan2_device(mlx_value(&values, *y)?, mlx_value(&values, *x)?, &stream)
-                        .map_err(|error| error.to_string())
-                }
                 TensorOp::UnaryMath { input, kind } => {
                     mlx_unary_math(mlx_value(&values, *input)?, *kind, &stream)
-                        .map_err(|error| error.to_string())
-                }
-                TensorOp::Fmod { x, y } => {
-                    mlx_fmod(mlx_value(&values, *x)?, mlx_value(&values, *y)?, &stream)
                         .map_err(|error| error.to_string())
                 }
                 // AD happens on the IR before lowering, so the value is all
@@ -1233,9 +1171,13 @@ impl MlxBackend {
                         .power_device(&exponent, &stream)
                         .map_err(|error| error.to_string())
                 }
-                TensorOp::Pow { base, exponent } => mlx_value(&values, *base)?
-                    .power_device(mlx_value(&values, *exponent)?, &stream)
-                    .map_err(|error| error.to_string()),
+                TensorOp::BinaryMath { lhs, rhs, kind } => mlx_binary_math(
+                    mlx_value(&values, *lhs)?,
+                    mlx_value(&values, *rhs)?,
+                    *kind,
+                    &stream,
+                )
+                .map_err(|error| error.to_string()),
                 TensorOp::Matmul { lhs, rhs } => mlx_value(&values, *lhs)?
                     .matmul_device(mlx_value(&values, *rhs)?, &stream)
                     .map_err(|error| error.to_string()),
@@ -2344,16 +2286,26 @@ fn mlx_erfc(input: &Array, stream: &StreamOrDevice) -> Result<Array, mlx_rs::err
     ops::r#where_device(&negative, &reflected, &positive, stream)
 }
 
-/// `kind(input)` with MLX's own op for every kind except `cbrt`, which MLX
-/// lacks (see [`mlx_cbrt`]). The MLX kernels are compiled without fast math
-/// and call Metal's `precise` transcendental functions; `round` is Metal's
-/// `rint`, halfway cases to even.
+/// `kind(input)` with MLX's own op for every kind except `expm1`, `erfc`
+/// and `cbrt` (see [`mlx_expm1`], [`mlx_erfc`], [`mlx_cbrt`]). The MLX
+/// kernels are compiled without fast math and call Metal's `precise`
+/// transcendental functions; `round` is Metal's `rint`, halfway cases to
+/// even.
 fn mlx_unary_math(
     input: &Array,
     kind: UnaryMathKind,
     stream: &StreamOrDevice,
 ) -> Result<Array, mlx_rs::error::Exception> {
     match kind {
+        UnaryMathKind::Exp => input.exp_device(stream),
+        UnaryMathKind::Log => input.log_device(stream),
+        UnaryMathKind::Log1p => input.log1p_device(stream),
+        UnaryMathKind::Expm1 => mlx_expm1(input, stream),
+        UnaryMathKind::Erf => ops::erf_device(input, stream),
+        UnaryMathKind::Erfc => mlx_erfc(input, stream),
+        UnaryMathKind::Sin => input.sin_device(stream),
+        UnaryMathKind::Cos => input.cos_device(stream),
+        UnaryMathKind::Tanh => ops::tanh_device(input, stream),
         UnaryMathKind::Tan => ops::tan_device(input, stream),
         UnaryMathKind::Arcsin => ops::asin_device(input, stream),
         UnaryMathKind::Arccos => ops::acos_device(input, stream),
@@ -2370,6 +2322,47 @@ fn mlx_unary_math(
         UnaryMathKind::Ceil => ops::ceil_device(input, stream),
         UnaryMathKind::Round => ops::round_device(input, 0, stream),
     }
+}
+
+/// `kind(lhs, rhs)` with MLX's own op, except `fmod` (see [`mlx_fmod`]).
+fn mlx_binary_math(
+    lhs: &Array,
+    rhs: &Array,
+    kind: BinaryMathKind,
+    stream: &StreamOrDevice,
+) -> Result<Array, mlx_rs::error::Exception> {
+    match kind {
+        BinaryMathKind::Pow => lhs.power_device(rhs, stream),
+        BinaryMathKind::Atan2 => ops::atan2_device(lhs, rhs, stream),
+        BinaryMathKind::Fmod => mlx_fmod(lhs, rhs, stream),
+    }
+}
+
+/// `exp(x) - 1` on MLX. MLX's own expm1 is off by up to several hundred
+/// float32 ulp, and `exp(x) - 1` cancels near zero. Kahan's
+/// `(u - 1) * x / log(u)` with `u = exp(x)` keeps both within a few ulp: it
+/// is used for `|x| < 0.5`, where `exp(x) - 1` loses precision, and returns
+/// `x` where `u` rounds to 1. Elsewhere `exp(x) - 1` is accurate and handles
+/// +-inf, overflow and NaN.
+fn mlx_expm1(input: &Array, stream: &StreamOrDevice) -> Result<Array, mlx_rs::error::Exception> {
+    let one = Array::from_f32(1.0);
+    let half = Array::from_f32(0.5);
+    let two = Array::from_f32(2.0);
+    let zero = Array::from_f32(0.0);
+    let exp = input.exp_device(stream)?;
+    let shifted = exp.subtract_device(&one, stream)?;
+    let small = input
+        .abs_device(stream)
+        .and_then(|magnitude| magnitude.lt_device(&half, stream))?;
+    let exact = shifted.eq_device(&zero, stream)?;
+    let log =
+        ops::r#where_device(&small, &exp, &two, stream).and_then(|base| base.log_device(stream))?;
+    let safe_log = ops::r#where_device(&exact, &one, &log, stream)?;
+    let kahan = shifted
+        .multiply_device(input, stream)
+        .and_then(|product| product.divide_device(&safe_log, stream))?;
+    let near_zero = ops::r#where_device(&exact, input, &kahan, stream)?;
+    ops::r#where_device(&small, &near_zero, &shifted, stream)
 }
 
 /// The real cube root on MLX, which has no `cbrt`: `y = |x|^(1/3)` from
@@ -2516,26 +2509,15 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Cholesky { .. } => "cholesky",
         TensorOp::CholeskyAd { .. } => "cholesky_ad",
         TensorOp::Triangular { .. } => "triangular",
-        TensorOp::Tanh { .. } => "tanh",
-        TensorOp::Exp { .. } => "exp",
         TensorOp::Sqrt { .. } => "sqrt",
         TensorOp::SqrtDerivative { .. } => "sqrt_derivative",
         TensorOp::Reshape { .. } => "reshape",
         TensorOp::Mean { .. } => "mean",
         TensorOp::MeanAxis { .. } => "mean_axis",
-        TensorOp::Sin { .. } => "sin",
-        TensorOp::Cos { .. } => "cos",
         TensorOp::Powi { .. } => "powi",
-        TensorOp::Pow { .. } => "pow",
+        TensorOp::BinaryMath { kind, .. } => kind.name(),
         TensorOp::Transpose { .. } => "transpose",
-        TensorOp::Log { .. } => "log",
-        TensorOp::Log1p { .. } => "log1p",
-        TensorOp::Expm1 { .. } => "expm1",
-        TensorOp::Erf { .. } => "erf",
-        TensorOp::Erfc { .. } => "erfc",
-        TensorOp::Atan2 { .. } => "atan2",
         TensorOp::UnaryMath { kind, .. } => kind.name(),
-        TensorOp::Fmod { .. } => "fmod",
         TensorOp::StopGradient { .. } => "stop_gradient",
         TensorOp::Custom { .. } => "custom",
         TensorOp::CumSum { .. } => "cumsum",

@@ -20,12 +20,12 @@ use cudarc::nvrtc::compile_ptx;
 use cudarc::nccl::{group_end, group_start, Comm as NcclComm, ReduceOp as NcclReduceOp};
 
 use super::{
-    contiguous_strides, cuda_sqrt_derivative_expression, element_count, tensor_op_inputs,
-    DynamicTensor, LinalgKind, TensorBackend, TensorDType, TensorDeviceBackend,
+    contiguous_strides, cuda_elementwise_formula, cuda_scalar_literal, element_count,
+    tensor_op_inputs, DynamicTensor, LinalgKind, TensorBackend, TensorDType, TensorDeviceBackend,
     TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorForiVjpJvpExecutionPlan,
     TensorForiVjpTarget, TensorFusionRegion, TensorNodeId, TensorOp, TensorReplicaReduction,
     TensorScanExecutionPlan, TensorScanTarget, TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget,
-    TensorShardingPlan,
+    TensorShardingPlan, UnaryMathKind,
 };
 
 #[cfg(test)]
@@ -1819,7 +1819,11 @@ fn cuda_remaining_use_counts(plan: &TensorExecutionPlan) -> Vec<usize> {
 fn cuda_matmul_bias_tanh_epilogue(
     plan: &TensorExecutionPlan,
 ) -> Option<CudaMatmulBiasTanhEpilogue> {
-    let TensorOp::Tanh { input: add } = plan.nodes.get(plan.output_node_id)?.op else {
+    let TensorOp::UnaryMath {
+        input: add,
+        kind: UnaryMathKind::Tanh,
+    } = plan.nodes.get(plan.output_node_id)?.op
+    else {
         return None;
     };
     let TensorOp::Add { lhs, rhs } = plan.nodes.get(add)?.op else {
@@ -2996,22 +3000,11 @@ fn execute_cuda_device_program<T: CudaReal>(
             | TensorOp::Greater { .. }
             | TensorOp::Compare { .. }
             | TensorOp::Where { .. }
-            | TensorOp::Tanh { .. }
-            | TensorOp::Exp { .. }
             | TensorOp::Sqrt { .. }
             | TensorOp::SqrtDerivative { .. }
-            | TensorOp::Sin { .. }
-            | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
-            | TensorOp::Pow { .. }
-            | TensorOp::Log { .. }
-            | TensorOp::Log1p { .. }
-            | TensorOp::Expm1 { .. }
-            | TensorOp::Erf { .. }
-            | TensorOp::Erfc { .. }
-            | TensorOp::Atan2 { .. }
             | TensorOp::UnaryMath { .. }
-            | TensorOp::Fmod { .. }
+            | TensorOp::BinaryMath { .. }
             | TensorOp::CumSum { .. }
             | TensorOp::Triangular { .. }
             | TensorOp::Matmul { .. }
@@ -3626,12 +3619,7 @@ fn launch_cuda_node<T: CudaReal>(
         | TensorOp::Mul { lhs, rhs }
         | TensorOp::Greater { lhs, rhs }
         | TensorOp::Compare { lhs, rhs, .. }
-        | TensorOp::Pow {
-            base: lhs,
-            exponent: rhs,
-        }
-        | TensorOp::Atan2 { y: lhs, x: rhs }
-        | TensorOp::Fmod { x: lhs, y: rhs } => {
+        | TensorOp::BinaryMath { lhs, rhs, .. } => {
             launch.arg(cuda_value(values, *lhs)?);
             launch.arg(cuda_value(values, *rhs)?);
             launch.arg(output);
@@ -3649,18 +3637,9 @@ fn launch_cuda_node<T: CudaReal>(
             launch.arg(&count);
         }
         TensorOp::Cholesky { input }
-        | TensorOp::Tanh { input }
-        | TensorOp::Exp { input }
         | TensorOp::Sqrt { input }
         | TensorOp::SqrtDerivative { input, .. }
-        | TensorOp::Sin { input }
-        | TensorOp::Cos { input }
         | TensorOp::Powi { input, .. }
-        | TensorOp::Log { input }
-        | TensorOp::Log1p { input }
-        | TensorOp::Expm1 { input }
-        | TensorOp::Erf { input }
-        | TensorOp::Erfc { input }
         | TensorOp::UnaryMath { input, .. }
         | TensorOp::CumSum { input, .. }
         | TensorOp::Transpose { input, .. }
@@ -4991,24 +4970,14 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
             | TensorOp::Greater { .. }
             | TensorOp::Compare { .. }
             | TensorOp::Where { .. }
-            | TensorOp::Tanh { .. }
-            | TensorOp::Exp { .. }
             | TensorOp::Sqrt { .. }
             | TensorOp::SqrtDerivative { .. }
-            | TensorOp::Sin { .. }
-            | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
-            | TensorOp::Pow { .. }
-            | TensorOp::Log { .. }
-            | TensorOp::Log1p { .. }
-            | TensorOp::Expm1 { .. }
-            | TensorOp::Erf { .. }
-            | TensorOp::Atan2 { .. }
-            | TensorOp::UnaryMath { .. }
-            | TensorOp::Fmod { .. }
             | TensorOp::StopGradient { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
+            TensorOp::UnaryMath { kind, .. } if kind.cuda_loop_lowerable() => {}
+            TensorOp::BinaryMath { kind, .. } if kind.cuda_loop_lowerable() => {}
             TensorOp::Reshape { input } if body.nodes[*input].shape == node.shape => {}
             _ => {
                 return Err(format!(
@@ -5090,24 +5059,14 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
             | TensorOp::Greater { .. }
             | TensorOp::Compare { .. }
             | TensorOp::Where { .. }
-            | TensorOp::Tanh { .. }
-            | TensorOp::Exp { .. }
             | TensorOp::Sqrt { .. }
             | TensorOp::SqrtDerivative { .. }
-            | TensorOp::Sin { .. }
-            | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
-            | TensorOp::Pow { .. }
-            | TensorOp::Log { .. }
-            | TensorOp::Log1p { .. }
-            | TensorOp::Expm1 { .. }
-            | TensorOp::Erf { .. }
-            | TensorOp::Atan2 { .. }
-            | TensorOp::UnaryMath { .. }
-            | TensorOp::Fmod { .. }
             | TensorOp::StopGradient { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
+            TensorOp::UnaryMath { kind, .. } if kind.cuda_loop_lowerable() => {}
+            TensorOp::BinaryMath { kind, .. } if kind.cuda_loop_lowerable() => {}
             TensorOp::Reshape { input }
                 if cuda_shapes_match_without_leading_units(
                     &scan_plan.body.plan.nodes[*input].shape,
@@ -5245,6 +5204,25 @@ impl CudaScalarExpressionBuilder {
     }
 }
 
+/// The shared CUDA formula (`cuda_elementwise_formula`) of `op` in a fused
+/// loop body or loop derivative body, operands spelled by `operand`;
+/// `None` for the ops the loop generators resolve themselves and for the
+/// math kinds fused loops do not admit (`cuda_loop_lowerable`).
+fn cuda_loop_formula(
+    op: &TensorOp,
+    operand: impl Fn(TensorNodeId) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let admitted = match op {
+        TensorOp::UnaryMath { kind, .. } => kind.cuda_loop_lowerable(),
+        TensorOp::BinaryMath { kind, .. } => kind.cuda_loop_lowerable(),
+        _ => true,
+    };
+    if !admitted {
+        return Ok(None);
+    }
+    cuda_elementwise_formula(op, |_, id| operand(id))
+}
+
 fn cuda_fori_body_expression(
     loop_plan: &TensorForiExecutionPlan,
     node_id: TensorNodeId,
@@ -5296,65 +5274,19 @@ fn cuda_fori_body_expression_inner(
             let offset = cuda_offset_expression(carry_shape, &node.shape);
             Ok(format!("capture_{parameter}[{offset}]"))
         }
-        TensorOp::ScalarConstant { value } => Ok(cuda_float_literal(*value)),
-        TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Div { lhs, rhs } => Ok(format!("({} / {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Greater { lhs, rhs } => Ok(format!(
-            "(({} > {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            child(*rhs)?
-        )),
-        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
-            "(({} {} {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            kind.operator(),
-            child(*rhs)?
-        )),
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => Ok(format!(
-            "(({} != 0.0f) ? {} : {})",
-            child(*condition)?,
-            child(*on_true)?,
-            child(*on_false)?
-        )),
-        TensorOp::Tanh { input } => Ok(format!("tanhf({})", child(*input)?)),
-        TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
-        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
-        TensorOp::SqrtDerivative { input, order } => {
-            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
-        }
-        TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
-        TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
-        TensorOp::Powi { input, exponent } => {
-            Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
-        }
-        TensorOp::Pow { base, exponent } => {
-            Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
-        }
-        TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
-        TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
-        TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
-        TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
-        TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
-        TensorOp::UnaryMath { input, kind } => {
-            Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
-        }
-        TensorOp::Fmod { x, y } => Ok(format!("fmodf({}, {})", child(*x)?, child(*y)?)),
+        TensorOp::ScalarConstant { value } => Ok(cuda_scalar_literal(*value)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
         // already run, so stop_gradient is the identity too.
         TensorOp::Broadcast { input }
         | TensorOp::Reshape { input }
         | TensorOp::Cast { input }
         | TensorOp::StopGradient { input } => child(*input),
-        _ => Err(format!(
-            "CUDA Fori body {} is not elementwise-lowerable",
-            cuda_op_name(&node.op)
-        )),
+        op => cuda_loop_formula(op, child)?.ok_or_else(|| {
+            format!(
+                "CUDA Fori body {} is not elementwise-lowerable",
+                cuda_op_name(op)
+            )
+        }),
     }?;
     Ok(builder.emit(node_id, None, expression))
 }
@@ -5466,55 +5398,7 @@ fn cuda_scan_body_expression_in_half_inner(
             };
             Ok(format!("capture_{parameter}[{offset}]"))
         }
-        TensorOp::ScalarConstant { value } => Ok(cuda_float_literal(*value)),
-        TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Div { lhs, rhs } => Ok(format!("({} / {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Greater { lhs, rhs } => Ok(format!(
-            "(({} > {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            child(*rhs)?
-        )),
-        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
-            "(({} {} {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            kind.operator(),
-            child(*rhs)?
-        )),
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => Ok(format!(
-            "(({} != 0.0f) ? {} : {})",
-            child(*condition)?,
-            child(*on_true)?,
-            child(*on_false)?
-        )),
-        TensorOp::Tanh { input } => Ok(format!("tanhf({})", child(*input)?)),
-        TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
-        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
-        TensorOp::SqrtDerivative { input, order } => {
-            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
-        }
-        TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
-        TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
-        TensorOp::Powi { input, exponent } => {
-            Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
-        }
-        TensorOp::Pow { base, exponent } => {
-            Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
-        }
-        TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
-        TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
-        TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
-        TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
-        TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
-        TensorOp::UnaryMath { input, kind } => {
-            Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
-        }
-        TensorOp::Fmod { x, y } => Ok(format!("fmodf({}, {})", child(*x)?, child(*y)?)),
+        TensorOp::ScalarConstant { value } => Ok(cuda_scalar_literal(*value)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
         // already run, so stop_gradient is the identity too.
         TensorOp::Broadcast { input }
@@ -5548,10 +5432,12 @@ fn cuda_scan_body_expression_in_half_inner(
             }
             in_half(inputs[half], packed_half)
         }
-        _ => Err(format!(
-            "CUDA Scan body {} is not elementwise-lowerable",
-            cuda_op_name(&node.op)
-        )),
+        op => cuda_loop_formula(op, child)?.ok_or_else(|| {
+            format!(
+                "CUDA Scan body {} is not elementwise-lowerable",
+                cuda_op_name(op)
+            )
+        }),
     }?;
     Ok(builder.emit(node_id, packed_half, expression))
 }
@@ -5626,65 +5512,19 @@ fn cuda_elementwise_plan_expression_with_index_inner(
                 "CUDA elementwise plan input {name:?} has no binding"
             )),
         },
-        TensorOp::ScalarConstant { value } if value.is_finite() => Ok(cuda_float_literal(*value)),
-        TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Div { lhs, rhs } => Ok(format!("({} / {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Greater { lhs, rhs } => Ok(format!(
-            "(({} > {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            child(*rhs)?
-        )),
-        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
-            "(({} {} {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            kind.operator(),
-            child(*rhs)?
-        )),
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => Ok(format!(
-            "(({} != 0.0f) ? {} : {})",
-            child(*condition)?,
-            child(*on_true)?,
-            child(*on_false)?
-        )),
-        TensorOp::Tanh { input } => Ok(format!("tanhf({})", child(*input)?)),
-        TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
-        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
-        TensorOp::SqrtDerivative { input, order } => {
-            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
-        }
-        TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
-        TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
-        TensorOp::Powi { input, exponent } => {
-            Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
-        }
-        TensorOp::Pow { base, exponent } => {
-            Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
-        }
-        TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
-        TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
-        TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
-        TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
-        TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
-        TensorOp::UnaryMath { input, kind } => {
-            Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
-        }
-        TensorOp::Fmod { x, y } => Ok(format!("fmodf({}, {})", child(*x)?, child(*y)?)),
+        TensorOp::ScalarConstant { value } if value.is_finite() => Ok(cuda_scalar_literal(*value)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
         // already run, so stop_gradient is the identity too.
         TensorOp::Broadcast { input }
         | TensorOp::Reshape { input }
         | TensorOp::Cast { input }
         | TensorOp::StopGradient { input } => child(*input),
-        _ => Err(format!(
-            "CUDA Fori VJP body uses unsupported {} operation",
-            cuda_op_name(&node.op)
-        )),
+        op => cuda_loop_formula(op, child)?.ok_or_else(|| {
+            format!(
+                "CUDA Fori VJP body uses unsupported {} operation",
+                cuda_op_name(op)
+            )
+        }),
     }?;
     Ok(builder.emit(node_id, None, expression))
 }
@@ -7873,6 +7713,22 @@ fn cuda_scan_vjp_jvp_group_kernel_source(
 }
 /// `host_driven` lists loop nodes that run as host-driven region loops; they
 /// launch their regions' own programs, so no node kernel is emitted for them.
+/// The shared CUDA formula (`cuda_elementwise_formula`) of one per-node
+/// kernel, whose operand `position` is the buffer read `operands[position]`.
+fn cuda_node_formula(
+    node_id: TensorNodeId,
+    op: &TensorOp,
+    operands: &[String],
+) -> Result<String, String> {
+    cuda_elementwise_formula(op, |position, _| {
+        operands
+            .get(position)
+            .cloned()
+            .ok_or_else(|| format!("CUDA node {node_id} reads a missing operand {position}"))
+    })?
+    .ok_or_else(|| format!("CUDA node {node_id} has no elementwise formula"))
+}
+
 fn cuda_program_source(
     plan: &TensorExecutionPlan,
     host_driven: &BTreeSet<TensorNodeId>,
@@ -7909,7 +7765,7 @@ fn cuda_program_source(
                 "extern \"C\" __global__ void {function}(float* out, unsigned long long count) {{\n\
                     unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
                     if (index < count) out[index] = {};\n}}\n",
-                cuda_float_literal(*value)
+                cuda_scalar_literal(*value)
             ),
             TensorOp::ScalarConstant { .. } => {
                 return Err("CUDA device program does not support non-finite constants".to_string())
@@ -7931,35 +7787,11 @@ fn cuda_program_source(
             | TensorOp::Mul { lhs, rhs }
             | TensorOp::Greater { lhs, rhs }
             | TensorOp::Compare { lhs, rhs, .. }
-            | TensorOp::Pow {
-                base: lhs,
-                exponent: rhs,
-            }
-            | TensorOp::Atan2 { y: lhs, x: rhs }
-            | TensorOp::Fmod { x: lhs, y: rhs } => {
+            | TensorOp::BinaryMath { lhs, rhs, .. } => {
                 let lhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*lhs].shape);
                 let rhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*rhs].shape);
-                let expression = match &node.op {
-                    TensorOp::Add { .. } => format!("lhs[{lhs_offset}] + rhs[{rhs_offset}]"),
-                    TensorOp::Sub { .. } => format!("lhs[{lhs_offset}] - rhs[{rhs_offset}]"),
-                    TensorOp::Div { .. } => format!("lhs[{lhs_offset}] / rhs[{rhs_offset}]"),
-                    TensorOp::Mul { .. } => format!("lhs[{lhs_offset}] * rhs[{rhs_offset}]"),
-                    TensorOp::Greater { .. } => {
-                        format!("lhs[{lhs_offset}] > rhs[{rhs_offset}] ? 1.0f : 0.0f")
-                    }
-                    TensorOp::Compare { kind, .. } => format!(
-                        "lhs[{lhs_offset}] {} rhs[{rhs_offset}] ? 1.0f : 0.0f",
-                        kind.operator()
-                    ),
-                    TensorOp::Pow { .. } => format!("powf(lhs[{lhs_offset}], rhs[{rhs_offset}])"),
-                    TensorOp::Atan2 { .. } => {
-                        format!("atan2f(lhs[{lhs_offset}], rhs[{rhs_offset}])")
-                    }
-                    TensorOp::Fmod { .. } => {
-                        format!("fmodf(lhs[{lhs_offset}], rhs[{rhs_offset}])")
-                    }
-                    _ => unreachable!(),
-                };
+                let operands = [format!("lhs[{lhs_offset}]"), format!("rhs[{rhs_offset}]")];
+                let expression = cuda_node_formula(node_id, &node.op, &operands)?;
                 format!(
                     "extern \"C\" __global__ void {function}(const float* lhs, const float* rhs, float* out, unsigned long long count) {{\n\
                         unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
@@ -7970,47 +7802,24 @@ fn cuda_program_source(
                 let condition_offset = cuda_offset_expression(&node.shape, &plan.nodes[*condition].shape);
                 let true_offset = cuda_offset_expression(&node.shape, &plan.nodes[*on_true].shape);
                 let false_offset = cuda_offset_expression(&node.shape, &plan.nodes[*on_false].shape);
+                let operands = [
+                    format!("condition[{condition_offset}]"),
+                    format!("on_true[{true_offset}]"),
+                    format!("on_false[{false_offset}]"),
+                ];
+                let expression = cuda_node_formula(node_id, &node.op, &operands)?;
                 format!(
                     "extern \"C\" __global__ void {function}(const float* condition, const float* on_true, const float* on_false, float* out, unsigned long long count) {{\n\
                         unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
-                        if (index < count) out[index] = condition[{condition_offset}] != 0.0f ? on_true[{true_offset}] : on_false[{false_offset}];\n}}\n"
+                        if (index < count) out[index] = {expression};\n}}\n"
                 )
             }
-            TensorOp::Tanh { input }
-            | TensorOp::Exp { input }
-            | TensorOp::Sqrt { input }
+            TensorOp::Sqrt { input }
             | TensorOp::SqrtDerivative { input, .. }
-            | TensorOp::Sin { input }
-            | TensorOp::Cos { input }
             | TensorOp::Powi { input, .. }
-            | TensorOp::Log { input }
-            | TensorOp::Log1p { input }
-            | TensorOp::Expm1 { input }
-            | TensorOp::Erf { input }
-            | TensorOp::Erfc { input }
             | TensorOp::UnaryMath { input, .. } => {
-                let expression = match &node.op {
-                    TensorOp::Tanh { .. } => "tanhf(input[index])".to_string(),
-                    TensorOp::Exp { .. } => "expf(input[index])".to_string(),
-                    TensorOp::Sqrt { .. } => "sqrtf(input[index])".to_string(),
-                    TensorOp::SqrtDerivative { order, .. } => {
-                        cuda_sqrt_derivative_expression("input[index]", *order)
-                    }
-                    TensorOp::Sin { .. } => "sinf(input[index])".to_string(),
-                    TensorOp::Cos { .. } => "cosf(input[index])".to_string(),
-                    TensorOp::Powi { exponent, .. } => {
-                        format!("quabla_powi(input[index], {exponent}U)")
-                    }
-                    TensorOp::Log { .. } => "logf(input[index])".to_string(),
-                    TensorOp::Log1p { .. } => "log1pf(input[index])".to_string(),
-                    TensorOp::Expm1 { .. } => "expm1f(input[index])".to_string(),
-                    TensorOp::Erf { .. } => "erff(input[index])".to_string(),
-                    TensorOp::Erfc { .. } => "erfcf(input[index])".to_string(),
-                    TensorOp::UnaryMath { kind, .. } => {
-                        format!("{}(input[index])", kind.cuda_function())
-                    }
-                    _ => unreachable!(),
-                };
+                let expression =
+                    cuda_node_formula(node_id, &node.op, &["input[index]".to_string()])?;
                 let input_count = element_count(&plan.nodes[*input].shape)?;
                 if input_count != count {
                     return Err(format!(
@@ -8599,20 +8408,6 @@ fn cuda_shapes_broadcastable(output_shape: &[usize], input_shape: &[usize]) -> b
         .all(|(output_extent, input_extent)| *input_extent == 1 || input_extent == output_extent)
 }
 
-/// A CUDA `float` literal that rounds `value` like `value as f32`, spelled
-/// with the shortest round-trip `f64` digits: a value exact in `f32` keeps an
-/// `f` suffix, any other is cast to `float`. A program retyped to `double` for
-/// `precision="float64"` drops the suffix and the cast and so keeps every bit
-/// of the `f64` constant (the shortest `f32` digits would not: `2^-12` would
-/// become `0.00024414062`).
-fn cuda_float_literal(value: f64) -> String {
-    if f64::from(value as f32) == value {
-        format!("{value:?}f")
-    } else {
-        format!("((float){value:?})")
-    }
-}
-
 /// A comma-separated `unsigned int` initializer for a baked index table.
 fn cuda_index_table(values: &[usize]) -> Result<String, String> {
     let mut table = String::with_capacity(values.len() * 6);
@@ -8681,26 +8476,15 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Cholesky { .. } => "cholesky",
         TensorOp::CholeskyAd { .. } => "cholesky_ad",
         TensorOp::Triangular { .. } => "triangular",
-        TensorOp::Tanh { .. } => "tanh",
-        TensorOp::Exp { .. } => "exp",
         TensorOp::Sqrt { .. } => "sqrt",
         TensorOp::SqrtDerivative { .. } => "sqrt_derivative",
         TensorOp::Reshape { .. } => "reshape",
         TensorOp::Mean { .. } => "mean",
         TensorOp::MeanAxis { .. } => "mean_axis",
-        TensorOp::Sin { .. } => "sin",
-        TensorOp::Cos { .. } => "cos",
         TensorOp::Powi { .. } => "powi",
-        TensorOp::Pow { .. } => "pow",
+        TensorOp::BinaryMath { kind, .. } => kind.name(),
         TensorOp::Transpose { .. } => "transpose",
-        TensorOp::Log { .. } => "log",
-        TensorOp::Log1p { .. } => "log1p",
-        TensorOp::Expm1 { .. } => "expm1",
-        TensorOp::Erf { .. } => "erf",
-        TensorOp::Erfc { .. } => "erfc",
-        TensorOp::Atan2 { .. } => "atan2",
         TensorOp::UnaryMath { kind, .. } => kind.name(),
-        TensorOp::Fmod { .. } => "fmod",
         TensorOp::StopGradient { .. } => "stop_gradient",
         TensorOp::Custom { .. } => "custom",
         TensorOp::CumSum { .. } => "cumsum",
@@ -9669,6 +9453,76 @@ mod host_loop_graph_tests {
                     assert_eq!((launches, launches64), (0, 0), "{name} steps={steps}");
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Every elementwise math kind runs as one NVRTC kernel of the per-node
+    /// program, so a host-driven loop body that uses it records and replays
+    /// CUDA graphs, bit-identical to the eager launches.
+    #[test]
+    fn host_loop_graphs_admit_every_elementwise_math_kind() -> Result<(), String> {
+        if !crate::test_support::Gate::Cuda.enabled() {
+            return Ok(());
+        }
+        let steps = 17;
+        let inputs = inputs(steps)?;
+        let backend = CudaBackend::new(0);
+        let kinds = UnaryMathKind::ALL
+            .into_iter()
+            .map(|kind| (kind.name(), Some(kind), None))
+            .chain(
+                crate::tensor_ir::BinaryMathKind::ALL
+                    .into_iter()
+                    .map(|kind| (kind.name(), None, Some(kind))),
+            );
+        for (name, unary, binary) in kinds {
+            // `rotate(c) + 0.25 kind(0.25 c + 0.5) + 0.001 i`, with the
+            // argument of `arccosh` moved into its domain.
+            let mut body = TensorIr::new();
+            let carry = body.input("carry", vec![LANES])?;
+            let index = body.input("index", vec![])?;
+            let rotated = rotate(&mut body, carry, false)?;
+            let quarter = body.scalar_constant(0.25);
+            let half = body.scalar_constant(0.5);
+            let scaled = body.mul(carry, quarter)?;
+            let mut argument = body.add(scaled, half)?;
+            let value = match (unary, binary) {
+                (Some(kind), _) => {
+                    if kind == UnaryMathKind::Arccosh {
+                        let one = body.scalar_constant(1.0);
+                        argument = body.add(argument, one)?;
+                    }
+                    body.unary_math(argument, kind)?
+                }
+                (_, Some(kind)) => {
+                    let operand = body.scalar_constant(0.75);
+                    body.binary_math(argument, operand, kind)?
+                }
+                _ => unreachable!("every entry has a kind"),
+            };
+            let term = body.mul(value, quarter)?;
+            let next = body.add(rotated, term)?;
+            let step = body.scalar_constant(0.001);
+            let step = body.mul(index, step)?;
+            let next = body.add(next, step)?;
+            let plan =
+                TensorForiExecutionPlan::new(0, steps, body.compile_cpu(next)?, "carry", "index")?;
+            let mut graph = TensorIr::new();
+            let initial = graph.input("initial", vec![LANES])?;
+            let captures = vec![
+                ("scale".to_string(), graph.input("scale", vec![LANES])?),
+                ("rate".to_string(), graph.input("rate", vec![])?),
+            ];
+            let output = graph.fori(initial, plan, captures)?;
+            let program = graph.compile_cpu(output)?;
+            let (eager, replayed, launches) = run_both(
+                &program,
+                |plan| backend.compile(plan),
+                |plan| plan.execute_many(&inputs),
+            )?;
+            assert_eq!(bits(&eager), bits(&replayed), "{name}");
+            assert!(launches > 0, "{name} replayed no graph");
         }
         Ok(())
     }

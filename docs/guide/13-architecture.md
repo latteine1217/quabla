@@ -59,7 +59,7 @@ so the rest of the code compiles unchanged.
 | Module | Responsibility |
 | --- | --- |
 | `tensor_ir.rs` | The IR, the CPU interpreter, runtime and symbolic AD, batching, plan compilation, CUDA source generation helpers |
-| `tensor_ir/elementwise.rs` | `UnaryMathKind` (tan, arcsin, ..., round) and `fmod`: values, derivatives, CUDA function names, symbolic rules |
+| `tensor_ir/elementwise.rs` | `UnaryMathKind` (exp, log, sin, tanh, erf, tan, ..., round) and `BinaryMathKind` (pow, atan2, fmod): every rule of an elementwise math function, from its value and derivatives to its CUDA spelling and constant folding |
 | `tensor_ir/extremum.rs` | `max`/`min` along axes (IEEE 754-2019 semantics) and their derivative rules |
 | `tensor_ir/linalg.rs` | Host kernels for the decompositions (`LinalgKind`): LU sign/log-determinant, Jacobi `eigh`, Householder QR, Jacobi SVD |
 | `tensor_ir/cholesky.rs` | Cholesky derivative kinds and the jet-based higher-order expansion |
@@ -102,7 +102,7 @@ groups:
 | Group | Variants |
 | --- | --- |
 | Leaves | `Input`, `ScalarConstant`, `Constant` |
-| Elementwise | `Cast`, `Add`, `Sub`, `Mul`, `Div`, `Greater`, `Compare`, `Where`, `Tanh`, `Exp`, `Log`, `Log1p`, `Expm1`, `Sqrt`, `Sin`, `Cos`, `Powi`, `Pow`, `Erf`, `Erfc`, `Atan2`, `UnaryMath { kind }`, `Fmod`, `StopGradient`, ... |
+| Elementwise | `Cast`, `Add`, `Sub`, `Mul`, `Div`, `Greater`, `Compare`, `Where`, `Sqrt`, `SqrtDerivative`, `Powi`, `UnaryMath { kind }`, `BinaryMath { kind }`, `StopGradient` |
 | Reductions | `Sum`, `SumAxis`, `Mean`, `MeanAxis`, `ExtremumAxis`, `CumSum` |
 | Shape and indexing | `Reshape`, `Transpose`, `Concat`, `Slice`, `PadSlice`, `Gather`, `ScatterAdd`, `Broadcast` |
 | Linear algebra | `Matmul`, `Solve`, `Cholesky`, `CholeskyAd`, `Triangular`, `Linalg { kind }` |

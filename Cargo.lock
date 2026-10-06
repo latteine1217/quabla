@@ -566,7 +566,6 @@ dependencies = [
 name = "quabla-python"
 version = "0.5.0"
 dependencies = [
- "libm",
  "pyo3",
  "quabla-core",
 ]

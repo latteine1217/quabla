@@ -11,6 +11,13 @@ deprecated names keep working until 1.0 (see
 
 ### Changed
 
+- Internal: the elementwise math functions of one operand (`exp`, `log`,
+  `log1p`, `expm1`, `erf`, `erfc`, `sin`, `cos`, `tanh`, and the `tan` ...
+  `round` family) are one IR op, and `power`, `atan2`, and `fmod` another;
+  each function's kind owns every rule of the function in one place
+  (`tensor_ir/elementwise.rs`): its value, derivative rules, CUDA spelling
+  and admission, MLX lowering, and constant folding. Values, derivatives,
+  and IR text are unchanged.
 - Tests only: the GPU test gates `QUABLA_MLX_TEST`, `QUABLA_CUDA_TEST`, and
   `QUABLA_CUDA_NCCL_TEST` are on exactly when the variable is `1`, in the
   Python suites and the Rust tests alike. Some suites (most of
@@ -21,6 +28,14 @@ deprecated names keep working until 1.0 (see
   runner prints `PASS`, `SKIP` with its reason, or `FAIL` for every test
   and a summary line, and exits non-zero on a failure; a gated test that
   used to return silently and print `PASS` now prints `SKIP`.
+
+### Fixed
+
+- Host-driven CUDA loops whose bodies use `fmod`, `tan`, the inverse
+  trigonometric and hyperbolic functions, `sinh`, `cosh`, `log2`, `log10`,
+  `cbrt`, `floor`, `ceil`, or `round` replay their iterations as CUDA
+  graphs like every other elementwise body, instead of launching each
+  kernel from the host; results are bit-identical.
 
 ## [0.5.0] - 2026-10-06
 
