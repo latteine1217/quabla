@@ -25,7 +25,7 @@ use super::{
     TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorForiVjpJvpExecutionPlan,
     TensorForiVjpTarget, TensorFusionRegion, TensorNodeId, TensorOp, TensorReplicaReduction,
     TensorScanExecutionPlan, TensorScanTarget, TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget,
-    TensorShardingPlan,
+    TensorShardingPlan, UnaryMathKind,
 };
 
 #[cfg(test)]
@@ -1819,7 +1819,11 @@ fn cuda_remaining_use_counts(plan: &TensorExecutionPlan) -> Vec<usize> {
 fn cuda_matmul_bias_tanh_epilogue(
     plan: &TensorExecutionPlan,
 ) -> Option<CudaMatmulBiasTanhEpilogue> {
-    let TensorOp::Tanh { input: add } = plan.nodes.get(plan.output_node_id)?.op else {
+    let TensorOp::UnaryMath {
+        input: add,
+        kind: UnaryMathKind::Tanh,
+    } = plan.nodes.get(plan.output_node_id)?.op
+    else {
         return None;
     };
     let TensorOp::Add { lhs, rhs } = plan.nodes.get(add)?.op else {
@@ -2996,19 +3000,10 @@ fn execute_cuda_device_program<T: CudaReal>(
             | TensorOp::Greater { .. }
             | TensorOp::Compare { .. }
             | TensorOp::Where { .. }
-            | TensorOp::Tanh { .. }
-            | TensorOp::Exp { .. }
             | TensorOp::Sqrt { .. }
             | TensorOp::SqrtDerivative { .. }
-            | TensorOp::Sin { .. }
-            | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
             | TensorOp::Pow { .. }
-            | TensorOp::Log { .. }
-            | TensorOp::Log1p { .. }
-            | TensorOp::Expm1 { .. }
-            | TensorOp::Erf { .. }
-            | TensorOp::Erfc { .. }
             | TensorOp::Atan2 { .. }
             | TensorOp::UnaryMath { .. }
             | TensorOp::Fmod { .. }
@@ -3649,18 +3644,9 @@ fn launch_cuda_node<T: CudaReal>(
             launch.arg(&count);
         }
         TensorOp::Cholesky { input }
-        | TensorOp::Tanh { input }
-        | TensorOp::Exp { input }
         | TensorOp::Sqrt { input }
         | TensorOp::SqrtDerivative { input, .. }
-        | TensorOp::Sin { input }
-        | TensorOp::Cos { input }
         | TensorOp::Powi { input, .. }
-        | TensorOp::Log { input }
-        | TensorOp::Log1p { input }
-        | TensorOp::Expm1 { input }
-        | TensorOp::Erf { input }
-        | TensorOp::Erfc { input }
         | TensorOp::UnaryMath { input, .. }
         | TensorOp::CumSum { input, .. }
         | TensorOp::Transpose { input, .. }
@@ -4991,24 +4977,16 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
             | TensorOp::Greater { .. }
             | TensorOp::Compare { .. }
             | TensorOp::Where { .. }
-            | TensorOp::Tanh { .. }
-            | TensorOp::Exp { .. }
             | TensorOp::Sqrt { .. }
             | TensorOp::SqrtDerivative { .. }
-            | TensorOp::Sin { .. }
-            | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
             | TensorOp::Pow { .. }
-            | TensorOp::Log { .. }
-            | TensorOp::Log1p { .. }
-            | TensorOp::Expm1 { .. }
-            | TensorOp::Erf { .. }
             | TensorOp::Atan2 { .. }
-            | TensorOp::UnaryMath { .. }
             | TensorOp::Fmod { .. }
             | TensorOp::StopGradient { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
+            TensorOp::UnaryMath { kind, .. } if kind.cuda_loop_lowerable() => {}
             TensorOp::Reshape { input } if body.nodes[*input].shape == node.shape => {}
             _ => {
                 return Err(format!(
@@ -5090,24 +5068,16 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
             | TensorOp::Greater { .. }
             | TensorOp::Compare { .. }
             | TensorOp::Where { .. }
-            | TensorOp::Tanh { .. }
-            | TensorOp::Exp { .. }
             | TensorOp::Sqrt { .. }
             | TensorOp::SqrtDerivative { .. }
-            | TensorOp::Sin { .. }
-            | TensorOp::Cos { .. }
             | TensorOp::Powi { .. }
             | TensorOp::Pow { .. }
-            | TensorOp::Log { .. }
-            | TensorOp::Log1p { .. }
-            | TensorOp::Expm1 { .. }
-            | TensorOp::Erf { .. }
             | TensorOp::Atan2 { .. }
-            | TensorOp::UnaryMath { .. }
             | TensorOp::Fmod { .. }
             | TensorOp::StopGradient { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
+            TensorOp::UnaryMath { kind, .. } if kind.cuda_loop_lowerable() => {}
             TensorOp::Reshape { input }
                 if cuda_shapes_match_without_leading_units(
                     &scan_plan.body.plan.nodes[*input].shape,
@@ -5322,26 +5292,18 @@ fn cuda_fori_body_expression_inner(
             child(*on_true)?,
             child(*on_false)?
         )),
-        TensorOp::Tanh { input } => Ok(format!("tanhf({})", child(*input)?)),
-        TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
         TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
         TensorOp::SqrtDerivative { input, order } => {
             Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
         }
-        TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
-        TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
         TensorOp::Powi { input, exponent } => {
             Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
         }
         TensorOp::Pow { base, exponent } => {
             Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
         }
-        TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
-        TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
-        TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
-        TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
         TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
-        TensorOp::UnaryMath { input, kind } => {
+        TensorOp::UnaryMath { input, kind } if kind.cuda_loop_lowerable() => {
             Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
         }
         TensorOp::Fmod { x, y } => Ok(format!("fmodf({}, {})", child(*x)?, child(*y)?)),
@@ -5492,26 +5454,18 @@ fn cuda_scan_body_expression_in_half_inner(
             child(*on_true)?,
             child(*on_false)?
         )),
-        TensorOp::Tanh { input } => Ok(format!("tanhf({})", child(*input)?)),
-        TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
         TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
         TensorOp::SqrtDerivative { input, order } => {
             Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
         }
-        TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
-        TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
         TensorOp::Powi { input, exponent } => {
             Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
         }
         TensorOp::Pow { base, exponent } => {
             Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
         }
-        TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
-        TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
-        TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
-        TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
         TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
-        TensorOp::UnaryMath { input, kind } => {
+        TensorOp::UnaryMath { input, kind } if kind.cuda_loop_lowerable() => {
             Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
         }
         TensorOp::Fmod { x, y } => Ok(format!("fmodf({}, {})", child(*x)?, child(*y)?)),
@@ -5652,26 +5606,18 @@ fn cuda_elementwise_plan_expression_with_index_inner(
             child(*on_true)?,
             child(*on_false)?
         )),
-        TensorOp::Tanh { input } => Ok(format!("tanhf({})", child(*input)?)),
-        TensorOp::Exp { input } => Ok(format!("expf({})", child(*input)?)),
         TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
         TensorOp::SqrtDerivative { input, order } => {
             Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
         }
-        TensorOp::Sin { input } => Ok(format!("sinf({})", child(*input)?)),
-        TensorOp::Cos { input } => Ok(format!("cosf({})", child(*input)?)),
         TensorOp::Powi { input, exponent } => {
             Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
         }
         TensorOp::Pow { base, exponent } => {
             Ok(format!("powf({}, {})", child(*base)?, child(*exponent)?))
         }
-        TensorOp::Log { input } => Ok(format!("logf({})", child(*input)?)),
-        TensorOp::Log1p { input } => Ok(format!("log1pf({})", child(*input)?)),
-        TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
-        TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
         TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
-        TensorOp::UnaryMath { input, kind } => {
+        TensorOp::UnaryMath { input, kind } if kind.cuda_loop_lowerable() => {
             Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
         }
         TensorOp::Fmod { x, y } => Ok(format!("fmodf({}, {})", child(*x)?, child(*y)?)),
@@ -7977,36 +7923,18 @@ fn cuda_program_source(
                         if (index < count) out[index] = condition[{condition_offset}] != 0.0f ? on_true[{true_offset}] : on_false[{false_offset}];\n}}\n"
                 )
             }
-            TensorOp::Tanh { input }
-            | TensorOp::Exp { input }
-            | TensorOp::Sqrt { input }
+            TensorOp::Sqrt { input }
             | TensorOp::SqrtDerivative { input, .. }
-            | TensorOp::Sin { input }
-            | TensorOp::Cos { input }
             | TensorOp::Powi { input, .. }
-            | TensorOp::Log { input }
-            | TensorOp::Log1p { input }
-            | TensorOp::Expm1 { input }
-            | TensorOp::Erf { input }
-            | TensorOp::Erfc { input }
             | TensorOp::UnaryMath { input, .. } => {
                 let expression = match &node.op {
-                    TensorOp::Tanh { .. } => "tanhf(input[index])".to_string(),
-                    TensorOp::Exp { .. } => "expf(input[index])".to_string(),
                     TensorOp::Sqrt { .. } => "sqrtf(input[index])".to_string(),
                     TensorOp::SqrtDerivative { order, .. } => {
                         cuda_sqrt_derivative_expression("input[index]", *order)
                     }
-                    TensorOp::Sin { .. } => "sinf(input[index])".to_string(),
-                    TensorOp::Cos { .. } => "cosf(input[index])".to_string(),
                     TensorOp::Powi { exponent, .. } => {
                         format!("quabla_powi(input[index], {exponent}U)")
                     }
-                    TensorOp::Log { .. } => "logf(input[index])".to_string(),
-                    TensorOp::Log1p { .. } => "log1pf(input[index])".to_string(),
-                    TensorOp::Expm1 { .. } => "expm1f(input[index])".to_string(),
-                    TensorOp::Erf { .. } => "erff(input[index])".to_string(),
-                    TensorOp::Erfc { .. } => "erfcf(input[index])".to_string(),
                     TensorOp::UnaryMath { kind, .. } => {
                         format!("{}(input[index])", kind.cuda_function())
                     }
@@ -8682,23 +8610,14 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Cholesky { .. } => "cholesky",
         TensorOp::CholeskyAd { .. } => "cholesky_ad",
         TensorOp::Triangular { .. } => "triangular",
-        TensorOp::Tanh { .. } => "tanh",
-        TensorOp::Exp { .. } => "exp",
         TensorOp::Sqrt { .. } => "sqrt",
         TensorOp::SqrtDerivative { .. } => "sqrt_derivative",
         TensorOp::Reshape { .. } => "reshape",
         TensorOp::Mean { .. } => "mean",
         TensorOp::MeanAxis { .. } => "mean_axis",
-        TensorOp::Sin { .. } => "sin",
-        TensorOp::Cos { .. } => "cos",
         TensorOp::Powi { .. } => "powi",
         TensorOp::Pow { .. } => "pow",
         TensorOp::Transpose { .. } => "transpose",
-        TensorOp::Log { .. } => "log",
-        TensorOp::Log1p { .. } => "log1p",
-        TensorOp::Expm1 { .. } => "expm1",
-        TensorOp::Erf { .. } => "erf",
-        TensorOp::Erfc { .. } => "erfc",
         TensorOp::Atan2 { .. } => "atan2",
         TensorOp::UnaryMath { kind, .. } => kind.name(),
         TensorOp::Fmod { .. } => "fmod",

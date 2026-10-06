@@ -1,14 +1,29 @@
-//! The [`UnaryMathKind`] functions of the `UnaryMath` op and the binary
-//! `Fmod` op: their `f64` reference values and derivatives, the CUDA
-//! function each one lowers to, and the symbolic derivative rules, which are
-//! written with IR ops so that every derivative order is again an ordinary
-//! graph on every backend.
+//! The elementwise math functions: one [`UnaryMathKind`] per function of one
+//! operand (the `UnaryMath` op) and the binary `Fmod` op. Everything that
+//! defines one function lives here, so adding a function means adding a kind
+//! and answering the questions its exhaustive matches ask:
+//!
+//! - its name in IR text and errors, and its `f64` CPU reference (a
+//!   `float32` node rounds that result once);
+//! - its derivatives: the symbolic rule (`TensorIr::unary_math_chain`),
+//!   written with IR ops so that every derivative order is again an ordinary
+//!   graph on every backend and shared by the symbolic JVP and VJP, and the
+//!   numeric rules of the CPU evaluator's AD paths (`numeric_chain`,
+//!   `numeric_mixed`);
+//! - its CUDA spelling ([`UnaryMathKind::cuda_function`]) and which CUDA
+//!   paths admit it ([`UnaryMathKind::cuda_fusable`],
+//!   [`UnaryMathKind::cuda_loop_lowerable`]); the MLX lowering is the
+//!   exhaustive `mlx_unary_math` of the MLX backend;
+//! - its constant folding and its StableHLO spelling, if any.
 //!
 //! Values follow IEEE semantics and never raise: an input outside the domain
-//! of a function (`arcsin(2)`, `log2(-1)`, `arccosh(0.5)`) gives NaN, a pole
+//! of a function (`arcsin(2)`, `log(-1)`, `arccosh(0.5)`) gives NaN, a pole
 //! gives an infinity (`arctanh(1) == inf`, `log10(0) == -inf`), as in NumPy.
 
-use super::{TensorComparison, TensorIr, TensorNodeId, TensorOp};
+use super::{
+    erf_derivative, erf_second_derivative, DynamicTensor, MixedTangent, TensorComparison, TensorIr,
+    TensorNodeId, TensorOp,
+};
 
 /// An elementwise function of one operand, executed by the `UnaryMath` op.
 /// The kinds share one op because they share every rule except their value
@@ -17,6 +32,29 @@ use super::{TensorComparison, TensorIr, TensorNodeId, TensorOp};
 /// where MLX has one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnaryMathKind {
+    /// `exp(x)`; derivative `exp(x)`, the result itself.
+    Exp,
+    /// The natural logarithm; derivative `1 / x`. `log(0) == -inf`, and a
+    /// negative input gives NaN.
+    Log,
+    /// `ln(1 + x)`, accurate for small `|x|`; `-1` maps to `-inf` and
+    /// `x < -1` to NaN. Derivative `1 / (1 + x)`.
+    Log1p,
+    /// `exp(x) - 1`, accurate for small `|x|`; derivative `exp(x)`.
+    Expm1,
+    /// The error function (the f64 musl `erf` of the `libm` crate on the
+    /// CPU); derivative `2 / sqrt(pi) * exp(-x^2)`.
+    Erf,
+    /// The complementary error function `1 - erf(x)` (the f64 musl `erfc` of
+    /// the `libm` crate on the CPU), which keeps full relative accuracy where
+    /// `erf(x)` is close to one; derivative `-2 / sqrt(pi) * exp(-x^2)`.
+    Erfc,
+    /// `sin(x)`; derivative `cos(x)`.
+    Sin,
+    /// `cos(x)`; derivative `-sin(x)`.
+    Cos,
+    /// `tanh(x)`; derivative `1 - tanh(x)^2`, formed from the result.
+    Tanh,
     /// `tan(x)`; derivative `1 + tan(x)^2`, formed from the result.
     Tan,
     /// `arcsin(x)` on `[-1, 1]`; derivative `1 / sqrt((1 - x)(1 + x))`.
@@ -53,8 +91,33 @@ pub enum UnaryMathKind {
     Round,
 }
 
+/// How the symbolic derivative of a [`UnaryMathKind`] scales an incoming
+/// tangent or cotangent `s`; both the symbolic JVP and VJP apply it through
+/// `TensorIr::apply_unary_chain`.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum UnaryChain {
+    /// The derivative is zero everywhere: no expression is built.
+    Zero,
+    /// `s * d`.
+    Times(TensorNodeId),
+    /// `0 - s * d`: `cos` negates the product with `sin(x)`, not the factor.
+    NegatedTimes(TensorNodeId),
+    /// `s / d`: `log` divides by `x` and `log1p` by `1 + x` instead of
+    /// multiplying by a reciprocal.
+    Over(TensorNodeId),
+}
+
 impl UnaryMathKind {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 24] = [
+        Self::Exp,
+        Self::Log,
+        Self::Log1p,
+        Self::Expm1,
+        Self::Erf,
+        Self::Erfc,
+        Self::Sin,
+        Self::Cos,
+        Self::Tanh,
         Self::Tan,
         Self::Arcsin,
         Self::Arccos,
@@ -72,8 +135,18 @@ impl UnaryMathKind {
         Self::Round,
     ];
 
+    /// The name of the op in IR text and error messages.
     pub fn name(self) -> &'static str {
         match self {
+            Self::Exp => "exp",
+            Self::Log => "log",
+            Self::Log1p => "log1p",
+            Self::Expm1 => "expm1",
+            Self::Erf => "erf",
+            Self::Erfc => "erfc",
+            Self::Sin => "sin",
+            Self::Cos => "cos",
+            Self::Tanh => "tanh",
             Self::Tan => "tan",
             Self::Arcsin => "arcsin",
             Self::Arccos => "arccos",
@@ -93,12 +166,21 @@ impl UnaryMathKind {
     }
 
     /// The `f64` function, the CPU reference that a `float32` node rounds
-    /// once. The inverse hyperbolic functions use the musl implementations
-    /// of the `libm` crate: Rust std's `acosh` is `ln(x + sqrt(x^2 - 1))`,
-    /// which loses relative accuracy near `1`, where musl switches to
-    /// `log1p`.
+    /// once. The error functions and the inverse hyperbolic functions use
+    /// the musl implementations of the `libm` crate: Rust std has no `erf`,
+    /// and its `acosh` is `ln(x + sqrt(x^2 - 1))`, which loses relative
+    /// accuracy near `1`, where musl switches to `log1p`.
     pub(super) fn function(self) -> fn(f64) -> f64 {
         match self {
+            Self::Exp => f64::exp,
+            Self::Log => f64::ln,
+            Self::Log1p => f64::ln_1p,
+            Self::Expm1 => f64::exp_m1,
+            Self::Erf => libm::erf,
+            Self::Erfc => libm::erfc,
+            Self::Sin => f64::sin,
+            Self::Cos => f64::cos,
+            Self::Tanh => f64::tanh,
             Self::Tan => f64::tan,
             Self::Arcsin => f64::asin,
             Self::Arccos => f64::acos,
@@ -122,17 +204,39 @@ impl UnaryMathKind {
         self.function()(x)
     }
 
+    /// The value a plan folds a scalar constant operand `x` to, or `None` to
+    /// keep the node. `log` folds only positive operands, so a non-positive
+    /// constant logarithm stays in the plan as written; array constants fold
+    /// with [`Self::function`] for every kind.
+    pub(super) fn fold_scalar(self, x: f64) -> Option<f64> {
+        match self {
+            Self::Log => (x > 0.0).then(|| x.ln()),
+            _ => Some(self.evaluate(x)),
+        }
+    }
+
     /// Whether the function is piecewise constant, so that every derivative
     /// order is zero (and no derivative expression is built).
     pub(super) fn is_piecewise_constant(self) -> bool {
         matches!(self, Self::Floor | Self::Ceil | Self::Round)
     }
 
-    /// The first derivative at `x`, the numeric counterpart of the symbolic
-    /// rule `TensorIr::unary_math_derivative` (same formula and the same
-    /// conventions at poles, domain edges, and infinities).
-    pub(super) fn derivative(self, x: f64) -> f64 {
+    /// The first-derivative factor of the numeric (CPU evaluator) AD rules
+    /// at input `x` with value `value`: the numeric counterpart of the
+    /// symbolic rule [`TensorIr::unary_math_chain`] (same formula and the
+    /// same conventions at poles, domain edges, and infinities). `cos` gives
+    /// `sin(x)`, which [`Self::numeric_chain`] negates after the product.
+    pub(super) fn derivative(self, x: f64, value: f64) -> f64 {
         match self {
+            Self::Exp => value,
+            Self::Log => 1.0 / x,
+            Self::Log1p => 1.0 / (1.0 + x),
+            Self::Expm1 => x.exp(),
+            Self::Erf => erf_derivative(x),
+            Self::Erfc => -erf_derivative(x),
+            Self::Sin => x.cos(),
+            Self::Cos => x.sin(),
+            Self::Tanh => 1.0 - value * value,
             Self::Tan => {
                 let value = x.tan();
                 1.0 + value * value
@@ -155,10 +259,17 @@ impl UnaryMathKind {
         }
     }
 
-    /// The second derivative at `x`, the derivative of the symbolic first
-    /// derivative rule.
-    pub(super) fn second_derivative(self, x: f64) -> f64 {
+    /// The second derivative at input `x` with value `value`, the derivative
+    /// of the symbolic first derivative rule, for the kinds whose numeric
+    /// second-order rule is `m d + (f s) d2` (see [`Self::numeric_mixed`];
+    /// `exp`, `log`, `log1p`, `sin` and `cos` form theirs from the first
+    /// derivative and the value instead and never call this).
+    pub(super) fn second_derivative(self, x: f64, value: f64) -> f64 {
         match self {
+            Self::Expm1 => x.exp(),
+            Self::Erf => erf_second_derivative(x),
+            Self::Erfc => -erf_second_derivative(x),
+            Self::Tanh => -2.0 * value * (1.0 - value * value),
             // d/dx (1 + t^2) = 2 t (1 + t^2).
             Self::Tan => {
                 let value = x.tan();
@@ -166,12 +277,12 @@ impl UnaryMathKind {
             }
             // d/dx ((1 - x)(1 + x))^(-1/2) = x d^3.
             Self::Arcsin | Self::Arccos => {
-                let derivative = self.derivative(x);
+                let derivative = self.derivative(x, value);
                 x * derivative * derivative * derivative
             }
             // d/dx (1 + x^2)^(-1) = -2x d^2.
             Self::Arctan => {
-                let derivative = self.derivative(x);
+                let derivative = self.derivative(x, value);
                 -2.0 * x * derivative * derivative
             }
             Self::Sinh => x.sinh(),
@@ -187,12 +298,12 @@ impl UnaryMathKind {
                 -(x * derivative) * derivative * derivative
             }
             Self::Arccosh => {
-                let derivative = self.derivative(x);
+                let derivative = self.derivative(x, value);
                 -(x * derivative) * derivative * derivative
             }
             // d/dx ((1 - x)(1 + x))^(-1) = 2x d^2.
             Self::Arctanh => {
-                let derivative = self.derivative(x);
+                let derivative = self.derivative(x, value);
                 2.0 * x * derivative * derivative
             }
             Self::Log2 => -std::f64::consts::LOG2_E / (x * x),
@@ -203,16 +314,152 @@ impl UnaryMathKind {
                 let derivative = 1.0 / (3.0 * value * value);
                 -2.0 * derivative * derivative / value
             }
-            Self::Floor | Self::Ceil | Self::Round => 0.0,
+            Self::Exp
+            | Self::Log
+            | Self::Log1p
+            | Self::Sin
+            | Self::Cos
+            | Self::Floor
+            | Self::Ceil
+            | Self::Round => 0.0,
         }
     }
 
+    /// `seed` times the derivative at `input` (whose value is `value`), the
+    /// first-order rule of the numeric AD paths (`TensorIr::value_and_vjp_many`
+    /// and `TensorIr::jvp_many`); `None` where the derivative is zero
+    /// everywhere. `cos` negates the product `seed * sin(x)`, which differs
+    /// from multiplying by `-sin(x)` in the sign of a NaN.
+    pub(super) fn numeric_chain(
+        self,
+        seed: &DynamicTensor,
+        input: &DynamicTensor,
+        value: &DynamicTensor,
+    ) -> Result<Option<DynamicTensor>, String> {
+        if self.is_piecewise_constant() {
+            return Ok(None);
+        }
+        let derivative = input.elementwise(value, |x, value| self.derivative(x, value))?;
+        let product = seed.mul(&derivative)?;
+        Ok(Some(if self == Self::Cos {
+            product.neg()?
+        } else {
+            product
+        }))
+    }
+
+    /// The second-order forward rule of the mixed-dual evaluator: the value,
+    /// both first-order tangents and the mixed tangent of `kind(x)` from
+    /// those of `x` (`f`, `s`, `m` below), in `f64` without rounding. Most
+    /// kinds use `m d + (f s) d2`; `exp`, `sin`, `cos`, `log` and `log1p`
+    /// keep the forms they were introduced with, which round differently.
+    pub(super) fn numeric_mixed(
+        self,
+        input: &MixedTangent,
+        shape: &[usize],
+    ) -> Result<MixedTangent, String> {
+        let value = input.value.map_f64(self.function())?;
+        if self.is_piecewise_constant() {
+            let zero = DynamicTensor::filled(shape.to_vec(), 0.0)?;
+            return Ok(MixedTangent {
+                value,
+                first: zero.clone(),
+                second: zero.clone(),
+                mixed: zero,
+            });
+        }
+        let derivative = input
+            .value
+            .elementwise(&value, |x, value| self.derivative(x, value))?;
+        let first = input.first.mul(&derivative)?;
+        let second = input.second.mul(&derivative)?;
+        let product = input.first.mul(&input.second)?;
+        let (first, second, mixed) = match self {
+            // (m + f s) e^x.
+            Self::Exp => (first, second, input.mixed.add(&product)?.mul(&value)?),
+            // m cos(x) - (f s) sin(x).
+            Self::Sin => (
+                first,
+                second,
+                input.mixed.mul(&derivative)?.sub(&product.mul(&value)?)?,
+            ),
+            // -(m sin(x)) - (f s) cos(x), every first-order term negated
+            // after its product.
+            Self::Cos => (
+                first.neg()?,
+                second.neg()?,
+                input
+                    .mixed
+                    .mul(&derivative)?
+                    .neg()?
+                    .sub(&product.mul(&value)?)?,
+            ),
+            // m d - (f s) d^2 with d = 1 / x or 1 / (1 + x).
+            Self::Log | Self::Log1p => (
+                first,
+                second,
+                input
+                    .mixed
+                    .mul(&derivative)?
+                    .sub(&product.mul(&derivative.mul(&derivative)?)?)?,
+            ),
+            _ => {
+                let second_derivative = input
+                    .value
+                    .elementwise(&value, |x, value| self.second_derivative(x, value))?;
+                (
+                    first,
+                    second,
+                    input
+                        .mixed
+                        .mul(&derivative)?
+                        .add(&product.mul(&second_derivative)?)?,
+                )
+            }
+        };
+        Ok(MixedTangent {
+            value,
+            first,
+            second,
+            mixed,
+        })
+    }
+
+    /// Bounds on `|f'|` and `|f''|` over the inputs of a node whose largest
+    /// value magnitude is `magnitude`, for the kinds the finite symbolic
+    /// second-order route admits (`TensorIr::supports_finite_symbolic_second_order`);
+    /// `None` keeps every other kind on the mixed-dual route.
+    pub(super) fn second_order_bounds(self, magnitude: f64) -> Option<(f64, f64)> {
+        match self {
+            Self::Sin | Self::Cos => Some((1.0, 1.0)),
+            Self::Tanh => Some((1.0, 2.0)),
+            Self::Exp => Some((magnitude, magnitude)),
+            _ => None,
+        }
+    }
+
+    /// Whether the forward rule emits the derivative expression before the
+    /// value node. Only the node order of a JVP graph depends on it; it is
+    /// kept per kind so that lowered JVP programs keep their numbering.
+    pub(super) fn jvp_emits_derivative_first(self) -> bool {
+        matches!(self, Self::Log1p | Self::Expm1 | Self::Erf | Self::Erfc)
+    }
+
     /// The single-precision CUDA math function; `double_precision_source`
-    /// rewrites each to its double overload (`tanf` -> `tan`). `rintf`
-    /// rounds halfway cases to even in the default rounding mode, whereas
-    /// `roundf` rounds them away from zero.
+    /// rewrites each to its double overload (`tanf` -> `tan`) for
+    /// `precision="float64"`. `rintf` rounds halfway cases to even in the
+    /// default rounding mode, whereas `roundf` rounds them away from zero.
     pub(super) fn cuda_function(self) -> &'static str {
         match self {
+            Self::Exp => "expf",
+            Self::Log => "logf",
+            Self::Log1p => "log1pf",
+            Self::Expm1 => "expm1f",
+            Self::Erf => "erff",
+            Self::Erfc => "erfcf",
+            Self::Sin => "sinf",
+            Self::Cos => "cosf",
+            Self::Tanh => "tanhf",
             Self::Tan => "tanf",
             Self::Arcsin => "asinf",
             Self::Arccos => "acosf",
@@ -228,6 +475,35 @@ impl UnaryMathKind {
             Self::Floor => "floorf",
             Self::Ceil => "ceilf",
             Self::Round => "rintf",
+        }
+    }
+
+    /// Whether whole-plan and region fusion inline the kind into one CUDA
+    /// elementwise kernel (`is_fusable_elementwise_compute_op`). `log`,
+    /// `log1p`, `expm1`, `erf` and `erfc` are not admitted yet: each runs as
+    /// its own per-node kernel, and admitting one changes which neighbouring
+    /// operations share a kernel (and so may contract into an FMA).
+    pub(super) fn cuda_fusable(self) -> bool {
+        !matches!(
+            self,
+            Self::Log | Self::Log1p | Self::Expm1 | Self::Erf | Self::Erfc
+        )
+    }
+
+    /// Whether a fused CUDA `fori`/`scan` body may contain the kind
+    /// (`cuda_fori_body_is_lowerable`, `cuda_scan_body_is_lowerable`).
+    /// `erfc` is not admitted yet: a loop whose body uses it runs as a
+    /// host-driven region loop of per-node kernels instead.
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    pub(super) fn cuda_loop_lowerable(self) -> bool {
+        self != Self::Erfc
+    }
+
+    /// The StableHLO operation of the kind, for those the export verifies.
+    pub(super) fn stablehlo_name(self) -> Option<&'static str> {
+        match self {
+            Self::Tanh => Some("stablehlo.tanh"),
+            _ => None,
         }
     }
 }
@@ -288,10 +564,102 @@ impl TensorIr {
         self.binary("fmod", x, y, |x, y| TensorOp::Fmod { x, y })
     }
 
-    /// The symbolic first derivative of `kind` at `input`, whose value
-    /// `kind(input)` is the node `value`; `None` for the piecewise-constant
-    /// kinds, whose derivative is zero.
-    pub(super) fn unary_math_derivative(
+    /// The symbolic derivative of `kind` at `input` as the scaling it applies
+    /// to an incoming tangent or cotangent (see [`UnaryChain`]), shared by
+    /// the symbolic JVP and VJP. `value` is the node `kind(input)`; only the
+    /// kinds whose derivative is formed from the result (`exp`, `tanh`,
+    /// `tan`, `cbrt`) need it, and the forward rule of the kinds that emit
+    /// their derivative first ([`UnaryMathKind::jvp_emits_derivative_first`])
+    /// passes `None`.
+    pub(super) fn unary_math_chain(
+        &mut self,
+        kind: UnaryMathKind,
+        input: TensorNodeId,
+        value: Option<TensorNodeId>,
+    ) -> Result<UnaryChain, String> {
+        let value = || {
+            value.ok_or_else(|| format!("the {} derivative is formed from its value", kind.name()))
+        };
+        Ok(match kind {
+            UnaryMathKind::Exp => UnaryChain::Times(value()?),
+            UnaryMathKind::Tanh => {
+                let value = value()?;
+                let one = self.scalar_constant(1.0);
+                let squared = self.mul(value, value)?;
+                UnaryChain::Times(self.sub(one, squared)?)
+            }
+            UnaryMathKind::Sin => UnaryChain::Times(self.unary_math(input, UnaryMathKind::Cos)?),
+            UnaryMathKind::Cos => {
+                UnaryChain::NegatedTimes(self.unary_math(input, UnaryMathKind::Sin)?)
+            }
+            UnaryMathKind::Log => UnaryChain::Over(input),
+            UnaryMathKind::Log1p => {
+                let one = self.scalar_constant(1.0);
+                UnaryChain::Over(self.add(one, input)?)
+            }
+            UnaryMathKind::Expm1 => UnaryChain::Times(self.unary_math(input, UnaryMathKind::Exp)?),
+            UnaryMathKind::Erf => UnaryChain::Times(self.erf_derivative(input, 1.0)?),
+            UnaryMathKind::Erfc => UnaryChain::Times(self.erf_derivative(input, -1.0)?),
+            _ => match self.unary_math_derivative(kind, input, value()?)? {
+                Some(derivative) => UnaryChain::Times(derivative),
+                None => UnaryChain::Zero,
+            },
+        })
+    }
+
+    /// `seed` scaled by `chain`; `None` for a zero derivative.
+    pub(super) fn apply_unary_chain(
+        &mut self,
+        chain: UnaryChain,
+        seed: TensorNodeId,
+    ) -> Result<Option<TensorNodeId>, String> {
+        Ok(match chain {
+            UnaryChain::Zero => None,
+            UnaryChain::Times(derivative) => Some(self.mul(seed, derivative)?),
+            UnaryChain::NegatedTimes(derivative) => {
+                let product = self.mul(seed, derivative)?;
+                let zero = self.scalar_constant(0.0);
+                Some(self.sub(zero, product)?)
+            }
+            UnaryChain::Over(divisor) => Some(self.div(seed, divisor)?),
+        })
+    }
+
+    /// The forward rule of `kind`: the value `kind(input)` and its tangent
+    /// for the input tangent `tangent`, `None` where the derivative is zero.
+    pub(super) fn unary_math_jvp(
+        &mut self,
+        kind: UnaryMathKind,
+        input: TensorNodeId,
+        tangent: TensorNodeId,
+    ) -> Result<(TensorNodeId, Option<TensorNodeId>), String> {
+        let (value, chain) = if kind.jvp_emits_derivative_first() {
+            let chain = self.unary_math_chain(kind, input, None)?;
+            (self.unary_math(input, kind)?, chain)
+        } else {
+            let value = self.unary_math(input, kind)?;
+            (value, self.unary_math_chain(kind, input, Some(value))?)
+        };
+        Ok((value, self.apply_unary_chain(chain, tangent)?))
+    }
+
+    /// Symbolic `sign * 2 / sqrt(pi) * exp(-(x * x))`: `erf'` for `sign = 1`
+    /// and `erfc'` for `sign = -1`.
+    fn erf_derivative(&mut self, input: TensorNodeId, sign: f64) -> Result<TensorNodeId, String> {
+        let squared = self.mul(input, input)?;
+        let zero = self.scalar_constant(0.0);
+        let negated = self.sub(zero, squared)?;
+        let decay = self.unary_math(negated, UnaryMathKind::Exp)?;
+        let scale = self.scalar_constant(sign * std::f64::consts::FRAC_2_SQRT_PI);
+        self.mul(scale, decay)
+    }
+
+    /// The symbolic first derivative of the inverse trigonometric and
+    /// hyperbolic kinds, `tan`, `log2`, `log10`, `cbrt` and the piecewise
+    /// constant kinds at `input`, whose value `kind(input)` is the node
+    /// `value`; `None` for the piecewise-constant kinds, whose derivative is
+    /// zero.
+    fn unary_math_derivative(
         &mut self,
         kind: UnaryMathKind,
         input: TensorNodeId,
@@ -300,6 +668,20 @@ impl TensorIr {
         let one = self.scalar_constant(1.0);
         let derivative = match kind {
             UnaryMathKind::Floor | UnaryMathKind::Ceil | UnaryMathKind::Round => return Ok(None),
+            UnaryMathKind::Exp
+            | UnaryMathKind::Log
+            | UnaryMathKind::Log1p
+            | UnaryMathKind::Expm1
+            | UnaryMathKind::Erf
+            | UnaryMathKind::Erfc
+            | UnaryMathKind::Sin
+            | UnaryMathKind::Cos
+            | UnaryMathKind::Tanh => {
+                return Err(format!(
+                    "the {} derivative is built by unary_math_chain",
+                    kind.name()
+                ))
+            }
             UnaryMathKind::Tan => {
                 let squared = self.mul(value, value)?;
                 self.add(one, squared)?

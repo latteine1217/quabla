@@ -1668,33 +1668,31 @@ impl PyTensor {
     }
 
     pub fn try_tanh(&self) -> Result<Self, String> {
-        self.try_unary("tanh", f64::tanh)
+        self.try_unary_math(UnaryMathKind::Tanh)
     }
 
     pub fn try_exp(&self) -> Result<Self, String> {
-        self.try_unary("exp", f64::exp)
+        self.try_unary_math(UnaryMathKind::Exp)
     }
 
     pub fn try_log(&self) -> Result<Self, String> {
-        self.try_unary("log", f64::ln)
+        self.try_unary_math(UnaryMathKind::Log)
     }
 
     pub fn try_log1p(&self) -> Result<Self, String> {
-        self.try_unary("log1p", f64::ln_1p)
+        self.try_unary_math(UnaryMathKind::Log1p)
     }
 
     pub fn try_expm1(&self) -> Result<Self, String> {
-        self.try_unary("expm1", f64::exp_m1)
+        self.try_unary_math(UnaryMathKind::Expm1)
     }
 
-    /// The f64 musl `erf` of the `libm` crate, as the CPU Tensor IR uses.
     pub fn try_erf(&self) -> Result<Self, String> {
-        self.try_unary("erf", libm::erf)
+        self.try_unary_math(UnaryMathKind::Erf)
     }
 
-    /// The f64 musl `erfc` of the `libm` crate, as the CPU Tensor IR uses.
     pub fn try_erfc(&self) -> Result<Self, String> {
-        self.try_unary("erfc", libm::erfc)
+        self.try_unary_math(UnaryMathKind::Erfc)
     }
 
     /// Elementwise `atan2(self, x)` with broadcasting and the dtype promotion
@@ -1872,11 +1870,11 @@ impl PyTensor {
     }
 
     pub fn try_sin(&self) -> Result<Self, String> {
-        self.try_unary("sin", f64::sin)
+        self.try_unary_math(UnaryMathKind::Sin)
     }
 
     pub fn try_cos(&self) -> Result<Self, String> {
-        self.try_unary("cos", f64::cos)
+        self.try_unary_math(UnaryMathKind::Cos)
     }
 
     pub fn try_powi(&self, exponent: u32) -> Result<Self, String> {

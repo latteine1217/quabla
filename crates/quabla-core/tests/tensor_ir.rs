@@ -12783,9 +12783,19 @@ fn atan2_derivatives_avoid_overflow_and_vanish_at_the_origin() {
 }
 
 /// The f64 function each `UnaryMathKind` must evaluate: Rust std, and the
-/// musl ports of the `libm` crate for the inverse hyperbolic functions.
+/// musl ports of the `libm` crate for the error functions and the inverse
+/// hyperbolic functions.
 fn unary_math_reference(kind: UnaryMathKind) -> fn(f64) -> f64 {
     match kind {
+        UnaryMathKind::Exp => f64::exp,
+        UnaryMathKind::Log => f64::ln,
+        UnaryMathKind::Log1p => f64::ln_1p,
+        UnaryMathKind::Expm1 => f64::exp_m1,
+        UnaryMathKind::Erf => libm::erf,
+        UnaryMathKind::Erfc => libm::erfc,
+        UnaryMathKind::Sin => f64::sin,
+        UnaryMathKind::Cos => f64::cos,
+        UnaryMathKind::Tanh => f64::tanh,
         UnaryMathKind::Tan => f64::tan,
         UnaryMathKind::Arcsin => f64::asin,
         UnaryMathKind::Arccos => f64::acos,
@@ -12908,7 +12918,17 @@ fn unary_math_and_fmod_values_follow_the_f64_reference() {
     // inside the others'.
     let shifted = must!(fused.add(x, one));
     let mut total = x;
-    for kind in UnaryMathKind::ALL {
+    // Every kind except those whole-plan fusion does not admit yet.
+    for kind in UnaryMathKind::ALL.into_iter().filter(|kind| {
+        !matches!(
+            kind,
+            UnaryMathKind::Log
+                | UnaryMathKind::Log1p
+                | UnaryMathKind::Expm1
+                | UnaryMathKind::Erf
+                | UnaryMathKind::Erfc
+        )
+    }) {
         let operand = if kind == UnaryMathKind::Arccosh {
             shifted
         } else {
@@ -12927,8 +12947,9 @@ fn unary_math_and_fmod_values_follow_the_f64_reference() {
     assert_eq!(value, must!(fused.evaluate(output, &inputs)));
     let source = must!(plan.cuda_source());
     for function in [
-        "tanf(", "asinf(", "acosf(", "atanf(", "sinhf(", "coshf(", "asinhf(", "acoshf(", "atanhf(",
-        "log2f(", "log10f(", "cbrtf(", "floorf(", "ceilf(", "rintf(", "fmodf(",
+        "expf(", "sinf(", "cosf(", "tanhf(", "tanf(", "asinf(", "acosf(", "atanf(", "sinhf(",
+        "coshf(", "asinhf(", "acoshf(", "atanhf(", "log2f(", "log10f(", "cbrtf(", "floorf(",
+        "ceilf(", "rintf(", "fmodf(",
     ] {
         assert!(
             source.contains(function),

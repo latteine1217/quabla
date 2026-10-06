@@ -9,6 +9,23 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Changed
+
+- The elementwise math functions of one operand (`exp`, `log`, `log1p`,
+  `expm1`, `erf`, `erfc`, `sin`, `cos`, `tanh`, and the `tan` ... `round`
+  family) are one IR op whose kind owns every rule of a function in one
+  place (`tensor_ir/elementwise.rs`): its value, derivative rules, CUDA
+  spelling and admission, MLX lowering, and constant folding. Values,
+  derivatives, IR text, and compiled kernels are unchanged.
+
+### Fixed
+
+- Host-driven CUDA loops whose bodies use `tan`, the inverse trigonometric
+  and hyperbolic functions, `sinh`, `cosh`, `log2`, `log10`, `cbrt`,
+  `floor`, `ceil`, or `round` replay their iterations as CUDA graphs like
+  every other elementwise body, instead of launching each kernel from the
+  host; results are bit-identical.
+
 ## [0.5.0] - 2026-10-06
 
 The v0.5 plan in `docs/jax_like_roadmap.md`: `vmap` batches `cond`,
