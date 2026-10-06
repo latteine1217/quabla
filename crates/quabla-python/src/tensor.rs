@@ -2410,12 +2410,26 @@ impl PyTensor {
                 ));
             }
         }
+        use quabla_core::tensor_ir::{AdamCoefficients, AdamOrder, F64Arith};
+
         let (learning_rate, b1, b2, eps, correction1, correction2) = hyperparameters;
         if correction1 == 0.0 || correction2 == 0.0 {
             return Err(PyValueError::new_err(
                 "division by zero scalar is not supported",
             ));
         }
+        // The shared canonical rule in float64; the corrections are the
+        // caller's (Python's `1 - b ** t`), `1 - beta` is formed in float64.
+        let coefficients = AdamCoefficients::with_corrections(
+            learning_rate,
+            b1,
+            b2,
+            eps,
+            correction1,
+            correction2,
+            weight_decay,
+        );
+        let mut arith = F64Arith::default();
         let mut parameters = Vec::with_capacity(self.data.len());
         let mut moments = Vec::with_capacity(self.data.len());
         let mut variances = Vec::with_capacity(self.data.len());
@@ -2426,19 +2440,22 @@ impl PyTensor {
             .zip(first.data.iter())
             .zip(second.data.iter())
         {
-            let m = m * b1 + gradient * (1.0 - b1);
-            let v = v * b2 + (gradient * gradient) * (1.0 - b2);
-            let denominator = (v / correction2).sqrt() + eps;
-            if denominator == 0.0 {
+            let (parameter, m, v) = arith.adam(
+                AdamOrder::Canonical,
+                &coefficients,
+                parameter,
+                gradient,
+                m,
+                v,
+            );
+            // The corrections are nonzero, so a zero divisor is a zero
+            // denominator `sqrt(v / c2) + eps`.
+            if arith.zero_divisor {
                 return Err(PyValueError::new_err(
                     "failed to evaluate tensor /: division by zero is not supported",
                 ));
             }
-            let mut delta = (m / correction1) / denominator;
-            if weight_decay != 0.0 {
-                delta += weight_decay * parameter;
-            }
-            parameters.push(self.dtype.round(parameter - delta * learning_rate));
+            parameters.push(self.dtype.round(parameter));
             moments.push(m);
             variances.push(v);
         }

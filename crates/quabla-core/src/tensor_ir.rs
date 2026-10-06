@@ -11,7 +11,10 @@ pub use linalg::{evaluate_eager as evaluate_linalg, LinalgKind};
 mod custom;
 pub use custom::{TensorCustomRule, TensorCustomTangent};
 mod device_optimizer;
-pub use device_optimizer::{DeviceOptimizerConfig, DeviceUpdateRule};
+pub use device_optimizer::{
+    adam_element, sgd_element, AdamArith, AdamCoefficients, AdamOrder, AdamUpdate,
+    DeviceOptimizerConfig, DeviceUpdateRule, F64Arith,
+};
 mod elementwise;
 pub use elementwise::UnaryMathKind;
 mod extremum;

@@ -17,9 +17,10 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
-    sqrt_derivative_coefficient, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor,
-    TensorBackend, TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend,
-    TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
+    adam_element, sgd_element, sqrt_derivative_coefficient, AdamArith, AdamCoefficients, AdamOrder,
+    DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, TensorBackend, TensorComparison,
+    TensorConstant, TensorDType, TensorDeviceBackend, TensorExecutionPlan, TensorExtremum,
+    TensorForiExecutionPlan, TensorOp, UnaryMathKind,
 };
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
@@ -317,6 +318,7 @@ impl MlxAdamPlan {
                     .map_err(|error| format!("MLX gradient clipping failed: {error}"))?,
                 None => gradient,
             };
+            let mut arith = MlxArith { stream: &stream };
             let DeviceUpdateRule::Adam {
                 beta1,
                 beta2,
@@ -324,10 +326,9 @@ impl MlxAdamPlan {
                 weight_decay,
             } = self.config.rule
             else {
-                let updated_parameter = gradient
-                    .multiply_device(&learning_rate, &stream)
-                    .and_then(|step| parameter.subtract_device(&step, &stream))
-                    .map_err(|error| format!("MLX SGD parameter update failed: {error}"))?;
+                let updated_parameter =
+                    sgd_element(&mut arith, &learning_rate, &parameter, &gradient)
+                        .map_err(|error| format!("MLX SGD parameter update failed: {error}"))?;
                 self.retained_inputs
                     .values
                     .insert(parameter_name.clone(), updated_parameter);
@@ -358,68 +359,27 @@ impl MlxAdamPlan {
                 .step
                 .checked_add(1)
                 .ok_or_else(|| "MLX Adam step counter overflow".to_string())?;
-            // `1 - beta` and the bias corrections are formed from the float64
-            // betas and rounded once, as the host computes them; `1 - beta2`
-            // of the float32-rounded 0.999 is 1.3e-5 relative off.
-            let (correction1, correction2) =
-                DeviceOptimizerConfig::adam_corrections(beta1, beta2, state.step);
-            let correction1 = Array::from_f32(correction1 as f32);
-            let correction2 = Array::from_f32(correction2 as f32);
-            let one_minus_beta1 = Array::from_f32((1.0 - beta1) as f32);
-            let one_minus_beta2 = Array::from_f32((1.0 - beta2) as f32);
-            let (beta1, beta2, epsilon, weight_decay) = (
-                beta1 as f32,
-                beta2 as f32,
-                epsilon as f32,
-                weight_decay as f32,
-            );
-            let first_moment = state
-                .first_moment
-                .multiply_device(Array::from_f32(beta1), &stream)
-                .and_then(|value| {
-                    gradient
-                        .multiply_device(&one_minus_beta1, &stream)
-                        .and_then(|scaled_gradient| value.add_device(&scaled_gradient, &stream))
-                })
-                .map_err(|error| format!("MLX Adam first moment update failed: {error}"))?;
-            let second_moment = state
-                .second_moment
-                .multiply_device(Array::from_f32(beta2), &stream)
-                .and_then(|value| {
-                    gradient
-                        .multiply_device(&gradient, &stream)
-                        .and_then(|squared_gradient| {
-                            squared_gradient.multiply_device(&one_minus_beta2, &stream)
-                        })
-                        .and_then(|scaled_gradient| value.add_device(&scaled_gradient, &stream))
-                })
-                .map_err(|error| format!("MLX Adam second moment update failed: {error}"))?;
-            let direction = first_moment
-                .divide_device(&correction1, &stream)
-                .and_then(|first| {
-                    second_moment
-                        .divide_device(&correction2, &stream)
-                        .and_then(|second| second.sqrt_device(&stream))
-                        .and_then(|denominator| {
-                            denominator.add_device(Array::from_f32(epsilon), &stream)
-                        })
-                        .and_then(|denominator| first.divide_device(&denominator, &stream))
-                })
-                .map_err(|error| format!("MLX Adam update failed: {error}"))?;
-            // AdamW's decoupled decay with the pre-update parameter; zero keeps
-            // the Adam expression exactly, as `0 * inf` would introduce a NaN.
-            let direction = if weight_decay != 0.0 {
-                parameter
-                    .multiply_device(Array::from_f32(weight_decay), &stream)
-                    .and_then(|decay| direction.add_device(&decay, &stream))
-                    .map_err(|error| format!("MLX AdamW decay failed: {error}"))?
-            } else {
-                direction
-            };
-            let updated_parameter = direction
-                .multiply_device(&learning_rate, &stream)
-                .and_then(|update| parameter.subtract_device(&update, &stream))
-                .map_err(|error| format!("MLX Adam parameter update failed: {error}"))?;
+            // The coefficients are formed in float64, as the host forms them,
+            // and rounded once to float32 scalars.
+            let coefficients = AdamCoefficients::new(
+                self.config.learning_rate,
+                beta1,
+                beta2,
+                epsilon,
+                weight_decay,
+                state.step,
+            )
+            .map(|value| Array::from_f32(value as f32));
+            let (updated_parameter, first_moment, second_moment) = adam_element(
+                &mut arith,
+                AdamOrder::Canonical,
+                &coefficients,
+                &parameter,
+                &gradient,
+                &state.first_moment,
+                &state.second_moment,
+            )
+            .map_err(|error| format!("MLX Adam update failed: {error}"))?;
             state.first_moment = first_moment;
             state.second_moment = second_moment;
             self.retained_inputs
@@ -476,6 +436,50 @@ impl MlxAdamPlan {
                 *dtype,
             ),
         )
+    }
+}
+
+/// MLX arithmetic of the shared optimizer rules: each operation is one lazy
+/// float32 array operation on `stream`, so a step stays one device graph.
+/// Coefficients are float32 scalar arrays.
+struct MlxArith<'a> {
+    stream: &'a StreamOrDevice,
+}
+
+impl AdamArith for MlxArith<'_> {
+    type Value = Array;
+    type Error = mlx_rs::error::Exception;
+
+    fn constant(&mut self, value: f64) -> Result<Array, Self::Error> {
+        Ok(Array::from_f32(value as f32))
+    }
+    fn add(&mut self, lhs: &Array, rhs: &Array) -> Result<Array, Self::Error> {
+        lhs.add_device(rhs, self.stream)
+    }
+    fn sub(&mut self, lhs: &Array, rhs: &Array) -> Result<Array, Self::Error> {
+        lhs.subtract_device(rhs, self.stream)
+    }
+    fn mul(&mut self, lhs: &Array, rhs: &Array) -> Result<Array, Self::Error> {
+        lhs.multiply_device(rhs, self.stream)
+    }
+    fn div(&mut self, lhs: &Array, rhs: &Array) -> Result<Array, Self::Error> {
+        lhs.divide_device(rhs, self.stream)
+    }
+    fn sqrt(&mut self, value: &Array) -> Result<Array, Self::Error> {
+        value.sqrt_device(self.stream)
+    }
+    fn if_nonzero(
+        &mut self,
+        flag: &Array,
+        value: Array,
+        update: impl FnOnce(&mut Self, &Array) -> Result<Array, Self::Error>,
+    ) -> Result<Array, Self::Error> {
+        // The flag is a host coefficient array; reading it evaluates no graph.
+        if flag.try_item::<f32>()? != 0.0 {
+            update(self, &value)
+        } else {
+            Ok(value)
+        }
     }
 }
 
