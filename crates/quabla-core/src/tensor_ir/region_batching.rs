@@ -465,17 +465,21 @@ impl TensorIr {
                     Ok(members)
                 },
             ),
-            TensorOp::ForiVjpJvp {
-                carry,
-                carry_tangent,
-                output_cotangent,
-                output_cotangent_tangent,
-                plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ForiVjpJvp {
+                        carry,
+                        carry_tangent,
+                        output_cotangent,
+                        output_cotangent_tangent,
+                        plan,
+                        target,
+                        group,
+                    },
                 captures,
                 tangent_captures,
-                target,
-                group,
-            } => self.batched_group_member(
+                ..
+            }) => self.batched_group_member(
                 groups,
                 ("fori_vjp_jvp", *group),
                 fori_target(target),

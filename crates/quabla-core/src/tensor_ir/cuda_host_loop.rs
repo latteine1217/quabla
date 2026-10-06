@@ -420,7 +420,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
                 vec![body.clone(), reverse],
             ))
         }
-        TensorOp::ForiVjpJvp { plan, .. } => {
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::ForiVjpJvp { plan, .. },
+            ..
+        }) => {
             let loop_plan = &plan.loop_plan;
             let body = &loop_plan.body.plan;
             let mut forward_tangents = plan.tangent_names.clone();
@@ -809,15 +812,19 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 reverse_tangents,
                 reverse,
             } => {
-                let TensorOp::ForiVjpJvp {
-                    carry,
-                    carry_tangent,
-                    output_cotangent,
-                    output_cotangent_tangent,
+                let TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiVjpJvp {
+                            carry,
+                            carry_tangent,
+                            output_cotangent,
+                            output_cotangent_tangent,
+                            plan: hvp,
+                            ..
+                        },
                     tangent_captures,
-                    plan: hvp,
                     ..
-                } = op
+                }) = op
                 else {
                     return Err(mismatch(node_id));
                 };
@@ -1175,7 +1182,10 @@ fn fori_vjp_results<T: CudaReal>(
                     kind: RegionKind::ForiVjp { target, .. },
                     ..
                 })
-                | TensorOp::ForiVjpJvp { target, .. } => target,
+                | TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjpJvp { target, .. },
+                    ..
+                }) => target,
                 _ => return Err(mismatch(*member)),
             };
             let name = match target {

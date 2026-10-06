@@ -612,20 +612,6 @@ enum TensorOp {
         on_true: TensorNodeId,
         on_false: TensorNodeId,
     },
-    /// One selected directional derivative of a shared fixed-bound `Fori`
-    /// reverse pass. This is the structural forward-over-reverse rule used by
-    /// compiled HVP and Hessian transforms.
-    ForiVjpJvp {
-        carry: TensorNodeId,
-        carry_tangent: TensorNodeId,
-        output_cotangent: TensorNodeId,
-        output_cotangent_tangent: TensorNodeId,
-        plan: TensorForiVjpJvpExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-        tangent_captures: Vec<(String, TensorNodeId)>,
-        target: TensorForiVjpTarget,
-        group: usize,
-    },
     /// One selected directional derivative of a shared fixed-bound `Scan`
     /// reverse pass. Both the final-carry and stacked-output cotangents are
     /// differentiated together, preserving the joint reverse semantics.
@@ -3297,7 +3283,10 @@ impl TensorIr {
                 kind: RegionKind::ForiVjp { .. },
                 ..
             })
-            | TensorOp::ForiVjpJvp { .. }
+            | TensorOp::Region(RegionNode {
+                kind: RegionKind::ForiVjpJvp { .. },
+                ..
+            })
             | TensorOp::Region(RegionNode {
                 kind: RegionKind::Scan { .. },
                 ..
@@ -3744,7 +3733,10 @@ impl TensorIr {
                     &mut fori_vjp_jvp_groups,
                     &format!("__quabla_fori_vjp_jvp_{node_index}"),
                 )?,
-                TensorOp::ForiVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjpJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic JVP through a Fori VJP JVP result is not implemented".to_string(),
                     );
@@ -4292,7 +4284,10 @@ impl TensorIr {
                         "symbolic VJP through a Fori JVP result is not implemented".to_string()
                     );
                 }
-                TensorOp::ForiVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjpJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Fori VJP JVP result is not implemented".to_string(),
                     );
@@ -4572,7 +4567,10 @@ impl TensorIr {
                         "symbolic VJP through a Fori JVP result is not implemented".to_string()
                     );
                 }
-                TensorOp::ForiVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjpJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Fori VJP JVP result is not implemented".to_string(),
                     );
@@ -6036,17 +6034,19 @@ impl TensorIr {
             TensorForiVjpTarget::External(name) => name,
         })?;
         Ok(self.push_node(
-            TensorOp::ForiVjpJvp {
-                carry,
-                carry_tangent,
-                output_cotangent,
-                output_cotangent_tangent,
-                plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::ForiVjpJvp {
+                    carry,
+                    carry_tangent,
+                    output_cotangent,
+                    output_cotangent_tangent,
+                    plan,
+                    target,
+                    group,
+                },
                 captures,
                 tangent_captures,
-                target,
-                group,
-            },
+            }),
             shape,
             dtype,
             false,
@@ -7864,7 +7864,10 @@ impl TensorIr {
                         "direct VJP through a Fori JVP result is not implemented".to_string()
                     )
                 }
-                TensorOp::ForiVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjpJvp { .. },
+                    ..
+                }) => {
                     return Err(
                         "direct VJP through a Fori VJP JVP result is not implemented".to_string(),
                     )
@@ -8561,7 +8564,10 @@ impl TensorIr {
                     kind: RegionKind::ForiJvp { .. },
                     ..
                 }) => return Err("JVP through a Fori JVP result is not implemented".to_string()),
-                TensorOp::ForiVjpJvp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ForiVjpJvp { .. },
+                    ..
+                }) => {
                     return Err("JVP through a Fori VJP JVP result is not implemented".to_string())
                 }
                 TensorOp::Region(RegionNode {
@@ -9316,7 +9322,7 @@ impl TensorIr {
                     "%{id} = fori_vjp(group={group}, target={target:?}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::ForiVjpJvp { target, group, .. } => format!(
+                TensorOp::Region(RegionNode { kind: RegionKind::ForiVjpJvp { target, group, .. }, .. }) => format!(
                     "%{id} = fori_vjp_jvp(group={group}, target={target:?}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
@@ -10014,17 +10020,21 @@ impl TensorIr {
                             .ok_or_else(|| format!("fori VJP has no gradient for {name:?}"))?,
                     }
                 }
-                TensorOp::ForiVjpJvp {
-                    carry,
-                    carry_tangent,
-                    output_cotangent,
-                    output_cotangent_tangent,
-                    plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiVjpJvp {
+                            carry,
+                            carry_tangent,
+                            output_cotangent,
+                            output_cotangent_tangent,
+                            plan,
+                            target,
+                            group,
+                        },
                     captures,
                     tangent_captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !fori_vjp_jvp_cache.contains_key(group) {
                         let external_inputs = tensor_forward_capture_values(captures, &values)?;
                         let external_tangents =
@@ -10909,7 +10919,7 @@ impl TensorIr {
                 TensorOp::Region(RegionNode { kind: RegionKind::ForiJvp { .. }, .. }) => return Err(
                     "mixed differentiation through Fori JVP results is not implemented".to_string(),
                 ),
-                TensorOp::ForiVjpJvp { .. } => return Err(
+                TensorOp::Region(RegionNode { kind: RegionKind::ForiVjpJvp { .. }, .. }) => return Err(
                     "mixed differentiation through Fori VJP JVP results is not implemented"
                         .to_string(),
                 ),

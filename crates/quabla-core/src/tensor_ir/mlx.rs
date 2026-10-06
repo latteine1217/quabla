@@ -915,17 +915,21 @@ impl MlxBackend {
                             .ok_or_else(|| format!("MLX Fori VJP has no gradient for {name:?}")),
                     }
                 }
-                TensorOp::ForiVjpJvp {
-                    carry,
-                    carry_tangent,
-                    output_cotangent,
-                    output_cotangent_tangent,
-                    plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiVjpJvp {
+                            carry,
+                            carry_tangent,
+                            output_cotangent,
+                            output_cotangent_tangent,
+                            plan,
+                            target,
+                            group,
+                        },
                     captures,
                     tangent_captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !fori_vjp_jvp_cache.contains_key(group) {
                         let captures = captures
                             .iter()

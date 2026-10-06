@@ -923,7 +923,10 @@ pub(super) fn cuda_fused_loop_lowering(op: &TensorOp) -> Option<Result<(), Strin
             },
             ..
         }) => cuda_fori_vjp_plan(loop_plan, target).map(|_| ()),
-        TensorOp::ForiVjpJvp { plan, .. } => cuda_fori_vjp_jvp_is_lowerable(plan),
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::ForiVjpJvp { plan, .. },
+            ..
+        }) => cuda_fori_vjp_jvp_is_lowerable(plan),
         TensorOp::Region(RegionNode {
             kind: RegionKind::Scan { scan_plan, .. },
             ..
@@ -2484,16 +2487,20 @@ fn execute_cuda_device_program<T: CudaReal>(
                 )?;
                 continue;
             }
-            TensorOp::ForiVjpJvp {
-                carry,
-                carry_tangent,
-                output_cotangent,
-                output_cotangent_tangent,
-                plan: fori_plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ForiVjpJvp {
+                        carry,
+                        carry_tangent,
+                        output_cotangent,
+                        output_cotangent_tangent,
+                        plan: fori_plan,
+                        ..
+                    },
                 captures,
                 tangent_captures,
                 ..
-            } => {
+            }) => {
                 let (before, current_and_after) = values.split_at_mut(node_id);
                 let slot = current_and_after.first_mut().ok_or_else(|| {
                     format!("CUDA Fori VJP JVP node {node_id} is missing its buffer slot")
@@ -7914,12 +7921,7 @@ fn cuda_program_source(
                     cuda_fori_vjp_group_kernel_source(node_id, loop_plan, captures, &targets)?
                 }
             }
-            TensorOp::ForiVjpJvp {
-                plan,
-                captures,
-                target,
-                ..
-            } => cuda_fori_vjp_jvp_node_kernel_source(node_id, plan, captures, target)?,
+            TensorOp::Region(RegionNode { kind: RegionKind::ForiVjpJvp { plan, target, .. }, captures, .. }) => cuda_fori_vjp_jvp_node_kernel_source(node_id, plan, captures, target)?,
             TensorOp::Region(RegionNode { kind: RegionKind::Scan { scan_plan, .. }, captures, .. }) => cuda_scan_node_kernel_source(node_id, scan_plan, captures)?,
             TensorOp::Region(RegionNode { kind: RegionKind::ScanVjp { scan_plan, group, .. }, captures, .. }) => {
                 let members = cuda_scan_vjp_group(plan, *group)?;
@@ -9679,12 +9681,13 @@ mod region_batching_tests {
                                 TensorOp::Region(RegionNode {
                                     kind: RegionKind::ForiVjp { .. },
                                     ..
-                                }) | TensorOp::ForiVjpJvp { .. }
-                                    | TensorOp::Region(RegionNode {
-                                        kind: RegionKind::ScanVjp { .. },
-                                        ..
-                                    })
-                                    | TensorOp::ScanVjpJvp { .. }
+                                }) | TensorOp::Region(RegionNode {
+                                    kind: RegionKind::ForiVjpJvp { .. },
+                                    ..
+                                }) | TensorOp::Region(RegionNode {
+                                    kind: RegionKind::ScanVjp { .. },
+                                    ..
+                                }) | TensorOp::ScanVjpJvp { .. }
                             )
                         })
                         .count();
