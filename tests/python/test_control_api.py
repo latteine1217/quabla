@@ -379,6 +379,110 @@ def test_optional_device_loop_vjp_and_hvp_parity():
                     assert_close(value, expected, 1e-4)
 
 
+def rotate(carry, scale):
+    # A slice/concat rotation plus a full reduction: neither is lane-local, so
+    # CUDA runs loops over this body host-driven instead of as fused kernels.
+    return qb.concat([carry[1:], carry[:1]], 0) * scale + carry.sum() * 0.05
+
+
+def host_driven_scan_loss(initial, scale):
+    def body(carry, i, scale):
+        nxt = (rotate(carry, scale) + i * 0.01).tanh()
+        # The step output has fewer lanes than the carry.
+        return nxt, nxt[:2] * nxt[1:3]
+
+    carry, outputs = scan(body, initial, length=9, operands=(scale,))
+    return (carry**2).sum() + (outputs**3).sum()
+
+
+def host_driven_fori_loss(initial, scale):
+    final = fori_loop(
+        0, 9, lambda i, carry, scale: rotate(carry, scale).sin(), initial, operands=(scale,)
+    )
+    return (final**2).sum()
+
+
+def host_driven_while(initial, scale):
+    # Slot 0 counts iterations; the body rotates the other slots.
+    counted = qb.concat([qb.zeros([1], initial.dtype), initial], 0)
+    return while_loop(
+        lambda c, scale: c[0] < 6.0,
+        lambda c, scale: qb.concat([c[:1] + 1.0, rotate(c[1:], scale).sin()], 0),
+        counted,
+        operands=(scale,),
+    )
+
+
+def test_scan_hvp_with_a_rotating_body_matches_finite_differences():
+    # The CPU reference of the CUDA test below, checked against central
+    # differences of the gradient (truncation error O(h^2) ~ 1e-10).
+    initial = qb.array([0.3, -0.2, 0.5, 0.1, -0.4])
+    scale = qb.array([0.9, 1.1, 0.8, 1.05, 0.95])
+    direction = qb.array([0.5, -1.0, 0.25, 2.0, -0.75])
+    gradient = qb.jit(qb.grad(host_driven_scan_loss, argnums=(0, 1)))
+    h = 1e-5
+    for argnums in (0, 1):
+        tangents = [qb.zeros([5]), qb.zeros([5])]
+        tangents[argnums] = direction
+        hvp = qb.jit(
+            lambda x, s, t=tuple(tangents): qb.jvp(
+                qb.grad(host_driven_scan_loss, argnums=(0, 1)), (x, s), t
+            )[1]
+        )(initial, scale)
+        shifted = [[initial, scale], [initial, scale]]
+        shifted[0][argnums] = shifted[0][argnums] + direction * h
+        shifted[1][argnums] = shifted[1][argnums] - direction * h
+        plus, minus = gradient(*shifted[0]), gradient(*shifted[1])
+        for exact, upper, lower in zip(hvp, plus, minus):
+            assert_close(exact, (upper - lower) / (2 * h), 1e-7)
+
+
+def test_optional_cuda_host_driven_loop_derivatives_match_cpu():
+    # Bodies that are not elementwise run as host-driven region loops on CUDA,
+    # including Hessian-vector products (forward over reverse) through `scan`,
+    # which used to be rejected there.
+    if os.environ.get("QUABLA_CUDA_TEST") != "1":
+        return
+    for dtype, precision, tolerance in (
+        (qb.float32, None, 1e-4),
+        (qb.float64, "float64", 1e-11),
+    ):
+        initial = qb.array([0.3, -0.2, 0.5, 0.1, -0.4], dtype=dtype)
+        scale = qb.array([0.9, 1.1, 0.8, 1.05, 0.95], dtype=dtype)
+        direction = qb.array([0.5, -1.0, 0.25, 2.0, -0.75], dtype=dtype)
+        zero = qb.zeros([5], dtype)
+
+        def hvp(loss, argnums):
+            gradient = qb.grad(loss, argnums=argnums)
+
+            def run(x, s):
+                tangents = (direction, zero) if argnums == 0 else (zero, direction)
+                return qb.jvp(gradient, (x, s), tangents)[1]
+
+            return run
+
+        operations = {
+            "scan value_and_grad": qb.value_and_grad(host_driven_scan_loss, argnums=(0, 1)),
+            "scan hvp initial": hvp(host_driven_scan_loss, 0),
+            "scan hvp scale": hvp(host_driven_scan_loss, 1),
+            "scan jvp": lambda x, s: qb.jvp(host_driven_scan_loss, (x, s), (zero, direction)),
+            "fori hvp initial": hvp(host_driven_fori_loss, 0),
+            "fori jvp": lambda x, s: qb.jvp(host_driven_fori_loss, (x, s), (direction, zero)),
+            "while jvp": lambda x, s: qb.jvp(host_driven_while, (x, s), (zero, direction)),
+        }
+        for name, operation in operations.items():
+            expected = qb.tree.leaves(qb.jit(operation)(initial, scale))
+            options = {"device": "cuda"}
+            if precision is not None:
+                options["precision"] = precision
+            actual = qb.tree.leaves(qb.jit(operation, **options)(initial, scale))
+            assert len(actual) == len(expected), name
+            for got, want in zip(actual, expected):
+                assert got.dtype == dtype, (name, got.dtype)
+                scale_of = max([1.0] + [abs(value) for value in want.to_flat_list()])
+                assert_close(got, want, tolerance * scale_of)
+
+
 def collatz_like(carry, limit, scale):
     # Grows the carry until its first entry reaches `limit`; the trip count
     # depends on traced values.

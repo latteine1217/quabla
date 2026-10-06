@@ -320,8 +320,9 @@ and its gradients in one device plan, and `mlx_adam_loss_optimizer` and
 - Indexing takes static Python integers; dynamic index tensors and
   boolean-mask indexing are unsupported.
 - CUDA runs loop bodies that are not purely elementwise as host-driven loops,
-  about 80 µs per iteration on a GTX 1660 SUPER. MLX factors matrices on its
-  CPU stream and has no `vmap` HVP lowering. Third and higher Cholesky
+  one CUDA graph launch per iteration (about 30 µs for a small `fori_loop`
+  body on a GTX 1660 SUPER). MLX factors matrices on its CPU stream and has
+  no `vmap` HVP lowering. Third and higher Cholesky
   derivatives use a scalar expansion that is slow beyond small matrices.
 - Data parallelism is single-node CUDA + NCCL only.
 - `quabla.vmap` cannot batch `cond`/`fori`/`scan`/`while` regions over a

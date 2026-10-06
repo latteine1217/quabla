@@ -64,6 +64,16 @@ python examples/benchmark_tensor_cuda.py --rank-two --device-resident
 python examples/benchmark_pinn_cuda.py
 ```
 
+Measure the per-iteration cost of host-driven CUDA loops (bodies that are not
+elementwise: `fori_loop`, `scan`, `while_loop`, their reverse passes, and a
+`scan` Hessian-vector product). `--dump` writes the exact results and
+`--compare` checks a second build against them bit for bit:
+
+```sh
+python examples/benchmark_host_loop_cuda.py --dump results.json
+python examples/benchmark_host_loop_cuda.py --compare results.json
+```
+
 The v0.2 retained-training benchmark compares `optim.Trainer` against the
 native Adam executor on the same analytic Poisson residual. It checks loss
 and parameter trajectories and separates construction, submission,

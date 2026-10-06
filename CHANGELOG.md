@@ -80,15 +80,30 @@ deprecated names keep working until 1.0 (see
   op on every backend with partials `1` and `-trunc(x1 / x2)`, and
   `mod`/`remainder` with NumPy's floor-mod semantics (sign of `x2`),
   composed from `fmod` as NumPy does.
+- `examples/benchmark_host_loop_cuda.py` measures the per-iteration cost of
+  host-driven CUDA loops and compares two builds bit for bit.
 
 ### Changed
 
 - `quabla.trace` is the array `trace(a, offset=0, axis1=0, axis2=1)`. The
   v0.1 call form `trace(function, input_specs)` keeps working and warns on
   the call, as `grad` and `jit` do, instead of on attribute access.
+- Host-driven CUDA loops (bodies that are not elementwise) run each
+  iteration as one CUDA graph launch: after two eager iterations a region
+  whose program only launches NVRTC kernels, device copies and cuBLAS
+  products is recorded once, and later iterations retarget its input and
+  output copies. Loop-invariant captures are bound once per loop instead of
+  every iteration, and the loop index is bound without an intermediate copy.
+  On a GTX 1660 SUPER a small `fori_loop` or `scan` iteration drops from
+  about 120-180 µs to about 30-50 µs, a `while_loop` iteration from about
+  220 µs to about 100 µs, and reverse-pass iterations about fourfold; results
+  are bit-identical to the previous implementation.
 
 ### Fixed
 
+- Hessian-vector products (forward over reverse) through a `scan` whose body
+  is not elementwise, or whose step output has a different lane count than
+  its carry, run on CUDA as host-driven loops instead of being rejected.
 - A CUDA request on a host without the NVIDIA driver library, or a
   data-parallel request without NCCL, raises an error naming the missing
   library instead of a Rust panic.
