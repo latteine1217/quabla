@@ -43,7 +43,7 @@ jobs:
       # Pinned to a master commit (the stable branch is not in master's
       # history and may be garbage-collected); the toolchain input then
       # selects stable.
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master 2026-09-12
         with:
           toolchain: stable
           components: rustfmt, clippy
