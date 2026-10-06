@@ -1,5 +1,26 @@
 # Rust SciML Runtime Roadmap
 
+## v0.5 Plan (2026-10-06)
+
+v0.5 makes `vmap` compose with control flow. In v0.4, `vmap` rejects any
+`cond`, `fori_loop`, `scan`, or `while_loop` region whose operands depend on
+a mapped argument, so `hessian` or a forward-mode `jacobian` through a loop,
+`vmap` of `odeint`, and `vmap` of `linalg.cg`, `linalg.gmres`, or `newton`
+all raise. Scope chosen by the owner on 2026-10-06; custom differentiation
+rules inside loop bodies, integer dtypes, and complex dtypes with FFT are
+not in it.
+
+| # | Item | Status |
+| --- | --- | --- |
+| 1 | Batching rule for `fori_loop` and `scan` regions and their derivative regions (JVP, VJP, forward-over-reverse HVP): mapped captures and carries batch the body region, unmapped operands stay unbatched | Planned |
+| 2 | Batching rule for `cond`: an unmapped predicate batches both branch regions; a mapped predicate evaluates both branches and selects per element, as JAX does | Planned |
+| 3 | Batching rule for `while_loop`: an unmapped predicate batches the body; a mapped predicate runs until every element is done and freezes finished elements' carries, as JAX does | Planned |
+| 4 | What the rules unlock, on CPU, CUDA, and MLX: `hessian` and `jacobian` through loops, `vmap` of `odeint` for every method, and `vmap` of `linalg.cg`, `linalg.gmres`, and `newton` | Planned |
+
+Release follow-ups carried into v0.5: the two-GPU NCCL validation with
+NVRTC 12.6 that v0.4.0 skipped, and the first PyPI upload once TestPyPI
+registration works.
+
 ## v0.4 Plan (2026-10-06)
 
 v0.4 fills the jax.numpy surface a PINN code base reaches for, adds the
