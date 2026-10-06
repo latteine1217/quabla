@@ -1,9 +1,10 @@
 //! Array ops composed of other ops, each defined once over the [`Primitives`]
-//! it is made of. A `TraceTensor` implements a primitive by recording its
-//! graph node; an eager `Tensor` implements it by evaluating that node at
-//! once with the core's CPU evaluator (or its direct kernel). Since the CPU
-//! evaluator runs a graph node by node, the eager value of a composite is
-//! the value of its traced graph, bit for bit, without building that graph.
+//! it is made of, which a `TraceTensor` implements by recording graph nodes.
+//! An eager `Tensor` runs the same definition: its first call with operands
+//! of a new shape, dtype, and weak type traces the composite and compiles
+//! the graph to one fused CPU kernel (`TensorIr::fused_kernel`), which later
+//! calls run without building a graph. The kernel computes the graph's value
+//! bit for bit, so an eager composite equals its traced graph.
 
 use quabla_core::tensor_ir::{TensorComparison, TensorDType};
 

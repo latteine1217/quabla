@@ -9,8 +9,8 @@ use pyo3::types::{PyAny, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use quabla_core::tensor_ir::{
     AdamCoefficients, AdamOrder, BatchingError, CudaBackend, CudaDataParallelExecutionPlan,
     CudaDataParallelTiming, CudaExecutionPlan, DeviceOptimizerConfig, DeviceUpdateRule,
-    DynamicTensor, F64Arith, MlxAdamPlan, MlxBackend, MlxRetainedInputs, SymbolicCotangent,
-    TensorBackend, TensorComparison, TensorCondExecutionPlan, TensorCustomRule,
+    DynamicTensor, F64Arith, FusedKernel, MlxAdamPlan, MlxBackend, MlxRetainedInputs,
+    SymbolicCotangent, TensorBackend, TensorComparison, TensorCondExecutionPlan, TensorCustomRule,
     TensorCustomTangent, TensorDType, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan,
     TensorIr, TensorNodeId, TensorRegion, TensorReplicaReduction, TensorScanExecutionPlan,
     TensorWhileExecutionPlan, UnaryMathKind,
@@ -1546,9 +1546,9 @@ impl TraceTensor {
     /// Evaluates the traced op `build` on eager operands at once: each
     /// operand becomes a constant of a fresh graph, `build` appends the nodes
     /// a trace of the op records, and the CPU evaluator runs them node by
-    /// node, as it runs a `jit` plan. Eager results therefore equal traced
-    /// ones bit for bit, and errors are the builder's. The result keeps the
-    /// weak type of its node.
+    /// node, which a `jit` plan, fused elementwise regions included, matches
+    /// bit for bit. Eager results therefore equal traced ones, and errors are
+    /// the builder's. The result keeps the weak type of its node.
     pub(crate) fn evaluate_eager<const N: usize>(
         operands: [&PyTensor; N],
         build: impl FnOnce([Self; N]) -> Result<Self, String>,
@@ -1588,6 +1588,62 @@ impl TraceTensor {
             .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
         let value = ir.evaluate(output.node_id, &BTreeMap::new())?;
         Ok(PyTensor::from_dynamic_tensor(value)?.with_weak(ir.node_weak(output.node_id)?))
+    }
+
+    /// [`Self::evaluate_eager_all`] for an op composed of elementwise
+    /// primitives, which also returns its graph compiled to one fused kernel
+    /// over the operands (`None` when the CPU evaluator would not run the
+    /// graph as one fused region) and the weak type of the result. The
+    /// kernel computes the graph's value bit for bit, so a later call with
+    /// operands of the same shapes, dtypes, and weak types can run it
+    /// without building the graph.
+    pub(crate) fn evaluate_eager_fused(
+        operands: &[&PyTensor],
+        build: impl FnOnce(Vec<Self>) -> Result<Self, String>,
+    ) -> Result<(PyTensor, Option<FusedKernel>, bool), String> {
+        let graph = TensorTraceGraph::new();
+        let tracers = operands
+            .iter()
+            .map(|operand| {
+                let value = operand.to_dynamic_tensor()?;
+                let shape = value.shape().to_vec();
+                let node_id = graph
+                    .ir
+                    .lock()
+                    .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+                    .constant(value, operand.is_weak());
+                Ok(Self::from_node(graph.clone(), node_id, shape, None))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let operand_nodes = tracers
+            .iter()
+            .map(|tracer| tracer.node_id)
+            .collect::<Vec<_>>();
+        let output = build(tracers)?;
+        let ir = graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let weak = ir.node_weak(output.node_id)?;
+        let kernel = ir.fused_kernel(output.node_id, &operand_nodes);
+        let fused = match &kernel {
+            Some(kernel) => kernel.evaluate(
+                &operands
+                    .iter()
+                    .map(|operand| operand.operand())
+                    .collect::<Vec<_>>(),
+            )?,
+            None => None,
+        };
+        let value = match fused {
+            Some(value) => value,
+            None => ir.evaluate(output.node_id, &BTreeMap::new())?,
+        };
+        Ok((
+            PyTensor::from_dynamic_tensor(value)?.with_weak(weak),
+            kernel,
+            weak,
+        ))
     }
 
     /// Captures an eager tensor as a constant of this tracer's graph, keeping

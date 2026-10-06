@@ -252,6 +252,17 @@ bit-exact IEEE `float32` for `+ - * / sqrt`, and the reference that the GPU
 backends are tested against. The interpreter reuses a buffer in place at
 its last use and caches grouped loop derivatives.
 
+Plan compilation also groups maximal elementwise subgraphs into regions
+(`tensor_ir/fusion.rs`), and a CPU plan runs each region as one fused
+program at its root: a flat list of instructions, each compiled to a
+closure, that runs over tiles of 256 elements and stores only the root.
+Every instruction applies its node's own rule in `f64` and rounds to the
+node dtype, so a region's value equals node-by-node evaluation bit for bit;
+a sum or product that meets two NaN operands, whose NaN the compiled
+kernels decide, makes the plan run node by node instead. Eager composites
+(`relu`, `sigmoid`, ...) run their graph as such a program, cached per
+operand type.
+
 ### CUDA
 
 `crates/quabla-core/src/tensor_ir/cuda.rs` (via `cudarc`, with libraries

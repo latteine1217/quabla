@@ -784,6 +784,52 @@ def test_eager_ops_match_jit_bitwise():
     assert float_bits(zeros.sqrt().tolist()) == float_bits([0.0, 0.0])
 
 
+def test_fused_elementwise_regions_match_their_ops_one_by_one():
+    # The CPU runs a jit plan's elementwise subgraphs, and an eager
+    # composite, as one fused program over tiles of elements. Its bits equal
+    # those of the same ops run one by one as eager single-op calls, NaN
+    # payloads, signed zeros, and float32 rounding after every op included.
+    def relu(a):
+        return qb.where(qb.logical_or(qb.isnan(a), a > 0.0), a, 0.0)
+
+    def sigmoid(a):
+        decay = qb.where(a.gt(0.0), a, 0.0 - a) * -1.0
+        decay = decay.exp()
+        denominator = decay + 1.0
+        return qb.where(a > 0.0, 1.0 / denominator, decay / denominator)
+
+    chains = [
+        relu,
+        sigmoid,
+        lambda a: a * a.sin() + a.exp() / (1.0 + a * a),
+        lambda a: qb.where(a > 0.5, a.log1p(), a.tanh() * 2.0) - a.sqrt(),
+        lambda a: (a.astype(qb.float64) * 3.0).astype(qb.float32).astype(a.dtype) + a,
+    ]
+    count = len(EAGER_JIT_POINTS)
+    for dtype in (qb.float32, qb.float64):
+        x = qb.array(EAGER_JIT_POINTS, dtype=dtype)
+        pairs = (x.reshape(count, 1) + qb.zeros([1, count]).astype(dtype)).reshape(-1)
+        swapped = (x.reshape(1, count) + qb.zeros([count, 1]).astype(dtype)).reshape(-1)
+        for chain in chains:
+            one_by_one = eager_jit_summary(chain(x))
+            assert eager_jit_summary(qb.jit(chain)(x)) == one_by_one, (dtype, chain)
+        expected = eager_jit_summary(relu(x))
+        assert eager_jit_summary(x.relu()) == expected
+        expected = eager_jit_summary(sigmoid(x))
+        assert eager_jit_summary(x.sigmoid()) == expected
+        # Two NaN operands of a commutative op give the first one's NaN.
+        both = [
+            lambda a, b: (a * b + b * a) * (a + b) - (b + a),
+            lambda a, b: qb.where(a > b, a * b, b + a) * 0.5 + b,
+        ]
+        for function in both:
+            one_by_one = eager_jit_summary(function(pairs, swapped))
+            assert eager_jit_summary(qb.jit(function)(pairs, swapped)) == one_by_one
+            scalar = qb.array(math.nan, dtype=dtype)
+            one_by_one = eager_jit_summary(function(pairs, scalar))
+            assert eager_jit_summary(qb.jit(function)(pairs, scalar)) == one_by_one
+
+
 def test_maximum_minimum_relu_and_extrema_propagate_nan_at_every_position():
     nan = math.nan
     for dtype in [qb.float32, qb.float64]:

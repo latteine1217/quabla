@@ -18,13 +18,40 @@ deprecated names keep working until 1.0 (see
   comparisons, `where`, the elementwise math functions, `sum`/`mean`,
   `matmul`) call that node's kernel directly and are as fast as before or
   faster (`x + y` on 100000 float32 elements: 225 us before, 37 us after).
-  Composite ops (`abs`, `relu`, `maximum`/`minimum`, `sigmoid`,
-  `softplus`, `norm`, ...) run their nodes one by one, as CPU `jit` does,
-  so they are slower than the former fused loops: on one element `relu`
-  takes about 350 ns instead of 115 ns and `sigmoid` about 740 ns instead
-  of 95 ns; on 100000 elements `relu` takes about 3.5 times and `sigmoid`
-  about 2.5 times as long. Eager Cholesky keeps its documented symmetric
-  positive-definite validation, which the traced op does not apply.
+  The composite ops `abs`, `relu`, `maximum`/`minimum`, `sigmoid`, and
+  `softplus` run their graph as one fused CPU kernel (see the fused CPU
+  evaluator below); other multi-node ops (`norm`, ...) run their nodes one
+  by one. Eager Cholesky keeps its documented symmetric positive-definite
+  validation, which the traced op does not apply.
+- The CPU runs chains of elementwise nodes as fused programs instead of
+  node by node. Plan compilation groups each maximal elementwise subgraph
+  whose inner values no other node reads into a region and compiles it to
+  a flat instruction list, each instruction a closure with its operation,
+  dtype, and operand kinds fixed; a region runs over tiles of 256 elements
+  and stores only its result. Every instruction applies its node's own rule
+  in `f64` and rounds to the node dtype, so results are unchanged bit for
+  bit (NaN payloads, signed zeros, and `float32` rounding after every op
+  included); a sum or product that meets two NaN operands, whose NaN the
+  compiled kernels pick, makes that evaluation run node by node instead.
+  Every CPU plan uses it, loop bodies and derivative plans included, and so
+  do the eager composites, through a kernel cached per operand shape,
+  dtype, and weak type. Measured on Apple silicon (macOS arm64, minimum
+  over interleaved runs, before -> after; v0.5.0 in parentheses where the
+  eager op had a hand-written loop): CPU `jit` of `x * y + sin(x)` over
+  2^20 `float32` elements 9.7 ms -> 6.6 ms, a chain of `sigmoid`,
+  `softplus`, `relu`, and `tanh` over 2^20 `float32` elements 101.7 ms ->
+  23.2 ms, a PINN residual loss (a 2-32-32-1 `tanh` network, value,
+  gradient, and Hessian per point, 1024 points) 7.1 ms -> 4.8 ms and its
+  `grad` 14.8 ms -> 10.8 ms, the `grad` of an MLP activation loss 93.2 ms ->
+  21.1 ms, and a 20-step `fori_loop` with an elementwise body over 2^16
+  elements 52.2 ms -> 13.5 ms. Eager `float64` composites on 100000
+  elements: `relu` 590 us -> 70 us (324 us), `abs` 488 us -> 53 us (375 us),
+  `sigmoid` 1391 us -> 389 us (283 us), `softplus` 2073 us -> 1040 us (1531
+  us), `maximum` 557 us -> 77 us (415 us); on one element `relu` 318 ns ->
+  146 ns (105 ns), `abs` 228 ns -> 142 ns (92 ns), `sigmoid` 697 ns -> 165
+  ns (91 ns), and `softplus` 785 ns -> 180 ns (99 ns), where the fixed cost
+  of running a dozen instructions keeps `sigmoid` and `softplus` above the
+  hand-written loops. Single-node ops are unchanged.
 
 - Internal: the elementwise math functions of one operand (`exp`, `log`,
   `log1p`, `expm1`, `erf`, `erfc`, `sin`, `cos`, `tanh`, and the `tan` ...
