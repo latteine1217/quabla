@@ -9,6 +9,14 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-06
+
+The v0.5 plan in `docs/jax_like_roadmap.md`: `vmap` batches `cond`,
+`fori_loop`, `scan`, and `while_loop` regions with JAX's semantics, which
+makes `hessian` and `jacobian` work through loops and `vmap` compose with
+`odeint` and the iterative solvers, plus fixes found on the way. All v0.4
+call forms keep working.
+
 ### Added
 
 - `vmap` batches `fori_loop` and `scan` regions, and the JVP, VJP, and
@@ -571,7 +579,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/latteine1217/quabla/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/latteine1217/quabla/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/latteine1217/quabla/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/latteine1217/quabla/compare/v0.2.2...v0.2.3

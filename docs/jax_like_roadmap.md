@@ -17,9 +17,13 @@ not in it.
 | 3 | Batching rule for `while_loop`: an unmapped predicate batches the body; a mapped predicate runs until every element is done and freezes finished elements' carries, as JAX does | Done: on CPU, CUDA, and MLX, including the forward-mode while regions of `jvp` and forward `jacobian`; finished elements keep their carry and tangent bit for bit, and CUDA still reads back one flag per iteration |
 | 4 | What the rules unlock, on CPU, CUDA, and MLX: `hessian` and `jacobian` through loops, `vmap` of `odeint` for every method, and `vmap` of `linalg.cg`, `linalg.gmres`, and `newton` | Done: `hessian` and `jacobian` through loops and `vmap` of `odeint` with item 1; `vmap` of `cg`, `gmres`, and `newton` over `b`, `x0`, and `args` with item 3, each element stopping at its own tolerance with per-element `info`, composed with their derivatives (`vmap(grad(...))`, `grad` of `vmap`), and the reverse-mode `jacobian`/`hessian` of `cg` and `gmres` solutions |
 
-Release follow-ups carried into v0.5: the two-GPU NCCL validation with
-NVRTC 12.6 that v0.4.0 skipped, and the first PyPI upload once TestPyPI
-registration works.
+All items shipped in v0.5.0, validated on the CPU, MLX, and a single-GPU
+CUDA host (NVRTC 13.1). Still open from the release process: the two-GPU
+NCCL validation with NVRTC 12.6, skipped for v0.4.0 and v0.5.0, and the
+first PyPI upload once TestPyPI registration works. Known gap found on the
+way: `hessian` through a `custom_vjp` solver composed with a loop (for
+example `newton` with `args` computed by `odeint`) needs reverse mode over
+a loop VJP, which is not implemented.
 
 ## v0.4 Plan (2026-10-06)
 

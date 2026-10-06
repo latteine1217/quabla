@@ -7,7 +7,7 @@ traced program on CPU, CUDA, and Apple silicon.**
 [![CI](https://github.com/latteine1217/quabla/actions/workflows/ci.yml/badge.svg)](https://github.com/latteine1217/quabla/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation)
-[![Release v0.4.0](https://img.shields.io/badge/release-v0.4.0-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.4.0)
+[![Release v0.5.0](https://img.shields.io/badge/release-v0.5.0-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.5.0)
 
 ![A tanh MLP trained with Quabla matches the exact solution of a 1D Poisson problem; its training loss falls from about 50 to 2.5e-4.](docs/assets/pinn_poisson.png)
 
@@ -66,7 +66,7 @@ running on CUDA or MLX.
 
 ## Status
 
-The latest release is **v0.4.0**, a research-grade pre-release published as
+The latest release is **v0.5.0**, a research-grade pre-release published as
 a git tag and GitHub Release; the PyPI distributions are built by CI and not
 yet uploaded. The v0.2 series introduced the JAX-style API
 ([CHANGELOG](CHANGELOG.md#020---2026-10-06), [design](docs/api_v0_2_design.md)):
@@ -91,7 +91,11 @@ jax.numpy shape, product, and calculus functions (`pad`, `roll`,
 and `newton` with implicit-function-theorem gradients; matrix
 factorizations on MLX; AdamW, SGD, global-norm clipping, and CUDA `float64`
 in the device `Trainer`; CUDA-graph replay of host-driven CUDA loops; and
-native `max`/`min` reductions.
+native `max`/`min` reductions. v0.5
+([CHANGELOG](CHANGELOG.md#050---2026-10-06)) lets `vmap` batch `cond`,
+`fori_loop`, `scan`, and `while_loop` and their derivatives, so `hessian`
+and `jacobian` work through loops and `vmap` composes with `odeint`,
+`linalg.cg`, `linalg.gmres`, and `newton`.
 
 All v0.1 call forms keep working. Migrated top-level names emit a
 `DeprecationWarning` once per name on explicit access (`from quabla import *`
