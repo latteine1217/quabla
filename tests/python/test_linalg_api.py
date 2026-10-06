@@ -9,6 +9,7 @@ central difference with step 1e-6 to ~1e-8.
 """
 
 import os
+import warnings
 
 try:
     import numpy as np
@@ -585,20 +586,200 @@ def test_optional_device_parity():
         (lambda m: tuple(qb.linalg.eigh(m)), (symmetric,)),
         (qb.grad(lambda m: (qb.linalg.eigh(m).eigenvectors ** 3).sum()), (symmetric,)),
     )
-    if os.environ.get("QUABLA_MLX_TEST") == "1":
+    for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
+        if os.environ.get(gate) != "1":
+            continue
         for function, arguments in functions:
-            raises(qb.UnsupportedOperationError, qb.jit(function, device="mlx"), *arguments)
-    if os.environ.get("QUABLA_CUDA_TEST") == "1":
-        for function, arguments in functions:
-            expected = qb.jit(function)(*arguments)
-            actual = qb.jit(function, device="cuda")(*arguments)
-            expected = expected if isinstance(expected, tuple) else (expected,)
-            actual = actual if isinstance(actual, tuple) else (actual,)
-            for got, want in zip(actual, expected):
-                assert_close(got, want, 5e-4)
+            assert_device_matches_cpu(device, function, arguments, 5e-4)
         singular = np.array([[1.0, 2.0], [2.0, 4.0]], dtype=np.float32)
-        sign, logabsdet = qb.jit(lambda m: tuple(qb.linalg.slogdet(m)), device="cuda")(singular)
+        sign, logabsdet = qb.jit(lambda m: tuple(qb.linalg.slogdet(m)), device=device)(singular)
         assert sign.item() == 0.0 and logabsdet.item() == -np.inf
+
+
+def assert_device_matches_cpu(device, function, arguments, tolerance):
+    """`function` under `jit` on `device` against the CPU, output by output."""
+    expected = qb.jit(function)(*arguments)
+    actual = qb.jit(function, device=device)(*arguments)
+    expected = expected if isinstance(expected, tuple) else (expected,)
+    actual = actual if isinstance(actual, tuple) else (actual,)
+    assert len(actual) == len(expected)
+    for got, want in zip(actual, expected):
+        assert got.dtype == want.dtype, (got.dtype, want.dtype)
+        assert_close(got, want, tolerance)
+
+
+def ill_conditioned(rng, batch, n, condition):
+    """Matrices with singular values spaced log-uniformly from 1 to `1 / condition`."""
+    left, _ = np.linalg.qr(rng.normal(size=batch + (n, n)))
+    right, _ = np.linalg.qr(rng.normal(size=batch + (n, n)))
+    values = np.logspace(0.0, -np.log10(condition), n)
+    return (left * values) @ transposed(right)
+
+
+def test_mlx_linalg_matches_the_cpu():
+    """Every `qb.linalg` function and `solve` on MLX against the CPU: values
+    and derivatives, batched, ill-conditioned, singular, and non-finite.
+
+    MLX factors with LAPACK on its CPU stream in float32 and applies the
+    CPU's conventions on the GPU stream, so outputs, signs and completed
+    bases included, agree with the CPU's float64 kernels to float32
+    accuracy. Unless stated otherwise every matrix has a condition number
+    below about 100 and eigenvalue or singular value gaps above about 0.1.
+    """
+    if os.environ.get("QUABLA_MLX_TEST") != "1":
+        return
+    rng = np.random.default_rng(15)
+
+    def f32(x):
+        return np.asarray(x, dtype=np.float32)
+
+    a = f32(well_conditioned(rng, (2, 3, 4, 4)))
+    b = f32(rng.normal(size=(2, 3, 4, 2)))
+    vector = f32(rng.normal(size=4))
+    direction = f32(rng.normal(size=a.shape))
+    lower = np.tril(well_conditioned(rng, (3, 4, 4)))
+    noisy = f32(lower + np.triu(rng.normal(size=lower.shape), 1))
+    spd = f32(lower @ transposed(lower))
+    rhs = f32(rng.normal(size=(3, 4, 3)))
+    symmetric = f32(symmetric_with_gaps(rng, (2, 3), 5))
+    symmetric_direction = rng.normal(size=symmetric.shape)
+    symmetric_direction = f32(symmetric_direction + transposed(symmetric_direction))
+    left, _ = np.linalg.qr(rng.normal(size=(2, 6, 4)))
+    right, _ = np.linalg.qr(rng.normal(size=(2, 4, 4)))
+    tall = f32((left * np.array([4.0, 3.0, 2.0, 1.0])) @ transposed(right))
+    small, _ = np.linalg.qr(rng.normal(size=(2, 3, 3)))
+    # A [2, 3, 6] matrix with singular values 3, 2, 1.
+    wide = f32(transposed((left[..., :3] * np.array([3.0, 2.0, 1.0])) @ transposed(small)))
+    tall_rhs = f32(rng.normal(size=(2, 6, 2)))
+    weights = qb.asarray(f32(rng.normal(size=(2, 6, 4))))
+
+    def cubed_gradient(function):
+        return qb.grad(lambda m: (function(m) ** 3).sum())
+
+    cases = (
+        (qb.linalg.solve, (a, b)),
+        (qb.solve, (a, vector)),
+        (qb.grad(lambda m, r: (qb.linalg.solve(m, r) ** 2).sum(), argnums=(0, 1)), (a, b)),
+        (lambda m, d: qb.jvp(lambda x: qb.linalg.solve(x, b), (m,), (d,))[1], (a, direction)),
+        (qb.hessian(lambda m: (qb.linalg.solve(m, b[0, 0]) ** 2).sum()), (a[0, 0],)),
+        (qb.vmap(qb.grad(lambda m, r: (qb.linalg.solve(m, r) ** 2).sum())), (a[0], b[0])),
+        (
+            lambda m, r: tuple(
+                qb.linalg.solve_triangular(m, r, trans=trans, lower=low)
+                for trans in (0, 1)
+                for low in (True, False)
+            ),
+            (noisy, rhs),
+        ),
+        (qb.grad(lambda m: (qb.linalg.solve_triangular(m, rhs, lower=True) ** 2).sum()), (noisy,)),
+        (lambda m, r: qb.linalg.cho_solve(qb.linalg.cholesky(m), r), (spd, rhs)),
+        (qb.grad(lambda m: (qb.linalg.cho_solve(qb.linalg.cholesky(m), rhs) ** 2).sum()), (spd,)),
+        (lambda m: tuple(qb.linalg.slogdet(m)), (a,)),
+        (qb.linalg.det, (a,)),
+        (qb.linalg.inv, (a,)),
+        (qb.grad(lambda m: qb.linalg.slogdet(m).logabsdet.sum()), (a,)),
+        (qb.grad(lambda m: qb.linalg.det(m).sum()), (a,)),
+        (lambda m, d: qb.jvp(qb.linalg.inv, (m,), (d,))[1], (a, direction)),
+        (qb.hessian(lambda m: qb.linalg.slogdet(m).logabsdet), (a[0, 0],)),
+        (lambda m: tuple(qb.linalg.eigh(m)), (symmetric,)),
+        # Components of equal magnitude: the first one is made positive.
+        (lambda m: tuple(qb.linalg.eigh(m)), (f32([[2.0, 0.0], [2.0, 2.0]]),)),
+        (cubed_gradient(lambda m: qb.linalg.eigh(m).eigenvalues), (symmetric,)),
+        (cubed_gradient(lambda m: qb.linalg.eigh(m).eigenvectors), (symmetric,)),
+        (
+            lambda m, d: qb.jvp(lambda x: tuple(qb.linalg.eigh(x)), (m,), (d,))[1],
+            (symmetric, symmetric_direction),
+        ),
+        (lambda m: tuple(qb.linalg.qr(m)), (tall,)),
+        (lambda m: tuple(qb.linalg.qr(m)), (wide,)),
+        (lambda m: tuple(qb.linalg.qr(m)), (a,)),
+        # The complete Q follows the CPU's Householder completion exactly.
+        (lambda m: tuple(qb.linalg.qr(m, mode="complete")), (tall,)),
+        (lambda m: qb.linalg.qr(m, mode="r"), (wide,)),
+        (cubed_gradient(lambda m: qb.linalg.qr(m).Q), (tall,)),
+        (cubed_gradient(lambda m: qb.linalg.qr(m).R), (wide,)),
+        (lambda m: tuple(qb.linalg.svd(m)), (tall,)),
+        (lambda m: tuple(qb.linalg.svd(m)), (wide,)),
+        # So do the extra columns of a full U and the extra rows of a full Vh.
+        (lambda m: tuple(qb.linalg.svd(m, full_matrices=True)), (tall,)),
+        (lambda m: tuple(qb.linalg.svd(m, full_matrices=True)), (wide,)),
+        (lambda m: qb.linalg.svd(m, compute_uv=False), (a,)),
+        (cubed_gradient(lambda m: qb.linalg.svd(m, compute_uv=False)), (tall,)),
+        (cubed_gradient(lambda m: qb.linalg.svd(m).U * weights), (tall,)),
+        (cubed_gradient(lambda m: qb.linalg.svd(m).Vh), (wide,)),
+        (lambda m, r: tuple(qb.linalg.lstsq(m, r, return_residuals=True)), (tall, tall_rhs)),
+        (qb.linalg.lstsq, (wide, tall_rhs[..., :3, :])),
+        (qb.grad(lambda m, r: (qb.linalg.lstsq(m, r) ** 2).sum()), (tall, tall_rhs)),
+    )
+    for function, arguments in cases:
+        assert_device_matches_cpu("mlx", function, arguments, 1e-5)
+
+    # Condition 1e3: the float32 error bound grows to about condition * eps.
+    ill = f32(ill_conditioned(rng, (2,), 5, 1e3))
+    ill_rhs = f32(rng.normal(size=(2, 5, 2)))
+    for function, arguments in (
+        (qb.linalg.solve, (ill, ill_rhs)),
+        (lambda m: tuple(qb.linalg.slogdet(m)), (ill,)),
+        (lambda m: qb.linalg.svd(m, compute_uv=False), (ill,)),
+        (lambda m: tuple(qb.linalg.qr(m)), (ill,)),
+        (lambda m: qb.linalg.eigh(m @ m.transpose([0, 2, 1])).eigenvalues, (ill,)),
+    ):
+        assert_device_matches_cpu("mlx", function, arguments, 2e-4)
+
+    def on_mlx(function):
+        return qb.jit(function, device="mlx")
+
+    # Exactly singular: slogdet and det follow NumPy; solve, inv, and the
+    # logabsdet gradient raise like the CPU. A zero pivot is detected
+    # exactly, so the matrix has a zero row: a matrix that is singular only
+    # in exact arithmetic (dependent rows) can leave a pivot of rounding
+    # size under LAPACK's float32 rounding, and is then solved.
+    singular = f32([[[1.0, 2.0, 3.0], [0.0, 0.0, 0.0], [1.0, 0.0, 1.0]], np.eye(3)])
+    sign, logabsdet = (np.asarray(t) for t in on_mlx(lambda m: tuple(qb.linalg.slogdet(m)))(singular))
+    assert sign.tolist() == [0.0, 1.0] and logabsdet.tolist() == [-np.inf, 0.0]
+    assert np.asarray(on_mlx(qb.linalg.det)(singular)).tolist() == [0.0, 1.0]
+    for function, arguments in (
+        (qb.linalg.solve, (singular, f32(np.ones((2, 3, 1))))),
+        (qb.linalg.inv, (singular,)),
+        (qb.grad(lambda m: qb.linalg.slogdet(m).logabsdet.sum()), (singular,)),
+    ):
+        raises(ValueError, qb.jit(function), *arguments, match="non-singular")
+        raises(ValueError, on_mlx(function), *arguments, match="non-singular")
+    # Rank deficiency: the factorizations stay orthonormal and exact.
+    deficient = f32(rng.normal(size=(2, 6, 2)) @ rng.normal(size=(2, 2, 4)))
+    u, s, vh = (np.asarray(t, dtype=np.float64) for t in on_mlx(lambda m: tuple(qb.linalg.svd(m)))(deficient))
+    assert_close(s, np.linalg.svd(deficient.astype(np.float64), compute_uv=False), 1e-5)
+    assert_close((u * s[..., None, :]) @ vh, deficient, 1e-5)
+    assert_close(transposed(u) @ u, np.broadcast_to(np.eye(4), (2, 4, 4)), 1e-5)
+    q, r = (np.asarray(t, dtype=np.float64) for t in on_mlx(lambda m: tuple(qb.linalg.qr(m)))(deficient))
+    assert_close(q @ r, deficient, 1e-5)
+    assert_close(transposed(q) @ q, np.broadcast_to(np.eye(4), (2, 4, 4)), 1e-5)
+    assert np.all(np.diagonal(r, axis1=-2, axis2=-1) >= 0.0)
+    semidefinite = deficient[..., :4, :] @ transposed(deficient[..., :4, :])
+    assert_device_matches_cpu("mlx", lambda m: qb.linalg.eigh(m).eigenvalues, (semidefinite,), 1e-4)
+
+    # A non-finite matrix gives NaN outputs without disturbing its batch.
+    mixed = tall.copy()
+    mixed[1, 2, 1] = np.nan
+    square = symmetric[0, :2].copy()
+    square[0, 0, 0] = np.inf
+    for function, argument in (
+        (lambda m: tuple(qb.linalg.svd(m)), mixed),
+        (lambda m: tuple(qb.linalg.qr(m)), mixed),
+        (lambda m: tuple(qb.linalg.eigh(m)), square),
+        (lambda m: tuple(qb.linalg.slogdet(m)), square),
+    ):
+        for got, want in zip(on_mlx(function)(argument), qb.jit(function)(argument)):
+            got, want = np.asarray(got), np.asarray(want)
+            nonfinite = 1 if argument is mixed else 0
+            assert np.all(np.isnan(got[nonfinite])) and np.all(np.isnan(want[nonfinite]))
+            assert_close(got[1 - nonfinite], want[1 - nonfinite], 1e-4)
+
+    # float64 programs run in float32 on MLX and keep their logical dtype.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        assert_device_matches_cpu("mlx", qb.linalg.solve, (a.astype(np.float64), b.astype(np.float64)), 1e-4)
+        assert_device_matches_cpu("mlx", lambda m: tuple(qb.linalg.svd(m)), (tall.astype(np.float64),), 1e-4)
 
 
 if __name__ == "__main__":

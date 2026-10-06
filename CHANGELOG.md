@@ -34,7 +34,7 @@ deprecated names keep working until 1.0 (see
   stiff problems. It forms `df/dy` and `df/dt` by one batched forward-mode
   pass per step and solves with `W = I - h d J` by LU; step control,
   `rtol`/`atol`, `max_steps`, `info`, and the eager and `jit` behavior match
-  `dopri5`. It runs on the CPU and CUDA (MLX rejects `solve`) and is
+  `dopri5`. It runs on every backend and is
   reverse-mode differentiable, through the Jacobian, with respect to the
   initial state, time span, and parameters.
 - `odeint(saveat=ts)` for every method: the states at the times `ts`,
@@ -58,6 +58,15 @@ deprecated names keep working until 1.0 (see
   method, and general `p` norms are scaled likewise),
   `quabla.linalg.matrix_power`, and `quabla.linalg.pinv` (NumPy's
   `rtol=None` cutoff).
+- MLX runs `solve` and every `quabla.linalg` function (`solve_triangular`,
+  `cho_solve`, `slogdet`, `det`, `inv`, `eigh`, `qr`, `svd`, `lstsq`) and
+  their derivatives instead of raising `UnsupportedOperationError`. MLX
+  0.32.2 has LU, `eigh`, QR, and SVD only on its CPU stream, so LAPACK
+  factors there in `float32` and the CPU backend's conventions (eigenvalue
+  order, vector signs, the sign of `R`, the Householder completion of
+  complete and full bases, NaN for non-finite matrices) are applied on the
+  GPU stream; `solve` substitutes with the LU factors in a Metal kernel and
+  raises on an exactly zero pivot like the CPU, after reading back one flag.
 
 ### Changed
 

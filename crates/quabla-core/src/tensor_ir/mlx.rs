@@ -6,6 +6,8 @@
 
 #[path = "mlx_cholesky.rs"]
 mod cholesky_backend;
+#[path = "mlx_linalg.rs"]
+mod linalg_backend;
 #[path = "mlx_scatter.rs"]
 mod scatter_backend;
 
@@ -524,6 +526,7 @@ impl MlxBackend {
         let mut scan_cache: HashMap<usize, (Array, Array)> = HashMap::new();
         let mut scan_vjp_cache: HashMap<usize, MlxScanVjpEvaluation> = HashMap::new();
         let mut scan_vjp_jvp_cache: HashMap<usize, MlxScanVjpJvpEvaluation> = HashMap::new();
+        let mut factorizations = linalg_backend::Factorizations::default();
 
         for (node_id, node) in plan.nodes.iter().enumerate() {
             // Every array in this backend is f32; any logical dtype that cannot be demoted to f32
@@ -648,8 +651,11 @@ impl MlxBackend {
                     let carry_name = loop_plan.carry_name().to_string();
                     region_inputs.insert(carry_name.clone(), mlx_value(&values, *carry)?.clone());
                     loop {
-                        let predicate =
-                            mlx_execute_plan_output(self, loop_plan.predicate_plan(), &region_inputs)?;
+                        let predicate = mlx_execute_plan_output(
+                            self,
+                            loop_plan.predicate_plan(),
+                            &region_inputs,
+                        )?;
                         if !mlx_scalar_predicate(&predicate)? {
                             break;
                         }
@@ -682,9 +688,7 @@ impl MlxBackend {
                         body_inputs.insert(loop_plan.carry_name.clone(), carry);
                         body_inputs.insert(
                             loop_plan.index_name.clone(),
-                            mlx_array_from_dynamic(&DynamicTensor::filled(
-                                vec![], index as f64,
-                            )?)?,
+                            mlx_array_from_dynamic(&DynamicTensor::filled(vec![], index as f64)?)?,
                         );
                         let mut outputs = self.execute_arrays_with_retained(
                             &loop_plan.body.plan,
@@ -708,15 +712,13 @@ impl MlxBackend {
                     let captures = captures
                         .iter()
                         .map(|(name, node_id)| {
-                            mlx_value(&values, *node_id)
-                                .map(|value| (name.clone(), value.clone()))
+                            mlx_value(&values, *node_id).map(|value| (name.clone(), value.clone()))
                         })
                         .collect::<Result<BTreeMap<_, _>, _>>()?;
                     let tangents = tangent_captures
                         .iter()
                         .map(|(name, node_id)| {
-                            mlx_value(&values, *node_id)
-                                .map(|value| (name.clone(), value.clone()))
+                            mlx_value(&values, *node_id).map(|value| (name.clone(), value.clone()))
                         })
                         .collect::<Result<BTreeMap<_, _>, _>>()?;
                     mlx_fori_jvp(
@@ -839,7 +841,8 @@ impl MlxBackend {
                             body_inputs.insert(
                                 scan_plan.index_name.clone(),
                                 mlx_array_from_dynamic(&DynamicTensor::filled(
-                                    vec![], index as f64,
+                                    vec![],
+                                    index as f64,
                                 )?)?,
                             );
                             let values = self.execute_arrays_with_retained(
@@ -961,8 +964,7 @@ impl MlxBackend {
                             mlx_value(&values, *output_cotangent)?.clone(),
                             mlx_value(&values, *output_cotangent_tangent)?.clone(),
                         )?;
-                        scan_vjp_jvp_cache
-                            .insert(*group, MlxScanVjpJvpEvaluation { gradients });
+                        scan_vjp_jvp_cache.insert(*group, MlxScanVjpJvpEvaluation { gradients });
                     }
                     let cached = scan_vjp_jvp_cache.get(group).ok_or_else(|| {
                         format!("MLX Scan VJP JVP group {group} was not cached after evaluation")
@@ -971,9 +973,11 @@ impl MlxBackend {
                         super::TensorScanVjpTarget::Carry => &plan.scan_plan.carry_name,
                         super::TensorScanVjpTarget::External(name) => name,
                     };
-                    cached.gradients.get(name).cloned().ok_or_else(|| {
-                        format!("MLX Scan VJP JVP has no gradient for {name:?}")
-                    })
+                    cached
+                        .gradients
+                        .get(name)
+                        .cloned()
+                        .ok_or_else(|| format!("MLX Scan VJP JVP has no gradient for {name:?}"))
                 }
                 TensorOp::Tanh { input } => ops::tanh_device(mlx_value(&values, *input)?, &stream)
                     .map_err(|error| error.to_string()),
@@ -1056,9 +1060,8 @@ impl MlxBackend {
                 }
                 TensorOp::Erf { input } => ops::erf_device(mlx_value(&values, *input)?, &stream)
                     .map_err(|error| error.to_string()),
-                TensorOp::Erfc { input } => {
-                    mlx_erfc(mlx_value(&values, *input)?, &stream).map_err(|error| error.to_string())
-                }
+                TensorOp::Erfc { input } => mlx_erfc(mlx_value(&values, *input)?, &stream)
+                    .map_err(|error| error.to_string()),
                 TensorOp::Atan2 { y, x } => {
                     ops::atan2_device(mlx_value(&values, *y)?, mlx_value(&values, *x)?, &stream)
                         .map_err(|error| error.to_string())
@@ -1097,25 +1100,33 @@ impl MlxBackend {
                     .matmul_device(mlx_value(&values, *rhs)?, &stream)
                     .map_err(|error| error.to_string()),
                 TensorOp::Cholesky { input } => cholesky_backend::evaluate(
-                    &[mlx_value(&values, *input)?], &node.shape, None, &stream,
+                    &[mlx_value(&values, *input)?],
+                    &node.shape,
+                    None,
+                    &stream,
                 ),
                 TensorOp::CholeskyAd { inputs, kind } => {
-                    let operands = inputs.iter().map(|input| mlx_value(&values, *input)).collect::<Result<Vec<_>, _>>()?;
+                    let operands = inputs
+                        .iter()
+                        .map(|input| mlx_value(&values, *input))
+                        .collect::<Result<Vec<_>, _>>()?;
                     cholesky_backend::evaluate(&operands, &node.shape, Some(*kind), &stream)
                 }
-                TensorOp::Solve { .. } => {
-                    return Err(
-                        "MLX GPU backend does not yet support solve: MLX linalg::solve only accepts a CPU stream"
-                            .to_string(),
-                    )
-                }
-                TensorOp::Linalg { kind, .. } => {
-                    return Err(format!(
-                        "MLX GPU backend does not support {}: MLX's LU, eigh, QR, and SVD \
-                         factorizations only accept a CPU stream",
-                        kind.name()
-                    ))
-                }
+                TensorOp::Solve { matrix, rhs } => linalg_backend::solve(
+                    &mut factorizations,
+                    *matrix,
+                    mlx_value(&values, *matrix)?,
+                    mlx_value(&values, *rhs)?,
+                    &node.shape,
+                    &stream,
+                ),
+                TensorOp::Linalg { input, kind } => linalg_backend::evaluate(
+                    &mut factorizations,
+                    *input,
+                    mlx_value(&values, *input)?,
+                    *kind,
+                    &stream,
+                ),
                 TensorOp::Triangular { input, lower } => {
                     let input = mlx_value(&values, *input)?;
                     if *lower {

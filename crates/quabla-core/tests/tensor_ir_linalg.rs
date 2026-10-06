@@ -326,17 +326,21 @@ fn vmap_batches_linalg_and_solve_operands() -> Result<(), String> {
 }
 
 #[test]
-fn mlx_validation_rejects_linalg() -> Result<(), String> {
-    for kind in [LinalgKind::LogAbsDet, LinalgKind::EighVectors] {
+fn mlx_validation_accepts_solve_and_linalg() -> Result<(), String> {
+    for kind in [
+        LinalgKind::LogAbsDet,
+        LinalgKind::EighVectors,
+        LinalgKind::SvdUFull,
+    ] {
         let mut graph = TensorIr::new();
         let a = graph.input("a", vec![2, 2])?;
         let output = graph.linalg(a, kind)?;
-        let plan = graph.compile_cpu(output)?;
-        assert_eq!(
-            plan.validate_mlx().map_err(|(op, _)| op),
-            Err(kind.name().to_string())
-        );
+        assert_eq!(graph.compile_cpu(output)?.validate_mlx(), Ok(()));
     }
+    let mut graph = TensorIr::new();
+    let a = graph.input("a", vec![2, 2])?;
+    let solved = graph.solve(a, a)?;
+    assert_eq!(graph.compile_cpu(solved)?.validate_mlx(), Ok(()));
     Ok(())
 }
 
@@ -508,4 +512,240 @@ fn prod_axis_is_a_division_free_product_tree() -> Result<(), String> {
     let flags = graph.input_typed("flags", vec![3], TensorDType::Bool)?;
     assert!(graph.prod_axis(flags, 0).is_err());
     Ok(())
+}
+
+/// MLX lowering of `solve` and every `Linalg` kind through MLX's CPU-stream
+/// LAPACK factorizations, against the CPU kernels. MLX executes in float32,
+/// so the CPU reference runs on the same float32 inputs, and the tolerances
+/// cover float32 rounding for these well-conditioned matrices.
+#[cfg(all(feature = "mlx", target_os = "macos"))]
+mod mlx {
+    use super::*;
+    use quabla_core::tensor_ir::{MlxBackend, TensorBackend};
+
+    fn enabled() -> bool {
+        std::env::var_os("QUABLA_MLX_TEST").is_some()
+    }
+
+    /// Deterministic entries in `[-1, 1)` from a linear congruential sequence.
+    fn entries(count: usize, seed: u64) -> Vec<f64> {
+        let step = |state: u64| {
+            state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407)
+        };
+        let mut state = step(seed);
+        (0..count)
+            .map(|_| {
+                state = step(state);
+                ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// A float32 stack of shape `shape` whose square matrices have their
+    /// diagonal shifted by `2 sqrt(n)`, which keeps them well conditioned.
+    fn matrices(shape: &[usize], seed: u64) -> DynamicTensor {
+        let (m, n) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+        let mut data = entries(shape.iter().product(), seed);
+        if m == n {
+            for (index, value) in data.iter_mut().enumerate() {
+                if (index % (n * n)) % (n + 1) == 0 {
+                    *value += 2.0 * (n as f64).sqrt();
+                }
+            }
+        }
+        tensor(shape, &data).astype(TensorDType::F32)
+    }
+
+    /// The CPU value of `output` and the MLX result for the same plan.
+    fn cpu_and_mlx(
+        graph: &TensorIr,
+        output: TensorNodeId,
+        inputs: &[(&str, &DynamicTensor)],
+    ) -> Result<(DynamicTensor, Result<DynamicTensor, String>), String> {
+        let inputs = inputs
+            .iter()
+            .map(|(name, value)| (name.to_string(), (*value).clone()))
+            .collect::<BTreeMap<_, _>>();
+        let plan = graph.compile_cpu(output)?;
+        Ok((plan.evaluate(&inputs)?, MlxBackend.execute(&plan, &inputs)))
+    }
+
+    /// Elementwise agreement to `tolerance * max(1, |cpu|)`; NaN and the
+    /// infinities must match exactly.
+    fn assert_matches(cpu: &DynamicTensor, mlx: &DynamicTensor, tolerance: f64, context: &str) {
+        assert_eq!(cpu.shape(), mlx.shape(), "{context}");
+        for (index, (&host, &device)) in cpu.data().iter().zip(mlx.data().iter()).enumerate() {
+            let agree = if host.is_finite() {
+                (host - device).abs() <= tolerance * host.abs().max(1.0)
+            } else {
+                host == device || (host.is_nan() && device.is_nan())
+            };
+            assert!(
+                agree,
+                "{context} element {index}: MLX {device} vs CPU {host}"
+            );
+        }
+    }
+
+    const KINDS: [LinalgKind; 12] = [
+        LinalgKind::DetSign,
+        LinalgKind::LogAbsDet,
+        LinalgKind::EighValues,
+        LinalgKind::EighVectors,
+        LinalgKind::QrQ,
+        LinalgKind::QrR,
+        LinalgKind::QrQComplete,
+        LinalgKind::SvdU,
+        LinalgKind::SvdS,
+        LinalgKind::SvdVh,
+        LinalgKind::SvdUFull,
+        LinalgKind::SvdVhFull,
+    ];
+
+    /// `graph.linalg(a, kind)` on a float32 input of `shape`, or `None` for
+    /// a square-only kind of a rectangular shape.
+    fn linalg_graph(shape: &[usize], kind: LinalgKind) -> Option<(TensorIr, TensorNodeId)> {
+        let mut graph = TensorIr::new();
+        let input = graph
+            .input_typed("a", shape.to_vec(), TensorDType::F32)
+            .ok()?;
+        let output = graph.linalg(input, kind).ok()?;
+        Some((graph, output))
+    }
+
+    #[test]
+    fn mlx_linalg_kinds_match_the_cpu_conventions() -> Result<(), String> {
+        if !enabled() {
+            return Ok(());
+        }
+        let shapes: [&[usize]; 7] = [
+            &[1, 1],
+            &[3, 3],
+            &[2, 3, 5, 5],
+            &[5, 3],
+            &[3, 5],
+            &[2, 6, 2],
+            &[1, 4],
+        ];
+        for (seed, shape) in shapes.iter().enumerate() {
+            let a = matrices(shape, seed as u64);
+            for kind in KINDS {
+                let Some((graph, output)) = linalg_graph(shape, kind) else {
+                    continue;
+                };
+                let (cpu, mlx) = cpu_and_mlx(&graph, output, &[("a", &a)])?;
+                // Signs and the completed bases follow the CPU kernels, so
+                // every output is compared entry by entry.
+                assert_matches(&cpu, &mlx?, 2e-5, &format!("{} of {shape:?}", kind.name()));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mlx_solve_and_determinants_match_the_cpu_and_its_errors() -> Result<(), String> {
+        if !enabled() {
+            return Ok(());
+        }
+        let mut graph = TensorIr::new();
+        let a = graph.input_typed("a", vec![3, 4, 4], TensorDType::F32)?;
+        let b = graph.input_typed("b", vec![3, 4, 2], TensorDType::F32)?;
+        let solved = graph.solve(a, b)?;
+        let (matrix, rhs) = (matrices(&[3, 4, 4], 11), matrices(&[3, 4, 2], 12));
+        let (cpu, mlx) = cpu_and_mlx(&graph, solved, &[("a", &matrix), ("b", &rhs)])?;
+        assert_matches(&cpu, &mlx?, 2e-6, "batched solve");
+        // The CPU substitutes into a triangular matrix directly; MLX's LU
+        // pivots its rows first and reaches the same solution.
+        let mut lower = vec![0.0; 3 * 16];
+        for (index, value) in entries(3 * 16, 13).into_iter().enumerate() {
+            let (row, column) = ((index % 16) / 4, index % 4);
+            if column < row {
+                lower[index] = 3.0 * value;
+            } else if column == row {
+                lower[index] = 0.5 + value.abs();
+            }
+        }
+        let lower = tensor(&[3, 4, 4], &lower).astype(TensorDType::F32);
+        let (cpu, mlx) = cpu_and_mlx(&graph, solved, &[("a", &lower), ("b", &rhs)])?;
+        assert_matches(&cpu, &mlx?, 2e-5, "lower-triangular solve");
+        // An exactly singular member raises like the CPU.
+        let mut singular = matrix.data().to_vec();
+        for column in 0..4 {
+            singular[16 + 4 + column] = 2.0 * singular[16 + column];
+        }
+        let singular = tensor(&[3, 4, 4], &singular).astype(TensorDType::F32);
+        let (_, mlx) = cpu_and_mlx(&graph, solved, &[("a", &matrix), ("b", &rhs)])?;
+        assert!(mlx.is_ok());
+        let inputs = BTreeMap::from([("a".to_string(), singular), ("b".to_string(), rhs)]);
+        let plan = graph.compile_cpu(solved)?;
+        for error in [
+            plan.evaluate(&inputs)
+                .expect_err("the CPU rejects a singular matrix"),
+            MlxBackend
+                .execute(&plan, &inputs)
+                .expect_err("MLX rejects a singular matrix"),
+        ] {
+            assert!(error.contains("non-singular"), "{error}");
+        }
+
+        let mut graph = TensorIr::new();
+        let a = graph.input_typed("a", vec![5, 2, 2], TensorDType::F32)?;
+        let sign = graph.linalg(a, LinalgKind::DetSign)?;
+        let log_abs = graph.linalg(a, LinalgKind::LogAbsDet)?;
+        // A row swap, a positive determinant, exactly singular, NaN, and inf.
+        let cases = tensor(
+            &[5, 2, 2],
+            &[
+                1.0,
+                2.0,
+                3.0,
+                4.0,
+                2.0,
+                0.0,
+                0.0,
+                3.0,
+                1.0,
+                2.0,
+                2.0,
+                4.0,
+                f64::NAN,
+                0.0,
+                0.0,
+                1.0,
+                f64::INFINITY,
+                1.0,
+                1.0,
+                1.0,
+            ],
+        )
+        .astype(TensorDType::F32);
+        for output in [sign, log_abs] {
+            let (cpu, mlx) = cpu_and_mlx(&graph, output, &[("a", &cases)])?;
+            assert_matches(&cpu, &mlx?, 1e-6, "slogdet special cases");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mlx_linalg_maps_non_finite_matrices_to_nan() -> Result<(), String> {
+        if !enabled() {
+            return Ok(());
+        }
+        // The first matrix holds -inf and the second NaN; each becomes NaN
+        // in every output, as on the CPU, and the third stays finite.
+        let mut data = matrices(&[3, 3, 3], 5).data().to_vec();
+        data[2] = f64::NEG_INFINITY;
+        data[13] = f64::NAN;
+        let a = tensor(&[3, 3, 3], &data).astype(TensorDType::F32);
+        for kind in KINDS {
+            let Some((graph, output)) = linalg_graph(&[3, 3, 3], kind) else {
+                continue;
+            };
+            let (cpu, mlx) = cpu_and_mlx(&graph, output, &[("a", &a)])?;
+            assert_matches(&cpu, &mlx?, 2e-5, &format!("{} with NaN", kind.name()));
+        }
+        Ok(())
+    }
 }

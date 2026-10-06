@@ -15135,13 +15135,12 @@ impl TensorExecutionPlan {
                 return Err(("shape".into(), "MLX shape extent exceeds i32".into()));
             }
             match &node.op {
-                TensorOp::Solve { .. } => return Err(("solve".into(),
-                    "MLX GPU backend does not yet support solve: MLX linalg::solve only accepts a CPU stream".into())),
-                TensorOp::Linalg { kind, .. } => return Err((kind.name().into(), format!(
-                    "MLX GPU backend does not support {}: MLX's LU, eigh, QR, and SVD \
-                     factorizations only accept a CPU stream", kind.name()))),
-                TensorOp::ScalarConstant { value } if !value.is_finite() => return Err((
-                    "constant".into(), "MLX backend does not support non-finite constants".into())),
+                TensorOp::ScalarConstant { value } if !value.is_finite() => {
+                    return Err((
+                        "constant".into(),
+                        "MLX backend does not support non-finite constants".into(),
+                    ))
+                }
                 TensorOp::Cond { branches, .. } => {
                     branches.on_true.plan.validate_mlx()?;
                     branches.on_false.plan.validate_mlx()?;
@@ -15159,12 +15158,16 @@ impl TensorExecutionPlan {
                         gradient.validate_mlx()?;
                     }
                 }
-                TensorOp::Scan { scan_plan, .. }
-                | TensorOp::ScanVjp { scan_plan, .. } => scan_plan.body.plan.validate_mlx()?,
+                TensorOp::Scan { scan_plan, .. } | TensorOp::ScanVjp { scan_plan, .. } => {
+                    scan_plan.body.plan.validate_mlx()?
+                }
                 TensorOp::ScanVjpJvp { plan, .. } => {
                     plan.scan_plan.body.plan.validate_mlx()?;
-                    for gradient in plan.carry_gradient_tangent_plans.values()
-                        .chain(plan.output_gradient_tangent_plans.values()) {
+                    for gradient in plan
+                        .carry_gradient_tangent_plans
+                        .values()
+                        .chain(plan.output_gradient_tangent_plans.values())
+                    {
                         gradient.validate_mlx()?;
                     }
                 }
