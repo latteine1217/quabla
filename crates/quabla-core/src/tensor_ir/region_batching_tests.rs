@@ -160,15 +160,18 @@ fn a_scan_capture_that_only_feeds_outputs_leaves_the_carry_unmapped() -> Result<
     };
     assert_eq!(axes, &vec![1, 0, 2]);
     assert_eq!(graph.nodes[*input].shape, vec![5, BATCH, 3]);
-    let TensorOp::Scan {
-        scan_plan, group, ..
-    } = &graph.nodes[final_carry].op
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::Scan {
+            scan_plan, group, ..
+        },
+        ..
+    }) = &graph.nodes[final_carry].op
     else {
         panic!("expected a batched scan node");
     };
     // Both results come from one batched scan.
     assert!(
-        matches!(&graph.nodes[*input].op, TensorOp::Scan { group: other, .. } if other == group)
+        matches!(&graph.nodes[*input].op, TensorOp::Region(RegionNode { kind: RegionKind::Scan { group: other, .. }, .. }) if other == group)
     );
     let body = &scan_plan.body.plan;
     assert_eq!(body.input_shape("carry")?, vec![3]);

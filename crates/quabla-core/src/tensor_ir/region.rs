@@ -15,7 +15,7 @@
 
 use super::{
     TensorCondExecutionPlan, TensorExecutionPlan, TensorForiExecutionPlan, TensorNodeId, TensorOp,
-    TensorWhileExecutionPlan,
+    TensorScanExecutionPlan, TensorScanTarget, TensorWhileExecutionPlan,
 };
 
 /// Matches every region node of [`TensorOp`].
@@ -23,7 +23,6 @@ macro_rules! region_op {
     () => {
         TensorOp::ForiVjp { .. }
             | TensorOp::ForiVjpJvp { .. }
-            | TensorOp::Scan { .. }
             | TensorOp::ScanVjp { .. }
             | TensorOp::ScanVjpJvp { .. }
             | TensorOp::Region(_)
@@ -75,6 +74,13 @@ pub(super) enum RegionKind {
         carry_tangent: TensorNodeId,
         loop_plan: TensorForiExecutionPlan,
     },
+    /// One selected result of a shared fixed-bound `Scan` execution.
+    Scan {
+        carry: TensorNodeId,
+        scan_plan: TensorScanExecutionPlan,
+        target: TensorScanTarget,
+        group: usize,
+    },
 }
 
 impl RegionNode {
@@ -85,6 +91,7 @@ impl RegionNode {
             RegionKind::While { .. } => "while",
             RegionKind::Fori { .. } => "fori",
             RegionKind::ForiJvp { .. } => "fori_jvp",
+            RegionKind::Scan { .. } => "scan",
         }
     }
 
@@ -95,6 +102,7 @@ impl RegionNode {
             RegionKind::While { .. } => "While",
             RegionKind::Fori { .. } => "Fori",
             RegionKind::ForiJvp { .. } => "Fori JVP",
+            RegionKind::Scan { .. } => "Scan",
         }
     }
 
@@ -109,6 +117,7 @@ impl RegionNode {
                 carry_tangent,
                 ..
             } => vec![carry, carry_tangent],
+            RegionKind::Scan { carry, .. } => vec![carry],
         }
     }
 
@@ -132,6 +141,7 @@ impl RegionNode {
                 carry_tangent,
                 ..
             } => vec![carry, carry_tangent],
+            RegionKind::Scan { carry, .. } => vec![carry],
         };
         operands.extend(self.captures.iter_mut().map(|(_, node_id)| node_id));
         operands.extend(self.tangent_captures.iter_mut().map(|(_, node_id)| node_id));
@@ -142,12 +152,18 @@ impl RegionNode {
     /// execution (one result each): the node id of the group's first
     /// member. `None` for the single-result kinds.
     pub(super) fn group(&self) -> Option<usize> {
-        None
+        match self.kind {
+            RegionKind::Scan { group, .. } => Some(group),
+            _ => None,
+        }
     }
 
     /// The group, mutably; see [`Self::group`].
     pub(super) fn group_mut(&mut self) -> Option<&mut usize> {
-        None
+        match &mut self.kind {
+            RegionKind::Scan { group, .. } => Some(group),
+            _ => None,
+        }
     }
 
     /// The traced body regions, in execution order: both branches of a
@@ -162,6 +178,7 @@ impl RegionNode {
             }
             RegionKind::Fori { loop_plan, .. } => vec![&loop_plan.body.plan],
             RegionKind::ForiJvp { loop_plan, .. } => vec![&loop_plan.body.plan],
+            RegionKind::Scan { scan_plan, .. } => vec![&scan_plan.body.plan],
         }
     }
 
@@ -197,7 +214,6 @@ impl<'a> RegionView<'a> {
         match self.op {
             TensorOp::ForiVjp { .. } => "fori_vjp",
             TensorOp::ForiVjpJvp { .. } => "fori_vjp_jvp",
-            TensorOp::Scan { .. } => "scan",
             TensorOp::ScanVjp { .. } => "scan_vjp",
             TensorOp::ScanVjpJvp { .. } => "scan_vjp_jvp",
             TensorOp::Region(region) => region.name(),
@@ -210,7 +226,6 @@ impl<'a> RegionView<'a> {
         match self.op {
             TensorOp::ForiVjp { .. } => "Fori VJP",
             TensorOp::ForiVjpJvp { .. } => "Fori VJP JVP",
-            TensorOp::Scan { .. } => "Scan",
             TensorOp::ScanVjp { .. } => "Scan VJP",
             TensorOp::ScanVjpJvp { .. } => "Scan VJP JVP",
             TensorOp::Region(region) => region.label(),
@@ -229,7 +244,6 @@ impl<'a> RegionView<'a> {
         match self.op {
             TensorOp::ForiVjp { captures, .. } => captures,
             TensorOp::ForiVjpJvp { captures, .. } => captures,
-            TensorOp::Scan { captures, .. } => captures,
             TensorOp::ScanVjp { captures, .. } => captures,
             TensorOp::ScanVjpJvp { captures, .. } => captures,
             TensorOp::Region(region) => &region.captures,
@@ -273,7 +287,6 @@ impl<'a> RegionView<'a> {
                 output_cotangent,
                 output_cotangent_tangent,
             ],
-            TensorOp::Scan { carry, .. } => vec![carry],
             TensorOp::ScanVjp {
                 carry,
                 final_carry_cotangent,
@@ -311,7 +324,6 @@ impl<'a> RegionView<'a> {
         match self.op {
             TensorOp::ForiVjp { group, .. } => Some(*group),
             TensorOp::ForiVjpJvp { group, .. } => Some(*group),
-            TensorOp::Scan { group, .. } => Some(*group),
             TensorOp::ScanVjp { group, .. } => Some(*group),
             TensorOp::ScanVjpJvp { group, .. } => Some(*group),
             TensorOp::Region(region) => region.group(),
@@ -325,7 +337,6 @@ impl<'a> RegionView<'a> {
         match self.op {
             TensorOp::ForiVjp { loop_plan, .. } => vec![&loop_plan.body.plan],
             TensorOp::ForiVjpJvp { plan, .. } => vec![&plan.loop_plan.body.plan],
-            TensorOp::Scan { scan_plan, .. } => vec![&scan_plan.body.plan],
             TensorOp::ScanVjp { scan_plan, .. } => vec![&scan_plan.body.plan],
             TensorOp::ScanVjpJvp { plan, .. } => vec![&plan.scan_plan.body.plan],
             TensorOp::Region(region) => region.regions(),
@@ -376,9 +387,6 @@ pub(super) fn region_operands_mut(op: &mut TensorOp) -> Option<Vec<&mut TensorNo
             captures,
             Some(tangent_captures),
         ),
-        TensorOp::Scan {
-            carry, captures, ..
-        } => (vec![carry], captures, None),
         TensorOp::ScanVjp {
             carry,
             final_carry_cotangent,
@@ -434,7 +442,6 @@ pub(super) fn group_mut(op: &mut TensorOp) -> Option<&mut usize> {
     match op {
         TensorOp::ForiVjp { group, .. }
         | TensorOp::ForiVjpJvp { group, .. }
-        | TensorOp::Scan { group, .. }
         | TensorOp::ScanVjp { group, .. }
         | TensorOp::ScanVjpJvp { group, .. }
         | TensorOp::Custom { group, .. } => Some(group),

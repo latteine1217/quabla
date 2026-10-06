@@ -457,7 +457,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
                 vec![forward, reverse],
             ))
         }
-        TensorOp::Scan { scan_plan, .. } => Ok((
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::Scan { scan_plan, .. },
+            ..
+        }) => Ok((
             HostLoopKind::Scan {
                 names: loop_names(
                     scan_plan.lower,
@@ -872,7 +875,11 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 fori_vjp_results(&mut host, plan, &members, &names.carry, gradients)
             }
             HostLoopKind::Scan { names } => {
-                let TensorOp::Scan { carry, .. } = op else {
+                let TensorOp::Region(RegionNode {
+                    kind: RegionKind::Scan { carry, .. },
+                    ..
+                }) = op
+                else {
                     return Err(mismatch(node_id));
                 };
                 let index = LoopIndex::new(&mut host, names)?;
@@ -904,7 +911,11 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 members
                     .iter()
                     .map(|member| {
-                        let TensorOp::Scan { target, .. } = &plan.nodes[*member].op else {
+                        let TensorOp::Region(RegionNode {
+                            kind: RegionKind::Scan { target, .. },
+                            ..
+                        }) = &plan.nodes[*member].op
+                        else {
                             return Err(mismatch(*member));
                         };
                         let buffer = match target {
@@ -1107,7 +1118,11 @@ fn named_values<'a, T: CudaReal>(
 }
 
 fn scan_output_count(op: &TensorOp) -> Result<usize, String> {
-    let TensorOp::Scan { scan_plan, .. } = op else {
+    let TensorOp::Region(RegionNode {
+        kind: RegionKind::Scan { scan_plan, .. },
+        ..
+    }) = op
+    else {
         return Err("CUDA host-driven Scan node is not a Scan".to_string());
     };
     element_count(&scan_plan.body.output_shapes()[1])

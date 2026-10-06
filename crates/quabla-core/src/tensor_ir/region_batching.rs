@@ -521,13 +521,17 @@ impl TensorIr {
                     Ok(members)
                 },
             ),
-            TensorOp::Scan {
-                carry,
-                scan_plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::Scan {
+                        carry,
+                        scan_plan,
+                        target,
+                        group,
+                    },
                 captures,
-                target,
-                group,
-            } => {
+                ..
+            }) => {
                 let target = match target {
                     TensorScanTarget::Carry => LoopTarget::Carry,
                     TensorScanTarget::Outputs => LoopTarget::Outputs,

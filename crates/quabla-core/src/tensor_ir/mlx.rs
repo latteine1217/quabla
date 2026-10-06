@@ -962,13 +962,17 @@ impl MlxBackend {
                         .cloned()
                         .ok_or_else(|| format!("MLX Fori VJP JVP has no gradient for {name:?}"))
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_cache.contains_key(group) {
                         let external_captures = captures
                             .iter()

@@ -635,14 +635,6 @@ enum TensorOp {
         target: TensorForiVjpTarget,
         group: usize,
     },
-    /// One selected result of a shared fixed-bound `Scan` execution.
-    Scan {
-        carry: TensorNodeId,
-        scan_plan: TensorScanExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-        target: TensorScanTarget,
-        group: usize,
-    },
     /// One selected result of a shared fixed-bound `Scan` reverse pass.
     ScanVjp {
         carry: TensorNodeId,
@@ -3322,7 +3314,10 @@ impl TensorIr {
             })
             | TensorOp::ForiVjp { .. }
             | TensorOp::ForiVjpJvp { .. }
-            | TensorOp::Scan { .. }
+            | TensorOp::Region(RegionNode {
+                kind: RegionKind::Scan { .. },
+                ..
+            })
             | TensorOp::ScanVjp { .. }
             | TensorOp::ScanVjpJvp { .. }
             | TensorOp::Region(RegionNode {
@@ -3763,13 +3758,17 @@ impl TensorIr {
                         "symbolic JVP through a Fori VJP JVP result is not implemented".to_string(),
                     );
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_jvp_results.contains_key(group) {
                         let result = symbolic_jvp_scan(
                             &mut transformed,
@@ -4300,13 +4299,17 @@ impl TensorIr {
                         "symbolic VJP through a Fori VJP JVP result is not implemented".to_string(),
                     );
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_values.contains_key(group) {
                         let carry = values.get(*carry).copied().ok_or_else(|| {
                             format!("scan carry node {carry} has no symbolic value")
@@ -4570,22 +4573,30 @@ impl TensorIr {
                         "symbolic VJP through a Fori VJP JVP result is not implemented".to_string(),
                     );
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            group,
+                            ..
+                        },
                     captures,
-                    group,
                     ..
-                } => {
+                }) => {
                     if processed_scan_groups.insert(*group) {
                         let mut carry_upstream = None;
                         let mut output_upstream = None;
                         for (scan_node_id, scan_node) in self.nodes.iter().enumerate() {
-                            let TensorOp::Scan {
-                                target,
-                                group: candidate_group,
+                            let TensorOp::Region(RegionNode {
+                                kind:
+                                    RegionKind::Scan {
+                                        target,
+                                        group: candidate_group,
+                                        ..
+                                    },
                                 ..
-                            } = &scan_node.op
+                            }) = &scan_node.op
                             else {
                                 continue;
                             };
@@ -5848,25 +5859,31 @@ impl TensorIr {
             .node_dtype(scan_plan.body.plan.output_node_ids[1])?;
         let group = self.nodes.len();
         let carry_id = self.push_node(
-            TensorOp::Scan {
-                carry,
-                scan_plan: scan_plan.clone(),
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Scan {
+                    carry,
+                    scan_plan: scan_plan.clone(),
+                    target: TensorScanTarget::Carry,
+                    group,
+                },
                 captures: captures.clone(),
-                target: TensorScanTarget::Carry,
-                group,
-            },
+                tangent_captures: Vec::new(),
+            }),
             carry_shape,
             carry_dtype,
             false,
         );
         let outputs_id = self.push_node(
-            TensorOp::Scan {
-                carry,
-                scan_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::Scan {
+                    carry,
+                    scan_plan,
+                    target: TensorScanTarget::Outputs,
+                    group,
+                },
                 captures,
-                target: TensorScanTarget::Outputs,
-                group,
-            },
+                tangent_captures: Vec::new(),
+            }),
             output_shape,
             output_dtype,
             false,
@@ -7836,23 +7853,31 @@ impl TensorIr {
                         "direct VJP through a Fori VJP JVP result is not implemented".to_string(),
                     )
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            group,
+                            ..
+                        },
                     captures,
-                    group,
                     ..
-                } => {
+                }) => {
                     if processed_scan_groups.insert(*group) {
                         let mut current_cotangent = Some(cotangent);
                         let mut carry_cotangent = None;
                         let mut output_cotangent = None;
                         for (scan_node_id, scan_node) in self.nodes.iter().enumerate() {
-                            let TensorOp::Scan {
-                                target,
-                                group: candidate_group,
+                            let TensorOp::Region(RegionNode {
+                                kind:
+                                    RegionKind::Scan {
+                                        target,
+                                        group: candidate_group,
+                                        ..
+                                    },
                                 ..
-                            } = &scan_node.op
+                            }) = &scan_node.op
                             else {
                                 continue;
                             };
@@ -8519,13 +8544,17 @@ impl TensorIr {
                 TensorOp::ForiVjpJvp { .. } => {
                     return Err("JVP through a Fori VJP JVP result is not implemented".to_string())
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_jvp_cache.contains_key(group) {
                         let external_inputs = tensor_fori_capture_values(captures, &values)?;
                         let external_tangents = tensor_fori_capture_values(captures, &tangents)?;
@@ -8851,7 +8880,10 @@ impl TensorIr {
                 }) | TensorOp::Region(RegionNode {
                     kind: RegionKind::Fori { .. },
                     ..
-                }) | TensorOp::Scan { .. }
+                }) | TensorOp::Region(RegionNode {
+                    kind: RegionKind::Scan { .. },
+                    ..
+                })
             )
         }) {
             return self.symbolic_hessian_scalar_through_regions(output, input_name, inputs);
@@ -8949,7 +8981,10 @@ impl TensorIr {
                 }) | TensorOp::Region(RegionNode {
                     kind: RegionKind::Fori { .. },
                     ..
-                }) | TensorOp::Scan { .. }
+                }) | TensorOp::Region(RegionNode {
+                    kind: RegionKind::Scan { .. },
+                    ..
+                })
             )
         }) {
             return self.symbolic_hvp_scalar_through_regions(
@@ -9264,13 +9299,7 @@ impl TensorIr {
                     "%{id} = fori_vjp_jvp(group={group}, target={target:?}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::Scan {
-                    scan_plan,
-                    captures,
-                    target,
-                    group,
-                    ..
-                } => format!(
+                TensorOp::Region(RegionNode { kind: RegionKind::Scan { scan_plan, target, group, .. }, captures, .. }) => format!(
                     "%{id} = scan(group={group}, target={target:?}, lower={}, upper={}, captures={captures:?}, body_nodes={}) : {}",
                     scan_plan.lower,
                     scan_plan.upper,
@@ -10022,13 +10051,17 @@ impl TensorIr {
                         .cloned()
                         .ok_or_else(|| format!("fori VJP JVP has no gradient for {name:?}"))?
                 }
-                TensorOp::Scan {
-                    carry,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::Scan {
+                            carry,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_cache.contains_key(group) {
                         let external_inputs = tensor_forward_capture_values(captures, &values)?;
                         let (carry, outputs) = scan_plan.evaluate(
@@ -10851,7 +10884,7 @@ impl TensorIr {
                     "mixed differentiation through Fori VJP JVP results is not implemented"
                         .to_string(),
                 ),
-                TensorOp::Scan { .. } => return Err(
+                TensorOp::Region(RegionNode { kind: RegionKind::Scan { .. }, .. }) => return Err(
                     "mixed second-order differentiation through Scan regions is not implemented"
                         .to_string(),
                 ),

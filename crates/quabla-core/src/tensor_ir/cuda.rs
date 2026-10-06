@@ -921,7 +921,10 @@ pub(super) fn cuda_fused_loop_lowering(op: &TensorOp) -> Option<Result<(), Strin
             loop_plan, target, ..
         } => cuda_fori_vjp_plan(loop_plan, target).map(|_| ()),
         TensorOp::ForiVjpJvp { plan, .. } => cuda_fori_vjp_jvp_is_lowerable(plan),
-        TensorOp::Scan { scan_plan, .. } => cuda_scan_body_is_lowerable(scan_plan),
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::Scan { scan_plan, .. },
+            ..
+        }) => cuda_scan_body_is_lowerable(scan_plan),
         TensorOp::ScanVjp {
             scan_plan, target, ..
         } => cuda_scan_vjp_plans(scan_plan, target).map(|_| ()),
@@ -2550,13 +2553,17 @@ fn execute_cuda_device_program<T: CudaReal>(
                 )?;
                 continue;
             }
-            TensorOp::Scan {
-                carry,
-                scan_plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::Scan {
+                        carry,
+                        scan_plan,
+                        target,
+                        group,
+                    },
                 captures,
-                target,
-                group,
-            } => {
+                ..
+            }) => {
                 let (before, current_and_after) = values.split_at_mut(node_id);
                 let slot = current_and_after.first_mut().ok_or_else(|| {
                     format!("CUDA Scan node {node_id} is missing its buffer slot")
@@ -7896,9 +7903,7 @@ fn cuda_program_source(
                 target,
                 ..
             } => cuda_fori_vjp_jvp_node_kernel_source(node_id, plan, captures, target)?,
-            TensorOp::Scan {
-                scan_plan, captures, ..
-            } => cuda_scan_node_kernel_source(node_id, scan_plan, captures)?,
+            TensorOp::Region(RegionNode { kind: RegionKind::Scan { scan_plan, .. }, captures, .. }) => cuda_scan_node_kernel_source(node_id, scan_plan, captures)?,
             TensorOp::ScanVjp {
                 scan_plan,
                 captures,
@@ -9682,7 +9687,7 @@ mod region_batching_tests {
                     // `[B, 2, n]`, which the packed-pair kernel (pair axis
                     // leading) does not lower, so it alone runs host-driven.
                     let batched_packed_scan = |id: &TensorNodeId| {
-                        matches!(&plan.nodes[*id].op, TensorOp::Scan { scan_plan, .. }
+                        matches!(&plan.nodes[*id].op, TensorOp::Region(RegionNode { kind: RegionKind::Scan { scan_plan, .. }, .. })
                             if cuda_scan_uses_packed_halves(scan_plan)
                                 && scan_plan.carry_shape().is_ok_and(|shape| shape.get(1) == Some(&2)))
                     };
