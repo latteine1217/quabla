@@ -5,8 +5,11 @@
 //! its primal graph is spliced in as ordinary nodes, and each primal output
 //! is wrapped in a `Custom` node that names the rule and the operands the
 //! rule differentiates with respect to. The node is the identity on its
-//! primal value, so plan compilation aliases it away and no backend ever
-//! executes it. Only the symbolic transforms look through it:
+//! primal value, so plan compilation aliases it away. A control-flow region
+//! body keeps its `Custom` nodes (`TensorIr::compile_region`), because the
+//! region's derivatives are built from the frozen body later; the backends
+//! evaluate such a node as the identity. Only the symbolic transforms look
+//! through it:
 //!
 //! - reverse mode splices the rule's forward graph (primal outputs and
 //!   residuals) in place of the primal value, then its backward graph, which
@@ -661,8 +664,7 @@ impl TensorIr {
     }
 
     /// The name of the rule of the first `Custom` node that `outputs`
-    /// depend on, if any. Control-flow regions reject such bodies, since a
-    /// compiled region no longer carries the rule.
+    /// depend on, if any.
     pub fn custom_rule_name(&self, outputs: &[TensorNodeId]) -> Result<Option<String>, String> {
         let reachable = self.reachable_from(outputs)?;
         Ok(self

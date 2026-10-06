@@ -7489,6 +7489,35 @@ impl TensorIr {
         &self,
         outputs: &[TensorNodeId],
     ) -> Result<(TensorExecutionPlan, Vec<TensorNodeId>), String> {
+        self.compile_plan(outputs, false)
+    }
+
+    /// Compiles the body of a control-flow region (a `cond` branch, a loop
+    /// body or predicate): [`Self::compile_cpu_many`], except that `Custom`
+    /// nodes stay in the plan instead of being aliased to their values.
+    ///
+    /// A region's derivatives are built later from its frozen plan, so the
+    /// plan must still carry the custom rules of the functions its body
+    /// calls; every backend evaluates a `Custom` node as the identity on its
+    /// value, as it does `stop_gradient`.
+    pub fn compile_region_many(
+        &self,
+        outputs: &[TensorNodeId],
+    ) -> Result<(TensorExecutionPlan, Vec<TensorNodeId>), String> {
+        self.compile_plan(outputs, true)
+    }
+
+    /// [`Self::compile_region_many`] with one output.
+    pub fn compile_region(&self, output: TensorNodeId) -> Result<TensorExecutionPlan, String> {
+        let (plan, _) = self.compile_region_many(&[output])?;
+        Ok(plan)
+    }
+
+    fn compile_plan(
+        &self,
+        outputs: &[TensorNodeId],
+        keep_custom: bool,
+    ) -> Result<(TensorExecutionPlan, Vec<TensorNodeId>), String> {
         if outputs.is_empty() {
             return Err("execution plan requires at least one output".to_string());
         }
@@ -7525,10 +7554,13 @@ impl TensorIr {
             let source_inputs = tensor_op_inputs(&node.op);
             let compiled_id = (|| -> Result<TensorNodeId, String> {
                 let mut op = remap_tensor_op(&node.op, &|id| remap.get(id))?;
-                if let Some(alias) =
-                    canonicalize_tensor_op(&mut op, &node.shape, node.dtype, &nodes)?
-                {
-                    return Ok(alias);
+                let retained_custom = keep_custom && matches!(op, TensorOp::Custom { .. });
+                if !retained_custom {
+                    if let Some(alias) =
+                        canonicalize_tensor_op(&mut op, &node.shape, node.dtype, &nodes)?
+                    {
+                        return Ok(alias);
+                    }
                 }
                 if let Some(value) = fold_scalar_constant_op(&op, &nodes) {
                     // Folded values are rounded to the node dtype, matching per-node execution
@@ -11451,8 +11483,8 @@ fn symbolic_jvp_while_plan(
     )?;
     Ok((
         TensorWhileExecutionPlan::new(
-            augmented.compile_cpu(keep_going)?,
-            augmented.compile_cpu(next_packed)?,
+            augmented.compile_region(keep_going)?,
+            augmented.compile_region(next_packed)?,
             packed_name,
         )?,
         tangent_names,
@@ -11616,7 +11648,7 @@ fn symbolic_jvp_scan_plan(
         symbolic_pack_tensor_pair(&mut augmented, carry_value, carry_tangent, &carry_shape)?;
     let packed_output =
         symbolic_pack_tensor_pair(&mut augmented, output_value, output_tangent, &output_shape)?;
-    let (body_plan, _) = augmented.compile_cpu_many(&[packed_carry, packed_output])?;
+    let (body_plan, _) = augmented.compile_region_many(&[packed_carry, packed_output])?;
     Ok((
         TensorScanExecutionPlan::new(
             scan_plan.lower,
@@ -11637,13 +11669,22 @@ fn symbolic_clone_with_input_replacements(
 ) -> Result<TensorNodeId, String> {
     source.node(output)?;
     let mut remap = HashMap::new();
+    // A source may be cloned more than once into one destination (the value
+    // and the tangent of a packed loop body), so each clone of a custom call
+    // gets its own group, the id of its first node, as `inline` gives it.
+    let mut custom_groups = HashMap::new();
     for (node_id, node) in source.nodes.iter().enumerate() {
         let mapped = match &node.op {
             TensorOp::Input { name } => replacements.get(name).copied().ok_or_else(|| {
                 format!("symbolic Fori JVP is missing input replacement {name:?}")
             })?,
             _ => {
-                let op = remap_tensor_op(&node.op, &|id| remap.get(&id).copied())?;
+                let mut op = remap_tensor_op(&node.op, &|id| remap.get(&id).copied())?;
+                if let TensorOp::Custom { group, .. } = &mut op {
+                    *group = *custom_groups
+                        .entry(*group)
+                        .or_insert(destination.nodes.len());
+                }
                 destination.push_node(op, node.shape.clone(), node.dtype, node.weak)
             }
         };
@@ -11715,7 +11756,7 @@ fn symbolic_jvp_region(
     let input_names = symbolic_region_input_names(&graph);
     let value = symbolic_retain_region_inputs(&mut graph, &input_names, transformed.value)?;
     let tangent = symbolic_retain_region_inputs(&mut graph, &input_names, transformed.tangent)?;
-    Ok((graph.compile_cpu(value)?, graph.compile_cpu(tangent)?))
+    Ok((graph.compile_region(value)?, graph.compile_region(tangent)?))
 }
 
 fn symbolic_cond_tangent_names(
@@ -12163,7 +12204,7 @@ fn symbolic_vjp_region(
         .into_iter()
         .map(|(name, mut output)| {
             output = symbolic_retain_region_inputs(&mut graph, &input_names, output)?;
-            graph.compile_cpu(output).map(|plan| (name, plan))
+            graph.compile_region(output).map(|plan| (name, plan))
         })
         .collect()
 }
@@ -16007,8 +16048,9 @@ fn tensor_op_group(op: &TensorOp) -> Option<usize> {
 /// The group of a multi-result node, mutably: a region execution group
 /// ([`RegionNode::group`]) or the call group of a `Custom` node. Both are the
 /// node id of the group's first member, so splicing renumbers them alike.
-/// Only region groups are executed; plan compilation aliases `Custom`
-/// nodes, so the evaluators' group caches never see a call group.
+/// Only region groups are executed: the evaluators' group caches are kept
+/// per region kind, and a `Custom` node (kept only in region bodies) is
+/// evaluated as the identity on its value.
 fn tensor_op_group_mut(op: &mut TensorOp) -> Option<&mut usize> {
     match op {
         TensorOp::Region(region) => region.group_mut(),

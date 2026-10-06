@@ -242,6 +242,10 @@ On CUDA, a host-driven iteration costs tens of microseconds, so long loops
 with tiny bodies are launch-bound. See
 [Devices](10-devices.md#104-cuda) for the exact rules on which bodies fuse.
 
-Calling a `custom_vjp`, `custom_jvp`, or `checkpoint` function, or a solver
-from Chapter 8, inside a `cond`, `fori_loop`, or `scan` body raises
-`ValueError`, because compiled regions do not keep custom rules.
+A `cond`, `fori_loop`, `scan`, or `while_loop` body may call a
+`custom_vjp`, `custom_jvp`, or `checkpoint` function, or a solver from
+Chapter 8: the compiled region keeps the custom rule, so the derivatives of
+the region apply it, as they do outside control flow. Forward mode through a
+body that calls a `custom_vjp` function needs the function's forward-mode
+rule (the solvers of Chapter 8 have one), and a `while_loop` body is still
+differentiated in forward mode only.

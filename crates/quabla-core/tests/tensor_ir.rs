@@ -14127,6 +14127,84 @@ fn custom_rule_node_batches_with_its_rule() {
     assert_eq!(must!(plan.evaluate(&inputs)).data().to_vec(), vec![3.0; 6]);
 }
 
+/// `fori(0, 3, carry + custom_square(x))` with `x` a capture: the body is
+/// compiled as a region, which keeps its `Custom` node.
+fn fori_with_custom_body() -> Result<(TensorIr, TensorNodeId), String> {
+    let rule = custom_square_rule()?;
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![2])?;
+    body.input("index", vec![])?;
+    let x = body.input("x", vec![2])?;
+    let value = body.mul(x, x)?;
+    let wrapped = body.custom(rule, &[value], &[x])?;
+    let next = body.add(carry, wrapped[0])?;
+    let plan = body.compile_region(next)?;
+    if !plan.lower_text().contains("custom") {
+        return Err(format!(
+            "region body lost its custom node:\n{}",
+            plan.lower_text()
+        ));
+    }
+    let loop_plan = TensorForiExecutionPlan::new(0, 3, plan, "carry", "index")?;
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![2])?;
+    let output = graph.fori(x, loop_plan, vec![("x".to_string(), x)])?;
+    let loss = graph.sum(output)?;
+    Ok((graph, loss))
+}
+
+#[test]
+fn custom_rule_in_a_loop_body_is_applied_by_the_loop_derivatives() {
+    let (graph, loss) = must!(fori_with_custom_body());
+    let inputs = BTreeMap::from([(
+        "x".to_string(),
+        must!(DynamicTensor::new(vec![2], vec![2.0, -1.0])),
+    )]);
+    // The value is x + 3 x^2; the node is the identity on its value.
+    let plan = must!(graph.compile_cpu(loss));
+    assert_eq!(must!(plan.evaluate(&inputs)).data().to_vec(), vec![16.0]);
+    // d/dx: 1 from the initial carry plus the rule's 3 per iteration, not
+    // the 2 x of the function.
+    let vjp = must!(graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)]));
+    let plan = must!(vjp.graph.compile_cpu(vjp.gradients["x"]));
+    assert_eq!(
+        must!(plan.evaluate(&inputs)).data().to_vec(),
+        vec![10.0, 10.0]
+    );
+    // The rule has no tangent graph, so forward mode through the loop fails
+    // as it does at the top level (when the loop JVP plan is built, on first
+    // use).
+    let tangents = BTreeMap::from([("x".to_string(), "dx".to_string())]);
+    let mut tangent_inputs = inputs.clone();
+    tangent_inputs.insert(
+        "dx".to_string(),
+        must!(DynamicTensor::new(vec![2], vec![1.0, 1.0])),
+    );
+    let error = graph
+        .symbolic_jvp_many_with_tangent_inputs(&[loss], &tangents)
+        .and_then(|jvp| jvp.graph.compile_cpu(jvp.tangents[0]))
+        .and_then(|plan| plan.evaluate(&tangent_inputs))
+        .err()
+        .unwrap_or_default();
+    assert!(error.contains("forward-mode differentiation"), "{error}");
+    // vmap batches the body's rule.
+    let mut batched = TensorIr::new();
+    let xs = must!(batched.input("xs", vec![3, 2]));
+    let bindings = BTreeMap::from([("x".to_string(), (xs, true))]);
+    let losses = must!(batched.inline_batched(&graph, &bindings, 3, &[loss]));
+    let total = must!(batched.sum(losses[0].0));
+    let vjp = must!(batched.symbolic_vjp_many(&[(total, SymbolicCotangent::Ones)]));
+    let plan = must!(vjp.graph.compile_cpu(vjp.gradients["xs"]));
+    let inputs = BTreeMap::from([(
+        "xs".to_string(),
+        must!(DynamicTensor::new(
+            vec![3, 2],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        )),
+    )]);
+    assert_eq!(must!(plan.evaluate(&inputs)).data().to_vec(), vec![10.0; 6]);
+}
+
 #[test]
 fn custom_rule_rejects_mismatched_graphs() {
     let mut forward = TensorIr::new();

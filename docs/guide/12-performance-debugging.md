@@ -179,9 +179,7 @@ yet addressed:
 - **`while_loop`** has no reverse-mode derivative (as in JAX).
   Reverse-over-reverse through `fori_loop`/`scan` regions is rejected;
   forward-over-reverse (Hessians, HVPs) works.
-- **Custom rules and solvers** cannot be called inside `cond`, `fori_loop`,
-  or `scan` bodies, and the Krylov and Newton solvers support only reverse
-  mode.
+- **The Krylov and Newton solvers** support only reverse mode.
 - **`jacobian`/`hessian`** return dense arrays.
 - **`qb.linalg`** has no non-symmetric `eig`; `lstsq` requires full rank;
   batched CUDA decompositions issue one cuSOLVER call per batch element.

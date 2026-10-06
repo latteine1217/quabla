@@ -147,8 +147,11 @@ qb.grad(net, argnums=1)(qb.ones((3, 2)), w, b)
   enclosing transform (`TypeError`); pass such values as arguments.
 - Every traced output must be floating-point.
 - Python scalars in differentiable arguments are constants.
-- These functions **cannot be called inside a `cond`, `fori_loop`, or `scan`
-  body** (`ValueError`), because compiled regions do not keep custom rules.
+- These functions may be called inside `cond`, `fori_loop`, `scan`, and
+  `while_loop` bodies. The compiled region keeps the rule, so the region's
+  derivatives (`grad`, `jvp`, Hessians, and `vmap` of them) apply it, as at
+  the top level; forward mode through a `custom_vjp` function still raises,
+  and a `while_loop` has forward mode only.
 
 ## 5.5 `stop_gradient`
 

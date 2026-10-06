@@ -476,6 +476,12 @@ layer = qb.checkpoint(lambda h: qb.tanh(h @ w + b))
   later reverse pass (`grad(vmap(f))`). A call of the function itself
   inside its own `fwd`, `bwd`, or JVP rule evaluates `fun` without the
   rule.
+- The functions may be called inside `cond`, `fori_loop`, `scan`, and
+  `while_loop` bodies, nested to any depth. The compiled region keeps the
+  rule, so the region's derivatives (`grad`, `jvp`, `hessian`, and `vmap`
+  of them) are those of the rule, as with `unroll=True`; forward mode
+  through a `custom_vjp` function raises there too, and a `while_loop`
+  body is differentiated in forward mode only.
 - Arguments at `nondiff_argnums` (`static_argnums` for `checkpoint`) are
   passed through unchanged and not differentiated; they must not hold
   traced arrays. Python scalars in other arguments are constants. `fun`,
@@ -1705,8 +1711,7 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - `qb.linalg` has no `eig` (non-symmetric). Batched CUDA solves and decompositions issue one cuSOLVER call per
   batch element. Derivatives at exactly singular matrices raise instead of
   returning non-finite values.
-- `custom_vjp`, `custom_jvp`, and `checkpoint` functions cannot be called
-  inside control-flow bodies, and their rules cannot close over tracers of
-  an enclosing transform (`checkpoint` can).
+- The rules of `custom_vjp`, `custom_jvp`, and `checkpoint` functions cannot
+  close over tracers of an enclosing transform (`checkpoint` can).
   `jacobian` and `hessian` are dense: their basis constant and result grow
   quadratically with the number of input elements.

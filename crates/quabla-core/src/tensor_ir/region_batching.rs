@@ -143,7 +143,7 @@ pub(super) fn batch_region_plan(
         outputs.push(output);
         mapped_outputs.push(mapped);
     }
-    let (plan, _) = graph.compile_cpu_many(&outputs)?;
+    let (plan, _) = graph.compile_region_many(&outputs)?;
     // Every input of a compiled region is reachable from its outputs, and a
     // batched node depends on the batched forms of the same operands, so the
     // region interface survives batching; check it rather than bind a
@@ -301,8 +301,8 @@ fn masked_while_plan(
     let selected = graph.where_select(mask, next, carry)?;
     let any_running = graph.any(running)?;
     Ok(TensorWhileExecutionPlan::new(
-        graph.compile_cpu(any_running)?,
-        graph.compile_cpu(selected)?,
+        graph.compile_region(any_running)?,
+        graph.compile_region(selected)?,
         carry_name,
     )?)
 }

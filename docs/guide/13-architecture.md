@@ -147,7 +147,12 @@ for evaluation. Its `TensorCustomRule` carries the forward graph (outputs and
 residuals), the backward graph, an optional tangent graph, and a
 `rematerialize` flag for `checkpoint`. The symbolic transforms splice these
 graphs in place of differentiating `value`; plan compilation aliases the
-node to `value`, so no custom node reaches a backend.
+node to `value`. Region bodies are the exception: they are compiled with
+`compile_region`, which keeps their `Custom` nodes, because a region's
+derivatives are built from its frozen body later, so the loop JVP, VJP,
+and HVP of a body that calls a function with a custom rule are those of
+the rule. Every backend evaluates a `Custom` node in a region body as the
+identity on its value, as it does `stop_gradient`.
 
 ## 13.4 Autodiff
 

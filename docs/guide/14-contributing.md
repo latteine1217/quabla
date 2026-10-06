@@ -87,7 +87,7 @@ gives correct values and derivatives:
 2. **A custom rule** (`qb.custom_vjp`/`custom_jvp` in Python). If the
    composition is right but its automatic derivative is unstable or
    expensive, wrap it. The Krylov solvers and Newton's method work this way.
-   Remember the limitation: custom rules cannot run inside loop bodies.
+   The rule also applies inside `cond` and loop bodies.
 3. **A new IR op.** Only when the function needs its own kernel on each
    backend for accuracy or performance (special functions, a fused
    reduction, a decomposition).

@@ -9,6 +9,18 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Added
+
+- `custom_vjp`, `custom_jvp`, and `checkpoint` functions may be called
+  inside `cond`, `fori_loop`, `scan`, and `while_loop` bodies, nested to any
+  depth; this used to raise `ValueError` (`while_loop` bodies were accepted
+  but their rules ignored, see Fixed). A compiled region body keeps the
+  custom rule nodes of the functions it calls, so the region's derivatives
+  (loop JVP, VJP, and Hessian-vector products, and `vmap` of them) apply the
+  rules exactly as `unroll=True` does. Values are evaluated on CPU, MLX,
+  and CUDA (fused, host-driven, and graph-replayed loops) as before; a
+  custom rule node is the identity on its value, like `stop_gradient`.
+
 ### Changed
 
 - Eager `Tensor` ops no longer carry their own numerics: each evaluates
@@ -130,6 +142,11 @@ deprecated names keep working until 1.0 (see
   constant, such as the ones seed of `grad` that the reverse-mode `cond`
   binds as a capture, was a `float64` zero whatever the constant's dtype;
   it now has the constant's dtype. Values are unchanged where it worked.
+- A `while_loop` body that called a `custom_jvp`, `custom_vjp`, or
+  `checkpoint` function was differentiated (in forward mode) through the
+  function instead of its rule: the compiled body dropped the rule. Forward
+  mode now applies a `custom_jvp` rule, and raises for a `custom_vjp`
+  function without a forward-mode rule, as it does outside a loop.
 
 ## [0.5.0] - 2026-10-06
 

@@ -1177,7 +1177,8 @@ impl MlxBackend {
                 }
                 // AD happens on the IR before lowering, so the value is all
                 // that remains of a stop_gradient or a custom rule node (plan
-                // compilation already aliases the latter to its value).
+                // compilation aliases the latter to its value outside
+                // control-flow region bodies).
                 TensorOp::StopGradient { input } | TensorOp::Custom { value: input, .. } => {
                     Ok(mlx_value(&values, *input)?.clone())
                 }
