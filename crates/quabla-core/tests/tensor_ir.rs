@@ -10354,7 +10354,7 @@ fn inline_batched_graphs_batch_again_for_nested_vmap() {
 }
 
 #[test]
-fn inline_batched_batches_solve_and_rejects_regions_and_invalid_bindings() {
+fn inline_batched_batches_solve_and_rejects_cond_and_invalid_bindings() {
     use quabla_core::tensor_ir::BatchingError;
     let mut callee = TensorIr::new();
     let matrix = must!(callee.input("matrix", vec![2, 2]));
@@ -10406,7 +10406,9 @@ fn inline_batched_batches_solve_and_rejects_regions_and_invalid_bindings() {
     ));
     assert!(!copied[0].1);
 
-    // Region nodes with a mapped operand are rejected, unmapped ones copied.
+    // The fixture's scan and fori batch, but its cond, whose predicate
+    // depends on the mapped x, has no batching rule yet; unmapped region
+    // nodes are copied.
     let (regions, loss) = must!(inline_region_fixture());
     let mut graph = TensorIr::new();
     let x = must!(graph.input("x", vec![4]));
@@ -10418,11 +10420,8 @@ fn inline_batched_batches_solve_and_rejects_regions_and_invalid_bindings() {
             4,
             &[loss],
         )
-        .expect_err("a mapped region has no batching rule");
-    assert!(
-        matches!(error, BatchingError::Unsupported { op } if ["scan", "fori", "cond"].contains(&op)),
-        "{error:?}"
-    );
+        .expect_err("a mapped cond has no batching rule");
+    assert_eq!(error, BatchingError::Unsupported { op: "cond" });
     assert!(error.to_string().contains("vmap cannot batch"), "{error}");
     let x_single = must!(graph.input("x_single", vec![]));
     let copied = must!(graph.inline_batched(
@@ -10467,6 +10466,308 @@ fn inline_batched_batches_solve_and_rejects_regions_and_invalid_bindings() {
         )
         .expect_err("a zero batch must be rejected");
     assert!(error.to_string().contains("above zero"), "{error}");
+}
+
+/// The inputs of [`loop_batching_fixture`] with their example shapes.
+const LOOP_BATCHING_INPUTS: [(&str, &[usize]); 4] =
+    [("x", &[3]), ("s", &[3]), ("w", &[3]), ("xs", &[5, 3])];
+
+/// `carry -> sin(carry * shift) + 0.1 * index` over `[0, 3)`.
+fn batching_fori_plan() -> Result<TensorForiExecutionPlan, String> {
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![3])?;
+    let shift = body.input("shift", vec![3])?;
+    let index = body.input("index", vec![])?;
+    let product = body.mul(carry, shift)?;
+    let wave = body.sin(product)?;
+    let tenth = body.scalar_constant(0.1);
+    let offset = body.mul(index, tenth)?;
+    let next = body.add(wave, offset)?;
+    TensorForiExecutionPlan::new(0, 3, body.compile_cpu(next)?, "carry", "index")
+}
+
+/// A callee over `x` (the initial carries), `s` (fori shift and scan scale),
+/// `w` (reaches only the scan outputs), and `xs` (one row per scan step,
+/// selected with the traced index as a `scan` over `xs` does): a fori loop, a
+/// scan, a fori loop nested in a fori body, and the scalar total.
+fn loop_batching_fixture() -> Result<(TensorIr, Vec<TensorNodeId>, TensorNodeId), String> {
+    use quabla_core::tensor_ir::TensorComparison;
+    let mut scan_body = TensorIr::new();
+    let carry = scan_body.input("carry", vec![3])?;
+    let scale = scan_body.input("scale", vec![3])?;
+    let w = scan_body.input("w", vec![3])?;
+    let xs = scan_body.input("xs", vec![5, 3])?;
+    let index = scan_body.input("index", vec![])?;
+    let steps = scan_body.constant(
+        DynamicTensor::new(vec![5, 1], vec![0.0, 1.0, 2.0, 3.0, 4.0])?,
+        false,
+    );
+    let selected = scan_body.compare(steps, index, TensorComparison::Equal)?;
+    let zero = scan_body.scalar_constant(0.0);
+    let masked = scan_body.where_select(selected, xs, zero)?;
+    let row = scan_body.sum_axis(masked, 0)?;
+    let product = scan_body.mul(carry, scale)?;
+    let shifted = scan_body.add(product, row)?;
+    let next = scan_body.tanh(shifted)?;
+    let weighted = scan_body.mul(next, w)?;
+    let output = scan_body.add(weighted, row)?;
+    let scan_plan = TensorScanExecutionPlan::new(
+        0,
+        5,
+        scan_body.compile_cpu_many(&[next, output])?.0,
+        "carry",
+        "index",
+    )?;
+
+    let mut outer_body = TensorIr::new();
+    let carry = outer_body.input("carry", vec![3])?;
+    let shift = outer_body.input("shift", vec![3])?;
+    let inner = outer_body.fori(
+        carry,
+        batching_fori_plan()?,
+        vec![("shift".to_string(), shift)],
+    )?;
+    let cosine = outer_body.cos(inner)?;
+    let half = outer_body.scalar_constant(0.5);
+    let next = outer_body.mul(cosine, half)?;
+    let outer_plan =
+        TensorForiExecutionPlan::new(0, 2, outer_body.compile_cpu(next)?, "carry", "index")?;
+
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![3])?;
+    let s = graph.input("s", vec![3])?;
+    let w = graph.input("w", vec![3])?;
+    let xs = graph.input("xs", vec![5, 3])?;
+    let looped = graph.fori(x, batching_fori_plan()?, vec![("shift".to_string(), s)])?;
+    let (final_carry, outputs) = graph.scan(
+        x,
+        scan_plan,
+        vec![
+            ("scale".to_string(), s),
+            ("w".to_string(), w),
+            ("xs".to_string(), xs),
+        ],
+    )?;
+    let nested = graph.fori(x, outer_plan, vec![("shift".to_string(), s)])?;
+    let mut total = None;
+    for (value, exponent) in [(looped, 2), (final_carry, 2), (outputs, 3), (nested, 2)] {
+        let power = graph.powi(value, exponent)?;
+        let sum = graph.sum(power)?;
+        total = Some(match total {
+            Some(total) => graph.add(total, sum)?,
+            None => sum,
+        });
+    }
+    let total = total.expect("the fixture sums four terms");
+    Ok((
+        graph,
+        vec![looped, final_carry, outputs, nested, total],
+        total,
+    ))
+}
+
+/// Deterministic values of shape `shape`, distinct per `salt`.
+fn loop_batching_value(shape: &[usize], salt: usize) -> Result<DynamicTensor, String> {
+    let count = shape.iter().product::<usize>();
+    DynamicTensor::new(
+        shape.to_vec(),
+        (0..count)
+            .map(|index| 0.8 * ((index * 7 + salt * 13) as f64 * 0.61).sin() + 0.05)
+            .collect(),
+    )
+}
+
+/// Batches `callee` over three examples with the inputs in `mapped` mapped
+/// and checks every output against a per-example evaluation of the callee
+/// (the meaning of `vmap`), returning whether each output is mapped.
+/// `inputs` lists every callee input with its example shape.
+fn batched_loop_outputs_match_examples(
+    callee: &TensorIr,
+    outputs: &[TensorNodeId],
+    inputs: &[(String, Vec<usize>)],
+    mapped: &[&str],
+) -> Result<Vec<bool>, String> {
+    let batch = 3;
+    let mut graph = TensorIr::new();
+    let mut bindings = BTreeMap::new();
+    let mut values = BTreeMap::new();
+    for (salt, (name, shape)) in inputs.iter().enumerate() {
+        let is_mapped = mapped.contains(&name.as_str());
+        let shape = if is_mapped {
+            std::iter::once(batch)
+                .chain(shape.iter().copied())
+                .collect()
+        } else {
+            shape.clone()
+        };
+        let node = graph.input(name.clone(), shape.clone())?;
+        bindings.insert(name.clone(), (node, is_mapped));
+        values.insert(name.clone(), loop_batching_value(&shape, salt)?);
+    }
+    let batched = graph
+        .inline_batched(callee, &bindings, batch, outputs)
+        .map_err(|error| error.to_string())?;
+    for index in 0..batch {
+        let mut example_inputs = BTreeMap::new();
+        for (name, value) in &values {
+            example_inputs.insert(
+                name.clone(),
+                if bindings[name].1 {
+                    example_of(value, index)?
+                } else {
+                    value.clone()
+                },
+            );
+        }
+        for ((node, is_mapped), output) in batched.iter().zip(outputs) {
+            let expected = callee.evaluate(*output, &example_inputs)?;
+            let result = graph.evaluate(*node, &values)?;
+            let actual = if *is_mapped {
+                example_of(&result, index)?
+            } else {
+                result
+            };
+            assert_eq!(actual.shape(), expected.shape(), "output {output}");
+            for (actual, expected) in actual.data().iter().zip(expected.data().iter()) {
+                assert!(
+                    (actual - expected).abs() <= 1e-12 * (1.0 + expected.abs()),
+                    "output {output}, example {index}: {actual} != {expected} (mapped {mapped:?})"
+                );
+            }
+        }
+    }
+    Ok(batched.iter().map(|(_, is_mapped)| *is_mapped).collect())
+}
+
+fn loop_batching_inputs() -> Vec<(String, Vec<usize>)> {
+    LOOP_BATCHING_INPUTS
+        .iter()
+        .map(|(name, shape)| (name.to_string(), shape.to_vec()))
+        .collect()
+}
+
+#[test]
+fn inline_batched_loops_match_per_example_loops_for_every_mapping() {
+    let (callee, outputs, _) = must!(loop_batching_fixture());
+    let inputs = loop_batching_inputs();
+    // Outputs: fori, scan carry, scan outputs, nested fori, total.
+    for (mapped, expected) in [
+        (vec!["x", "s", "w", "xs"], [true; 5]),
+        // A mapped carry with unmapped captures.
+        (vec!["x"], [true; 5]),
+        // A mapped capture makes every carry that reads it mapped.
+        (vec!["s"], [true; 5]),
+        // w reaches the scan outputs only, so the carries stay unmapped.
+        (vec!["w"], [false, false, true, false, true]),
+        // The scanned rows reach the scan carry through the fixed point.
+        (vec!["xs"], [false, true, true, false, true]),
+    ] {
+        let flags = must!(batched_loop_outputs_match_examples(
+            &callee, &outputs, &inputs, &mapped
+        ));
+        assert_eq!(flags, expected, "mapped {mapped:?}");
+    }
+}
+
+#[test]
+fn inline_batched_loop_derivatives_match_per_example_derivatives() {
+    let (callee, _, total) = must!(loop_batching_fixture());
+    let inputs = loop_batching_inputs();
+    let names = ["x", "s", "w", "xs"];
+
+    // Reverse mode: ForiVjp and ScanVjp groups give per-example gradients
+    // also for the unmapped inputs.
+    let reverse = must!(callee.symbolic_vjp_many(&[(total, SymbolicCotangent::Ones)]));
+    let gradients = names
+        .iter()
+        .map(|name| reverse.gradients[*name])
+        .collect::<Vec<_>>();
+    for mapped in [vec!["x"], vec!["s"], vec!["w"], vec!["xs"], names.to_vec()] {
+        let flags = must!(batched_loop_outputs_match_examples(
+            &reverse.graph,
+            &gradients,
+            &inputs,
+            &mapped
+        ));
+        assert!(flags.iter().all(|flag| *flag), "mapped {mapped:?}");
+    }
+
+    // Forward mode (ForiJvp and the packed Scan JVP) with only the tangents
+    // mapped, as a forward-mode Jacobian batches them, and with both.
+    let tangent_names = names
+        .iter()
+        .map(|name| (name.to_string(), format!("{name}_tangent")))
+        .collect::<BTreeMap<_, _>>();
+    let mut tangent_inputs = inputs.clone();
+    tangent_inputs.extend(
+        inputs
+            .iter()
+            .map(|(name, shape)| (format!("{name}_tangent"), shape.clone())),
+    );
+    let forward = must!(callee.symbolic_jvp_with_tangent_inputs(total, &tangent_names));
+    for mapped in [
+        vec!["x_tangent", "s_tangent", "w_tangent", "xs_tangent"],
+        vec!["s", "s_tangent"],
+        vec!["w", "x_tangent"],
+    ] {
+        let flags = must!(batched_loop_outputs_match_examples(
+            &forward.graph,
+            &[forward.value, forward.tangent],
+            &tangent_inputs,
+            &mapped
+        ));
+        assert!(flags[1], "mapped {mapped:?}");
+    }
+
+    // Forward over reverse (ForiVjpJvp and ScanVjpJvp): a Hessian batches the
+    // tangents of the gradient graph with unmapped primals.
+    let hvp = must!(reverse
+        .graph
+        .symbolic_jvp_many_with_tangent_inputs(&gradients, &tangent_names));
+    for mapped in [
+        vec!["x_tangent", "s_tangent", "w_tangent", "xs_tangent"],
+        vec!["s_tangent"],
+        vec!["x", "w_tangent"],
+    ] {
+        let flags = must!(batched_loop_outputs_match_examples(
+            &hvp.graph,
+            &hvp.tangents,
+            &tangent_inputs,
+            &mapped
+        ));
+        assert!(flags.iter().all(|flag| *flag), "mapped {mapped:?}");
+    }
+}
+
+#[test]
+fn inline_batched_loops_batch_again_for_nested_vmap() {
+    // vmap(vmap(f)): the batched graph, whose loop bodies are batched, is
+    // itself batched again over a second leading axis.
+    let (callee, outputs, _) = must!(loop_batching_fixture());
+    let mut inner = TensorIr::new();
+    let mut bindings = BTreeMap::new();
+    let mut inner_inputs = Vec::new();
+    for (name, shape) in LOOP_BATCHING_INPUTS {
+        let is_mapped = name == "s" || name == "w";
+        let shape: Vec<usize> = if is_mapped {
+            std::iter::once(2).chain(shape.iter().copied()).collect()
+        } else {
+            shape.to_vec()
+        };
+        let node = must!(inner.input(name, shape.clone()));
+        bindings.insert(name.to_string(), (node, is_mapped));
+        inner_inputs.push((name.to_string(), shape));
+    }
+    let batched = must!(inner.inline_batched(&callee, &bindings, 2, &outputs));
+    assert!(batched.iter().all(|(_, mapped)| *mapped));
+    let inner_outputs = batched.iter().map(|(node, _)| *node).collect::<Vec<_>>();
+    let flags = must!(batched_loop_outputs_match_examples(
+        &inner,
+        &inner_outputs,
+        &inner_inputs,
+        &["x", "s"]
+    ));
+    assert!(flags.iter().all(|flag| *flag));
 }
 
 fn log1p_input(values: &[f64]) -> Result<BTreeMap<String, DynamicTensor>, String> {

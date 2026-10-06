@@ -311,9 +311,16 @@ decorator: `@qb.jit(device="mlx", static_argnums=1)`, `@qb.grad(argnums=1)`.
   one gradient per example, `[B, *w.shape]`, as in JAX, while
   `vjp(vmap(f, in_axes=(0, None)), x, w)` sums the unmapped gradient over
   the batch, as reverse mode must. A mapped `solve` broadcasts an unmapped
-  operand over the batch. A mapped `cond`, `fori`, or `scan` raises
-  `quabla.UnsupportedOperationError` (the v0.1 `tensor_vmap_*` helpers batch
-  `fori`/`scan` bodies).
+  operand over the batch. A `fori_loop` or `scan` region with a mapped
+  operand batches its body region with exactly the mapped operands mapped,
+  and so do the loop's JVP, VJP, and forward-over-reverse regions, so
+  `vmap`, `jacobian`, and `hessian` work through loops, nested loops
+  included. As in JAX, a carry that depends on a mapped capture is mapped
+  from the first iteration, unmapped captures stay unbatched, and a scan's
+  stacked outputs are `[B, length, ...]`; a reverse-mode loop region maps
+  every input once any operand is mapped, since its gradients are per
+  example. A mapped `cond` or `while_loop` raises
+  `quabla.UnsupportedOperationError`.
 - Closures and constants: an eager array (`Tensor` or `TensorView`,
   including a result such as `qb.sin(math.pi * 0.3)`) that meets a traced
   value becomes a constant of the graph. This covers arithmetic in either
@@ -1657,8 +1664,12 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 - StableHLO export (`stablehlo_text`) covers only a small inspection subset
   and is not an execution path.
 - The legacy 2D `Matrix`/`TraceGraph` API is not migrated to the facade.
-- `quabla.vmap` cannot batch `cond`/`fori`/`scan` regions over a mapped
-  argument.
+- `quabla.vmap` cannot batch `cond` or `while_loop` regions over a mapped
+  argument (`fori_loop` and `scan` regions batch). On CUDA, the
+  forward-mode `scan` region inside a batched directional derivative (a
+  forward-mode `jacobian` or `hessian` through `scan`) runs host-driven:
+  its packed `[primal, tangent]` carry gains a leading batch axis, which the
+  fused packed-pair kernel does not lower.
 - `qb.linalg` has no `eig` (non-symmetric). Batched CUDA solves and decompositions issue one cuSOLVER call per
   batch element. Derivatives at exactly singular matrices raise instead of
   returning non-finite values.

@@ -9699,3 +9699,211 @@ mod host_loop_graph_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod region_batching_tests {
+    //! Loops batched by `vmap` (`region_batching.rs`) on the device: an
+    //! elementwise body stays eligible for the fused per-lane loop kernels
+    //! with its larger `[B, n]` carry, also when an unmapped `[n]` capture
+    //! broadcasts against it; the checkpointed reverse passes replay the
+    //! batched carries bit for bit like the complete tape; and a body that is
+    //! not elementwise runs host-driven.
+    use super::*;
+    use crate::tensor_ir::{SymbolicCotangent, TensorIr, LOOP_CHECKPOINT_TEST_FULL_TAPE};
+
+    const BATCH: usize = 3;
+    const LANES: usize = 33;
+
+    /// A loss over a fori loop and a scan whose bodies are elementwise, or
+    /// rotate the carry when `rotate` (not lane-local, so host-driven).
+    fn loss_graph(steps: usize, rotate: bool) -> Result<(TensorIr, TensorNodeId), String> {
+        let mut body = TensorIr::new();
+        let carry = body.input_typed("carry", vec![LANES], TensorDType::F32)?;
+        let index = body.input_typed("index", vec![], TensorDType::F32)?;
+        let scale = body.input_typed("scale", vec![LANES], TensorDType::F32)?;
+        let carry_term = if rotate {
+            let head = body.slice_axis(carry, 0, 0, 1)?;
+            let tail = body.slice_axis(carry, 0, 1, LANES)?;
+            body.concat(vec![tail, head], 0)?
+        } else {
+            carry
+        };
+        let scaled = body.mul(carry_term, scale)?;
+        let delta = body.scalar_constant(0.001);
+        let delta = body.mul(index, delta)?;
+        let shifted = body.add(scaled, delta)?;
+        let next = body.tanh(shifted)?;
+        let fori_plan =
+            TensorForiExecutionPlan::new(0, steps, body.compile_cpu(next)?, "carry", "index")?;
+        let scan_plan = TensorScanExecutionPlan::new(
+            0,
+            steps,
+            body.compile_cpu_many(&[next, next])?.0,
+            "carry",
+            "index",
+        )?;
+        let mut graph = TensorIr::new();
+        let initial = graph.input_typed("initial", vec![LANES], TensorDType::F32)?;
+        let scale = graph.input_typed("scale", vec![LANES], TensorDType::F32)?;
+        let looped = graph.fori(initial, fori_plan, vec![("scale".to_string(), scale)])?;
+        let (final_carry, outputs) =
+            graph.scan(initial, scan_plan, vec![("scale".to_string(), scale)])?;
+        let mut total = graph.sum(looped)?;
+        for value in [final_carry, outputs] {
+            let squared = graph.mul(value, value)?;
+            let sum = graph.sum(squared)?;
+            total = graph.add(total, sum)?;
+        }
+        Ok((graph, total))
+    }
+
+    /// The batched gradients and their directional derivatives (forward over
+    /// reverse), with `initial` and the tangents mapped and `scale` mapped
+    /// when `scale_mapped`.
+    fn batched_plan(
+        steps: usize,
+        rotate: bool,
+        scale_mapped: bool,
+    ) -> Result<(TensorExecutionPlan, BTreeMap<String, DynamicTensor>), String> {
+        let (graph, total) = loss_graph(steps, rotate)?;
+        let reverse = graph.symbolic_vjp_many(&[(total, SymbolicCotangent::Ones)])?;
+        let gradients = [reverse.gradients["initial"], reverse.gradients["scale"]];
+        let tangents = BTreeMap::from([
+            ("initial".to_string(), "initial_tangent".to_string()),
+            ("scale".to_string(), "scale_tangent".to_string()),
+        ]);
+        let hvp = reverse
+            .graph
+            .symbolic_jvp_many_with_tangent_inputs(&gradients, &tangents)?;
+        let mut outputs = hvp.values.clone();
+        outputs.extend(&hvp.tangents);
+        let mut batched = TensorIr::new();
+        let mut bindings = BTreeMap::new();
+        let mut inputs = BTreeMap::new();
+        for (salt, name) in ["initial", "scale", "initial_tangent", "scale_tangent"]
+            .into_iter()
+            .enumerate()
+        {
+            let mapped = name != "scale" || scale_mapped;
+            let shape = if mapped {
+                vec![BATCH, LANES]
+            } else {
+                vec![LANES]
+            };
+            let count = shape.iter().product::<usize>();
+            let values = (0..count)
+                .map(|i| match name {
+                    "scale" => 0.9 + ((i * 7 + salt) % 23) as f64 * 0.005,
+                    _ => ((i * 5 + salt * 3) % 29) as f64 * 0.01 - 0.14,
+                })
+                .collect();
+            let node = batched.input_typed(name, shape.clone(), TensorDType::F32)?;
+            bindings.insert(name.to_string(), (node, mapped));
+            inputs.insert(
+                name.to_string(),
+                DynamicTensor::with_dtype(shape, values, TensorDType::F32)?,
+            );
+        }
+        let results = batched
+            .inline_batched(&hvp.graph, &bindings, BATCH, &outputs)
+            .map_err(|error| error.to_string())?;
+        let ids = results.iter().map(|(node, _)| *node).collect::<Vec<_>>();
+        Ok((batched.compile_cpu_many(&ids)?.0, inputs))
+    }
+
+    fn run(
+        plan: &TensorExecutionPlan,
+        inputs: &BTreeMap<String, DynamicTensor>,
+        full_tape: bool,
+    ) -> Result<Vec<DynamicTensor>, String> {
+        LOOP_CHECKPOINT_TEST_FULL_TAPE.with(|value| value.set(full_tape));
+        let result = CudaBackend::new(0)
+            .compile(plan.clone())
+            .and_then(|plan| plan.execute_many(inputs));
+        LOOP_CHECKPOINT_TEST_FULL_TAPE.with(|value| value.set(false));
+        result
+    }
+
+    #[test]
+    fn batched_loops_fuse_checkpoint_and_match_the_cpu_on_device() -> Result<(), String> {
+        if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+            return Ok(());
+        }
+        for rotate in [false, true] {
+            for scale_mapped in [false, true] {
+                // 17 and 64 steps take the checkpointed reverse pass.
+                for steps in [3, 17, 64] {
+                    let label =
+                        format!("rotate={rotate} scale_mapped={scale_mapped} steps={steps}");
+                    let (plan, inputs) = batched_plan(steps, rotate, scale_mapped)?;
+                    let loops = plan
+                        .nodes
+                        .iter()
+                        .filter(|node| {
+                            matches!(
+                                node.op,
+                                TensorOp::ForiVjp { .. }
+                                    | TensorOp::ForiVjpJvp { .. }
+                                    | TensorOp::ScanVjp { .. }
+                                    | TensorOp::ScanVjpJvp { .. }
+                            )
+                        })
+                        .count();
+                    assert!(loops >= 4, "{label}: the batched plan keeps its loop nodes");
+                    let host_driven = host_loop::cuda_host_driven_nodes(&plan);
+                    let reasons = host_driven
+                        .iter()
+                        .map(|id| {
+                            (
+                                cuda_op_name(&plan.nodes[*id].op),
+                                host_loop::cuda_loop_fused_error(&plan, *id),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    // The forward-mode Scan inside the directional derivative
+                    // packs its carry as `[primal, tangent]`; batched, that is
+                    // `[B, 2, n]`, which the packed-pair kernel (pair axis
+                    // leading) does not lower, so it alone runs host-driven.
+                    let batched_packed_scan = |id: &TensorNodeId| {
+                        matches!(&plan.nodes[*id].op, TensorOp::Scan { scan_plan, .. }
+                            if cuda_scan_uses_packed_halves(scan_plan)
+                                && scan_plan.carry_shape().is_ok_and(|shape| shape.get(1) == Some(&2)))
+                    };
+                    if rotate {
+                        assert!(
+                            host_driven.iter().any(|id| !batched_packed_scan(id)),
+                            "{label}"
+                        );
+                    } else {
+                        assert!(
+                            host_driven.iter().all(batched_packed_scan),
+                            "{label}: {reasons:?}"
+                        );
+                    }
+                    let cpu = plan.evaluate_many(&inputs)?;
+                    let checkpointed = run(&plan, &inputs, false)?;
+                    let full = run(&plan, &inputs, true)?;
+                    assert_eq!(checkpointed.len(), cpu.len(), "{label}");
+                    for ((device, tape), cpu) in checkpointed.iter().zip(&full).zip(&cpu) {
+                        assert_eq!(device.shape(), cpu.shape(), "{label}");
+                        assert!(
+                            device
+                                .data()
+                                .iter()
+                                .zip(tape.data().iter())
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "{label}: checkpointed and full-tape results differ"
+                        );
+                        for (device, cpu) in device.data().iter().zip(cpu.data().iter()) {
+                            assert!(
+                                (device - cpu).abs() <= 1e-4 * (1.0 + cpu.abs()),
+                                "{label}: {device} != {cpu}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}

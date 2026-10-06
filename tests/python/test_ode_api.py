@@ -703,6 +703,114 @@ def test_optional_device_rosenbrock23_and_saveat_parity():
                     )
 
 
+# ---- vmap of odeint ----
+
+
+def forced_oscillator(y, t, k):
+    return qb.stack([y[1], -k[0] * y[0] - k[1] * y[1] + 0.1 * qb.sin(t)], 0)
+
+
+def batched_problem(dtype):
+    y0 = qb.array([[1.0, 0.0], [0.5, -0.3], [-0.2, 0.8]], dtype=dtype)
+    k = qb.array([[2.0, 0.1], [3.0, 0.3], [1.5, 0.05]], dtype=dtype)
+    return y0, k
+
+
+VMAP_SOLVES = [
+    {"method": "euler", "steps": 30},
+    {"method": "heun", "steps": 30},
+    {"method": "rk4", "steps": 30},
+    {"method": "rk4", "steps": 30, "save": True},
+    {"method": "rk4", "steps": 30, "saveat": [0.0, 0.4, 1.1, 1.5]},
+    {"method": "dopri5", "rtol": 1e-7, "atol": 1e-9},
+    {"method": "dopri5", "saveat": [0.0, 0.4, 1.1, 1.5]},
+    {"method": "rosenbrock23", "rtol": 1e-5, "atol": 1e-8},
+    {"method": "rosenbrock23", "saveat": [0.4, 1.1, 1.5]},
+]
+
+
+def solver(options):
+    def solve(y0, k):
+        return qb.ode.odeint(forced_oscillator, y0, (0.0, 1.5), args=(k,), **options)
+
+    return solve
+
+
+def stacked_examples(function, y0, k, in_axes):
+    """A Python loop over the batch of unbatched solves."""
+    results = [
+        function(y0 if in_axes[0] is None else y0[index], k if in_axes[1] is None else k[index])
+        for index in range(3)
+    ]
+    return qb.tree.map(lambda *leaves: qb.stack(list(leaves), 0), *results)
+
+
+def assert_trees_close(actual, expected, tolerance):
+    for got, want in zip(qb.tree.leaves(actual), qb.tree.leaves(expected)):
+        assert got.shape == want.shape and got.dtype == want.dtype, (got, want)
+        for a, b in zip(got.to_flat_list(), want.to_flat_list()):
+            assert abs(a - b) <= tolerance * max(1.0, abs(b)), (a, b)
+
+
+def test_vmap_of_odeint_matches_a_loop_over_examples():
+    # Every method is a bounded fori_loop (or scan), so vmap batches the
+    # loop region: over the initial states, over the parameters, or both.
+    for dtype, tolerance in ((qb.float64, 1e-12), (qb.float32, 1e-5)):
+        y0, k = batched_problem(dtype)
+        for options in VMAP_SOLVES:
+            solve = solver(options)
+            for in_axes in ((0, None), (None, 0), (0, 0)):
+                args = (y0 if in_axes[0] == 0 else y0[0], k if in_axes[1] == 0 else k[0])
+                expected = stacked_examples(solve, *args, in_axes)
+                batched = qb.vmap(solve, in_axes=in_axes)(*args)
+                assert_trees_close(batched, expected, tolerance)
+                assert_trees_close(qb.jit(qb.vmap(solve, in_axes=in_axes))(*args), expected, tolerance)
+
+
+def test_vmap_of_odeint_gradients_matches_per_example_gradients():
+    y0, k = batched_problem(qb.float64)
+    for options in (VMAP_SOLVES[2], VMAP_SOLVES[5], VMAP_SOLVES[6], VMAP_SOLVES[7]):
+        solve = solver(options)
+
+        def loss(y0, k):
+            return (solve(y0, k) ** 2).sum()
+
+        gradient = qb.grad(loss, argnums=(0, 1))
+        for in_axes in ((0, 0), (None, 0)):
+            args = (y0 if in_axes[0] == 0 else y0[0], k)
+            expected = stacked_examples(gradient, *args, in_axes)
+            assert_trees_close(qb.vmap(gradient, in_axes=in_axes)(*args), expected, 1e-10)
+
+
+def test_optional_device_vmap_of_odeint_parity():
+    devices = [
+        (device, precision)
+        for device, flag, precisions in (
+            ("mlx", "QUABLA_MLX_TEST", (None,)),
+            ("cuda", "QUABLA_CUDA_TEST", (None, "float64")),
+        )
+        if os.environ.get(flag) == "1"
+        for precision in precisions
+    ]
+    for device, precision in devices:
+        dtype = qb.float64 if precision == "float64" else qb.float32
+        tolerance = 1e-10 if precision == "float64" else 1e-4
+        y0, k = batched_problem(dtype)
+        for options in (VMAP_SOLVES[2], VMAP_SOLVES[4], VMAP_SOLVES[6], VMAP_SOLVES[7], VMAP_SOLVES[8]):
+            solve = solver(options)
+            operations = [
+                qb.vmap(solve),
+                qb.vmap(qb.grad(lambda y0, k: (solve(y0, k) ** 2).sum(), argnums=1)),
+            ]
+            for operation in operations:
+                expected = qb.jit(operation)(y0, k)
+                device_options = {"device": device}
+                if precision is not None:
+                    device_options["precision"] = precision
+                actual = qb.jit(operation, **device_options)(y0, k)
+                assert_trees_close(actual, expected, tolerance)
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_") and callable(test):

@@ -18,6 +18,9 @@ mod extremum;
 pub use extremum::TensorExtremum;
 mod host_storage;
 pub use host_storage::HostTensorStorage;
+mod region_batching;
+#[cfg(test)]
+mod region_batching_tests;
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
 mod cuda;
@@ -1044,7 +1047,7 @@ pub struct SymbolicVjpMany {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BatchingError {
     /// A node that depends on a mapped input has no batching rule; `op` is
-    /// its IR op name (a `cond`/`fori`/`scan` region node).
+    /// its IR op name (a `cond` or `while` region node).
     Unsupported { op: &'static str },
     /// Invalid bindings, outputs, or batch size.
     Invalid(String),
@@ -1057,11 +1060,15 @@ impl std::fmt::Display for BatchingError {
                 "vmap cannot batch a while_loop: its trip count could differ per batch \
                  element; use a bounded fori_loop whose body masks finished elements with where",
             ),
+            Self::Unsupported { op: "cond" } => formatter.write_str(
+                "vmap cannot batch a cond whose predicate or operands depend on a mapped \
+                 argument: cond has no batching rule yet; compute both branches and select \
+                 per element with where",
+            ),
             Self::Unsupported { op } => write!(
                 formatter,
-                "vmap cannot batch a {op} region node: a cond, fori, or scan region whose \
-                 operands depend on a mapped argument has no batching rule yet (the \
-                 tensor_vmap_* helpers trace fori and scan bodies batched)"
+                "vmap cannot batch a {op} node that depends on a mapped argument: it has no \
+                 batching rule"
             ),
             Self::Invalid(message) => formatter.write_str(message),
         }
@@ -1216,6 +1223,9 @@ struct TensorScanMlxVjpPlan {
 #[derive(Clone, Debug)]
 pub struct TensorForiVjpJvpExecutionPlan {
     loop_plan: TensorForiExecutionPlan,
+    /// The prefix of the plan's internal input names, kept so a batched
+    /// loop plan can be transformed again with the same names.
+    namespace: String,
     cotangent_name: String,
     tangent_names: BTreeMap<String, String>,
     gradient_tangent_plans: BTreeMap<String, TensorExecutionPlan>,
@@ -1231,6 +1241,9 @@ pub struct TensorForiVjpJvpExecutionPlan {
 #[derive(Clone, Debug)]
 pub struct TensorScanVjpJvpExecutionPlan {
     scan_plan: TensorScanExecutionPlan,
+    /// The prefix of the plan's internal input names, kept so a batched
+    /// scan plan can be transformed again with the same names.
+    namespace: String,
     carry_cotangent_name: String,
     output_cotangent_name: String,
     tangent_names: BTreeMap<String, String>,
@@ -3104,9 +3117,13 @@ impl TensorIr {
     /// flattened example axes; `concat` broadcasts its unmapped operands over
     /// the batch. The result is an ordinary graph, so it can be batched again
     /// (nested `vmap`), differentiated, and inlined. `solve` broadcasts an
-    /// unmapped operand over the batch like `concat`. A mapped
-    /// region node (`cond`, `fori`, `scan`, and their derivative nodes) is
-    /// [`BatchingError::Unsupported`]; unmapped ones are copied unchanged.
+    /// unmapped operand over the batch like `concat`. Loop region nodes
+    /// (`fori`, `scan`, and their JVP, VJP, and forward-over-reverse nodes)
+    /// batch their body regions recursively (see `region_batching.rs`); a
+    /// loop result that does not depend on a mapped operand stays unmapped,
+    /// and a scan's stacked outputs are `[B, T, *y]`. A mapped `cond` or
+    /// `while` node is [`BatchingError::Unsupported`]; unmapped region nodes
+    /// are copied unchanged.
     pub fn inline_batched(
         &mut self,
         callee: &TensorIr,
@@ -3155,6 +3172,7 @@ impl TensorIr {
         let mut mapped = vec![false; callee.nodes.len()];
         let mut groups = HashMap::new();
         let mut custom_groups = HashMap::new();
+        let mut loop_groups = HashMap::new();
         for (id, node) in callee.nodes.iter().enumerate() {
             if !reachable[id] {
                 continue;
@@ -3169,14 +3187,15 @@ impl TensorIr {
                 .iter()
                 .any(|input| mapped[*input])
             {
-                mapped[id] = true;
-                self.push_batched(
+                let (spliced, is_mapped) = self.push_batched(
                     callee,
                     node,
                     (&remap, &mapped),
                     batch_size,
-                    &mut custom_groups,
-                )?
+                    (&mut custom_groups, &mut loop_groups),
+                )?;
+                mapped[id] = is_mapped;
+                spliced
             } else {
                 self.push_spliced(node, &remap, &mut groups)?
             };
@@ -3217,20 +3236,25 @@ impl TensorIr {
     }
 
     /// Appends the batched form of a callee node with at least one mapped
-    /// operand (see [`Self::inline_batched`]); the node's dtype and weak
-    /// flag are kept, and its shape gains the leading batch axis.
+    /// operand (see [`Self::inline_batched`]) and returns it with whether it
+    /// is mapped; the node's dtype and weak flag are kept, and its shape gains
+    /// the leading batch axis. Only a loop region node can stay unmapped.
     ///
     /// A `Custom` node is batched with its rule (`TensorCustomRule::batched`),
     /// once per call: `custom_groups` maps a callee group id to the batched
-    /// group id and rule.
+    /// group id and rule. Loop region nodes are batched by
+    /// `push_batched_loop`, once per multi-result group (`loop_groups`).
     fn push_batched(
         &mut self,
         callee: &TensorIr,
         node: &TensorNode,
         (remap, mapped): (&HashMap<TensorNodeId, TensorNodeId>, &[bool]),
         batch_size: usize,
-        custom_groups: &mut HashMap<usize, (usize, Arc<TensorCustomRule>)>,
-    ) -> Result<TensorNodeId, BatchingError> {
+        (custom_groups, loop_groups): (
+            &mut HashMap<usize, (usize, Arc<TensorCustomRule>)>,
+            &mut region_batching::LoopBatchGroups,
+        ),
+    ) -> Result<(TensorNodeId, bool), BatchingError> {
         let target = |operand: TensorNodeId| {
             remap
                 .get(&operand)
@@ -3494,15 +3518,16 @@ impl TensorIr {
                     rhs: operands[1],
                 }
             }
-            TensorOp::Cond { .. }
-            | TensorOp::While { .. }
-            | TensorOp::Fori { .. }
+            TensorOp::Fori { .. }
             | TensorOp::ForiJvp { .. }
             | TensorOp::ForiVjp { .. }
             | TensorOp::ForiVjpJvp { .. }
             | TensorOp::Scan { .. }
             | TensorOp::ScanVjp { .. }
             | TensorOp::ScanVjpJvp { .. } => {
+                return self.push_batched_loop(node, (remap, mapped), batch_size, loop_groups)
+            }
+            TensorOp::Cond { .. } | TensorOp::While { .. } => {
                 return Err(BatchingError::Unsupported {
                     op: tensor_op_name(&node.op),
                 })
@@ -3516,11 +3541,14 @@ impl TensorIr {
                 )))
             }
         };
-        Ok(self.push_node(
-            op,
-            batched_shape(batch_size, &node.shape),
-            node.dtype,
-            node.weak,
+        Ok((
+            self.push_node(
+                op,
+                batched_shape(batch_size, &node.shape),
+                node.dtype,
+                node.weak,
+            ),
+            true,
         ))
     }
 
@@ -14316,6 +14344,7 @@ impl TensorForiVjpJvpExecutionPlan {
         }
         Ok(Self {
             loop_plan,
+            namespace: namespace.to_string(),
             cotangent_name,
             tangent_names: jvp_tangent_names,
             gradient_tangent_plans,
@@ -14563,6 +14592,7 @@ impl TensorScanVjpJvpExecutionPlan {
         };
         Ok(Self {
             scan_plan,
+            namespace: namespace.to_string(),
             carry_cotangent_name,
             output_cotangent_name,
             tangent_names,

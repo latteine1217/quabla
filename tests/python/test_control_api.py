@@ -600,6 +600,289 @@ def test_optional_device_while_loop_parity():
         assert_close(tangent, cpu_tangent, 1e-3 * abs(cpu_tangent.to_flat_list()[0]))
 
 
+# ---- vmap of fori_loop and scan regions ----
+
+
+def per_example(function, args, in_axes):
+    """The meaning of `vmap`: a Python loop over the batch of unbatched
+    calls, stacked on a leading axis."""
+    batch = next(arg.shape[axis] for arg, axis in zip(args, in_axes) if axis is not None)
+    examples = [arg if axis is None else qb.moveaxis(arg, axis, 0) for arg, axis in zip(args, in_axes)]
+    results = [
+        function(*[arg if axis is None else arg[index] for arg, axis in zip(examples, in_axes)])
+        for index in range(batch)
+    ]
+    return qb.tree.map(lambda *leaves: qb.stack(list(leaves), 0), *results)
+
+
+def assert_tree_close(actual, expected, tolerance):
+    actual, expected = qb.tree.leaves(actual), qb.tree.leaves(expected)
+    assert len(actual) == len(expected)
+    for got, want in zip(actual, expected):
+        assert got.dtype == want.dtype, (got.dtype, want.dtype)
+        scale = max([1.0] + [abs(value) for value in want.to_flat_list()])
+        assert_close(got, want, tolerance * scale)
+
+
+def assert_vmap_matches_examples(function, args, in_axes, tolerance):
+    expected = per_example(function, args, in_axes)
+    assert_tree_close(qb.vmap(function, in_axes=in_axes)(*args), expected, tolerance)
+    # Loops inside and around jit batch the same way.
+    assert_tree_close(qb.jit(qb.vmap(function, in_axes=in_axes))(*args), expected, tolerance)
+    assert_tree_close(qb.vmap(qb.jit(function), in_axes=in_axes)(*args), expected, tolerance)
+
+
+def batched_loop_arguments(dtype):
+    carries = qb.array(
+        [[0.3, -0.2, 0.5], [0.1, 0.4, -0.6], [1.0, 0.2, 0.0], [-0.5, 0.9, 0.3]], dtype=dtype
+    )
+    scales = qb.array(
+        [[0.9, 1.1, 0.8], [1.05, 0.95, 0.7], [0.5, 0.6, 1.2], [1.3, 0.8, 0.9]], dtype=dtype
+    )
+    rows = qb.array(
+        [[[0.1 * b + 0.03 * t - 0.02 * k for k in range(3)] for t in range(5)] for b in range(4)],
+        dtype=dtype,
+    )
+    return carries, scales, rows
+
+
+def mapped_fori(carry, scale):
+    return fori_loop(
+        0, 5, lambda i, c, s: (c * s).sin() + 0.1 * i, carry, operands=(scale,)
+    )
+
+
+def mapped_scan(carry, scale, rows):
+    # The per-step input is row i of `rows`, selected with the traced index
+    # as jax.lax.scan over xs would.
+    steps = rows.shape[0]
+
+    def body(c, i, s, rows):
+        mask = qb.arange(steps).astype(rows.dtype).equal(i).astype(rows.dtype)
+        row = (rows * mask.reshape([steps, 1])).sum(0)
+        nxt = (c * s + row).tanh()
+        return nxt, (nxt * row)[:2]
+
+    return scan(body, carry, length=steps, operands=(scale, rows))
+
+
+def nested_loops(carry, scale):
+    # A scan whose body runs a fori_loop over the outer carry.
+    def body(c, i, s):
+        inner = fori_loop(0, 2, lambda j, d, s: (d * s).cos() + 0.1 * d, c, operands=(s,))
+        return inner, inner.sum()
+
+    return scan(body, carry, length=3, operands=(scale,))
+
+
+def test_vmap_batches_fori_loop_and_scan_like_a_loop_over_examples():
+    for dtype, tolerance in ((qb.float64, 1e-13), (qb.float32, 1e-6)):
+        carries, scales, rows = batched_loop_arguments(dtype)
+        cases = [
+            (mapped_fori, (carries, scales), (0, 0)),
+            # A mapped carry with an unmapped capture, and the reverse: the
+            # carry depends on the mapped capture, so it is mapped too.
+            (mapped_fori, (carries, scales[0]), (0, None)),
+            (mapped_fori, (carries[0], scales), (None, 0)),
+            (mapped_scan, (carries, scales, rows), (0, 0, 0)),
+            (mapped_scan, (carries, scales[0], rows[0]), (0, None, None)),
+            (mapped_scan, (carries[0], scales, rows[0]), (None, 0, None)),
+            # Mapped per-step inputs (scan over xs).
+            (mapped_scan, (carries[0], scales[0], rows), (None, None, 0)),
+            (nested_loops, (carries, scales), (0, 0)),
+            (nested_loops, (carries[0], scales), (None, 0)),
+            # A batch axis that is not leading.
+            (mapped_fori, (carries.transpose(), scales[0]), (1, None)),
+        ]
+        for function, args, in_axes in cases:
+            assert_vmap_matches_examples(function, args, in_axes, tolerance)
+        # Nested vmap: the outer map batches the inner map's loop regions again.
+        pairs = qb.stack([carries, carries * 0.5], 0)
+        assert_tree_close(
+            qb.vmap(qb.vmap(mapped_fori, in_axes=(0, None)), in_axes=(0, 0))(pairs, scales[:2]),
+            per_example(
+                lambda c, s: per_example(mapped_fori, (c, s), (0, None)), (pairs, scales[:2]), (0, 0)
+            ),
+            tolerance,
+        )
+
+
+def loop_losses():
+    def fori_loss(carry, scale):
+        return (mapped_fori(carry, scale) ** 2).sum()
+
+    def scan_loss(carry, scale, rows):
+        final, outputs = mapped_scan(carry, scale, rows)
+        return (final**2).sum() + (outputs**3).sum()
+
+    def nested_loss(carry, scale):
+        final, outputs = nested_loops(carry, scale)
+        return (final**2).sum() + outputs.sum()
+
+    return fori_loss, scan_loss, nested_loss
+
+
+def test_vmap_of_loop_gradients_and_jvps_matches_per_example_derivatives():
+    fori_loss, scan_loss, nested_loss = loop_losses()
+    for dtype, tolerance in ((qb.float64, 1e-12), (qb.float32, 1e-5)):
+        carries, scales, rows = batched_loop_arguments(dtype)
+        cases = [
+            (qb.grad(fori_loss, argnums=(0, 1)), (carries, scales), (0, 0)),
+            (qb.grad(fori_loss, argnums=(0, 1)), (carries, scales[0]), (0, None)),
+            (qb.grad(fori_loss, argnums=(0, 1)), (carries[0], scales), (None, 0)),
+            (qb.grad(scan_loss, argnums=(0, 1, 2)), (carries, scales, rows), (0, 0, 0)),
+            (qb.grad(scan_loss, argnums=(0, 1, 2)), (carries[0], scales[0], rows), (None, None, 0)),
+            (qb.grad(nested_loss, argnums=(0, 1)), (carries, scales[0]), (0, None)),
+            (
+                lambda c, s, t: qb.jvp(fori_loss, (c, s), (t, qb.zeros([3], dtype))),
+                (carries, scales, scales * 0.5),
+                (0, 0, 0),
+            ),
+            # Only the tangent is mapped, as a forward-mode Jacobian maps it.
+            (
+                lambda t, c, s, r: qb.jvp(scan_loss, (c, s, r), (t, qb.zeros([3], dtype), qb.zeros([5, 3], dtype))),
+                (carries, carries[0], scales[0], rows[0]),
+                (0, None, None, None),
+            ),
+            (
+                lambda t, c, s: qb.jvp(qb.grad(nested_loss), (c, s), (t, qb.zeros([3], dtype)))[1],
+                (carries, carries[0], scales[0]),
+                (0, None, None),
+            ),
+        ]
+        for function, args, in_axes in cases:
+            assert_vmap_matches_examples(function, args, in_axes, tolerance)
+
+
+def basis(size, dtype):
+    return [qb.eye(size, dtype=dtype)[index] for index in range(size)]
+
+
+def test_hessian_and_jacobian_through_loops_match_per_direction_calls():
+    fori_loss, scan_loss, nested_loss = loop_losses()
+    for dtype, tolerance in ((qb.float64, 1e-12), (qb.float32, 1e-5)):
+        carries, scales, rows = batched_loop_arguments(dtype)
+        carry, scale, row = carries[0], scales[0], rows[0]
+        directions = basis(3, dtype)
+        for loss, extra in ((fori_loss, ()), (scan_loss, (row,)), (nested_loss, ())):
+            for argnums in (0, 1):
+                arguments = (carry, scale, *extra)
+                # Row j of the Hessian is the HVP along basis vector j, one
+                # unbatched forward-over-reverse call per direction.
+                expected = qb.stack(
+                    [
+                        qb.jvp(
+                            qb.grad(loss, argnums=argnums),
+                            arguments,
+                            tuple(
+                                direction if index == argnums else qb.zeros_like(value)
+                                for index, value in enumerate(arguments)
+                            ),
+                        )[1]
+                        for direction in directions
+                    ],
+                    0,
+                )
+                hessian = qb.hessian(loss, argnums=argnums)
+                assert_tree_close(hessian(*arguments), expected, tolerance)
+                assert_tree_close(qb.jit(hessian)(*arguments), expected, tolerance)
+        # Forward-mode Jacobian (more outputs than inputs): columns are JVPs.
+        def outputs_of(scale):
+            return mapped_scan(carry, scale, row)[1].reshape([10])
+
+        forward = qb.stack(
+            [qb.jvp(outputs_of, (scale,), (direction,))[1] for direction in directions], 1
+        )
+        assert_tree_close(qb.jacobian(outputs_of)(scale), forward, tolerance)
+        # Reverse-mode Jacobian (fewer outputs than inputs): rows are VJPs.
+        def summary(rows):
+            final, outputs = mapped_scan(carry, scale, rows)
+            return qb.stack([final.sum(), (outputs**2).sum()], 0)
+
+        _, pullback = qb.vjp(summary, row)
+        reverse = qb.stack([pullback(direction)[0] for direction in basis(2, dtype)], 0)
+        assert_tree_close(qb.jacobian(summary)(row), reverse, tolerance)
+        assert_tree_close(qb.jacobian(mapped_fori)(carry, scale), qb.stack(
+            [qb.jvp(mapped_fori, (carry, scale), (direction, qb.zeros([3], dtype)))[1] for direction in directions], 1
+        ), tolerance)
+
+
+def test_hessian_through_a_linear_loop_matches_the_closed_form():
+    # c <- c * s five times gives x * s**5, so the loss sum((x * s**5)**2)
+    # has the Hessian diag(2 * s**10) in x and diag(90 * x**2 * s**8) in s.
+    def loss(x, s):
+        return (fori_loop(0, 5, lambda i, c, s: c * s, x, operands=(s,)) ** 2).sum()
+
+    x, s = qb.array([0.5, -1.5, 2.0]), qb.array([1.1, 0.9, -0.7])
+    xs, ss = x.to_flat_list(), s.to_flat_list()
+    expected_x = [[2 * ss[i] ** 10 if i == j else 0.0 for j in range(3)] for i in range(3)]
+    expected_s = [
+        [90 * xs[i] ** 2 * ss[i] ** 8 if i == j else 0.0 for j in range(3)] for i in range(3)
+    ]
+    assert_close(qb.hessian(loss)(x, s), expected_x, 1e-12)
+    assert_close(qb.hessian(loss, argnums=1)(x, s), expected_s, 1e-11)
+
+
+def test_vmap_of_while_loop_and_cond_still_reports_no_rule():
+    def branch(x):
+        return cond(x.sum() > 0.0, lambda t: t * 2.0, lambda t: -t, x)
+
+    assert_raises(
+        qb.UnsupportedOperationError,
+        qb.vmap(branch),
+        qb.array([[1.0], [-1.0]]),
+        match="vmap cannot batch a cond",
+    )
+
+
+def test_optional_device_vmap_of_loops_matches_cpu():
+    fori_loss, scan_loss, _ = loop_losses()
+    devices = [
+        (device, precision)
+        for device, flag, precisions in (
+            ("mlx", "QUABLA_MLX_TEST", (None,)),
+            ("cuda", "QUABLA_CUDA_TEST", (None, "float64")),
+        )
+        if os.environ.get(flag) == "1"
+        for precision in precisions
+    ]
+    for device, precision in devices:
+        dtype = qb.float64 if precision == "float64" else qb.float32
+        tolerance = 1e-11 if precision == "float64" else 1e-5
+        carries, scales, rows = batched_loop_arguments(dtype)
+        rotating = qb.array(
+            [[0.3, -0.2, 0.5, 0.1, -0.4], [0.2, 0.1, -0.3, 0.6, 0.0], [-0.5, 0.4, 0.2, -0.1, 0.3]],
+            dtype=dtype,
+        )
+        rotation_scale = qb.array([0.9, 1.1, 0.8, 1.05, 0.95], dtype=dtype)
+        operations = {
+            "vmap fori": (qb.vmap(mapped_fori, in_axes=(0, None)), (carries, scales[0])),
+            "vmap fori capture": (qb.vmap(mapped_fori, in_axes=(None, 0)), (carries[0], scales)),
+            # Not elementwise: CUDA runs these loops host-driven.
+            "vmap rotating fori": (
+                qb.vmap(host_driven_fori_loss, in_axes=(0, None)),
+                (rotating, rotation_scale),
+            ),
+            "vmap scan xs": (qb.vmap(mapped_scan, in_axes=(None, None, 0)), (carries[0], scales[0], rows)),
+            "vmap nested": (qb.vmap(nested_loops), (carries, scales)),
+            "vmap grad": (qb.vmap(qb.grad(scan_loss, argnums=(0, 1, 2))), (carries, scales, rows)),
+            "hessian fori": (qb.hessian(fori_loss), (carries[0], scales[0])),
+            "hessian scan": (qb.hessian(scan_loss, argnums=1), (carries[0], scales[0], rows[0])),
+            "hessian rotating scan": (
+                qb.hessian(host_driven_scan_loss),
+                (rotating[0], rotation_scale),
+            ),
+            "jacobian scan": (qb.jacobian(lambda s: mapped_scan(carries[0], s, rows[0])[1].reshape([10])), (scales[0],)),
+        }
+        for name, (operation, args) in operations.items():
+            expected = qb.jit(operation)(*args)
+            options = {"device": device}
+            if precision is not None:
+                options["precision"] = precision
+            actual = qb.jit(operation, **options)(*args)
+            assert_tree_close(actual, expected, tolerance)
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_") and callable(test):

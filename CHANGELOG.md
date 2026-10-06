@@ -9,6 +9,23 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Added
+
+- `vmap` batches `fori_loop` and `scan` regions, and the JVP, VJP, and
+  forward-over-reverse regions derived from them, on the CPU, CUDA, and
+  MLX. A mapped capture, carry, or scanned operand batches the loop body
+  with exactly those inputs mapped; a carry that depends on a mapped
+  capture is mapped from the first iteration (the carry fixed point JAX
+  computes), unmapped operands stay unbatched, and stacked scan outputs are
+  `[B, length, ...]`. `vmap`, `jacobian` in both modes, and `hessian` now
+  work through loops, nested loops, and loops inside `jit`, and `vmap` of
+  `ode.odeint` works for every method, with `save` and `saveat`.
+
+### Changed
+
+- The `UnsupportedOperationError` of `vmap` names only `cond` and
+  `while_loop` regions, the ones that still have no batching rule.
+
 ## [0.4.0] - 2026-10-06
 
 The v0.4 plan in `docs/jax_like_roadmap.md`: the jax.numpy functions a PINN

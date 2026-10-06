@@ -2428,20 +2428,21 @@ def test_vmap_rejects_invalid_axes_and_unbatchable_ops():
             0, 3, lambda i, c, s: c + i * s, initial, [scale]
         )
 
-    error = assert_raises(
-        qb.UnsupportedOperationError,
-        qb.vmap(looped),
-        qb.array([1.0, 2.0]),
-        qb.array([2.0, 3.0]),
-        match="region",
-    )
-    assert error.op == "fori"
-    # The deprecated helper batches the region body.
+    # A mapped loop region batches its body, as the deprecated helper does.
+    assert_close(qb.vmap(looped)(qb.array([1.0, 2.0]), qb.array([2.0, 3.0])), [7.0, 11.0])
     old = qb.tensor_vmap_fn(looped, [("initial", []), ("scale", [])], 2)
     assert_close(
         old({"initial": qb.array([1.0, 2.0]), "scale": qb.array([2.0, 3.0])}),
         [7.0, 11.0],
     )
+    # A mapped cond has no batching rule yet.
+    error = assert_raises(
+        qb.UnsupportedOperationError,
+        qb.vmap(lambda x: qb.cond(x > 0.0, lambda t: t * 2.0, lambda t: -t, x)),
+        qb.array([1.0, -2.0]),
+        match="cond",
+    )
+    assert error.op == "cond"
 
 
 def test_vmap_matches_the_tensor_vmap_helpers():
