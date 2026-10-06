@@ -46,6 +46,13 @@ deprecated names keep working until 1.0 (see
 - The forward-mode tangent of a legacy `TensorIr::greater` mask has the
   mask's shape instead of a scalar, so forward-over-reverse
   differentiation of a graph that reshapes such a mask no longer fails.
+- Reverse mode through a `scan` region that uses only its final carry or
+  only its stacked outputs, such as a `cond` branch returning
+  `scan(...)[0]`, failed with "symbolic Scan group ... has no output
+  result" (or "no carry result"), eagerly and under `jit`, and so did
+  `hessian` through a `fori_loop` whose body runs such a scan. Compiling a
+  region removes the unused result, while the symbolic VJP required both;
+  the discarded result now contributes a zero cotangent.
 
 ## [0.4.0] - 2026-10-06
 
