@@ -2969,6 +2969,8 @@ fn execute_cuda_device_program<T: CudaReal>(
             | TensorOp::Erf { .. }
             | TensorOp::Erfc { .. }
             | TensorOp::Atan2 { .. }
+            | TensorOp::UnaryMath { .. }
+            | TensorOp::Fmod { .. }
             | TensorOp::CumSum { .. }
             | TensorOp::Triangular { .. }
             | TensorOp::Matmul { .. }
@@ -3583,7 +3585,8 @@ fn launch_cuda_node<T: CudaReal>(
             base: lhs,
             exponent: rhs,
         }
-        | TensorOp::Atan2 { y: lhs, x: rhs } => {
+        | TensorOp::Atan2 { y: lhs, x: rhs }
+        | TensorOp::Fmod { x: lhs, y: rhs } => {
             launch.arg(cuda_value(values, *lhs)?);
             launch.arg(cuda_value(values, *rhs)?);
             launch.arg(output);
@@ -3613,6 +3616,7 @@ fn launch_cuda_node<T: CudaReal>(
         | TensorOp::Expm1 { input }
         | TensorOp::Erf { input }
         | TensorOp::Erfc { input }
+        | TensorOp::UnaryMath { input, .. }
         | TensorOp::CumSum { input, .. }
         | TensorOp::Transpose { input, .. }
         | TensorOp::Triangular { input, .. } => {
@@ -4951,6 +4955,8 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
             | TensorOp::Expm1 { .. }
             | TensorOp::Erf { .. }
             | TensorOp::Atan2 { .. }
+            | TensorOp::UnaryMath { .. }
+            | TensorOp::Fmod { .. }
             | TensorOp::StopGradient { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
@@ -5048,6 +5054,8 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
             | TensorOp::Expm1 { .. }
             | TensorOp::Erf { .. }
             | TensorOp::Atan2 { .. }
+            | TensorOp::UnaryMath { .. }
+            | TensorOp::Fmod { .. }
             | TensorOp::StopGradient { .. }
             | TensorOp::Broadcast { .. }
             | TensorOp::Cast { .. } => {}
@@ -5284,6 +5292,10 @@ fn cuda_fori_body_expression_inner(
         TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
         TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
         TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
+        TensorOp::UnaryMath { input, kind } => {
+            Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
+        }
+        TensorOp::Fmod { x, y } => Ok(format!("fmodf({}, {})", child(*x)?, child(*y)?)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
         // already run, so stop_gradient is the identity too.
         TensorOp::Broadcast { input }
@@ -5450,6 +5462,10 @@ fn cuda_scan_body_expression_in_half_inner(
         TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
         TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
         TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
+        TensorOp::UnaryMath { input, kind } => {
+            Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
+        }
+        TensorOp::Fmod { x, y } => Ok(format!("fmodf({}, {})", child(*x)?, child(*y)?)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
         // already run, so stop_gradient is the identity too.
         TensorOp::Broadcast { input }
@@ -5606,6 +5622,10 @@ fn cuda_elementwise_plan_expression_with_index_inner(
         TensorOp::Expm1 { input } => Ok(format!("expm1f({})", child(*input)?)),
         TensorOp::Erf { input } => Ok(format!("erff({})", child(*input)?)),
         TensorOp::Atan2 { y, x } => Ok(format!("atan2f({}, {})", child(*y)?, child(*x)?)),
+        TensorOp::UnaryMath { input, kind } => {
+            Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
+        }
+        TensorOp::Fmod { x, y } => Ok(format!("fmodf({}, {})", child(*x)?, child(*y)?)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
         // already run, so stop_gradient is the identity too.
         TensorOp::Broadcast { input }
@@ -7866,7 +7886,8 @@ fn cuda_program_source(
                 base: lhs,
                 exponent: rhs,
             }
-            | TensorOp::Atan2 { y: lhs, x: rhs } => {
+            | TensorOp::Atan2 { y: lhs, x: rhs }
+            | TensorOp::Fmod { x: lhs, y: rhs } => {
                 let lhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*lhs].shape);
                 let rhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*rhs].shape);
                 let expression = match &node.op {
@@ -7884,6 +7905,9 @@ fn cuda_program_source(
                     TensorOp::Pow { .. } => format!("powf(lhs[{lhs_offset}], rhs[{rhs_offset}])"),
                     TensorOp::Atan2 { .. } => {
                         format!("atan2f(lhs[{lhs_offset}], rhs[{rhs_offset}])")
+                    }
+                    TensorOp::Fmod { .. } => {
+                        format!("fmodf(lhs[{lhs_offset}], rhs[{rhs_offset}])")
                     }
                     _ => unreachable!(),
                 };
@@ -7914,7 +7938,8 @@ fn cuda_program_source(
             | TensorOp::Log1p { input }
             | TensorOp::Expm1 { input }
             | TensorOp::Erf { input }
-            | TensorOp::Erfc { input } => {
+            | TensorOp::Erfc { input }
+            | TensorOp::UnaryMath { input, .. } => {
                 let expression = match &node.op {
                     TensorOp::Tanh { .. } => "tanhf(input[index])".to_string(),
                     TensorOp::Exp { .. } => "expf(input[index])".to_string(),
@@ -7932,6 +7957,9 @@ fn cuda_program_source(
                     TensorOp::Expm1 { .. } => "expm1f(input[index])".to_string(),
                     TensorOp::Erf { .. } => "erff(input[index])".to_string(),
                     TensorOp::Erfc { .. } => "erfcf(input[index])".to_string(),
+                    TensorOp::UnaryMath { kind, .. } => {
+                        format!("{}(input[index])", kind.cuda_function())
+                    }
                     _ => unreachable!(),
                 };
                 let input_count = element_count(&plan.nodes[*input].shape)?;
@@ -8531,6 +8559,8 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Erf { .. } => "erf",
         TensorOp::Erfc { .. } => "erfc",
         TensorOp::Atan2 { .. } => "atan2",
+        TensorOp::UnaryMath { kind, .. } => kind.name(),
+        TensorOp::Fmod { .. } => "fmod",
         TensorOp::StopGradient { .. } => "stop_gradient",
         TensorOp::Custom { .. } => "custom",
         TensorOp::CumSum { .. } => "cumsum",

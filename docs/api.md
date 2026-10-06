@@ -78,17 +78,62 @@ qb.eye(n, m=None, dtype=None)
   `TraceTensor(node_id=3, shape=[2], dtype=float32)`.
 - Module-level functions call the method of the same name on a `Tensor` or
   `TraceTensor`, so eager and traced code share one spelling (`qb.sin(x)` is
-  `x.sin()`): `sin`, `cos`, `tanh`, `exp`, `expm1`, `log`, `log1p`, `erf`,
-  `erfc`, `sqrt`, `relu`, `sigmoid`, `softplus`, `stop_gradient`, `sum`,
+  `x.sin()`): `sin`, `cos`, `tan`, `tanh`, `sinh`, `cosh`, `arcsin`,
+  `arccos`, `arctan`, `arcsinh`, `arccosh`, `arctanh`, `exp`, `expm1`,
+  `log`, `log1p`, `log2`, `log10`, `erf`, `erfc`, `sqrt`, `cbrt`, `floor`,
+  `ceil`, `round`, `relu`, `sigmoid`, `softplus`, `stop_gradient`, `sum`,
   `mean`, `prod`, `max`, `min`, `any`, `all`, `norm`, `cumsum`, `matmul`,
   `transpose`,
   `reshape`, `broadcast_to`, `astype`, `maximum`, `minimum`, `atan2`,
-  `power`, `solve` (see `qb.linalg` below), `cholesky`, `tril`, and `triu`, next to the v0.1
+  `fmod`, `power`, `solve` (see `qb.linalg` below), `cholesky`, `tril`, and
+  `triu`, next to the v0.1
   functions `where`, `concat`, `stack`, `einsum`, and the comparison and
   logical functions. Other operands (numbers, lists, NumPy arrays) go
-  through `asarray`; a Python number stays a weak scalar. `abs`, `sum`,
-  `max`, `min`, `any`, and `all` are attributes of `quabla` but not in
-  `__all__`, so `from quabla import *` leaves the builtins alone.
+  through `asarray`; a Python number stays a weak scalar. `abs`, `round`,
+  `sum`, `max`, `min`, `any`, and `all` are attributes of `quabla` but not
+  in `__all__`, so `from quabla import *` leaves the builtins alone.
+- `tan`, `arcsin`, `arccos`, `arctan`, `sinh`, `cosh`, `arcsinh`, `arccosh`,
+  `arctanh`, `log2`, `log10`, `cbrt`, `floor`, `ceil`, and `round` are one
+  native IR op (`UnaryMath`) evaluated with each platform's own function:
+  Rust std on the CPU (the musl `asinh`, `acosh`, and `atanh` of the `libm`
+  crate, since std's `acosh` loses accuracy near 1), the CUDA math library
+  (`tanf`, `asinf`, ..., `rintf`, and their double forms under
+  `precision="float64"`), and the MLX op of the same name; MLX has no
+  `cbrt`, so it takes `|x|^(1/3)` from `power` and one Newton step, within
+  about one float32 ulp. `round` rounds halfway cases to even, as NumPy and
+  JAX do. Values follow IEEE semantics and never raise: outside a domain
+  the result is NaN (`arcsin(2)`, `log2(-1)`, `arccosh(0.5)`), at a pole an
+  infinity (`arctanh(1)`, `log10(0)`). Derivatives are built from IR ops,
+  so every order is again a graph on every backend: `tan' = 1 + tan(x)^2`
+  and `cbrt' = 1 / (3 cbrt(x)^2)` reuse the computed value;
+  `arcsin' = 1 / sqrt((1 - x)(1 + x))` (negated for `arccos`) and
+  `arctanh' = 1 / ((1 - x)(1 + x))` use the factored form, which stays
+  accurate next to `|x| = 1`; `arccosh' = 1 / (sqrt(x - 1) sqrt(x + 1))`,
+  which neither loses accuracy near 1 nor overflows for large `x`;
+  `arcsinh' = 1 / sqrt(x^2 + 1)` is formed as `r / sqrt(1 + u^2)` with
+  `r = 1 / max(|x|, 1)` and `u = r` for `|x| > 1` (else `x`), so it does
+  not overflow (`1e-200` at `x = 1e200`) and is zero at `+-inf`;
+  `arctan' = 1 / (1 + x^2)`, `sinh' = cosh`, `cosh' = sinh`,
+  `log2' = 1 / (x ln 2)`, `log10' = 1 / (x ln 10)`; `floor`, `ceil`, and
+  `round` have a zero derivative of every order. Outside a domain a
+  derivative is NaN or, where the formula stays finite (`arctanh`, `log2`
+  of a negative `x`), the value of the formula, as for `log`. On MLX,
+  float32 subnormal inputs count as zeros (Metal flushes them), as for
+  MLX's other ops.
+- `fmod(x1, x2)` is C `fmod`, NumPy's `fmod`: the remainder of the quotient
+  truncated toward zero, exact, with the sign of `x1`; NaN for `x2 == 0`
+  or an infinite `x1`, and `x1` for an infinite `x2`. It is a native
+  broadcasting op (`fmodf` on CUDA; on MLX, whose `remainder` is the
+  floor-mod, the exact `remainder(|x1|, |x2|)` with the sign of `x1`). Its
+  partials are `1` and `-trunc(x1 / x2)`, where the quotient is that of the
+  computed remainder, `round((x1 - fmod(x1, x2)) / x2)`, so it is exact and
+  consistent with the value at quotients that round to an integer.
+  `mod(x1, x2)` (also `remainder`) is NumPy's floor-mod, with the sign of
+  `x2`, composed from `fmod` the way NumPy computes it: `r + x2` where
+  `r = fmod(x1, x2)` is nonzero with a sign other than that of `x2`, and a
+  zero result signed like `x2`. It never forms `x1 - floor(x1 / x2) x2`,
+  which loses small remainders to rounding; its partials are `1` and
+  `-floor(x1 / x2)`.
 - `prod(x, axis=None, keepdims=False)` multiplies the entries over `axis`
   (an int, a sequence of ints, or every axis) as a pairwise tree of
   multiplications, each rounded to the dtype: an extent `n` rounds each

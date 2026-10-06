@@ -12,7 +12,7 @@ use quabla_core::tensor_ir::{
     SymbolicCotangent, TensorBackend, TensorComparison, TensorCondExecutionPlan, TensorCustomRule,
     TensorCustomTangent, TensorDType, TensorExecutionPlan, TensorForiExecutionPlan, TensorIr,
     TensorNodeId, TensorRegion, TensorReplicaReduction, TensorScanExecutionPlan,
-    TensorWhileExecutionPlan,
+    TensorWhileExecutionPlan, UnaryMathKind,
 };
 use quabla_core::{
     QuablaCompiler, QuablaExecutable, QuablaMultiOutputExecutable, QuablaMultiOutputProgram,
@@ -1433,6 +1433,7 @@ impl TraceTensor {
             "greater" => ir.greater(self.node_id, rhs.node_id)?,
             "pow" => ir.pow(self.node_id, rhs.node_id)?,
             "atan2" => ir.atan2(self.node_id, rhs.node_id)?,
+            "fmod" => ir.fmod(self.node_id, rhs.node_id)?,
             _ => return Err(format!("unsupported trace tensor binary op {op}")),
         };
         let shape = ir.node_shape(node_id)?;
@@ -1459,6 +1460,7 @@ impl TraceTensor {
             "greater" => ir.greater(self.node_id, scalar)?,
             "pow" => ir.pow(self.node_id, scalar)?,
             "atan2" => ir.atan2(self.node_id, scalar)?,
+            "fmod" => ir.fmod(self.node_id, scalar)?,
             _ => return Err(format!("unsupported trace tensor scalar op {op}")),
         };
         let shape = ir.node_shape(node_id)?;
@@ -2395,6 +2397,14 @@ impl TraceTensor {
 
     fn erfc_tensor(&self) -> Result<Self, String> {
         self.apply(&[], |ir| ir.erfc(self.node_id))
+    }
+
+    fn unary_math_tensor(&self, kind: UnaryMathKind) -> Result<Self, String> {
+        self.apply(&[], |ir| ir.unary_math(self.node_id, kind))
+    }
+
+    fn unary_math(&self, kind: UnaryMathKind) -> PyResult<Self> {
+        self.unary_math_tensor(kind).map_err(PyValueError::new_err)
     }
 
     fn stop_gradient_tensor(&self) -> Result<Self, String> {
@@ -3643,6 +3653,82 @@ impl TraceTensor {
         Err(PyTypeError::new_err(
             "expected a TraceTensor, Tensor, or numeric scalar operand",
         ))
+    }
+
+    /// C `fmod(self, y)` of an array or Python number `y`: the remainder of
+    /// the quotient truncated toward zero, with the sign of `self`.
+    fn fmod(&self, y: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Some(y) = self.traced_operand(y) {
+            return self.binary(&y?, "fmod").map_err(PyValueError::new_err);
+        }
+        if let Some(y) = extract_scalar(y) {
+            self.ensure_not_bool("fmod")
+                .map_err(PyValueError::new_err)?;
+            return self.scalar_binary(y, "fmod").map_err(PyValueError::new_err);
+        }
+        Err(PyTypeError::new_err(
+            "expected a TraceTensor, Tensor, or numeric scalar operand",
+        ))
+    }
+
+    fn tan(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Tan)
+    }
+
+    fn arcsin(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Arcsin)
+    }
+
+    fn arccos(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Arccos)
+    }
+
+    fn arctan(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Arctan)
+    }
+
+    fn sinh(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Sinh)
+    }
+
+    fn cosh(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Cosh)
+    }
+
+    fn arcsinh(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Arcsinh)
+    }
+
+    fn arccosh(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Arccosh)
+    }
+
+    fn arctanh(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Arctanh)
+    }
+
+    fn log2(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Log2)
+    }
+
+    fn log10(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Log10)
+    }
+
+    fn cbrt(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Cbrt)
+    }
+
+    fn floor(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Floor)
+    }
+
+    fn ceil(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Ceil)
+    }
+
+    fn round(&self) -> PyResult<Self> {
+        self.unary_math(UnaryMathKind::Round)
     }
 
     /// The value with a zero derivative in every transform.

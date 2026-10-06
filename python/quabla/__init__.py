@@ -36,6 +36,7 @@ from ._ops import all as all
 from ._ops import any as any
 from ._ops import max as max
 from ._ops import min as min
+from ._ops import round as round
 from ._ops import sum as sum
 from ._quabla import *  # noqa: F403
 
