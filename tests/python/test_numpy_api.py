@@ -9,7 +9,6 @@ is accurate to about 1e-8 relative.
 """
 
 import math
-import os
 import warnings
 
 try:
@@ -19,16 +18,9 @@ except ImportError:  # NumPy is optional; the comparisons against it skip.
 
 import quabla as qb
 
+from _support import devices, raises, run, skip
+
 INF, NAN = math.inf, math.nan
-
-
-def raises(kind, function, *args, match=None, **kwargs):
-    try:
-        function(*args, **kwargs)
-    except kind as error:
-        assert match is None or match in str(error), str(error)
-        return error
-    raise AssertionError(f"expected {kind.__name__}")
 
 
 def flat(x):
@@ -516,13 +508,7 @@ def test_functions_under_jit_and_vmap_match_eager():
 
 
 def test_device_results_match_cpu():
-    devices = [
-        device
-        for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST"))
-        if os.environ.get(gate) == "1"
-    ]
-    for device in devices:
-        assert device in qb.devices(), f"{device} requested but not built"
+    for device in devices():
         cases = transform_cases(qb.float32) + svd_cases()
         for function, arguments in cases:
             arguments = tuple(a.astype(qb.float32) for a in arguments)
@@ -616,7 +602,7 @@ def numpy_cases(rng):
 
 def test_functions_match_numpy_in_float64_and_float32():
     if np is None:
-        return
+        skip("numpy is not installed")
     rng = np.random.default_rng(0)
     # The edge inputs make NumPy warn about the infinities and NaN it returns.
     with np.errstate(all="ignore"):
@@ -662,7 +648,4 @@ def compare_with_numpy(function, reference, arguments, keywords, native=False, *
 if __name__ == "__main__":
     if np is None:
         print("note: numpy is not installed; NumPy comparisons are skipped")
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
-            print(f"PASS {name}")
+    run(globals())

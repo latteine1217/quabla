@@ -1,5 +1,7 @@
 #![cfg(all(feature = "cuda", target_os = "linux"))]
 
+mod support;
+
 use quabla_core::tensor_ir::{CudaBackend, DynamicTensor, TensorIr, TensorNodeId};
 use std::collections::BTreeMap;
 
@@ -67,7 +69,7 @@ fn assert_close(actual: &[f64], expected: &[f64], bits: bool) {
 
 #[test]
 fn native_cholesky_cuda_matches_expanded_primal_and_ad() -> Result<(), String> {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return Ok(());
     }
     for (batch, n) in [(1, 1), (1, 3), (1, 8), (1, 17), (2, 3)] {
@@ -185,7 +187,7 @@ fn native_cholesky_cuda_matches_expanded_primal_and_ad() -> Result<(), String> {
 
 #[test]
 fn native_cholesky_cuda_preserves_exceptional_primal() -> Result<(), String> {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return Ok(());
     }
     for data in [
@@ -301,7 +303,7 @@ fn profile_native_cholesky_cuda() -> Result<(), String> {
 
 #[test]
 fn native_cholesky_cuda_preserves_exceptional_ad() -> Result<(), String> {
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return Ok(());
     }
     for data in [
@@ -383,7 +385,7 @@ fn native_cholesky_cuda_preserves_exceptional_ad() -> Result<(), String> {
 #[test]
 fn native_cholesky_cuda_preserves_f32_public_dtype() -> Result<(), String> {
     use quabla_core::tensor_ir::TensorDType;
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return Ok(());
     }
     let mut graph = TensorIr::new();

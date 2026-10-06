@@ -11,16 +11,9 @@ import pickle
 import quabla as qb
 from quabla import random
 
+from _support import raises, run
+
 N = 100_000
-
-
-def raises(kind, fun, *args, match=None, **kwargs):
-    try:
-        fun(*args, **kwargs)
-    except kind as error:
-        assert match is None or match in str(error), str(error)
-        return
-    raise AssertionError(f"expected {kind.__name__}")
 
 
 def moments(values):
@@ -188,7 +181,4 @@ def test_keys_are_host_values_under_transforms():
 
 
 if __name__ == "__main__":
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
-            print(f"PASS {name}")
+    run(globals())

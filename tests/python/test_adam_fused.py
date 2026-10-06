@@ -1,11 +1,12 @@
 """Pure fused host Adam equivalence to the former eager expression."""
 
 import math
-import os
 import struct
 
 import quabla as qb
 from quabla.optim import Adam, AdamW, Trainer
+
+from _support import devices, run
 
 
 def reference(parameter, gradient, state, optimizer):
@@ -95,16 +96,17 @@ def test_device_adam_and_adamw_kernels_match_the_reference():
     batch replacement. Non-finite gradients propagate as on the CPU. Float32
     plans agree to a few float32 ulps, float64 plans to a few float64 ulps.
     """
-    devices = [
-        (device, dtype, options, tolerance)
-        for device, flag, dtype, options, tolerance in (
-            ("mlx", "QUABLA_MLX_TEST", qb.float32, {}, 1e-6),
-            ("cuda:0", "QUABLA_CUDA_TEST", qb.float32, {}, 1e-6),
-            ("cuda:0", "QUABLA_CUDA_TEST", qb.float64, {"precision": "float64"}, 1e-14),
+    targets = devices("mlx", "cuda:0")
+    runs = [
+        case
+        for case in (
+            ("mlx", qb.float32, {}, 1e-6),
+            ("cuda:0", qb.float32, {}, 1e-6),
+            ("cuda:0", qb.float64, {"precision": "float64"}, 1e-14),
         )
-        if os.environ.get(flag) == "1"
+        if case[0] in targets
     ]
-    for device, dtype, options, tolerance in devices:
+    for device, dtype, options, tolerance in runs:
         for optimizer in (
             Adam(0.031, b1=0.71, b2=0.953, eps=0.0013),
             AdamW(0.031, b1=0.71, b2=0.953, eps=0.0013, weight_decay=0.37),
@@ -140,7 +142,4 @@ def test_device_adam_and_adamw_kernels_match_the_reference():
 
 
 if __name__ == "__main__":
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
-            print(f"PASS {name}")
+    run(globals())

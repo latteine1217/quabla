@@ -9,6 +9,19 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Changed
+
+- Tests only: the GPU test gates `QUABLA_MLX_TEST`, `QUABLA_CUDA_TEST`, and
+  `QUABLA_CUDA_NCCL_TEST` are on exactly when the variable is `1`, in the
+  Python suites and the Rust tests alike. Some suites (most of
+  `tests/python/test_matrix.py`, the device checks in
+  `tests/python/test_api.py`, and nearly all Rust tests) used to switch on
+  for any value, so `QUABLA_CUDA_TEST=0` enabled them; it no longer does.
+  The Python suites share one harness (`tests/python/_support.py`) whose
+  runner prints `PASS`, `SKIP` with its reason, or `FAIL` for every test
+  and a summary line, and exits non-zero on a failure; a gated test that
+  used to return silently and print `PASS` now prints `SKIP`.
+
 ## [0.5.0] - 2026-10-06
 
 The v0.5 plan in `docs/jax_like_roadmap.md`: `vmap` batches `cond`,

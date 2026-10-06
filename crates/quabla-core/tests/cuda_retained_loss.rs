@@ -1,3 +1,5 @@
+mod support;
+
 use quabla_core::tensor_ir::{DynamicTensor, SymbolicCotangent, TensorIr};
 use std::collections::BTreeMap;
 
@@ -34,7 +36,7 @@ fn retained_loss_uses_updated_parameters_and_latest_batch_without_adam_mutation(
 ) -> Result<(), String> {
     use quabla_core::tensor_ir::CudaBackend;
     use std::collections::BTreeSet;
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return Ok(());
     }
     let mut graph = TensorIr::new();

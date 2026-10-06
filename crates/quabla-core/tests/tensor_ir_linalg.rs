@@ -3,6 +3,8 @@
 //! tree: CPU values, the numeric and symbolic derivative paths, vmap
 //! batching, and backend validation.
 
+mod support;
+
 use std::collections::BTreeMap;
 
 use quabla_core::tensor_ir::{DynamicTensor, LinalgKind, TensorDType, TensorIr, TensorNodeId};
@@ -524,7 +526,7 @@ mod mlx {
     use quabla_core::tensor_ir::{MlxBackend, TensorBackend};
 
     fn enabled() -> bool {
-        std::env::var_os("QUABLA_MLX_TEST").is_some()
+        crate::support::Gate::Mlx.enabled()
     }
 
     /// Deterministic entries in `[-1, 1)` from a linear congruential sequence.

@@ -10,6 +10,8 @@ try:
 except ImportError:  # NumPy is optional for quabla; every test here needs it.
     np = None
 
+from _support import run
+
 
 def assert_f32_import(source):
     expected = np.asarray(source).astype(np.float64).astype(np.float32)
@@ -99,9 +101,4 @@ def test_endian_rejection_and_bool_import():
 
 
 if __name__ == "__main__":
-    if np is None:
-        print("skipped test_buffer_narrow_import: numpy is not installed")
-    else:
-        for name, test in list(globals().items()):
-            if name.startswith("test_") and callable(test):
-                test()
+    run(globals(), skip_reason="numpy is not installed" if np is None else None)

@@ -1,3 +1,5 @@
+mod support;
+
 use quabla_core::tensor_ir::TensorIr;
 
 #[test]
@@ -49,7 +51,7 @@ fn where_cuda_source_selects_shared_values_without_recursive_calls() -> Result<(
 fn shared_dag_and_where_execute_with_cuda_cpu_parity() -> Result<(), String> {
     use quabla_core::tensor_ir::{CudaBackend, DynamicTensor, TensorBackend};
     use std::collections::BTreeMap;
-    if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+    if !crate::support::Gate::Cuda.enabled() {
         return Ok(());
     }
     for lazy in [false, true] {
