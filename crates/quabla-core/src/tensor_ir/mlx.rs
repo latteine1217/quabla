@@ -17,10 +17,10 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
-    adam_element, sgd_element, sqrt_derivative_coefficient, AdamArith, AdamCoefficients, AdamOrder,
-    BinaryMathKind, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, TensorBackend,
-    TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend, TensorExecutionPlan,
-    TensorExtremum, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
+    adam_element, region_op, sgd_element, sqrt_derivative_coefficient, AdamArith, AdamCoefficients,
+    AdamOrder, BinaryMathKind, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, RegionView,
+    TensorBackend, TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend,
+    TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
 };
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
@@ -2417,15 +2417,7 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Greater { .. } => "greater",
         TensorOp::Compare { kind, .. } => kind.name(),
         TensorOp::Where { .. } => "where",
-        TensorOp::Cond { .. } => "cond",
-        TensorOp::While { .. } => "while",
-        TensorOp::Fori { .. } => "fori",
-        TensorOp::ForiJvp { .. } => "fori_jvp",
-        TensorOp::ForiVjp { .. } => "fori_vjp",
-        TensorOp::ForiVjpJvp { .. } => "fori_vjp_jvp",
-        TensorOp::Scan { .. } => "scan",
-        TensorOp::ScanVjp { .. } => "scan_vjp",
-        TensorOp::ScanVjpJvp { .. } => "scan_vjp_jvp",
+        op @ region_op!() => RegionView::expect(op).name(),
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::ExtremumAxis { kind, .. } => match kind {

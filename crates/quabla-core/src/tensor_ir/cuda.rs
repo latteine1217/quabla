@@ -20,12 +20,12 @@ use cudarc::nvrtc::compile_ptx;
 use cudarc::nccl::{group_end, group_start, Comm as NcclComm, ReduceOp as NcclReduceOp};
 
 use super::{
-    contiguous_strides, cuda_elementwise_formula, cuda_scalar_literal, element_count,
-    tensor_op_inputs, DynamicTensor, LinalgKind, TensorBackend, TensorDType, TensorDeviceBackend,
-    TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorForiVjpJvpExecutionPlan,
-    TensorForiVjpTarget, TensorFusionRegion, TensorNodeId, TensorOp, TensorReplicaReduction,
-    TensorScanExecutionPlan, TensorScanTarget, TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget,
-    TensorShardingPlan, UnaryMathKind,
+    contiguous_strides, cuda_elementwise_formula, cuda_scalar_literal, element_count, region_op,
+    tensor_op_inputs, DynamicTensor, LinalgKind, RegionView, TensorBackend, TensorDType,
+    TensorDeviceBackend, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan,
+    TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget, TensorFusionRegion, TensorNodeId, TensorOp,
+    TensorReplicaReduction, TensorScanExecutionPlan, TensorScanTarget,
+    TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget, TensorShardingPlan, UnaryMathKind,
 };
 
 #[cfg(test)]
@@ -852,56 +852,26 @@ fn create_nccl_communicators(replicas: &[CudaExecutionPlan]) -> Result<Vec<NcclC
 pub(super) fn validate_cuda_plan(plan: &TensorExecutionPlan) -> Result<(), (String, String)> {
     ensure_cuda_f32_execution(plan).map_err(|message| ("dtype".into(), message))?;
     for (node_id, node) in plan.nodes.iter().enumerate() {
-        let (op, result) = match &node.op {
-            TensorOp::Fori { loop_plan, .. } => ("Fori", cuda_fori_body_is_lowerable(loop_plan)),
-            TensorOp::ForiJvp { loop_plan, .. } => {
-                ("Fori JVP", cuda_fori_jvp_is_lowerable(loop_plan))
-            }
-            TensorOp::ForiVjp {
-                loop_plan, target, ..
-            } => (
-                "Fori VJP",
-                cuda_fori_vjp_plan(loop_plan, target).map(|_| ()),
-            ),
-            TensorOp::ForiVjpJvp { plan, .. } => {
-                ("Fori VJP JVP", cuda_fori_vjp_jvp_is_lowerable(plan))
-            }
-            TensorOp::Scan { scan_plan, .. } => ("Scan", cuda_scan_body_is_lowerable(scan_plan)),
-            TensorOp::ScanVjp {
-                scan_plan, target, ..
-            } => (
-                "Scan VJP",
-                cuda_scan_vjp_plans(scan_plan, target).map(|_| ()),
-            ),
-            TensorOp::ScanVjpJvp {
-                plan: scan_hvp,
-                group,
-                ..
-            } => {
-                cuda_scan_vjp_jvp_group(plan, *group).map_err(|error| {
-                    (
-                        "Scan VJP JVP".into(),
-                        format!(
-                            "CUDA Scan VJP JVP node {node_id} has invalid group bindings: {error}"
-                        ),
-                    )
-                })?;
-                ("Scan VJP JVP", cuda_scan_vjp_jvp_is_lowerable(scan_hvp))
-            }
-            // A data-dependent trip count has no fused kernel; `While` always runs as a
-            // host-driven region loop.
-            TensorOp::While { .. } => (
-                "While",
-                Err("while_loop has a data-dependent trip count".to_string()),
-            ),
-            TensorOp::Cond { branches, .. } => {
-                validate_cuda_plan(&branches.on_true.plan)?;
-                validate_cuda_plan(&branches.on_false.plan)?;
-                continue;
-            }
-            _ => continue,
+        let Some(region) = RegionView::of(&node.op) else {
+            continue;
         };
-        let Err(error) = result else {
+        if !region.is_loop() {
+            // A `Cond` runs its selected branch as a separate region plan.
+            for branch in region.regions() {
+                validate_cuda_plan(branch)?;
+            }
+            continue;
+        }
+        let op = region.label();
+        if let TensorOp::ScanVjpJvp { group, .. } = &node.op {
+            cuda_scan_vjp_jvp_group(plan, *group).map_err(|error| {
+                (
+                    op.to_string(),
+                    format!("CUDA {op} node {node_id} has invalid group bindings: {error}"),
+                )
+            })?;
+        }
+        let Some(Err(error)) = cuda_fused_loop_lowering(&node.op) else {
             continue;
         };
         // A loop the fused per-lane kernel cannot lower runs as a host-driven region loop when
@@ -918,6 +888,28 @@ pub(super) fn validate_cuda_plan(plan: &TensorExecutionPlan) -> Result<(), (Stri
         ));
     }
     Ok(())
+}
+
+/// Whether the fused per-lane kernel lowers a loop node, with the reason
+/// when it cannot; `None` for a node that is not a loop.
+pub(super) fn cuda_fused_loop_lowering(op: &TensorOp) -> Option<Result<(), String>> {
+    Some(match op {
+        // A data-dependent trip count has no fused kernel; `While` always runs as a
+        // host-driven region loop.
+        TensorOp::While { .. } => Err("while_loop has a data-dependent trip count".to_string()),
+        TensorOp::Fori { loop_plan, .. } => cuda_fori_body_is_lowerable(loop_plan),
+        TensorOp::ForiJvp { loop_plan, .. } => cuda_fori_jvp_is_lowerable(loop_plan),
+        TensorOp::ForiVjp {
+            loop_plan, target, ..
+        } => cuda_fori_vjp_plan(loop_plan, target).map(|_| ()),
+        TensorOp::ForiVjpJvp { plan, .. } => cuda_fori_vjp_jvp_is_lowerable(plan),
+        TensorOp::Scan { scan_plan, .. } => cuda_scan_body_is_lowerable(scan_plan),
+        TensorOp::ScanVjp {
+            scan_plan, target, ..
+        } => cuda_scan_vjp_plans(scan_plan, target).map(|_| ()),
+        TensorOp::ScanVjpJvp { plan, .. } => cuda_scan_vjp_jvp_is_lowerable(plan),
+        _ => return None,
+    })
 }
 
 /// Rejects a `float32` node anywhere in a plan compiled with `f64` buffers.
@@ -941,23 +933,9 @@ pub(super) fn validate_cuda_float64_plan(
                 ),
             ));
         }
-        let nested: Vec<&TensorExecutionPlan> = match &node.op {
-            TensorOp::Cond { branches, .. } => {
-                vec![&branches.on_true.plan, &branches.on_false.plan]
-            }
-            TensorOp::Fori { loop_plan, .. }
-            | TensorOp::ForiJvp { loop_plan, .. }
-            | TensorOp::ForiVjp { loop_plan, .. } => vec![&loop_plan.body.plan],
-            TensorOp::ForiVjpJvp { plan, .. } => vec![&plan.loop_plan.body.plan],
-            TensorOp::While { loop_plan, .. } => {
-                vec![&loop_plan.predicate.plan, &loop_plan.body.plan]
-            }
-            TensorOp::Scan { scan_plan, .. } | TensorOp::ScanVjp { scan_plan, .. } => {
-                vec![&scan_plan.body.plan]
-            }
-            TensorOp::ScanVjpJvp { plan, .. } => vec![&plan.scan_plan.body.plan],
-            _ => Vec::new(),
-        };
+        let nested = RegionView::of(&node.op)
+            .map(RegionView::regions)
+            .unwrap_or_default();
         for nested in nested {
             validate_cuda_float64_plan(nested)?;
         }
@@ -8455,15 +8433,7 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Greater { .. } => "greater",
         TensorOp::Compare { kind, .. } => kind.name(),
         TensorOp::Where { .. } => "where",
-        TensorOp::Cond { .. } => "cond",
-        TensorOp::Fori { .. } => "fori",
-        TensorOp::While { .. } => "while",
-        TensorOp::ForiJvp { .. } => "fori_jvp",
-        TensorOp::ForiVjp { .. } => "fori_vjp",
-        TensorOp::ForiVjpJvp { .. } => "fori_vjp_jvp",
-        TensorOp::Scan { .. } => "scan",
-        TensorOp::ScanVjp { .. } => "scan_vjp",
-        TensorOp::ScanVjpJvp { .. } => "scan_vjp_jvp",
+        op @ region_op!() => RegionView::expect(op).name(),
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::ExtremumAxis { kind, .. } => match kind {

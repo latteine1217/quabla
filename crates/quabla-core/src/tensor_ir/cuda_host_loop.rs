@@ -45,13 +45,12 @@ use cudarc::driver::{
 };
 
 use super::super::{
-    element_count, DynamicTensor, SymbolicCotangent, TensorCarryCheckpoints, TensorExecutionPlan,
-    TensorForiVjpTarget, TensorIr, TensorNodeId, TensorOp, TensorScanTarget, TensorScanVjpTarget,
+    element_count, DynamicTensor, RegionView, SymbolicCotangent, TensorCarryCheckpoints,
+    TensorExecutionPlan, TensorForiVjpTarget, TensorIr, TensorNodeId, TensorOp, TensorScanTarget,
+    TensorScanVjpTarget,
 };
 use super::{
-    cuda_fori_body_is_lowerable, cuda_fori_jvp_is_lowerable, cuda_fori_jvp_tangent_names,
-    cuda_fori_vjp_jvp_is_lowerable, cuda_fori_vjp_plan, cuda_scalar_predicate,
-    cuda_scan_body_is_lowerable, cuda_scan_vjp_jvp_is_lowerable, cuda_scan_vjp_plans, cuda_value,
+    cuda_fori_jvp_tangent_names, cuda_fused_loop_lowering, cuda_scalar_predicate, cuda_value,
     execute_cuda_device_program, recycle_cuda_computed_values, CudaBackend, CudaBufferPool,
     CudaExecutionPlan, CudaExecutionState, CudaProgramRuntime, CudaReal,
 };
@@ -192,16 +191,11 @@ enum HostLoopKind {
     },
 }
 
-/// Group key of a loop node whose sibling nodes share one execution.
-fn loop_group_key(op: &TensorOp) -> Option<(u8, usize)> {
-    match op {
-        TensorOp::Scan { group, .. } => Some((0, *group)),
-        TensorOp::ScanVjp { group, .. } => Some((1, *group)),
-        TensorOp::ForiVjp { group, .. } => Some((2, *group)),
-        TensorOp::ForiVjpJvp { group, .. } => Some((3, *group)),
-        TensorOp::ScanVjpJvp { group, .. } => Some((4, *group)),
-        _ => None,
-    }
+/// Group key of a loop node whose sibling nodes share one execution: group
+/// ids are compared within one op kind.
+fn loop_group_key(op: &TensorOp) -> Option<(&'static str, usize)> {
+    let region = RegionView::of(op)?;
+    Some((region.name(), region.group()?))
 }
 
 /// Nodes produced by the same loop execution as `node_id`, in node order.
@@ -226,25 +220,9 @@ pub(super) fn cuda_loop_fused_error(
     plan: &TensorExecutionPlan,
     node_id: TensorNodeId,
 ) -> Option<String> {
-    let members = cuda_loop_group_members(plan, node_id);
-    let error = |member: TensorNodeId| -> Option<String> {
-        match &plan.nodes[member].op {
-            TensorOp::While { .. } => Some("while_loop has a data-dependent trip count".into()),
-            TensorOp::Fori { loop_plan, .. } => cuda_fori_body_is_lowerable(loop_plan).err(),
-            TensorOp::ForiJvp { loop_plan, .. } => cuda_fori_jvp_is_lowerable(loop_plan).err(),
-            TensorOp::ForiVjp {
-                loop_plan, target, ..
-            } => cuda_fori_vjp_plan(loop_plan, target).err(),
-            TensorOp::ForiVjpJvp { plan, .. } => cuda_fori_vjp_jvp_is_lowerable(plan).err(),
-            TensorOp::Scan { scan_plan, .. } => cuda_scan_body_is_lowerable(scan_plan).err(),
-            TensorOp::ScanVjp {
-                scan_plan, target, ..
-            } => cuda_scan_vjp_plans(scan_plan, target).err(),
-            TensorOp::ScanVjpJvp { plan, .. } => cuda_scan_vjp_jvp_is_lowerable(plan).err(),
-            _ => None,
-        }
-    };
-    members.into_iter().find_map(error)
+    cuda_loop_group_members(plan, node_id)
+        .into_iter()
+        .find_map(|member| cuda_fused_loop_lowering(&plan.nodes[member].op)?.err())
 }
 
 /// The set of nodes that run host-driven, every member of a host-driven group
@@ -1090,15 +1068,8 @@ fn loop_captures<'a, T: CudaReal>(
     op: &TensorOp,
     values: &'a [Option<CudaSlice<T>>],
 ) -> Result<BTreeMap<String, &'a CudaSlice<T>>, String> {
-    let captures = match op {
-        TensorOp::While { captures, .. }
-        | TensorOp::Fori { captures, .. }
-        | TensorOp::ForiJvp { captures, .. }
-        | TensorOp::ForiVjp { captures, .. }
-        | TensorOp::ForiVjpJvp { captures, .. }
-        | TensorOp::Scan { captures, .. }
-        | TensorOp::ScanVjp { captures, .. }
-        | TensorOp::ScanVjpJvp { captures, .. } => captures,
+    let captures = match RegionView::of(op) {
+        Some(region) if region.is_loop() => region.captures(),
         _ => return Err("CUDA host-driven loop node has no captures".to_string()),
     };
     named_values(captures, values)

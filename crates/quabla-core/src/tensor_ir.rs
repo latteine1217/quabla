@@ -23,6 +23,8 @@ mod extremum;
 pub use extremum::TensorExtremum;
 mod host_storage;
 pub use host_storage::HostTensorStorage;
+mod region;
+use region::{region_op, RegionView};
 mod region_batching;
 #[cfg(test)]
 mod region_batching_tests;
@@ -1037,9 +1039,11 @@ pub struct TensorExecutionPlan {
 
 /// A frozen, explicitly captured branch region.
 ///
-/// Regions retain the normal Tensor IR input contract, but are kept separate
-/// from their parent until a future nested `Cond` node owns them. This makes
-/// lazy branch evaluation available without treating `where` as control flow.
+/// Regions retain the normal Tensor IR input contract and stay separate from
+/// the parent graph: the region node that owns them (a `Cond` branch, a loop
+/// body or predicate) binds its operands to the region inputs by name. This
+/// makes lazy branch evaluation available without treating `where` as
+/// control flow.
 #[derive(Clone, Debug)]
 pub struct TensorRegion {
     plan: TensorExecutionPlan,
@@ -1072,8 +1076,9 @@ pub struct TensorCondExecutionPlan {
 /// A frozen, fixed-bound loop body with an explicit carry capture and an
 /// optional scalar index capture.
 ///
-/// This is the region-level execution contract used by a future `Fori` IR
-/// node. It is intentionally separate from host-static graph unrolling.
+/// This is the region-level execution contract of the `Fori` region node and
+/// its derivative nodes. It is intentionally separate from host-static graph
+/// unrolling.
 #[derive(Clone, Debug)]
 pub struct TensorForiExecutionPlan {
     lower: usize,
@@ -3053,7 +3058,7 @@ impl TensorIr {
         groups: &mut HashMap<usize, usize>,
     ) -> Result<TensorNodeId, String> {
         let mut op = remap_tensor_op(&node.op, &|id| remap.get(&id).copied())?;
-        if let Some(group) = tensor_op_group_mut(&mut op) {
+        if let Some(group) = region::group_mut(&mut op) {
             *group = *groups.entry(*group).or_insert(self.nodes.len());
         }
         Ok(self.push_node(op, node.shape.clone(), node.dtype, node.weak))
@@ -5508,8 +5513,9 @@ impl TensorIr {
     }
 
     /// Adds a lazy conditional with explicit ordered bindings from region input
-    /// names to parent graph values. This is the primitive used by future
-    /// traced nested control flow; `cond` is the input-name convenience form.
+    /// names to parent graph values. This is the primitive used by traced
+    /// control flow, nested regions included; `cond` is the input-name
+    /// convenience form.
     pub fn cond_with_captures(
         &mut self,
         predicate: TensorNodeId,
@@ -14281,34 +14287,10 @@ impl TensorExecutionPlan {
                         "MLX backend does not support non-finite constants".into(),
                     ))
                 }
-                TensorOp::Cond { branches, .. } => {
-                    branches.on_true.plan.validate_mlx()?;
-                    branches.on_false.plan.validate_mlx()?;
-                }
-                TensorOp::While { loop_plan, .. } => {
-                    loop_plan.predicate.plan.validate_mlx()?;
-                    loop_plan.body.plan.validate_mlx()?;
-                }
-                TensorOp::Fori { loop_plan, .. }
-                | TensorOp::ForiJvp { loop_plan, .. }
-                | TensorOp::ForiVjp { loop_plan, .. } => loop_plan.body.plan.validate_mlx()?,
-                TensorOp::ForiVjpJvp { plan, .. } => {
-                    plan.loop_plan.body.plan.validate_mlx()?;
-                    for gradient in plan.gradient_tangent_plans.values() {
-                        gradient.validate_mlx()?;
-                    }
-                }
-                TensorOp::Scan { scan_plan, .. } | TensorOp::ScanVjp { scan_plan, .. } => {
-                    scan_plan.body.plan.validate_mlx()?
-                }
-                TensorOp::ScanVjpJvp { plan, .. } => {
-                    plan.scan_plan.body.plan.validate_mlx()?;
-                    for gradient in plan
-                        .carry_gradient_tangent_plans
-                        .values()
-                        .chain(plan.output_gradient_tangent_plans.values())
-                    {
-                        gradient.validate_mlx()?;
+                op @ region_op!() => {
+                    let region = RegionView::expect(op);
+                    for plan in region.regions().into_iter().chain(region.derived_regions()) {
+                        plan.validate_mlx()?;
                     }
                 }
                 _ => {}
@@ -15193,57 +15175,16 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                 TensorOp::Broadcast { input } => {
                     specialized.broadcast_to(mapped(*input)?, node.shape.clone())?
                 }
-                TensorOp::Cond { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Cond regions".to_string()
-                    )
-                }
-                TensorOp::While { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform While regions".to_string()
-                    )
+                op @ region_op!() => {
+                    return Err(format!(
+                        "batch specialization does not yet transform {} regions",
+                        RegionView::expect(op).label()
+                    ))
                 }
                 TensorOp::Custom { .. } => {
                     return Err(
                         "batch specialization applies to compiled plans, which have no custom \
                          rule nodes"
-                            .to_string(),
-                    )
-                }
-                TensorOp::Fori { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Fori regions".to_string()
-                    )
-                }
-                TensorOp::ForiJvp { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Fori JVP regions".to_string(),
-                    )
-                }
-                TensorOp::ForiVjp { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Fori VJP regions".to_string(),
-                    )
-                }
-                TensorOp::ForiVjpJvp { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Fori VJP JVP regions"
-                            .to_string(),
-                    )
-                }
-                TensorOp::Scan { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Scan regions".to_string()
-                    )
-                }
-                TensorOp::ScanVjp { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Scan VJP regions".to_string(),
-                    )
-                }
-                TensorOp::ScanVjpJvp { .. } => {
-                    return Err(
-                        "batch specialization does not yet transform Scan VJP JVP regions"
                             .to_string(),
                     )
                 }
@@ -15585,93 +15526,7 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
             on_true,
             on_false,
         } => vec![*condition, *on_true, *on_false],
-        TensorOp::Cond {
-            predicate,
-            captures,
-            ..
-        } => std::iter::once(*predicate)
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::While {
-            carry, captures, ..
-        } => std::iter::once(*carry)
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::Fori {
-            carry, captures, ..
-        } => std::iter::once(*carry)
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::ForiJvp {
-            carry,
-            carry_tangent,
-            captures,
-            tangent_captures,
-            ..
-        } => std::iter::once(*carry)
-            .chain(std::iter::once(*carry_tangent))
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .chain(tangent_captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::ForiVjp {
-            carry,
-            output_cotangent,
-            captures,
-            ..
-        } => std::iter::once(*carry)
-            .chain(std::iter::once(*output_cotangent))
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::ForiVjpJvp {
-            carry,
-            carry_tangent,
-            output_cotangent,
-            output_cotangent_tangent,
-            captures,
-            tangent_captures,
-            ..
-        } => std::iter::once(*carry)
-            .chain(std::iter::once(*carry_tangent))
-            .chain(std::iter::once(*output_cotangent))
-            .chain(std::iter::once(*output_cotangent_tangent))
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .chain(tangent_captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::Scan {
-            carry, captures, ..
-        } => std::iter::once(*carry)
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::ScanVjp {
-            carry,
-            final_carry_cotangent,
-            output_cotangent,
-            captures,
-            ..
-        } => std::iter::once(*carry)
-            .chain(std::iter::once(*final_carry_cotangent))
-            .chain(std::iter::once(*output_cotangent))
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
-        TensorOp::ScanVjpJvp {
-            carry,
-            carry_tangent,
-            final_carry_cotangent,
-            final_carry_cotangent_tangent,
-            output_cotangent,
-            output_cotangent_tangent,
-            captures,
-            tangent_captures,
-            ..
-        } => std::iter::once(*carry)
-            .chain(std::iter::once(*carry_tangent))
-            .chain(std::iter::once(*final_carry_cotangent))
-            .chain(std::iter::once(*final_carry_cotangent_tangent))
-            .chain(std::iter::once(*output_cotangent))
-            .chain(std::iter::once(*output_cotangent_tangent))
-            .chain(captures.iter().map(|(_, node_id)| *node_id))
-            .chain(tangent_captures.iter().map(|(_, node_id)| *node_id))
-            .collect(),
+        op @ region_op!() => RegionView::expect(op).operands(),
         TensorOp::Sum { input }
         | TensorOp::SumAxis { input, .. }
         | TensorOp::ExtremumAxis { input, .. }
@@ -16053,15 +15908,10 @@ fn tensor_forward_last_uses(
     }
 }
 
+/// The execution group of a region node whose sibling nodes share one
+/// region execution; see [`RegionView::group`].
 fn tensor_op_group(op: &TensorOp) -> Option<usize> {
-    match op {
-        TensorOp::ForiVjp { group, .. }
-        | TensorOp::ForiVjpJvp { group, .. }
-        | TensorOp::Scan { group, .. }
-        | TensorOp::ScanVjp { group, .. }
-        | TensorOp::ScanVjpJvp { group, .. } => Some(*group),
-        _ => None,
-    }
+    RegionView::of(op).and_then(RegionView::group)
 }
 
 fn tensor_forward_capture_values(
@@ -16142,16 +15992,7 @@ fn infer_tensor_placement(
             on_true,
             on_false,
         } => merge(&[*condition, *on_true, *on_false]),
-        TensorOp::Cond { .. }
-        | TensorOp::While { .. }
-        | TensorOp::Fori { .. }
-        | TensorOp::ForiJvp { .. }
-        | TensorOp::ForiVjp { .. }
-        | TensorOp::ForiVjpJvp { .. }
-        | TensorOp::Scan { .. }
-        | TensorOp::ScanVjp { .. }
-        | TensorOp::ScanVjpJvp { .. }
-        | TensorOp::Custom { .. } => Err(format!(
+        region_op!() | TensorOp::Custom { .. } => Err(format!(
             "kernel node {node_id} contains {} regions; placement propagation requires explicit region lowering",
             tensor_op_name(&node.op)
         )),
@@ -16609,15 +16450,7 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Greater { .. } => "greater",
         TensorOp::Compare { kind, .. } => kind.name(),
         TensorOp::Where { .. } => "where",
-        TensorOp::Cond { .. } => "cond",
-        TensorOp::Fori { .. } => "fori",
-        TensorOp::While { .. } => "while",
-        TensorOp::ForiJvp { .. } => "fori_jvp",
-        TensorOp::ForiVjp { .. } => "fori_vjp",
-        TensorOp::ForiVjpJvp { .. } => "fori_vjp_jvp",
-        TensorOp::Scan { .. } => "scan",
-        TensorOp::ScanVjp { .. } => "scan_vjp",
-        TensorOp::ScanVjpJvp { .. } => "scan_vjp_jvp",
+        op @ region_op!() => RegionView::expect(op).name(),
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::ExtremumAxis { kind, .. } => match kind {
@@ -17093,15 +16926,7 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         TensorOp::Input { .. }
         | TensorOp::Constant { .. }
         | TensorOp::CholeskyAd { .. }
-        | TensorOp::Cond { .. }
-        | TensorOp::While { .. }
-        | TensorOp::Fori { .. }
-        | TensorOp::ForiJvp { .. }
-        | TensorOp::ForiVjp { .. }
-        | TensorOp::ForiVjpJvp { .. }
-        | TensorOp::Scan { .. }
-        | TensorOp::ScanVjp { .. }
-        | TensorOp::ScanVjpJvp { .. }
+        | region_op!()
         | TensorOp::Custom { .. } => return None,
         TensorOp::ScalarConstant { value } => arguments[0] = value.to_bits(),
         TensorOp::Add { lhs, rhs }
@@ -17274,20 +17099,6 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
     })
 }
 
-/// The execution-group id of a node that shares one region execution with
-/// its sibling results, if the op has one.
-fn tensor_op_group_mut(op: &mut TensorOp) -> Option<&mut usize> {
-    match op {
-        TensorOp::ForiVjp { group, .. }
-        | TensorOp::ForiVjpJvp { group, .. }
-        | TensorOp::Scan { group, .. }
-        | TensorOp::ScanVjp { group, .. }
-        | TensorOp::ScanVjpJvp { group, .. }
-        | TensorOp::Custom { group, .. } => Some(group),
-        _ => None,
-    }
-}
-
 // Dense indexing removes hash work without allocating a full table for sparse outputs.
 enum TensorNodeRemap {
     Dense(Vec<TensorNodeId>),
@@ -17370,173 +17181,13 @@ fn remap_tensor_op(
             on_true: remap_node(*on_true)?,
             on_false: remap_node(*on_false)?,
         }),
-        TensorOp::Cond {
-            predicate,
-            branches,
-            captures,
-        } => Ok(TensorOp::Cond {
-            predicate: remap_node(*predicate)?,
-            branches: branches.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-        }),
-        TensorOp::ForiJvp {
-            carry,
-            carry_tangent,
-            loop_plan,
-            captures,
-            tangent_captures,
-        } => Ok(TensorOp::ForiJvp {
-            carry: remap_node(*carry)?,
-            carry_tangent: remap_node(*carry_tangent)?,
-            loop_plan: loop_plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            tangent_captures: tangent_captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-        }),
-        TensorOp::ForiVjp {
-            carry,
-            output_cotangent,
-            loop_plan,
-            captures,
-            target,
-            group,
-        } => Ok(TensorOp::ForiVjp {
-            carry: remap_node(*carry)?,
-            output_cotangent: remap_node(*output_cotangent)?,
-            loop_plan: loop_plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            target: target.clone(),
-            group: *group,
-        }),
-        TensorOp::ScanVjpJvp {
-            carry,
-            carry_tangent,
-            final_carry_cotangent,
-            final_carry_cotangent_tangent,
-            output_cotangent,
-            output_cotangent_tangent,
-            plan,
-            captures,
-            tangent_captures,
-            target,
-            group,
-        } => Ok(TensorOp::ScanVjpJvp {
-            carry: remap_node(*carry)?,
-            carry_tangent: remap_node(*carry_tangent)?,
-            final_carry_cotangent: remap_node(*final_carry_cotangent)?,
-            final_carry_cotangent_tangent: remap_node(*final_carry_cotangent_tangent)?,
-            output_cotangent: remap_node(*output_cotangent)?,
-            output_cotangent_tangent: remap_node(*output_cotangent_tangent)?,
-            plan: plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            tangent_captures: tangent_captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            target: target.clone(),
-            group: *group,
-        }),
-        TensorOp::ForiVjpJvp {
-            carry,
-            carry_tangent,
-            output_cotangent,
-            output_cotangent_tangent,
-            plan,
-            captures,
-            tangent_captures,
-            target,
-            group,
-        } => Ok(TensorOp::ForiVjpJvp {
-            carry: remap_node(*carry)?,
-            carry_tangent: remap_node(*carry_tangent)?,
-            output_cotangent: remap_node(*output_cotangent)?,
-            output_cotangent_tangent: remap_node(*output_cotangent_tangent)?,
-            plan: plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            tangent_captures: tangent_captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            target: target.clone(),
-            group: *group,
-        }),
-        TensorOp::Fori {
-            carry,
-            loop_plan,
-            captures,
-        } => Ok(TensorOp::Fori {
-            carry: remap_node(*carry)?,
-            loop_plan: loop_plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-        }),
-        TensorOp::While {
-            carry,
-            loop_plan,
-            captures,
-        } => Ok(TensorOp::While {
-            carry: remap_node(*carry)?,
-            loop_plan: loop_plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-        }),
-        TensorOp::Scan {
-            carry,
-            scan_plan,
-            captures,
-            target,
-            group,
-        } => Ok(TensorOp::Scan {
-            carry: remap_node(*carry)?,
-            scan_plan: scan_plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            target: *target,
-            group: *group,
-        }),
-        TensorOp::ScanVjp {
-            carry,
-            final_carry_cotangent,
-            output_cotangent,
-            scan_plan,
-            captures,
-            target,
-            group,
-        } => Ok(TensorOp::ScanVjp {
-            carry: remap_node(*carry)?,
-            final_carry_cotangent: remap_node(*final_carry_cotangent)?,
-            output_cotangent: remap_node(*output_cotangent)?,
-            scan_plan: scan_plan.clone(),
-            captures: captures
-                .iter()
-                .map(|(name, node_id)| Ok((name.clone(), remap_node(*node_id)?)))
-                .collect::<Result<Vec<_>, String>>()?,
-            target: target.clone(),
-            group: *group,
-        }),
+        op @ region_op!() => {
+            let mut op = op.clone();
+            for operand in region::region_operands_mut(&mut op).into_iter().flatten() {
+                *operand = remap_node(*operand)?;
+            }
+            Ok(op)
+        }
         TensorOp::Sum { input } => Ok(TensorOp::Sum {
             input: remap_node(*input)?,
         }),
