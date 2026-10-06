@@ -668,6 +668,122 @@ def test_sigmoid_and_softplus_are_stable_and_eager_matches_jit_bitwise():
     assert abs(softplus - 2.0611536e-9) <= 1e-15, softplus
 
 
+# Signed zeros, subnormals, infinities, NaNs of both signs and a payload,
+# rounding and domain edges.
+EAGER_JIT_POINTS = [
+    0.0,
+    -0.0,
+    1e-310,
+    -1e-30,
+    0.5,
+    -1.5,
+    2.5,
+    0.1,
+    1.0,
+    -1.0,
+    20.0,
+    -88.5,
+    1e30,
+    -1e300,
+    math.inf,
+    -math.inf,
+    math.nan,
+    struct.unpack("<d", struct.pack("<Q", 0xFFF8000000001234))[0],
+]
+
+
+# A well-conditioned matrix; its Gram matrix is symmetric positive definite.
+SPD_ROOT = [[2.0, 0.5, 0.1], [0.3, 1.5, 0.2], [0.1, 0.4, 1.2]]
+
+
+def eager_jit_summary(result):
+    """dtype, shape, and element bit patterns of a result (or a raised type)."""
+    if isinstance(result, BaseException):
+        return type(result).__name__
+    if result.dtype == qb.bool_:
+        bits = [bool(value) for value in flat_values(result.tolist())]
+    else:
+        bits = float_bits(flat_values(result.tolist()))
+    return str(result.dtype), list(result.shape), bits
+
+
+def flat_values(values):
+    if not isinstance(values, list):
+        return [values]
+    return [item for value in values for item in flat_values(value)]
+
+
+def eager_and_jit(function, *operands):
+    results = []
+    for evaluate in (function, qb.jit(function)):
+        try:
+            results.append(eager_jit_summary(evaluate(*operands)))
+        except (ValueError, TypeError) as error:
+            results.append(eager_jit_summary(error))
+    return results
+
+
+def test_eager_ops_match_jit_bitwise():
+    # An eager op evaluates the graph its trace records, so its value,
+    # dtype, and errors equal those of the CPU jit, signed zeros and NaN
+    # signs included. Eager abs(+0.0) used to return -0.0 and
+    # sqrt(-0.0) returned -0.0, among others.
+    unary = ["abs", "relu", "sigmoid", "softplus", "sqrt", "exp", "log", "log1p",
+             "expm1", "erf", "erfc", "tanh", "sin", "cos", "tan", "arcsin", "arctanh",
+             "cbrt", "floor", "round", "isnan", "isfinite", "__neg__"]
+    binary = [
+        lambda a, b: a + b, lambda a, b: a - b, lambda a, b: a * b, lambda a, b: a / b,
+        lambda a, b: a**b, lambda a, b: a.atan2(b), lambda a, b: a.fmod(b),
+        lambda a, b: a.maximum(b), lambda a, b: a.minimum(b), lambda a, b: a.gt(b),
+        lambda a, b: a > b, lambda a, b: a.equal(b),
+    ]
+    count = len(EAGER_JIT_POINTS)
+    for dtype in (qb.float32, qb.float64):
+        x = qb.array(EAGER_JIT_POINTS, dtype=dtype)
+        lhs, rhs = x.reshape(count, 1), x.reshape(1, count)
+        pairs = (x.reshape(count, 1) + qb.zeros([1, count]).astype(dtype)).reshape(-1)
+        mask = x > 0.5
+        cases = [(lambda a, m=m: getattr(a, m)(), [x]) for m in unary]
+        cases += [(function, [lhs, rhs]) for function in binary]
+        cases += [(function, [pairs, pairs[::-1]]) for function in binary]
+        for scalar in (0.0, -0.0, 0.1, math.inf, math.nan):
+            cases += [
+                (lambda a, s=scalar: a + s, [x]),
+                (lambda a, s=scalar: s - a, [x]),
+                (lambda a, s=scalar: a * s, [x]),
+                (lambda a, s=scalar: s / a, [x]),
+                (lambda a, s=scalar: a**s, [x]),
+                (lambda a, s=scalar: a.maximum(s), [x]),
+                (lambda a, s=scalar: a <= s, [x]),
+            ]
+        cube = qb.array([EAGER_JIT_POINTS[i % count] for i in range(60)], dtype=dtype)
+        cube = cube.reshape(4, 3, 5)
+        for method in ("sum", "mean", "max", "min", "prod", "norm"):
+            for axis in (None, 1, (0, 2)):
+                cases.append((lambda a, m=method, ax=axis: getattr(a, m)(axis=ax), [cube]))
+        cases += [
+            (lambda a: a.cumsum(axis=1, reverse=True), [cube]),
+            (lambda a, u: a.scatter_add([1, 1, 0], u, axis=1), [cube, cube]),
+            (lambda a: a.reshape(12, 5) @ a.reshape(5, 12), [cube]),
+            (lambda m, a: qb.where(m, a, 2.5), [mask, x]),
+            (lambda m, a: (m * 2.0) + a, [mask, x]),
+            (lambda m, a: (m * 0.1).sum() + a, [mask, x]),
+            (lambda b: (b @ b.T).cholesky(), [qb.array(SPD_ROOT, dtype=dtype)]),
+            (lambda a: qb.eye(3).astype(a.dtype).solve(a.reshape(3, 6)), [x]),
+        ]
+        for function, operands in cases:
+            eager, jitted = eager_and_jit(function, *operands)
+            assert eager == jitted, (dtype, eager, jitted)
+    # Eager Cholesky keeps its documented validation, which the traced op
+    # (lower triangle, NaN for an indefinite matrix) omits.
+    assert_raises(ValueError, (-qb.eye(3)).cholesky, match="positive-definite")
+    asymmetric = qb.array([[2.0, 1.0], [0.0, 2.0]])
+    assert_raises(ValueError, asymmetric.cholesky, match="symmetric")
+    zeros = qb.array([0.0, -0.0])
+    assert float_bits(zeros.abs().tolist()) == float_bits([0.0, 0.0])
+    assert float_bits(zeros.sqrt().tolist()) == float_bits([0.0, 0.0])
+
+
 def test_maximum_minimum_relu_and_extrema_propagate_nan_at_every_position():
     nan = math.nan
     for dtype in [qb.float32, qb.float64]:

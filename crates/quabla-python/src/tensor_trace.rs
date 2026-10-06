@@ -20,6 +20,7 @@ use quabla_core::{
     QuablaPrecision, QuablaTarget,
 };
 
+use crate::composite::{self, Primitives};
 use crate::dtype::PyDType;
 use crate::errors::{concrete_value_error, tracer_error, unsupported_operation_error};
 use crate::tensor::bool_operation_error;
@@ -1471,7 +1472,7 @@ impl TraceTensor {
         Self::try_concat(&reshaped, axis)
     }
 
-    fn binary(&self, rhs: &Self, op: &str) -> Result<Self, String> {
+    pub(crate) fn binary(&self, rhs: &Self, op: &str) -> Result<Self, String> {
         if let Some(lifted) = Self::lifted_to_common_graph(&[self, rhs])? {
             return lifted[0].binary(&lifted[1], op);
         }
@@ -1500,7 +1501,7 @@ impl TraceTensor {
         ))
     }
 
-    fn scalar_binary(&self, value: f64, op: &str) -> Result<Self, String> {
+    pub(crate) fn scalar_binary(&self, value: f64, op: &str) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -1540,6 +1541,53 @@ impl TraceTensor {
         let node_id = ir.constant(value, weak);
         let shape = ir.node_shape(node_id)?;
         Ok(Self::from_node(self.graph.clone(), node_id, shape, None))
+    }
+
+    /// Evaluates the traced op `build` on eager operands at once: each
+    /// operand becomes a constant of a fresh graph, `build` appends the nodes
+    /// a trace of the op records, and the CPU evaluator runs them node by
+    /// node, as it runs a `jit` plan. Eager results therefore equal traced
+    /// ones bit for bit, and errors are the builder's. The result keeps the
+    /// weak type of its node.
+    pub(crate) fn evaluate_eager<const N: usize>(
+        operands: [&PyTensor; N],
+        build: impl FnOnce([Self; N]) -> Result<Self, String>,
+    ) -> Result<PyTensor, String> {
+        Self::evaluate_eager_all(&operands, |tracers| {
+            build(
+                tracers
+                    .try_into()
+                    .map_err(|_| "eager operand count mismatch".to_string())?,
+            )
+        })
+    }
+
+    /// [`Self::evaluate_eager`] for any number of operands.
+    pub(crate) fn evaluate_eager_all(
+        operands: &[&PyTensor],
+        build: impl FnOnce(Vec<Self>) -> Result<Self, String>,
+    ) -> Result<PyTensor, String> {
+        let graph = TensorTraceGraph::new();
+        let tracers = operands
+            .iter()
+            .map(|operand| {
+                let value = operand.to_dynamic_tensor()?;
+                let shape = value.shape().to_vec();
+                let node_id = graph
+                    .ir
+                    .lock()
+                    .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+                    .constant(value, operand.is_weak());
+                Ok(Self::from_node(graph.clone(), node_id, shape, None))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let output = build(tracers)?;
+        let ir = graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?;
+        let value = ir.evaluate(output.node_id, &BTreeMap::new())?;
+        Ok(PyTensor::from_dynamic_tensor(value)?.with_weak(ir.node_weak(output.node_id)?))
     }
 
     /// Captures an eager tensor as a constant of this tracer's graph, keeping
@@ -1591,7 +1639,21 @@ impl TraceTensor {
         Ok(Self::from_node(self.graph.clone(), node_id, shape, None))
     }
 
-    fn scalar_left_binary(&self, value: f64, op: &str) -> Result<Self, String> {
+    /// `-x` as `x * -1`, so `-0.0` stays signed; `bool` is rejected.
+    pub(crate) fn negative_tensor(&self) -> Result<Self, String> {
+        self.ensure_not_bool("negative")?;
+        self.scalar_binary(-1.0, "mul")
+    }
+
+    /// [`Self::scalar_binary`] for an op without a `bool` form (`atan2`,
+    /// `fmod`): a `bool` operand would otherwise join the weak scalar as
+    /// 0/1 values.
+    pub(crate) fn float_scalar_binary(&self, value: f64, op: &str) -> Result<Self, String> {
+        self.ensure_not_bool(op)?;
+        self.scalar_binary(value, op)
+    }
+
+    pub(crate) fn scalar_left_binary(&self, value: f64, op: &str) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -1616,7 +1678,7 @@ impl TraceTensor {
         ))
     }
 
-    fn sum_tensor(&self, axis: Option<isize>) -> Result<Self, String> {
+    pub(crate) fn sum_tensor(&self, axis: Option<isize>) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -1642,7 +1704,7 @@ impl TraceTensor {
         ))
     }
 
-    fn matmul_tensor(&self, rhs: &Self) -> Result<Self, String> {
+    pub(crate) fn matmul_tensor(&self, rhs: &Self) -> Result<Self, String> {
         if let Some(lifted) = Self::lifted_to_common_graph(&[self, rhs])? {
             return lifted[0].matmul_tensor(&lifted[1]);
         }
@@ -1665,7 +1727,7 @@ impl TraceTensor {
         self.matmul_tensor(rhs)
     }
 
-    fn solve_tensor(&self, rhs: &Self) -> Result<Self, String> {
+    pub(crate) fn solve_tensor(&self, rhs: &Self) -> Result<Self, String> {
         if let Some(lifted) = Self::lifted_to_common_graph(&[self, rhs])? {
             return lifted[0].solve_tensor(&lifted[1]);
         }
@@ -1709,7 +1771,7 @@ impl TraceTensor {
         self.solve_tensor(rhs)
     }
 
-    fn solve_triangular_tensor(
+    pub(crate) fn solve_triangular_tensor(
         &self,
         rhs: &Self,
         lower: bool,
@@ -1728,7 +1790,7 @@ impl TraceTensor {
         matrix.solve_tensor(rhs)
     }
 
-    fn cholesky_tensor(&self) -> Result<Self, String> {
+    pub(crate) fn cholesky_tensor(&self) -> Result<Self, String> {
         // The IR factors every matrix of the leading axes, including a
         // leading vmap batch axis.
         let rank = self.shape.len();
@@ -1741,7 +1803,7 @@ impl TraceTensor {
         self.apply(&[], |ir| ir.cholesky(self.node_id))
     }
 
-    fn linalg_tensor(&self, kind: &str) -> Result<Self, String> {
+    pub(crate) fn linalg_tensor(&self, kind: &str) -> Result<Self, String> {
         let kind = quabla_core::tensor_ir::LinalgKind::from_name(kind)?;
         self.apply(&[], |ir| ir.linalg(self.node_id, kind))
     }
@@ -1800,21 +1862,29 @@ impl TraceTensor {
         Ok(())
     }
 
-    fn compare_tensor(&self, rhs: &Self, kind: TensorComparison) -> Result<Self, String> {
+    pub(crate) fn compare_tensor(
+        &self,
+        rhs: &Self,
+        kind: TensorComparison,
+    ) -> Result<Self, String> {
         if let Some(lifted) = Self::lifted_to_common_graph(&[self, rhs])? {
             return lifted[0].compare_tensor(&lifted[1], kind);
         }
         self.apply(&[rhs], |ir| ir.compare(self.node_id, rhs.node_id, kind))
     }
 
-    fn compare_scalar(&self, value: f64, kind: TensorComparison) -> Result<Self, String> {
+    pub(crate) fn compare_scalar(
+        &self,
+        value: f64,
+        kind: TensorComparison,
+    ) -> Result<Self, String> {
         self.apply(&[], |ir| {
             let scalar = ir.scalar_constant(value);
             ir.compare(self.node_id, scalar, kind)
         })
     }
 
-    fn logical_tensor(&self, rhs: &Self, and: bool) -> Result<Self, String> {
+    pub(crate) fn logical_tensor(&self, rhs: &Self, and: bool) -> Result<Self, String> {
         if let Some(lifted) = Self::lifted_to_common_graph(&[self, rhs])? {
             return lifted[0].logical_tensor(&lifted[1], and);
         }
@@ -1827,11 +1897,11 @@ impl TraceTensor {
         })
     }
 
-    fn logical_not_tensor(&self) -> Result<Self, String> {
+    pub(crate) fn logical_not_tensor(&self) -> Result<Self, String> {
         self.apply(&[], |ir| ir.logical_not(self.node_id))
     }
 
-    fn classify_tensor(&self, nan: bool) -> Result<Self, String> {
+    pub(crate) fn classify_tensor(&self, nan: bool) -> Result<Self, String> {
         self.apply(&[], |ir| {
             if nan {
                 ir.isnan(self.node_id)
@@ -1843,7 +1913,7 @@ impl TraceTensor {
 
     /// `any`/`all` with the multi-axis, keepdims and vmap handling of `sum`:
     /// `sum(cast(b)) > 0` and `sum(cast(!b)) == 0`, as `TensorIr::any`/`all`.
-    fn any_all_tensor(
+    pub(crate) fn any_all_tensor(
         &self,
         axes: Option<Vec<isize>>,
         keepdims: bool,
@@ -1873,58 +1943,23 @@ impl TraceTensor {
         counts.compare_scalar(0.0, kind)
     }
 
-    /// `isnan(self) | ordered`, the `maximum`/`minimum` mask for a float
-    /// `self`: a NaN `self` selects itself, and a NaN right operand fails the
-    /// ordered comparison and is selected, so NaN propagates from either side
-    /// like NumPy and JAX. A `bool` left operand cannot be NaN; it keeps the
-    /// legacy `greater` mask so its promotion and errors stay unchanged.
-    fn nan_or(&self, ordered: Self) -> Result<Self, String> {
-        self.classify_tensor(true)?.logical_tensor(&ordered, false)
+    pub(crate) fn maximum_tensor(&self, rhs: &Self) -> Result<Self, String> {
+        composite::maximum(self, rhs)
     }
 
-    /// `where(isnan(x) | (x > y), x, y)`: ties select `y`, and NaN in either
-    /// operand propagates.
-    fn maximum_tensor(&self, rhs: &Self) -> Result<Self, String> {
-        if !self.dtype()?.is_floating() {
-            let mask = self.binary(rhs, "greater")?;
-            return mask.where_tensor(self, rhs);
-        }
-        let mask = self.nan_or(self.compare_tensor(rhs, TensorComparison::Greater)?)?;
-        mask.where_tensor(self, rhs)
+    pub(crate) fn maximum_scalar(&self, rhs: f64) -> Result<Self, String> {
+        composite::maximum_scalar(self, rhs)
     }
 
-    fn maximum_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let mask = if self.dtype()?.is_floating() {
-            self.nan_or(self.compare_scalar(rhs, TensorComparison::Greater)?)?
-        } else {
-            self.scalar_binary(rhs, "greater")?
-        };
-        let rhs = self.scalar_tensor(rhs)?;
-        mask.where_tensor(self, &rhs)
+    pub(crate) fn minimum_tensor(&self, rhs: &Self) -> Result<Self, String> {
+        composite::minimum(self, rhs)
     }
 
-    /// `where(isnan(x) | (y > x), x, y)`: ties select `y`, and NaN in either
-    /// operand propagates.
-    fn minimum_tensor(&self, rhs: &Self) -> Result<Self, String> {
-        if !self.dtype()?.is_floating() {
-            let mask = rhs.binary(self, "greater")?;
-            return mask.where_tensor(self, rhs);
-        }
-        let mask = self.nan_or(rhs.compare_tensor(self, TensorComparison::Greater)?)?;
-        mask.where_tensor(self, rhs)
+    pub(crate) fn minimum_scalar(&self, rhs: f64) -> Result<Self, String> {
+        composite::minimum_scalar(self, rhs)
     }
 
-    fn minimum_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let mask = if self.dtype()?.is_floating() {
-            self.nan_or(self.compare_scalar(rhs, TensorComparison::Less)?)?
-        } else {
-            self.scalar_left_binary(rhs, "greater")?
-        };
-        let rhs = self.scalar_tensor(rhs)?;
-        mask.where_tensor(self, &rhs)
-    }
-
-    fn tanh_tensor(&self) -> Result<Self, String> {
+    pub(crate) fn tanh_tensor(&self) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -1940,51 +1975,23 @@ impl TraceTensor {
         ))
     }
 
-    fn relu_tensor(&self) -> Result<Self, String> {
-        self.ensure_not_bool("relu")?;
-        self.maximum_scalar(0.0)
+    pub(crate) fn relu_tensor(&self) -> Result<Self, String> {
+        composite::relu(self)
     }
 
-    fn abs_tensor(&self) -> Result<Self, String> {
-        self.ensure_not_bool("abs")?;
-        let mask = self.scalar_binary(0.0, "greater")?;
-        let negative = self.scalar_left_binary(0.0, "sub")?;
-        mask.where_tensor(self, &negative)
+    pub(crate) fn abs_tensor(&self) -> Result<Self, String> {
+        composite::abs(self)
     }
 
-    /// `exp(-|x|)`, which never overflows. `abs` takes its `0 - x` branch at
-    /// zero, so the derivative there is that of `exp(x)`.
-    fn exp_negative_abs(&self) -> Result<Self, String> {
-        self.abs_tensor()?.scalar_binary(-1.0, "mul")?.exp_tensor()
+    pub(crate) fn sigmoid_tensor(&self) -> Result<Self, String> {
+        composite::sigmoid(self)
     }
 
-    /// `where(x > 0, 1 / (1 + z), z / (1 + z))` with `z = exp(-|x|)`. Both
-    /// branches stay finite for every finite `x`, so the unselected branch
-    /// cannot form `0 * inf` in the gradient (the textbook
-    /// `1 / (1 + exp(-x))` overflows `exp` for large negative `x`). Zero
-    /// takes the `z / (1 + z)` branch, which matches the branch `abs` takes.
-    /// `PyTensor::try_sigmoid` evaluates the same per-op rounded expression.
-    fn sigmoid_tensor(&self) -> Result<Self, String> {
-        self.ensure_not_bool("sigmoid")?;
-        let decay = self.exp_negative_abs()?;
-        let denominator = decay.scalar_binary(1.0, "add")?;
-        let positive = denominator.scalar_left_binary(1.0, "div")?;
-        let negative = decay.binary(&denominator, "div")?;
-        self.compare_scalar(0.0, TensorComparison::Greater)?
-            .where_tensor(&positive, &negative)
+    pub(crate) fn softplus_tensor(&self) -> Result<Self, String> {
+        composite::softplus(self)
     }
 
-    /// `maximum(x, 0) + log1p(exp(-|x|))`; `log1p` keeps the correction
-    /// accurate where `exp(-|x|)` is below the dtype epsilon.
-    /// `PyTensor::try_softplus` evaluates the same per-op rounded expression.
-    fn softplus_tensor(&self) -> Result<Self, String> {
-        self.ensure_not_bool("softplus")?;
-        let linear = self.maximum_scalar(0.0)?;
-        let correction = self.exp_negative_abs()?.log1p_tensor()?;
-        linear.binary(&correction, "add")
-    }
-
-    fn triangular_tensor(&self, lower: bool) -> Result<Self, String> {
+    pub(crate) fn triangular_tensor(&self, lower: bool) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -2000,7 +2007,7 @@ impl TraceTensor {
         ))
     }
 
-    fn exp_tensor(&self) -> Result<Self, String> {
+    pub(crate) fn exp_tensor(&self) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -2016,7 +2023,7 @@ impl TraceTensor {
         ))
     }
 
-    fn reshape_tensor(&self, shape: Vec<usize>) -> Result<Self, String> {
+    pub(crate) fn reshape_tensor(&self, shape: Vec<usize>) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -2048,7 +2055,7 @@ impl TraceTensor {
         ))
     }
 
-    fn gather_tensor(&self, indices: &[usize], axis: isize) -> Result<Self, String> {
+    pub(crate) fn gather_tensor(&self, indices: &[usize], axis: isize) -> Result<Self, String> {
         let actual_axis = usize::try_from(self.example_axis(axis)?)
             .map_err(|_| "normalized tensor axis is negative".to_string())?;
         if indices.is_empty() {
@@ -2078,7 +2085,7 @@ impl TraceTensor {
         ))
     }
 
-    fn scatter_add_tensor(
+    pub(crate) fn scatter_add_tensor(
         &self,
         indices: &[usize],
         updates: &Self,
@@ -2147,7 +2154,7 @@ impl TraceTensor {
         Ok(output)
     }
 
-    fn broadcast_to_tensor(&self, shape: Vec<usize>) -> Result<Self, String> {
+    pub(crate) fn broadcast_to_tensor(&self, shape: Vec<usize>) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -2189,7 +2196,7 @@ impl TraceTensor {
         ))
     }
 
-    fn reduce_axes_tensor(
+    pub(crate) fn reduce_axes_tensor(
         &self,
         axes: Option<Vec<isize>>,
         keepdims: bool,
@@ -2229,7 +2236,11 @@ impl TraceTensor {
 
     /// The product over the example `axes` (every example axis when `None`)
     /// as the pairwise `mul` tree of `TensorIr::prod_axis`.
-    fn prod_axes_tensor(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+    pub(crate) fn prod_axes_tensor(
+        &self,
+        axes: Option<Vec<isize>>,
+        keepdims: bool,
+    ) -> Result<Self, String> {
         self.ensure_not_bool("prod")?;
         let batch_offset = usize::from(self.batch_axis.is_some());
         let example_rank = self.shape.len() - batch_offset;
@@ -2266,7 +2277,11 @@ impl TraceTensor {
     // the dtype's range. A zero, infinite or NaN scale falls back to 1, which
     // keeps those inputs' unscaled results. The scale's derivative terms
     // cancel, so gradients stay `x / norm` up to rounding.
-    fn norm_tensor(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+    pub(crate) fn norm_tensor(
+        &self,
+        axes: Option<Vec<isize>>,
+        keepdims: bool,
+    ) -> Result<Self, String> {
         self.ensure_not_bool("norm")?;
         let largest = self
             .abs_tensor()?
@@ -2290,7 +2305,7 @@ impl TraceTensor {
     /// and flattened into one, so the graph has O(1) nodes in the reduced
     /// size and ties across all reduced axes share the derivative equally,
     /// as in JAX. An empty `axes` returns `self`.
-    fn extrema_axes_tensor(
+    pub(crate) fn extrema_axes_tensor(
         &self,
         axes: Option<Vec<isize>>,
         keepdims: bool,
@@ -2343,7 +2358,7 @@ impl TraceTensor {
         reduced.reshape_tensor(shape)
     }
 
-    fn sin_tensor(&self) -> Result<Self, String> {
+    pub(crate) fn sin_tensor(&self) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -2359,7 +2374,7 @@ impl TraceTensor {
         ))
     }
 
-    fn cos_tensor(&self) -> Result<Self, String> {
+    pub(crate) fn cos_tensor(&self) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -2375,7 +2390,7 @@ impl TraceTensor {
         ))
     }
 
-    fn powi_tensor(&self, exponent: u32) -> Result<Self, String> {
+    pub(crate) fn powi_tensor(&self, exponent: u32) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -2391,7 +2406,7 @@ impl TraceTensor {
         ))
     }
 
-    fn transpose_tensor(&self, axes: Option<Vec<isize>>) -> Result<Self, String> {
+    pub(crate) fn transpose_tensor(&self, axes: Option<Vec<isize>>) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -2420,7 +2435,7 @@ impl TraceTensor {
         ))
     }
 
-    fn log_tensor(&self) -> Result<Self, String> {
+    pub(crate) fn log_tensor(&self) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -2436,23 +2451,23 @@ impl TraceTensor {
         ))
     }
 
-    fn log1p_tensor(&self) -> Result<Self, String> {
+    pub(crate) fn log1p_tensor(&self) -> Result<Self, String> {
         self.apply(&[], |ir| ir.log1p(self.node_id))
     }
 
-    fn expm1_tensor(&self) -> Result<Self, String> {
+    pub(crate) fn expm1_tensor(&self) -> Result<Self, String> {
         self.apply(&[], |ir| ir.expm1(self.node_id))
     }
 
-    fn erf_tensor(&self) -> Result<Self, String> {
+    pub(crate) fn erf_tensor(&self) -> Result<Self, String> {
         self.apply(&[], |ir| ir.erf(self.node_id))
     }
 
-    fn erfc_tensor(&self) -> Result<Self, String> {
+    pub(crate) fn erfc_tensor(&self) -> Result<Self, String> {
         self.apply(&[], |ir| ir.erfc(self.node_id))
     }
 
-    fn unary_math_tensor(&self, kind: UnaryMathKind) -> Result<Self, String> {
+    pub(crate) fn unary_math_tensor(&self, kind: UnaryMathKind) -> Result<Self, String> {
         self.apply(&[], |ir| ir.unary_math(self.node_id, kind))
     }
 
@@ -2466,7 +2481,7 @@ impl TraceTensor {
 
     /// Inclusive prefix sums along the example `axis`, or over the flattened
     /// example when `axis` is `None` (NumPy's convention).
-    fn cumsum_tensor(&self, axis: Option<isize>, reverse: bool) -> Result<Self, String> {
+    pub(crate) fn cumsum_tensor(&self, axis: Option<isize>, reverse: bool) -> Result<Self, String> {
         self.ensure_not_bool("cumsum")?;
         let source = match axis {
             Some(_) => self.clone(),
@@ -2479,7 +2494,7 @@ impl TraceTensor {
         source.apply(&[], |ir| ir.cumsum(source.node_id, axis, reverse))
     }
 
-    fn sqrt_tensor(&self) -> Result<Self, String> {
+    pub(crate) fn sqrt_tensor(&self) -> Result<Self, String> {
         let mut ir = self
             .graph
             .ir
@@ -2493,6 +2508,57 @@ impl TraceTensor {
             shape,
             self.batch_axis,
         ))
+    }
+}
+
+/// The primitives of the composites as graph nodes.
+impl Primitives for TraceTensor {
+    fn dtype(&self) -> Result<TensorDType, String> {
+        TraceTensor::dtype(self)
+    }
+
+    fn binary(&self, rhs: &Self, op: &'static str) -> Result<Self, String> {
+        TraceTensor::binary(self, rhs, op)
+    }
+
+    fn scalar_binary(&self, value: f64, op: &'static str) -> Result<Self, String> {
+        TraceTensor::scalar_binary(self, value, op)
+    }
+
+    fn scalar_left_binary(&self, value: f64, op: &'static str) -> Result<Self, String> {
+        TraceTensor::scalar_left_binary(self, value, op)
+    }
+
+    fn compare(&self, rhs: &Self, kind: TensorComparison) -> Result<Self, String> {
+        self.compare_tensor(rhs, kind)
+    }
+
+    fn compare_scalar(&self, value: f64, kind: TensorComparison) -> Result<Self, String> {
+        TraceTensor::compare_scalar(self, value, kind)
+    }
+
+    fn isnan(&self) -> Result<Self, String> {
+        self.classify_tensor(true)
+    }
+
+    fn logical_or(&self, rhs: &Self) -> Result<Self, String> {
+        self.logical_tensor(rhs, false)
+    }
+
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
+        self.where_tensor(on_true, on_false)
+    }
+
+    fn scalar(&self, value: f64) -> Result<Self, String> {
+        self.scalar_tensor(value)
+    }
+
+    fn exp(&self) -> Result<Self, String> {
+        self.exp_tensor()
+    }
+
+    fn log1p(&self) -> Result<Self, String> {
+        self.log1p_tensor()
     }
 }
 
@@ -3279,13 +3345,8 @@ impl TraceTensor {
         trace_scalar_left_operand(self, lhs, "div")
     }
 
-    /// `-x` as `x * -1`, like the eager `Tensor` (so `-0.0` stays signed).
     fn __neg__(&self) -> PyResult<Self> {
-        if self.dtype().map_err(PyValueError::new_err)? == TensorDType::Bool {
-            return Err(PyValueError::new_err(bool_operation_error("negative")));
-        }
-        self.scalar_binary(-1.0, "mul")
-            .map_err(PyValueError::new_err)
+        self.negative_tensor().map_err(PyValueError::new_err)
     }
 
     /// `x ** n` for a non-negative Python int `n` lowers to `powi`, which
@@ -3697,10 +3758,8 @@ impl TraceTensor {
             return self.binary(&x?, "atan2").map_err(PyValueError::new_err);
         }
         if let Some(x) = extract_scalar(x) {
-            self.ensure_not_bool("atan2")
-                .map_err(PyValueError::new_err)?;
             return self
-                .scalar_binary(x, "atan2")
+                .float_scalar_binary(x, "atan2")
                 .map_err(PyValueError::new_err);
         }
         Err(PyTypeError::new_err(
@@ -3715,9 +3774,9 @@ impl TraceTensor {
             return self.binary(&y?, "fmod").map_err(PyValueError::new_err);
         }
         if let Some(y) = extract_scalar(y) {
-            self.ensure_not_bool("fmod")
-                .map_err(PyValueError::new_err)?;
-            return self.scalar_binary(y, "fmod").map_err(PyValueError::new_err);
+            return self
+                .float_scalar_binary(y, "fmod")
+                .map_err(PyValueError::new_err);
         }
         Err(PyTypeError::new_err(
             "expected a TraceTensor, Tensor, or numeric scalar operand",
@@ -3869,7 +3928,7 @@ pub(crate) enum TracedBinary {
 }
 
 impl TracedBinary {
-    fn apply(self, lhs: &TraceTensor, rhs: &TraceTensor) -> Result<TraceTensor, String> {
+    pub(crate) fn apply(self, lhs: &TraceTensor, rhs: &TraceTensor) -> Result<TraceTensor, String> {
         match self {
             Self::Arithmetic(op) => lhs.binary(rhs, op),
             Self::Compare(kind) => lhs.compare_tensor(rhs, kind),

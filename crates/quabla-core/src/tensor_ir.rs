@@ -7,11 +7,13 @@ mod cholesky;
 mod cholesky_tests;
 pub use cholesky::CholeskyAdKind;
 mod linalg;
-pub use linalg::{evaluate_eager as evaluate_linalg, LinalgKind};
+pub use linalg::LinalgKind;
 mod custom;
 pub use custom::{TensorCustomRule, TensorCustomTangent};
 mod device_optimizer;
 pub use device_optimizer::{DeviceOptimizerConfig, DeviceUpdateRule};
+mod eager;
+pub use eager::{EagerKernel, EagerOperand};
 mod elementwise;
 pub use elementwise::UnaryMathKind;
 mod extremum;
@@ -5708,6 +5710,12 @@ impl TensorIr {
 
     pub fn node_dtype(&self, id: TensorNodeId) -> Result<TensorDType, String> {
         Ok(self.node(id)?.dtype)
+    }
+
+    /// Whether node `id` is weakly typed: a Python scalar, or a value
+    /// computed only from weak operands (see [`TensorIr::scalar_constant`]).
+    pub fn node_weak(&self, id: TensorNodeId) -> Result<bool, String> {
+        Ok(self.node(id)?.weak)
     }
 
     /// Rejects differentiation with respect to a `Bool` input: bool values
@@ -12318,19 +12326,6 @@ impl TensorIr {
             .get(id)
             .ok_or_else(|| format!("node {id} does not exist"))
     }
-}
-
-/// The product of an eager tensor along `axis`, evaluated through the graph
-/// of [`TensorIr::prod_axis`], so eager arrays and traced CPU programs round
-/// the product identically.
-pub fn evaluate_prod_axis(input: &DynamicTensor, axis: isize) -> Result<DynamicTensor, String> {
-    let mut graph = TensorIr::new();
-    let argument = graph.input_typed("input", input.shape.clone(), input.dtype)?;
-    let output = graph.prod_axis(argument, axis)?;
-    graph.evaluate(
-        output,
-        &BTreeMap::from([("input".to_string(), input.clone())]),
-    )
 }
 
 /// A derivative of a `Linalg` node for the numeric evaluators.

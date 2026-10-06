@@ -6,6 +6,7 @@ use pyo3::types::{PyAny, PySequence};
 use quabla_core::tensor_ir::TensorDType;
 
 mod compiler;
+mod composite;
 mod dtype;
 mod errors;
 mod interop;
