@@ -3,15 +3,16 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyEllipsis, PyMemoryView, PySlice, PySliceMethods, PyTuple};
 use quabla_core::tensor_ir::{
-    BinaryMathKind, EagerKernel, EagerOperand, HostTensorStorage, TensorComparison, TensorDType,
-    UnaryMathKind,
+    BinaryMathKind, EagerKernel, EagerOperand, FusedKernel, HostTensorStorage, TensorComparison,
+    TensorDType, UnaryMathKind,
 };
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::ffi::c_int;
 #[cfg(test)]
 use std::sync::Arc;
 
-use crate::composite::{self, Primitives};
+use crate::composite;
 use crate::dtype::PyDType;
 use crate::interop;
 use crate::tensor_trace::{eager_traced_binary, TraceTensor, TracedBinary};
@@ -493,7 +494,7 @@ impl PyTensor {
     }
 
     /// This tensor as a borrowed operand of a direct kernel.
-    fn operand(&self) -> EagerOperand<'_> {
+    pub(crate) fn operand(&self) -> EagerOperand<'_> {
         EagerOperand::Array {
             shape: &self.shape,
             storage: &self.data,
@@ -554,7 +555,8 @@ impl PyTensor {
     // graph is a single node over operands that need no promotion cast calls
     // that node's kernel directly instead (`EagerKernel`), which skips the
     // graph's fixed cost of a few hundred nanoseconds per node, and the
-    // composites of `crate::composite` run each of their primitives so.
+    // composites of `crate::composite` run their graph as a cached fused
+    // kernel (`PyTensor::composite`).
 
     /// The traced op `build` evaluated on `operands`.
     fn evaluated<const N: usize>(
@@ -785,21 +787,29 @@ impl PyTensor {
     /// `where(isnan(x) | (x > y), x, y)`: ties select `y`, and NaN in either
     /// operand propagates.
     pub fn try_maximum(&self, rhs: &Self) -> Result<Self, String> {
-        composite::maximum(self, rhs)
+        Self::composite(Composite::Maximum, [self, rhs], |x| {
+            composite::maximum(&x[0], &x[1])
+        })
     }
 
     pub fn try_maximum_scalar(&self, rhs: f64) -> Result<Self, String> {
-        composite::maximum_scalar(self, rhs)
+        Self::composite(Composite::MaximumScalar(rhs.to_bits()), [self], |x| {
+            composite::maximum_scalar(&x[0], rhs)
+        })
     }
 
     /// `where(isnan(x) | (y > x), x, y)`: ties select `y`, and NaN in either
     /// operand propagates.
     pub fn try_minimum(&self, rhs: &Self) -> Result<Self, String> {
-        composite::minimum(self, rhs)
+        Self::composite(Composite::Minimum, [self, rhs], |x| {
+            composite::minimum(&x[0], &x[1])
+        })
     }
 
     pub fn try_minimum_scalar(&self, rhs: f64) -> Result<Self, String> {
-        composite::minimum_scalar(self, rhs)
+        Self::composite(Composite::MinimumScalar(rhs.to_bits()), [self], |x| {
+            composite::minimum_scalar(&x[0], rhs)
+        })
     }
 
     /// `where(mask, on_true, on_false)`. Values of one dtype record no
@@ -1090,19 +1100,19 @@ impl PyTensor {
     }
 
     pub fn try_relu(&self) -> Result<Self, String> {
-        composite::relu(self)
+        Self::composite(Composite::Relu, [self], |x| composite::relu(&x[0]))
     }
 
     pub fn try_abs(&self) -> Result<Self, String> {
-        composite::abs(self)
+        Self::composite(Composite::Abs, [self], |x| composite::abs(&x[0]))
     }
 
     pub fn try_sigmoid(&self) -> Result<Self, String> {
-        composite::sigmoid(self)
+        Self::composite(Composite::Sigmoid, [self], |x| composite::sigmoid(&x[0]))
     }
 
     pub fn try_softplus(&self) -> Result<Self, String> {
-        composite::softplus(self)
+        Self::composite(Composite::Softplus, [self], |x| composite::softplus(&x[0]))
     }
 
     pub fn try_triangular(&self, lower: bool) -> Result<Self, String> {
@@ -1237,54 +1247,103 @@ fn arithmetic_kernel(op: &str) -> Option<EagerKernel> {
     })
 }
 
-/// The primitives of the composites, each evaluated at once.
-impl Primitives for PyTensor {
-    fn dtype(&self) -> Result<TensorDType, String> {
-        Ok(self.dtype)
-    }
+/// An eager composite op of `crate::composite`, with the bits of its Python
+/// number argument: with the operand types, the key of a cached kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Composite {
+    Relu,
+    Abs,
+    Sigmoid,
+    Softplus,
+    Maximum,
+    Minimum,
+    MaximumScalar(u64),
+    MinimumScalar(u64),
+}
 
-    fn binary(&self, rhs: &Self, op: &'static str) -> Result<Self, String> {
-        self.binary_op(rhs, arithmetic_kernel(op), TracedBinary::Arithmetic(op))
-    }
+/// The fused kernel of one composite for operands of one shape, dtype, and
+/// weak type each, and the weak type of its result.
+struct CompositeKernel {
+    composite: Composite,
+    operands: Vec<(Vec<usize>, TensorDType, bool)>,
+    kernel: FusedKernel,
+    weak: bool,
+}
 
-    fn scalar_binary(&self, value: f64, op: &'static str) -> Result<Self, String> {
-        self.scalar_arithmetic(value, op, false)
+impl CompositeKernel {
+    fn matches(&self, composite: Composite, operands: &[&PyTensor]) -> bool {
+        self.composite == composite
+            && self.operands.len() == operands.len()
+            && self
+                .operands
+                .iter()
+                .zip(operands)
+                .all(|((shape, dtype, weak), operand)| {
+                    *shape == operand.shape && *dtype == operand.dtype && *weak == operand.weak
+                })
     }
+}
 
-    fn scalar_left_binary(&self, value: f64, op: &'static str) -> Result<Self, String> {
-        self.scalar_arithmetic(value, op, true)
-    }
+/// The kernels a thread has compiled, most recent last. A program that
+/// keeps calling composites on new shapes evicts the oldest.
+const COMPOSITE_KERNELS: usize = 64;
 
-    fn compare(&self, rhs: &Self, kind: TensorComparison) -> Result<Self, String> {
-        self.try_compare(rhs, kind)
-    }
+thread_local! {
+    static COMPOSITE_CACHE: RefCell<Vec<CompositeKernel>> = const { RefCell::new(Vec::new()) };
+}
 
-    fn compare_scalar(&self, value: f64, kind: TensorComparison) -> Result<Self, String> {
-        self.try_compare_scalar(value, kind)
-    }
-
-    fn isnan(&self) -> Result<Self, String> {
-        self.try_classify(true)
-    }
-
-    fn logical_or(&self, rhs: &Self) -> Result<Self, String> {
-        self.try_logical(rhs, false)
-    }
-
-    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
-        Self::try_where(self, on_true, on_false)
-    }
-
-    fn scalar(&self, value: f64) -> Result<Self, String> {
-        Ok(Self::weak_scalar(value))
-    }
-
-    fn exp(&self) -> Result<Self, String> {
-        self.try_exp()
-    }
-
-    fn log1p(&self) -> Result<Self, String> {
-        self.try_log1p()
+impl PyTensor {
+    /// The eager value of a composite: its graph (`build` over tracers of the
+    /// operands, the definition `TraceTensor` records), run as one fused
+    /// kernel. The first call with operands of a new type builds the graph and
+    /// compiles the kernel; later calls run the cached kernel, which gives the
+    /// graph's value, dtype, and weak type bit for bit without building it.
+    /// A graph the evaluator would not fuse whole is evaluated each time.
+    fn composite<const N: usize>(
+        composite: Composite,
+        operands: [&Self; N],
+        build: impl FnOnce(Vec<TraceTensor>) -> Result<TraceTensor, String>,
+    ) -> Result<Self, String> {
+        let cached = COMPOSITE_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            let entry = cache
+                .iter()
+                .rev()
+                .find(|entry| entry.matches(composite, &operands))?;
+            let value = entry
+                .kernel
+                .evaluate(&operands.map(|operand| operand.operand()));
+            Some(value.map(|value| value.map(|value| (value, entry.weak))))
+        });
+        match cached {
+            Some(Ok(Some((value, weak)))) => {
+                return Self::from_dynamic_tensor(value).map(|tensor| tensor.with_weak(weak))
+            }
+            Some(Err(error)) => return Err(error),
+            // Two NaN operands met in a sum or product, whose NaN only the
+            // node-by-node evaluation of the graph decides.
+            Some(Ok(None)) => return TraceTensor::evaluate_eager_all(&operands, build),
+            None => {}
+        }
+        let (value, kernel, weak) = TraceTensor::evaluate_eager_fused(&operands, build)?;
+        if let Some(kernel) = kernel {
+            COMPOSITE_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                if cache.len() == COMPOSITE_KERNELS {
+                    cache.remove(0);
+                }
+                cache.push(CompositeKernel {
+                    composite,
+                    operands: operands
+                        .iter()
+                        .map(|operand| (operand.shape.clone(), operand.dtype, operand.weak))
+                        .collect(),
+                    kernel,
+                    weak,
+                });
+            });
+        }
+        Ok(value)
     }
 }
 
@@ -2910,7 +2969,8 @@ mod delegation_tests {
             let context = format!("{:?}/{} {:?}/{}", lhs.dtype, lhs.weak, rhs.dtype, rhs.weak);
             for op in ["add", "sub", "mul", "div", "greater"] {
                 let graph = PyTensor::evaluated([lhs, rhs], |[x, y]| x.binary(&y, op));
-                let direct = Primitives::binary(lhs, rhs, op);
+                let direct =
+                    lhs.binary_op(rhs, arithmetic_kernel(op), TracedBinary::Arithmetic(op));
                 match (direct, graph) {
                     (Ok(direct), Ok(graph)) => {
                         assert_same(&direct, &graph, &format!("{op} {context}"))
@@ -3010,23 +3070,32 @@ mod delegation_tests {
         }
     }
 
-    /// A composite evaluated primitive by primitive equals its whole traced
-    /// graph, including the signed zeros and NaN signs that the former
-    /// hand-written eager versions changed.
+    /// A composite run as its cached fused kernel equals its whole traced
+    /// graph evaluated node by node, including the signed zeros and NaN
+    /// signs that the former hand-written eager versions changed, on the
+    /// call that compiles the kernel and on later calls with other values.
     #[test]
     fn composites_equal_their_traced_graph() {
         let composites: [Pair; 4] = [
-            (composite::abs, TraceTensor::abs_tensor),
-            (composite::relu, TraceTensor::relu_tensor),
-            (composite::sigmoid, TraceTensor::sigmoid_tensor),
-            (composite::softplus, TraceTensor::softplus_tensor),
+            (PyTensor::try_abs, TraceTensor::abs_tensor),
+            (PyTensor::try_relu, TraceTensor::relu_tensor),
+            (PyTensor::try_sigmoid, TraceTensor::sigmoid_tensor),
+            (PyTensor::try_softplus, TraceTensor::softplus_tensor),
         ];
         for dtype in [TensorDType::F32, TensorDType::F64] {
+            for (direct, build) in composites {
+                for (shape, offset) in [(vec![4, 4], 0), (vec![4, 4], 3), (vec![], 5)] {
+                    let input = tensor(&shape, dtype, offset);
+                    let graph = PyTensor::evaluated([&input], |[x]| build(&x)).unwrap();
+                    assert_same(&direct(&input).unwrap(), &graph, "composite");
+                }
+            }
             let input = tensor(&[4, 4], dtype, 0);
             let other = tensor(&[4, 4], dtype, 9);
-            for (direct, build) in composites {
-                let graph = PyTensor::evaluated([&input], |[x]| build(&x)).unwrap();
-                assert_same(&direct(&input).unwrap(), &graph, "composite");
+            let row = tensor(&[1, 4], dtype, 2);
+            for (lhs, rhs) in [(&input, &row), (&row, &input)] {
+                let graph = PyTensor::evaluated([lhs, rhs], |[x, y]| x.maximum_tensor(&y)).unwrap();
+                assert_same(&lhs.try_maximum(rhs).unwrap(), &graph, "maximum broadcast");
             }
             for value in [0.0, -0.0, 1.5, f64::NAN] {
                 let graph = PyTensor::evaluated([&input], |[x]| x.maximum_scalar(value)).unwrap();

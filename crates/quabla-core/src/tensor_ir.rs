@@ -21,6 +21,9 @@ mod elementwise;
 pub use elementwise::{BinaryMathKind, UnaryMathKind};
 mod extremum;
 pub use extremum::TensorExtremum;
+mod fusion;
+pub use fusion::FusedKernel;
+use fusion::{CpuFusionPlan, FusionStep};
 mod host_storage;
 pub use host_storage::HostTensorStorage;
 mod region_batching;
@@ -1033,6 +1036,8 @@ pub struct TensorExecutionPlan {
     output_node_id: TensorNodeId,
     output_node_ids: Vec<TensorNodeId>,
     fused_elementwise_output: bool,
+    /// The elementwise regions the CPU evaluator runs as fused programs.
+    cpu_fusion: Arc<CpuFusionPlan>,
 }
 
 /// A frozen, explicitly captured branch region.
@@ -7555,6 +7560,7 @@ impl TensorIr {
             .ok_or_else(|| "execution plan requires at least one output".to_string())?;
         let fused_elementwise_output =
             output_node_ids.len() == 1 && is_fusable_elementwise_subgraph(&nodes, output_node_id);
+        let cpu_fusion = Arc::new(CpuFusionPlan::new(&nodes, &output_node_ids));
         Ok((
             TensorExecutionPlan {
                 input_nodes: Arc::new(tensor_input_nodes(&nodes)),
@@ -7562,6 +7568,7 @@ impl TensorIr {
                 output_node_id,
                 output_node_ids: output_node_ids.clone(),
                 fused_elementwise_output,
+                cpu_fusion,
             },
             output_node_ids,
         ))
@@ -9693,6 +9700,19 @@ impl TensorIr {
         inputs: &BTreeMap<String, DynamicTensor>,
         outputs: Option<&[TensorNodeId]>,
     ) -> Result<Vec<Option<DynamicTensor>>, String> {
+        Self::evaluate_tensor_nodes_fused(nodes, inputs, outputs, None)
+    }
+
+    /// Node-by-node evaluation in which the regions of `fusion` (a plan's
+    /// fused elementwise regions, whose interior values are not among
+    /// `outputs`) run as one fused program at their root; their other nodes
+    /// get no value.
+    fn evaluate_tensor_nodes_fused(
+        nodes: &[TensorNode],
+        inputs: &BTreeMap<String, DynamicTensor>,
+        outputs: Option<&[TensorNodeId]>,
+        fusion: Option<&CpuFusionPlan>,
+    ) -> Result<Vec<Option<DynamicTensor>>, String> {
         let mut values: Vec<Option<DynamicTensor>> = Vec::with_capacity(nodes.len());
         let mut last_uses = outputs.map(|outputs| tensor_forward_last_uses(nodes, outputs));
         let mut fori_vjp_cache: HashMap<usize, TensorForiVjpEvaluation> = HashMap::new();
@@ -9702,6 +9722,31 @@ impl TensorIr {
         let mut scan_vjp_jvp_cache: HashMap<usize, TensorScanVjpJvpEvaluation> = HashMap::new();
 
         for (node_id, node) in nodes.iter().enumerate() {
+            match fusion.map_or(FusionStep::Node, |fusion| fusion.step(node_id)) {
+                FusionStep::Node => {}
+                FusionStep::Skip => {
+                    values.push(None);
+                    continue;
+                }
+                FusionStep::Region { program, consumed } => {
+                    // Two NaN operands of a sum or product take the NaN that
+                    // the evaluator's own kernels pick, so such a plan runs
+                    // again node by node (see `fusion::binary_lanes`).
+                    let Some(value) = program.evaluate(&values)? else {
+                        return Self::evaluate_tensor_nodes_fused(nodes, inputs, outputs, None);
+                    };
+                    values.push(Some(value));
+                    #[cfg(test)]
+                    if last_uses.is_some() {
+                        let elements = values.iter().flatten().map(|value| value.data.len()).sum();
+                        CPU_FORWARD_PEAK_ELEMENTS.with(|peak| peak.set(peak.get().max(elements)));
+                    }
+                    if let Some(last_uses) = &mut last_uses {
+                        release_consumed_values(last_uses, &mut values, node_id, consumed);
+                    }
+                    continue;
+                }
+            }
             let reused = match reuse_forward_unary(node, &mut values, last_uses.as_ref())? {
                 Some(value) => Some(value),
                 None => reuse_forward_binary(node, &mut values, last_uses.as_ref())?,
@@ -10331,15 +10376,12 @@ impl TensorIr {
                 CPU_FORWARD_PEAK_ELEMENTS.with(|peak| peak.set(peak.get().max(elements)));
             }
             if let Some(last_uses) = &mut last_uses {
-                for input in tensor_op_inputs(&node.op) {
-                    last_uses.remaining[input] -= 1;
-                    if last_uses.remaining[input] == 0 && !last_uses.retained[input] {
-                        values[input] = None;
-                    }
-                }
-                if last_uses.remaining[node_id] == 0 && !last_uses.retained[node_id] {
-                    values[node_id] = None;
-                }
+                release_consumed_values(
+                    last_uses,
+                    &mut values,
+                    node_id,
+                    &tensor_op_inputs(&node.op),
+                );
                 // Region siblings share one evaluation, but its cached tensors need not outlive
                 // the final sibling. Node values above protect any requested output separately.
                 if let Some(group) = tensor_op_group(&node.op) {
@@ -14633,6 +14675,7 @@ impl TensorExecutionPlan {
         }
         Ok(TensorDataParallelProgram {
             replica_plan: TensorExecutionPlan {
+                cpu_fusion: Arc::new(CpuFusionPlan::new(&replica.nodes, &self.output_node_ids)),
                 nodes: replica.nodes,
                 input_nodes: replica.input_nodes,
                 output_node_id: self.output_node_id,
@@ -14818,10 +14861,11 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
         &self,
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<Vec<DynamicTensor>, String> {
-        let mut values = TensorIr::evaluate_tensor_nodes_with_outputs(
+        let mut values = TensorIr::evaluate_tensor_nodes_fused(
             &self.nodes,
             inputs,
             Some(&self.output_node_ids),
+            Some(&self.cpu_fusion),
         )?;
         let mut output_uses = vec![0usize; self.nodes.len()];
         for output in &self.output_node_ids {
@@ -14848,13 +14892,13 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
         &self,
         inputs: &BTreeMap<String, DynamicTensor>,
     ) -> Result<DynamicTensor, String> {
-        // The CPU runs every plan node by node, including elementwise plans
-        // that CUDA fuses: whole-buffer kernels round each `float32` operation
-        // to `f32` and avoid a per-element graph walk.
-        TensorIr::evaluate_tensor_nodes_with_outputs(
+        // The CPU runs a plan node by node, except that each fused elementwise
+        // region runs as one tiled program at its root (see `fusion.rs`).
+        TensorIr::evaluate_tensor_nodes_fused(
             &self.nodes,
             inputs,
             Some(&[self.output_node_id]),
+            Some(&self.cpu_fusion),
         )?
         .get_mut(self.output_node_id)
         .and_then(Option::take)
@@ -15794,6 +15838,26 @@ struct TensorForwardLastUses {
     remaining: Vec<usize>,
     retained: Vec<bool>,
     group_last_nodes: HashMap<usize, TensorNodeId>,
+}
+
+/// Counts the uses `consumed` made by the node (or fused region) evaluated
+/// at `node_id` and drops every value, that node's included, with no use
+/// left that is not retained.
+fn release_consumed_values(
+    last_uses: &mut TensorForwardLastUses,
+    values: &mut [Option<DynamicTensor>],
+    node_id: TensorNodeId,
+    consumed: &[TensorNodeId],
+) {
+    for &input in consumed {
+        last_uses.remaining[input] -= 1;
+        if last_uses.remaining[input] == 0 && !last_uses.retained[input] {
+            values[input] = None;
+        }
+    }
+    if last_uses.remaining[node_id] == 0 && !last_uses.retained[node_id] {
+        values[node_id] = None;
+    }
 }
 
 fn reuse_forward_unary(
