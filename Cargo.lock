@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "quabla-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cudarc",
  "libloading 0.9.0",
@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "quabla-macros"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "quabla-python"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libm",
  "pyo3",

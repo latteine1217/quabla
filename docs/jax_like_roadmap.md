@@ -22,8 +22,10 @@ one native IR op instead of a chain of per-element comparisons (a 600-element
 `jit` `max` went from 3,597 nodes and 0.47 ms to 2 nodes and 2.3 µs on the
 CPU), with JAX's tie-splitting derivative and an order-independent `-0 < +0`.
 
-Not yet done from v0.3: the first PyPI upload, waiting on TestPyPI
-registration.
+All items shipped in v0.4.0. The release was validated on the CPU, MLX, and
+a single-GPU CUDA host (NVRTC 13.1); the two-GPU NCCL run with NVRTC 12.6
+was not repeated for v0.4.0 and is the first follow-up, together with the
+first PyPI upload, which waits on TestPyPI registration.
 
 ## v0.3 Plan (2026-10-06)
 

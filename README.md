@@ -7,7 +7,7 @@ traced program on CPU, CUDA, and Apple silicon.**
 [![CI](https://github.com/latteine1217/quabla/actions/workflows/ci.yml/badge.svg)](https://github.com/latteine1217/quabla/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation)
-[![Release v0.3.0](https://img.shields.io/badge/release-v0.3.0-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.3.0)
+[![Release v0.4.0](https://img.shields.io/badge/release-v0.4.0-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.4.0)
 
 ![A tanh MLP trained with Quabla matches the exact solution of a 1D Poisson problem; its training loss falls from about 50 to 2.5e-4.](docs/assets/pinn_poisson.png)
 
@@ -66,9 +66,9 @@ running on CUDA or MLX.
 
 ## Status
 
-The latest release is **v0.3.0**, a research-grade, source-only pre-release
-(a git tag and GitHub Release; wheels are built by CI but not published to
-PyPI). The v0.2 series introduced the JAX-style API
+The latest release is **v0.4.0**, a research-grade pre-release published as
+a git tag and GitHub Release; the PyPI distributions are built by CI and not
+yet uploaded. The v0.2 series introduced the JAX-style API
 ([CHANGELOG](CHANGELOG.md#020---2026-10-06), [design](docs/api_v0_2_design.md)):
 `grad`, `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `vmap`, and
 `jit(device="cpu" | "cuda:N" | "mlx")` over arrays and pytrees, `quabla.optim`
@@ -81,7 +81,17 @@ learning-rate schedules; `quabla.linalg` (batched `solve`, `slogdet`, `eigh`,
 Dormand-Prince integration; `while_loop`; `custom_vjp`, `custom_jvp`, and
 `checkpoint`; registered pytree nodes; keyed `quabla.random`; stable
 `softmax`/`logsumexp`/`var`; NumPy-style shape helpers; `save`/`load`; and
-opt-in native `float64` on CUDA.
+opt-in native `float64` on CUDA. v0.4
+([CHANGELOG](CHANGELOG.md#040---2026-10-06)) adds native trigonometric,
+hyperbolic, logarithmic, and rounding functions and `fmod`/`mod`; the
+jax.numpy shape, product, and calculus functions (`pad`, `roll`,
+`tensordot`, `kron`, `diff`, `trapezoid`, `interp`, ...) with
+`linalg.norm`/`matrix_power`/`pinv`; stiff integration
+(`odeint(method="rosenbrock23")`) and `saveat`; `linalg.cg`, `linalg.gmres`,
+and `newton` with implicit-function-theorem gradients; matrix
+factorizations on MLX; AdamW, SGD, global-norm clipping, and CUDA `float64`
+in the device `Trainer`; CUDA-graph replay of host-driven CUDA loops; and
+native `max`/`min` reductions.
 
 All v0.1 call forms keep working. Migrated top-level names emit a
 `DeprecationWarning` once per name on explicit access (`from quabla import *`
@@ -110,9 +120,9 @@ records are in [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md).
 | Backend | Platform | Build feature | Execution dtype | Autodiff | Control flow | Notable limitations |
 | --- | --- | --- | --- | --- | --- | --- |
 | CPU | macOS, Linux | default | `f64` reference; each `float32` op is the `f64` result rounded to `f32` | Runtime and symbolic JVP/VJP, dense Jacobian and Hessian, HVP, `vmap` JVP/VJP/HVP | `cond`, `fori`, `scan` regions with JVP, VJP, and forward-over-reverse HVP | Interprets frozen plans (no machine-code JIT) |
-| CUDA | Linux, NVIDIA driver | `cuda` | `f32`; `f64` with `precision="float64"` | Symbolic JVP/VJP plans, multi-output value-and-gradient, `vmap` JVP/VJP/HVP, device SGD/Adam | `cond` via one host predicate readback; `fori`/`scan` as fused kernels for pure-elementwise bodies and as host-driven region loops otherwise; `while_loop` with one predicate readback per iteration | Host-driven loops cost a launch sequence per iteration; requires `libnvrtc` at runtime (cuBLAS optional, cuSOLVER for `solve` and the decompositions) |
+| CUDA | Linux, NVIDIA driver | `cuda` | `f32`; `f64` with `precision="float64"` | Symbolic JVP/VJP plans, multi-output value-and-gradient, `vmap` JVP/VJP/HVP, device `Trainer` with SGD/Adam/AdamW and global-norm clipping | `cond` via one host predicate readback; `fori`/`scan` as fused kernels for pure-elementwise bodies and as host-driven region loops otherwise; `while_loop` with one predicate readback per iteration | Host-driven loops cost one CUDA graph launch per iteration (eager launches for bodies with `cond`, nested loops, or cuSOLVER); requires `libnvrtc` at runtime (cuBLAS optional, cuSOLVER for `solve` and the decompositions) |
 | CUDA + NCCL | Linux, two or more GPUs on one node | `cuda-nccl` | `f32` | Scalar value-and-gradient with all-reduced replicated parameter gradients | As CUDA | Single node; equal axis-zero batch shards; mapped-input gradients rejected; optimizer update on the host; requires a loadable `libnccl.so` |
-| MLX | macOS, Apple silicon | `mlx` | `f32` | Symbolic JVP/VJP, multi-output value-and-gradient, `vmap` JVP/VJP, device Adam | `cond` via one host predicate readback; `fori`/`scan` dispatched from the host on device-resident arrays, with first-order VJP and forward-over-reverse HVP | LU, `eigh`, QR, and SVD factorizations run with LAPACK on MLX's CPU stream (MLX 0.32.2 has no GPU kernels for them), and `solve` reads one pivot flag back; `vmap` HVP not lowered; no fused Metal loop kernels |
+| MLX | macOS, Apple silicon | `mlx` | `f32` | Symbolic JVP/VJP, multi-output value-and-gradient, `vmap` JVP/VJP, device `Trainer` with SGD/Adam/AdamW and global-norm clipping | `cond` via one host predicate readback; `fori`/`scan` dispatched from the host on device-resident arrays, with first-order VJP and forward-over-reverse HVP | LU, `eigh`, QR, and SVD factorizations run with LAPACK on MLX's CPU stream (MLX 0.32.2 has no GPU kernels for them), and `solve` reads one pivot flag back; `vmap` HVP not lowered; no fused Metal loop kernels |
 
 Staged Cholesky uses a native operation on CPU, CUDA, and Metal. `float32`
 and `float64` JVP, VJP, and second derivatives use bounded IR and O(n²)

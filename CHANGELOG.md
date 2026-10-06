@@ -9,6 +9,15 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-06
+
+The v0.4 plan in `docs/jax_like_roadmap.md`: the jax.numpy functions a PINN
+code base reaches for, stiff and implicit solvers, MLX factorizations,
+device `Trainer` parity, and faster host-driven CUDA loops, plus native
+`max`/`min` reductions. All v0.3 call forms keep working; gradients of
+`max`/`min` at ties and a few float32 device optimizer results change as
+listed under Changed.
+
 ### Added
 
 - PyPI distributions built by the `Wheels` workflow: `quabla` (Linux x86_64
@@ -501,7 +510,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/latteine1217/quabla/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/latteine1217/quabla/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/latteine1217/quabla/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/latteine1217/quabla/compare/v0.2.1...v0.2.2
