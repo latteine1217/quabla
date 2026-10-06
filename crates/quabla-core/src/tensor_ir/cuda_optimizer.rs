@@ -18,11 +18,14 @@
 //! partials, then one block over the partials), so a step is deterministic.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
-use super::super::{DeviceOptimizerConfig, DeviceUpdateRule, TensorNodeId};
+use super::super::device_optimizer::{cuda_adam_update, cuda_sgd_update};
+use super::super::{
+    AdamCoefficients, AdamOrder, DeviceOptimizerConfig, DeviceUpdateRule, TensorNodeId,
+};
 use super::{cuda_value_mut, input_node_id, CudaAdamState, CudaExecutionPlan, CudaReal};
 
 /// Threads per block of the global-norm kernels; the kernels' shared arrays
@@ -32,7 +35,7 @@ const GLOBAL_NORM_THREADS: u32 = 256;
 /// covered by grid-stride loops, which keeps the final single-block pass short.
 const GLOBAL_NORM_MAX_BLOCKS: usize = 256;
 
-pub(super) const CUDA_TRAINING_SOURCE: &str = r#"
+const GLOBAL_NORM_SOURCE: &str = r#"
 __device__ __forceinline__ double quabla_global_norm_combine(double total, double value, int square) {
     if (square) return total + value;
     // A NaN maximum stays NaN, as the host norm propagates it.
@@ -99,41 +102,103 @@ extern "C" __global__ void quabla_global_norm_reduce(
     if (!isfinite(norm)) scalars[2] = 1.0;
 }
 
-extern "C" __global__ void quabla_device_sgd(
-    float* parameter, const float* gradient, float learning_rate,
-    const double* scalars, int clipped, unsigned long long count
-) {
+"#;
+
+/// The optimizer kernels of every CUDA module: the legacy v0.1 update
+/// kernels, the global-norm reduction, and the fused update kernels. The
+/// update statements come from the shared rules in `device_optimizer.rs`
+/// (`cuda_adam_update`, `cuda_sgd_update`); the templates below only load,
+/// clip, and store.
+pub(super) fn cuda_optimizer_source() -> &'static str {
+    static SOURCE: LazyLock<String> = LazyLock::new(|| {
+        let mut source = legacy_update_kernels();
+        source.push_str(GLOBAL_NORM_SOURCE);
+        source.push_str(&device_update_kernels());
+        source
+    });
+    &SOURCE
+}
+
+/// The v0.1 kernels behind `adam_step`, `sgd_step`, `cuda_adam_step`, and
+/// `cuda_adam_optimizer`. They take `float` hyperparameters and keep
+/// [`AdamOrder::V01`] until v1.0.
+fn legacy_update_kernels() -> String {
+    let sgd = cuda_sgd_update("parameter[index]", "gradient[index]");
+    let (statements, [parameter, first, second]) = cuda_adam_update(
+        AdamOrder::V01,
+        "parameter[index]",
+        "gradient_value",
+        "first_moment[index]",
+        "second_moment[index]",
+    );
+    format!(
+        r#"
+extern "C" __global__ void quabla_sgd(
+    float* parameter, const float* gradient, float learning_rate, unsigned long long count
+) {{
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) parameter[index] = {sgd};
+}}
+
+extern "C" __global__ void quabla_adam(
+    float* parameter, const float* gradient, float* first_moment, float* second_moment,
+    float learning_rate, float beta1, float beta2, float epsilon,
+    float correction1, float correction2, unsigned long long count
+) {{
     unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= count) return;
     float gradient_value = gradient[index];
-    // Clipping scales in double and rounds once, as clip_by_global_norm.
-    if (clipped) gradient_value = (float)((double)gradient_value * scalars[1]);
-    parameter[index] = parameter[index] - gradient_value * learning_rate;
+{statements}    first_moment[index] = {first};
+    second_moment[index] = {second};
+    parameter[index] = {parameter};
+}}
+"#
+    )
 }
+
+/// The fused kernels of [`CudaExecutionPlan::optimizer_step`], in
+/// [`AdamOrder::Canonical`]. `1 - beta` and the bias corrections arrive
+/// formed in float64 from the float64 betas (see [`AdamCoefficients`]).
+fn device_update_kernels() -> String {
+    // Clipping scales in double and rounds once, as clip_by_global_norm.
+    const LOAD_GRADIENT: &str =
+        "    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    float gradient_value = gradient[index];
+    if (clipped) gradient_value = (float)((double)gradient_value * scalars[1]);";
+    let sgd = cuda_sgd_update("parameter[index]", "gradient_value");
+    let (statements, [parameter, first, second]) = cuda_adam_update(
+        AdamOrder::Canonical,
+        "value",
+        "gradient_value",
+        "first_moment[index]",
+        "second_moment[index]",
+    );
+    format!(
+        r#"
+extern "C" __global__ void quabla_device_sgd(
+    float* parameter, const float* gradient, float learning_rate,
+    const double* scalars, int clipped, unsigned long long count
+) {{
+{LOAD_GRADIENT}
+    parameter[index] = {sgd};
+}}
 
 extern "C" __global__ void quabla_device_adam(
     float* parameter, const float* gradient, float* first_moment, float* second_moment,
     float learning_rate, float beta1, float beta2, float one_minus_beta1, float one_minus_beta2,
     float epsilon, float correction1, float correction2, float weight_decay,
     const double* scalars, int clipped, unsigned long long count
-) {
-    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= count) return;
-    float gradient_value = gradient[index];
-    if (clipped) gradient_value = (float)((double)gradient_value * scalars[1]);
-    // The host Adam/AdamW expression, in its operation order. `1 - beta` and
-    // the corrections arrive formed in float64 from the float64 betas: in a
-    // float32 plan `1.0f - beta2` of the rounded 0.999 is 1.3e-5 relative off.
-    float first = first_moment[index] * beta1 + gradient_value * one_minus_beta1;
-    float second = second_moment[index] * beta2 + (gradient_value * gradient_value) * one_minus_beta2;
-    float delta = (first / correction1) / (sqrtf(second / correction2) + epsilon);
+) {{
+{LOAD_GRADIENT}
     float value = parameter[index];
-    if (weight_decay != 0.0f) delta += weight_decay * value;
-    first_moment[index] = first;
-    second_moment[index] = second;
-    parameter[index] = value - delta * learning_rate;
+{statements}    first_moment[index] = {first};
+    second_moment[index] = {second};
+    parameter[index] = {parameter};
+}}
+"#
+    )
 }
-"#;
 
 /// Device scratch of the global-norm reduction, reused across steps.
 #[derive(Debug, Default)]
@@ -264,7 +329,7 @@ impl<T: CudaReal> CudaExecutionPlan<T> {
                     launch.arg(&clipped);
                     launch.arg(&count_u64);
                     // SAFETY: the arguments match the six parameters of `quabla_device_sgd` in
-                    // `CUDA_TRAINING_SOURCE` in order and type (`float` is `T` after the
+                    // `device_update_kernels` in order and type (`float` is `T` after the
                     // float64 rewrite); `parameter` and `gradient` hold `count` elements
                     // (checked above), `scalars` holds three, the kernel guards
                     // `index < count`, and only the mutably passed `parameter` is written.
@@ -306,21 +371,25 @@ impl<T: CudaReal> CudaExecutionPlan<T> {
                         .step
                         .checked_add(1)
                         .ok_or_else(|| "CUDA Adam step counter overflow".to_string())?;
-                    let (correction1, correction2) =
-                        DeviceOptimizerConfig::adam_corrections(beta1, beta2, adam.step);
-                    let hyperparameters = [
+                    let AdamCoefficients {
+                        learning_rate: _,
                         beta1,
                         beta2,
-                        1.0 - beta1,
-                        1.0 - beta2,
+                        one_minus_beta1,
+                        one_minus_beta2,
                         epsilon,
                         correction1,
                         correction2,
                         weight_decay,
-                    ]
+                    } = AdamCoefficients::new(
+                        config.learning_rate,
+                        beta1,
+                        beta2,
+                        epsilon,
+                        weight_decay,
+                        adam.step,
+                    )
                     .map(T::from_f64);
-                    let [beta1, beta2, one_minus_beta1, one_minus_beta2, epsilon, correction1, correction2, weight_decay] =
-                        hyperparameters;
                     let kernel = self
                         .module
                         .load_function("quabla_device_adam")
@@ -343,7 +412,7 @@ impl<T: CudaReal> CudaExecutionPlan<T> {
                     launch.arg(&clipped);
                     launch.arg(&count_u64);
                     // SAFETY: the arguments match the sixteen parameters of `quabla_device_adam`
-                    // in `CUDA_TRAINING_SOURCE` in order and type (`float` is `T` after the
+                    // in `device_update_kernels` in order and type (`float` is `T` after the
                     // float64 rewrite); the parameter, gradient, and both moments hold `count`
                     // elements (the moments are allocated from the parameter length, which the
                     // plan's input shape fixes), `scalars` holds three, the kernel guards
@@ -442,7 +511,7 @@ impl<T: CudaReal> CudaExecutionPlan<T> {
                 launch.arg(&offset);
                 launch.arg(&square);
                 // SAFETY: the arguments match the six parameters of `quabla_global_norm_partials`
-                // in `CUDA_TRAINING_SOURCE` in order and type; `gradient` holds `count` elements
+                // in `GLOBAL_NORM_SOURCE` in order and type; `gradient` holds `count` elements
                 // and the grid-stride loop guards `index < count`; the launch has `block_count`
                 // blocks of `GLOBAL_NORM_THREADS` threads (the kernel's shared array size) and
                 // block `b` writes only `partials[offset + b]`, inside the `partial_count`
@@ -463,7 +532,7 @@ impl<T: CudaReal> CudaExecutionPlan<T> {
             launch.arg(&clip_norm);
             launch.arg(&square);
             // SAFETY: the arguments match the five parameters of `quabla_global_norm_reduce` in
-            // `CUDA_TRAINING_SOURCE` in order and type; the kernel reads the first
+            // `GLOBAL_NORM_SOURCE` in order and type; the kernel reads the first
             // `partial_count` entries of `partials`, all written by the pass above, runs as one
             // block of `GLOBAL_NORM_THREADS` threads, and writes only `scalars[0]`,
             // `scalars[1]`, or `scalars[2]` of its three elements.

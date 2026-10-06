@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
+use quabla_core::tensor_ir::{AdamCoefficients, AdamOrder, F64Arith};
 
 use crate::tensor::PyTensor;
 
@@ -128,8 +129,16 @@ impl PyAdam {
         }
 
         self.step += 1;
-        let correction1 = 1.0 - self.beta1.powi(self.step as i32);
-        let correction2 = 1.0 - self.beta2.powi(self.step as i32);
+        // v0.1's order and `powi` corrections, kept bit for bit until v1.0
+        // (see `AdamOrder::V01`).
+        let coefficients = AdamCoefficients::v01(
+            self.learning_rate,
+            self.beta1,
+            self.beta2,
+            self.epsilon,
+            self.step,
+        );
+        let mut arith = F64Arith::default();
         let mut updated = BTreeMap::new();
         for (name, parameter, gradient) in validated {
             let (shape, parameter_data) = parameter.shape_data();
@@ -146,13 +155,17 @@ impl PyAdam {
                 .zip(gradient_data.iter())
                 .zip(first.iter_mut().zip(second.iter_mut()))
             {
-                *first = self.beta1 * *first + (1.0 - self.beta1) * *gradient;
-                *second = self.beta2 * *second + (1.0 - self.beta2) * gradient * gradient;
-                values.push(
-                    *value
-                        - self.learning_rate * (*first / correction1)
-                            / ((*second / correction2).sqrt() + self.epsilon),
+                let (value, m, v) = arith.adam(
+                    AdamOrder::V01,
+                    &coefficients,
+                    *value,
+                    *gradient,
+                    *first,
+                    *second,
                 );
+                *first = m;
+                *second = v;
+                values.push(value);
             }
             // Moment state stays f64; the updated parameter keeps its original dtype.
             updated.insert(

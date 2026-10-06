@@ -7,13 +7,13 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use quabla_core::tensor_ir::{
-    BatchingError, CudaBackend, CudaDataParallelExecutionPlan, CudaDataParallelTiming,
-    CudaExecutionPlan, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, MlxAdamPlan,
-    MlxBackend, MlxRetainedInputs, SymbolicCotangent, TensorBackend, TensorComparison,
-    TensorCondExecutionPlan, TensorCustomRule, TensorCustomTangent, TensorDType,
-    TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorIr, TensorNodeId,
-    TensorRegion, TensorReplicaReduction, TensorScanExecutionPlan, TensorWhileExecutionPlan,
-    UnaryMathKind,
+    AdamCoefficients, AdamOrder, BatchingError, CudaBackend, CudaDataParallelExecutionPlan,
+    CudaDataParallelTiming, CudaExecutionPlan, DeviceOptimizerConfig, DeviceUpdateRule,
+    DynamicTensor, F64Arith, MlxAdamPlan, MlxBackend, MlxRetainedInputs, SymbolicCotangent,
+    TensorBackend, TensorComparison, TensorCondExecutionPlan, TensorCustomRule,
+    TensorCustomTangent, TensorDType, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan,
+    TensorIr, TensorNodeId, TensorRegion, TensorReplicaReduction, TensorScanExecutionPlan,
+    TensorWhileExecutionPlan, UnaryMathKind,
 };
 use quabla_core::{
     QuablaCompiler, QuablaExecutable, QuablaMultiOutputExecutable, QuablaMultiOutputProgram,
@@ -8793,23 +8793,50 @@ fn execute_cuda_adam_step(
 impl TensorCudaAdamOptimizer {
     /// Applies AdamW's decoupled decay to the parameters the loss ignores.
     ///
-    /// Their gradient and moments are zero, so the host update reduces to
-    /// `p - (0 + weight_decay * p) * learning_rate`, evaluated here in float64
-    /// and rounded once, exactly as the CPU trainer does (the `0 +` keeps its
-    /// signed-zero result). Plain Adam and SGD leave them unchanged.
+    /// Their gradient and moments are zero, so the shared canonical rule,
+    /// evaluated here in float64 and rounded once exactly as the CPU trainer
+    /// does, reduces to `p - (0 + weight_decay * p) * learning_rate` (the
+    /// `0 +` keeps its signed-zero result). The update count does not matter:
+    /// a zero moment over any positive bias correction is `+0`. Plain Adam
+    /// and SGD leave them unchanged.
     fn decay_frozen_parameters(&mut self) -> Result<(), String> {
-        let DeviceUpdateRule::Adam { weight_decay, .. } = self.config.rule else {
+        let DeviceUpdateRule::Adam {
+            beta1,
+            beta2,
+            epsilon,
+            weight_decay,
+        } = self.config.rule
+        else {
             return Ok(());
         };
         if weight_decay == 0.0 {
             return Ok(());
         }
-        let learning_rate = self.config.learning_rate;
+        let coefficients = AdamCoefficients::new(
+            self.config.learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+            weight_decay,
+            1,
+        );
+        let mut arith = F64Arith::default();
         for value in self.frozen_parameters.values_mut() {
             let decayed = value
                 .data()
                 .iter()
-                .map(|parameter| parameter - (0.0 + weight_decay * parameter) * learning_rate)
+                .map(|parameter| {
+                    arith
+                        .adam(
+                            AdamOrder::Canonical,
+                            &coefficients,
+                            *parameter,
+                            0.0,
+                            0.0,
+                            0.0,
+                        )
+                        .0
+                })
                 .collect();
             *value = DynamicTensor::from_storage(
                 value.shape().to_vec(),
