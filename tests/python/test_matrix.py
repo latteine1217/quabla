@@ -6836,7 +6836,7 @@ def test_bool_logical_ops_and_reductions_match_between_eager_and_traced():
 
     expect_error(lambda: x & y, "logical_and requires bool operands")
     expect_error(lambda: x.any(), "any requires bool operands")
-    expect_error(lambda: x.isfinite().isnan(), "isnan is not defined for bool tensors")
+    expect_error(lambda: x.isfinite().isnan(), "isnan requires a floating operand, got dtype bool")
     expect_error(
         lambda: quabla.trace_tensor(lambda x: x.all(), [("x", [2])]),
         "all requires bool operands",

@@ -3,12 +3,15 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyEllipsis, PyMemoryView, PySlice, PySliceMethods, PyTuple};
 use quabla_core::tensor_ir::{
-    BinaryMathKind, HostTensorStorage, TensorComparison, TensorDType, TensorExtremum, UnaryMathKind,
+    BinaryMathKind, EagerKernel, EagerOperand, HostTensorStorage, TensorComparison, TensorDType,
+    UnaryMathKind,
 };
 use std::borrow::Cow;
 use std::ffi::c_int;
+#[cfg(test)]
 use std::sync::Arc;
 
+use crate::composite::{self, Primitives};
 use crate::dtype::PyDType;
 use crate::interop;
 use crate::tensor_trace::{eager_traced_binary, TraceTensor, TracedBinary};
@@ -50,10 +53,10 @@ fn traced(
 }
 
 /// Eager host tensor with physical storage matching its logical dtype.
-/// Every eager op rounds its `f64` intermediate result the way
-/// the CPU Tensor IR backend rounds an `f32` node. Python scalars are weak:
-/// they are rounded to the tensor dtype before the op. A `bool` tensor holds
-/// `0.0`/`1.0` and follows the Tensor IR promotion rule.
+/// Every op evaluates the Tensor IR nodes that a trace of it records with the
+/// core's CPU evaluator, so eager results, dtypes, weak types, and errors are
+/// those of CPU `jit`. Python scalars are weak operands, and a `bool` tensor
+/// holds `0.0`/`1.0` and follows the Tensor IR promotion rule.
 #[pyclass(name = "Tensor", skip_from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PyTensor {
@@ -302,18 +305,6 @@ pub(crate) fn extract_scalar(value: &Bound<'_, PyAny>) -> Option<f64> {
     value.extract::<f64>().ok()
 }
 
-/// Whether a max/min reduction replaces its running `current` with the later
-/// `value`: the rule of the traced `ExtremumAxis` op (NaN propagates from any
-/// position and `-0 < +0`), so eager and traced results agree.
-fn extrema_replaces(maximum: bool, current: f64, value: f64) -> bool {
-    let kind = if maximum {
-        TensorExtremum::Max
-    } else {
-        TensorExtremum::Min
-    };
-    kind.replaces(current, value)
-}
-
 fn element_count(shape: &[usize]) -> Result<usize, String> {
     if shape.contains(&0) {
         return Err("tensor extents must be greater than zero".to_string());
@@ -365,44 +356,6 @@ fn normalize_axis(axis: isize, rank: usize) -> Result<usize, String> {
     Ok(normalized as usize)
 }
 
-fn normalize_permutation(axes: Option<Vec<isize>>, rank: usize) -> Result<Vec<usize>, String> {
-    let axes = axes.unwrap_or_else(|| (0..rank).rev().map(|axis| axis as isize).collect());
-    if axes.len() != rank {
-        return Err(format!(
-            "transpose axes must have length {rank}, got {}",
-            axes.len()
-        ));
-    }
-
-    let axes = axes
-        .into_iter()
-        .map(|axis| normalize_axis(axis, rank))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut seen = vec![false; rank];
-    for axis in &axes {
-        if std::mem::replace(&mut seen[*axis], true) {
-            return Err(format!(
-                "transpose axes {:?} are not a permutation of 0..{rank}",
-                axes
-            ));
-        }
-    }
-
-    Ok(axes)
-}
-
-fn normalize_reduction_axes(axes: Vec<isize>, rank: usize) -> Result<Vec<usize>, String> {
-    let mut axes = axes
-        .into_iter()
-        .map(|axis| normalize_axis(axis, rank))
-        .collect::<Result<Vec<_>, _>>()?;
-    axes.sort_unstable();
-    if axes.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err("reduction axes must be unique".to_string());
-    }
-    Ok(axes)
-}
-
 fn extract_reduction_axes(axis: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<isize>>> {
     let Some(axis) = axis else {
         return Ok(None);
@@ -416,106 +369,6 @@ fn extract_reduction_axes(axis: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Ve
     axis.extract::<Vec<isize>>().map(Some).map_err(|_| {
         PyTypeError::new_err("axis must be None, an integer, or a sequence of integers")
     })
-}
-
-fn matmul_float_block<T: Copy + Into<f64>>(
-    lhs: &[T],
-    rhs: &[T],
-    output: &mut [f64],
-    [rows, inner, columns]: [usize; 3],
-) {
-    for row in 0..rows {
-        let output = &mut output[row * columns..(row + 1) * columns];
-        for k in 0..inner {
-            let lhs = lhs[row * inner + k].into();
-            let rhs = &rhs[k * columns..(k + 1) * columns];
-            // Accumulate in F64 in the original increasing-inner order.
-            for (output, &rhs) in output.iter_mut().zip(rhs) {
-                *output += lhs * rhs.into();
-            }
-        }
-    }
-}
-
-fn broadcast_shape(lhs: &[usize], rhs: &[usize]) -> Result<Vec<usize>, String> {
-    let rank = lhs.len().max(rhs.len());
-    let mut shape = Vec::with_capacity(rank);
-
-    for offset in 0..rank {
-        let lhs_extent = lhs.iter().rev().nth(offset).copied().unwrap_or(1);
-        let rhs_extent = rhs.iter().rev().nth(offset).copied().unwrap_or(1);
-        let extent = if lhs_extent == rhs_extent {
-            lhs_extent
-        } else if lhs_extent == 1 {
-            rhs_extent
-        } else if rhs_extent == 1 {
-            lhs_extent
-        } else {
-            return Err(format!(
-                "cannot broadcast tensor shapes {:?} and {:?}",
-                lhs, rhs
-            ));
-        };
-        shape.push(extent);
-    }
-
-    shape.reverse();
-    Ok(shape)
-}
-
-// Advance row-major broadcast offsets with stack-only operand metadata. Only
-// wrapped axes propagate a carry, so ordinary elements avoid full rank decoding.
-// Inlining specializes the one-to-three operand loop and removes per-element calls.
-#[inline(always)]
-fn advance_broadcast_offsets<const N: usize>(
-    mut next: usize,
-    shape: &[usize],
-    operands: [(&[usize], &[usize]); N],
-    offsets: &mut [usize; N],
-) {
-    for axis in (0..shape.len()).rev() {
-        let wrapped = next.is_multiple_of(shape[axis]);
-        for (offset, (input_shape, strides)) in offsets.iter_mut().zip(operands) {
-            let rank_offset = shape.len() - input_shape.len();
-            if axis >= rank_offset && input_shape[axis - rank_offset] != 1 {
-                let step = strides[axis - rank_offset];
-                if wrapped {
-                    *offset -= (shape[axis] - 1) * step;
-                } else {
-                    *offset += step;
-                }
-            }
-        }
-        if !wrapped {
-            break;
-        }
-        next /= shape[axis];
-    }
-}
-
-fn broadcast_offset(
-    output_index: usize,
-    output_shape: &[usize],
-    input_shape: &[usize],
-    input_strides: &[usize],
-) -> usize {
-    let mut remaining = output_index;
-    let mut offset = 0;
-    let rank_offset = output_shape.len() - input_shape.len();
-
-    for axis in (0..output_shape.len()).rev() {
-        let coordinate = remaining % output_shape[axis];
-        remaining /= output_shape[axis];
-
-        if axis >= rank_offset {
-            let input_axis = axis - rank_offset;
-            if input_shape[input_axis] != 1 {
-                offset += coordinate * input_strides[input_axis];
-            }
-        }
-    }
-
-    offset
 }
 
 fn view_offset(flat_index: usize, shape: &[usize], strides: &[usize], offset: usize) -> usize {
@@ -629,8 +482,22 @@ impl PyTensor {
         self.weak
     }
 
+    /// The tensor with weak type `weak` (see the `weak` field).
+    pub(crate) fn with_weak(mut self, weak: bool) -> Self {
+        self.weak = weak;
+        self
+    }
+
     pub fn shape_data(&self) -> (&[usize], Cow<'_, [f64]>) {
         (&self.shape, self.data.to_f64())
+    }
+
+    /// This tensor as a borrowed operand of a direct kernel.
+    fn operand(&self) -> EagerOperand<'_> {
+        EagerOperand::Array {
+            shape: &self.shape,
+            storage: &self.data,
+        }
     }
 
     pub fn to_dynamic_tensor(&self) -> Result<quabla_core::tensor_ir::DynamicTensor, String> {
@@ -658,265 +525,11 @@ impl PyTensor {
         self
     }
 
-    /// Strict promotion for two tensors: dtypes must match exactly.
-    fn result_dtype(&self, rhs: &Self, op: &str) -> Result<TensorDType, String> {
-        if self.dtype != rhs.dtype {
-            return Err(format!(
-                "tensor {op} operands have mismatched dtypes {} and {}; \
-                 convert one of them explicitly with astype",
-                self.dtype, rhs.dtype
-            ));
-        }
-        Ok(self.dtype)
-    }
-
-    /// Result dtype and weakness under the Tensor IR promotion rule: strong
-    /// floats must match, weak floats adopt the strong dtype, and `bool`
-    /// joins a float operand as 0/1 values of its dtype and weakness. Two
-    /// `bool` operands are accepted only when `allow_bool` (comparisons,
-    /// `where`, concatenation).
-    fn promotion(
-        tensors: &[&Self],
-        op: &str,
-        allow_bool: bool,
-    ) -> Result<(TensorDType, bool), String> {
-        let mut result: Option<(TensorDType, bool)> = None;
-        for tensor in tensors {
-            if tensor.dtype == TensorDType::Bool {
-                continue;
-            }
-            result = Some(match result {
-                None => (tensor.dtype, tensor.weak),
-                Some((dtype, weak)) if dtype == tensor.dtype => (dtype, weak && tensor.weak),
-                Some((_, true)) if !tensor.weak => (tensor.dtype, false),
-                Some((dtype, false)) if tensor.weak => (dtype, false),
-                Some((dtype, _)) => {
-                    return Err(format!(
-                        "tensor {op} operands have mismatched dtypes {dtype} and {}; \
-                         convert one of them explicitly with astype",
-                        tensor.dtype
-                    ))
-                }
-            });
-        }
-        match result {
-            Some(result) => Ok(result),
-            None if allow_bool => Ok((TensorDType::Bool, false)),
-            None => Err(bool_operation_error(op)),
-        }
-    }
-
-    /// Operands converted to their promoted dtype, or `None` when they
-    /// already share it; callers retry the op on the converted pair.
-    fn promoted_pair(
-        &self,
-        rhs: &Self,
-        op: &str,
-        allow_bool: bool,
-    ) -> Result<Option<(Self, Self)>, String> {
-        let (dtype, _) = Self::promotion(&[self, rhs], op, allow_bool)?;
-        if self.dtype == dtype && rhs.dtype == dtype {
-            return Ok(None);
-        }
-        Ok(Some((self.converted(dtype), rhs.converted(dtype))))
-    }
-
-    fn converted(&self, dtype: TensorDType) -> Self {
-        if self.dtype == dtype {
-            self.clone()
-        } else {
-            self.clone().typed(dtype)
-        }
-    }
-
-    /// A `bool` tensor enters scalar arithmetic as weak `f64` 0/1 values.
-    fn arithmetic_base(&self) -> Self {
-        if self.dtype == TensorDType::Bool {
-            let mut base = self.clone().typed(TensorDType::F64);
-            base.weak = true;
-            base
-        } else {
-            self.clone()
-        }
-    }
-
     fn ensure_not_bool(&self, op: &str) -> Result<(), String> {
         if self.dtype == TensorDType::Bool {
             return Err(bool_operation_error(op));
         }
         Ok(())
-    }
-
-    fn ensure_bool(&self, op: &str) -> Result<(), String> {
-        if self.dtype != TensorDType::Bool {
-            return Err(format!(
-                "{op} requires bool operands, got dtype {}; \
-                 build a mask with a comparison or convert explicitly with astype",
-                self.dtype
-            ));
-        }
-        Ok(())
-    }
-
-    /// Broadcasts two same-dtype operands through `f`, rounding each result
-    /// to `dtype`.
-    fn zip_broadcast(
-        &self,
-        rhs: &Self,
-        op: &str,
-        dtype: TensorDType,
-        f: impl Fn(f64, f64) -> Result<f64, String>,
-    ) -> Result<Self, String> {
-        let shape = broadcast_shape(&self.shape, &rhs.shape)?;
-        let output_size = element_count(&shape)?;
-        let mut data = Vec::with_capacity(output_size);
-
-        if self.shape == rhs.shape {
-            for (lhs, rhs) in self.data.iter().zip(rhs.data.iter()) {
-                let value =
-                    f(lhs, rhs).map_err(|err| format!("failed to evaluate tensor {op}: {err}"))?;
-                data.push(dtype.round(value));
-            }
-        } else if self.data.len() == 1 && rhs.data.len() == output_size {
-            for rhs in rhs.data.iter() {
-                let value = f(self.data.get(0), rhs)
-                    .map_err(|err| format!("failed to evaluate tensor {op}: {err}"))?;
-                data.push(dtype.round(value));
-            }
-        } else if rhs.data.len() == 1 && self.data.len() == output_size {
-            for lhs in self.data.iter() {
-                let value = f(lhs, rhs.data.get(0))
-                    .map_err(|err| format!("failed to evaluate tensor {op}: {err}"))?;
-                data.push(dtype.round(value));
-            }
-        } else {
-            let lhs_strides = contiguous_strides(&self.shape);
-            let rhs_strides = contiguous_strides(&rhs.shape);
-            let mut offsets = [0; 2];
-            for index in 0..output_size {
-                let value = f(self.data.get(offsets[0]), rhs.data.get(offsets[1]))
-                    .map_err(|err| format!("failed to evaluate tensor {op}: {err}"))?;
-                data.push(dtype.round(value));
-                if index + 1 < output_size {
-                    advance_broadcast_offsets(
-                        index + 1,
-                        &shape,
-                        [(&self.shape, &lhs_strides), (&rhs.shape, &rhs_strides)],
-                        &mut offsets,
-                    );
-                }
-            }
-        }
-
-        Ok(Self {
-            shape,
-            data: HostTensorStorage::from_f64(data, dtype),
-            dtype,
-            weak: false,
-        })
-    }
-
-    fn try_elementwise(
-        &self,
-        rhs: &Self,
-        op: &str,
-        f: impl Fn(f64, f64) -> Result<f64, String>,
-    ) -> Result<Self, String> {
-        let (dtype, weak) = Self::promotion(&[self, rhs], op, false)?;
-        let lhs = self.converted(dtype);
-        let rhs = rhs.converted(dtype);
-        let mut output = lhs.zip_broadcast(&rhs, op, dtype, f)?;
-        output.weak = weak;
-        Ok(output)
-    }
-
-    fn try_map(&self, f: impl Fn(f64) -> f64) -> Result<Self, String> {
-        // Keep F64 arithmetic per lane, but write directly to dtype-sized output.
-        let data = match self.dtype {
-            TensorDType::F64 => HostTensorStorage::F64(Arc::new(self.data.iter().map(f).collect())),
-            TensorDType::F32 => {
-                HostTensorStorage::F32(Arc::new(self.data.iter().map(|v| f(v) as f32).collect()))
-            }
-            TensorDType::Bool => HostTensorStorage::Bool(Arc::new(
-                self.data.iter().map(|v| u8::from(f(v) != 0.0)).collect(),
-            )),
-        };
-        Ok(Self {
-            shape: self.shape.clone(),
-            data,
-            dtype: self.dtype,
-            weak: self.weak,
-        })
-    }
-
-    /// Elementwise float math; `bool` tensors must be converted explicitly.
-    fn try_unary(&self, op: &str, f: impl Fn(f64) -> f64) -> Result<Self, String> {
-        self.ensure_not_bool(op)?;
-        self.try_map(f)
-    }
-
-    /// IEEE comparison producing a strong `bool` tensor.
-    pub fn try_compare(&self, rhs: &Self, kind: TensorComparison) -> Result<Self, String> {
-        let (dtype, _) = Self::promotion(&[self, rhs], kind.name(), true)?;
-        self.converted(dtype).zip_broadcast(
-            &rhs.converted(dtype),
-            kind.name(),
-            TensorDType::Bool,
-            |lhs, rhs| Ok(f64::from(kind.evaluate(lhs, rhs))),
-        )
-    }
-
-    /// Compares with a weak Python scalar, which adopts the tensor dtype.
-    pub fn try_compare_scalar(&self, rhs: f64, kind: TensorComparison) -> Result<Self, String> {
-        let base = self.arithmetic_base();
-        let rhs = base.dtype.round(rhs);
-        Self::from_shape_data_typed(
-            base.shape.clone(),
-            base.data
-                .iter()
-                .map(|lhs| f64::from(kind.evaluate(lhs, rhs)))
-                .collect(),
-            TensorDType::Bool,
-        )
-    }
-
-    pub fn try_logical(&self, rhs: &Self, and: bool) -> Result<Self, String> {
-        let op = if and { "logical_and" } else { "logical_or" };
-        self.ensure_bool(op)?;
-        rhs.ensure_bool(op)?;
-        self.zip_broadcast(rhs, op, TensorDType::Bool, |lhs, rhs| {
-            let (lhs, rhs) = (lhs != 0.0, rhs != 0.0);
-            Ok(f64::from(if and { lhs && rhs } else { lhs || rhs }))
-        })
-    }
-
-    pub fn try_logical_not(&self) -> Result<Self, String> {
-        self.ensure_bool("logical_not")?;
-        self.try_map(|value| f64::from(value == 0.0))
-    }
-
-    /// `isnan`/`isfinite` of a float tensor as a `bool` tensor.
-    pub fn try_classify(&self, op: &str, test: impl Fn(f64) -> bool) -> Result<Self, String> {
-        self.ensure_not_bool(op)?;
-        Self::from_shape_data_typed(
-            self.shape.clone(),
-            self.data
-                .iter()
-                .map(|value| f64::from(test(value)))
-                .collect(),
-            TensorDType::Bool,
-        )
-    }
-
-    /// `any`/`all` as max/min reductions of the 0/1 values.
-    pub fn try_any_all(
-        &self,
-        axes: Option<Vec<isize>>,
-        keepdims: bool,
-        any: bool,
-    ) -> Result<Self, String> {
-        self.ensure_bool(if any { "any" } else { "all" })?;
-        self.try_extrema_axes(axes, keepdims, any)
     }
 
     /// Python truthiness: a single-element `bool` tensor converts like
@@ -934,364 +547,308 @@ impl PyTensor {
         }
     }
 
+    // Eager ops are adapters over the core: an op is the graph that a trace
+    // of it records (the `TraceTensor` builder methods), evaluated at once by
+    // the CPU evaluator (`TraceTensor::evaluate_eager`), so eager and `jit`
+    // results, dtypes, weak types, and errors cannot diverge. An op whose
+    // graph is a single node over operands that need no promotion cast calls
+    // that node's kernel directly instead (`EagerKernel`), which skips the
+    // graph's fixed cost of a few hundred nanoseconds per node, and the
+    // composites of `crate::composite` run each of their primitives so.
+
+    /// The traced op `build` evaluated on `operands`.
+    fn evaluated<const N: usize>(
+        operands: [&Self; N],
+        build: impl FnOnce([TraceTensor; N]) -> Result<TraceTensor, String>,
+    ) -> Result<Self, String> {
+        TraceTensor::evaluate_eager(operands, build)
+    }
+
+    /// `kernel` over `operands`, or `None` when the kernel rejects them, so
+    /// that the caller's graph route runs the op and reports the builder's
+    /// error. The caller ensures that the graph of the op would be exactly
+    /// this node: the operands already have the dtypes promotion gives them,
+    /// so no cast is recorded. `weak` is the weak type of the operands that
+    /// determine the node dtype; a `Compare` node is never weak.
+    fn direct<const N: usize>(
+        kernel: EagerKernel,
+        operands: [EagerOperand<'_>; N],
+        weak: bool,
+    ) -> Option<Self> {
+        let value = kernel.evaluate(&operands).ok()?;
+        let weak = weak && !matches!(kernel, EagerKernel::Compare(_));
+        Self::from_dynamic_tensor(value)
+            .ok()
+            .map(|tensor| tensor.with_weak(weak))
+    }
+
+    /// The binary op `op` with a tensor operand; `kernel` is its node's
+    /// kernel when it has a direct path. Operands of one dtype record no
+    /// promotion cast.
+    fn binary_op(
+        &self,
+        rhs: &Self,
+        kernel: Option<EagerKernel>,
+        op: TracedBinary,
+    ) -> Result<Self, String> {
+        if let Some(kernel) = kernel.filter(|_| self.dtype == rhs.dtype) {
+            let operands = [self.operand(), rhs.operand()];
+            if let Some(output) = Self::direct(kernel, operands, self.weak && rhs.weak) {
+                return Ok(output);
+            }
+        }
+        Self::evaluated([self, rhs], |[lhs, rhs]| op.apply(&lhs, &rhs))
+    }
+
+    /// `self op value`, or `value op self` when `scalar_first`, with a
+    /// Python number, which is a weak scalar; `build` records the op. A
+    /// floating operand that is strong (or weak `f64`, the only weak float)
+    /// casts the scalar to its dtype, which the direct path does by
+    /// building the scalar in that dtype.
+    fn scalar_op(
+        &self,
+        value: f64,
+        kernel: Option<EagerKernel>,
+        scalar_first: bool,
+        build: impl FnOnce(&TraceTensor) -> Result<TraceTensor, String>,
+    ) -> Result<Self, String> {
+        let castable = self.dtype.is_floating() && (!self.weak || self.dtype == TensorDType::F64);
+        if let Some(kernel) = kernel.filter(|_| castable) {
+            let scalar = EagerOperand::Scalar(self.dtype.round(value), self.dtype);
+            let tensor = self.operand();
+            let operands = if scalar_first {
+                [scalar, tensor]
+            } else {
+                [tensor, scalar]
+            };
+            if let Some(output) = Self::direct(kernel, operands, self.weak) {
+                return Ok(output);
+            }
+        }
+        Self::evaluated([self], |[tensor]| build(&tensor))
+    }
+
+    /// The `TraceTensor::binary` op `op` with a Python number.
+    fn scalar_arithmetic(
+        &self,
+        value: f64,
+        op: &'static str,
+        scalar_first: bool,
+    ) -> Result<Self, String> {
+        self.scalar_op(value, arithmetic_kernel(op), scalar_first, |tensor| {
+            if scalar_first {
+                tensor.scalar_left_binary(value, op)
+            } else {
+                tensor.scalar_binary(value, op)
+            }
+        })
+    }
+
+    /// A one-operand op with the direct path `kernel` for floating tensors.
+    fn unary(
+        &self,
+        kernel: EagerKernel,
+        build: impl FnOnce(&TraceTensor) -> Result<TraceTensor, String>,
+    ) -> Result<Self, String> {
+        if self.dtype.is_floating() {
+            if let Some(output) = Self::direct(kernel, [self.operand()], self.weak) {
+                return Ok(output);
+            }
+        }
+        Self::evaluated([self], |[tensor]| build(&tensor))
+    }
+
     pub fn try_add(&self, rhs: &Self) -> Result<Self, String> {
-        self.try_elementwise(rhs, "+", |lhs, rhs| Ok(lhs + rhs))
+        self.binary_op(rhs, Some(EagerKernel::Add), TracedBinary::Arithmetic("add"))
     }
 
     pub fn try_add_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let base = self.arithmetic_base();
-        let rhs = base.dtype.round(rhs);
-        base.try_map(|lhs| lhs + rhs)
+        self.scalar_arithmetic(rhs, "add", false)
     }
 
     pub fn try_sub(&self, rhs: &Self) -> Result<Self, String> {
-        self.try_elementwise(rhs, "-", |lhs, rhs| Ok(lhs - rhs))
+        self.binary_op(rhs, Some(EagerKernel::Sub), TracedBinary::Arithmetic("sub"))
     }
 
     pub fn try_sub_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let base = self.arithmetic_base();
-        let rhs = base.dtype.round(rhs);
-        base.try_map(|lhs| lhs - rhs)
+        self.scalar_arithmetic(rhs, "sub", false)
     }
 
     pub fn try_scalar_sub(&self, lhs: f64) -> Result<Self, String> {
-        let base = self.arithmetic_base();
-        let lhs = base.dtype.round(lhs);
-        base.try_map(|rhs| lhs - rhs)
+        self.scalar_arithmetic(lhs, "sub", true)
     }
 
     pub fn try_mul(&self, rhs: &Self) -> Result<Self, String> {
-        self.try_elementwise(rhs, "*", |lhs, rhs| Ok(lhs * rhs))
+        self.binary_op(rhs, Some(EagerKernel::Mul), TracedBinary::Arithmetic("mul"))
     }
 
     pub fn try_mul_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let base = self.arithmetic_base();
-        let rhs = base.dtype.round(rhs);
-        base.try_map(|lhs| lhs * rhs)
+        self.scalar_arithmetic(rhs, "mul", false)
     }
 
     // Division follows IEEE 754 (±inf, NaN), as traced CPU, CUDA and MLX
     // execution do.
     pub fn try_div(&self, rhs: &Self) -> Result<Self, String> {
-        self.try_elementwise(rhs, "/", |lhs, rhs| Ok(lhs / rhs))
+        self.binary_op(rhs, Some(EagerKernel::Div), TracedBinary::Arithmetic("div"))
     }
 
     pub fn try_div_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let base = self.arithmetic_base();
-        let rhs = base.dtype.round(rhs);
-        base.try_map(|lhs| lhs / rhs)
+        self.scalar_arithmetic(rhs, "div", false)
     }
 
     pub fn try_scalar_div(&self, lhs: f64) -> Result<Self, String> {
-        let base = self.arithmetic_base();
-        let lhs = base.dtype.round(lhs);
-        base.try_map(|rhs| lhs / rhs)
+        self.scalar_arithmetic(lhs, "div", true)
     }
 
+    /// `-x` as `x * -1`, so `-0.0` stays signed; `bool` is rejected.
+    pub fn try_negative(&self) -> Result<Self, String> {
+        if self.dtype.is_floating() {
+            return self.try_mul_scalar(-1.0);
+        }
+        Self::evaluated([self], |[tensor]| tensor.negative_tensor())
+    }
+
+    /// The legacy `gt` mask: `x > y` as 0/1 values of the promoted dtype.
     pub fn try_gt(&self, rhs: &Self) -> Result<Self, String> {
-        self.try_elementwise(rhs, "gt", |lhs, rhs| Ok(if lhs > rhs { 1.0 } else { 0.0 }))
+        self.binary_op(
+            rhs,
+            Some(EagerKernel::Greater),
+            TracedBinary::Arithmetic("greater"),
+        )
     }
 
     pub fn try_gt_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let base = self.arithmetic_base();
-        let rhs = base.dtype.round(rhs);
-        base.try_map(|lhs| if lhs > rhs { 1.0 } else { 0.0 })
+        self.scalar_arithmetic(rhs, "greater", false)
     }
 
-    /// `where(isnan(x) | (x > y), x, y)` like the traced form: ties select
-    /// `y`, and NaN in either operand propagates (a NaN `y` fails `>`).
+    /// IEEE comparison producing a strong `bool` tensor.
+    pub fn try_compare(&self, rhs: &Self, kind: TensorComparison) -> Result<Self, String> {
+        self.binary_op(
+            rhs,
+            Some(EagerKernel::Compare(kind)),
+            TracedBinary::Compare(kind),
+        )
+    }
+
+    /// Compares with a weak Python scalar, which adopts the tensor dtype.
+    pub fn try_compare_scalar(&self, rhs: f64, kind: TensorComparison) -> Result<Self, String> {
+        self.scalar_op(rhs, Some(EagerKernel::Compare(kind)), false, |tensor| {
+            tensor.compare_scalar(rhs, kind)
+        })
+    }
+
+    /// `lhs && rhs` and `lhs || rhs` of two `bool` tensors, which the graph
+    /// records as `where(lhs, rhs, lhs)` and `where(lhs, lhs, rhs)`.
+    pub fn try_logical(&self, rhs: &Self, and: bool) -> Result<Self, String> {
+        if self.dtype == TensorDType::Bool && rhs.dtype == TensorDType::Bool {
+            let weak = self.weak && rhs.weak;
+            let (lhs, rhs) = (self.operand(), rhs.operand());
+            let operands = if and {
+                [lhs, rhs, lhs]
+            } else {
+                [lhs, lhs, rhs]
+            };
+            if let Some(output) = Self::direct(EagerKernel::Where, operands, weak) {
+                return Ok(output);
+            }
+        }
+        Self::evaluated([self, rhs], |[lhs, rhs]| lhs.logical_tensor(&rhs, and))
+    }
+
+    pub fn try_logical_not(&self) -> Result<Self, String> {
+        Self::evaluated([self], |[tensor]| tensor.logical_not_tensor())
+    }
+
+    /// `isnan` (`nan`) or `isfinite` of a float tensor as a `bool` tensor.
+    /// The graph records `isnan(x)` as the single node `x != x`.
+    pub fn try_classify(&self, nan: bool) -> Result<Self, String> {
+        if nan && self.dtype.is_floating() {
+            let kernel = EagerKernel::Compare(TensorComparison::NotEqual);
+            if let Some(output) = Self::direct(kernel, [self.operand(), self.operand()], false) {
+                return Ok(output);
+            }
+        }
+        Self::evaluated([self], |[tensor]| tensor.classify_tensor(nan))
+    }
+
+    pub fn try_any_all(
+        &self,
+        axes: Option<Vec<isize>>,
+        keepdims: bool,
+        any: bool,
+    ) -> Result<Self, String> {
+        Self::evaluated([self], |[tensor]| {
+            tensor.any_all_tensor(axes, keepdims, any)
+        })
+    }
+
+    /// `where(isnan(x) | (x > y), x, y)`: ties select `y`, and NaN in either
+    /// operand propagates.
     pub fn try_maximum(&self, rhs: &Self) -> Result<Self, String> {
-        let mask = self.try_elementwise(rhs, "gt", |lhs, rhs| {
-            Ok(f64::from(lhs.is_nan() || lhs > rhs))
-        })?;
-        Self::try_where(&mask, self, rhs)
+        composite::maximum(self, rhs)
     }
 
     pub fn try_maximum_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let base = self.arithmetic_base();
-        let rhs = base.dtype.round(rhs);
-        base.try_map(|lhs| if lhs.is_nan() || lhs > rhs { lhs } else { rhs })
+        composite::maximum_scalar(self, rhs)
     }
 
-    /// `where(isnan(x) | (y > x), x, y)` like the traced form: ties select
-    /// `y`, and NaN in either operand propagates.
+    /// `where(isnan(x) | (y > x), x, y)`: ties select `y`, and NaN in either
+    /// operand propagates.
     pub fn try_minimum(&self, rhs: &Self) -> Result<Self, String> {
-        let mask = rhs.try_elementwise(self, "gt", |rhs, lhs| {
-            Ok(f64::from(lhs.is_nan() || rhs > lhs))
-        })?;
-        Self::try_where(&mask, self, rhs)
+        composite::minimum(self, rhs)
     }
 
     pub fn try_minimum_scalar(&self, rhs: f64) -> Result<Self, String> {
-        let base = self.arithmetic_base();
-        let rhs = base.dtype.round(rhs);
-        base.try_map(|lhs| if lhs.is_nan() || rhs > lhs { lhs } else { rhs })
+        composite::minimum_scalar(self, rhs)
     }
 
+    /// `where(mask, on_true, on_false)`. Values of one dtype record no
+    /// promotion cast; neither does a weak scalar value (a Python number)
+    /// meeting a strong float, whose cast the direct path applies by
+    /// rounding the scalar to that dtype.
     pub fn try_where(mask: &Self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
-        // The mask is only tested for non-zero (bool or legacy float mask) and does not take part
-        // in dtype unification.
-        if let Some((on_true, on_false)) = on_true.promoted_pair(on_false, "where", true)? {
-            return Self::try_where(mask, &on_true, &on_false);
-        }
-        let dtype = on_true.result_dtype(on_false, "where")?;
-        let value_shape = broadcast_shape(&on_true.shape, &on_false.shape)?;
-        let shape = broadcast_shape(&mask.shape, &value_shape)?;
-        let count = element_count(&shape)?;
-        let mask_strides = contiguous_strides(&mask.shape);
-        let true_strides = contiguous_strides(&on_true.shape);
-        let false_strides = contiguous_strides(&on_false.shape);
-        let mut data = Vec::with_capacity(count);
-
-        if mask.shape == shape && on_true.shape == shape && on_false.shape == shape {
-            for ((mask, on_true), on_false) in mask
-                .data
-                .iter()
-                .zip(on_true.data.iter())
-                .zip(on_false.data.iter())
-            {
-                data.push(if mask != 0.0 { on_true } else { on_false });
-            }
-            return Self::from_shape_data_typed(shape, data, dtype);
-        }
-
-        let mut offsets = [0; 3];
-        for index in 0..count {
-            data.push(if mask.data.get(offsets[0]) != 0.0 {
-                on_true.data.get(offsets[1])
-            } else {
-                on_false.data.get(offsets[2])
-            });
-            if index + 1 < count {
-                advance_broadcast_offsets(
-                    index + 1,
-                    &shape,
-                    [
-                        (&mask.shape, &mask_strides),
-                        (&on_true.shape, &true_strides),
-                        (&on_false.shape, &false_strides),
-                    ],
-                    &mut offsets,
-                );
+        let values = if on_true.dtype == on_false.dtype {
+            Some((
+                on_true.operand(),
+                on_false.operand(),
+                on_true.weak && on_false.weak,
+            ))
+        } else if let Some(scalar) = on_false.scalar_cast_to(on_true) {
+            Some((on_true.operand(), scalar, false))
+        } else {
+            on_true
+                .scalar_cast_to(on_false)
+                .map(|scalar| (scalar, on_false.operand(), false))
+        };
+        if let Some((on_true, on_false, weak)) = values {
+            let operands = [mask.operand(), on_true, on_false];
+            if let Some(output) = Self::direct(EagerKernel::Where, operands, weak) {
+                return Ok(output);
             }
         }
+        Self::evaluated([mask, on_true, on_false], |[mask, on_true, on_false]| {
+            mask.where_tensor(&on_true, &on_false)
+        })
+    }
 
-        Self::from_shape_data_typed(shape, data, dtype)
+    /// This tensor as the promotion cast to `other`'s dtype gives it, when
+    /// this is a weak rank-0 `f64` (a Python number) and `other` a strong
+    /// float of another dtype.
+    fn scalar_cast_to(&self, other: &Self) -> Option<EagerOperand<'static>> {
+        (self.weak
+            && self.shape.is_empty()
+            && self.dtype == TensorDType::F64
+            && !other.weak
+            && other.dtype.is_floating())
+        .then(|| EagerOperand::Scalar(other.dtype.round(self.data.get(0)), other.dtype))
     }
 
     pub fn try_matmul(&self, rhs: &Self) -> Result<Self, String> {
-        if let Some((lhs, rhs)) = self.promoted_pair(rhs, "matmul", false)? {
-            return lhs.try_matmul(&rhs);
-        }
-        let dtype = self.result_dtype(rhs, "matmul")?;
-        if self.shape.len() < 2 || rhs.shape.len() < 2 {
-            return Err(format!(
-                "matmul requires tensors with at least two dimensions, got {:?} and {:?}",
-                self.shape, rhs.shape
-            ));
-        }
-
-        let lhs_rows = self.shape[self.shape.len() - 2];
-        let lhs_inner = self.shape[self.shape.len() - 1];
-        let rhs_inner = rhs.shape[rhs.shape.len() - 2];
-        let rhs_cols = rhs.shape[rhs.shape.len() - 1];
-        if lhs_inner != rhs_inner {
-            return Err(format!(
-                "cannot matmul tensor shapes {:?} and {:?}: inner dimensions {lhs_inner} and {rhs_inner} differ",
-                self.shape, rhs.shape
-            ));
-        }
-
-        let lhs_batch_shape = &self.shape[..self.shape.len() - 2];
-        let rhs_batch_shape = &rhs.shape[..rhs.shape.len() - 2];
-        let batch_shape = broadcast_shape(lhs_batch_shape, rhs_batch_shape)?;
-        let batch_count = element_count(&batch_shape)?;
-        let lhs_batch_strides = contiguous_strides(lhs_batch_shape);
-        let rhs_batch_strides = contiguous_strides(rhs_batch_shape);
-
-        let mut shape = batch_shape;
-        shape.push(lhs_rows);
-        shape.push(rhs_cols);
-        let mut data = vec![0.0; element_count(&shape)?];
-
-        for batch_index in 0..batch_count {
-            let lhs_batch = broadcast_offset(
-                batch_index,
-                &shape[..shape.len() - 2],
-                lhs_batch_shape,
-                &lhs_batch_strides,
-            );
-            let rhs_batch = broadcast_offset(
-                batch_index,
-                &shape[..shape.len() - 2],
-                rhs_batch_shape,
-                &rhs_batch_strides,
-            );
-
-            let lhs_start = lhs_batch * lhs_rows * lhs_inner;
-            let rhs_start = rhs_batch * rhs_inner * rhs_cols;
-            let output_start = batch_index * lhs_rows * rhs_cols;
-            let output = &mut data[output_start..output_start + lhs_rows * rhs_cols];
-            let dimensions = [lhs_rows, lhs_inner, rhs_cols];
-            match (&self.data, &rhs.data) {
-                (HostTensorStorage::F64(lhs), HostTensorStorage::F64(rhs)) => {
-                    matmul_float_block(&lhs[lhs_start..], &rhs[rhs_start..], output, dimensions);
-                }
-                (HostTensorStorage::F32(lhs), HostTensorStorage::F32(rhs)) => {
-                    matmul_float_block(&lhs[lhs_start..], &rhs[rhs_start..], output, dimensions);
-                }
-                _ => unreachable!("matmul operands have validated matching float dtypes"),
-            }
-        }
-
-        Self::from_shape_data_typed(shape, data, dtype)
+        self.binary_op(rhs, Some(EagerKernel::Matmul), TracedBinary::Matmul)
     }
 
     pub fn try_solve(&self, rhs: &Self) -> Result<Self, String> {
-        if let Some((lhs, rhs)) = self.promoted_pair(rhs, "solve", false)? {
-            return lhs.try_solve(&rhs);
-        }
-        let dtype = self.result_dtype(rhs, "solve")?;
-        let rank = self.shape.len();
-        if rank < 2 || rhs.shape.len() != rank {
-            return Err(format!(
-                "solve requires matrix and right-hand side tensors of the same rank, at least \
-                 two, got {:?} and {:?}",
-                self.shape, rhs.shape
-            ));
-        }
-        let n = self.shape[rank - 1];
-        if n != self.shape[rank - 2]
-            || n != rhs.shape[rank - 2]
-            || self.shape[..rank - 2] != rhs.shape[..rank - 2]
-        {
-            return Err(format!(
-                "solve requires coefficient shape {:?} and right-hand side shape {:?} to have \
-                 square matrices, compatible rows, and the same batch axes",
-                self.shape, rhs.shape
-            ));
-        }
-        if rank == 2 {
-            return self.solve_matrix(rhs, dtype);
-        }
-        // Each matrix of the leading batch axes is solved independently.
-        let columns = rhs.shape[rank - 1];
-        let (matrices, blocks) = (self.data.to_f64(), rhs.data.to_f64());
-        let mut output = Vec::with_capacity(blocks.len());
-        for (matrix, block) in matrices
-            .chunks_exact(n * n)
-            .zip(blocks.chunks_exact(n * columns))
-        {
-            let matrix = Self::from_shape_data_typed(vec![n, n], matrix.to_vec(), dtype)?;
-            let block = Self::from_shape_data_typed(vec![n, columns], block.to_vec(), dtype)?;
-            output.extend(matrix.solve_matrix(&block, dtype)?.data.to_f64().iter());
-        }
-        Self::from_shape_data_typed(rhs.shape.clone(), output, dtype)
-    }
-
-    fn solve_matrix(&self, rhs: &Self, dtype: TensorDType) -> Result<Self, String> {
-        if let Some(result) = self.finite_triangular_solution(rhs) {
-            return Self::from_shape_data_typed(rhs.shape.clone(), result, dtype);
-        }
-        self.solve_lu(rhs, dtype)
-    }
-
-    fn solve_lu(&self, rhs: &Self, dtype: TensorDType) -> Result<Self, String> {
-        let n = self.shape[0];
-        let columns = rhs.shape[1];
-        let mut factor = self.data.to_f64().into_owned();
-        let mut result = rhs.data.to_f64().into_owned();
-        for pivot in 0..n {
-            let pivot_row = (pivot..n)
-                .max_by(|&left, &right| {
-                    factor[left * n + pivot]
-                        .abs()
-                        .total_cmp(&factor[right * n + pivot].abs())
-                })
-                .expect("pivot range is non-empty");
-            if factor[pivot_row * n + pivot] == 0.0 {
-                return Err("solve requires a non-singular coefficient matrix".to_string());
-            }
-            if pivot_row != pivot {
-                for column in 0..n {
-                    factor.swap(pivot * n + column, pivot_row * n + column);
-                }
-                for column in 0..columns {
-                    result.swap(pivot * columns + column, pivot_row * columns + column);
-                }
-            }
-            let diagonal = factor[pivot * n + pivot];
-            for row in pivot + 1..n {
-                let multiplier = factor[row * n + pivot] / diagonal;
-                factor[row * n + pivot] = multiplier;
-                for column in pivot + 1..n {
-                    factor[row * n + column] -= multiplier * factor[pivot * n + column];
-                }
-                for column in 0..columns {
-                    result[row * columns + column] -= multiplier * result[pivot * columns + column];
-                }
-            }
-        }
-        for row in (0..n).rev() {
-            for column in 0..columns {
-                let mut value = result[row * columns + column];
-                for inner in row + 1..n {
-                    value -= factor[row * n + inner] * result[inner * columns + column];
-                }
-                result[row * columns + column] = value / factor[row * n + row];
-            }
-        }
-        Self::from_shape_data_typed(rhs.shape.clone(), result, dtype)
-    }
-
-    // Exact triangular structure permits substitution without a factor matrix.
-    // Exceptional values keep the pivoted solver's existing error/IEEE behavior.
-    fn finite_triangular_solution(&self, rhs: &Self) -> Option<Vec<f64>> {
-        if self
-            .data
-            .iter()
-            .chain(rhs.data.iter())
-            .any(|value| !value.is_finite())
-        {
-            return None;
-        }
-        let n = self.shape[0];
-        let columns = rhs.shape[1];
-        let mut lower = true;
-        let mut upper = true;
-        for row in 0..n {
-            if self.data.get(row * n + row) == 0.0 {
-                return None;
-            }
-            for column in 0..row {
-                upper &= self.data.get(row * n + column) == 0.0;
-                lower &= self.data.get(column * n + row) == 0.0;
-            }
-        }
-        if !lower && !upper {
-            return None;
-        }
-        let mut result = rhs.data.to_f64().into_owned();
-        for step in 0..n {
-            let row = if lower { step } else { n - 1 - step };
-            let diagonal = self.data.get(row * n + row);
-            let dependencies = if lower { 0..row } else { row + 1..n };
-            for column in 0..columns {
-                let mut value = result[row * columns + column];
-                for inner in dependencies.clone() {
-                    value -= self.data.get(row * n + inner) * result[inner * columns + column];
-                    if !value.is_finite() {
-                        return None;
-                    }
-                }
-                let solved = value / diagonal;
-                if !solved.is_finite() {
-                    return None;
-                }
-                result[row * columns + column] = solved;
-            }
-        }
-        Some(result)
+        self.binary_op(rhs, None, TracedBinary::Solve)
     }
 
     pub fn try_solve_triangular(
@@ -1300,76 +857,56 @@ impl PyTensor {
         lower: bool,
         transpose: bool,
     ) -> Result<Self, String> {
-        let matrix = self.try_triangular(lower)?;
-        let matrix = if transpose {
-            // Swap only the matrix axes; leading batch axes stay in place.
-            let rank = matrix.shape.len() as isize;
-            let mut axes = (0..rank).collect::<Vec<_>>();
-            axes.swap((rank - 2) as usize, (rank - 1) as usize);
-            matrix.try_transpose(Some(axes))?
-        } else {
-            matrix
-        };
-        matrix.try_solve(rhs)
+        self.binary_op(
+            rhs,
+            None,
+            TracedBinary::SolveTriangular { lower, transpose },
+        )
     }
 
     pub fn try_linalg(&self, kind: &str) -> Result<Self, String> {
-        let kind = quabla_core::tensor_ir::LinalgKind::from_name(kind)?;
-        Self::from_dynamic_tensor(quabla_core::tensor_ir::evaluate_linalg(
-            kind,
-            &self.to_dynamic_tensor()?,
-        )?)
+        Self::evaluated([self], |[tensor]| tensor.linalg_tensor(kind))
     }
 
+    /// The traced `cholesky` factor of each matrix, with the strict input
+    /// validation that eager Cholesky documents and the traced op omits (it
+    /// reads the lower triangle and returns NaN for an indefinite matrix):
+    /// an asymmetric matrix is rejected before, and a non-positive pivot
+    /// (a factor diagonal entry that is not positive) after, the
+    /// factorization.
     pub fn try_cholesky(&self) -> Result<Self, String> {
-        self.ensure_not_bool("cholesky")?;
         let rank = self.shape.len();
-        if rank < 2 || self.shape[rank - 2] != self.shape[rank - 1] {
-            return Err(format!(
-                "cholesky requires a stack of square matrices [..., n, n], got {:?}",
-                self.shape
-            ));
+        let square = rank >= 2 && self.shape[rank - 2] == self.shape[rank - 1];
+        if !square || !self.dtype.is_floating() {
+            return Self::evaluated([self], |[tensor]| tensor.cholesky_tensor());
         }
-        if rank > 2 {
-            // Each matrix of the leading batch axes is factored independently.
-            let n = self.shape[rank - 1];
-            let values = self.data.to_f64();
-            let mut output = Vec::with_capacity(values.len());
-            for matrix in values.chunks_exact(n * n) {
-                let matrix = Self::from_shape_data_typed(vec![n, n], matrix.to_vec(), self.dtype)?;
-                output.extend(matrix.try_cholesky()?.data.to_f64().iter());
-            }
-            return Self::from_shape_data_typed(self.shape.clone(), output, self.dtype);
-        }
-        let n = self.shape[0];
-        let mut factor = vec![0.0; n * n];
-        for row in 0..n {
-            for column in 0..=row {
-                let symmetric = self.data.get(column * n + row);
-                let value = self.data.get(row * n + column);
-                let tolerance = 1e-12 * value.abs().max(symmetric.abs()).max(1.0);
-                if (value - symmetric).abs() > tolerance {
-                    return Err("cholesky requires a symmetric coefficient matrix".to_string());
-                }
-                let mut reduced = value;
-                for inner in 0..column {
-                    reduced -= factor[row * n + inner] * factor[column * n + inner];
-                }
-                if row == column {
-                    if reduced.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-                        return Err(
-                            "cholesky requires a positive-definite coefficient matrix".to_string()
-                        );
+        let n = self.shape[rank - 1];
+        let values = self.data.to_f64();
+        for matrix in values.chunks_exact(n * n) {
+            for row in 0..n {
+                for column in 0..row {
+                    let (value, mirrored) = (matrix[row * n + column], matrix[column * n + row]);
+                    let tolerance = 1e-12 * value.abs().max(mirrored.abs()).max(1.0);
+                    if (value - mirrored).abs() > tolerance {
+                        return Err("cholesky requires a symmetric coefficient matrix".to_string());
                     }
-                    factor[row * n + column] = reduced.sqrt();
-                } else {
-                    factor[row * n + column] = reduced / factor[column * n + column];
                 }
             }
         }
-        Self::from_shape_data_typed(self.shape.clone(), factor, self.dtype)
+        let factor = Self::evaluated([self], |[tensor]| tensor.cholesky_tensor())?;
+        let positive = factor
+            .data
+            .to_f64()
+            .chunks_exact(n * n)
+            .all(|matrix| (0..n).all(|index| matrix[index * n + index] > 0.0));
+        if !positive {
+            return Err("cholesky requires a positive-definite coefficient matrix".to_string());
+        }
+        Ok(factor)
     }
 
+    /// A view of the same storage with another shape (the `Reshape` node's
+    /// value), keeping the dtype and weak type.
     pub fn try_reshape(&self, shape: Vec<usize>) -> Result<Self, String> {
         let expected = element_count(&shape)?;
         if expected != self.data.len() {
@@ -1389,282 +926,81 @@ impl PyTensor {
     }
 
     pub fn try_broadcast_to(&self, shape: Vec<usize>) -> Result<Self, String> {
-        if broadcast_shape(&self.shape, &shape)? != shape {
-            return Err(format!(
-                "cannot broadcast tensor shape {:?} to {:?}",
-                self.shape, shape
-            ));
-        }
-        let count = element_count(&shape)?;
-        let strides = contiguous_strides(&self.shape);
-        let mut data = Vec::with_capacity(count);
-        let mut offsets = [0];
-        for index in 0..count {
-            data.push(self.data.get(offsets[0]));
-            if index + 1 < count {
-                advance_broadcast_offsets(
-                    index + 1,
-                    &shape,
-                    [(&self.shape, &strides)],
-                    &mut offsets,
-                );
-            }
-        }
-        Self::from_shape_data_typed(shape, data, self.dtype)
+        Self::evaluated([self], |[tensor]| tensor.broadcast_to_tensor(shape))
     }
 
     pub fn try_transpose(&self, axes: Option<Vec<isize>>) -> Result<Self, String> {
-        let axes = normalize_permutation(axes, self.shape.len())?;
-        let shape = axes
-            .iter()
-            .map(|axis| self.shape[*axis])
-            .collect::<Vec<_>>();
-        let input_strides = contiguous_strides(&self.shape);
-        let mut data = vec![0.0; self.data.len()];
-
-        for (output_index, output_value) in data.iter_mut().enumerate() {
-            let mut remaining = output_index;
-            let mut input_index = 0;
-            for output_axis in (0..shape.len()).rev() {
-                let coordinate = remaining % shape[output_axis];
-                remaining /= shape[output_axis];
-                input_index += coordinate * input_strides[axes[output_axis]];
-            }
-            *output_value = self.data.get(input_index);
-        }
-
-        Self::from_shape_data_typed(shape, data, self.dtype)
-    }
-
-    fn try_reduce(&self, axis: Option<isize>, scale: f64) -> Result<Self, String> {
-        self.ensure_not_bool(if scale == 1.0 { "sum" } else { "mean" })?;
-        let Some(axis) = axis else {
-            return Self::from_shape_data_typed(
-                vec![],
-                vec![self.data.iter().sum::<f64>() * scale],
-                self.dtype,
-            );
-        };
-        let axis = normalize_axis(axis, self.shape.len())?;
-        let mut shape = self.shape.clone();
-        shape.remove(axis);
-        let mut data = vec![0.0; element_count(&shape)?];
-        let inner = element_count(&self.shape[axis + 1..])?;
-        let outer = element_count(&self.shape[..axis])?;
-        let extent = self.shape[axis];
-        // Preserve each output's source order and scale before accumulation.
-        for block in 0..outer {
-            for reduced in 0..extent {
-                let source = (block * extent + reduced) * inner;
-                let output = block * inner;
-                for offset in 0..inner {
-                    data[output + offset] += self.data.get(source + offset) * scale;
-                }
-            }
-        }
-
-        Self::from_shape_data_typed(shape, data, self.dtype)
-    }
-
-    pub fn try_sum(&self, axis: Option<isize>) -> Result<Self, String> {
-        self.try_reduce(axis, 1.0)
-    }
-
-    pub fn try_mean(&self, axis: Option<isize>) -> Result<Self, String> {
-        let scale = match axis {
-            Some(axis) => 1.0 / self.shape[normalize_axis(axis, self.shape.len())?] as f64,
-            None => 1.0 / self.data.len() as f64,
-        };
-        self.try_reduce(axis, scale)
+        Self::evaluated([self], |[tensor]| tensor.transpose_tensor(axes))
     }
 
     pub fn try_sum_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
-        self.try_reduce_axes(axes, keepdims, false)
+        self.reduction(axes, keepdims, false)
     }
 
     pub fn try_mean_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
-        self.try_reduce_axes(axes, keepdims, true)
+        self.reduction(axes, keepdims, true)
     }
 
-    // The same scaled expression as the traced `norm`, so eager and jit agree.
-    pub fn try_norm(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
-        self.ensure_not_bool("norm")?;
-        let largest = self.try_abs()?.try_max_axes(axes.clone(), true)?;
-        let usable = largest
-            .try_compare_scalar(0.0, TensorComparison::Greater)?
-            .try_logical(&largest.try_classify("isfinite", f64::is_finite)?, true)?;
-        let one = Self::from_shape_data_typed(vec![], vec![1.0], largest.dtype)?;
-        let scale = Self::try_where(&usable, &largest, &one)?;
-        let reduced = self
-            .try_div(&scale)?
-            .try_powi(2)?
-            .try_sum_axes(axes, keepdims)?
-            .try_sqrt()?;
-        reduced.try_mul(&scale.try_reshape(reduced.shape.clone())?)
-    }
-
-    /// The product over `axes` (every axis when `None`), evaluated through
-    /// the traced `prod` graph so eager and jit results round identically;
-    /// see `quabla_core::tensor_ir::TensorIr::prod_axis`.
-    pub fn try_prod_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
-        self.ensure_not_bool("prod")?;
-        let rank = self.shape.len();
-        let product_along = |tensor: &Self, axis: usize| {
-            let product = quabla_core::tensor_ir::evaluate_prod_axis(
-                &tensor.to_dynamic_tensor()?,
-                axis as isize,
-            )?;
-            let mut product = Self::from_dynamic_tensor(product)?;
-            product.weak = self.weak;
-            Ok::<_, String>(product)
-        };
-        let Some(axes) = axes else {
-            let product = product_along(&self.try_reshape(vec![self.data.len()])?, 0)?;
-            return if keepdims {
-                product.try_reshape(vec![1; rank])
-            } else {
-                Ok(product)
-            };
-        };
-        let mut axes = normalize_reduction_axes(axes, rank)?;
-        axes.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
-        let mut reduced = self.clone();
-        for axis in axes {
-            reduced = product_along(&reduced, axis)?;
-            if keepdims {
-                let mut shape = reduced.shape.clone();
-                shape.insert(axis, 1);
-                reduced = reduced.try_reshape(shape)?;
-            }
-        }
-        Ok(reduced)
-    }
-
-    pub fn try_max_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
-        self.ensure_not_bool("max")?;
-        self.try_extrema_axes(axes, keepdims, true)
-    }
-
-    pub fn try_min_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
-        self.ensure_not_bool("min")?;
-        self.try_extrema_axes(axes, keepdims, false)
-    }
-
-    fn try_reduce_axes(
+    /// `sum` or `mean` over `axes`. Every axis or one axis is a single
+    /// `Sum`/`Mean` node (plus a reshape for `keepdims`), which runs
+    /// directly; several axes reduce one at a time in the graph.
+    fn reduction(
         &self,
         axes: Option<Vec<isize>>,
         keepdims: bool,
         mean: bool,
     ) -> Result<Self, String> {
-        let Some(axes) = axes else {
-            let reduced = if mean {
-                self.try_mean(None)?
-            } else {
-                self.try_sum(None)?
-            };
-            return if keepdims {
-                reduced.try_reshape(vec![1; self.shape.len()])
-            } else {
-                Ok(reduced)
-            };
+        let rank = self.shape.len();
+        let single = match axes.as_deref() {
+            None => Some(None),
+            Some(&[axis]) => normalize_axis(axis, rank).ok().map(Some),
+            Some(_) => None,
         };
-        let mut axes = normalize_reduction_axes(axes, self.shape.len())?;
-        axes.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
-        let mut reduced = self.clone();
-        for axis in axes {
-            reduced = if mean {
-                reduced.try_mean(Some(axis as isize))?
-            } else {
-                reduced.try_sum(Some(axis as isize))?
+        if let (Some(axis), true) = (single, self.dtype.is_floating()) {
+            let kernel = match (axis, mean) {
+                (None, false) => EagerKernel::Sum,
+                (None, true) => EagerKernel::Mean,
+                (Some(axis), false) => EagerKernel::SumAxis(axis),
+                (Some(axis), true) => EagerKernel::MeanAxis(axis),
             };
-            if keepdims {
-                let mut shape = reduced.shape.clone();
-                shape.insert(axis, 1);
-                reduced = reduced.try_reshape(shape)?;
+            if let Some(output) = Self::direct(kernel, [self.operand()], self.weak) {
+                if !keepdims {
+                    return Ok(output);
+                }
+                let shape = match axis {
+                    None => vec![1; rank],
+                    Some(axis) => {
+                        let mut shape = output.shape.clone();
+                        shape.insert(axis, 1);
+                        shape
+                    }
+                };
+                return output.try_reshape(shape);
             }
         }
-        Ok(reduced)
+        Self::evaluated([self], |[tensor]| {
+            tensor.reduce_axes_tensor(axes, keepdims, mean)
+        })
     }
 
-    fn try_extrema_axes(
-        &self,
-        axes: Option<Vec<isize>>,
-        keepdims: bool,
-        maximum: bool,
-    ) -> Result<Self, String> {
-        let Some(axes) = axes else {
-            let reduced = self.try_extrema(None, maximum)?;
-            return if keepdims {
-                reduced.try_reshape(vec![1; self.shape.len()])
-            } else {
-                Ok(reduced)
-            };
-        };
-        let mut axes = normalize_reduction_axes(axes, self.shape.len())?;
-        axes.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
-        let mut reduced = self.clone();
-        for axis in axes {
-            reduced = reduced.try_extrema(Some(axis as isize), maximum)?;
-            if keepdims {
-                let mut shape = reduced.shape.clone();
-                shape.insert(axis, 1);
-                reduced = reduced.try_reshape(shape)?;
-            }
-        }
-        Ok(reduced)
+    pub fn try_norm(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        Self::evaluated([self], |[tensor]| tensor.norm_tensor(axes, keepdims))
     }
 
-    fn try_extrema(&self, axis: Option<isize>, maximum: bool) -> Result<Self, String> {
-        if self.data.is_empty() {
-            return Err("max/min reduction requires at least one tensor element".to_string());
-        }
-        let Some(axis) = axis else {
-            let value = self.data.iter().fold(self.data.get(0), |current, value| {
-                if extrema_replaces(maximum, current, value) {
-                    value
-                } else {
-                    current
-                }
-            });
-            return Self::from_shape_data_typed(vec![], vec![value], self.dtype);
-        };
-        let axis = normalize_axis(axis, self.shape.len())?;
-        if self.shape[axis] == 0 {
-            return Err("max/min reduction requires a non-empty reduced axis".to_string());
-        }
-        let mut shape = self.shape.clone();
-        shape.remove(axis);
-        let output_strides = contiguous_strides(&shape);
-        let mut data = vec![None; element_count(&shape)?];
+    pub fn try_prod_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        Self::evaluated([self], |[tensor]| tensor.prod_axes_tensor(axes, keepdims))
+    }
 
-        for (source_index, value) in self.data.iter().enumerate() {
-            let mut remaining = source_index;
-            let mut output_index = 0;
-            for source_axis in (0..self.shape.len()).rev() {
-                let coordinate = remaining % self.shape[source_axis];
-                remaining /= self.shape[source_axis];
-                if source_axis != axis {
-                    let output_axis = if source_axis < axis {
-                        source_axis
-                    } else {
-                        source_axis - 1
-                    };
-                    output_index += coordinate * output_strides[output_axis];
-                }
-            }
-            match data[output_index] {
-                Some(current) if !extrema_replaces(maximum, current, value) => {}
-                _ => data[output_index] = Some(value),
-            }
-        }
+    pub fn try_max_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        Self::evaluated([self], |[tensor]| {
+            tensor.extrema_axes_tensor(axes, keepdims, true)
+        })
+    }
 
-        Self::from_shape_data_typed(
-            shape,
-            data.into_iter()
-                .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| "max/min reduction produced an empty output".to_string())?,
-            self.dtype,
-        )
+    pub fn try_min_axes(&self, axes: Option<Vec<isize>>, keepdims: bool) -> Result<Self, String> {
+        Self::evaluated([self], |[tensor]| {
+            tensor.extrema_axes_tensor(axes, keepdims, false)
+        })
     }
 
     pub fn try_tanh(&self) -> Result<Self, String> {
@@ -1695,178 +1031,8 @@ impl PyTensor {
         self.try_unary_math(UnaryMathKind::Erfc)
     }
 
-    /// Elementwise `atan2(self, x)` with broadcasting and the dtype promotion
-    /// of the other binary ops; `bool` operands are rejected.
-    pub fn try_atan2(&self, x: &Self) -> Result<Self, String> {
-        self.ensure_not_bool("atan2")?;
-        x.ensure_not_bool("atan2")?;
-        self.try_elementwise(x, "atan2", |y, x| Ok(BinaryMathKind::Atan2.evaluate(y, x)))
-    }
-
-    /// `atan2(self, x)` for a Python number `x`, a weak scalar rounded to the
-    /// tensor dtype.
-    pub fn try_atan2_scalar(&self, x: f64) -> Result<Self, String> {
-        self.ensure_not_bool("atan2")?;
-        let x = self.dtype.round(x);
-        self.try_map(|y| BinaryMathKind::Atan2.evaluate(y, x))
-    }
-
-    /// Elementwise `kind(self)` with the `f64` function of the CPU Tensor IR
-    /// `UnaryMath` op, rounded once to the dtype.
-    pub fn try_unary_math(&self, kind: UnaryMathKind) -> Result<Self, String> {
-        self.try_unary(kind.name(), move |x| kind.evaluate(x))
-    }
-
-    /// Elementwise C `fmod(self, y)` (the sign of `self`) with broadcasting
-    /// and the dtype promotion of the other binary ops; `bool` operands are
-    /// rejected.
-    pub fn try_fmod(&self, y: &Self) -> Result<Self, String> {
-        self.ensure_not_bool("fmod")?;
-        y.ensure_not_bool("fmod")?;
-        self.try_elementwise(y, "fmod", |x, y| Ok(BinaryMathKind::Fmod.evaluate(x, y)))
-    }
-
-    /// `fmod(self, y)` for a Python number `y`, a weak scalar rounded to the
-    /// tensor dtype.
-    pub fn try_fmod_scalar(&self, y: f64) -> Result<Self, String> {
-        self.ensure_not_bool("fmod")?;
-        let y = self.dtype.round(y);
-        self.try_map(|x| BinaryMathKind::Fmod.evaluate(x, y))
-    }
-
-    fn unary_math(&self, kind: UnaryMathKind) -> PyResult<Self> {
-        self.try_unary_math(kind).map_err(PyValueError::new_err)
-    }
-
-    /// Inclusive prefix sums along `axis` (over the flattened tensor when
-    /// `None`, like NumPy), from the last entry when `reverse`. Every running
-    /// sum rounds to the dtype, as the CPU Tensor IR `cumsum` does.
-    pub fn try_cumsum(&self, axis: Option<isize>, reverse: bool) -> Result<Self, String> {
-        self.ensure_not_bool("cumsum")?;
-        let (shape, axis) = match axis {
-            Some(axis) => (self.shape.clone(), normalize_axis(axis, self.shape.len())?),
-            None => (vec![self.data.len()], 0),
-        };
-        let extent = shape[axis];
-        let inner = shape[axis + 1..].iter().product::<usize>();
-        let outer = shape[..axis].iter().product::<usize>();
-        let mut data = self.data.iter().collect::<Vec<_>>();
-        for outer_index in 0..outer {
-            for lane in 0..inner {
-                let position = |step: usize| {
-                    let row = if reverse { extent - 1 - step } else { step };
-                    (outer_index * extent + row) * inner + lane
-                };
-                let mut running = data[position(0)];
-                for step in 1..extent {
-                    running = self.dtype.round(running + data[position(step)]);
-                    data[position(step)] = running;
-                }
-            }
-        }
-        let mut output = Self::from_shape_data_typed(shape, data, self.dtype)?;
-        output.weak = self.weak;
-        Ok(output)
-    }
-
     pub fn try_sqrt(&self) -> Result<Self, String> {
-        self.try_unary("sqrt", f64::sqrt)
-    }
-
-    pub fn try_relu(&self) -> Result<Self, String> {
-        self.ensure_not_bool("relu")?;
-        self.try_maximum_scalar(0.0)
-    }
-
-    #[allow(clippy::neg_multiply)] // Multiplication preserves the old NaN quieting behavior.
-    pub fn try_abs(&self) -> Result<Self, String> {
-        self.ensure_not_bool("abs")?;
-        if self.data.iter().any(f64::is_nan) {
-            // LLVM may change NaN signs/payloads when fusing the multiply.
-            // Preserve the established kernels for exceptional inputs.
-            let mask = self.try_gt_scalar(0.0)?;
-            let negative = self.try_mul_scalar(-1.0)?;
-            return Self::try_where(&mask, self, &negative);
-        }
-        // Preserve the former where(x > 0, x, x * -1) semantics, including
-        // signed zero, NaNs, and the intermediate multiplication rounding.
-        // The final where result is strongly typed even for weak inputs.
-        Ok(Self {
-            shape: self.shape.clone(),
-            data: HostTensorStorage::from_f64(
-                self.data
-                    .iter()
-                    .map(|value| {
-                        let selected = if value > 0.0 {
-                            value
-                        } else {
-                            self.dtype.round(value * -1.0)
-                        };
-                        self.dtype.round(selected)
-                    })
-                    .collect(),
-                self.dtype,
-            ),
-            dtype: self.dtype,
-            weak: false,
-        })
-    }
-
-    /// The traced `sigmoid` expression `where(x > 0, 1 / (1 + z), z / (1 + z))`
-    /// with `z = exp(-|x|)`, rounded to the dtype after every op exactly as
-    /// per-node CPU execution does, so eager and CPU `jit` agree bitwise.
-    pub fn try_sigmoid(&self) -> Result<Self, String> {
-        let round = |value: f64| self.dtype.round(value);
-        self.try_unary("sigmoid", |value| {
-            let decay = round((-value.abs()).exp());
-            let denominator = round(decay + 1.0);
-            if value > 0.0 {
-                1.0 / denominator
-            } else {
-                decay / denominator
-            }
-        })
-    }
-
-    /// The traced `softplus` expression `maximum(x, 0) + log1p(exp(-|x|))`,
-    /// rounded to the dtype after every op like `try_sigmoid`.
-    pub fn try_softplus(&self) -> Result<Self, String> {
-        let round = |value: f64| self.dtype.round(value);
-        self.try_unary("softplus", |value| {
-            let linear = if value.is_nan() || value > 0.0 {
-                value
-            } else {
-                0.0
-            };
-            linear + round(round((-value.abs()).exp()).ln_1p())
-        })
-    }
-
-    pub fn try_triangular(&self, lower: bool) -> Result<Self, String> {
-        self.ensure_not_bool(if lower { "tril" } else { "triu" })?;
-        if self.shape.len() < 2 {
-            return Err(format!(
-                "triangular projection requires at least rank two, got {:?}",
-                self.shape
-            ));
-        }
-        let columns = self.shape[self.shape.len() - 1];
-        let rows = self.shape[self.shape.len() - 2];
-        let data = self
-            .data
-            .iter()
-            .enumerate()
-            .map(|(index, value)| {
-                let row = (index / columns) % rows;
-                let column = index % columns;
-                if (lower && row >= column) || (!lower && row <= column) {
-                    value
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-        Self::from_shape_data_typed(self.shape.clone(), data, self.dtype)
+        self.unary(EagerKernel::Sqrt, TraceTensor::sqrt_tensor)
     }
 
     pub fn try_sin(&self) -> Result<Self, String> {
@@ -1877,89 +1043,101 @@ impl PyTensor {
         self.try_unary_math(UnaryMathKind::Cos)
     }
 
-    pub fn try_powi(&self, exponent: u32) -> Result<Self, String> {
-        self.try_unary("powi", |value| value.powf(exponent as f64))
-    }
-
-    pub fn try_powf(&self, exponent: f64) -> Result<Self, String> {
-        self.try_unary("pow", |value| BinaryMathKind::Pow.evaluate(value, exponent))
-    }
-
-    /// Elementwise `self ** exponent` of two tensors with broadcasting and
-    /// the dtype promotion of the other binary ops (strict between tensors).
-    /// `bool` operands are rejected, as by the scalar-exponent form.
-    pub fn try_pow(&self, exponent: &Self) -> Result<Self, String> {
-        self.ensure_not_bool("pow")?;
-        exponent.ensure_not_bool("pow")?;
-        self.try_elementwise(exponent, "**", |base, exponent| {
-            Ok(BinaryMathKind::Pow.evaluate(base, exponent))
+    pub fn try_unary_math(&self, kind: UnaryMathKind) -> Result<Self, String> {
+        self.unary(EagerKernel::UnaryMath(kind), |tensor| {
+            tensor.unary_math_tensor(kind)
         })
     }
 
-    /// `base ** self` for a Python number `base`, which is a weak scalar
-    /// rounded to the tensor dtype like the other scalar operands.
+    fn unary_math(&self, kind: UnaryMathKind) -> PyResult<Self> {
+        self.try_unary_math(kind).map_err(PyValueError::new_err)
+    }
+
+    /// Elementwise `atan2(self, x)` with broadcasting and the promotion of
+    /// the other binary ops.
+    pub fn try_atan2(&self, x: &Self) -> Result<Self, String> {
+        let kernel = EagerKernel::BinaryMath(BinaryMathKind::Atan2);
+        self.binary_op(x, Some(kernel), TracedBinary::Arithmetic("atan2"))
+    }
+
+    /// `atan2(self, x)` for a Python number `x`, a weak scalar.
+    pub fn try_atan2_scalar(&self, x: f64) -> Result<Self, String> {
+        let kernel = EagerKernel::BinaryMath(BinaryMathKind::Atan2);
+        self.scalar_op(x, Some(kernel), false, |tensor| {
+            tensor.float_scalar_binary(x, "atan2")
+        })
+    }
+
+    /// Elementwise C `fmod(self, y)` (the sign of `self`) with broadcasting
+    /// and the promotion of the other binary ops.
+    pub fn try_fmod(&self, y: &Self) -> Result<Self, String> {
+        let kernel = EagerKernel::BinaryMath(BinaryMathKind::Fmod);
+        self.binary_op(y, Some(kernel), TracedBinary::Arithmetic("fmod"))
+    }
+
+    /// `fmod(self, y)` for a Python number `y`, a weak scalar.
+    pub fn try_fmod_scalar(&self, y: f64) -> Result<Self, String> {
+        let kernel = EagerKernel::BinaryMath(BinaryMathKind::Fmod);
+        self.scalar_op(y, Some(kernel), false, |tensor| {
+            tensor.float_scalar_binary(y, "fmod")
+        })
+    }
+
+    /// Inclusive prefix sums along `axis` (over the flattened tensor when
+    /// `None`, like NumPy), from the last entry when `reverse`.
+    pub fn try_cumsum(&self, axis: Option<isize>, reverse: bool) -> Result<Self, String> {
+        Self::evaluated([self], |[tensor]| tensor.cumsum_tensor(axis, reverse))
+    }
+
+    pub fn try_relu(&self) -> Result<Self, String> {
+        composite::relu(self)
+    }
+
+    pub fn try_abs(&self) -> Result<Self, String> {
+        composite::abs(self)
+    }
+
+    pub fn try_sigmoid(&self) -> Result<Self, String> {
+        composite::sigmoid(self)
+    }
+
+    pub fn try_softplus(&self) -> Result<Self, String> {
+        composite::softplus(self)
+    }
+
+    pub fn try_triangular(&self, lower: bool) -> Result<Self, String> {
+        Self::evaluated([self], |[tensor]| tensor.triangular_tensor(lower))
+    }
+
+    pub fn try_powi(&self, exponent: u32) -> Result<Self, String> {
+        Self::evaluated([self], |[tensor]| tensor.powi_tensor(exponent))
+    }
+
+    /// `self ** exponent` for a Python number other than a non-negative
+    /// int, through the elementwise `pow` op with a weak scalar.
+    pub fn try_powf(&self, exponent: f64) -> Result<Self, String> {
+        self.scalar_arithmetic(exponent, "pow", false)
+    }
+
+    /// Elementwise `self ** exponent` of two tensors with broadcasting and
+    /// the promotion of the other binary ops.
+    pub fn try_pow(&self, exponent: &Self) -> Result<Self, String> {
+        let kernel = EagerKernel::BinaryMath(BinaryMathKind::Pow);
+        self.binary_op(exponent, Some(kernel), TracedBinary::Arithmetic("pow"))
+    }
+
+    /// `base ** self` for a Python number `base`, a weak scalar.
     pub fn try_scalar_pow(&self, base: f64) -> Result<Self, String> {
-        self.ensure_not_bool("pow")?;
-        let base = self.dtype.round(base);
-        self.try_map(|exponent| BinaryMathKind::Pow.evaluate(base, exponent))
+        self.scalar_arithmetic(base, "pow", true)
     }
 
     pub fn try_concat(tensors: &[PyTensor], axis: usize) -> Result<Self, String> {
-        let first = tensors
-            .first()
-            .ok_or_else(|| "concat requires at least one tensor".to_string())?;
-        let (dtype, _) = Self::promotion(&tensors.iter().collect::<Vec<_>>(), "concat", true)?;
-        if tensors.iter().any(|tensor| tensor.dtype != dtype) {
-            let converted = tensors
-                .iter()
-                .map(|tensor| tensor.converted(dtype))
-                .collect::<Vec<_>>();
-            return Self::try_concat(&converted, axis);
+        if tensors.is_empty() {
+            return Err("concat requires at least one tensor".to_string());
         }
-        if axis >= first.shape.len() {
-            return Err(format!(
-                "concat axis {axis} is out of bounds for rank {}",
-                first.shape.len()
-            ));
-        }
-        let mut shape = first.shape.clone();
-        let mut axis_extent = 0usize;
-        for tensor in tensors {
-            if tensor.shape.len() != shape.len() {
-                return Err(format!(
-                    "concat requires tensors with the same rank, got {:?} and {:?}",
-                    shape, tensor.shape
-                ));
-            }
-            for (dimension, (&expected, &actual)) in shape.iter().zip(&tensor.shape).enumerate() {
-                if dimension != axis && expected != actual {
-                    return Err(format!(
-                        "cannot concatenate shapes {:?} and {:?} along axis {axis}",
-                        shape, tensor.shape
-                    ));
-                }
-            }
-            axis_extent = axis_extent
-                .checked_add(tensor.shape[axis])
-                .ok_or_else(|| "concat axis extent overflows usize".to_string())?;
-        }
-        shape[axis] = axis_extent;
-
-        let outer = first.shape[..axis].iter().product::<usize>();
-        let inner = first.shape[axis + 1..].iter().product::<usize>();
-        let mut data = Vec::with_capacity(element_count(&shape)?);
-        for outer_index in 0..outer {
-            for tensor in tensors {
-                let block = tensor.shape[axis]
-                    .checked_mul(inner)
-                    .ok_or_else(|| "concat block size overflows usize".to_string())?;
-                let start = outer_index
-                    .checked_mul(block)
-                    .ok_or_else(|| "concat offset overflows usize".to_string())?;
-                data.extend((start..start + block).map(|index| tensor.data.get(index)));
-            }
-        }
-        Self::from_shape_data_typed(shape, data, first.dtype)
+        TraceTensor::evaluate_eager_all(&tensors.iter().collect::<Vec<_>>(), |tensors| {
+            TraceTensor::try_concat(&tensors, axis)
+        })
     }
 
     pub fn try_stack(tensors: &[PyTensor], axis: isize) -> Result<Self, String> {
@@ -1969,17 +1147,9 @@ impl PyTensor {
         if tensors.iter().any(|tensor| tensor.shape != first.shape) {
             return Err("stack requires tensors with identical shapes".to_string());
         }
-        let rank = first.shape.len() + 1;
-        let axis = normalize_axis(axis, rank)?;
-        let reshaped = tensors
-            .iter()
-            .map(|tensor| {
-                let mut shape = tensor.shape.clone();
-                shape.insert(axis, 1);
-                tensor.try_reshape(shape)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::try_concat(&reshaped, axis)
+        TraceTensor::evaluate_eager_all(&tensors.iter().collect::<Vec<_>>(), |tensors| {
+            TraceTensor::try_stack(&tensors, axis)
+        })
     }
 
     pub fn try_slice(
@@ -2002,6 +1172,10 @@ impl PyTensor {
         })
     }
 
+    /// The integer and contiguous-slice indices of a `__getitem__` key: the
+    /// values the traced `Slice` and `Reshape` nodes select, copied once
+    /// after the slice layouts are composed. The weak type is kept, as by
+    /// those nodes.
     pub fn try_index(&self, indices: &[TensorIndex]) -> Result<Self, String> {
         if indices.is_empty() {
             return Ok(self.clone());
@@ -2029,34 +1203,11 @@ impl PyTensor {
                 }
             }
         }
-        output.materialize()
+        Ok(output.materialize()?.with_weak(self.weak))
     }
 
     pub fn try_gather(&self, indices: &[usize], axis: isize) -> Result<Self, String> {
-        let axis = normalize_axis(axis, self.shape.len())?;
-        if indices.is_empty() {
-            return Err("gather indices must not be empty".to_string());
-        }
-        if indices.iter().any(|index| *index >= self.shape[axis]) {
-            return Err(format!(
-                "gather index is out of bounds for axis {axis} with extent {}",
-                self.shape[axis]
-            ));
-        }
-        let mut shape = self.shape.clone();
-        shape[axis] = indices.len();
-        let mut data = Vec::with_capacity(element_count(&shape)?);
-        let outer = self.shape[..axis].iter().product::<usize>();
-        let inner = self.shape[axis + 1..].iter().product::<usize>();
-        // Each selected element along the axis owns one contiguous inner
-        // block; copying it directly avoids retaining all sliced tensors.
-        for outer_index in 0..outer {
-            for &index in indices {
-                let start = (outer_index * self.shape[axis] + index) * inner;
-                data.extend((start..start + inner).map(|index| self.data.get(index)));
-            }
-        }
-        Self::from_shape_data_typed(shape, data, self.dtype)
+        Self::evaluated([self], |[tensor]| tensor.gather_tensor(indices, axis))
     }
 
     pub fn try_scatter_add(
@@ -2065,54 +1216,75 @@ impl PyTensor {
         updates: &Self,
         axis: isize,
     ) -> Result<Self, String> {
-        if let Some((base, updates)) = self.promoted_pair(updates, "scatter_add", false)? {
-            return base.try_scatter_add(indices, &updates, axis);
-        }
-        let dtype = self.result_dtype(updates, "scatter_add")?;
-        let axis = normalize_axis(axis, self.shape.len())?;
-        if indices.is_empty() {
-            return Err("scatter indices must not be empty".to_string());
-        }
-        if indices.iter().any(|index| *index >= self.shape[axis]) {
-            return Err(format!(
-                "scatter index is out of bounds for axis {axis} with extent {}",
-                self.shape[axis]
-            ));
-        }
-        if updates.shape.len() != self.shape.len()
-            || updates.shape.iter().enumerate().any(|(dimension, extent)| {
-                if dimension == axis {
-                    *extent != indices.len()
-                } else {
-                    *extent != self.shape[dimension]
-                }
-            })
-        {
-            return Err(format!(
-                "scatter updates shape {:?} is incompatible with base shape {:?}, axis {axis}, and {} indices",
-                updates.shape,
-                self.shape,
-                indices.len()
-            ));
-        }
-        let strides = contiguous_strides(&self.shape);
-        let mut data = self.data.to_f64().into_owned();
-        for (source_index, value) in updates.data.iter().enumerate() {
-            let mut remaining = source_index;
-            let mut destination_index = 0;
-            for dimension in (0..updates.shape.len()).rev() {
-                let coordinate = remaining % updates.shape[dimension];
-                remaining /= updates.shape[dimension];
-                let coordinate = if dimension == axis {
-                    indices[coordinate]
-                } else {
-                    coordinate
-                };
-                destination_index += coordinate * strides[dimension];
-            }
-            data[destination_index] += value;
-        }
-        Self::from_shape_data_typed(self.shape.clone(), data, dtype)
+        Self::evaluated([self, updates], |[tensor, updates]| {
+            tensor.scatter_add_tensor(indices, &updates, axis)
+        })
+    }
+}
+
+/// The kernel of a `TraceTensor::binary` op that has a direct path.
+fn arithmetic_kernel(op: &str) -> Option<EagerKernel> {
+    Some(match op {
+        "add" => EagerKernel::Add,
+        "sub" => EagerKernel::Sub,
+        "mul" => EagerKernel::Mul,
+        "div" => EagerKernel::Div,
+        "greater" => EagerKernel::Greater,
+        "pow" => EagerKernel::BinaryMath(BinaryMathKind::Pow),
+        "atan2" => EagerKernel::BinaryMath(BinaryMathKind::Atan2),
+        "fmod" => EagerKernel::BinaryMath(BinaryMathKind::Fmod),
+        _ => return None,
+    })
+}
+
+/// The primitives of the composites, each evaluated at once.
+impl Primitives for PyTensor {
+    fn dtype(&self) -> Result<TensorDType, String> {
+        Ok(self.dtype)
+    }
+
+    fn binary(&self, rhs: &Self, op: &'static str) -> Result<Self, String> {
+        self.binary_op(rhs, arithmetic_kernel(op), TracedBinary::Arithmetic(op))
+    }
+
+    fn scalar_binary(&self, value: f64, op: &'static str) -> Result<Self, String> {
+        self.scalar_arithmetic(value, op, false)
+    }
+
+    fn scalar_left_binary(&self, value: f64, op: &'static str) -> Result<Self, String> {
+        self.scalar_arithmetic(value, op, true)
+    }
+
+    fn compare(&self, rhs: &Self, kind: TensorComparison) -> Result<Self, String> {
+        self.try_compare(rhs, kind)
+    }
+
+    fn compare_scalar(&self, value: f64, kind: TensorComparison) -> Result<Self, String> {
+        self.try_compare_scalar(value, kind)
+    }
+
+    fn isnan(&self) -> Result<Self, String> {
+        self.try_classify(true)
+    }
+
+    fn logical_or(&self, rhs: &Self) -> Result<Self, String> {
+        self.try_logical(rhs, false)
+    }
+
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, String> {
+        Self::try_where(self, on_true, on_false)
+    }
+
+    fn scalar(&self, value: f64) -> Result<Self, String> {
+        Ok(Self::weak_scalar(value))
+    }
+
+    fn exp(&self) -> Result<Self, String> {
+        self.try_exp()
+    }
+
+    fn log1p(&self) -> Result<Self, String> {
+        self.try_log1p()
     }
 }
 
@@ -2981,9 +2153,7 @@ impl PyTensor {
     }
 
     fn __neg__(&self) -> PyResult<Self> {
-        self.ensure_not_bool("negative")
-            .and_then(|_| self.try_mul_scalar(-1.0))
-            .map_err(PyValueError::new_err)
+        self.try_negative().map_err(PyValueError::new_err)
     }
 
     fn __pow__(
@@ -3126,13 +2296,11 @@ impl PyTensor {
     }
 
     fn isnan(&self) -> PyResult<Self> {
-        self.try_classify("isnan", f64::is_nan)
-            .map_err(PyValueError::new_err)
+        self.try_classify(true).map_err(PyValueError::new_err)
     }
 
     fn isfinite(&self) -> PyResult<Self> {
-        self.try_classify("isfinite", f64::is_finite)
-            .map_err(PyValueError::new_err)
+        self.try_classify(false).map_err(PyValueError::new_err)
     }
 
     #[pyo3(signature = (axis = None, keepdims = false))]
@@ -3418,7 +2586,7 @@ mod indexing_tests {
                 }
             }
         }
-        Ok(output)
+        Ok(output.with_weak(input.weak))
     }
 
     fn assert_same(actual: &PyTensor, expected: &PyTensor) {
@@ -3458,7 +2626,10 @@ mod indexing_tests {
                 let indices = [input.shape[axis] - 1, 0, input.shape[axis] - 1];
                 let slices = indices
                     .iter()
-                    .map(|&index| input.try_slice(axis, index, 1, 1)?.materialize())
+                    .map(|&index| {
+                        let slice = input.try_slice(axis, index, 1, 1)?.materialize()?;
+                        Ok(slice.with_weak(input.weak))
+                    })
                     .collect::<Result<Vec<_>, String>>()
                     .unwrap();
                 let expected = PyTensor::try_concat(&slices, axis).unwrap();
@@ -3524,207 +2695,6 @@ mod indexing_tests {
 }
 
 #[cfg(test)]
-mod triangular_solve_tests {
-    use super::*;
-
-    #[test]
-    fn eager_triangular_solve_preserves_projection_transpose_and_rounding() -> Result<(), String> {
-        for dtype in [TensorDType::F32, TensorDType::F64] {
-            let original = PyTensor::from_shape_data_typed(
-                vec![3, 3],
-                vec![2.0, 0.7, -0.2, 3.5, 4.0, 0.3, -0.6, 0.4, 5.0],
-                dtype,
-            )?;
-            let rhs = PyTensor::from_shape_data_typed(
-                vec![3, 2],
-                vec![0.3, -1.2, 2.1, 0.4, -0.1, 4.3],
-                dtype,
-            )?;
-            for lower in [false, true] {
-                for transpose in [false, true] {
-                    let projected = original.try_triangular(lower)?;
-                    let matrix = if transpose {
-                        projected.try_transpose(None)?
-                    } else {
-                        projected
-                    };
-                    let scratch = matrix.finite_triangular_solution(&rhs).unwrap();
-                    let actual = original.try_solve_triangular(&rhs, lower, transpose)?;
-                    let previous = matrix.solve_lu(&rhs, dtype)?;
-                    let rounded =
-                        PyTensor::from_shape_data_typed(rhs.shape.clone(), scratch, dtype)?;
-                    assert_eq!(actual.dtype, dtype);
-                    assert_eq!(
-                        actual.data.to_f64().as_ref(),
-                        rounded.data.to_f64().as_ref()
-                    );
-                    let tolerance = if dtype == TensorDType::F32 {
-                        1e-6
-                    } else {
-                        1e-12
-                    };
-                    for (actual, old) in actual.data.iter().zip(previous.data.iter()) {
-                        assert!((actual - old).abs() < tolerance * old.abs().max(1.0));
-                    }
-                    for (residual, expected) in
-                        matrix.try_matmul(&actual)?.data.iter().zip(rhs.data.iter())
-                    {
-                        assert!((residual - expected).abs() < tolerance * expected.abs().max(1.0));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn eager_triangular_solve_keeps_dtype_shape_and_singular_errors() -> Result<(), String> {
-        let matrix = PyTensor::from_shape_data_typed(
-            vec![2, 2],
-            vec![2.0, 0.0, 1.0, 3.0],
-            TensorDType::F32,
-        )?;
-        let rhs = PyTensor::from_shape_data_typed(vec![2, 1], vec![1.0, 2.0], TensorDType::F64)?;
-        assert!(matrix
-            .try_solve_triangular(&rhs, true, false)
-            .unwrap_err()
-            .contains("mismatched dtypes"));
-        let rhs = rhs.converted(TensorDType::F32);
-        let singular = PyTensor::from_shape_data_typed(
-            vec![2, 2],
-            vec![0.0, 0.0, 1.0, 3.0],
-            TensorDType::F32,
-        )?;
-        assert_eq!(
-            singular
-                .try_solve_triangular(&rhs, true, false)
-                .unwrap_err(),
-            "solve requires a non-singular coefficient matrix"
-        );
-        let vector = PyTensor::from_shape_data_typed(vec![2], vec![1.0, 2.0], TensorDType::F32)?;
-        assert!(matrix
-            .try_solve_triangular(&vector, true, false)
-            .unwrap_err()
-            .contains("same rank"));
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod abs_tests {
-    use super::*;
-
-    fn previous_abs(input: &PyTensor) -> PyTensor {
-        let mask = input.try_gt_scalar(0.0).unwrap();
-        let negative = input.try_mul_scalar(-1.0).unwrap();
-        PyTensor::try_where(&mask, input, &negative).unwrap()
-    }
-
-    #[test]
-    fn abs_preserves_ieee_bits_and_dtype_for_both_float_types() {
-        let values = vec![
-            0.0,
-            -0.0,
-            1.0,
-            -1.0,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::from_bits(0x7ff8_0000_0000_1234),
-            f64::from_bits(0xfff8_0000_0000_1234),
-            f64::from_bits(0x7ff0_0000_0000_1234),
-            f64::from_bits(0xfff0_0000_0000_1234),
-            f64::from_bits(1),
-            -f64::from_bits(1),
-            f64::from(f32::from_bits(1)),
-            -f64::from(f32::from_bits(1)),
-            1.000_000_06,
-            -1.000_000_06,
-            f64::MAX,
-            -f64::MAX,
-        ];
-        for dtype in [TensorDType::F32, TensorDType::F64] {
-            let input = PyTensor::from_shape_data_typed(vec![3, 6], values.clone(), dtype).unwrap();
-            let expected = previous_abs(&input);
-            let actual = input.try_abs().unwrap();
-            assert_eq!(actual.shape, input.shape);
-            assert_eq!(actual.dtype, dtype);
-            assert_eq!(storage_capacity(&actual.data), input.data.len());
-            assert!(!storage_ptr_eq(&actual.data, &input.data));
-            for (actual, expected) in actual.data.iter().zip(expected.data.iter()) {
-                assert_eq!(actual.to_bits(), expected.to_bits(), "dtype {dtype}");
-            }
-            assert_eq!(actual.data.get(0).to_bits(), (-0.0_f64).to_bits());
-            assert_eq!(actual.data.get(1).to_bits(), 0.0_f64.to_bits());
-        }
-    }
-
-    #[test]
-    fn abs_preserves_strong_result_of_weak_inputs_and_bool_error() {
-        let input = PyTensor::weak_scalar(-2.0);
-        let expected = previous_abs(&input);
-        let actual = input.try_abs().unwrap();
-        assert_eq!(actual.weak, expected.weak);
-        assert!(!actual.weak);
-        assert_eq!(actual.data.to_f64().as_ref(), &[2.0]);
-        assert!(input.weak);
-        assert_eq!(input.data.to_f64().as_ref(), &[-2.0]);
-
-        let input =
-            PyTensor::from_shape_data_typed(vec![2], vec![0.0, 1.0], TensorDType::Bool).unwrap();
-        assert_eq!(input.try_abs().unwrap_err(), bool_operation_error("abs"));
-    }
-}
-
-#[cfg(test)]
-mod matmul_tests {
-    use super::*;
-
-    #[test]
-    fn contiguous_batched_matmul_preserves_accumulation_and_rounding() {
-        for dtype in [TensorDType::F32, TensorDType::F64] {
-            let lhs = PyTensor::from_shape_data_typed(
-                vec![3, 5, 37],
-                (0..555)
-                    .map(|i| match i % 6 {
-                        0 => 1e16,
-                        1 => 1.0,
-                        2 => -1e16,
-                        _ => (i as f64 - 71.0) / 13.0,
-                    })
-                    .collect(),
-                dtype,
-            )
-            .unwrap();
-            let rhs = PyTensor::from_shape_data_typed(
-                vec![1, 37, 29],
-                (0..1073).map(|i| (i as f64 % 17.0 - 8.0) / 7.0).collect(),
-                dtype,
-            )
-            .unwrap();
-            let actual = lhs.try_matmul(&rhs).unwrap();
-            assert_eq!(actual.shape, [3, 5, 29]);
-            assert_eq!(actual.dtype, dtype);
-            for batch in 0..3 {
-                for row in 0..5 {
-                    for col in 0..29 {
-                        let mut expected = 0.0;
-                        for inner in 0..37 {
-                            expected += lhs.data.get(batch * 185 + row * 37 + inner)
-                                * rhs.data.get(inner * 29 + col);
-                        }
-                        assert_eq!(
-                            actual.data.get(batch * 145 + row * 29 + col).to_bits(),
-                            dtype.round(expected).to_bits(),
-                            "dtype {dtype}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
 mod adam_tests {
     use super::*;
 
@@ -3766,79 +2736,6 @@ mod adam_tests {
         assert_eq!(zipped.shape, shape);
         assert_eq!(zipped.data, broadcast.data);
         assert_eq!(zipped.dtype, TensorDType::F32);
-    }
-}
-
-#[cfg(test)]
-mod contiguous_reduction_tests {
-    use super::*;
-
-    #[test]
-    fn axis_reduction_preserves_coordinate_reference_bits() {
-        for shape in [vec![2, 3, 5], vec![1, 2, 1, 3], vec![6]] {
-            for dtype in [TensorDType::F32, TensorDType::F64] {
-                let values = (0..element_count(&shape).unwrap())
-                    .map(|i| match i % 8 {
-                        0 => 1e16,
-                        1 => 1.0,
-                        2 => -1e16,
-                        3 => -0.0,
-                        4 => f64::INFINITY,
-                        5 => f64::NEG_INFINITY,
-                        6 => f64::from_bits(0x7ff8_0000_0000_1234),
-                        _ => 0.125,
-                    })
-                    .collect();
-                let input = PyTensor::from_shape_data_typed(shape.clone(), values, dtype).unwrap();
-                for (axis, &extent) in shape.iter().enumerate() {
-                    for scale in [1.0, 1.0 / extent as f64] {
-                        let mut output_shape = shape.clone();
-                        output_shape.remove(axis);
-                        let strides = contiguous_strides(&output_shape);
-                        let mut expected = vec![0.0; element_count(&output_shape).unwrap()];
-                        for (index, value) in input.data.iter().enumerate() {
-                            let mut remaining = index;
-                            let mut output_index = 0;
-                            for source_axis in (0..shape.len()).rev() {
-                                let coordinate = remaining % shape[source_axis];
-                                remaining /= shape[source_axis];
-                                if source_axis != axis {
-                                    let output_axis = if source_axis < axis {
-                                        source_axis
-                                    } else {
-                                        source_axis - 1
-                                    };
-                                    output_index += coordinate * strides[output_axis];
-                                }
-                            }
-                            expected[output_index] += value * scale;
-                        }
-                        let actual = input.try_reduce(Some(axis as isize), scale).unwrap();
-                        assert_eq!(actual.shape, output_shape);
-                        assert_eq!(actual.dtype, dtype);
-                        for (actual, expected) in actual.data.iter().zip(expected) {
-                            assert_eq!(actual.to_bits(), dtype.round(expected).to_bits());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn scalar_broadcast_preserves_operand_order_and_shape_validation() {
-        let vector = PyTensor::from_shape_data(vec![2], vec![2.0, 4.0]).unwrap();
-        let scalar = PyTensor::from_shape_data(vec![1, 1], vec![8.0]).unwrap();
-        let left = scalar.try_sub(&vector).unwrap();
-        let right = vector.try_sub(&scalar).unwrap();
-        assert_eq!(left.shape, [1, 2]);
-        assert_eq!(left.data.to_f64().as_ref(), [6.0, 4.0]);
-        assert_eq!(right.data.to_f64().as_ref(), [-6.0, -4.0]);
-        let incompatible = PyTensor::from_shape_data(vec![3], vec![1.0; 3]).unwrap();
-        assert!(vector
-            .try_add(&incompatible)
-            .unwrap_err()
-            .contains("cannot broadcast"));
     }
 }
 
@@ -3939,292 +2836,239 @@ mod owned_output_tests {
 }
 
 #[cfg(test)]
-mod broadcast_carry_tests {
+mod delegation_tests {
     use super::*;
 
-    fn reference_zip(
-        lhs: &PyTensor,
-        rhs: &PyTensor,
-        dtype: TensorDType,
-        f: impl Fn(f64, f64) -> Result<f64, String>,
-    ) -> Result<PyTensor, String> {
-        let shape = broadcast_shape(&lhs.shape, &rhs.shape)?;
-        let lhs_strides = contiguous_strides(&lhs.shape);
-        let rhs_strides = contiguous_strides(&rhs.shape);
-        let mut data = Vec::with_capacity(element_count(&shape)?);
-        for index in 0..element_count(&shape)? {
-            let lhs_index = broadcast_offset(index, &shape, &lhs.shape, &lhs_strides);
-            let rhs_index = broadcast_offset(index, &shape, &rhs.shape, &rhs_strides);
-            let value = f(lhs.data.get(lhs_index), rhs.data.get(rhs_index))
-                .map_err(|err| format!("failed to evaluate tensor test: {err}"))?;
-            data.push(dtype.round(value));
-        }
-        Ok(PyTensor {
-            shape,
-            data: HostTensorStorage::from_f64(data, dtype),
-            dtype,
-            weak: false,
-        })
-    }
+    /// An eager op and the traced op it must equal.
+    type Pair = (
+        fn(&PyTensor) -> Result<PyTensor, String>,
+        fn(&TraceTensor) -> Result<TraceTensor, String>,
+    );
 
-    fn fixture(shape: Vec<usize>, dtype: TensorDType) -> PyTensor {
-        let count = element_count(&shape).unwrap();
-        PyTensor::from_shape_data_typed(
-            shape,
-            (0..count)
-                .map(|index| match index % 7 {
-                    0 => -0.0,
-                    1 => 0.0,
-                    2 => f64::INFINITY,
-                    3 => f64::NAN,
-                    _ => index as f64 * 0.13 - 0.7,
-                })
-                .collect(),
-            dtype,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn carried_offsets_preserve_output_bits_and_first_error() {
-        for dtype in [TensorDType::F32, TensorDType::F64] {
-            for (lhs_shape, rhs_shape) in [
-                (vec![3, 1], vec![1, 5]),
-                (vec![2, 1, 4, 1], vec![3, 1, 5]),
-                (vec![2, 1, 1, 1, 3, 1], vec![1, 4]),
-                (vec![2, 3], vec![3]),
-                (vec![2, 3], vec![4]),
-            ] {
-                let lhs = fixture(lhs_shape, dtype);
-                let rhs = fixture(rhs_shape, dtype);
-                for checked in [false, true] {
-                    let operation = |left, right| {
-                        if checked && right == 0.0 {
-                            Err("zero divisor".into())
-                        } else {
-                            Ok(left - right)
-                        }
-                    };
-                    match (
-                        lhs.zip_broadcast(&rhs, "test", dtype, operation),
-                        reference_zip(&lhs, &rhs, dtype, operation),
-                    ) {
-                        (Ok(actual), Ok(expected)) => {
-                            assert_eq!(actual.shape, expected.shape);
-                            assert_eq!(
-                                actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
-                                expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
-                            );
-                        }
-                        (Err(actual), Err(expected)) => assert_eq!(actual, expected),
-                        pair => panic!("different broadcast outcomes: {pair:?}"),
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn direct_unary_storage_preserves_dtype_bits_and_weakness() {
-        for dtype in [TensorDType::F64, TensorDType::F32, TensorDType::Bool] {
-            let source = fixture(vec![7], dtype);
-            let operation = |value: f64| -value;
-            let expected = PyTensor::from_shape_data_typed(
-                source.shape.clone(),
-                source.data.iter().map(operation).collect(),
-                dtype,
-            )
-            .unwrap();
-            let actual = source.try_map(operation).unwrap();
-            assert_eq!(actual.dtype, expected.dtype);
-            assert_eq!(actual.shape, expected.shape);
-            assert_eq!(
-                actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
-                expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
-            );
-        }
-        let scalar = PyTensor::weak_scalar(-0.0);
-        let result = scalar.try_map(|value| -value).unwrap();
-        assert!(result.weak);
-        assert_eq!(result.data.get(0).to_bits(), 0.0f64.to_bits());
-    }
-
-    #[test]
-    #[ignore = "complete native broadcast release timing probe"]
-    fn profile_broadcast_carry() {
-        use std::time::Instant;
-        for (lhs_shape, rhs_shape) in [
-            (vec![4, 1], vec![1, 4]),
-            (vec![256, 1], vec![1, 256]),
-            (vec![16, 1, 16, 1], vec![1, 16, 1, 16]),
-            (vec![4, 1, 4, 1, 4, 1, 4, 1], vec![1, 4, 1, 4, 1, 4, 1, 4]),
-        ] {
-            let rank = lhs_shape.len();
-            let elements =
-                element_count(&broadcast_shape(&lhs_shape, &rhs_shape).unwrap()).unwrap();
-            let lhs = fixture(lhs_shape, TensorDType::F32);
-            let rhs = fixture(rhs_shape, TensorDType::F32);
-            let modes = if std::env::var_os("QUABLA_BROADCAST_CARRY_FIRST").is_some() {
-                [false, true]
-            } else {
-                [true, false]
-            };
-            for reference in modes {
-                let mut times = Vec::new();
-                for _ in 0..15 {
-                    let start = Instant::now();
-                    let output = if reference {
-                        reference_zip(&lhs, &rhs, TensorDType::F32, |left, right| Ok(left - right))
-                    } else {
-                        lhs.zip_broadcast(&rhs, "test", TensorDType::F32, |left, right| {
-                            Ok(left - right)
-                        })
-                    }
-                    .unwrap();
-                    std::hint::black_box(output);
-                    times.push(start.elapsed().as_nanos());
-                }
-                times.sort();
-                println!("{{\"rank\":{rank},\"elements\":{elements},\"reference\":{reference},\"median_ns\":{}}}", times[7]);
-            }
-        }
-    }
-    fn reference_where(
-        mask: &PyTensor,
-        on_true: &PyTensor,
-        on_false: &PyTensor,
-    ) -> Result<PyTensor, String> {
-        let shape = broadcast_shape(
-            &mask.shape,
-            &broadcast_shape(&on_true.shape, &on_false.shape)?,
-        )?;
-        let strides = [
-            contiguous_strides(&mask.shape),
-            contiguous_strides(&on_true.shape),
-            contiguous_strides(&on_false.shape),
+    /// Special values: signed zeros, subnormals, infinities, NaNs of both
+    /// signs and a payload, rounding and domain edges.
+    fn values(count: usize, offset: usize) -> Vec<f64> {
+        let special = [
+            0.0,
+            -0.0,
+            1e-310,
+            -1e-30,
+            0.5,
+            -1.5,
+            2.5,
+            1e30,
+            -1e300,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::from_bits(0xfff8_0000_0000_1234),
+            0.9999999,
+            1.0,
+            -88.5,
         ];
-        let mut data = Vec::with_capacity(element_count(&shape)?);
-        for index in 0..element_count(&shape)? {
-            let m = broadcast_offset(index, &shape, &mask.shape, &strides[0]);
-            let t = broadcast_offset(index, &shape, &on_true.shape, &strides[1]);
-            let f = broadcast_offset(index, &shape, &on_false.shape, &strides[2]);
-            data.push(if mask.data.get(m) != 0.0 {
-                on_true.data.get(t)
-            } else {
-                on_false.data.get(f)
-            });
-        }
-        PyTensor::from_shape_data_typed(shape, data, on_true.dtype)
+        (0..count)
+            .map(|index| special[(index * 5 + offset) % special.len()])
+            .collect()
     }
 
-    fn reference_broadcast(input: &PyTensor, target: &[usize]) -> Result<PyTensor, String> {
-        if broadcast_shape(&input.shape, target)? != target {
-            return Err(format!(
-                "cannot broadcast tensor shape {:?} to {:?}",
-                input.shape, target
-            ));
-        }
-        let strides = contiguous_strides(&input.shape);
-        let data = (0..element_count(target)?)
-            .map(|index| {
-                input
-                    .data
-                    .get(broadcast_offset(index, target, &input.shape, &strides))
-            })
-            .collect();
-        PyTensor::from_shape_data_typed(target.to_vec(), data, input.dtype)
+    fn tensor(shape: &[usize], dtype: TensorDType, offset: usize) -> PyTensor {
+        let count = shape.iter().product();
+        PyTensor::from_shape_data_typed(shape.to_vec(), values(count, offset), dtype).unwrap()
     }
 
+    fn assert_same(actual: &PyTensor, expected: &PyTensor, context: &str) {
+        assert_eq!(actual.shape, expected.shape, "{context}");
+        assert_eq!(actual.dtype, expected.dtype, "{context}");
+        assert_eq!(actual.weak, expected.weak, "{context}");
+        let bits = |tensor: &PyTensor| tensor.data.iter().map(f64::to_bits).collect::<Vec<_>>();
+        assert_eq!(bits(actual), bits(expected), "{context}");
+    }
+
+    /// Every op with a direct path gives the value, dtype, and weak type of
+    /// its traced graph evaluated by the CPU evaluator, for strong and weak
+    /// operands of both float dtypes and for the promotion cases that the
+    /// direct path leaves to the graph.
     #[test]
-    fn selection_and_unary_broadcast_preserve_bits_dtype_and_errors() {
-        for dtype in [TensorDType::F64, TensorDType::F32, TensorDType::Bool] {
-            let mask = PyTensor::from_shape_data_typed(
-                vec![2, 1, 1, 1],
-                vec![0.0, 1.0],
-                TensorDType::Bool,
-            )
-            .unwrap();
-            let on_true = fixture(vec![1, 3, 1, 4], dtype);
-            let on_false = fixture(vec![2, 1, 5, 1], dtype);
-            let actual = PyTensor::try_where(&mask, &on_true, &on_false).unwrap();
-            let expected = reference_where(&mask, &on_true, &on_false).unwrap();
-            assert_eq!(actual.dtype, expected.dtype);
-            assert_eq!(actual.shape, expected.shape);
-            assert_eq!(
-                actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
-                expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
-            );
-            let input = fixture(vec![3, 1, 4], dtype);
-            for target in [vec![2, 3, 5, 4], vec![3, 5, 4], vec![2, 3, 5, 7]] {
-                match (
-                    input.try_broadcast_to(target.clone()),
-                    reference_broadcast(&input, &target),
-                ) {
-                    (Ok(actual), Ok(expected)) => {
-                        assert_eq!(actual.dtype, expected.dtype);
-                        assert_eq!(actual.shape, expected.shape);
-                        assert_eq!(
-                            actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
-                            expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
-                        );
+    fn direct_paths_equal_the_traced_graph() {
+        let mut operands = Vec::new();
+        for dtype in [TensorDType::F32, TensorDType::F64] {
+            operands.push((tensor(&[3, 4], dtype, 0), tensor(&[3, 4], dtype, 7)));
+            operands.push((tensor(&[3, 4], dtype, 2), tensor(&[], dtype, 11)));
+            operands.push((tensor(&[], dtype, 12), tensor(&[3, 4], dtype, 3)));
+            operands.push((tensor(&[3, 1], dtype, 1), tensor(&[1, 4], dtype, 5)));
+        }
+        // A weak `f64` (from `bool * 2.0`) meeting strong and weak operands.
+        let mask = tensor(&[3, 4], TensorDType::Bool, 4);
+        let weak = mask.try_mul_scalar(2.0).unwrap();
+        assert!(weak.weak);
+        operands.push((weak.clone(), tensor(&[3, 4], TensorDType::F32, 6)));
+        operands.push((weak.clone(), weak.clone()));
+        operands.push((weak.clone(), tensor(&[3, 4], TensorDType::F64, 9)));
+        operands.push((mask.clone(), tensor(&[3, 4], TensorDType::F32, 6)));
+        operands.push((mask.clone(), mask.clone()));
+        for (lhs, rhs) in &operands {
+            let context = format!("{:?}/{} {:?}/{}", lhs.dtype, lhs.weak, rhs.dtype, rhs.weak);
+            for op in ["add", "sub", "mul", "div", "greater"] {
+                let graph = PyTensor::evaluated([lhs, rhs], |[x, y]| x.binary(&y, op));
+                let direct = Primitives::binary(lhs, rhs, op);
+                match (direct, graph) {
+                    (Ok(direct), Ok(graph)) => {
+                        assert_same(&direct, &graph, &format!("{op} {context}"))
                     }
-                    (Err(actual), Err(expected)) => assert_eq!(actual, expected),
-                    pair => panic!("different broadcast outcomes: {pair:?}"),
+                    (Err(direct), Err(graph)) => assert_eq!(direct, graph),
+                    pair => panic!("{op} {context}: {pair:?}"),
                 }
             }
-            let mask = fixture(vec![7], TensorDType::Bool);
-            assert_eq!(
-                PyTensor::try_where(&mask, &on_true, &on_false).unwrap_err(),
-                reference_where(&mask, &on_true, &on_false).unwrap_err()
-            );
-        }
-        // A legacy NaN mask is nonzero; unselected NaNs remain unobserved.
-        let mask = fixture(vec![4, 1], TensorDType::F64);
-        let on_true = fixture(vec![1, 7], TensorDType::F64);
-        let on_false = fixture(vec![4, 1], TensorDType::F64);
-        let actual = PyTensor::try_where(&mask, &on_true, &on_false).unwrap();
-        let expected = reference_where(&mask, &on_true, &on_false).unwrap();
-        assert_eq!(
-            actual.data.iter().map(f64::to_bits).collect::<Vec<_>>(),
-            expected.data.iter().map(f64::to_bits).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    #[ignore = "complete where and unary broadcast release timing probe"]
-    fn profile_selection_carry() {
-        use std::time::Instant;
-        let mask = fixture(vec![16, 1, 1, 1], TensorDType::Bool);
-        let on_true = fixture(vec![1, 16, 16, 1], TensorDType::F32);
-        let on_false = fixture(vec![1, 1, 1, 16], TensorDType::F32);
-        let input = fixture(vec![1, 16, 1, 16], TensorDType::F32);
-        let target = vec![16; 4];
-        let modes = if std::env::var_os("QUABLA_BROADCAST_CARRY_FIRST").is_some() {
-            [false, true]
-        } else {
-            [true, false]
-        };
-        for operation in ["where", "broadcast"] {
-            for old in modes {
-                let mut times = Vec::new();
-                for _ in 0..15 {
-                    let start = Instant::now();
-                    let result = match (operation, old) {
-                        ("where", true) => reference_where(&mask, &on_true, &on_false),
-                        ("where", false) => PyTensor::try_where(&mask, &on_true, &on_false),
-                        (_, true) => reference_broadcast(&input, &target),
-                        (_, false) => input.try_broadcast_to(target.clone()),
-                    }
-                    .unwrap();
-                    std::hint::black_box(result);
-                    times.push(start.elapsed().as_nanos());
+            for kind in [TensorComparison::Less, TensorComparison::NotEqual] {
+                let graph = PyTensor::evaluated([lhs, rhs], |[x, y]| x.compare_tensor(&y, kind));
+                match (lhs.try_compare(rhs, kind), graph) {
+                    (Ok(direct), Ok(graph)) => assert_same(&direct, &graph, &context),
+                    (Err(direct), Err(graph)) => assert_eq!(direct, graph),
+                    pair => panic!("{kind:?} {context}: {pair:?}"),
                 }
-                times.sort();
-                println!(
-                    "{{\"operation\":\"{operation}\",\"reference\":{old},\"median_ns\":{}}}",
-                    times[7]
+            }
+            let graph = PyTensor::evaluated([&mask, lhs, rhs], |[m, x, y]| m.where_tensor(&x, &y));
+            match (PyTensor::try_where(&mask, lhs, rhs), graph) {
+                (Ok(direct), Ok(graph)) => assert_same(&direct, &graph, &context),
+                (Err(direct), Err(graph)) => assert_eq!(direct, graph),
+                pair => panic!("where {context}: {pair:?}"),
+            }
+            if lhs.dtype == TensorDType::F32 || lhs.dtype == TensorDType::F64 {
+                for (value, scalar_first) in [(0.1, false), (-0.0, true), (f64::NAN, false)] {
+                    for op in ["add", "sub", "mul", "div", "greater"] {
+                        let graph = PyTensor::evaluated([lhs], |[x]| {
+                            if scalar_first {
+                                x.scalar_left_binary(value, op)
+                            } else {
+                                x.scalar_binary(value, op)
+                            }
+                        })
+                        .unwrap();
+                        let direct = lhs.scalar_arithmetic(value, op, scalar_first).unwrap();
+                        assert_same(&direct, &graph, &format!("{op} {value} {context}"));
+                    }
+                    let scalar = PyTensor::weak_scalar(value);
+                    let graph = PyTensor::evaluated([&mask, lhs, &scalar], |[m, x, y]| {
+                        m.where_tensor(&x, &y)
+                    })
+                    .unwrap();
+                    let direct = PyTensor::try_where(&mask, lhs, &scalar).unwrap();
+                    assert_same(&direct, &graph, &format!("where scalar {context}"));
+                }
+            }
+        }
+        for dtype in [TensorDType::F32, TensorDType::F64] {
+            let input = tensor(&[2, 3, 4], dtype, 0);
+            let unary: [Pair; 6] = [
+                (PyTensor::try_exp, TraceTensor::exp_tensor),
+                (PyTensor::try_log1p, TraceTensor::log1p_tensor),
+                (PyTensor::try_sqrt, TraceTensor::sqrt_tensor),
+                (PyTensor::try_erfc, TraceTensor::erfc_tensor),
+                (PyTensor::try_tanh, TraceTensor::tanh_tensor),
+                (PyTensor::try_negative, TraceTensor::negative_tensor),
+            ];
+            for (direct, build) in unary {
+                let graph = PyTensor::evaluated([&input], |[x]| build(&x)).unwrap();
+                assert_same(&direct(&input).unwrap(), &graph, "unary");
+            }
+            let graph = PyTensor::evaluated([&input], |[x]| x.classify_tensor(true)).unwrap();
+            assert_same(&input.try_classify(true).unwrap(), &graph, "isnan");
+            for (axes, keepdims) in [
+                (None, false),
+                (None, true),
+                (Some(vec![1]), false),
+                (Some(vec![-1]), true),
+                (Some(vec![0, 2]), false),
+            ] {
+                for mean in [false, true] {
+                    let graph = PyTensor::evaluated([&input], |[x]| {
+                        x.reduce_axes_tensor(axes.clone(), keepdims, mean)
+                    })
+                    .unwrap();
+                    let direct = input.reduction(axes.clone(), keepdims, mean).unwrap();
+                    assert_same(&direct, &graph, &format!("{axes:?} {keepdims} {mean}"));
+                }
+            }
+            let lhs = tensor(&[4, 5], dtype, 1);
+            let rhs = tensor(&[5, 3], dtype, 2);
+            let graph = PyTensor::evaluated([&lhs, &rhs], |[x, y]| x.matmul_tensor(&y)).unwrap();
+            assert_same(&lhs.try_matmul(&rhs).unwrap(), &graph, "matmul");
+            let masks = [
+                tensor(&[3, 4], TensorDType::Bool, 0),
+                tensor(&[3, 4], TensorDType::Bool, 3),
+            ];
+            for and in [false, true] {
+                let graph =
+                    PyTensor::evaluated([&masks[0], &masks[1]], |[x, y]| x.logical_tensor(&y, and))
+                        .unwrap();
+                assert_same(
+                    &masks[0].try_logical(&masks[1], and).unwrap(),
+                    &graph,
+                    "logical",
                 );
             }
         }
+    }
+
+    /// A composite evaluated primitive by primitive equals its whole traced
+    /// graph, including the signed zeros and NaN signs that the former
+    /// hand-written eager versions changed.
+    #[test]
+    fn composites_equal_their_traced_graph() {
+        let composites: [Pair; 4] = [
+            (composite::abs, TraceTensor::abs_tensor),
+            (composite::relu, TraceTensor::relu_tensor),
+            (composite::sigmoid, TraceTensor::sigmoid_tensor),
+            (composite::softplus, TraceTensor::softplus_tensor),
+        ];
+        for dtype in [TensorDType::F32, TensorDType::F64] {
+            let input = tensor(&[4, 4], dtype, 0);
+            let other = tensor(&[4, 4], dtype, 9);
+            for (direct, build) in composites {
+                let graph = PyTensor::evaluated([&input], |[x]| build(&x)).unwrap();
+                assert_same(&direct(&input).unwrap(), &graph, "composite");
+            }
+            for value in [0.0, -0.0, 1.5, f64::NAN] {
+                let graph = PyTensor::evaluated([&input], |[x]| x.maximum_scalar(value)).unwrap();
+                assert_same(&input.try_maximum_scalar(value).unwrap(), &graph, "maximum");
+                let graph = PyTensor::evaluated([&input], |[x]| x.minimum_scalar(value)).unwrap();
+                assert_same(&input.try_minimum_scalar(value).unwrap(), &graph, "minimum");
+            }
+            let graph =
+                PyTensor::evaluated([&input, &other], |[x, y]| x.maximum_tensor(&y)).unwrap();
+            assert_same(
+                &input.try_maximum(&other).unwrap(),
+                &graph,
+                "maximum tensor",
+            );
+            let graph =
+                PyTensor::evaluated([&input, &other], |[x, y]| x.minimum_tensor(&y)).unwrap();
+            assert_same(
+                &input.try_minimum(&other).unwrap(),
+                &graph,
+                "minimum tensor",
+            );
+            let zeros = PyTensor::from_shape_data_typed(vec![2], vec![0.0, -0.0], dtype).unwrap();
+            let absolute = zeros.try_abs().unwrap();
+            assert!(absolute.data.iter().all(|value| value.to_bits() == 0));
+        }
+        let mask = tensor(&[4], TensorDType::Bool, 0);
+        assert_eq!(mask.try_abs().unwrap_err(), bool_operation_error("abs"));
+    }
+
+    #[test]
+    fn scalar_broadcast_preserves_operand_order_and_shape_validation() {
+        let vector = PyTensor::from_shape_data(vec![2], vec![2.0, 4.0]).unwrap();
+        let scalar = PyTensor::from_shape_data(vec![1, 1], vec![8.0]).unwrap();
+        let left = scalar.try_sub(&vector).unwrap();
+        let right = vector.try_sub(&scalar).unwrap();
+        assert_eq!(left.shape, [1, 2]);
+        assert_eq!(left.data.to_f64().as_ref(), [6.0, 4.0]);
+        assert_eq!(right.data.to_f64().as_ref(), [-6.0, -4.0]);
+        let incompatible = PyTensor::from_shape_data(vec![3], vec![1.0; 3]).unwrap();
+        assert!(vector
+            .try_add(&incompatible)
+            .unwrap_err()
+            .contains("cannot broadcast"));
     }
 }

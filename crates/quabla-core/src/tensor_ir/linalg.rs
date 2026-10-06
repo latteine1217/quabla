@@ -132,15 +132,6 @@ impl LinalgKind {
     }
 }
 
-/// Evaluates `kind` on a floating-point `input` for eager arrays, rounded
-/// once to the input dtype like the IR evaluator rounds a `Linalg` node.
-pub fn evaluate_eager(kind: LinalgKind, input: &DynamicTensor) -> Result<DynamicTensor, String> {
-    if !input.dtype.is_floating() {
-        return Err(format!("{} requires a floating-point tensor", kind.name()));
-    }
-    Ok(evaluate(kind, input)?.into_dtype(input.dtype))
-}
-
 /// Evaluates `kind` on every matrix of `input` in `f64`.
 pub(super) fn evaluate(kind: LinalgKind, input: &DynamicTensor) -> Result<DynamicTensor, String> {
     let shape = kind.output_shape(&input.shape)?;

@@ -11,6 +11,21 @@ deprecated names keep working until 1.0 (see
 
 ### Changed
 
+- Eager `Tensor` ops no longer carry their own numerics: each evaluates
+  the Tensor IR nodes that a trace of it records with the core's CPU
+  evaluator, so eager results, dtypes, weak types, and errors are those of
+  CPU `jit` by construction. Ops that are one IR node (arithmetic,
+  comparisons, `where`, the elementwise math functions, `sum`/`mean`,
+  `matmul`) call that node's kernel directly and are as fast as before or
+  faster (`x + y` on 100000 float32 elements: 225 us before, 37 us after).
+  Composite ops (`abs`, `relu`, `maximum`/`minimum`, `sigmoid`,
+  `softplus`, `norm`, ...) run their nodes one by one, as CPU `jit` does,
+  so they are slower than the former fused loops: on one element `relu`
+  takes about 350 ns instead of 115 ns and `sigmoid` about 740 ns instead
+  of 95 ns; on 100000 elements `relu` takes about 3.5 times and `sigmoid`
+  about 2.5 times as long. Eager Cholesky keeps its documented symmetric
+  positive-definite validation, which the traced op does not apply.
+
 - Internal: the elementwise math functions of one operand (`exp`, `log`,
   `log1p`, `expm1`, `erf`, `erfc`, `sin`, `cos`, `tanh`, and the `tan` ...
   `round` family) are one IR op, and `power`, `atan2`, and `fmod` another;
@@ -68,6 +83,32 @@ deprecated names keep working until 1.0 (see
   `cbrt`, `floor`, `ceil`, or `round` replay their iterations as CUDA
   graphs like every other elementwise body, instead of launching each
   kernel from the host; results are bit-identical.
+- Eager `Tensor` results that differed from CPU `jit` now equal it bit for
+  bit (eager values only; `jit` results are unchanged):
+  - `abs(+0.0)` is `+0.0`, not `-0.0`, and `sqrt(-0.0)` is `+0.0`, not
+    `-0.0`, in both dtypes.
+  - `sigmoid(nan)` keeps the sign of the input NaN instead of flipping it.
+  - `x ** c` for a float32 `x` and a Python float `c` (other than a
+    non-negative int) rounds `c` to float32 first, like every other weak
+    scalar operand; it used to apply the float64 `c`, which could differ
+    in the last bit (`x ** 0.1`).
+  - `x.powi(n)` and `x ** n` for a non-negative int `n` use `powi`, as the
+    traced op does, instead of `powf`; float64 results can differ in the
+    last bit for `n >= 3`.
+  - Float32 `cholesky()` rounds every step of the factorization to
+    float32, and float32 `scatter_add` rounds every accumulated update, as
+    the traced ops do; both used to compute in float64 and round once.
+  - A weak value (the result of a `bool` tensor and a Python number, such
+    as `mask * 0.5`) stays weak through `sum`, `mean`, `max`, `min`,
+    `prod`, `norm`, transposes, `broadcast_to`, `gather`, indexing,
+    `tril`/`triu`, and `abs`, so it adopts the dtype of a float32 operand
+    it meets later instead of raising a dtype-mismatch error.
+  - Error messages are those of the traced op, for example
+    `add is not defined for bool tensors` instead of
+    `+ is not defined for bool tensors`, `add operands have mismatched
+    dtypes ...` instead of `tensor + operands have mismatched dtypes ...`,
+    and `isnan requires a floating operand, got dtype bool` for a `bool`
+    tensor.
 
 ## [0.5.0] - 2026-10-06
 
