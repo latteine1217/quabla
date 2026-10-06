@@ -21,8 +21,7 @@ use super::{
 /// Matches every region node of [`TensorOp`].
 macro_rules! region_op {
     () => {
-        TensorOp::ForiJvp { .. }
-            | TensorOp::ForiVjp { .. }
+        TensorOp::ForiVjp { .. }
             | TensorOp::ForiVjpJvp { .. }
             | TensorOp::Scan { .. }
             | TensorOp::ScanVjp { .. }
@@ -69,6 +68,13 @@ pub(super) enum RegionKind {
         carry: TensorNodeId,
         loop_plan: TensorForiExecutionPlan,
     },
+    /// Tangent result of a fixed-bound `Fori`. The matching primal remains an
+    /// ordinary `Fori`, avoiding the packed slice/concat carry representation.
+    ForiJvp {
+        carry: TensorNodeId,
+        carry_tangent: TensorNodeId,
+        loop_plan: TensorForiExecutionPlan,
+    },
 }
 
 impl RegionNode {
@@ -78,6 +84,7 @@ impl RegionNode {
             RegionKind::Cond { .. } => "cond",
             RegionKind::While { .. } => "while",
             RegionKind::Fori { .. } => "fori",
+            RegionKind::ForiJvp { .. } => "fori_jvp",
         }
     }
 
@@ -87,6 +94,7 @@ impl RegionNode {
             RegionKind::Cond { .. } => "Cond",
             RegionKind::While { .. } => "While",
             RegionKind::Fori { .. } => "Fori",
+            RegionKind::ForiJvp { .. } => "Fori JVP",
         }
     }
 
@@ -96,6 +104,11 @@ impl RegionNode {
             RegionKind::Cond { predicate, .. } => vec![predicate],
             RegionKind::While { carry, .. } => vec![carry],
             RegionKind::Fori { carry, .. } => vec![carry],
+            RegionKind::ForiJvp {
+                carry,
+                carry_tangent,
+                ..
+            } => vec![carry, carry_tangent],
         }
     }
 
@@ -114,6 +127,11 @@ impl RegionNode {
             RegionKind::Cond { predicate, .. } => vec![predicate],
             RegionKind::While { carry, .. } => vec![carry],
             RegionKind::Fori { carry, .. } => vec![carry],
+            RegionKind::ForiJvp {
+                carry,
+                carry_tangent,
+                ..
+            } => vec![carry, carry_tangent],
         };
         operands.extend(self.captures.iter_mut().map(|(_, node_id)| node_id));
         operands.extend(self.tangent_captures.iter_mut().map(|(_, node_id)| node_id));
@@ -143,6 +161,7 @@ impl RegionNode {
                 vec![&loop_plan.predicate.plan, &loop_plan.body.plan]
             }
             RegionKind::Fori { loop_plan, .. } => vec![&loop_plan.body.plan],
+            RegionKind::ForiJvp { loop_plan, .. } => vec![&loop_plan.body.plan],
         }
     }
 
@@ -176,7 +195,6 @@ impl<'a> RegionView<'a> {
     /// The IR op name, as `lower_text` and error messages print it.
     pub(super) fn name(self) -> &'static str {
         match self.op {
-            TensorOp::ForiJvp { .. } => "fori_jvp",
             TensorOp::ForiVjp { .. } => "fori_vjp",
             TensorOp::ForiVjpJvp { .. } => "fori_vjp_jvp",
             TensorOp::Scan { .. } => "scan",
@@ -190,7 +208,6 @@ impl<'a> RegionView<'a> {
     /// The node kind as prose ("Fori VJP JVP"), for diagnostics.
     pub(super) fn label(self) -> &'static str {
         match self.op {
-            TensorOp::ForiJvp { .. } => "Fori JVP",
             TensorOp::ForiVjp { .. } => "Fori VJP",
             TensorOp::ForiVjpJvp { .. } => "Fori VJP JVP",
             TensorOp::Scan { .. } => "Scan",
@@ -210,7 +227,6 @@ impl<'a> RegionView<'a> {
     /// The named operands bound to the body inputs of the same name.
     pub(super) fn captures(self) -> &'a [(String, TensorNodeId)] {
         match self.op {
-            TensorOp::ForiJvp { captures, .. } => captures,
             TensorOp::ForiVjp { captures, .. } => captures,
             TensorOp::ForiVjpJvp { captures, .. } => captures,
             TensorOp::Scan { captures, .. } => captures,
@@ -225,9 +241,6 @@ impl<'a> RegionView<'a> {
     /// the others.
     pub(super) fn tangent_captures(self) -> &'a [(String, TensorNodeId)] {
         match self.op {
-            TensorOp::ForiJvp {
-                tangent_captures, ..
-            } => tangent_captures,
             TensorOp::ForiVjpJvp {
                 tangent_captures, ..
             } => tangent_captures,
@@ -243,11 +256,6 @@ impl<'a> RegionView<'a> {
     /// captures.
     pub(super) fn operands(self) -> Vec<TensorNodeId> {
         let mut operands = match *self.op {
-            TensorOp::ForiJvp {
-                carry,
-                carry_tangent,
-                ..
-            } => vec![carry, carry_tangent],
             TensorOp::ForiVjp {
                 carry,
                 output_cotangent,
@@ -315,7 +323,6 @@ impl<'a> RegionView<'a> {
     /// `Cond`, the predicate and body of a `While`, the body of a loop.
     pub(super) fn regions(self) -> Vec<&'a TensorExecutionPlan> {
         match self.op {
-            TensorOp::ForiJvp { loop_plan, .. } => vec![&loop_plan.body.plan],
             TensorOp::ForiVjp { loop_plan, .. } => vec![&loop_plan.body.plan],
             TensorOp::ForiVjpJvp { plan, .. } => vec![&plan.loop_plan.body.plan],
             TensorOp::Scan { scan_plan, .. } => vec![&scan_plan.body.plan],
@@ -345,13 +352,6 @@ impl<'a> RegionView<'a> {
 /// [`RegionView::operands`] order; `None` when it is not a region node.
 pub(super) fn region_operands_mut(op: &mut TensorOp) -> Option<Vec<&mut TensorNodeId>> {
     let (mut operands, captures, tangent_captures): (Vec<&mut TensorNodeId>, _, _) = match op {
-        TensorOp::ForiJvp {
-            carry,
-            carry_tangent,
-            captures,
-            tangent_captures,
-            ..
-        } => (vec![carry, carry_tangent], captures, Some(tangent_captures)),
         TensorOp::ForiVjp {
             carry,
             output_cotangent,

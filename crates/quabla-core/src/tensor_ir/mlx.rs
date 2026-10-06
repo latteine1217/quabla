@@ -842,13 +842,17 @@ impl MlxBackend {
                     }
                     Ok(carry)
                 }
-                TensorOp::ForiJvp {
-                    carry,
-                    carry_tangent,
-                    loop_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiJvp {
+                            carry,
+                            carry_tangent,
+                            loop_plan,
+                        },
                     captures,
                     tangent_captures,
-                } => {
+                    ..
+                }) => {
                     let captures = captures
                         .iter()
                         .map(|(name, node_id)| {

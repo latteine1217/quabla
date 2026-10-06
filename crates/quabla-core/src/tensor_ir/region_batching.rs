@@ -383,13 +383,17 @@ impl TensorIr {
                 let plan = loop_plan.with_body(body.plan)?;
                 Ok((self.fori(carry, plan, captures)?, carry_mapped))
             }
-            TensorOp::ForiJvp {
-                carry,
-                carry_tangent,
-                loop_plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ForiJvp {
+                        carry,
+                        carry_tangent,
+                        loop_plan,
+                    },
                 captures,
                 tangent_captures,
-            } => {
+                ..
+            }) => {
                 // One body evaluates both the primal and the tangent of each
                 // input, so an input is mapped when either of them is.
                 let mut inputs = mapped_names(captures);

@@ -357,7 +357,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
             },
             vec![loop_plan.body.plan.clone()],
         )),
-        TensorOp::ForiJvp { loop_plan, .. } => {
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::ForiJvp { loop_plan, .. },
+            ..
+        }) => {
             let tangents = cuda_fori_jvp_tangent_names(loop_plan);
             let body = &loop_plan.body.plan;
             let forward = body
@@ -706,12 +709,16 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 Ok(vec![(node_id, state)])
             }
             HostLoopKind::ForiJvp { names, tangents } => {
-                let TensorOp::ForiJvp {
-                    carry,
-                    carry_tangent,
+                let TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ForiJvp {
+                            carry,
+                            carry_tangent,
+                            ..
+                        },
                     tangent_captures,
                     ..
-                } = op
+                }) = op
                 else {
                     return Err(mismatch(node_id));
                 };

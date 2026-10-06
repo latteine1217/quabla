@@ -913,7 +913,10 @@ pub(super) fn cuda_fused_loop_lowering(op: &TensorOp) -> Option<Result<(), Strin
             kind: RegionKind::Fori { loop_plan, .. },
             ..
         }) => cuda_fori_body_is_lowerable(loop_plan),
-        TensorOp::ForiJvp { loop_plan, .. } => cuda_fori_jvp_is_lowerable(loop_plan),
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::ForiJvp { loop_plan, .. },
+            ..
+        }) => cuda_fori_jvp_is_lowerable(loop_plan),
         TensorOp::ForiVjp {
             loop_plan, target, ..
         } => cuda_fori_vjp_plan(loop_plan, target).map(|_| ()),
@@ -2293,13 +2296,17 @@ fn execute_cuda_device_program<T: CudaReal>(
                 )?;
                 continue;
             }
-            TensorOp::ForiJvp {
-                carry,
-                carry_tangent,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ForiJvp {
+                        carry,
+                        carry_tangent,
+                        ..
+                    },
                 captures,
                 tangent_captures,
                 ..
-            } => {
+            }) => {
                 let (before, current_and_after) = values.split_at_mut(node_id);
                 let slot = current_and_after.first_mut().ok_or_else(|| {
                     format!("CUDA Fori JVP node {node_id} is missing its buffer slot")
@@ -7862,11 +7869,7 @@ fn cuda_program_source(
                 String::new()
             }
             TensorOp::Region(RegionNode { kind: RegionKind::Fori { loop_plan, .. }, captures, .. }) => cuda_fori_node_kernel_source(node_id, loop_plan, captures)?,
-            TensorOp::ForiJvp {
-                loop_plan,
-                captures,
-                ..
-            } => cuda_fori_jvp_node_kernel_source(node_id, loop_plan, captures)?,
+            TensorOp::Region(RegionNode { kind: RegionKind::ForiJvp { loop_plan, .. }, captures, .. }) => cuda_fori_jvp_node_kernel_source(node_id, loop_plan, captures)?,
             TensorOp::ForiVjp {
                 loop_plan,
                 captures,
