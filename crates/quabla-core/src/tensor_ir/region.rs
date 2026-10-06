@@ -15,16 +15,14 @@
 
 use super::{
     TensorCondExecutionPlan, TensorExecutionPlan, TensorForiExecutionPlan, TensorForiVjpTarget,
-    TensorNodeId, TensorOp, TensorScanExecutionPlan, TensorScanTarget, TensorWhileExecutionPlan,
+    TensorNodeId, TensorOp, TensorScanExecutionPlan, TensorScanTarget, TensorScanVjpTarget,
+    TensorWhileExecutionPlan,
 };
 
 /// Matches every region node of [`TensorOp`].
 macro_rules! region_op {
     () => {
-        TensorOp::ForiVjpJvp { .. }
-            | TensorOp::ScanVjp { .. }
-            | TensorOp::ScanVjpJvp { .. }
-            | TensorOp::Region(_)
+        TensorOp::ForiVjpJvp { .. } | TensorOp::ScanVjpJvp { .. } | TensorOp::Region(_)
     };
 }
 pub(super) use region_op;
@@ -88,6 +86,15 @@ pub(super) enum RegionKind {
         target: TensorScanTarget,
         group: usize,
     },
+    /// One selected result of a shared fixed-bound `Scan` reverse pass.
+    ScanVjp {
+        carry: TensorNodeId,
+        final_carry_cotangent: TensorNodeId,
+        output_cotangent: TensorNodeId,
+        scan_plan: TensorScanExecutionPlan,
+        target: TensorScanVjpTarget,
+        group: usize,
+    },
 }
 
 impl RegionNode {
@@ -100,6 +107,7 @@ impl RegionNode {
             RegionKind::ForiJvp { .. } => "fori_jvp",
             RegionKind::ForiVjp { .. } => "fori_vjp",
             RegionKind::Scan { .. } => "scan",
+            RegionKind::ScanVjp { .. } => "scan_vjp",
         }
     }
 
@@ -112,6 +120,7 @@ impl RegionNode {
             RegionKind::ForiJvp { .. } => "Fori JVP",
             RegionKind::ForiVjp { .. } => "Fori VJP",
             RegionKind::Scan { .. } => "Scan",
+            RegionKind::ScanVjp { .. } => "Scan VJP",
         }
     }
 
@@ -132,6 +141,12 @@ impl RegionNode {
                 ..
             } => vec![carry, output_cotangent],
             RegionKind::Scan { carry, .. } => vec![carry],
+            RegionKind::ScanVjp {
+                carry,
+                final_carry_cotangent,
+                output_cotangent,
+                ..
+            } => vec![carry, final_carry_cotangent, output_cotangent],
         }
     }
 
@@ -161,6 +176,12 @@ impl RegionNode {
                 ..
             } => vec![carry, output_cotangent],
             RegionKind::Scan { carry, .. } => vec![carry],
+            RegionKind::ScanVjp {
+                carry,
+                final_carry_cotangent,
+                output_cotangent,
+                ..
+            } => vec![carry, final_carry_cotangent, output_cotangent],
         };
         operands.extend(self.captures.iter_mut().map(|(_, node_id)| node_id));
         operands.extend(self.tangent_captures.iter_mut().map(|(_, node_id)| node_id));
@@ -174,6 +195,7 @@ impl RegionNode {
         match self.kind {
             RegionKind::ForiVjp { group, .. } => Some(group),
             RegionKind::Scan { group, .. } => Some(group),
+            RegionKind::ScanVjp { group, .. } => Some(group),
             _ => None,
         }
     }
@@ -183,6 +205,7 @@ impl RegionNode {
         match &mut self.kind {
             RegionKind::ForiVjp { group, .. } => Some(group),
             RegionKind::Scan { group, .. } => Some(group),
+            RegionKind::ScanVjp { group, .. } => Some(group),
             _ => None,
         }
     }
@@ -201,6 +224,7 @@ impl RegionNode {
             RegionKind::ForiJvp { loop_plan, .. } => vec![&loop_plan.body.plan],
             RegionKind::ForiVjp { loop_plan, .. } => vec![&loop_plan.body.plan],
             RegionKind::Scan { scan_plan, .. } => vec![&scan_plan.body.plan],
+            RegionKind::ScanVjp { scan_plan, .. } => vec![&scan_plan.body.plan],
         }
     }
 
@@ -235,7 +259,6 @@ impl<'a> RegionView<'a> {
     pub(super) fn name(self) -> &'static str {
         match self.op {
             TensorOp::ForiVjpJvp { .. } => "fori_vjp_jvp",
-            TensorOp::ScanVjp { .. } => "scan_vjp",
             TensorOp::ScanVjpJvp { .. } => "scan_vjp_jvp",
             TensorOp::Region(region) => region.name(),
             _ => unreachable!("RegionView holds a region op"),
@@ -246,7 +269,6 @@ impl<'a> RegionView<'a> {
     pub(super) fn label(self) -> &'static str {
         match self.op {
             TensorOp::ForiVjpJvp { .. } => "Fori VJP JVP",
-            TensorOp::ScanVjp { .. } => "Scan VJP",
             TensorOp::ScanVjpJvp { .. } => "Scan VJP JVP",
             TensorOp::Region(region) => region.label(),
             _ => unreachable!("RegionView holds a region op"),
@@ -263,7 +285,6 @@ impl<'a> RegionView<'a> {
     pub(super) fn captures(self) -> &'a [(String, TensorNodeId)] {
         match self.op {
             TensorOp::ForiVjpJvp { captures, .. } => captures,
-            TensorOp::ScanVjp { captures, .. } => captures,
             TensorOp::ScanVjpJvp { captures, .. } => captures,
             TensorOp::Region(region) => &region.captures,
             _ => unreachable!("RegionView holds a region op"),
@@ -301,12 +322,6 @@ impl<'a> RegionView<'a> {
                 output_cotangent,
                 output_cotangent_tangent,
             ],
-            TensorOp::ScanVjp {
-                carry,
-                final_carry_cotangent,
-                output_cotangent,
-                ..
-            } => vec![carry, final_carry_cotangent, output_cotangent],
             TensorOp::ScanVjpJvp {
                 carry,
                 carry_tangent,
@@ -337,7 +352,6 @@ impl<'a> RegionView<'a> {
     pub(super) fn group(self) -> Option<usize> {
         match self.op {
             TensorOp::ForiVjpJvp { group, .. } => Some(*group),
-            TensorOp::ScanVjp { group, .. } => Some(*group),
             TensorOp::ScanVjpJvp { group, .. } => Some(*group),
             TensorOp::Region(region) => region.group(),
             _ => None,
@@ -349,7 +363,6 @@ impl<'a> RegionView<'a> {
     pub(super) fn regions(self) -> Vec<&'a TensorExecutionPlan> {
         match self.op {
             TensorOp::ForiVjpJvp { plan, .. } => vec![&plan.loop_plan.body.plan],
-            TensorOp::ScanVjp { scan_plan, .. } => vec![&scan_plan.body.plan],
             TensorOp::ScanVjpJvp { plan, .. } => vec![&plan.scan_plan.body.plan],
             TensorOp::Region(region) => region.regions(),
             _ => unreachable!("RegionView holds a region op"),
@@ -392,17 +405,6 @@ pub(super) fn region_operands_mut(op: &mut TensorOp) -> Option<Vec<&mut TensorNo
             ],
             captures,
             Some(tangent_captures),
-        ),
-        TensorOp::ScanVjp {
-            carry,
-            final_carry_cotangent,
-            output_cotangent,
-            captures,
-            ..
-        } => (
-            vec![carry, final_carry_cotangent, output_cotangent],
-            captures,
-            None,
         ),
         TensorOp::ScanVjpJvp {
             carry,
@@ -447,7 +449,6 @@ pub(super) fn region_operands_mut(op: &mut TensorOp) -> Option<Vec<&mut TensorNo
 pub(super) fn group_mut(op: &mut TensorOp) -> Option<&mut usize> {
     match op {
         TensorOp::ForiVjpJvp { group, .. }
-        | TensorOp::ScanVjp { group, .. }
         | TensorOp::ScanVjpJvp { group, .. }
         | TensorOp::Custom { group, .. } => Some(group),
         TensorOp::Region(region) => region.group_mut(),

@@ -569,15 +569,19 @@ impl TensorIr {
                     ]))
                 })
             }
-            TensorOp::ScanVjp {
-                carry,
-                final_carry_cotangent,
-                output_cotangent,
-                scan_plan,
+            TensorOp::Region(RegionNode {
+                kind:
+                    RegionKind::ScanVjp {
+                        carry,
+                        final_carry_cotangent,
+                        output_cotangent,
+                        scan_plan,
+                        target,
+                        group,
+                    },
                 captures,
-                target,
-                group,
-            } => self.batched_group_member(
+                ..
+            }) => self.batched_group_member(
                 groups,
                 ("scan_vjp", *group),
                 scan_vjp_target(target),

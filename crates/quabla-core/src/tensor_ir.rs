@@ -626,16 +626,6 @@ enum TensorOp {
         target: TensorForiVjpTarget,
         group: usize,
     },
-    /// One selected result of a shared fixed-bound `Scan` reverse pass.
-    ScanVjp {
-        carry: TensorNodeId,
-        final_carry_cotangent: TensorNodeId,
-        output_cotangent: TensorNodeId,
-        scan_plan: TensorScanExecutionPlan,
-        captures: Vec<(String, TensorNodeId)>,
-        target: TensorScanVjpTarget,
-        group: usize,
-    },
     /// One selected directional derivative of a shared fixed-bound `Scan`
     /// reverse pass. Both the final-carry and stacked-output cotangents are
     /// differentiated together, preserving the joint reverse semantics.
@@ -3312,7 +3302,10 @@ impl TensorIr {
                 kind: RegionKind::Scan { .. },
                 ..
             })
-            | TensorOp::ScanVjp { .. }
+            | TensorOp::Region(RegionNode {
+                kind: RegionKind::ScanVjp { .. },
+                ..
+            })
             | TensorOp::ScanVjpJvp { .. }
             | TensorOp::Region(RegionNode {
                 kind: RegionKind::While { .. },
@@ -3786,15 +3779,19 @@ impl TensorIr {
                         TensorScanTarget::Outputs => result.1,
                     }
                 }
-                TensorOp::ScanVjp {
-                    carry,
-                    final_carry_cotangent,
-                    output_cotangent,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ScanVjp {
+                            carry,
+                            final_carry_cotangent,
+                            output_cotangent,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => symbolic_jvp_scan_vjp(
+                    ..
+                }) => symbolic_jvp_scan_vjp(
                     &mut transformed,
                     SymbolicJvpScanVjpContext {
                         scan_plan,
@@ -4339,7 +4336,10 @@ impl TensorIr {
                         TensorScanTarget::Outputs => result.1,
                     }
                 }
-                TensorOp::ScanVjp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Scan VJP result is not implemented".to_string()
                     );
@@ -4678,7 +4678,10 @@ impl TensorIr {
                         )?;
                     }
                 }
-                TensorOp::ScanVjp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjp { .. },
+                    ..
+                }) => {
                     return Err(
                         "symbolic VJP through a Scan VJP result is not implemented".to_string()
                     );
@@ -6112,15 +6115,18 @@ impl TensorIr {
             TensorScanVjpTarget::External(name) => name,
         })?;
         Ok(self.push_node(
-            TensorOp::ScanVjp {
-                carry,
-                final_carry_cotangent,
-                output_cotangent,
-                scan_plan,
+            TensorOp::Region(RegionNode {
+                kind: RegionKind::ScanVjp {
+                    carry,
+                    final_carry_cotangent,
+                    output_cotangent,
+                    scan_plan,
+                    target,
+                    group,
+                },
                 captures,
-                target,
-                group,
-            },
+                tangent_captures: Vec::new(),
+            }),
             shape,
             dtype,
             false,
@@ -7951,7 +7957,10 @@ impl TensorIr {
                         }
                     }
                 }
-                TensorOp::ScanVjp { .. } => {
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjp { .. },
+                    ..
+                }) => {
                     return Err(
                         "direct VJP through a Scan VJP result is not implemented".to_string()
                     )
@@ -8596,9 +8605,10 @@ impl TensorIr {
                         TensorScanTarget::Outputs => cached.output_tangent.clone(),
                     }
                 }
-                TensorOp::ScanVjp { .. } => {
-                    return Err("JVP through a Scan VJP result is not implemented".to_string())
-                }
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjp { .. },
+                    ..
+                }) => return Err("JVP through a Scan VJP result is not implemented".to_string()),
                 TensorOp::ScanVjpJvp { .. } => {
                     return Err("JVP through a Scan VJP JVP result is not implemented".to_string())
                 }
@@ -9268,7 +9278,7 @@ impl TensorIr {
                     "%{id} = add(%{lhs}, %{rhs}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::ScanVjp { target, group, .. } => format!(
+                TensorOp::Region(RegionNode { kind: RegionKind::ScanVjp { target, group, .. }, .. }) => format!(
                     "%{id} = scan_vjp(group={group}, target={target:?}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
@@ -10097,15 +10107,19 @@ impl TensorIr {
                         TensorScanTarget::Outputs => cached.outputs.clone(),
                     }
                 }
-                TensorOp::ScanVjp {
-                    carry,
-                    final_carry_cotangent,
-                    output_cotangent,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ScanVjp {
+                            carry,
+                            final_carry_cotangent,
+                            output_cotangent,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_vjp_cache.contains_key(group) {
                         let external_inputs = tensor_forward_capture_values(captures, &values)?;
                         let (carry_gradient, external_gradients) = scan_plan.vjp(
@@ -10903,7 +10917,7 @@ impl TensorIr {
                     "mixed second-order differentiation through Scan regions is not implemented"
                         .to_string(),
                 ),
-                TensorOp::ScanVjp { .. } => return Err(
+                TensorOp::Region(RegionNode { kind: RegionKind::ScanVjp { .. }, .. }) => return Err(
                     "mixed second-order differentiation through Scan VJP results is not implemented"
                         .to_string(),
                 ),

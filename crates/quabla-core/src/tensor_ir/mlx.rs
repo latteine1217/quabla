@@ -1037,15 +1037,19 @@ impl MlxBackend {
                         super::TensorScanTarget::Outputs => outputs.clone(),
                     })
                 }
-                TensorOp::ScanVjp {
-                    carry,
-                    final_carry_cotangent,
-                    output_cotangent,
-                    scan_plan,
+                TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ScanVjp {
+                            carry,
+                            final_carry_cotangent,
+                            output_cotangent,
+                            scan_plan,
+                            target,
+                            group,
+                        },
                     captures,
-                    target,
-                    group,
-                } => {
+                    ..
+                }) => {
                     if !scan_vjp_cache.contains_key(group) {
                         let captures = captures
                             .iter()

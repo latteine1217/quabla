@@ -474,7 +474,10 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
             },
             vec![scan_plan.body.plan.clone()],
         )),
-        TensorOp::ScanVjp { scan_plan, .. } => {
+        TensorOp::Region(RegionNode {
+            kind: RegionKind::ScanVjp { scan_plan, .. },
+            ..
+        }) => {
             let body = &scan_plan.body.plan;
             let [carry_output, step_output] = body.output_node_ids() else {
                 return Err("scan body must return a carry and an output".to_string());
@@ -940,13 +943,17 @@ impl<T: CudaReal> CudaHostLoop<T> {
                 output_cotangent,
                 reverse,
             } => {
-                let TensorOp::ScanVjp {
-                    carry,
-                    final_carry_cotangent,
-                    output_cotangent: output_cotangents,
-                    scan_plan,
+                let TensorOp::Region(RegionNode {
+                    kind:
+                        RegionKind::ScanVjp {
+                            carry,
+                            final_carry_cotangent,
+                            output_cotangent: output_cotangents,
+                            scan_plan,
+                            ..
+                        },
                     ..
-                } = op
+                }) = op
                 else {
                     return Err(mismatch(node_id));
                 };
@@ -1191,7 +1198,11 @@ fn scan_vjp_results<T: CudaReal>(
         .iter()
         .map(|member| {
             let target = match &plan.nodes[*member].op {
-                TensorOp::ScanVjp { target, .. } | TensorOp::ScanVjpJvp { target, .. } => target,
+                TensorOp::Region(RegionNode {
+                    kind: RegionKind::ScanVjp { target, .. },
+                    ..
+                })
+                | TensorOp::ScanVjpJvp { target, .. } => target,
                 _ => return Err(mismatch(*member)),
             };
             let name = match target {
