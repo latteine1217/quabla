@@ -17,6 +17,15 @@ deprecated names keep working until 1.0 (see
   and MLX backends). Both provide the `quabla` package; install one per
   environment. Wheels cover CPython 3.10 to 3.14. Version tags publish to
   TestPyPI and then PyPI through trusted publishing.
+- MLX runs `solve` and every `quabla.linalg` function (`solve_triangular`,
+  `cho_solve`, `slogdet`, `det`, `inv`, `eigh`, `qr`, `svd`, `lstsq`) and
+  their derivatives instead of raising `UnsupportedOperationError`. MLX
+  0.32.2 has LU, `eigh`, QR, and SVD only on its CPU stream, so LAPACK
+  factors there in `float32` and the CPU backend's conventions (eigenvalue
+  order, vector signs, the sign of `R`, the Householder completion of
+  complete and full bases, NaN for non-finite matrices) are applied on the
+  GPU stream; `solve` substitutes with the LU factors in a Metal kernel and
+  raises on an exactly zero pivot like the CPU, after reading back one flag.
 
 ### Fixed
 

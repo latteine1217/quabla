@@ -32,8 +32,8 @@ No derivative forms an explicit inverse: the gradient of `logabsdet` is
 `solve(a^T, g I)` and its tangent `trace(solve(a, da))`. The derivatives of
 `slogdet`, `det`, and `inv` at an exactly singular matrix are undefined:
 `slogdet` itself returns `(0, -inf)` there, but the derivative's `solve`
-raises on the CPU (and reports the singular factor on CUDA), where JAX
-returns non-finite values. The eigenvector derivative divides by eigenvalue
+raises on the CPU and MLX (and reports the singular factor on CUDA), where
+JAX returns non-finite values. The eigenvector derivative divides by eigenvalue
 gaps, so it is infinite or NaN for a repeated eigenvalue, as in JAX; the
 eigenvalue derivative stays defined. The `qr` derivative needs a matrix of
 full column rank (for a wide `a`, its leading square block of full rank)
@@ -42,9 +42,15 @@ are exact for distinct nonzero singular values (see `svd`). The extra
 columns of `mode="complete"` and `full_matrices=True` are not unique, so
 differentiating them raises.
 
-Devices: CPU and CUDA (cuSOLVER `getrf`/`getrs`, `syevd`, `geqrf`/`orgqr`,
-and `gesvdj`, `float32`). MLX rejects `solve`, `slogdet`, `eigh`, `qr`, and
-`svd`, because MLX's factorizations only run on its CPU stream.
+Devices: CPU, CUDA (cuSOLVER `getrf`/`getrs`, `syevd`, `geqrf`/`orgqr`,
+and `gesvdj`, `float32`), and MLX, whose factorizations exist only on its CPU
+stream: LAPACK `getrf`, `syevd`, `geqrf`/`orgqr`, and `gesdd` run there in
+`float32`, the CPU's sign and completion conventions are applied on the GPU
+stream, and `solve` substitutes with the LU factors in a Metal kernel after
+reading back one flag that raises for an exactly zero pivot. Whether a pivot
+of a singular matrix is exactly zero depends on rounding, so a matrix that
+is singular only in exact arithmetic may be solved with huge values instead
+of raising, on any backend.
 """
 
 import collections

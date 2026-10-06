@@ -13,7 +13,7 @@ traced integer indexing (`sort`, `argmax`, `x[idx]`, `.at[]`) are not in it.
 | 2 | jax.numpy compositions: `flip`, `roll`, `pad`, `tile`, `repeat`, `moveaxis`, `swapaxes`, `ravel`, `diag`, `diagonal`, `trace`, `outer`, `dot`, `tensordot`, `kron`, `cross`, `diff`, `trapezoid`, `interp`, `polyval`, `logaddexp`, `hypot`, `exp2`, `isinf`, `nan_to_num`; `linalg.norm` (`ord`, `axis`), `linalg.matrix_power`, `linalg.pinv` | Planned |
 | 3 | Stiff ODEs and `saveat`: an adaptive L-stable Rosenbrock method in `odeint`, and states at requested times through each method's dense output | Planned |
 | 4 | Iterative and implicit solvers: matrix-free `linalg.cg` and `linalg.gmres`, Newton root finding, each with an implicit-function-theorem gradient instead of differentiating the iterations | Planned |
-| 5 | MLX factorizations: `solve`, `det`/`slogdet`, `inv`, `eigh`, `qr`, `svd`, `lstsq` through MLX's CPU stream instead of an error | Planned |
+| 5 | MLX factorizations: `solve`, `det`/`slogdet`, `inv`, `eigh`, `qr`, `svd`, `lstsq` through MLX's CPU stream instead of an error | Done: LAPACK factorizations on the CPU stream with the CPU's conventions applied on the GPU stream, `solve` by a Metal LU substitution kernel |
 | 6 | Device `Trainer` parity: AdamW and global-norm clipping on CUDA and MLX, `float64` on CUDA | Planned |
 | 7 | CUDA loops: lower the per-iteration cost of host-driven loops (about 80 us in v0.3) and an HVP fallback for Scan bodies that are not elementwise | Planned |
 

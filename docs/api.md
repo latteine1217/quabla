@@ -555,8 +555,8 @@ annotated yet, so checkers infer their types.
 
 `qb.jit(fun, device=None, static_argnums=(), max_traces=8)` selects CPU by
 default, or explicitly `"cuda"`, `"cuda:N"`, or `"mlx"`. A missing build
-target raises `UnsupportedOperationError`; device-loop lowering rejections
-and MLX `solve` errors carry `.op` and `.device`. Invalid device spellings
+target raises `UnsupportedOperationError`; device lowering rejections carry
+`.op` and `.device`. Invalid device spellings
 are `ValueError`. Eager array operations remain on the host. Device calls
 upload inputs and return host output pytrees; logical float64 device programs
 emit one `UserWarning` per compiled function because execution is float32.
@@ -768,13 +768,25 @@ is written with `solve`, `matmul`, and the decompositions themselves:
   of `qr` and the triangular solves.
 
 Derivatives at exactly singular matrices are undefined: the derivatives of
-`slogdet`, `det`, and `inv` call `solve`, which raises on the CPU and reports
-the singular factor on CUDA (JAX returns non-finite values). A repeated
+`slogdet`, `det`, and `inv` call `solve`, which raises on the CPU and MLX and
+reports the singular factor on CUDA (JAX returns non-finite values). A repeated
 eigenvalue makes `F` infinite, so the eigenvector derivative is inf or NaN,
-as in JAX, while the eigenvalue derivative stays defined. MLX rejects
-`solve`, `slogdet`, `det`, `inv`, `eigh`, `qr`, `svd`, and `lstsq` with
-`UnsupportedOperationError`, because MLX's factorizations only run on its
-CPU stream.
+as in JAX, while the eigenvalue derivative stays defined.
+
+On MLX, whose LU, `eigh`, QR, and SVD factorizations exist only on its CPU
+stream, each factorization runs there with LAPACK (`getrf`, `syevd`,
+`geqrf`/`orgqr`, `gesdd`) in float32, and the CPU backend's conventions
+(ascending eigenvalues, signed vectors, a non-negative diagonal of `R`, the
+Householder completion of a complete `Q` or full SVD basis, NaN for a
+non-finite matrix) are applied on the GPU stream; the two streams share
+unified memory, so nothing is copied between them. `solve` (and so `inv`,
+`solve_triangular`, `cho_solve`, `lstsq`, and every derivative that solves)
+substitutes with the LU factors in a Metal kernel and reads one flag back
+to raise on an exactly zero pivot like the CPU. Exact zero pivots depend on
+rounding: a matrix that is singular only in exact arithmetic, such as one
+with linearly dependent rows, can leave a pivot of rounding size, and is
+then solved with huge values instead of raising; LAPACK's float32 rounding
+can do so where the CPU's float64 elimination finds an exact zero.
 
 `qb.ode.odeint(f, y0, (t0, t1), steps=n, method="rk4", args=(), save=False)`
 integrates `dy/dt = f(y, t, *args)` with `n` equal steps of classical RK4,
@@ -1450,10 +1462,9 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
   results and loop-region inputs must be floating, not `bool`.
 - Derivatives beyond forward-over-reverse of `fori`/`scan` regions are
   explicit errors. Vmapped `cond` predicates are rejected at trace time.
-- MLX rejects `solve` (and `solve_triangular`, which composes it),
-  `slogdet`/`det`/`inv`, and `eigh`, and
-  `vmap` HVP has no MLX lowering. Triangular-solve kernels are not
-  implemented on devices.
+- MLX runs its factorizations on the CPU stream (see `quabla.linalg`), and
+  `vmap` HVP has no MLX lowering. Triangular solves use the general LU
+  `solve` on devices.
 - Third or higher Cholesky derivatives use a scalar expansion whose graph
   grows as O(n^3) and is impractical beyond small matrices; first and second
   orders use the native kernels in `float32` and `float64`.

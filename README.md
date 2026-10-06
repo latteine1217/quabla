@@ -112,7 +112,7 @@ records are in [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md).
 | CPU | macOS, Linux | default | `f64` reference; each `float32` op is the `f64` result rounded to `f32` | Runtime and symbolic JVP/VJP, dense Jacobian and Hessian, HVP, `vmap` JVP/VJP/HVP | `cond`, `fori`, `scan` regions with JVP, VJP, and forward-over-reverse HVP | Interprets frozen plans (no machine-code JIT) |
 | CUDA | Linux, NVIDIA driver | `cuda` | `f32`; `f64` with `precision="float64"` | Symbolic JVP/VJP plans, multi-output value-and-gradient, `vmap` JVP/VJP/HVP, device SGD/Adam | `cond` via one host predicate readback; `fori`/`scan` as fused kernels for pure-elementwise bodies and as host-driven region loops otherwise; `while_loop` with one predicate readback per iteration | Host-driven loops cost a launch sequence per iteration; requires `libnvrtc` at runtime (cuBLAS optional, cuSOLVER for `solve` and the decompositions) |
 | CUDA + NCCL | Linux, two or more GPUs on one node | `cuda-nccl` | `f32` | Scalar value-and-gradient with all-reduced replicated parameter gradients | As CUDA | Single node; equal axis-zero batch shards; mapped-input gradients rejected; optimizer update on the host; requires a loadable `libnccl.so` |
-| MLX | macOS, Apple silicon | `mlx` | `f32` | Symbolic JVP/VJP, multi-output value-and-gradient, `vmap` JVP/VJP, device Adam | `cond` via one host predicate readback; `fori`/`scan` dispatched from the host on device-resident arrays, with first-order VJP and forward-over-reverse HVP | `solve`, `slogdet`, `eigh`, `qr`, `svd`, and `lstsq` rejected (MLX 0.32.2 factorizations are CPU-stream only); `vmap` HVP not lowered; no fused Metal loop kernels |
+| MLX | macOS, Apple silicon | `mlx` | `f32` | Symbolic JVP/VJP, multi-output value-and-gradient, `vmap` JVP/VJP, device Adam | `cond` via one host predicate readback; `fori`/`scan` dispatched from the host on device-resident arrays, with first-order VJP and forward-over-reverse HVP | LU, `eigh`, QR, and SVD factorizations run with LAPACK on MLX's CPU stream (MLX 0.32.2 has no GPU kernels for them), and `solve` reads one pivot flag back; `vmap` HVP not lowered; no fused Metal loop kernels |
 
 Staged Cholesky uses a native operation on CPU, CUDA, and Metal. `float32`
 and `float64` JVP, VJP, and second derivatives use bounded IR and O(n²)
@@ -320,8 +320,8 @@ and its gradients in one device plan, and `mlx_adam_loss_optimizer` and
 - Indexing takes static Python integers; dynamic index tensors and
   boolean-mask indexing are unsupported.
 - CUDA runs loop bodies that are not purely elementwise as host-driven loops,
-  about 80 µs per iteration on a GTX 1660 SUPER. MLX rejects `solve` and the
-  decompositions and has no `vmap` HVP lowering. Third and higher Cholesky
+  about 80 µs per iteration on a GTX 1660 SUPER. MLX factors matrices on its
+  CPU stream and has no `vmap` HVP lowering. Third and higher Cholesky
   derivatives use a scalar expansion that is slow beyond small matrices.
 - Data parallelism is single-node CUDA + NCCL only.
 - `quabla.vmap` cannot batch `cond`/`fori`/`scan`/`while` regions over a

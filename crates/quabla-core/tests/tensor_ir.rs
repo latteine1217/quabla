@@ -32,15 +32,17 @@ macro_rules! must {
 }
 
 #[test]
-fn mlx_lowering_validation_rejects_solve_and_checks_inactive_regions_without_execution() {
+fn mlx_lowering_validation_rejects_non_finite_constants_in_inactive_regions_without_execution() {
     let mut branch = TensorIr::new();
     let a = must!(branch.input("a", vec![1, 1]));
     let b = must!(branch.input("b", vec![1, 1]));
-    let solved = must!(branch.solve(a, b));
-    let bad = must!(branch.compile_cpu(solved));
+    let infinity = branch.scalar_constant(f64::INFINITY);
+    let shifted = must!(branch.add(a, infinity));
+    let scaled = must!(branch.mul(shifted, b));
+    let bad = must!(branch.compile_cpu(scaled));
     assert_eq!(
         bad.validate_mlx().map_err(|(op, _)| op),
-        Err("solve".into())
+        Err("constant".into())
     );
     let mut good = TensorIr::new();
     let a = must!(good.input("a", vec![1, 1]));
@@ -60,7 +62,7 @@ fn mlx_lowering_validation_rejects_solve_and_checks_inactive_regions_without_exe
     let plan = must!(graph.compile_cpu(output));
     assert_eq!(
         plan.validate_mlx().map_err(|(op, _)| op),
-        Err("solve".into())
+        Err("constant".into())
     );
     // The unsupported region remains valid on CPU and the chosen branch is lazy.
     let inputs = BTreeMap::from([
@@ -6603,7 +6605,10 @@ fn mlx_backend_serializes_concurrent_execution_across_threads() {
 
 #[cfg(all(feature = "mlx", target_os = "macos"))]
 #[test]
-fn mlx_backend_rejects_solve_until_a_gpu_implementation_exists() {
+fn mlx_backend_solves_through_the_cpu_stream_lu() {
+    if std::env::var_os("QUABLA_MLX_TEST").is_none() {
+        return;
+    }
     let mut graph = TensorIr::new();
     let matrix = must!(graph.input("matrix", vec![2, 2]));
     let rhs = must!(graph.input("rhs", vec![2, 1]));
@@ -6619,10 +6624,8 @@ fn mlx_backend_rejects_solve_until_a_gpu_implementation_exists() {
         ),
     ]);
     let plan = must!(graph.compile_cpu(output));
-    let error = MlxBackend
-        .execute(&plan, &inputs)
-        .expect_err("MLX solve must not fall back to CPU");
-    assert!(error.contains("does not yet support solve"));
+    let solution = must!(MlxBackend.execute(&plan, &inputs));
+    assert_eq!(solution.data().as_ref(), &[2.0, 3.0]);
 }
 
 #[test]

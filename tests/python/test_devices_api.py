@@ -121,14 +121,13 @@ def test_device_jit_matches_cpu_for_nested_transforms_and_pytrees():
         # The warning names the caller's line, not quabla's cache layers.
         assert seen[0].filename == __file__, seen[0].filename
         if device == "mlx":
-            unsupported = qb.jit(lambda a, b: qb.solve(a, b), device="mlx")
+            unsupported = qb.jit(lambda a: a + float("inf"), device="mlx")
             error = raises(
                 qb.UnsupportedOperationError,
                 unsupported,
                 qb.array([[2.0]], dtype=qb.float32),
-                qb.array([[1.0]], dtype=qb.float32),
             )
-            assert (error.op, error.device) == ("solve", "mlx")
+            assert (error.op, error.device) == ("constant", "mlx")
     if not ran:
         print("SKIP device jit runtime: GPU gates unset")
 
