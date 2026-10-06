@@ -1,18 +1,11 @@
 """Device jit, ahead-of-time signatures and migration compatibility."""
 
 import math
-import os
 import warnings
 
 import quabla as qb
 
-
-def raises(kind, function, *args, **kwargs):
-    try:
-        function(*args, **kwargs)
-    except kind as error:
-        return error
-    raise AssertionError(f"expected {kind.__name__}")
+from _support import devices, raises, require, run
 
 
 def close(a, b, tolerance=1e-5):
@@ -82,12 +75,7 @@ def test_deprecated_names_warn_once_and_preserve_objects():
 
 
 def test_device_jit_matches_cpu_for_nested_transforms_and_pytrees():
-    ran = False
-    for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(gate) != "1":
-            continue
-        assert device in qb.devices(), f"{gate} requested but target not built"
-        ran = True
+    for device in devices():
 
         def loss(params, x):
             y = qb.tanh(x * params["w"] + params["b"])
@@ -128,17 +116,10 @@ def test_device_jit_matches_cpu_for_nested_transforms_and_pytrees():
                 qb.array([[2.0]], dtype=qb.float32),
             )
             assert (error.op, error.device) == ("constant", "mlx")
-    if not ran:
-        print("SKIP device jit runtime: GPU gates unset")
 
 
 def test_device_stable_activations_and_nan_propagation_match_cpu():
-    ran = False
-    for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(gate) != "1":
-            continue
-        assert device in qb.devices(), f"{gate} requested but target not built"
-        ran = True
+    for device in devices():
         # Normal float32 range only: GPUs may flush subnormal results to zero.
         x = qb.array([-30.0, -5.0, -1.0, 0.0, 0.5, 3.0, 25.0], dtype=qb.float32)
         y = qb.array([-2.0, -5.0, 0.0, 0.0, 1.0, 2.0, 30.0], dtype=qb.float32)
@@ -176,8 +157,6 @@ def test_device_stable_activations_and_nan_propagation_match_cpu():
         ]:
             result = qb.jit(function, device=device)(nan).to_flat_list()
             assert any(math.isnan(value) for value in result), (device, result)
-    if not ran:
-        print("SKIP device activation parity: GPU gates unset")
 
 
 
@@ -220,12 +199,7 @@ def test_device_max_min_match_cpu_in_loops_vmap_trainer_and_float64():
         carry = qb.fori_loop(0, 4, lambda i, c: qb.sin(c) + c.max(axis=0), v)
         return carry.sum() + qb.scan(lambda c, i: (c * 0.9, c.max()), v, length=3)[1].sum()
 
-    ran = False
-    for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(gate) != "1":
-            continue
-        assert device in qb.devices(), f"{gate} requested but target not built"
-        ran = True
+    for device in devices():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             settings = [(qb.float32, {})]
@@ -291,17 +265,10 @@ def test_device_max_min_match_cpu_in_loops_vmap_trainer_and_float64():
         for name in params:
             for got, want in zip(actual.params[name].tolist(), expected.params[name].tolist()):
                 assert math.isclose(got, want, rel_tol=1e-5), (device, name, got, want)
-    if not ran:
-        print("SKIP device max/min parity: GPU gates unset")
 
 
 def test_device_compositions_and_shape_helpers_match_cpu():
-    ran = False
-    for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(gate) != "1":
-            continue
-        assert device in qb.devices(), f"{gate} requested but target not built"
-        ran = True
+    for device in devices():
         x = qb.array(
             [[1000.0, 0.0, -3.0, 2.5], [-0.5, 1.25, 30.0, -30.0], [0.0, 0.0, 0.0, 0.0]],
             dtype=qb.float32,
@@ -354,8 +321,6 @@ def test_device_compositions_and_shape_helpers_match_cpu():
         bounds = qb.array([[-math.inf, -math.inf], [math.inf, 0.0]], dtype=qb.float32)
         totals = qb.jit(lambda t: qb.logsumexp(t, axis=1), device=device)(bounds)
         assert totals.tolist() == [-math.inf, math.inf], (device, totals.tolist())
-    if not ran:
-        print("SKIP device compositions: GPU gates unset")
 
 
 def close_relative(a, b, tolerance):
@@ -365,12 +330,7 @@ def close_relative(a, b, tolerance):
 
 
 def test_device_expm1_erf_erfc_atan2_stop_gradient_cumsum_and_prod_match_cpu():
-    ran = False
-    for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(gate) != "1":
-            continue
-        assert device in qb.devices(), f"{gate} requested but target not built"
-        ran = True
+    for device in devices():
         x = qb.array([-6.0, -1.0, -1e-4, 0.0, 0.3, 1.7, 4.0], dtype=qb.float32)
         y = qb.array([2.0, -0.5, 0.0, 0.0, -3.0, 0.25, 1e-3], dtype=qb.float32)
         functions = {
@@ -425,8 +385,6 @@ def test_device_expm1_erf_erfc_atan2_stop_gradient_cumsum_and_prod_match_cpu():
                 close_relative(value, expected, 1e-5)
         batched = qb.jit(qb.vmap(lambda t: qb.cumsum(t, reverse=True)), device=device)(long)
         close_relative(batched, qb.jit(qb.vmap(lambda t: qb.cumsum(t, reverse=True)))(long), 1e-5)
-    if not ran:
-        print("SKIP device new-op parity: GPU gates unset")
 
 
 def same_or_close(actual, expected, tolerance):
@@ -468,12 +426,7 @@ DEVICE_UNARY_MATH_POINTS = {
 
 
 def test_device_unary_math_fmod_and_mod_match_cpu():
-    ran = False
-    for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(gate) != "1":
-            continue
-        assert device in qb.devices(), f"{gate} requested but target not built"
-        ran = True
+    for device in devices():
         for name, points in DEVICE_UNARY_MATH_POINTS.items():
             function = getattr(qb, name)
             x = qb.array(points, dtype=qb.float32)
@@ -554,8 +507,6 @@ def test_device_unary_math_fmod_and_mod_match_cpu():
                 qb.jit(gradient)(finite_x, finite_y),
             ):
                 same_or_close(got, want, 4e-6)
-    if not ran:
-        print("SKIP device unary math parity: GPU gates unset")
 
 
 def test_jit_precision_argument():
@@ -583,10 +534,7 @@ def close_normwise(actual, expected, tolerance):
 
 
 def test_cuda_float64_precision_matches_cpu():
-    if os.environ.get("QUABLA_CUDA_TEST") != "1":
-        print("SKIP CUDA float64 precision: QUABLA_CUDA_TEST unset")
-        return
-    assert "cuda" in qb.devices(), "QUABLA_CUDA_TEST requested but target not built"
+    require("cuda")
 
     def series(count, scale=1.0, shift=0.0):
         return [scale * math.sin(1.37 * i + 0.4) + shift for i in range(count)]
@@ -746,7 +694,4 @@ def test_cuda_float64_precision_matches_cpu():
 
 
 if __name__ == "__main__":
-    for name, test in list(globals().items()):
-        if name.startswith("test_"):
-            test()
-            print(f"PASS {name}")
+    run(globals())

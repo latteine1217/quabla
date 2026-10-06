@@ -1,21 +1,14 @@
 """ODE integrators: convergence order, adaptive accuracy, derivatives, and devices."""
 
 import math
-import os
 
 import quabla as qb
+
+from _support import devices, raises, run
 
 
 def decay(y, t, k):
     return -k * y
-
-
-def raises(kind, function, *args, **kwargs):
-    try:
-        function(*args, **kwargs)
-    except kind:
-        return
-    raise AssertionError(f"expected {kind.__name__}")
 
 
 def test_methods_converge_at_their_order():
@@ -92,9 +85,7 @@ def test_invalid_arguments():
 
 def test_optional_device_parity():
     y0, k = qb.array([1.0, 2.0], dtype=qb.float32), qb.array(0.7, dtype=qb.float32)
-    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(flag) != "1":
-            continue
+    for device in devices():
 
         def solve(rate):
             return qb.ode.odeint(decay, y0, (0.0, 2.0), steps=40, args=(rate,))
@@ -299,9 +290,7 @@ def test_optional_device_dopri5_parity():
         return (y * y).sum()
 
     mu = qb.array(1.0, dtype=qb.float32)
-    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(flag) != "1":
-            continue
+    for device in devices():
         # The body slices and concatenates its packed carry and takes norms,
         # so CUDA runs it as a host-driven loop over the body's device program.
         for operation in (loss, qb.value_and_grad(loss)):
@@ -687,9 +676,7 @@ def test_optional_device_rosenbrock23_and_saveat_parity():
         return loss
 
     explicit = [saved("rk4", {"steps": 40}), saved("dopri5", {"rtol": 1e-4, "atol": 1e-6, "max_steps": 96})]
-    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(flag) != "1":
-            continue
+    for device in devices():
         losses = explicit + [stiff, saved("rosenbrock23", {"rtol": 1e-4, "atol": 1e-6, "max_steps": 64})]
         for loss in losses:
             for operation in (loss, qb.value_and_grad(loss)):
@@ -783,16 +770,9 @@ def test_vmap_of_odeint_gradients_matches_per_example_gradients():
 
 
 def test_optional_device_vmap_of_odeint_parity():
-    devices = [
-        (device, precision)
-        for device, flag, precisions in (
-            ("mlx", "QUABLA_MLX_TEST", (None,)),
-            ("cuda", "QUABLA_CUDA_TEST", (None, "float64")),
-        )
-        if os.environ.get(flag) == "1"
-        for precision in precisions
-    ]
-    for device, precision in devices:
+    precisions = {"mlx": (None,), "cuda": (None, "float64")}
+    runs = [(device, precision) for device in devices(*precisions) for precision in precisions[device]]
+    for device, precision in runs:
         dtype = qb.float64 if precision == "float64" else qb.float32
         tolerance = 1e-10 if precision == "float64" else 1e-4
         y0, k = batched_problem(dtype)
@@ -812,7 +792,4 @@ def test_optional_device_vmap_of_odeint_parity():
 
 
 if __name__ == "__main__":
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
-            print(f"PASS {name}")
+    run(globals())

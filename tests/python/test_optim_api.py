@@ -3,19 +3,12 @@
 import collections
 import dataclasses
 import math
-import os
 from unittest.mock import patch
 
 import quabla as qb
 from quabla.optim import Adam, SGD, Trainer
 
-
-def raises(kind, fun, *args, **kwargs):
-    try:
-        fun(*args, **kwargs)
-    except kind:
-        return
-    raise AssertionError(f"expected {kind.__name__}")
+from _support import devices, enabled, raises, require, run
 
 
 def scalar(value):
@@ -197,8 +190,8 @@ def test_optimizers_and_trainer_keep_custom_node_parameters():
     assert type(final) is Pair and type(final.first) is Affine
     assert abs(scalar(final.first.weight) - 2) < 0.01
     assert abs(scalar(final.first.bias) + scalar(final.second) - 1) < 0.01
-    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda:0", "QUABLA_CUDA_TEST")):
-        if os.environ.get(flag) != "1":
+    for device in ("mlx", "cuda:0"):
+        if not enabled(device):
             continue
         on_device = Trainer(affine_loss, params, Adam(0.05), x, target, device=device)
         for _ in range(300):
@@ -397,19 +390,19 @@ def test_device_factory_retains_only_fixed_data_and_reuses_native_step():
 def test_mlx_trainer_convergence():
     from quabla.optim import AdamW
 
-    if os.environ.get("QUABLA_MLX_TEST") == "1":
-        train("mlx", Adam(0.05))
-        train("mlx", AdamW(0.05, weight_decay=1e-5, clip_norm=1.0))
-        train("mlx", SGD(0.05, clip_norm=5.0))
+    require("mlx")
+    train("mlx", Adam(0.05))
+    train("mlx", AdamW(0.05, weight_decay=1e-5, clip_norm=1.0))
+    train("mlx", SGD(0.05, clip_norm=5.0))
 
 
 def test_cuda_trainer_convergence():
     from quabla.optim import AdamW
 
-    if os.environ.get("QUABLA_CUDA_TEST") == "1":
-        train("cuda:0", Adam(0.05))
-        train("cuda:0", AdamW(0.05, weight_decay=1e-5, clip_norm=1.0))
-        train("cuda:0", SGD(0.05, clip_norm=5.0))
+    require("cuda")
+    train("cuda:0", Adam(0.05))
+    train("cuda:0", AdamW(0.05, weight_decay=1e-5, clip_norm=1.0))
+    train("cuda:0", SGD(0.05, clip_norm=5.0))
 
 
 def test_device_trainer_keeps_parameters_the_loss_ignores():
@@ -429,9 +422,7 @@ def test_device_trainer_keeps_parameters_the_loss_ignores():
         "b2": qb.array(0.2, dtype=qb.float32),
     }
     xs = qb.array([0.1, 0.4, 0.9], dtype=qb.float32)
-    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda:0", "QUABLA_CUDA_TEST")):
-        if os.environ.get(flag) != "1":
-            continue
+    for device in devices("mlx", "cuda:0"):
         expected = Trainer(loss, params, Adam(0.01), xs)
         actual = Trainer(loss, params, Adam(0.01), xs, device=device)
         for _ in range(2):
@@ -723,8 +714,7 @@ def test_device_trainer_sets_scheduled_rates():
 
 
 def test_mlx_trainer_schedule_matches_cpu():
-    if os.environ.get("QUABLA_MLX_TEST") != "1":
-        return
+    require("mlx")
     from quabla.optim import warmup_cosine_decay
 
     schedule = warmup_cosine_decay(0.0, 0.05, 3, 12, end_value=0.005)
@@ -747,8 +737,7 @@ def test_mlx_trainer_schedule_matches_cpu():
 
 
 def test_cuda_trainer_schedule():
-    if os.environ.get("QUABLA_CUDA_TEST") != "1":
-        return
+    require("cuda")
     from quabla.optim import warmup_cosine_decay
 
     schedule = warmup_cosine_decay(0.0, 0.05, 3, 12, end_value=0.005)
@@ -766,14 +755,6 @@ def test_cuda_trainer_schedule():
         assert math.isclose(scalar(got), scalar(want), rel_tol=1e-5), (got, want)
     raises(ValueError, setattr, cuda._executor, "learning_rate", math.nan)
     train("cuda:0", Adam(warmup_cosine_decay(0.0, 0.08, 20, 400, end_value=0.01)))
-
-
-def enabled_devices():
-    return [
-        device
-        for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda:0", "QUABLA_CUDA_TEST"))
-        if os.environ.get(flag) == "1"
-    ]
 
 
 def pinn_model(params, x):
@@ -881,13 +862,12 @@ def run_pinn_parity(device, dtype, rel, absolute, **options):
 def test_device_trainer_matches_cpu_for_every_optimizer():
     # float32 device plans agree with the float64-accumulating CPU trainer to
     # float32 rounding; the trajectories differ by a few ulps per step.
-    for device in enabled_devices():
+    for device in devices("mlx", "cuda:0"):
         run_pinn_parity(device, qb.float32, rel=1e-6, absolute=1e-6)
 
 
 def test_cuda_trainer_float64_precision():
-    if os.environ.get("QUABLA_CUDA_TEST") != "1":
-        return
+    require("cuda")
     # Native double agrees with the CPU to double rounding, far below float32.
     run_pinn_parity("cuda:0", qb.float64, rel=1e-12, absolute=1e-13, precision="float64")
     params, batches = pinn_problem(qb.float64)
@@ -964,7 +944,7 @@ def test_device_clip_norm_edge_cases_match_cpu():
             SGD(1e24, clip_norm=1e-25),
         ),
     ]
-    for device in enabled_devices():
+    for device in devices("mlx", "cuda:0"):
         for label, objective, params, optimizer in cases:
             cpu = Trainer(objective, params, optimizer)
             device_trainer = Trainer(objective, params, optimizer, device=device)
@@ -1206,19 +1186,4 @@ def test_public_namespace_is_all():
 
 
 if __name__ == "__main__":
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            if (
-                name == "test_mlx_trainer_convergence"
-                and os.environ.get("QUABLA_MLX_TEST") != "1"
-            ):
-                print(f"SKIP {name} (set QUABLA_MLX_TEST=1)")
-                continue
-            if (
-                name == "test_cuda_trainer_convergence"
-                and os.environ.get("QUABLA_CUDA_TEST") != "1"
-            ):
-                print(f"SKIP {name} (set QUABLA_CUDA_TEST=1)")
-                continue
-            test()
-            print(f"PASS {name}")
+    run(globals())

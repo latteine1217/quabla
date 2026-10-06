@@ -9191,7 +9191,7 @@ mod loop_checkpoint_tests {
 
     #[test]
     fn checkpoint_vjp_and_directional_match_full_tape_on_device() -> Result<(), String> {
-        if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        if !crate::test_support::Gate::Cuda.enabled() {
             return Ok(());
         }
         for scan in [false, true] {
@@ -9234,7 +9234,7 @@ mod loop_checkpoint_tests {
 
     #[test]
     fn checkpoint_device_bounds_and_input_errors_match_full_tape() -> Result<(), String> {
-        if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        if !crate::test_support::Gate::Cuda.enabled() {
             return Ok(());
         }
         for scan in [false, true] {
@@ -9655,7 +9655,7 @@ mod host_loop_graph_tests {
     /// them, in both precisions; both also match the CPU reference.
     #[test]
     fn host_loop_graph_replays_match_eager_runs_bit_for_bit() -> Result<(), String> {
-        if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        if !crate::test_support::Gate::Cuda.enabled() {
             return Ok(());
         }
         // One step never records; three record at the last step; 17 and 64
@@ -9826,7 +9826,7 @@ mod region_batching_tests {
 
     #[test]
     fn batched_loops_fuse_checkpoint_and_match_the_cpu_on_device() -> Result<(), String> {
-        if std::env::var_os("QUABLA_CUDA_TEST").is_none() {
+        if !crate::test_support::Gate::Cuda.enabled() {
             return Ok(());
         }
         for rotate in [false, true] {

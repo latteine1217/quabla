@@ -4,6 +4,8 @@ import math
 
 import quabla as qb
 
+from _support import run
+
 
 def reference_cholesky(matrix):
     """The previous staged lower-triangle recurrence, including scalar rounding."""
@@ -95,6 +97,4 @@ def test_native_cholesky_complete_derivative_composition():
 
 
 if __name__ == "__main__":
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
+    run(globals())

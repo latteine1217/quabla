@@ -1,10 +1,12 @@
 """S7 eager, staged, and differentiated control-flow wrapper checks."""
 
 import math
-import os
 
 import quabla as qb
 from quabla._control import cond, fori_loop, scan, while_loop
+
+from _support import devices, require, run
+from _support import raises as assert_raises
 
 
 def assert_close(actual, expected, tolerance=1e-10):
@@ -14,16 +16,6 @@ def assert_close(actual, expected, tolerance=1e-10):
         abs(a - b) <= tolerance
         for a, b in zip(actual.to_flat_list(), expected.to_flat_list())
     ), (actual.to_flat_list(), expected.to_flat_list())
-
-
-def assert_raises(kind, function, *args, match=None, **kwargs):
-    try:
-        function(*args, **kwargs)
-    except kind as error:
-        if match is not None:
-            assert match in str(error), str(error)
-        return error
-    raise AssertionError(f"expected {kind.__name__}")
 
 
 def loop_loss(initial, scale, *, unroll=False):
@@ -350,9 +342,7 @@ def test_rejections_preserve_user_exceptions_and_single_array_scope():
 
 
 def test_optional_device_loop_vjp_and_hvp_parity():
-    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(flag) != "1":
-            continue
+    for device in devices():
         initial = qb.array([1.0, 2.0], dtype=qb.float32)
         scale = qb.array([2.0, 3.0], dtype=qb.float32)
         derivative = qb.grad(loop_loss, argnums=1)
@@ -442,8 +432,7 @@ def test_optional_cuda_host_driven_loop_derivatives_match_cpu():
     # Bodies that are not elementwise run as host-driven region loops on CUDA,
     # including Hessian-vector products (forward over reverse) through `scan`,
     # which used to be rejected there.
-    if os.environ.get("QUABLA_CUDA_TEST") != "1":
-        return
+    require("cuda")
     for dtype, precision, tolerance in (
         (qb.float32, None, 1e-4),
         (qb.float64, "float64", 1e-11),
@@ -578,9 +567,7 @@ def test_while_loop_reverse_mode_is_rejected_clearly():
 
 
 def test_optional_device_while_loop_parity():
-    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(flag) != "1":
-            continue
+    for device in devices():
         carry = qb.array([1.0, -2.0], dtype=qb.float32)
         limit, scale = qb.array(100.0, dtype=qb.float32), qb.array(1.5, dtype=qb.float32)
         expected = qb.jit(collatz_like)(carry, limit, scale)
@@ -826,16 +813,9 @@ def test_loop_bodies_may_ignore_their_carry():
 
 
 def test_optional_device_vmap_of_while_loop_matches_cpu():
-    devices = [
-        (device, precision)
-        for device, flag, precisions in (
-            ("mlx", "QUABLA_MLX_TEST", (None,)),
-            ("cuda", "QUABLA_CUDA_TEST", (None, "float64")),
-        )
-        if os.environ.get(flag) == "1"
-        for precision in precisions
-    ]
-    for device, precision in devices:
+    precisions = {"mlx": (None,), "cuda": (None, "float64")}
+    runs = [(device, precision) for device in devices(*precisions) for precision in precisions[device]]
+    for device, precision in runs:
         dtype = qb.float64 if precision == "float64" else qb.float32
         tolerance = 1e-11 if precision == "float64" else 1e-5
         carries, limits = while_arguments(dtype)
@@ -1434,9 +1414,7 @@ def test_reverse_mode_through_a_scan_that_discards_a_result():
 
 
 def test_optional_device_discarded_scan_result_parity():
-    for device, flag in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
-        if os.environ.get(flag) != "1":
-            continue
+    for device in devices():
         w = qb.array([1.5], dtype=qb.float32)
         vs = (qb.array([0.5], dtype=qb.float32), qb.array([-1.0], dtype=qb.float32))
         for branch in (scan_final_carry, scan_output_sum):
@@ -1517,16 +1495,9 @@ def test_vmap_of_cond_with_a_float_predicate_selects_nonzero_examples():
 
 def test_optional_device_vmap_of_cond_matches_cpu():
     piecewise_loss, gated_loss, loops_loss, _ = cond_losses()
-    devices = [
-        (device, precision)
-        for device, flag, precisions in (
-            ("mlx", "QUABLA_MLX_TEST", (None,)),
-            ("cuda", "QUABLA_CUDA_TEST", (None, "float64")),
-        )
-        if os.environ.get(flag) == "1"
-        for precision in precisions
-    ]
-    for device, precision in devices:
+    precisions = {"mlx": (None,), "cuda": (None, "float64")}
+    runs = [(device, precision) for device in devices(*precisions) for precision in precisions[device]]
+    for device, precision in runs:
         dtype = qb.float64 if precision == "float64" else qb.float32
         tolerance = 1e-11 if precision == "float64" else 1e-5
         flags, xs, ws = batched_cond_arguments(dtype)
@@ -1562,16 +1533,9 @@ def test_optional_device_vmap_of_cond_matches_cpu():
 
 def test_optional_device_vmap_of_loops_matches_cpu():
     fori_loss, scan_loss, _ = loop_losses()
-    devices = [
-        (device, precision)
-        for device, flag, precisions in (
-            ("mlx", "QUABLA_MLX_TEST", (None,)),
-            ("cuda", "QUABLA_CUDA_TEST", (None, "float64")),
-        )
-        if os.environ.get(flag) == "1"
-        for precision in precisions
-    ]
-    for device, precision in devices:
+    precisions = {"mlx": (None,), "cuda": (None, "float64")}
+    runs = [(device, precision) for device in devices(*precisions) for precision in precisions[device]]
+    for device, precision in runs:
         dtype = qb.float64 if precision == "float64" else qb.float32
         tolerance = 1e-11 if precision == "float64" else 1e-5
         carries, scales, rows = batched_loop_arguments(dtype)
@@ -1637,6 +1601,4 @@ def test_eager_cond_predicate_matches_the_traced_rule():
 
 
 if __name__ == "__main__":
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
+    run(globals())

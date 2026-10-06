@@ -2,6 +2,8 @@
 
 import quabla as qb
 
+from _support import raises as assert_raises, run
+
 
 def assert_close(actual, expected):
     expected = qb.asarray(expected)
@@ -10,16 +12,6 @@ def assert_close(actual, expected):
         abs(a - b) < 1e-10
         for a, b in zip(actual.to_flat_list(), expected.to_flat_list())
     ), (actual.to_flat_list(), expected.to_flat_list())
-
-
-def assert_raises(kind, function, *args, match=None):
-    try:
-        function(*args)
-    except kind as error:
-        if match is not None:
-            assert match in str(error), str(error)
-        return error
-    raise AssertionError(f"expected {kind.__name__}")
 
 
 def test_native_program_retains_order_shapes_and_duplicate_outputs():
@@ -106,6 +98,4 @@ def test_single_output_compiler_facade_keeps_tensor_and_ad_contract():
 
 
 if __name__ == "__main__":
-    for name, test in list(globals().items()):
-        if name.startswith("test_") and callable(test):
-            test()
+    run(globals())

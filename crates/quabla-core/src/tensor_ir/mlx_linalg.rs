@@ -516,7 +516,7 @@ mod tests {
     /// the sign convention pick the first of equal-magnitude components.
     #[test]
     fn sign_flips_follow_the_first_largest_component() -> Result<(), String> {
-        if std::env::var_os("QUABLA_MLX_TEST").is_none() {
+        if !crate::test_support::Gate::Mlx.enabled() {
             return Ok(());
         }
         let _guard = super::super::mlx_execution_guard();
