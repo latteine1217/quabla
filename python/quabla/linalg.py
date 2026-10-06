@@ -1,6 +1,6 @@
 """Dense linear algebra over the last two axes, batched over leading axes.
 
-Every function takes eager or traced arrays, so it runs eagerly, under
+Every dense function takes eager or traced arrays, so it runs eagerly, under
 `jit`, `grad`, `jacfwd`/`jacrev`, and `vmap`, and has derivatives of every
 order (each derivative rule is written with `solve`, `matmul`, and the
 decompositions themselves). Leading batch axes of two operands broadcast
@@ -45,11 +45,19 @@ differentiating them raises.
 Devices: CPU and CUDA (cuSOLVER `getrf`/`getrs`, `syevd`, `geqrf`/`orgqr`,
 and `gesvdj`, `float32`). MLX rejects `solve`, `slogdet`, `eigh`, `qr`, and
 `svd`, because MLX's factorizations only run on its CPU stream.
+
+Two matrix-free iterative solvers take a function `matvec(x, *args)`
+instead of a matrix (see `_krylov.py`): `cg` for symmetric positive-definite
+operators and `gmres` for general ones. They differ from the functions
+above: their derivatives come from the implicit function theorem at the
+solution, in reverse mode only (composable twice), and they do not support
+`vmap` or forward mode.
 """
 
 import collections
 
 from ._array import asarray, eye, zeros
+from ._krylov import cg, gmres
 from ._quabla import Tensor, TraceTensor, concat
 
 __all__ = [
@@ -58,10 +66,12 @@ __all__ = [
     "QRResult",
     "SVDResult",
     "SlogdetResult",
+    "cg",
     "cho_solve",
     "cholesky",
     "det",
     "eigh",
+    "gmres",
     "inv",
     "lstsq",
     "qr",

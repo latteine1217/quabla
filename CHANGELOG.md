@@ -17,6 +17,18 @@ deprecated names keep working until 1.0 (see
   and MLX backends). Both provide the `quabla` package; install one per
   environment. Wheels cover CPython 3.10 to 3.14. Version tags publish to
   TestPyPI and then PyPI through trusted publishing.
+- `linalg.cg` (symmetric positive-definite operators, optional
+  preconditioner) and `linalg.gmres` (restarted GMRES with right
+  preconditioning, CGS2 Arnoldi, and Givens rotations): matrix-free solvers
+  for `matvec(x, *args)`, run eagerly or as one `while_loop` region under
+  `jit`. Gradients with respect to `b` and the arrays in `args` follow the
+  implicit function theorem (one adjoint solve) instead of differentiating
+  the iterations; reverse mode composes twice. `info=True` returns the
+  iteration count, true residual norm, and success flag; an eager solve that
+  does not converge raises `RuntimeError` otherwise.
+- A Newton root finder with a backtracking line search and
+  implicit-function-theorem gradients, not yet exported while its public
+  location is decided.
 
 ### Fixed
 
