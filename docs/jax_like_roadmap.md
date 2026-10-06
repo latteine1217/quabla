@@ -1,5 +1,25 @@
 # Rust SciML Runtime Roadmap
 
+## v0.4 Plan (2026-10-06)
+
+v0.4 fills the jax.numpy surface a PINN code base reaches for, adds the
+stiff and implicit solvers scientific ML needs, and removes the backend gaps
+v0.3 left. Scope chosen by the owner on 2026-10-06; integer dtypes and
+traced integer indexing (`sort`, `argmax`, `x[idx]`, `.at[]`) are not in it.
+
+| # | Item | Status |
+| --- | --- | --- |
+| 1 | Native elementwise ops: `tan`, `arcsin`, `arccos`, `arctan`, `sinh`, `cosh`, `arcsinh`, `arccosh`, `arctanh`, `log2`, `log10`, `cbrt`, `floor`, `ceil`, `round`, `fmod` (with floor `mod`), on every backend with derivatives | Planned |
+| 2 | jax.numpy compositions: `flip`, `roll`, `pad`, `tile`, `repeat`, `moveaxis`, `swapaxes`, `ravel`, `diag`, `diagonal`, `trace`, `outer`, `dot`, `tensordot`, `kron`, `cross`, `diff`, `trapezoid`, `interp`, `polyval`, `logaddexp`, `hypot`, `exp2`, `isinf`, `nan_to_num`; `linalg.norm` (`ord`, `axis`), `linalg.matrix_power`, `linalg.pinv` | Planned |
+| 3 | Stiff ODEs and `saveat`: an adaptive L-stable Rosenbrock method in `odeint`, and states at requested times through each method's dense output | Planned |
+| 4 | Iterative and implicit solvers: matrix-free `linalg.cg` and `linalg.gmres`, Newton root finding, each with an implicit-function-theorem gradient instead of differentiating the iterations | Planned |
+| 5 | MLX factorizations: `solve`, `det`/`slogdet`, `inv`, `eigh`, `qr`, `svd`, `lstsq` through MLX's CPU stream instead of an error | Planned |
+| 6 | Device `Trainer` parity: AdamW and global-norm clipping on CUDA and MLX, `float64` on CUDA | Planned |
+| 7 | CUDA loops: lower the per-iteration cost of host-driven loops (about 80 us in v0.3) and an HVP fallback for Scan bodies that are not elementwise | Planned |
+
+Not yet done from v0.3: the first PyPI upload, waiting on TestPyPI
+registration.
+
 ## v0.3 Plan (2026-10-06)
 
 v0.3 closes the gaps a PINN or scientific-ML user meets when moving from
@@ -25,9 +45,8 @@ with a native `log1p`, NaN-propagating `max`/`maximum`/`relu`, native
 | 10 | Native `float64` on CUDA | Done as opt-in `jit(..., precision="float64")`; `Trainer` and NCCL stay `float32` |
 | 11 | Packaging and tooling | Done: `__version__`, value `repr`, `save`/`load`, type stubs, wheel workflow; PyPI publishing of `quabla` and `quabla-mlx` added after v0.3.0 |
 
-All items shipped in v0.3.0. Open follow-ups: the first PyPI upload, a CUDA
-HVP fallback for Scan bodies that are not elementwise, caching to cut the per-iteration cost of
-host-driven CUDA loops, and `float64` for the device `Trainer`.
+All items shipped in v0.3.0. Its open follow-ups are items 6 and 7 of the
+v0.4 plan and the first PyPI upload.
 
 Decisions taken by the owner on 2026-10-06 and implemented:
 
