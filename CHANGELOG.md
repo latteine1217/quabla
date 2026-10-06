@@ -127,6 +127,26 @@ deprecated names keep working until 1.0 (see
   about 120-180 µs to about 30-50 µs, a `while_loop` iteration from about
   220 µs to about 100 µs, and reverse-pass iterations about fourfold; results
   are bit-identical to the previous implementation.
+- The gradient of a `max` or `min` reduction at a tie is split equally among
+  the tied entries (JAX's rule), including ties across several reduced axes,
+  instead of going entirely to the last one. This reaches every function
+  built on the reductions, such as `linalg.norm` with `ord=inf` and the
+  matrix 1- and inf-norms. A NaN maximum has a NaN gradient.
+- `max` and `min` order the sign of zero as IEEE 754-2019 `maximum` and
+  `minimum` do (and NumPy on arm64): the `max` of `-0.0` and `+0.0` is
+  `+0.0` and the `min` is `-0.0`, eagerly and under `jit` on every backend,
+  instead of whichever zero came last.
+- Traced `max` and `min` reductions are one native IR op instead of a slice,
+  a reshape and an elementwise `maximum` per reduced element, so a staged
+  program has a constant node count in the reduced size: a 600-element `jit`
+  `max` has 2 nodes instead of 3,597 (its gradient 11 instead of 9,590) and
+  takes 2.3 µs per call on the CPU instead of 470 µs, 0.18 ms instead of
+  14 ms on MLX, and 0.14 ms instead of 40 ms on a GTX 1660 SUPER. The scaled
+  `norm` gains as much. CUDA reduces each line with one thread, or one
+  block of 256 threads for lines of 256 or more entries, with no atomics, so
+  results are run-to-run identical and equal to the CPU bit for bit in
+  float32 and `precision="float64"`; MLX restores the sign of a zero result,
+  which its own reduction does not keep.
 
 ### Fixed
 

@@ -19,7 +19,7 @@ use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 use super::{
     sqrt_derivative_coefficient, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor,
     TensorBackend, TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend,
-    TensorExecutionPlan, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
+    TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
 };
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
@@ -1285,6 +1285,13 @@ impl MlxBackend {
                         &stream,
                     )
                     .map_err(|error| error.to_string()),
+                TensorOp::ExtremumAxis { input, axis, kind } => mlx_extremum_axis(
+                    mlx_value(&values, *input)?,
+                    i32::try_from(*axis).map_err(|_| "MLX max/min axis exceeds i32".to_string())?,
+                    *kind,
+                    &stream,
+                )
+                .map_err(|error| error.to_string()),
                 TensorOp::MeanAxis { input, axis } => mlx_value(&values, *input)?
                     .mean_axis_device(
                         i32::try_from(*axis)
@@ -2425,6 +2432,46 @@ fn mlx_fmod(
     )
 }
 
+/// `TensorOp::ExtremumAxis` on MLX. MLX's max/min reductions propagate NaN
+/// (their Metal operators return NaN when either operand is NaN), but a tie
+/// of `-0` and `+0` returns whichever zero the reduction tree meets last.
+/// The order `-0 < +0` is restored where the result is zero: mapping
+/// each zero to its reciprocal (`+0 -> +inf`, `-0 -> -inf`) and every other
+/// entry to the identity of the reduction, the same reduction is `+inf`
+/// for `max` exactly when the line holds a `+0` (`-inf` for `min` when it
+/// holds a `-0`), and the reciprocal of that is the zero to return.
+fn mlx_extremum_axis(
+    input: &Array,
+    axis: i32,
+    kind: TensorExtremum,
+    stream: &StreamOrDevice,
+) -> Result<Array, mlx_rs::error::Exception> {
+    let scalar = Array::from_f32;
+    let reduce = |array: &Array| match kind {
+        TensorExtremum::Max => array.max_axis_device(axis, false, stream),
+        TensorExtremum::Min => array.min_axis_device(axis, false, stream),
+    };
+    let identity = match kind {
+        TensorExtremum::Max => f32::NEG_INFINITY,
+        TensorExtremum::Min => f32::INFINITY,
+    };
+    let reduced = reduce(input)?;
+    let zero = scalar(0.0);
+    let keys = ops::r#where_device(
+        input.eq_device(&zero, stream)?,
+        input.reciprocal_device(stream)?,
+        scalar(identity),
+        stream,
+    )?;
+    let signed_zero = reduce(&keys)?.reciprocal_device(stream)?;
+    ops::r#where_device(
+        reduced.eq_device(&zero, stream)?,
+        &signed_zero,
+        &reduced,
+        stream,
+    )
+}
+
 fn mlx_value(values: &[Array], node_id: usize) -> Result<&Array, String> {
     values
         .get(node_id)
@@ -2455,6 +2502,10 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::ScanVjpJvp { .. } => "scan_vjp_jvp",
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
+        TensorOp::ExtremumAxis { kind, .. } => match kind {
+            TensorExtremum::Max => "max_axis",
+            TensorExtremum::Min => "min_axis",
+        },
         TensorOp::Matmul { .. } => "matmul",
         TensorOp::Solve { .. } => "solve",
         TensorOp::Linalg { kind, .. } => kind.name(),

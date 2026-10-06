@@ -68,11 +68,11 @@ def _dot(u, v):
 
 
 def _norm(v):
-    """The 2-norm as `sqrt(v . v)`. `Tensor.norm` rescales by `max|v|`,
-    which avoids overflow but lowers its maximum to a chain of `n` scalar
-    comparisons, a cost every loop iteration would pay; the squared norm
-    only overflows beyond about 1e154 in float64 and 1e19 in float32, where
-    the CG and GMRES inner products overflow anyway."""
+    """The 2-norm as `sqrt(v . v)`. The rescaling of `Tensor.norm` by
+    `max|v|` would buy nothing here: the squared norm only overflows beyond
+    about 1e154 in float64 and 1e19 in float32, where the CG and GMRES inner
+    products overflow anyway, and skipping the extra reduction keeps every
+    loop iteration cheaper."""
     return _dot(v, v).sqrt()
 
 

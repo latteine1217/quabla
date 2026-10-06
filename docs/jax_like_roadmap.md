@@ -17,6 +17,11 @@ traced integer indexing (`sort`, `argmax`, `x[idx]`, `.at[]`) are not in it.
 | 6 | Device `Trainer` parity: AdamW and global-norm clipping on CUDA and MLX, `float64` on CUDA | Done: AdamW, SGD, and `clip_norm` on CUDA and MLX with the CPU's update order and the global norm reduced on the device; `Trainer(precision="float64")` on CUDA |
 | 7 | CUDA loops: lower the per-iteration cost of host-driven loops (about 80 us in v0.3) and an HVP fallback for Scan bodies that are not elementwise | Done: one CUDA graph launch per iteration (about fourfold faster, bit-identical); host-driven `ScanVjpJvp` |
 
+Also fixed during v0.4, outside the plan: traced `max`/`min` reductions are
+one native IR op instead of a chain of per-element comparisons (a 600-element
+`jit` `max` went from 3,597 nodes and 0.47 ms to 2 nodes and 2.3 µs on the
+CPU), with JAX's tie-splitting derivative and an order-independent `-0 < +0`.
+
 Not yet done from v0.3: the first PyPI upload, waiting on TestPyPI
 registration.
 
@@ -58,10 +63,10 @@ Decisions taken by the owner on 2026-10-06 and implemented:
   magnitudes above about 1e19; results change in the last bits.
 
 Smaller observations kept for later: `abs` has gradient -1 at 0 (JAX uses
-+1), `max` gives the whole gradient of a tie to the last element (JAX
-splits it), and CPU float32 reductions accumulate in f64, so device
-float32 sums can differ from the CPU reference beyond roundoff for very
-large or cancelling inputs.
++1), and CPU float32 reductions accumulate in f64, so device float32 sums
+can differ from the CPU reference beyond roundoff for very large or
+cancelling inputs. `max` used to give the whole gradient of a tie to the
+last element; it splits it as JAX does since v0.4.
 
 ## v0.2 API Increment (2026-10-03)
 

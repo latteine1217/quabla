@@ -180,6 +180,121 @@ def test_device_stable_activations_and_nan_propagation_match_cpu():
         print("SKIP device activation parity: GPU gates unset")
 
 
+
+def same_values(actual, expected):
+    """Bitwise equality of two flat value lists, NaN matching NaN."""
+    return len(actual) == len(expected) and all(
+        (math.isnan(a) and math.isnan(b)) or (a == b and math.copysign(1, a) == math.copysign(1, b))
+        for a, b in zip(actual, expected)
+    )
+
+
+def test_device_max_min_match_cpu_in_loops_vmap_trainer_and_float64():
+    nan, inf = math.nan, math.inf
+    # NaN, infinities, signed zeros and ties; the 700-wide rows take CUDA's
+    # one-block-per-output reduction.
+    small = [[1.0, 3.0, 2.0, 3.0], [nan, 1.0, -inf, 0.5], [-0.0, 0.0, -0.0, -1.0]]
+    wide = [((index * 7919) % 1000 - 500) * 1.37e-3 for index in range(1400)]
+    wide[3], wide[4], wide[900] = -0.0, inf, nan
+    reductions = {
+        "max": lambda t: t.max(),
+        "min_rows": lambda t: t.min(axis=1),
+        "max_columns": lambda t: t.max(axis=0, keepdims=True),
+        "min_all_keep": lambda t: t.min(axis=(0, 1), keepdims=True),
+    }
+    # Finite inputs with ties: the chooser gradients divide exact counts.
+    tied = [[2.0, 0.5, 2.0, -1.0], [0.25, 0.25, -3.0, -3.0], [1.0, 1.0, 1.0, 1.0]]
+    weights = [1.5, -0.75, 3.0]
+
+    def tied_loss(t, w):
+        return (t.max(axis=1) * w).sum() + t.min() + qb.linalg.norm(t)
+
+    def loops(v):
+        return (
+            qb.fori_loop(0, 6, lambda i, c: c - 0.5 * c.max(axis=1, keepdims=True), v),
+            qb.scan(lambda c, i: (c - 0.25 * c.max(), c.min()), v, length=5)[1],
+            qb.while_loop(lambda c: c.max() > 0.1, lambda c: c * 0.5, v),
+        )
+
+    def loop_loss(v):
+        carry = qb.fori_loop(0, 4, lambda i, c: qb.sin(c) + c.max(axis=0), v)
+        return carry.sum() + qb.scan(lambda c, i: (c * 0.9, c.max()), v, length=3)[1].sum()
+
+    ran = False
+    for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):
+        if os.environ.get(gate) != "1":
+            continue
+        assert device in qb.devices(), f"{gate} requested but target not built"
+        ran = True
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            settings = [(qb.float32, {})]
+            if device == "cuda":
+                settings.append((qb.float64, {"precision": "float64"}))
+            for dtype, options in settings:
+                for data in [small, [wide[:700], wide[700:]]]:
+                    x = qb.array(data, dtype=dtype)
+                    for name, function in reductions.items():
+                        actual = qb.jit(function, device=device, **options)(x)
+                        expected = qb.jit(function)(x)
+                        assert same_values(actual.to_flat_list(), expected.to_flat_list()), (
+                            device,
+                            name,
+                            actual.tolist(),
+                            expected.tolist(),
+                        )
+                x = qb.array(tied, dtype=dtype)
+                w = qb.array(weights, dtype=dtype)
+                gradient = qb.grad(tied_loss, argnums=(0, 1))
+                for actual, expected in zip(
+                    qb.jit(gradient, device=device, **options)(x, w), qb.jit(gradient)(x, w)
+                ):
+                    close(actual, expected, 1e-6)
+
+                def squared(t):
+                    return t.max() ** 2
+
+                v = qb.array([2.0, -1.0, 2.0], dtype=dtype)
+                hessian = qb.jit(qb.hessian(squared), device=device, **options)(v)
+                assert hessian.tolist() == [[0.5, 0.0, 0.5], [0.0, 0.0, 0.0], [0.5, 0.0, 0.5]]
+                batched = qb.jit(qb.vmap(lambda t: t.max(axis=0)), device=device, **options)
+                assert batched(x).tolist() == qb.vmap(lambda t: t.max(axis=0))(x).tolist()
+                v = qb.array(tied, dtype=dtype)
+                for actual, expected in zip(
+                    qb.jit(loops, device=device, **options)(v), qb.jit(loops)(v)
+                ):
+                    close(actual, expected, 1e-6)
+                close(
+                    qb.jit(qb.grad(loop_loss), device=device, **options)(v),
+                    qb.jit(qb.grad(loop_loss))(v),
+                    1e-5,
+                )
+
+        # A Trainer loss with a max term trains like the CPU Trainer.
+        from quabla.optim import Adam, Trainer
+
+        def loss(params, xs, ys):
+            residual = params["a"] * xs + params["b"] - ys
+            return (residual * residual).mean() + 0.1 * residual.abs().max()
+
+        params = {
+            "a": qb.array([0.5], dtype=qb.float32),
+            "b": qb.array([0.0], dtype=qb.float32),
+        }
+        xs = qb.array([0.0, 0.5, 1.0, 1.5], dtype=qb.float32)
+        ys = qb.array([1.0, 2.0, 2.5, 4.0], dtype=qb.float32)
+        expected = Trainer(loss, params, Adam(0.05), xs, ys)
+        actual = Trainer(loss, params, Adam(0.05), xs, ys, device=device)
+        for _ in range(3):
+            expected.step()
+            actual.step()
+        for name in params:
+            for got, want in zip(actual.params[name].tolist(), expected.params[name].tolist()):
+                assert math.isclose(got, want, rel_tol=1e-5), (device, name, got, want)
+    if not ran:
+        print("SKIP device max/min parity: GPU gates unset")
+
+
 def test_device_compositions_and_shape_helpers_match_cpu():
     ran = False
     for device, gate in (("mlx", "QUABLA_MLX_TEST"), ("cuda", "QUABLA_CUDA_TEST")):

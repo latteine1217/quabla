@@ -2,7 +2,9 @@ use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyEllipsis, PyMemoryView, PySlice, PySliceMethods, PyTuple};
-use quabla_core::tensor_ir::{HostTensorStorage, TensorComparison, TensorDType, UnaryMathKind};
+use quabla_core::tensor_ir::{
+    HostTensorStorage, TensorComparison, TensorDType, TensorExtremum, UnaryMathKind,
+};
 use std::borrow::Cow;
 use std::ffi::c_int;
 use std::sync::Arc;
@@ -301,14 +303,15 @@ pub(crate) fn extract_scalar(value: &Bound<'_, PyAny>) -> Option<f64> {
 }
 
 /// Whether a max/min reduction replaces its running `current` with the later
-/// `value`. It mirrors the traced pairwise `maximum(current, value)`: ties
-/// take the later element, and a NaN is kept once seen and taken when it
-/// arrives, so NaN propagates from any position like NumPy.
+/// `value`: the rule of the traced `ExtremumAxis` op (NaN propagates from any
+/// position and `-0 < +0`), so eager and traced results agree.
 fn extrema_replaces(maximum: bool, current: f64, value: f64) -> bool {
-    if current.is_nan() {
-        return false;
-    }
-    value.is_nan() || (maximum && value >= current) || (!maximum && value <= current)
+    let kind = if maximum {
+        TensorExtremum::Max
+    } else {
+        TensorExtremum::Min
+    };
+    kind.replaces(current, value)
 }
 
 fn element_count(shape: &[usize]) -> Result<usize, String> {

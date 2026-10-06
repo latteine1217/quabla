@@ -2393,12 +2393,13 @@ def test_trace_tensor_sqrt_and_norm_define_zero_subgradient_and_preserve_symboli
     assert_close_rows([norm_gradients["x"].to_flat_list()], [[0.6, 0.8]])
 
 
-def test_trace_tensor_reduction_extrema_choose_last_tied_coordinate_for_gradients():
+def test_trace_tensor_reduction_extrema_split_tied_gradients_equally():
     inputs = {"x": quabla.Tensor([2, 3], [1.0, 5.0, 5.0, 2.0, 2.0, 0.0])}
     cotangent = quabla.Tensor([], [1.0])
 
+    # JAX's chooser rule: tied extrema share the derivative equally.
     for operation, expected_value, expected_gradient in (
-        ("max", [7.0], [0.0, 0.0, 1.0, 0.0, 1.0, 0.0]),
+        ("max", [7.0], [0.0, 0.5, 0.5, 0.5, 0.5, 0.0]),
         ("min", [1.0], [1.0, 0.0, 0.0, 0.0, 0.0, 1.0]),
     ):
         traced = quabla.trace_tensor(
