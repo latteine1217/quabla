@@ -20,8 +20,8 @@ use cudarc::nvrtc::compile_ptx;
 use cudarc::nccl::{group_end, group_start, Comm as NcclComm, ReduceOp as NcclReduceOp};
 
 use super::{
-    contiguous_strides, cuda_sqrt_derivative_expression, element_count, tensor_op_inputs,
-    DynamicTensor, LinalgKind, TensorBackend, TensorDType, TensorDeviceBackend,
+    contiguous_strides, cuda_elementwise_formula, cuda_scalar_literal, element_count,
+    tensor_op_inputs, DynamicTensor, LinalgKind, TensorBackend, TensorDType, TensorDeviceBackend,
     TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorForiVjpJvpExecutionPlan,
     TensorForiVjpTarget, TensorFusionRegion, TensorNodeId, TensorOp, TensorReplicaReduction,
     TensorScanExecutionPlan, TensorScanTarget, TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget,
@@ -5204,6 +5204,25 @@ impl CudaScalarExpressionBuilder {
     }
 }
 
+/// The shared CUDA formula (`cuda_elementwise_formula`) of `op` in a fused
+/// loop body or loop derivative body, operands spelled by `operand`;
+/// `None` for the ops the loop generators resolve themselves and for the
+/// math kinds fused loops do not admit (`cuda_loop_lowerable`).
+fn cuda_loop_formula(
+    op: &TensorOp,
+    operand: impl Fn(TensorNodeId) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let admitted = match op {
+        TensorOp::UnaryMath { kind, .. } => kind.cuda_loop_lowerable(),
+        TensorOp::BinaryMath { kind, .. } => kind.cuda_loop_lowerable(),
+        _ => true,
+    };
+    if !admitted {
+        return Ok(None);
+    }
+    cuda_elementwise_formula(op, |_, id| operand(id))
+}
+
 fn cuda_fori_body_expression(
     loop_plan: &TensorForiExecutionPlan,
     node_id: TensorNodeId,
@@ -5255,58 +5274,19 @@ fn cuda_fori_body_expression_inner(
             let offset = cuda_offset_expression(carry_shape, &node.shape);
             Ok(format!("capture_{parameter}[{offset}]"))
         }
-        TensorOp::ScalarConstant { value } => Ok(cuda_float_literal(*value)),
-        TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Div { lhs, rhs } => Ok(format!("({} / {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Greater { lhs, rhs } => Ok(format!(
-            "(({} > {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            child(*rhs)?
-        )),
-        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
-            "(({} {} {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            kind.operator(),
-            child(*rhs)?
-        )),
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => Ok(format!(
-            "(({} != 0.0f) ? {} : {})",
-            child(*condition)?,
-            child(*on_true)?,
-            child(*on_false)?
-        )),
-        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
-        TensorOp::SqrtDerivative { input, order } => {
-            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
-        }
-        TensorOp::Powi { input, exponent } => {
-            Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
-        }
-        TensorOp::BinaryMath { lhs, rhs, kind } if kind.cuda_loop_lowerable() => Ok(format!(
-            "{}({}, {})",
-            kind.cuda_function(),
-            child(*lhs)?,
-            child(*rhs)?
-        )),
-        TensorOp::UnaryMath { input, kind } if kind.cuda_loop_lowerable() => {
-            Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
-        }
+        TensorOp::ScalarConstant { value } => Ok(cuda_scalar_literal(*value)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
         // already run, so stop_gradient is the identity too.
         TensorOp::Broadcast { input }
         | TensorOp::Reshape { input }
         | TensorOp::Cast { input }
         | TensorOp::StopGradient { input } => child(*input),
-        _ => Err(format!(
-            "CUDA Fori body {} is not elementwise-lowerable",
-            cuda_op_name(&node.op)
-        )),
+        op => cuda_loop_formula(op, child)?.ok_or_else(|| {
+            format!(
+                "CUDA Fori body {} is not elementwise-lowerable",
+                cuda_op_name(op)
+            )
+        }),
     }?;
     Ok(builder.emit(node_id, None, expression))
 }
@@ -5418,48 +5398,7 @@ fn cuda_scan_body_expression_in_half_inner(
             };
             Ok(format!("capture_{parameter}[{offset}]"))
         }
-        TensorOp::ScalarConstant { value } => Ok(cuda_float_literal(*value)),
-        TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Div { lhs, rhs } => Ok(format!("({} / {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Greater { lhs, rhs } => Ok(format!(
-            "(({} > {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            child(*rhs)?
-        )),
-        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
-            "(({} {} {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            kind.operator(),
-            child(*rhs)?
-        )),
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => Ok(format!(
-            "(({} != 0.0f) ? {} : {})",
-            child(*condition)?,
-            child(*on_true)?,
-            child(*on_false)?
-        )),
-        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
-        TensorOp::SqrtDerivative { input, order } => {
-            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
-        }
-        TensorOp::Powi { input, exponent } => {
-            Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
-        }
-        TensorOp::BinaryMath { lhs, rhs, kind } if kind.cuda_loop_lowerable() => Ok(format!(
-            "{}({}, {})",
-            kind.cuda_function(),
-            child(*lhs)?,
-            child(*rhs)?
-        )),
-        TensorOp::UnaryMath { input, kind } if kind.cuda_loop_lowerable() => {
-            Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
-        }
+        TensorOp::ScalarConstant { value } => Ok(cuda_scalar_literal(*value)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
         // already run, so stop_gradient is the identity too.
         TensorOp::Broadcast { input }
@@ -5493,10 +5432,12 @@ fn cuda_scan_body_expression_in_half_inner(
             }
             in_half(inputs[half], packed_half)
         }
-        _ => Err(format!(
-            "CUDA Scan body {} is not elementwise-lowerable",
-            cuda_op_name(&node.op)
-        )),
+        op => cuda_loop_formula(op, child)?.ok_or_else(|| {
+            format!(
+                "CUDA Scan body {} is not elementwise-lowerable",
+                cuda_op_name(op)
+            )
+        }),
     }?;
     Ok(builder.emit(node_id, packed_half, expression))
 }
@@ -5571,58 +5512,19 @@ fn cuda_elementwise_plan_expression_with_index_inner(
                 "CUDA elementwise plan input {name:?} has no binding"
             )),
         },
-        TensorOp::ScalarConstant { value } if value.is_finite() => Ok(cuda_float_literal(*value)),
-        TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Div { lhs, rhs } => Ok(format!("({} / {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Greater { lhs, rhs } => Ok(format!(
-            "(({} > {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            child(*rhs)?
-        )),
-        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
-            "(({} {} {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            kind.operator(),
-            child(*rhs)?
-        )),
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => Ok(format!(
-            "(({} != 0.0f) ? {} : {})",
-            child(*condition)?,
-            child(*on_true)?,
-            child(*on_false)?
-        )),
-        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
-        TensorOp::SqrtDerivative { input, order } => {
-            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
-        }
-        TensorOp::Powi { input, exponent } => {
-            Ok(format!("quabla_powi({}, {exponent}U)", child(*input)?))
-        }
-        TensorOp::BinaryMath { lhs, rhs, kind } if kind.cuda_loop_lowerable() => Ok(format!(
-            "{}({}, {})",
-            kind.cuda_function(),
-            child(*lhs)?,
-            child(*rhs)?
-        )),
-        TensorOp::UnaryMath { input, kind } if kind.cuda_loop_lowerable() => {
-            Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
-        }
+        TensorOp::ScalarConstant { value } if value.is_finite() => Ok(cuda_scalar_literal(*value)),
         // Cast source and target both execute as float, so the cast is the identity; AD has
         // already run, so stop_gradient is the identity too.
         TensorOp::Broadcast { input }
         | TensorOp::Reshape { input }
         | TensorOp::Cast { input }
         | TensorOp::StopGradient { input } => child(*input),
-        _ => Err(format!(
-            "CUDA Fori VJP body uses unsupported {} operation",
-            cuda_op_name(&node.op)
-        )),
+        op => cuda_loop_formula(op, child)?.ok_or_else(|| {
+            format!(
+                "CUDA Fori VJP body uses unsupported {} operation",
+                cuda_op_name(op)
+            )
+        }),
     }?;
     Ok(builder.emit(node_id, None, expression))
 }
@@ -7811,6 +7713,22 @@ fn cuda_scan_vjp_jvp_group_kernel_source(
 }
 /// `host_driven` lists loop nodes that run as host-driven region loops; they
 /// launch their regions' own programs, so no node kernel is emitted for them.
+/// The shared CUDA formula (`cuda_elementwise_formula`) of one per-node
+/// kernel, whose operand `position` is the buffer read `operands[position]`.
+fn cuda_node_formula(
+    node_id: TensorNodeId,
+    op: &TensorOp,
+    operands: &[String],
+) -> Result<String, String> {
+    cuda_elementwise_formula(op, |position, _| {
+        operands
+            .get(position)
+            .cloned()
+            .ok_or_else(|| format!("CUDA node {node_id} reads a missing operand {position}"))
+    })?
+    .ok_or_else(|| format!("CUDA node {node_id} has no elementwise formula"))
+}
+
 fn cuda_program_source(
     plan: &TensorExecutionPlan,
     host_driven: &BTreeSet<TensorNodeId>,
@@ -7848,7 +7766,7 @@ fn cuda_program_source(
                 "extern \"C\" __global__ void {function}(float* out, unsigned long long count) {{\n\
                     unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
                     if (index < count) out[index] = {};\n}}\n",
-                cuda_float_literal(*value)
+                cuda_scalar_literal(*value)
             ),
             TensorOp::ScalarConstant { .. } => {
                 return Err("CUDA device program does not support non-finite constants".to_string())
@@ -7873,23 +7791,8 @@ fn cuda_program_source(
             | TensorOp::BinaryMath { lhs, rhs, .. } => {
                 let lhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*lhs].shape);
                 let rhs_offset = cuda_offset_expression(&node.shape, &plan.nodes[*rhs].shape);
-                let expression = match &node.op {
-                    TensorOp::Add { .. } => format!("lhs[{lhs_offset}] + rhs[{rhs_offset}]"),
-                    TensorOp::Sub { .. } => format!("lhs[{lhs_offset}] - rhs[{rhs_offset}]"),
-                    TensorOp::Div { .. } => format!("lhs[{lhs_offset}] / rhs[{rhs_offset}]"),
-                    TensorOp::Mul { .. } => format!("lhs[{lhs_offset}] * rhs[{rhs_offset}]"),
-                    TensorOp::Greater { .. } => {
-                        format!("lhs[{lhs_offset}] > rhs[{rhs_offset}] ? 1.0f : 0.0f")
-                    }
-                    TensorOp::Compare { kind, .. } => format!(
-                        "lhs[{lhs_offset}] {} rhs[{rhs_offset}] ? 1.0f : 0.0f",
-                        kind.operator()
-                    ),
-                    TensorOp::BinaryMath { kind, .. } => {
-                        format!("{}(lhs[{lhs_offset}], rhs[{rhs_offset}])", kind.cuda_function())
-                    }
-                    _ => unreachable!(),
-                };
+                let operands = [format!("lhs[{lhs_offset}]"), format!("rhs[{rhs_offset}]")];
+                let expression = cuda_node_formula(node_id, &node.op, &operands)?;
                 format!(
                     "extern \"C\" __global__ void {function}(const float* lhs, const float* rhs, float* out, unsigned long long count) {{\n\
                         unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
@@ -7900,29 +7803,24 @@ fn cuda_program_source(
                 let condition_offset = cuda_offset_expression(&node.shape, &plan.nodes[*condition].shape);
                 let true_offset = cuda_offset_expression(&node.shape, &plan.nodes[*on_true].shape);
                 let false_offset = cuda_offset_expression(&node.shape, &plan.nodes[*on_false].shape);
+                let operands = [
+                    format!("condition[{condition_offset}]"),
+                    format!("on_true[{true_offset}]"),
+                    format!("on_false[{false_offset}]"),
+                ];
+                let expression = cuda_node_formula(node_id, &node.op, &operands)?;
                 format!(
                     "extern \"C\" __global__ void {function}(const float* condition, const float* on_true, const float* on_false, float* out, unsigned long long count) {{\n\
                         unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
-                        if (index < count) out[index] = condition[{condition_offset}] != 0.0f ? on_true[{true_offset}] : on_false[{false_offset}];\n}}\n"
+                        if (index < count) out[index] = {expression};\n}}\n"
                 )
             }
             TensorOp::Sqrt { input }
             | TensorOp::SqrtDerivative { input, .. }
             | TensorOp::Powi { input, .. }
             | TensorOp::UnaryMath { input, .. } => {
-                let expression = match &node.op {
-                    TensorOp::Sqrt { .. } => "sqrtf(input[index])".to_string(),
-                    TensorOp::SqrtDerivative { order, .. } => {
-                        cuda_sqrt_derivative_expression("input[index]", *order)
-                    }
-                    TensorOp::Powi { exponent, .. } => {
-                        format!("quabla_powi(input[index], {exponent}U)")
-                    }
-                    TensorOp::UnaryMath { kind, .. } => {
-                        format!("{}(input[index])", kind.cuda_function())
-                    }
-                    _ => unreachable!(),
-                };
+                let expression =
+                    cuda_node_formula(node_id, &node.op, &["input[index]".to_string()])?;
                 let input_count = element_count(&plan.nodes[*input].shape)?;
                 if input_count != count {
                     return Err(format!(
@@ -8509,20 +8407,6 @@ fn cuda_shapes_broadcastable(output_shape: &[usize], input_shape: &[usize]) -> b
         .iter()
         .zip(input_shape)
         .all(|(output_extent, input_extent)| *input_extent == 1 || input_extent == output_extent)
-}
-
-/// A CUDA `float` literal that rounds `value` like `value as f32`, spelled
-/// with the shortest round-trip `f64` digits: a value exact in `f32` keeps an
-/// `f` suffix, any other is cast to `float`. A program retyped to `double` for
-/// `precision="float64"` drops the suffix and the cast and so keeps every bit
-/// of the `f64` constant (the shortest `f32` digits would not: `2^-12` would
-/// become `0.00024414062`).
-fn cuda_float_literal(value: f64) -> String {
-    if f64::from(value as f32) == value {
-        format!("{value:?}f")
-    } else {
-        format!("((float){value:?})")
-    }
 }
 
 /// A comma-separated `unsigned int` initializer for a baked index table.
@@ -9595,6 +9479,76 @@ mod host_loop_graph_tests {
                     assert_eq!((launches, launches64), (0, 0), "{name} steps={steps}");
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Every elementwise math kind runs as one NVRTC kernel of the per-node
+    /// program, so a host-driven loop body that uses it records and replays
+    /// CUDA graphs, bit-identical to the eager launches.
+    #[test]
+    fn host_loop_graphs_admit_every_elementwise_math_kind() -> Result<(), String> {
+        if !crate::test_support::Gate::Cuda.enabled() {
+            return Ok(());
+        }
+        let steps = 17;
+        let inputs = inputs(steps)?;
+        let backend = CudaBackend::new(0);
+        let kinds = UnaryMathKind::ALL
+            .into_iter()
+            .map(|kind| (kind.name(), Some(kind), None))
+            .chain(
+                crate::tensor_ir::BinaryMathKind::ALL
+                    .into_iter()
+                    .map(|kind| (kind.name(), None, Some(kind))),
+            );
+        for (name, unary, binary) in kinds {
+            // `rotate(c) + 0.25 kind(0.25 c + 0.5) + 0.001 i`, with the
+            // argument of `arccosh` moved into its domain.
+            let mut body = TensorIr::new();
+            let carry = body.input("carry", vec![LANES])?;
+            let index = body.input("index", vec![])?;
+            let rotated = rotate(&mut body, carry, false)?;
+            let quarter = body.scalar_constant(0.25);
+            let half = body.scalar_constant(0.5);
+            let scaled = body.mul(carry, quarter)?;
+            let mut argument = body.add(scaled, half)?;
+            let value = match (unary, binary) {
+                (Some(kind), _) => {
+                    if kind == UnaryMathKind::Arccosh {
+                        let one = body.scalar_constant(1.0);
+                        argument = body.add(argument, one)?;
+                    }
+                    body.unary_math(argument, kind)?
+                }
+                (_, Some(kind)) => {
+                    let operand = body.scalar_constant(0.75);
+                    body.binary_math(argument, operand, kind)?
+                }
+                _ => unreachable!("every entry has a kind"),
+            };
+            let term = body.mul(value, quarter)?;
+            let next = body.add(rotated, term)?;
+            let step = body.scalar_constant(0.001);
+            let step = body.mul(index, step)?;
+            let next = body.add(next, step)?;
+            let plan =
+                TensorForiExecutionPlan::new(0, steps, body.compile_cpu(next)?, "carry", "index")?;
+            let mut graph = TensorIr::new();
+            let initial = graph.input("initial", vec![LANES])?;
+            let captures = vec![
+                ("scale".to_string(), graph.input("scale", vec![LANES])?),
+                ("rate".to_string(), graph.input("rate", vec![])?),
+            ];
+            let output = graph.fori(initial, plan, captures)?;
+            let program = graph.compile_cpu(output)?;
+            let (eager, replayed, launches) = run_both(
+                &program,
+                |plan| backend.compile(plan),
+                |plan| plan.execute_many(&inputs),
+            )?;
+            assert_eq!(bits(&eager), bits(&replayed), "{name}");
+            assert!(launches > 0, "{name} replayed no graph");
         }
         Ok(())
     }

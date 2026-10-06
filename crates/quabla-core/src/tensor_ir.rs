@@ -15373,6 +15373,9 @@ fn cuda_dag_statements(
     Ok(source)
 }
 
+/// One node of a whole-plan or region fusion kernel, its operands read from
+/// the SSA values `child` names. Only the ops fusion admits
+/// (`is_fusable_elementwise_compute_op`) are spelled.
 fn cuda_scalar_expression(
     nodes: &[TensorNode],
     node_id: TensorNodeId,
@@ -15381,6 +15384,11 @@ fn cuda_scalar_expression(
     let node = nodes
         .get(node_id)
         .ok_or_else(|| format!("CUDA lowering references missing node {node_id}"))?;
+    if is_fusable_elementwise_compute_op(&node.op) {
+        if let Some(expression) = cuda_elementwise_formula(&node.op, |_, id| child(id))? {
+            return Ok(expression);
+        }
+    }
     match &node.op {
         TensorOp::Input { .. } => Ok(format!("input_{node_id}[quabla_offset_{node_id}(index)]")),
         TensorOp::ScalarConstant { value } if value.is_finite() => Ok(cuda_scalar_literal(*value)),
@@ -15394,85 +15402,80 @@ fn cuda_scalar_expression(
         }
         // f32 and f64 both execute as float on CUDA (TensorDeviceBackend::execution_dtype), so cast
         // is the identity.
-        TensorOp::Cast { input } => child(*input),
-        TensorOp::Add { lhs, rhs } => Ok(format!("({} + {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Sub { lhs, rhs } => Ok(format!("({} - {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Mul { lhs, rhs } => Ok(format!("({} * {})", child(*lhs)?, child(*rhs)?)),
-        TensorOp::Greater { lhs, rhs } => Ok(format!(
-            "(({} > {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            child(*rhs)?
-        )),
-        TensorOp::Compare { lhs, rhs, kind } => Ok(format!(
-            "(({} {} {}) ? 1.0f : 0.0f)",
-            child(*lhs)?,
-            kind.operator(),
-            child(*rhs)?
-        )),
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => Ok(format!(
-            "(({} != 0.0f) ? {} : {})",
-            child(*condition)?,
-            child(*on_true)?,
-            child(*on_false)?
-        )),
-        TensorOp::Sqrt { input } => Ok(format!("sqrtf({})", child(*input)?)),
-        TensorOp::SqrtDerivative { input, order } => {
-            Ok(cuda_sqrt_derivative_expression(&child(*input)?, *order))
-        }
-        TensorOp::Powi { input, exponent } => {
-            Ok(format!("quabla_powi({}, {}U)", child(*input)?, exponent))
-        }
-        TensorOp::BinaryMath { lhs, rhs, kind } => Ok(format!(
-            "{}({}, {})",
-            kind.cuda_function(),
-            child(*lhs)?,
-            child(*rhs)?
-        )),
-        TensorOp::UnaryMath { input, kind } => {
-            Ok(format!("{}({})", kind.cuda_function(), child(*input)?))
-        }
-        TensorOp::StopGradient { input } => child(*input),
-        TensorOp::Div { .. } => {
-            Err("CUDA loop-body lowering does not yet support div or log".to_string())
-        }
-        TensorOp::Sum { .. }
-        | TensorOp::CumSum { .. }
-        | TensorOp::SumAxis { .. }
-        | TensorOp::ExtremumAxis { .. }
-        | TensorOp::Matmul { .. }
-        | TensorOp::Solve { .. }
-        | TensorOp::Linalg { .. }
-        | TensorOp::Cholesky { .. }
-        | TensorOp::CholeskyAd { .. }
-        | TensorOp::Triangular { .. }
-        | TensorOp::Reshape { .. }
-        | TensorOp::Mean { .. }
-        | TensorOp::MeanAxis { .. }
-        | TensorOp::Transpose { .. }
-        | TensorOp::Concat { .. }
-        | TensorOp::Slice { .. }
-        | TensorOp::PadSlice { .. }
-        | TensorOp::Gather { .. }
-        | TensorOp::ScatterAdd { .. }
-        | TensorOp::Broadcast { .. }
-        | TensorOp::Cond { .. }
-        | TensorOp::While { .. }
-        | TensorOp::Fori { .. }
-        | TensorOp::ForiJvp { .. }
-        | TensorOp::ForiVjp { .. }
-        | TensorOp::ForiVjpJvp { .. }
-        | TensorOp::Scan { .. }
-        | TensorOp::ScanVjp { .. }
-        | TensorOp::ScanVjpJvp { .. }
-        | TensorOp::Custom { .. } => Err(format!(
+        TensorOp::Cast { input } | TensorOp::StopGradient { input } => child(*input),
+        _ => Err(format!(
             "CUDA lowering does not yet support {}",
             tensor_op_name(&node.op)
         )),
     }
+}
+
+/// The CUDA `float` expression of one elementwise compute node: the single
+/// table of CUDA spellings that every generator shares (the per-node
+/// kernels, whole-plan and region fusion, and the fused loop bodies).
+/// `operand(position, node)` spells operand `position` of `op`, which is
+/// the only thing the generators do differently (a buffer read at a
+/// broadcast offset, a register, a capture, or another SSA value); operands
+/// are spelled in order, so a generator that emits statements as it goes
+/// numbers them deterministically. `Ok(None)` is returned for the ops a
+/// generator resolves itself: inputs, constants, the identities (`cast`,
+/// `stop_gradient`, and the layout ops) and everything that is not
+/// elementwise.
+fn cuda_elementwise_formula(
+    op: &TensorOp,
+    operand: impl Fn(usize, TensorNodeId) -> Result<String, String>,
+) -> Result<Option<String>, String> {
+    let binary = |symbol: &str, lhs: TensorNodeId, rhs: TensorNodeId| {
+        Ok::<_, String>(format!(
+            "({} {symbol} {})",
+            operand(0, lhs)?,
+            operand(1, rhs)?
+        ))
+    };
+    Ok(Some(match op {
+        TensorOp::Add { lhs, rhs } => binary("+", *lhs, *rhs)?,
+        TensorOp::Sub { lhs, rhs } => binary("-", *lhs, *rhs)?,
+        TensorOp::Mul { lhs, rhs } => binary("*", *lhs, *rhs)?,
+        TensorOp::Div { lhs, rhs } => binary("/", *lhs, *rhs)?,
+        TensorOp::Greater { lhs, rhs } => format!(
+            "(({} > {}) ? 1.0f : 0.0f)",
+            operand(0, *lhs)?,
+            operand(1, *rhs)?
+        ),
+        TensorOp::Compare { lhs, rhs, kind } => format!(
+            "(({} {} {}) ? 1.0f : 0.0f)",
+            operand(0, *lhs)?,
+            kind.operator(),
+            operand(1, *rhs)?
+        ),
+        TensorOp::Where {
+            condition,
+            on_true,
+            on_false,
+        } => format!(
+            "(({} != 0.0f) ? {} : {})",
+            operand(0, *condition)?,
+            operand(1, *on_true)?,
+            operand(2, *on_false)?
+        ),
+        TensorOp::Sqrt { input } => format!("sqrtf({})", operand(0, *input)?),
+        TensorOp::SqrtDerivative { input, order } => {
+            cuda_sqrt_derivative_expression(&operand(0, *input)?, *order)
+        }
+        TensorOp::Powi { input, exponent } => {
+            format!("quabla_powi({}, {exponent}U)", operand(0, *input)?)
+        }
+        TensorOp::UnaryMath { input, kind } => {
+            format!("{}({})", kind.cuda_function(), operand(0, *input)?)
+        }
+        TensorOp::BinaryMath { lhs, rhs, kind } => format!(
+            "{}({}, {})",
+            kind.cuda_function(),
+            operand(0, *lhs)?,
+            operand(1, *rhs)?
+        ),
+        _ => return Ok(None),
+    }))
 }
 
 #[cfg(all(feature = "cuda", target_os = "linux"))]
