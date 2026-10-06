@@ -20,8 +20,8 @@ use cudarc::nvrtc::compile_ptx;
 use cudarc::nccl::{group_end, group_start, Comm as NcclComm, ReduceOp as NcclReduceOp};
 
 use super::{
-    contiguous_strides, cuda_elementwise_formula, cuda_scalar_literal, element_count, region_op,
-    tensor_op_inputs, DynamicTensor, LinalgKind, RegionKind, RegionNode, RegionView, TensorBackend,
+    contiguous_strides, cuda_elementwise_formula, cuda_scalar_literal, element_count,
+    tensor_op_inputs, DynamicTensor, LinalgKind, RegionKind, RegionNode, TensorBackend,
     TensorDType, TensorDeviceBackend, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan,
     TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget, TensorFusionRegion, TensorNodeId, TensorOp,
     TensorReplicaReduction, TensorScanExecutionPlan, TensorScanTarget,
@@ -861,7 +861,7 @@ fn create_nccl_communicators(replicas: &[CudaExecutionPlan]) -> Result<Vec<NcclC
 pub(super) fn validate_cuda_plan(plan: &TensorExecutionPlan) -> Result<(), (String, String)> {
     ensure_cuda_f32_execution(plan).map_err(|message| ("dtype".into(), message))?;
     for (node_id, node) in plan.nodes.iter().enumerate() {
-        let Some(region) = RegionView::of(&node.op) else {
+        let TensorOp::Region(region) = &node.op else {
             continue;
         };
         if !region.is_loop() {
@@ -970,9 +970,10 @@ pub(super) fn validate_cuda_float64_plan(
                 ),
             ));
         }
-        let nested = RegionView::of(&node.op)
-            .map(RegionView::regions)
-            .unwrap_or_default();
+        let nested = match &node.op {
+            TensorOp::Region(region) => region.regions(),
+            _ => Vec::new(),
+        };
         for nested in nested {
             validate_cuda_float64_plan(nested)?;
         }
@@ -8481,7 +8482,7 @@ fn cuda_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Greater { .. } => "greater",
         TensorOp::Compare { kind, .. } => kind.name(),
         TensorOp::Where { .. } => "where",
-        op @ region_op!() => RegionView::expect(op).name(),
+        TensorOp::Region(region) => region.name(),
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::ExtremumAxis { kind, .. } => match kind {

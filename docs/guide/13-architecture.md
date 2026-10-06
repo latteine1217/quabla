@@ -106,7 +106,7 @@ groups:
 | Reductions | `Sum`, `SumAxis`, `Mean`, `MeanAxis`, `ExtremumAxis`, `CumSum` |
 | Shape and indexing | `Reshape`, `Transpose`, `Concat`, `Slice`, `PadSlice`, `Gather`, `ScatterAdd`, `Broadcast` |
 | Linear algebra | `Matmul`, `Solve`, `Cholesky`, `CholeskyAd`, `Triangular`, `Linalg { kind }` |
-| Regions | `Cond`, `Fori`, `ForiJvp`, `ForiVjp`, `ForiVjpJvp`, `While`, `Scan`, `ScanVjp`, `ScanVjpJvp` |
+| Regions | `Region(RegionNode)`, whose `RegionKind` is `Cond`, `Fori`, `ForiJvp`, `ForiVjp`, `ForiVjpJvp`, `While`, `Scan`, `ScanVjp`, or `ScanVjpJvp` |
 | Custom rules | `Custom` |
 
 Many user-facing functions are *compositions*, not ops: `maximum` is a
@@ -117,8 +117,14 @@ small.
 
 ### Regions
 
-A region node owns frozen sub-plans and a list of *captures* that bind parent
-nodes to the region's input names. For example `TensorForiExecutionPlan`
+A region node (`TensorOp::Region`, defined in `tensor_ir/region.rs`) owns
+frozen sub-plans and a list of *captures* that bind parent nodes to the
+region's input names. Its `RegionKind` holds the kind's operand slots (the
+predicate, or the carry and its tangents and cotangents), its plan, and,
+for multi-result kinds, the selected result and group; `RegionNode` answers
+the kind-independent questions (operands, group, name, frozen plans) once,
+while evaluation, differentiation, and batching match on the kind. For
+example `TensorForiExecutionPlan`
 holds the bounds, the body plan, and the names of the carry and index
 inputs; `TensorCondExecutionPlan` holds two branch plans;
 `TensorWhileExecutionPlan` holds a predicate and a body region;

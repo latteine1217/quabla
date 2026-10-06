@@ -17,11 +17,10 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
-    adam_element, region_op, sgd_element, sqrt_derivative_coefficient, AdamArith, AdamCoefficients,
-    AdamOrder, BinaryMathKind, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, RegionKind,
-    RegionNode, RegionView, TensorBackend, TensorComparison, TensorConstant, TensorDType,
-    TensorDeviceBackend, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorOp,
-    UnaryMathKind,
+    adam_element, sgd_element, sqrt_derivative_coefficient, AdamArith, AdamCoefficients, AdamOrder,
+    BinaryMathKind, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, RegionKind, RegionNode,
+    TensorBackend, TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend,
+    TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
 };
 
 /// Apple MLX backend for the supported rank-N Tensor IR primitives.
@@ -2449,7 +2448,7 @@ fn mlx_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Greater { .. } => "greater",
         TensorOp::Compare { kind, .. } => kind.name(),
         TensorOp::Where { .. } => "where",
-        op @ region_op!() => RegionView::expect(op).name(),
+        TensorOp::Region(region) => region.name(),
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::ExtremumAxis { kind, .. } => match kind {

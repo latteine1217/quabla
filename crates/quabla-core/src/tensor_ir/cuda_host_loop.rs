@@ -45,7 +45,7 @@ use cudarc::driver::{
 };
 
 use super::super::{
-    element_count, DynamicTensor, RegionKind, RegionNode, RegionView, SymbolicCotangent,
+    element_count, DynamicTensor, RegionKind, RegionNode, SymbolicCotangent,
     TensorCarryCheckpoints, TensorExecutionPlan, TensorForiVjpTarget, TensorIr, TensorNodeId,
     TensorOp, TensorScanTarget, TensorScanVjpTarget,
 };
@@ -194,7 +194,9 @@ enum HostLoopKind {
 /// Group key of a loop node whose sibling nodes share one execution: group
 /// ids are compared within one op kind.
 fn loop_group_key(op: &TensorOp) -> Option<(&'static str, usize)> {
-    let region = RegionView::of(op)?;
+    let TensorOp::Region(region) = op else {
+        return None;
+    };
     Some((region.name(), region.group()?))
 }
 
@@ -1128,8 +1130,8 @@ fn loop_captures<'a, T: CudaReal>(
     op: &TensorOp,
     values: &'a [Option<CudaSlice<T>>],
 ) -> Result<BTreeMap<String, &'a CudaSlice<T>>, String> {
-    let captures = match RegionView::of(op) {
-        Some(region) if region.is_loop() => region.captures(),
+    let captures = match op {
+        TensorOp::Region(region) if region.is_loop() => &region.captures,
         _ => return Err("CUDA host-driven loop node has no captures".to_string()),
     };
     named_values(captures, values)

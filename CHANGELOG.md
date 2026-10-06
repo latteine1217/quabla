@@ -33,6 +33,15 @@ deprecated names keep working until 1.0 (see
   (`tensor_ir/elementwise.rs`): its value, derivative rules, CUDA spelling
   and admission, MLX lowering, and constant folding. Values, derivatives,
   and IR text are unchanged.
+- Internal: the nine control-flow region ops (`Cond`, `While`, `Fori`,
+  `ForiJvp`, `ForiVjp`, `ForiVjpJvp`, `Scan`, `ScanVjp`, `ScanVjpJvp`) are
+  one IR op, `Region`, whose kind holds the kind's operand slots, plan, and
+  result selection beside the captures every kind shares
+  (`tensor_ir/region.rs`). Operand lists and remapping, groups, CSE and
+  placement exclusion, op names, IR text, and the MLX and CUDA plan
+  validators handle every region kind once; evaluation, differentiation,
+  and batching still match on the kind. Values, derivatives, errors, and
+  IR text are unchanged.
 - Tests only: the GPU test gates `QUABLA_MLX_TEST`, `QUABLA_CUDA_TEST`, and
   `QUABLA_CUDA_NCCL_TEST` are on exactly when the variable is `1`, in the
   Python suites and the Rust tests alike. Some suites (most of

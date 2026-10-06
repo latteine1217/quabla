@@ -24,7 +24,7 @@ pub use extremum::TensorExtremum;
 mod host_storage;
 pub use host_storage::HostTensorStorage;
 mod region;
-use region::{region_op, RegionKind, RegionNode, RegionView};
+use region::{RegionKind, RegionNode};
 mod region_batching;
 #[cfg(test)]
 mod region_batching_tests;
@@ -2981,7 +2981,7 @@ impl TensorIr {
         groups: &mut HashMap<usize, usize>,
     ) -> Result<TensorNodeId, String> {
         let mut op = remap_tensor_op(&node.op, &|id| remap.get(&id).copied())?;
-        if let Some(group) = region::group_mut(&mut op) {
+        if let Some(group) = tensor_op_group_mut(&mut op) {
             *group = *groups.entry(*group).or_insert(self.nodes.len());
         }
         Ok(self.push_node(op, node.shape.clone(), node.dtype, node.weak))
@@ -9270,7 +9270,10 @@ impl TensorIr {
             .enumerate()
             .map(|(id, node)| match &node.op {
                 TensorOp::Input { name } => {
-                    format!("%{id} = input[name={name}] : {}", format_tensor_type(&node.shape, node.dtype))
+                    format!(
+                        "%{id} = input[name={name}] : {}",
+                        format_tensor_type(&node.shape, node.dtype)
+                    )
                 }
                 TensorOp::ScalarConstant { value } => {
                     format!(
@@ -9292,55 +9295,9 @@ impl TensorIr {
                     "%{id} = add(%{lhs}, %{rhs}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::Region(RegionNode { kind: RegionKind::ScanVjp { target, group, .. }, .. }) => format!(
-                    "%{id} = scan_vjp(group={group}, target={target:?}) : {}",
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::Region(RegionNode { kind: RegionKind::ScanVjpJvp { target, group, .. }, .. }) => format!(
-                    "%{id} = scan_vjp_jvp(group={group}, target={target:?}) : {}",
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::Region(RegionNode { kind: RegionKind::Cond { predicate, branches }, captures, .. }) => format!(
-                    "%{id} = cond(%{predicate}, captures={captures:?}, true_nodes={}, false_nodes={}) : {}",
-                    branches.true_node_count(),
-                    branches.false_node_count(),
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::Region(RegionNode { kind: RegionKind::While { carry, loop_plan }, captures, .. }) => format!(
-                    "%{id} = while(carry=%{carry}, captures={captures:?}, predicate_nodes={}, body_nodes={}) : {}",
-                    loop_plan.predicate.plan.node_count(),
-                    loop_plan.body.plan.node_count(),
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::Region(RegionNode { kind: RegionKind::Fori { carry, loop_plan }, captures, .. }) => format!(
-                    "%{id} = fori(carry=%{carry}, lower={}, upper={}, captures={captures:?}, body_nodes={}) : {}",
-                    loop_plan.lower,
-                    loop_plan.upper,
-                    loop_plan.body.plan.node_count(),
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::Region(RegionNode { kind: RegionKind::ForiJvp { carry, carry_tangent, loop_plan }, captures, tangent_captures, .. }) => format!(
-                    "%{id} = fori_jvp(carry=%{carry}, carry_tangent=%{carry_tangent}, lower={}, upper={}, captures={captures:?}, tangent_captures={tangent_captures:?}, body_nodes={}) : {}",
-                    loop_plan.lower,
-                    loop_plan.upper,
-                    loop_plan.body.plan.node_count(),
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::Region(RegionNode { kind: RegionKind::ForiVjp { target, group, .. }, .. }) => format!(
-                    "%{id} = fori_vjp(group={group}, target={target:?}) : {}",
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::Region(RegionNode { kind: RegionKind::ForiVjpJvp { target, group, .. }, .. }) => format!(
-                    "%{id} = fori_vjp_jvp(group={group}, target={target:?}) : {}",
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
-                TensorOp::Region(RegionNode { kind: RegionKind::Scan { scan_plan, target, group, .. }, captures, .. }) => format!(
-                    "%{id} = scan(group={group}, target={target:?}, lower={}, upper={}, captures={captures:?}, body_nodes={}) : {}",
-                    scan_plan.lower,
-                    scan_plan.upper,
-                    scan_plan.body.plan.node_count(),
-                    format_tensor_type(&node.shape, node.dtype)
-                ),
+                TensorOp::Region(region) => {
+                    region.lower_text(id, &format_tensor_type(&node.shape, node.dtype))
+                }
                 TensorOp::Sub { lhs, rhs } => format!(
                     "%{id} = sub(%{lhs}, %{rhs}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
@@ -9371,7 +9328,10 @@ impl TensorIr {
                     format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Sum { input } => {
-                    format!("%{id} = sum(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
+                    format!(
+                        "%{id} = sum(%{input}) : {}",
+                        format_tensor_type(&node.shape, node.dtype)
+                    )
                 }
                 TensorOp::SumAxis { input, axis } => format!(
                     "%{id} = sum(%{input}, axis={axis}) : {}",
@@ -9386,8 +9346,14 @@ impl TensorIr {
                     "%{id} = matmul(%{lhs}, %{rhs}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
-                TensorOp::CholeskyAd { inputs, kind } => format!("%{id} = cholesky_{kind:?}({inputs:?}) : {}", format_tensor_type(&node.shape, node.dtype)),
-                TensorOp::Cholesky { input } => format!("%{id} = cholesky(%{input}) : {}", format_tensor_type(&node.shape, node.dtype)),
+                TensorOp::CholeskyAd { inputs, kind } => format!(
+                    "%{id} = cholesky_{kind:?}({inputs:?}) : {}",
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
+                TensorOp::Cholesky { input } => format!(
+                    "%{id} = cholesky(%{input}) : {}",
+                    format_tensor_type(&node.shape, node.dtype)
+                ),
                 TensorOp::Solve { matrix, rhs } => format!(
                     "%{id} = solve(%{matrix}, %{rhs}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
@@ -9403,17 +9369,26 @@ impl TensorIr {
                     format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Sqrt { input } => {
-                    format!("%{id} = sqrt(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
+                    format!(
+                        "%{id} = sqrt(%{input}) : {}",
+                        format_tensor_type(&node.shape, node.dtype)
+                    )
                 }
                 TensorOp::SqrtDerivative { input, order } => format!(
                     "%{id} = sqrt_derivative(%{input}, order={order}) : {}",
                     format_tensor_type(&node.shape, node.dtype)
                 ),
                 TensorOp::Reshape { input } => {
-                    format!("%{id} = reshape(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
+                    format!(
+                        "%{id} = reshape(%{input}) : {}",
+                        format_tensor_type(&node.shape, node.dtype)
+                    )
                 }
                 TensorOp::Mean { input } => {
-                    format!("%{id} = mean(%{input}) : {}", format_tensor_type(&node.shape, node.dtype))
+                    format!(
+                        "%{id} = mean(%{input}) : {}",
+                        format_tensor_type(&node.shape, node.dtype)
+                    )
                 }
                 TensorOp::MeanAxis { input, axis } => format!(
                     "%{id} = mean(%{input}, axis={axis}) : {}",
@@ -14397,8 +14372,7 @@ impl TensorExecutionPlan {
                         "MLX backend does not support non-finite constants".into(),
                     ))
                 }
-                op @ region_op!() => {
-                    let region = RegionView::expect(op);
+                TensorOp::Region(region) => {
                     for plan in region.regions().into_iter().chain(region.derived_regions()) {
                         plan.validate_mlx()?;
                     }
@@ -15285,10 +15259,10 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                 TensorOp::Broadcast { input } => {
                     specialized.broadcast_to(mapped(*input)?, node.shape.clone())?
                 }
-                op @ region_op!() => {
+                TensorOp::Region(region) => {
                     return Err(format!(
                         "batch specialization does not yet transform {} regions",
-                        RegionView::expect(op).label()
+                        region.label()
                     ))
                 }
                 TensorOp::Custom { .. } => {
@@ -15636,7 +15610,7 @@ fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
             on_true,
             on_false,
         } => vec![*condition, *on_true, *on_false],
-        op @ region_op!() => RegionView::expect(op).operands(),
+        TensorOp::Region(region) => region.operands(),
         TensorOp::Sum { input }
         | TensorOp::SumAxis { input, .. }
         | TensorOp::ExtremumAxis { input, .. }
@@ -16019,9 +15993,25 @@ fn tensor_forward_last_uses(
 }
 
 /// The execution group of a region node whose sibling nodes share one
-/// region execution; see [`RegionView::group`].
+/// region execution; see [`RegionNode::group`].
 fn tensor_op_group(op: &TensorOp) -> Option<usize> {
-    RegionView::of(op).and_then(RegionView::group)
+    match op {
+        TensorOp::Region(region) => region.group(),
+        _ => None,
+    }
+}
+
+/// The group of a multi-result node, mutably: a region execution group
+/// ([`RegionNode::group`]) or the call group of a `Custom` node. Both are the
+/// node id of the group's first member, so splicing renumbers them alike.
+/// Only region groups are executed; plan compilation aliases `Custom`
+/// nodes, so the evaluators' group caches never see a call group.
+fn tensor_op_group_mut(op: &mut TensorOp) -> Option<&mut usize> {
+    match op {
+        TensorOp::Region(region) => region.group_mut(),
+        TensorOp::Custom { group, .. } => Some(group),
+        _ => None,
+    }
 }
 
 fn tensor_forward_capture_values(
@@ -16102,7 +16092,7 @@ fn infer_tensor_placement(
             on_true,
             on_false,
         } => merge(&[*condition, *on_true, *on_false]),
-        region_op!() | TensorOp::Custom { .. } => Err(format!(
+        TensorOp::Region(_) | TensorOp::Custom { .. } => Err(format!(
             "kernel node {node_id} contains {} regions; placement propagation requires explicit region lowering",
             tensor_op_name(&node.op)
         )),
@@ -16560,7 +16550,7 @@ fn tensor_op_name(op: &TensorOp) -> &'static str {
         TensorOp::Greater { .. } => "greater",
         TensorOp::Compare { kind, .. } => kind.name(),
         TensorOp::Where { .. } => "where",
-        op @ region_op!() => RegionView::expect(op).name(),
+        TensorOp::Region(region) => region.name(),
         TensorOp::Sum { .. } => "sum",
         TensorOp::SumAxis { .. } => "sum_axis",
         TensorOp::ExtremumAxis { kind, .. } => match kind {
@@ -17036,7 +17026,7 @@ fn pure_tensor_op_cse_key(op: &TensorOp, shape: &[usize]) -> Option<PureTensorOp
         TensorOp::Input { .. }
         | TensorOp::Constant { .. }
         | TensorOp::CholeskyAd { .. }
-        | region_op!()
+        | TensorOp::Region(_)
         | TensorOp::Custom { .. } => return None,
         TensorOp::ScalarConstant { value } => arguments[0] = value.to_bits(),
         TensorOp::Add { lhs, rhs }
@@ -17291,12 +17281,12 @@ fn remap_tensor_op(
             on_true: remap_node(*on_true)?,
             on_false: remap_node(*on_false)?,
         }),
-        op @ region_op!() => {
-            let mut op = op.clone();
-            for operand in region::region_operands_mut(&mut op).into_iter().flatten() {
+        TensorOp::Region(region) => {
+            let mut region = region.clone();
+            for operand in region.operands_mut() {
                 *operand = remap_node(*operand)?;
             }
-            Ok(op)
+            Ok(TensorOp::Region(region))
         }
         TensorOp::Sum { input } => Ok(TensorOp::Sum {
             input: remap_node(*input)?,
