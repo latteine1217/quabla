@@ -6,3 +6,10 @@ resolver = "2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/latteine1217/quabla"
+
+# Cargo's release default strips debug info with the platform `strip`. On
+# macOS 27 (ld-27037) that leaves the extension module with a misaligned
+# LINKEDIT string pool, so a source build (`pip install` from the sdist)
+# fails to import. Keeping the symbols costs about 150 KB per module.
+[profile.release]
+strip = false

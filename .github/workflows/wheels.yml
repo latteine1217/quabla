@@ -233,6 +233,14 @@ jobs:
 
   # One upload covers both distributions: the OIDC token is scoped to every
   # project whose trusted publisher names this workflow and environment.
+  #
+  # PyPI keeps one pending publisher per (owner, repository, workflow,
+  # environment), and a token exchange turns at most one pending publisher
+  # into a project. Publishing both distributions to an index for the first
+  # time therefore takes two runs of the job: register the pending publisher
+  # of `quabla` and run it (`quabla` is created, `quabla-mlx` is rejected),
+  # then register the pending publisher of `quabla-mlx` and re-run the failed
+  # job, which skips the files that already exist.
   publish-testpypi:
     name: publish to TestPyPI
     if: startsWith(github.ref, 'refs/tags/v') || inputs.testpypi
@@ -272,3 +280,8 @@ jobs:
           path: dist
           merge-multiple: true
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          # A re-run after a partial first upload (see above) skips the files
+          # PyPI already holds; PyPI never accepts a changed file under an
+          # existing name, so nothing is overwritten.
+          skip-existing: true
