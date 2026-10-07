@@ -1,5 +1,18 @@
 # Rust SciML Runtime Roadmap
 
+## v0.7 Plan (2026-10-07)
+
+v0.7 fixes the robustness gaps found during v0.6 before the v1.0 work of
+the next section starts. Scope chosen by the owner on 2026-10-07.
+
+| # | Item | Status |
+| --- | --- | --- |
+| 1 | CUDA `float64` resource limits: a long composite chain differentiated twice (`jit(hessian(f), device="cuda", precision="float64")`) was reported to fail with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES` in a fused region, likely from register pressure; reproduce it, then size fused regions or launches so device programs never exceed the device's resources, with an error that names the limit if a single node still cannot fit | Planned |
+| 2 | Validation that covers what runs: `validate_mlx`, `validate_cuda_plan`, and `validate_cuda_float64_plan` check different subsets of a region's plans (MLX does not validate the symbolic loop-derivative plans it executes; the CUDA `float64` validator checks only traced regions), so an unsupported program can fail during execution instead of at compile time; make each backend validate every plan it will execute, with one shared traversal of a region's plans | Planned |
+
+Also carried: the Linux CUDA check of the `quabla` 0.6.1 wheel installed
+from PyPI.
+
 ## v0.6 Plan (2026-10-07)
 
 v0.6 lets custom derivative rules compose with control flow and pays down
@@ -34,7 +47,7 @@ derivative engines exist only for deprecated v0.1 entry points:
 | --- | --- | --- |
 | S3 | The runtime VJP (`value_and_vjp_many`) and JVP (`jvp_many`) engines in `tensor_ir.rs` serve only the deprecated `tensor_*` functions and pyclasses (`TensorValueAndGradFunction`, `TensorVjpFunction`, `TensorJvpFunction`, `TensorJacobianFunction`, and the others listed in `_compat.py`). Rebuild those entry points as adapters over compiled symbolic plans, make the Rust `TensorIr::vjp`/`jvp` test oracles symbolic adapters, and delete the runtime engines (about 1,900 lines). | ulp-level changes in `float64`; `float32` derivatives round per operation instead of once |
 | S4 | The mixed second-order evaluator (`hessian_scalar`/`hvp_scalar`, `evaluate_mixed*`, `MixedTangent`, `SolveReplayPlan`) serves only the deprecated `tensor_hessian_scalar_fn`/`tensor_hvp_scalar_fn`. Move them onto symbolic second derivatives and delete it (about 1,470 lines). | At a non-finite or domain-edge input, NaN appears only in the affected entries instead of every entry |
-| S5 | The legacy `Matrix`/`TraceGraph` engine in `crates/quabla-python/src/trace.rs` (its own trace, AD, and evaluation, about 780 lines of AD) is independent of `TensorIr`. Lower `quabla.legacy` onto `TensorIr` or remove it with the deprecated names. | Depends on the `quabla.legacy` decision for v1.0 |
+| S5 | The legacy `Matrix`/`TraceGraph` engine in `crates/quabla-python/src/trace.rs` (its own trace, AD, and evaluation, about 780 lines of AD) is independent of `TensorIr`. Decided by the owner on 2026-10-07: v1.0 removes `quabla.legacy` together with the deprecated v0.1 names listed in `python/quabla/_compat.py`. | Removed in v1.0 |
 | A1 | `_quabla.Adam.step` (and so `optim.Adam.step`) and the legacy CUDA `cuda_adam_*` kernels keep the v0.1 update order and, on CUDA, `float32` bias corrections, as an explicitly named variant of the shared Adam rule. Switch them to the canonical rule. | ulp-level parameter changes; `optim.Adam.step` and `optim.Adam.update` then agree bit for bit |
 
 ## v0.5 Plan (2026-10-06)
