@@ -7,7 +7,7 @@ traced program on CPU, CUDA, and Apple silicon.**
 [![CI](https://github.com/latteine1217/quabla/actions/workflows/ci.yml/badge.svg)](https://github.com/latteine1217/quabla/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation)
-[![Release v0.6.1](https://img.shields.io/badge/release-v0.6.1-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.6.1)
+[![Release v0.7.0](https://img.shields.io/badge/release-v0.7.0-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.7.0)
 [![Docs](https://img.shields.io/badge/docs-developer%20guide-blue)](https://latteine1217.github.io/quabla/guide/)
 
 **Documentation: [Developer Guide](https://latteine1217.github.io/quabla/guide/)
@@ -70,7 +70,7 @@ running on CUDA or MLX.
 
 ## Status
 
-The latest release is **v0.6.1**, a research-grade pre-release published as
+The latest release is **v0.7.0**, a research-grade pre-release published as
 a git tag, a GitHub Release, and on PyPI as
 [`quabla`](https://pypi.org/project/quabla/) and
 [`quabla-mlx`](https://pypi.org/project/quabla-mlx/) (v0.6.1 is the first
@@ -107,7 +107,11 @@ and `jacobian` work through loops and `vmap` composes with `odeint`,
 stepping with `linalg.cg` or `newton` inside `odeint`), gives the iterative
 solvers forward mode, and differentiates loops in reverse mode twice; eager
 `Tensor` ops now evaluate through the same CPU evaluator as `jit`, which
-fuses elementwise chains.
+fuses elementwise chains. v0.7
+([CHANGELOG](CHANGELOG.md#070---2026-10-07)) launches CUDA kernels within
+their compiled thread limit, so `float64` higher derivatives of long chains
+no longer fail with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`, and makes every
+backend validate all the plans it runs when the function compiles.
 
 All v0.1 call forms keep working. Migrated top-level names emit a
 `DeprecationWarning` once per name on explicit access (`from quabla import *`

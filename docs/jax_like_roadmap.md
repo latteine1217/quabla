@@ -10,8 +10,13 @@ the next section starts. Scope chosen by the owner on 2026-10-07.
 | 1 | CUDA `float64` resource limits: a long composite chain differentiated twice (`jit(hessian(f), device="cuda", precision="float64")`) was reported to fail with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES` in a fused region, likely from register pressure; reproduce it, then size fused regions or launches so device programs never exceed the device's resources, with an error that names the limit if a single node still cannot fit | Done: the cause was the launch, not the region: one-thread-per-element kernels always launched 1024 threads per block, and the fused `float64` Hessian kernel of the reported chain uses 72 registers per thread (73,728 registers for 1024 threads; a block has 65,536), so its limit is 896 threads. Those launches now take the compiled kernel's `CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK` when it is below 1024, which cannot change any result; fixed-shape launches (reductions, tiled matmul, Cholesky, global norm) keep their shape and raise an error naming the limit if it does not fit. Region splitting is not needed: a kernel uses at most 255 registers per thread, so every kernel can launch with at least 256 threads per block on current devices |
 | 2 | Validation that covers what runs: `validate_mlx`, `validate_cuda_plan`, and `validate_cuda_float64_plan` check different subsets of a region's plans (MLX does not validate the symbolic loop-derivative plans it executes; the CUDA `float64` validator checks only traced regions), so an unsupported program can fail during execution instead of at compile time; make each backend validate every plan it will execute, with one shared traversal of a region's plans | Done: one plan walk (`TensorExecutionPlan::try_for_each_plan` in `tensor_ir/region.rs`) pairs each validator's per-plan check with its backend's list of the plans a region node runs: the traced regions plus the loop derivative plans for MLX and the CUDA `float64` check (built at compile time; they are the plans the first run used to build, so results are unchanged), and the `Cond` branches, fused loop bodies, and host-driven loop region programs for CUDA, which now also rejects non-finite constants. Unsupported loop derivatives (a custom rule's non-finite constant or `float32` node, a missing forward-mode rule) raise `UnsupportedOperationError` at compile time |
 
-Also carried: the Linux CUDA check of the `quabla` 0.6.1 wheel installed
-from PyPI.
+Both items shipped in v0.7.0, validated on the CPU, MLX, and a single-GPU
+CUDA host (NVRTC 13.1); the owner chose to release without the two-GPU NCCL
+run with NVRTC 12.6, whose host was fully booked.
+The Linux CUDA check of the `quabla` 0.6.1 wheel installed from PyPI passed.
+Found during v0.7 and left open: a CUDA `float64` full-array `Sum` over many
+blocks accumulates with `atomicAdd`, so its last bits can differ from run to
+run.
 
 ## v0.6 Plan (2026-10-07)
 

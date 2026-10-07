@@ -9,6 +9,14 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-07
+
+The v0.7 plan in `docs/jax_like_roadmap.md`: two robustness fixes found
+during v0.6. CUDA kernels launch within their compiled thread limit, and
+every backend validates all the plans it runs when the function compiles.
+The public API is unchanged, and every program that ran before gives the
+same results.
+
 ### Fixed
 
 - Device validation covers every plan a backend runs. A loop's derivative
@@ -840,7 +848,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/latteine1217/quabla/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/latteine1217/quabla/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/latteine1217/quabla/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/latteine1217/quabla/compare/v0.4.0...v0.5.0
