@@ -9,6 +9,12 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-08
+
+CUDA results are the same on every run: partial sums are added in a fixed
+order instead of with floating-point atomics. The library is otherwise
+unchanged.
+
 ### Fixed
 
 - CUDA results that add partial sums across threads are the same on every
@@ -25,7 +31,10 @@ deprecated names keep working until 1.0 (see
   double with a fixed tree and rounds once. A
   sum or mean over at most 256 elements keeps the bits it had; the others
   differ from earlier runs within rounding, and a long `float32` capture
-  gradient is more accurate. CUDA kernels no longer use floating-point
+  gradient is more accurate. The extra kernel costs little: on a GTX 1660
+  SUPER, sums and means take the same time, and a `float32` loop VJP with a
+  broadcast capture over 262144 lanes takes 4 to 6% longer. CUDA kernels no
+  longer use floating-point
   atomics, so the `float64` compare-and-swap fallback for devices below
   compute capability 6.0 is gone.
 
@@ -868,7 +877,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/latteine1217/quabla/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/latteine1217/quabla/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/latteine1217/quabla/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/latteine1217/quabla/compare/v0.5.0...v0.6.0

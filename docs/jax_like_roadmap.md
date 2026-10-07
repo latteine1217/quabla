@@ -14,7 +14,7 @@ Both items shipped in v0.7.0, validated on the CPU, MLX, and a single-GPU
 CUDA host (NVRTC 13.1); the owner chose to release without the two-GPU NCCL
 run with NVRTC 12.6, whose host was fully booked.
 The Linux CUDA check of the `quabla` 0.6.1 wheel installed from PyPI passed.
-Found during v0.7 and fixed after v0.7.0: CUDA full-array sums over many
+Found during v0.7 and fixed in v0.7.1: CUDA full-array sums over many
 blocks and broadcast loop-capture gradients accumulated with `atomicAdd`, so
 their last bits differed from run to run; they now add in a fixed order (see
 the changelog).
