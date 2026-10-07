@@ -2470,23 +2470,17 @@ fn execute_cuda_device_program<T: CudaReal>(
                     let carry_launch_count = u32::try_from(carry_count).map_err(|_| {
                         format!("CUDA Fori VJP node {node_id} launch exceeds u32 element count")
                     })?;
-                    let mut outputs = Vec::with_capacity(members.len());
-                    for (member_id, member_target) in &members {
-                        let member_count = element_count(&plan.nodes[*member_id].shape)?;
-                        let mut output =
-                            take_cuda_buffer(stream, free_buffers, member_count, *member_id)?;
-                        // A capture that broadcasts into the carry reduces into its output
-                        // with atomicAdd, and a pooled buffer still holds an earlier value, so
-                        // every lane of a capture gradient is cleared; carry-shaped captures are
-                        // overwritten anyway, which keeps this independent of the kernel's
-                        // shape test.
-                        if matches!(member_target, TensorForiVjpTarget::External(_)) {
-                            stream.memset_zeros(&mut output).map_err(|error| {
-                                format!("failed to clear CUDA reduced Fori VJP output: {error:?}")
-                            })?;
-                        }
-                        outputs.push(output);
-                    }
+                    let member_ids = members
+                        .iter()
+                        .map(|(member_id, _)| *member_id)
+                        .collect::<Vec<_>>();
+                    let mut outputs = take_cuda_loop_vjp_outputs(
+                        stream,
+                        free_buffers,
+                        plan,
+                        &member_ids,
+                        carry_count,
+                    )?;
                     let kernel = module
                         .load_function(&cuda_node_function_name(node_id))
                         .map_err(|error| {
@@ -2520,6 +2514,16 @@ fn execute_cuda_device_program<T: CudaReal>(
                         )?;
                     }
                     free_buffers.recycle(tape);
+                    reduce_cuda_capture_gradients(
+                        stream,
+                        module,
+                        node_id,
+                        free_buffers,
+                        plan,
+                        &member_ids,
+                        &mut outputs,
+                        carry_count,
+                    )?;
                     let mut cached = CudaForiVjpCache::default();
                     for ((member_id, _), output) in members.into_iter().zip(outputs) {
                         if member_id == node_id {
@@ -2806,23 +2810,17 @@ fn execute_cuda_device_program<T: CudaReal>(
                     let launch_count = u32::try_from(carry_count).map_err(|_| {
                         format!("CUDA Scan VJP node {node_id} launch exceeds u32 element count")
                     })?;
-                    let mut outputs = Vec::with_capacity(members.len());
-                    for (member_id, member_target) in &members {
-                        let member_count = element_count(&plan.nodes[*member_id].shape)?;
-                        let mut output =
-                            take_cuda_buffer(stream, free_buffers, member_count, *member_id)?;
-                        // A capture that broadcasts into the carry reduces into its output
-                        // with atomicAdd, and a pooled buffer still holds an earlier value, so
-                        // every lane of a capture gradient is cleared; carry-shaped captures are
-                        // overwritten anyway, which keeps this independent of the kernel's
-                        // shape test.
-                        if matches!(member_target, TensorScanVjpTarget::External(_)) {
-                            stream.memset_zeros(&mut output).map_err(|error| {
-                                format!("failed to clear CUDA reduced Scan VJP output: {error:?}")
-                            })?;
-                        }
-                        outputs.push(output);
-                    }
+                    let member_ids = members
+                        .iter()
+                        .map(|(member_id, _)| *member_id)
+                        .collect::<Vec<_>>();
+                    let mut outputs = take_cuda_loop_vjp_outputs(
+                        stream,
+                        free_buffers,
+                        plan,
+                        &member_ids,
+                        carry_count,
+                    )?;
                     let kernel = module
                         .load_function(&cuda_node_function_name(node_id))
                         .map_err(|error| {
@@ -2860,6 +2858,16 @@ fn execute_cuda_device_program<T: CudaReal>(
                         )?;
                     }
                     free_buffers.recycle(tape);
+                    reduce_cuda_capture_gradients(
+                        stream,
+                        module,
+                        node_id,
+                        free_buffers,
+                        plan,
+                        &member_ids,
+                        &mut outputs,
+                        carry_count,
+                    )?;
                     let mut cached = CudaScanVjpCache::default();
                     for ((member_id, _), output) in members.into_iter().zip(outputs) {
                         if member_id == node_id {
@@ -2957,25 +2965,17 @@ fn execute_cuda_device_program<T: CudaReal>(
                     let launch_count = u32::try_from(carry_count).map_err(|_| {
                         format!("CUDA Scan VJP JVP node {node_id} launch exceeds u32 element count")
                     })?;
-                    let mut outputs = Vec::with_capacity(members.len());
-                    for (member_id, member_target) in &members {
-                        let member_count = element_count(&plan.nodes[*member_id].shape)?;
-                        let mut output =
-                            take_cuda_buffer(stream, free_buffers, member_count, *member_id)?;
-                        // A capture that broadcasts into the carry reduces into its output
-                        // with atomicAdd, and a pooled buffer still holds an earlier value, so
-                        // every lane of a capture gradient is cleared; carry-shaped captures are
-                        // overwritten anyway, which keeps this independent of the kernel's
-                        // shape test.
-                        if matches!(member_target, TensorScanVjpTarget::External(_)) {
-                            stream.memset_zeros(&mut output).map_err(|error| {
-                                format!(
-                                    "failed to clear CUDA reduced Scan VJP JVP output: {error:?}"
-                                )
-                            })?;
-                        }
-                        outputs.push(output);
-                    }
+                    let member_ids = members
+                        .iter()
+                        .map(|(member_id, _)| *member_id)
+                        .collect::<Vec<_>>();
+                    let mut outputs = take_cuda_loop_vjp_outputs(
+                        stream,
+                        free_buffers,
+                        plan,
+                        &member_ids,
+                        carry_count,
+                    )?;
                     let kernel = module
                         .load_function(&cuda_node_function_name(node_id))
                         .map_err(|error| {
@@ -3003,6 +3003,16 @@ fn execute_cuda_device_program<T: CudaReal>(
                     )?;
                     free_buffers.recycle(carry_tape);
                     free_buffers.recycle(tangent_tape);
+                    reduce_cuda_capture_gradients(
+                        stream,
+                        module,
+                        node_id,
+                        free_buffers,
+                        plan,
+                        &member_ids,
+                        &mut outputs,
+                        carry_count,
+                    )?;
                     let mut cached = CudaScanVjpJvpCache::default();
                     for ((member_id, _), output) in members.into_iter().zip(outputs) {
                         if member_id == node_id {
@@ -3143,6 +3153,13 @@ fn execute_cuda_device_program<T: CudaReal>(
                         blas,
                     },
                 )?;
+                if let TensorOp::Sum { input } | TensorOp::Mean { input } = &node.op {
+                    let blocks =
+                        cuda_full_reduction_blocks(element_count(&plan.nodes[*input].shape)?);
+                    if blocks > 1 {
+                        launch_cuda_full_reduction_blocks(stream, module, node_id, output)?;
+                    }
+                }
                 release_dead_cuda_values(
                     plan,
                     node_id,
@@ -3656,9 +3673,8 @@ fn cuda_kernel_thread_limit(kernel: &CudaFunction) -> Result<u32, String> {
 ///
 /// It serves kernels whose thread `blockIdx.x * blockDim.x + threadIdx.x`
 /// computes its element alone and returns past the count. Each element is
-/// then the same arithmetic whatever the block size (only the interleaving
-/// of the loop VJP kernels' atomic additions follows the hardware schedule,
-/// in any case), so the block only has to be launchable: it is
+/// then the same arithmetic whatever the block size, so the block only has
+/// to be launchable: it is
 /// `CUDA_ELEMENTWISE_BLOCK` whenever the kernel allows that, and otherwise
 /// the kernel's own limit.
 fn cuda_elementwise_launch(kernel: &CudaFunction, count: u32) -> Result<LaunchConfig, String> {
@@ -3760,14 +3776,6 @@ fn launch_cuda_node<T: CudaReal>(
         }
         _ => None,
     };
-    if matches!(op, TensorOp::Sum { .. } | TensorOp::Mean { .. }) {
-        // All-zero bits are +0.0 in both precisions. A device memset needs no host
-        // staging buffer, and a CUDA graph can record it (a copy from a temporary host
-        // value could not be replayed).
-        stream
-            .memset_zeros(output)
-            .map_err(|error| format!("failed to clear CUDA reduction output: {error:?}"))?;
-    }
     let mut launch = stream.launch_builder(kernel);
     match op {
         TensorOp::ScalarConstant { .. } => {
@@ -3892,9 +3900,12 @@ fn launch_cuda_node<T: CudaReal>(
             let dimensions = dimensions
                 .as_ref()
                 .ok_or_else(|| "CUDA reduction launch dimensions are missing".to_string())?;
+            let blocks = usize::try_from(dimensions[0])
+                .map(cuda_full_reduction_blocks)
+                .map_err(|_| "CUDA reduction input count exceeds usize".to_string())?;
             Some(LaunchConfig {
                 grid_dim: (
-                    u32::try_from(dimensions[0].div_ceil(CUDA_REDUCTION_BLOCK as u64))
+                    u32::try_from(blocks)
                         .map_err(|_| "CUDA reduction grid size exceeds u32".to_string())?,
                     1,
                     1,
@@ -3938,7 +3949,9 @@ fn launch_cuda_node<T: CudaReal>(
     // `cuda_program_source` for this node, and the launch shape matches the emitted variant: the
     // 16x16 tiled grid only when `use_tiled_rank_two_matmul` also selected the tiled kernel,
     // `CUDA_REDUCTION_BLOCK` (256) threads for each reduction block (one block per
-    // output for long-axis reductions), one block per matrix for Cholesky, and a flat grid
+    // output for long-axis reductions; for a full sum or mean the
+    // `cuda_full_reduction_blocks` blocks that size its module array of partials, of which
+    // block `blockIdx.x` writes one entry), one block per matrix for Cholesky, and a flat grid
     // otherwise. Operands are node buffers sized by their node shapes, the output holds `count`
     // elements, and every kernel bounds its index by the count or dimensions it receives, except
     // the Cholesky kernel: it replaces `count` with the per-matrix size and offsets both buffers
@@ -3948,6 +3961,45 @@ fn launch_cuda_node<T: CudaReal>(
         launch.launch(config).map_err(|error| {
             format!("failed to launch CUDA node {}: {error:?}", cuda_op_name(op))
         })?;
+    }
+    Ok(())
+}
+
+/// The second pass of a full `Sum`/`Mean` over several blocks: one block of
+/// `{function}_blocks` adds the per-block partials that the first pass left
+/// in the module array `{function}_partials`, in a fixed order, into `output`.
+fn launch_cuda_full_reduction_blocks<T: CudaReal>(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    node_id: TensorNodeId,
+    output: &mut CudaSlice<T>,
+) -> Result<(), String> {
+    let name = format!("{}_blocks", cuda_node_function_name(node_id));
+    let kernel = module
+        .load_function(&name)
+        .map_err(|error| format!("failed to load CUDA reduction kernel {name}: {error:?}"))?;
+    let config = cuda_fixed_block_launch(
+        &kernel,
+        LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (CUDA_REDUCTION_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        "sum",
+    )?;
+    let count = 1u64;
+    let mut launch = stream.launch_builder(&kernel);
+    launch.arg(output);
+    launch.arg(&count);
+    // SAFETY: the arguments follow the parameter list `(float* out, unsigned long long count)`
+    // emitted by `cuda_fixed_order_sum_source` for this node; `output` is the node's one-element
+    // buffer, written only by block 0 at `index = 0 < count`, and the kernel reads its module
+    // array `{function}_partials` only below the block count it was sized with. The first pass
+    // ran before on the same stream, so every partial is written.
+    unsafe {
+        launch
+            .launch(config)
+            .map_err(|error| format!("failed to launch CUDA reduction kernel {name}: {error:?}"))?;
     }
     Ok(())
 }
@@ -4020,6 +4072,103 @@ fn launch_cuda_fori_jvp_node<T: CudaReal>(
     Ok(())
 }
 
+/// Takes the buffers that a loop VJP kernel writes for the group `member_ids`.
+///
+/// A member whose capture broadcasts into the carry
+/// (`cuda_capture_gradient_is_reduced`) gets a per-lane buffer of
+/// `carry_count` elements; `reduce_cuda_capture_gradients` later sums it into
+/// the member's own buffer. Every other member gets its own buffer, which
+/// the kernel overwrites entirely.
+fn take_cuda_loop_vjp_outputs<T: CudaReal>(
+    stream: &Arc<CudaStream>,
+    free_buffers: &mut CudaBufferPool<T>,
+    plan: &TensorExecutionPlan,
+    member_ids: &[TensorNodeId],
+    carry_count: usize,
+) -> Result<Vec<CudaSlice<T>>, String> {
+    member_ids
+        .iter()
+        .map(|member_id| {
+            let member_count = element_count(&plan.nodes[*member_id].shape)?;
+            let count = if cuda_capture_gradient_is_reduced(carry_count, member_count) {
+                carry_count
+            } else {
+                member_count
+            };
+            take_cuda_buffer(stream, free_buffers, count, *member_id)
+        })
+        .collect()
+}
+
+/// Replaces the per-lane buffer of every broadcast-capture member in
+/// `outputs` (see `take_cuda_loop_vjp_outputs`) with the member's gradient,
+/// summed by the kernel `cuda_capture_gradient_write` emitted after the loop
+/// VJP kernel of `node_id`, and returns the per-lane buffer to the pool.
+#[allow(clippy::too_many_arguments)]
+fn reduce_cuda_capture_gradients<T: CudaReal>(
+    stream: &Arc<CudaStream>,
+    module: &Arc<CudaModule>,
+    node_id: TensorNodeId,
+    free_buffers: &mut CudaBufferPool<T>,
+    plan: &TensorExecutionPlan,
+    member_ids: &[TensorNodeId],
+    outputs: &mut [CudaSlice<T>],
+    carry_count: usize,
+) -> Result<(), String> {
+    let function = cuda_node_function_name(node_id);
+    for (target_index, (member_id, lanes)) in member_ids.iter().zip(outputs).enumerate() {
+        let member_count = element_count(&plan.nodes[*member_id].shape)?;
+        if !cuda_capture_gradient_is_reduced(carry_count, member_count) {
+            continue;
+        }
+        if member_count == 0 {
+            return Err(format!(
+                "CUDA loop VJP node {member_id} reduces {carry_count} lanes into an empty capture"
+            ));
+        }
+        let name = cuda_capture_reduction_function_name(&function, target_index);
+        let kernel = module.load_function(&name).map_err(|error| {
+            format!("failed to load CUDA capture gradient reduction {name}: {error:?}")
+        })?;
+        let launch_count = u32::try_from(member_count).map_err(|_| {
+            format!("CUDA loop VJP node {member_id} reduction exceeds u32 element count")
+        })?;
+        let config = if carry_count / member_count >= CUDA_REDUCTION_BLOCK as usize {
+            cuda_fixed_block_launch(
+                &kernel,
+                LaunchConfig {
+                    grid_dim: (launch_count, 1, 1),
+                    block_dim: (CUDA_REDUCTION_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                "capture gradient reduction",
+            )?
+        } else {
+            cuda_elementwise_launch(&kernel, launch_count)?
+        };
+        let mut output = take_cuda_buffer(stream, free_buffers, member_count, *member_id)?;
+        let count = member_count as u64;
+        let mut launch = stream.launch_builder(&kernel);
+        launch.arg(&*lanes);
+        launch.arg(&mut output);
+        launch.arg(&count);
+        // SAFETY: the arguments follow the parameter list `(const float* lanes, float* out,
+        // unsigned long long count)` emitted by `cuda_fixed_order_sum_source` for this target.
+        // `lanes` holds the carry's `carry_count` elements and the kernel reads it only at
+        // `base + lane < carry_count` (the broadcast offsets of carry entries); `output` holds
+        // `count` elements and each output `index < count` is written by its own thread, or by
+        // its own block, which matches the block shape chosen from the same lane count as the
+        // kernel's.
+        unsafe {
+            launch.launch(config).map_err(|error| {
+                format!("failed to launch CUDA capture gradient reduction {name}: {error:?}")
+            })?;
+        }
+        free_buffers.recycle(std::mem::replace(lanes, output));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_cuda_fori_vjp_node<T: CudaReal>(
     stream: &Arc<CudaStream>,
@@ -4048,6 +4197,8 @@ fn launch_cuda_fori_vjp_node<T: CudaReal>(
     // elements read through offsets derived from those shapes, the tape holds
     // `(upper - lower + 1) * count` elements so every `(step - lower + 1) * count + index` write is
     // in bounds and is written before it is read, and the kernel returns for `index >= count`.
+    // A capture that broadcasts into the carry has a per-lane `out` of `count` elements
+    // (`take_cuda_loop_vjp_outputs`), written only at `index`.
     // Read-only operands are passed by shared reference and written buffers by `&mut`.
     unsafe {
         launch
@@ -4086,7 +4237,9 @@ fn launch_cuda_fori_vjp_group<T: CudaReal>(
     // `output_cotangent`, `carry_tape`, one `out_i` per group member, then the `unsigned long long`
     // counts); every operand is a node buffer of `element_count(node.shape)` elements read through
     // offsets derived from those shapes, the tape holds `(upper - lower + 1) * count` elements and
-    // is written before it is read, and the kernel returns for `index >= count`. Read-only operands
+    // is written before it is read, and the kernel returns for `index >= count`. A capture that
+    // broadcasts into the carry has a per-lane `out_i` of `count` elements
+    // (`take_cuda_loop_vjp_outputs`), written only at `index`. Read-only operands
     // are passed by shared reference and written buffers by `&mut`.
     unsafe {
         launch
@@ -4218,8 +4371,9 @@ fn launch_cuda_scan_vjp_node<T: CudaReal>(
     // `carry_tape`, `out`, then the `unsigned long long` counts); every operand is a node buffer of
     // `element_count(node.shape)` elements read through offsets derived from those shapes, the tape
     // holds `(upper - lower + 1) * carry_count` elements and is written before it is read, and the
-    // kernel returns for `index >= carry_count`. Read-only operands are passed by shared reference
-    // and written buffers by `&mut`.
+    // kernel returns for `index >= carry_count`. A capture that broadcasts into the carry has a
+    // per-lane `out` of `carry_count` elements (`take_cuda_loop_vjp_outputs`), written only at
+    // `index`. Read-only operands are passed by shared reference and written buffers by `&mut`.
     unsafe {
         launch
             .launch(cuda_elementwise_launch(kernel, launch_count)?)
@@ -4264,8 +4418,9 @@ fn launch_cuda_scan_vjp_group<T: CudaReal>(
     // holds `(upper - lower + 1) * carry_count` elements and is written before it is read,
     // `output_cotangent` holds `(upper - lower) * output_count` elements and is read only at
     // `(step - lower) * output_count + lane` with `lane < output_count`, and the kernel returns for
-    // `index >= carry_count`. Read-only operands are passed by shared reference and written
-    // buffers by `&mut`.
+    // `index >= carry_count`. A capture that broadcasts into the carry has a per-lane `out_i` of
+    // `carry_count` elements (`take_cuda_loop_vjp_outputs`), written only at `index`. Read-only
+    // operands are passed by shared reference and written buffers by `&mut`.
     unsafe {
         launch
             .launch(cuda_elementwise_launch(kernel, launch_count)?)
@@ -4322,8 +4477,10 @@ fn launch_cuda_scan_vjp_jvp_group<T: CudaReal>(
     // per group member, then the `unsigned long long` counts); every operand is a node buffer of
     // `element_count(node.shape)` elements read through offsets derived from those shapes, both
     // tapes hold `(upper - lower + 1) * carry_count` elements and are written before they are read,
-    // and the kernel returns for `index >= carry_count`. Read-only operands are passed by shared
-    // reference and written buffers by `&mut`.
+    // and the kernel returns for `index >= carry_count`. A capture that broadcasts into the carry
+    // has a per-lane `out_i` of `carry_count` elements (`take_cuda_loop_vjp_outputs`), written
+    // only at `index`. Read-only operands are passed by shared reference and written buffers by
+    // `&mut`.
     unsafe {
         launch
             .launch(cuda_elementwise_launch(kernel, launch_count)?)
@@ -6475,9 +6632,8 @@ fn cuda_scan_vjp_jvp_group(
     Ok(members)
 }
 
-/// Replay independent lanes once per reverse block. Broadcast capture reductions
-/// retain their original tape and launch timing because atomic accumulation order
-/// is not part of the approved numerical changes.
+/// Replay independent lanes once per reverse block. Loops with a capture that
+/// broadcasts into the carry keep the full tape.
 fn cuda_loop_checkpoint_block(
     lower: usize,
     upper: usize,
@@ -6631,21 +6787,22 @@ fn cuda_fori_vjp_node_kernel_source(
         ),
         _ => return Err("CUDA Fori VJP failed to construct its carry reverse update".to_string()),
     };
-    let target_write = match target {
-        TensorForiVjpTarget::Carry => "out[index] = cotangent;".to_string(),
+    let function = cuda_node_function_name(node_id);
+    let (target_write, reduction) = match target {
+        TensorForiVjpTarget::Carry => ("out[index] = cotangent;".to_string(), String::new()),
         TensorForiVjpTarget::External(name) => {
             let target_shape = loop_plan
                 .external_captures()
                 .get(name)
                 .ok_or_else(|| format!("CUDA Fori VJP has no capture {name:?}"))?;
-            if target_shape == &carry_shape {
-                "out[index] = gradient;".to_string()
-            } else {
-                format!(
-                    "atomicAdd(out + {}, gradient);",
-                    cuda_offset_expression(&carry_shape, target_shape)
-                )
-            }
+            cuda_capture_gradient_write(
+                &function,
+                0,
+                "out",
+                "gradient",
+                &carry_shape,
+                target_shape,
+            )?
         }
     };
     let parameters = captures
@@ -6663,7 +6820,6 @@ fn cuda_fori_vjp_node_kernel_source(
         .join(", ");
     let lower = loop_plan.lower;
     let upper = loop_plan.upper;
-    let function = cuda_node_function_name(node_id);
     let block = cuda_loop_checkpoint_block(
         lower,
         upper,
@@ -6689,7 +6845,7 @@ fn cuda_fori_vjp_node_kernel_source(
                 float contribution = {gradient_expression};\n\\
                 {reverse_update}\n\\
             }}\n\\
-            {target_write}\n}}\n"))
+            {target_write}\n}}\n{reduction}"))
 }
 fn cuda_fori_vjp_group_kernel_source(
     node_id: TensorNodeId,
@@ -6736,6 +6892,8 @@ fn cuda_fori_vjp_group_kernel_source(
     let mut gradient_declarations = String::new();
     let mut contribution_updates = String::new();
     let mut target_writes = String::new();
+    let mut reductions = String::new();
+    let function = cuda_node_function_name(node_id);
     for (target_index, target) in targets.iter().enumerate() {
         match target {
             TensorForiVjpTarget::Carry => {
@@ -6759,16 +6917,17 @@ fn cuda_fori_vjp_group_kernel_source(
                 contribution_updates.push_str(&format!(
                     "gradient_{target_index} += {gradient_expression};\n"
                 ));
-                if target_shape == &carry_shape {
-                    target_writes.push_str(&format!(
-                        "out_{target_index}[index] = gradient_{target_index};\n"
-                    ));
-                } else {
-                    target_writes.push_str(&format!(
-                        "atomicAdd(out_{target_index} + {}, gradient_{target_index});\n",
-                        cuda_offset_expression(&carry_shape, target_shape)
-                    ));
-                }
+                let (write, reduction) = cuda_capture_gradient_write(
+                    &function,
+                    target_index,
+                    &format!("out_{target_index}"),
+                    &format!("gradient_{target_index}"),
+                    &carry_shape,
+                    target_shape,
+                )?;
+                target_writes.push_str(&write);
+                target_writes.push('\n');
+                reductions.push_str(&reduction);
             }
         }
     }
@@ -6792,7 +6951,6 @@ fn cuda_fori_vjp_group_kernel_source(
         .join(", ");
     let lower = loop_plan.lower;
     let upper = loop_plan.upper;
-    let function = cuda_node_function_name(node_id);
     let block = cuda_loop_checkpoint_block(
         lower,
         upper,
@@ -6819,7 +6977,7 @@ fn cuda_fori_vjp_group_kernel_source(
                 cotangent = {carry_gradient_expression};\n\\
             }}\n\\
             {target_writes}\
-        }}\n"))
+        }}\n{reductions}"))
 }
 fn cuda_fori_vjp_jvp_node_kernel_source(
     node_id: TensorNodeId,
@@ -7389,21 +7547,22 @@ fn cuda_scan_vjp_node_kernel_source(
                 carry_cotangent = {carry_reverse_expression} + output_reverse_contribution;"
         ),
     };
-    let target_write = match target {
-        TensorScanVjpTarget::Carry => "out[index] = carry_cotangent;".to_string(),
+    let function = cuda_node_function_name(node_id);
+    let (target_write, reduction) = match target {
+        TensorScanVjpTarget::Carry => ("out[index] = carry_cotangent;".to_string(), String::new()),
         TensorScanVjpTarget::External(name) => {
             let target_shape = scan_plan
                 .external_captures()
                 .get(name)
                 .ok_or_else(|| format!("CUDA Scan VJP has no capture {name:?}"))?;
-            if target_shape == &carry_shape {
-                "out[index] = gradient;".to_string()
-            } else {
-                format!(
-                    "atomicAdd(out + {}, gradient);",
-                    cuda_offset_expression(&carry_shape, target_shape)
-                )
-            }
+            cuda_capture_gradient_write(
+                &function,
+                0,
+                "out",
+                "gradient",
+                &carry_shape,
+                target_shape,
+            )?
         }
     };
     let output_reverse_update = if output_reverse_expression.is_empty() {
@@ -7450,7 +7609,6 @@ fn cuda_scan_vjp_node_kernel_source(
         .join(", ");
     let lower = scan_plan.lower;
     let upper = scan_plan.upper;
-    let function = cuda_node_function_name(node_id);
     let block = cuda_loop_checkpoint_block(
         lower,
         upper,
@@ -7493,7 +7651,7 @@ fn cuda_scan_vjp_node_kernel_source(
                 float contribution = ({carry_target_expression} + output_contribution);\n\\
                 {reverse_update}\n\\
             }}\n\\
-            {target_write}\n}}\n"))
+            {target_write}\n}}\n{reduction}"))
 }
 fn cuda_scan_vjp_group_kernel_source(
     node_id: TensorNodeId,
@@ -7579,6 +7737,8 @@ fn cuda_scan_vjp_group_kernel_source(
     let mut gradient_declarations = String::new();
     let mut contribution_updates = String::new();
     let mut target_writes = String::new();
+    let mut reductions = String::new();
+    let function = cuda_node_function_name(node_id);
     for (target_index, target) in targets.iter().enumerate() {
         match target {
             TensorScanVjpTarget::Carry => {
@@ -7615,16 +7775,17 @@ fn cuda_scan_vjp_group_kernel_source(
                 contribution_updates.push_str(&format!(
                     "gradient_{target_index} += ({carry_expression} + {output_expression});\n"
                 ));
-                if target_shape == &carry_shape {
-                    target_writes.push_str(&format!(
-                        "out_{target_index}[index] = gradient_{target_index};\n"
-                    ));
-                } else {
-                    target_writes.push_str(&format!(
-                        "atomicAdd(out_{target_index} + {}, gradient_{target_index});\n",
-                        cuda_offset_expression(&carry_shape, target_shape)
-                    ));
-                }
+                let (write, reduction) = cuda_capture_gradient_write(
+                    &function,
+                    target_index,
+                    &format!("out_{target_index}"),
+                    &format!("gradient_{target_index}"),
+                    &carry_shape,
+                    target_shape,
+                )?;
+                target_writes.push_str(&write);
+                target_writes.push('\n');
+                reductions.push_str(&reduction);
             }
         }
     }
@@ -7652,7 +7813,6 @@ fn cuda_scan_vjp_group_kernel_source(
         .join(", ");
     let lower = scan_plan.lower;
     let upper = scan_plan.upper;
-    let function = cuda_node_function_name(node_id);
     let block = cuda_loop_checkpoint_block(
         lower,
         upper,
@@ -7686,7 +7846,7 @@ fn cuda_scan_vjp_group_kernel_source(
                 carry_cotangent = ({carry_reverse_expression} + {output_reverse_expression});\n\\
             }}\n\\
             {target_writes}\
-        }}\n"))
+        }}\n{reductions}"))
 }
 fn cuda_scan_vjp_jvp_group_kernel_source(
     node_id: TensorNodeId,
@@ -7797,6 +7957,8 @@ fn cuda_scan_vjp_jvp_group_kernel_source(
     let mut gradient_declarations = String::new();
     let mut gradient_updates = String::new();
     let mut target_writes = String::new();
+    let mut reductions = String::new();
+    let function = cuda_node_function_name(node_id);
     for (target_index, target) in targets.iter().enumerate() {
         let name = match *target {
             TensorScanVjpTarget::Carry => &scan.carry_name,
@@ -7844,15 +8006,19 @@ fn cuda_scan_vjp_jvp_group_kernel_source(
             TensorScanVjpTarget::Carry => target_writes.push_str(&format!(
                 "out_{target_index}[index] = carry_cotangent_tangent; "
             )),
-            TensorScanVjpTarget::External(_) if target_shape == shape => {
-                target_writes.push_str(&format!(
-                    "out_{target_index}[index] = gradient_{target_index}; "
-                ));
+            TensorScanVjpTarget::External(_) => {
+                let (write, reduction) = cuda_capture_gradient_write(
+                    &function,
+                    target_index,
+                    &format!("out_{target_index}"),
+                    &format!("gradient_{target_index}"),
+                    &shape,
+                    &target_shape,
+                )?;
+                target_writes.push_str(&write);
+                target_writes.push(' ');
+                reductions.push_str(&reduction);
             }
-            TensorScanVjpTarget::External(_) => target_writes.push_str(&format!(
-                "atomicAdd(out_{target_index} + {}, gradient_{target_index}); ",
-                cuda_offset_expression(&shape, &target_shape)
-            )),
         }
     }
     let carry_directional = plan
@@ -7931,7 +8097,6 @@ fn cuda_scan_vjp_jvp_group_kernel_source(
         .join(", ");
     let lower = scan.lower;
     let upper = scan.upper;
-    let function = cuda_node_function_name(node_id);
     let block = cuda_loop_checkpoint_block(
         lower,
         upper,
@@ -7953,7 +8118,7 @@ fn cuda_scan_vjp_jvp_group_kernel_source(
         float carry = initial_carry[index]; float carry_tangent = initial_carry_tangent[index]; {tape_forward}\n\
             float carry_cotangent = final_carry_cotangent[index]; float carry_cotangent_tangent = final_carry_cotangent_tangent[index]; {gradient_declarations}\n\
         for (unsigned long long reverse_step = {upper}ULL; reverse_step > {lower}ULL; --reverse_step) {{ unsigned long long step = reverse_step - 1ULL; float loop_index = (float)step; {tape_reverse} {reverse_output_setup} {gradient_updates} float nc = ({primal_carry} + {primal_output}); float nct = {next_cotangent_tangent}; carry_cotangent = nc; carry_cotangent_tangent = nct; }}\n\
-        {target_writes}\n}}\n"))
+        {target_writes}\n}}\n{reductions}"))
 }
 /// `host_driven` lists loop nodes that run as host-driven region loops; they
 /// launch their regions' own programs, so no node kernel is emitted for them.
@@ -8152,14 +8317,39 @@ fn cuda_program_source(
                     .collect::<Vec<_>>();
                 cuda_scan_vjp_jvp_group_kernel_source(node_id, scan_hvp, captures, &targets)?
             }
-            TensorOp::Sum { .. } | TensorOp::Mean { .. } => {
+            // Each block sums its 256 entries with a fixed tree. One block stores the
+            // result (`0.0f +` keeps the value of the atomic add into a cleared output
+            // this kernel used before, which turned a -0 sum into +0). Several blocks
+            // store their partials in a module array, and `{function}_blocks` adds them
+            // in a fixed order: an atomic add of the partials would round in whatever
+            // order the blocks finish, so results differed from run to run.
+            TensorOp::Sum { input } | TensorOp::Mean { input } => {
                 let scale = if matches!(&node.op, TensorOp::Mean { .. }) {
                     " / (float)count".to_string()
                 } else {
                     String::new()
                 };
+                let blocks = cuda_full_reduction_blocks(element_count(&plan.nodes[*input].shape)?);
+                let (partials, store, finish) = if blocks == 1 {
+                    (String::new(), format!("out[0] = 0.0f + partial[0]{scale};"), String::new())
+                } else {
+                    let array = format!("{function}_partials");
+                    (
+                        format!("__device__ float {array}[{blocks}];\n"),
+                        format!("{array}[blockIdx.x] = partial[0]{scale};"),
+                        cuda_fixed_order_sum_source(
+                            &format!("{function}_blocks"),
+                            "",
+                            &array,
+                            "0ULL",
+                            "k",
+                            blocks,
+                            true,
+                        ),
+                    )
+                };
                 format!(
-                    "extern \"C\" __global__ void {function}(const float* input, float* out, unsigned long long count) {{\n\
+                    "{partials}extern \"C\" __global__ void {function}(const float* input, float* out, unsigned long long count) {{\n\
                         __shared__ float partial[256];\n\
                         unsigned int thread = threadIdx.x;\n\
                         unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + thread;\n\
@@ -8169,7 +8359,7 @@ fn cuda_program_source(
                             if (thread < stride) partial[thread] += partial[thread + stride];\n\
                             __syncthreads();\n\
                         }}\n\
-                        if (thread == 0U) atomicAdd(out, partial[0]{scale});\n}}\n"
+                        if (thread == 0U) {store}\n}}\n{finish}"
                 )
             }
             // One thread scans one line along `axis` with `__fadd_rn`, so each running sum
@@ -8565,6 +8755,165 @@ fn cuda_extremum_axis_kernel_source(
     }
 }
 
+/// The blocks of the full `Sum`/`Mean` kernel for `count` input elements: one
+/// per `CUDA_REDUCTION_BLOCK` entries, and one for an empty input, whose
+/// block then stores the empty sum (or `0 / 0` mean) itself.
+fn cuda_full_reduction_blocks(count: usize) -> usize {
+    count.div_ceil(CUDA_REDUCTION_BLOCK as usize).max(1)
+}
+
+/// A kernel `{function}({parameters}float* out, unsigned long long count)`
+/// that stores in each of the `count` outputs the sum of its `extent` values
+/// `{values}[base + lane]`, where `base` and `lane` are C expressions of the
+/// output `index` and of the value position `k`.
+///
+/// The summation order is fixed, so every run returns the same bits. The
+/// serial shape mirrors the short sum-axis kernel: one thread adds the values
+/// of an output from `+0` in increasing `k`, in the kernel's precision. The
+/// block shape mirrors the long sum-axis kernel: a block of
+/// `CUDA_REDUCTION_BLOCK` threads owns each output, each thread adds a strided
+/// share in double and a shared-memory tree combines the shares, which bounds
+/// the rounding error of long float32 sums; the result is rounded once.
+fn cuda_fixed_order_sum_source(
+    function: &str,
+    parameters: &str,
+    values: &str,
+    base: &str,
+    lane: &str,
+    extent: usize,
+    block: bool,
+) -> String {
+    if block {
+        format!(
+            r#"extern "C" __global__ void {function}({parameters}float* out, unsigned long long count) {{
+    unsigned long long index = blockIdx.x;
+    if (index >= count) return;
+    unsigned int thread = threadIdx.x;
+    unsigned long long base = {base};
+    __shared__ double partial[256];
+    double value = 0.0;
+    for (unsigned long long k = thread; k < {extent}ULL; k += 256ULL) value += (double){values}[base + {lane}];
+    partial[thread] = value;
+    __syncthreads();
+    for (unsigned int stride = 128U; stride > 0U; stride >>= 1U) {{
+        if (thread < stride) partial[thread] += partial[thread + stride];
+        __syncthreads();
+    }}
+    if (thread == 0U) out[index] = (float)partial[0];
+}}
+"#
+        )
+    } else {
+        format!(
+            r#"extern "C" __global__ void {function}({parameters}float* out, unsigned long long count) {{
+    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    unsigned long long base = {base};
+    float value = 0.0f;
+    for (unsigned long long k = 0ULL; k < {extent}ULL; ++k) value += {values}[base + {lane}];
+    out[index] = value;
+}}
+"#
+        )
+    }
+}
+
+/// The kernel name that reduces the per-lane gradients of loop VJP target
+/// `target_index` of the kernel `function`.
+fn cuda_capture_reduction_function_name(function: &str, target_index: usize) -> String {
+    format!("{function}_capture_{target_index}")
+}
+
+/// Whether a loop VJP reduces the gradient of a capture with
+/// `target_count` elements over the lanes of a carry with `carry_count`:
+/// exactly when the capture broadcasts into the carry, which is when the
+/// counts differ (`cuda_offset_expression` maps equal counts one to one).
+fn cuda_capture_gradient_is_reduced(carry_count: usize, target_count: usize) -> bool {
+    carry_count != target_count
+}
+
+/// How a loop VJP kernel stores lane `index`'s accumulated capture gradient
+/// `gradient` into `out`, and, for a capture that broadcasts into the carry,
+/// the kernel `{function}_capture_{target_index}` that then sums the lanes.
+///
+/// Every lane of a broadcast capture writes its own gradient to a per-lane
+/// buffer of the carry's element count, and the second kernel adds the lanes
+/// of each capture element in a fixed order (`cuda_fixed_order_sum_source`,
+/// with the lanes in increasing carry order). The loop kernels used to
+/// `atomicAdd` the lanes into the capture, which rounded in whatever order
+/// the lanes finished, so the gradient differed from run to run. A capture
+/// with the carry's element count but another shape is written in place:
+/// `0.0f +` keeps the value of the atomic add into a cleared output used
+/// before, which turned a -0 gradient into +0.
+fn cuda_capture_gradient_write(
+    function: &str,
+    target_index: usize,
+    out: &str,
+    gradient: &str,
+    carry_shape: &[usize],
+    target_shape: &[usize],
+) -> Result<(String, String), String> {
+    if target_shape == carry_shape {
+        return Ok((format!("{out}[index] = {gradient};"), String::new()));
+    }
+    let carry_count = carry_shape.iter().product::<usize>();
+    let target_count = target_shape.iter().product::<usize>();
+    if !cuda_capture_gradient_is_reduced(carry_count, target_count) {
+        return Ok((format!("{out}[index] = 0.0f + {gradient};"), String::new()));
+    }
+    if !cuda_shapes_broadcastable(carry_shape, target_shape) {
+        return Err(format!(
+            "CUDA loop VJP capture shape {target_shape:?} does not broadcast to the carry shape {carry_shape:?}"
+        ));
+    }
+    let rank_offset = carry_shape.len() - target_shape.len();
+    let carry_strides = contiguous_strides(carry_shape);
+    let target_strides = contiguous_strides(target_shape);
+    let mut base_terms = Vec::new();
+    let mut reduced_axes = Vec::new();
+    for axis in 0..carry_shape.len() {
+        if axis >= rank_offset && target_shape[axis - rank_offset] != 1 {
+            base_terms.push(format!(
+                "((index / {}ULL) % {}ULL) * {}ULL",
+                target_strides[axis - rank_offset],
+                target_shape[axis - rank_offset],
+                carry_strides[axis]
+            ));
+        } else if carry_shape[axis] != 1 {
+            reduced_axes.push(axis);
+        }
+    }
+    // `k` enumerates the broadcast lanes of one capture element in row-major order.
+    let mut lane_terms = Vec::new();
+    let mut lane_stride = 1usize;
+    for axis in reduced_axes.into_iter().rev() {
+        lane_terms.push(format!(
+            "((k / {lane_stride}ULL) % {}ULL) * {}ULL",
+            carry_shape[axis], carry_strides[axis]
+        ));
+        lane_stride *= carry_shape[axis];
+    }
+    let join = |terms: Vec<String>| {
+        if terms.is_empty() {
+            "0ULL".to_string()
+        } else {
+            terms.join(" + ")
+        }
+    };
+    // Broadcastable shapes with different counts have a nonzero capture count.
+    let lanes = carry_count / target_count;
+    let reduction = cuda_fixed_order_sum_source(
+        &cuda_capture_reduction_function_name(function, target_index),
+        "const float* lanes, ",
+        "lanes",
+        &join(base_terms),
+        &join(lane_terms),
+        lanes,
+        lanes >= CUDA_REDUCTION_BLOCK as usize,
+    );
+    Ok((format!("{out}[index] = {gradient};"), reduction))
+}
+
 fn cuda_offset_expression(output_shape: &[usize], input_shape: &[usize]) -> String {
     cuda_offset_expression_with_index(output_shape, input_shape, "index")
 }
@@ -8869,6 +9218,40 @@ extern "C" __global__ void QUABLA_MATMUL_FUNCTION(
 mod region_codegen_tests {
     use super::*;
     use crate::tensor_ir::TensorIr;
+
+    #[test]
+    fn capture_gradients_reduce_lanes_in_a_fixed_order() -> Result<(), String> {
+        // A carry-shaped capture is written in place, and an equal count of
+        // another shape adds `+0` as the cleared atomic output did.
+        assert_eq!(
+            cuda_capture_gradient_write("k", 0, "out", "g", &[2, 3], &[2, 3])?,
+            ("out[index] = g;".to_string(), String::new())
+        );
+        assert_eq!(
+            cuda_capture_gradient_write("k", 0, "out", "g", &[2, 3], &[1, 6])?,
+            ("out[index] = 0.0f + g;".to_string(), String::new())
+        );
+        // [2, 1] under [2, 3]: element `index` adds lanes `index * 3 + k`, serially.
+        let (write, reduction) =
+            cuda_capture_gradient_write("k", 1, "out_1", "g", &[2, 3], &[2, 1])?;
+        assert_eq!(write, "out_1[index] = g;");
+        assert!(reduction.contains("void k_capture_1(const float* lanes, float* out"));
+        assert!(reduction.contains("unsigned long long base = ((index / 1ULL) % 2ULL) * 3ULL;"));
+        assert!(
+            reduction.contains("k < 3ULL; ++k) value += lanes[base + ((k / 1ULL) % 3ULL) * 1ULL];")
+        );
+        // [3] under [5, 4, 3]: 20 lanes per element, row-major over the two leading axes.
+        let (_, reduction) = cuda_capture_gradient_write("k", 0, "out", "g", &[5, 4, 3], &[3])?;
+        assert!(reduction.contains("unsigned long long base = ((index / 1ULL) % 3ULL) * 1ULL;"));
+        assert!(reduction
+            .contains("lanes[base + ((k / 1ULL) % 4ULL) * 3ULL + ((k / 4ULL) % 5ULL) * 12ULL]"));
+        // 256 lanes or more take one block per element with double accumulation.
+        let (_, reduction) = cuda_capture_gradient_write("k", 0, "out", "g", &[300], &[1])?;
+        assert!(reduction.contains("__shared__ double partial[256];"));
+        assert!(!reduction.contains("atomic"));
+        assert!(cuda_capture_gradient_write("k", 0, "out", "g", &[2, 3], &[3, 1]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn shared_fori_and_scan_body_sources_are_linear() -> Result<(), String> {

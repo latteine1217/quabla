@@ -541,27 +541,8 @@ pub(crate) fn double_precision_source(source: &str) -> Result<String, String> {
             output.push(character);
         }
     }
-    if output.contains("atomicAdd(") {
-        output.insert_str(0, DOUBLE_ATOMIC_ADD);
-    }
     Ok(output)
 }
-
-// `atomicAdd(double*, double)` exists only from compute capability 6.0, and
-// NVRTC compiles for its default virtual architecture when no option names
-// one (compute_52 for NVRTC 12.x). Below 6.0 the kernel gets the
-// compare-and-swap form from the CUDA C Programming Guide.
-const DOUBLE_ATOMIC_ADD: &str = "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600\n\
-__device__ double atomicAdd(double* address, double value) {\n\
-    unsigned long long* bits = (unsigned long long*)address;\n\
-    unsigned long long old = *bits, assumed;\n\
-    do {\n\
-        assumed = old;\n\
-        old = atomicCAS(bits, assumed, __double_as_longlong(value + __longlong_as_double(assumed)));\n\
-    } while (assumed != old);\n\
-    return __longlong_as_double(old);\n\
-}\n\
-#endif\n";
 
 /// The end of the C numeric literal starting at `start`: digits, a decimal
 /// point, a signed exponent (not for hexadecimal integers), and a suffix.
@@ -605,15 +586,6 @@ mod tests {
             out[1] = fabs(a) > 1.7976931348623157e308 ? __longlong_as_double(0x7ff8000000000000LL) : -__longlong_as_double(0x7ff0000000000000LL);\n\
             out[2] = addf(a, mulf(a, 1.0));\n}"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn double_atomic_add_has_a_fallback_below_compute_capability_6() -> Result<(), String> {
-        let double = double_precision_source("if (t == 0U) atomicAdd(out, partial[0]);")?;
-        assert!(double.starts_with("#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600"));
-        assert!(double.ends_with("atomicAdd(out, partial[0]);"));
-        assert!(!double_precision_source("float a = 1.0f;")?.contains("atomicCAS"));
         Ok(())
     }
 
