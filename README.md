@@ -7,7 +7,7 @@ traced program on CPU, CUDA, and Apple silicon.**
 [![CI](https://github.com/latteine1217/quabla/actions/workflows/ci.yml/badge.svg)](https://github.com/latteine1217/quabla/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation)
-[![Release v0.5.0](https://img.shields.io/badge/release-v0.5.0-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.5.0)
+[![Release v0.6.0](https://img.shields.io/badge/release-v0.6.0-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.6.0)
 [![Docs](https://img.shields.io/badge/docs-developer%20guide-blue)](https://latteine1217.github.io/quabla/guide/)
 
 **Documentation: [Developer Guide](https://latteine1217.github.io/quabla/guide/)
@@ -70,7 +70,7 @@ running on CUDA or MLX.
 
 ## Status
 
-The latest release is **v0.5.0**, a research-grade pre-release published as
+The latest release is **v0.6.0**, a research-grade pre-release published as
 a git tag and GitHub Release; the PyPI distributions are built by CI and not
 yet uploaded. The v0.2 series introduced the JAX-style API
 ([CHANGELOG](CHANGELOG.md#020---2026-10-06), [design](docs/api_v0_2_design.md)):
@@ -99,7 +99,13 @@ native `max`/`min` reductions. v0.5
 ([CHANGELOG](CHANGELOG.md#050---2026-10-06)) lets `vmap` batch `cond`,
 `fori_loop`, `scan`, and `while_loop` and their derivatives, so `hessian`
 and `jacobian` work through loops and `vmap` composes with `odeint`,
-`linalg.cg`, `linalg.gmres`, and `newton`.
+`linalg.cg`, `linalg.gmres`, and `newton`. v0.6
+([CHANGELOG](CHANGELOG.md#060---2026-10-07)) lets `custom_vjp` and
+`custom_jvp` functions run inside control-flow bodies (implicit time
+stepping with `linalg.cg` or `newton` inside `odeint`), gives the iterative
+solvers forward mode, and differentiates loops in reverse mode twice; eager
+`Tensor` ops now evaluate through the same CPU evaluator as `jit`, which
+fuses elementwise chains.
 
 All v0.1 call forms keep working. Migrated top-level names emit a
 `DeprecationWarning` once per name on explicit access (`from quabla import *`

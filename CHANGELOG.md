@@ -9,6 +9,17 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-07
+
+The v0.6 plan in `docs/jax_like_roadmap.md` (custom derivative rules inside
+control flow, a fused CPU evaluator, and one region node) together with
+the refactors of the 2026-10-07 architecture review: eager `Tensor` ops
+evaluate through the core so they equal CPU `jit` bit for bit, elementwise
+ops keep their rules in one table, the Adam update rule is written once,
+CPU loop derivatives use the same symbolic engine as the devices, and the
+test suites share one gate rule and runner. All v0.5 call forms keep
+working; the result changes are listed under Changed and Fixed.
+
 ### Added
 
 - `custom_vjp`, `custom_jvp`, and `checkpoint` functions may be called
@@ -779,7 +790,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/latteine1217/quabla/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/latteine1217/quabla/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/latteine1217/quabla/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/latteine1217/quabla/compare/v0.2.3...v0.3.0
