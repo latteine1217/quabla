@@ -9,6 +9,25 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Fixed
+
+- Device validation covers every plan a backend runs. A loop's derivative
+  nodes run plans that the loop builds from its body (the body's VJP and
+  JVP, the per-gradient tangent plans, and on CUDA the region programs of a
+  host-driven loop); they hold nodes the body does not, such as the graphs
+  of a `custom_vjp` or `custom_jvp` rule called in the body. MLX and the
+  CUDA `precision="float64"` check used to validate only the body, so an
+  unsupported derivative compiled and then failed in the middle of the run
+  (MLX: a non-finite constant of a rule, or a missing forward-mode rule
+  under `jvp` of a loop), or a `float32` node of a rule ran in double
+  without the rounding the CPU applies (CUDA `float64`); CUDA reported a
+  non-finite constant only while compiling the host-driven loop, as a
+  generic `ValueError`. Each backend now walks one shared list of the plans
+  a region node runs and raises `UnsupportedOperationError` when the
+  function compiles, naming the derivative plan and node. MLX builds the
+  loop derivative plans at compile time instead of at the first run; they
+  are the same plans, so results are unchanged.
+
 ## [0.6.1] - 2026-10-07
 
 Packaging fixes for the first PyPI release; the library is unchanged.

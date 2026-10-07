@@ -14,10 +14,13 @@
 //! group, the op names, and the frozen plans. The derivative rules, the
 //! evaluators, and the batching rules match on the kind.
 
+use std::borrow::Cow;
+
 use super::{
     TensorCondExecutionPlan, TensorExecutionPlan, TensorForiExecutionPlan,
-    TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget, TensorNodeId, TensorScanExecutionPlan,
-    TensorScanTarget, TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget, TensorWhileExecutionPlan,
+    TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget, TensorNodeId, TensorOp,
+    TensorScanExecutionPlan, TensorScanTarget, TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget,
+    TensorWhileExecutionPlan,
 };
 
 /// A control-flow region node: its kind, with the kind's operand slots,
@@ -388,26 +391,179 @@ impl RegionNode {
         }
     }
 
-    /// The per-gradient tangent plans that a forward-over-reverse node
-    /// compiles from its body when it is built; empty for the other kinds.
-    /// The derivative plans that loops compile lazily on first use
-    /// (`TensorLoopDerivatives`) and the carry JVP of `ScanVjpJvp` are not
-    /// included.
-    pub(super) fn derived_regions(&self) -> Vec<&TensorExecutionPlan> {
-        match &self.kind {
-            RegionKind::ForiVjpJvp { plan, .. } => plan.gradient_tangent_plans.values().collect(),
-            RegionKind::ScanVjpJvp { plan, .. } => plan
-                .carry_gradient_tangent_plans
-                .values()
-                .chain(plan.output_gradient_tangent_plans.values())
-                .collect(),
+    /// Every plan the CPU evaluator and the MLX loop executors run for this
+    /// node: the traced regions, then the plans of [`Self::derived_plans`].
+    pub(super) fn plans(&self) -> Result<Vec<RegionPlan<'_>>, String> {
+        let mut plans = self
+            .regions()
+            .into_iter()
+            .map(RegionPlan::traced)
+            .collect::<Vec<_>>();
+        plans.extend(self.derived_plans()?);
+        Ok(plans)
+    }
+
+    /// The symbolic derivative plans the CPU evaluator and the MLX loop
+    /// executors run for this node besides its traced regions: the body's
+    /// forward-mode plan for `ForiJvp`, its reverse-mode plan for the VJP
+    /// kinds, and for forward over reverse both of them with the
+    /// per-gradient tangent plans. They differentiate the frozen body, so
+    /// they hold nodes the body does not (the backward or tangent graph of a
+    /// custom rule called in the body, for one).
+    ///
+    /// A loop compiles its forward- and reverse-mode body plans on first use
+    /// and caches them for every clone of the loop plan (`TensorLoopDerivatives`);
+    /// this builds them if they are still lazy, so a validator sees exactly
+    /// the plans a later execution runs, and an error building one is
+    /// returned here instead of during that execution.
+    pub(super) fn derived_plans(&self) -> Result<Vec<RegionPlan<'_>>, String> {
+        const FORWARD: &str = "forward-mode body plan";
+        const REVERSE: &str = "reverse-mode body plan";
+        const GRADIENT_TANGENT: &str = "gradient tangent plan";
+        fn built<'a>(
+            what: &'static str,
+            plan: Result<&'a TensorExecutionPlan, String>,
+        ) -> Result<RegionPlan<'a>, String> {
+            plan.map(|plan| RegionPlan::derived(what, plan))
+                .map_err(|error| format!("cannot build its {what}: {error}"))
+        }
+        Ok(match &self.kind {
             RegionKind::Cond { .. }
             | RegionKind::While { .. }
             | RegionKind::Fori { .. }
-            | RegionKind::ForiJvp { .. }
-            | RegionKind::ForiVjp { .. }
-            | RegionKind::Scan { .. }
-            | RegionKind::ScanVjp { .. } => Vec::new(),
+            | RegionKind::Scan { .. } => Vec::new(),
+            RegionKind::ForiJvp { loop_plan, .. } => vec![built(
+                FORWARD,
+                loop_plan.forward_jvp_plan().map(|forward| &forward.plan),
+            )?],
+            RegionKind::ForiVjp { loop_plan, .. } => {
+                vec![built(REVERSE, loop_plan.vjp_plan().map(|vjp| &vjp.plan))?]
+            }
+            RegionKind::ForiVjpJvp { plan, .. } => {
+                let mut plans = vec![
+                    built(
+                        FORWARD,
+                        plan.loop_plan
+                            .forward_jvp_plan()
+                            .map(|forward| &forward.plan),
+                    )?,
+                    built(REVERSE, plan.loop_plan.vjp_plan().map(|vjp| &vjp.plan))?,
+                ];
+                plans.extend(
+                    plan.gradient_tangent_plans
+                        .values()
+                        .map(|plan| RegionPlan::derived(GRADIENT_TANGENT, plan)),
+                );
+                plans
+            }
+            RegionKind::ScanVjp { scan_plan, .. } => {
+                vec![built(REVERSE, scan_plan.vjp_plan().map(|vjp| &vjp.plan))?]
+            }
+            RegionKind::ScanVjpJvp { plan, .. } => {
+                let mut plans = vec![
+                    RegionPlan::derived(FORWARD, &plan.forward_jvp.plan),
+                    built(REVERSE, plan.scan_plan.vjp_plan().map(|vjp| &vjp.plan))?,
+                ];
+                plans.extend(
+                    plan.carry_gradient_tangent_plans
+                        .values()
+                        .chain(plan.output_gradient_tangent_plans.values())
+                        .map(|plan| RegionPlan::derived(GRADIENT_TANGENT, plan)),
+                );
+                plans
+            }
+        })
+    }
+}
+
+/// The plans of [`RegionNode::plans`] in the form a plan walk takes them
+/// ([`TensorExecutionPlan::try_for_each_plan`]): the region list of the CPU
+/// evaluator and MLX, with an error building a derivative plan reported for
+/// the node that needs it.
+pub(super) fn evaluator_region_plans<'p>(
+    _plan: &'p TensorExecutionPlan,
+    node_id: TensorNodeId,
+    region: &'p RegionNode,
+) -> Result<Vec<RegionPlan<'p>>, (String, String)> {
+    region.plans().map_err(|error| {
+        (
+            region.name().to_string(),
+            format!("{} node {node_id} {error}", region.label()),
+        )
+    })
+}
+
+/// A plan that a region node runs, as a backend's plan walk lists it
+/// (see [`TensorExecutionPlan::try_for_each_plan`]).
+pub(super) struct RegionPlan<'a> {
+    pub(super) plan: Cow<'a, TensorExecutionPlan>,
+    /// What a plan derived from the node's regions computes ("reverse-mode
+    /// body plan"), which a validation error inside it names; `None` for a
+    /// traced region, whose errors read as they would at the top level.
+    pub(super) derived: Option<&'static str>,
+}
+
+impl<'a> RegionPlan<'a> {
+    pub(super) fn traced(plan: &'a TensorExecutionPlan) -> Self {
+        Self {
+            plan: Cow::Borrowed(plan),
+            derived: None,
         }
+    }
+
+    pub(super) fn derived(what: &'static str, plan: &'a TensorExecutionPlan) -> Self {
+        Self {
+            plan: Cow::Borrowed(plan),
+            derived: Some(what),
+        }
+    }
+}
+
+impl TensorExecutionPlan {
+    /// Applies `check` to this plan and then, depth first, to every plan
+    /// that its region nodes run, as `region_plans` lists them for a region
+    /// node (given with the plan holding it and its node id).
+    ///
+    /// This is the one traversal behind the backend validators: each pairs
+    /// its per-plan `check` with the list of plans its executor runs for a
+    /// node, so no plan a backend executes escapes the check, whatever the
+    /// nesting. An error inside a derived plan is extended with what that
+    /// plan is and which node runs it.
+    pub(super) fn try_for_each_plan<R, C>(
+        &self,
+        region_plans: &R,
+        check: &mut C,
+    ) -> Result<(), (String, String)>
+    where
+        R: for<'p> Fn(
+            &'p TensorExecutionPlan,
+            TensorNodeId,
+            &'p RegionNode,
+        ) -> Result<Vec<RegionPlan<'p>>, (String, String)>,
+        C: FnMut(&TensorExecutionPlan) -> Result<(), (String, String)>,
+    {
+        check(self)?;
+        for (node_id, node) in self.nodes.iter().enumerate() {
+            let TensorOp::Region(region) = &node.op else {
+                continue;
+            };
+            for nested in region_plans(self, node_id, region)? {
+                nested
+                    .plan
+                    .try_for_each_plan(region_plans, check)
+                    .map_err(|(op, message)| match nested.derived {
+                        None => (op, message),
+                        Some(what) => (
+                            op,
+                            format!(
+                                "{message} (in the {what} of {} node {node_id}, derived from \
+                                 its body)",
+                                region.label()
+                            ),
+                        ),
+                    })?;
+            }
+        }
+        Ok(())
     }
 }

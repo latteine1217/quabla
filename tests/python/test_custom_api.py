@@ -532,5 +532,105 @@ def test_custom_rules_inside_control_flow_on_devices_match_cpu():
                 scale = max([1.0] + [abs(value) for value in want.to_flat_list()])
                 assert_close(got, want, tolerance * scale)
 
+
+# Rules whose derivative graphs hold an infinite constant: a clip at an
+# infinite bound changes no finite value, but no device kernel can spell the
+# bound. A loop compiles such a rule's graph only into the derivative plans it
+# builds from its body, never into the body itself.
+@qb.custom_jvp
+def clipped(x):
+    return qb.sin(x)
+
+
+@clipped.defjvp
+def clipped_jvp(primals, tangents):
+    (x,), (t,) = primals, tangents
+    return qb.sin(x), qb.minimum(qb.cos(x) * t, math.inf)
+
+
+@qb.custom_vjp
+def clipped_back(x):
+    return qb.sin(x)
+
+
+clipped_back.defvjp(
+    lambda x: (qb.sin(x), x), lambda x, g: (qb.minimum(qb.cos(x) * g, math.inf),)
+)
+
+
+def test_devices_reject_unsupported_loop_derivatives_at_compile_time():
+    # Device validation used to check a loop's body but not the derivative
+    # plans the loop runs, so these compiled and then failed: MLX in the
+    # middle of the run, after the forward pass, and CUDA while compiling
+    # the host-driven loop's region programs, with a generic error. Both
+    # now raise UnsupportedOperationError when the function compiles.
+    x = qb.array([0.3, 0.5], dtype=qb.float32)
+    direction = qb.array([1.0, -2.0], dtype=qb.float32)
+    functions = []
+    for rule in (clipped, clipped_back):
+        losses = custom_region_losses(rule, False)
+        for kind in ("fori", "scan", "cond in fori"):
+            functions.append((losses[kind], qb.grad(losses[kind])))
+    losses = custom_region_losses(clipped, False)
+    for kind in ("fori", "cond in fori"):
+        loss = losses[kind]
+        functions.append((loss, lambda x, loss=loss: qb.jvp(loss, (x,), (direction,))))
+    for device in devices():
+        for loss, derivative in functions:
+            # The body runs on the device; the CPU runs the derivative.
+            assert_close(qb.jit(loss, device=device)(x), qb.jit(loss)(x), 2e-5)
+            for leaf in qb.tree.leaves(qb.jit(derivative)(x)):
+                assert all(math.isfinite(value) for value in leaf.to_flat_list())
+            lowered = qb.jit(derivative, device=device).lower(x)
+            error = raises(qb.UnsupportedOperationError, lowered.compile, match="non-finite")
+            assert (error.op, error.device) == ("constant", device), (error.op, error.device)
+            assert "derived from its body" in str(error), str(error)
+
+
+def test_mlx_reports_a_missing_loop_forward_rule_at_compile_time():
+    # Forward mode through a loop whose body calls a custom_vjp function has
+    # no rule to apply; the CPU reports it when the loop runs, MLX (like
+    # CUDA) now when the function compiles.
+    x = qb.array([0.3, 0.5], dtype=qb.float32)
+    loss = custom_region_losses(tripled_back, False)["fori"]
+    function = qb.jit(lambda x: qb.jvp(loss, (x,), (qb.ones_like(x),)), device=devices("mlx")[0])
+    raises(
+        qb.UnsupportedOperationError,
+        function.lower(x).compile,
+        match="defines only a reverse-mode rule",
+    )
+
+
+@qb.custom_vjp
+def rounded_back(x):
+    return qb.sin(x)
+
+
+# The backward rule rounds the cotangent through float32.
+rounded_back.defvjp(
+    lambda x: (qb.sin(x), x),
+    lambda x, g: ((qb.cos(x) * g).astype(qb.float32).astype(qb.float64),),
+)
+
+
+def test_cuda_float64_rejects_float32_nodes_in_loop_derivatives():
+    # precision="float64" refuses float32 nodes, which it would run in
+    # double. It used to check only a loop's body, so a float32 node of a
+    # rule applied in the loop's derivative ran in double and silently
+    # skipped the rounding the CPU applies.
+    device = devices("cuda")[0]
+    x = qb.array([0.3, 0.5], dtype=qb.float64)
+    loss = custom_region_losses(rounded_back, False)["fori"]
+    assert_close(
+        qb.jit(loss, device=device, precision="float64")(x), qb.jit(loss)(x), 1e-12
+    )
+    lowered = qb.jit(qb.grad(loss), device=device, precision="float64").lower(x)
+    error = raises(qb.UnsupportedOperationError, lowered.compile, match="float32 node")
+    assert error.op == "float32", error.op
+    assert "derived from its body" in str(error), str(error)
+    # The default precision runs float32 nodes as float32.
+    assert_close(qb.jit(qb.grad(loss), device=device)(x), qb.jit(qb.grad(loss))(x), 2e-5)
+
+
 if __name__ == "__main__":
     run(globals())

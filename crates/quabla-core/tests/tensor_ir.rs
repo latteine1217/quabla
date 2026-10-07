@@ -14279,6 +14279,226 @@ fn custom_rule_in_a_loop_body_is_applied_by_the_loop_derivatives() {
     assert_eq!(must!(plan.evaluate(&inputs)).data().to_vec(), vec![10.0; 6]);
 }
 
+/// A rule for `x * x` like `custom_square_rule`, with a backward graph
+/// returning `finish(3 g)` and a tangent graph returning `finish(3 t)`.
+fn custom_square_rule_through(
+    finish: fn(&mut TensorIr, TensorNodeId) -> Result<TensorNodeId, String>,
+) -> Result<std::sync::Arc<TensorCustomRule>, String> {
+    let mut forward = TensorIr::new();
+    let x = forward.input("x", vec![2])?;
+    let square = forward.mul(x, x)?;
+    let mut backward = TensorIr::new();
+    backward.input("residual", vec![2])?;
+    let g = backward.input("g", vec![2])?;
+    let three = backward.scalar_constant(3.0);
+    let scaled = backward.mul(g, three)?;
+    let cotangent = finish(&mut backward, scaled)?;
+    let mut tangent = TensorIr::new();
+    tangent.input("x", vec![2])?;
+    let t = tangent.input("t", vec![2])?;
+    let three = tangent.scalar_constant(3.0);
+    let scaled = tangent.mul(t, three)?;
+    let output = finish(&mut tangent, scaled)?;
+    Ok(std::sync::Arc::new(TensorCustomRule::new(
+        "custom_square".to_string(),
+        forward,
+        vec!["x".to_string()],
+        1,
+        vec![square, x],
+        backward,
+        vec!["residual".to_string()],
+        vec!["g".to_string()],
+        vec![Some(cotangent)],
+        Some(TensorCustomTangent::new(
+            tangent,
+            vec![Some("t".to_string())],
+            vec![output],
+        )),
+        false,
+    )?))
+}
+
+/// `min(value, +inf)`: the identity on finite values, through an infinite
+/// constant that no device kernel can spell.
+fn clip_at_infinity(graph: &mut TensorIr, value: TensorNodeId) -> Result<TensorNodeId, String> {
+    let infinity = graph.scalar_constant(f64::INFINITY);
+    let below = graph.compare(value, infinity, TensorComparison::Less)?;
+    graph.where_select(below, value, infinity)
+}
+
+/// `value` rounded to float32 and widened back.
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn round_through_float32(
+    graph: &mut TensorIr,
+    value: TensorNodeId,
+) -> Result<TensorNodeId, String> {
+    let narrow = graph.cast(value, TensorDType::F32)?;
+    graph.cast(narrow, TensorDType::F64)
+}
+
+/// `sum(fori(0, 3, carry + rule(x)))` with `x` a capture, or with `scan` the
+/// sum of the final carry and of the stacked step outputs `rule(x)` of a scan
+/// with the same carry update. The body keeps its `Custom` node, so the
+/// rule's graphs enter only the derivative plans the loop builds from it.
+fn loop_with_custom_body(
+    rule: std::sync::Arc<TensorCustomRule>,
+    scan: bool,
+) -> Result<(TensorIr, TensorNodeId), String> {
+    let mut body = TensorIr::new();
+    let carry = body.input("carry", vec![2])?;
+    body.input("index", vec![])?;
+    let x = body.input("x", vec![2])?;
+    let value = body.mul(x, x)?;
+    let wrapped = body.custom(rule, &[value], &[x])?;
+    let next = body.add(carry, wrapped[0])?;
+    let mut graph = TensorIr::new();
+    let x = graph.input("x", vec![2])?;
+    let captures = vec![("x".to_string(), x)];
+    let loss = if scan {
+        let (plan, _) = body.compile_region_many(&[next, wrapped[0]])?;
+        let scan_plan = TensorScanExecutionPlan::new(0, 3, plan, "carry", "index")?;
+        let (carry, outputs) = graph.scan(x, scan_plan, captures)?;
+        let carry = graph.sum(carry)?;
+        let outputs = graph.sum(outputs)?;
+        graph.add(carry, outputs)?
+    } else {
+        let loop_plan =
+            TensorForiExecutionPlan::new(0, 3, body.compile_region(next)?, "carry", "index")?;
+        let output = graph.fori(x, loop_plan, captures)?;
+        graph.sum(output)?
+    };
+    Ok((graph, loss))
+}
+
+/// The reverse-mode gradient plan of `loss` with respect to `x`.
+fn loop_gradient_plan(graph: &TensorIr, loss: TensorNodeId) -> Result<TensorExecutionPlan, String> {
+    let vjp = graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)])?;
+    vjp.graph.compile_cpu(vjp.gradients["x"])
+}
+
+/// The forward-mode tangent plan of `loss` along the input `dx`.
+fn loop_tangent_plan(graph: &TensorIr, loss: TensorNodeId) -> Result<TensorExecutionPlan, String> {
+    let tangents = BTreeMap::from([("x".to_string(), "dx".to_string())]);
+    let jvp = graph.symbolic_jvp_many_with_tangent_inputs(&[loss], &tangents)?;
+    jvp.graph.compile_cpu(jvp.tangents[0])
+}
+
+#[test]
+fn mlx_validation_checks_the_derivative_plans_a_loop_builds_from_its_body() {
+    // The rule's infinite bound lies only in the loop's body VJP and JVP,
+    // which MLX runs per iteration. Validation used to check the body alone,
+    // so these plans validated and then failed in the middle of the run.
+    let rule = must!(custom_square_rule_through(clip_at_infinity));
+    let inputs = BTreeMap::from([
+        (
+            "x".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![2.0, -1.0])),
+        ),
+        (
+            "dx".to_string(),
+            must!(DynamicTensor::new(vec![2], vec![1.0, 1.0])),
+        ),
+    ]);
+    // d/dx: 1 from the initial carry plus the rule's 3 per iteration (and,
+    // for the scan, 3 more per stacked output).
+    for (scan, gradient) in [(false, 10.0), (true, 19.0)] {
+        let (graph, loss) = must!(loop_with_custom_body(rule.clone(), scan));
+        assert_eq!(must!(graph.compile_cpu(loss)).validate_mlx(), Ok(()));
+        let reverse = must!(loop_gradient_plan(&graph, loss));
+        let mut plans = vec![(reverse, "reverse-mode body plan", vec![gradient; 2])];
+        if !scan {
+            // A scan's forward mode is a traced scan over a packed carry,
+            // which validation always checked.
+            let forward = must!(loop_tangent_plan(&graph, loss));
+            plans.push((forward, "forward-mode body plan", vec![20.0]));
+        }
+        for (plan, what, expected) in plans {
+            let (op, message) = plan.validate_mlx().err().unwrap_or_default();
+            assert_eq!(
+                op, "constant",
+                "MLX validation must reject the {what}: {message}"
+            );
+            assert!(
+                message.contains(what) && message.contains("derived from its body"),
+                "{message}"
+            );
+            // The clip changes no finite value: the CPU runs the same plan.
+            assert_eq!(must!(plan.evaluate(&inputs)).data().to_vec(), expected);
+        }
+    }
+}
+
+#[test]
+fn mlx_validation_reports_a_loop_derivative_plan_that_cannot_be_built() {
+    // The rule has no tangent graph, so the loop's forward-mode body plan
+    // cannot be built. That used to surface when the loop ran; validation
+    // now builds the plan and reports the reason.
+    let (graph, loss) = must!(fori_with_custom_body());
+    let plan = must!(loop_tangent_plan(&graph, loss));
+    let (op, message) = plan.validate_mlx().err().unwrap_or_default();
+    assert_eq!(op, "fori_jvp", "{message}");
+    assert!(
+        message.contains("cannot build its forward-mode body plan")
+            && message.contains("forward-mode differentiation"),
+        "{message}"
+    );
+}
+
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+#[test]
+fn cuda_validation_checks_the_programs_a_loop_builds_from_its_body() {
+    // Runs no device code: every program here is rejected by validation,
+    // before a CUDA context exists.
+    let cuda = QuablaTarget::Cuda { device_ordinal: 0 };
+    let compile = |plan_graph: (TensorIr, TensorNodeId), precision| {
+        let (graph, output) = plan_graph;
+        let program = QuablaMultiOutputProgram::new(graph, vec![output])?;
+        match QuablaCompiler.compile_many_checked_with_precision(&program, cuda, precision) {
+            Err(QuablaCompileError::Unsupported { op, message }) => Ok((op, message)),
+            Err(error) => Err(format!("expected an unsupported operation, got {error:?}")),
+            Ok(_) => Err("expected an unsupported operation, got an executable".to_string()),
+        }
+    };
+    let gradient_graph = |rule, scan| -> Result<(TensorIr, TensorNodeId), String> {
+        let (graph, loss) = loop_with_custom_body(rule, scan)?;
+        let vjp = graph.symbolic_vjp_many(&[(loss, SymbolicCotangent::Ones)])?;
+        let gradient = vjp.gradients["x"];
+        Ok((vjp.graph, gradient))
+    };
+    // The infinite bound defeats the fused loop kernel, so the loops run
+    // host-driven, whose region programs (the body VJP among them) used to
+    // fail only when the backend compiled them, with a generic error.
+    let rule = must!(custom_square_rule_through(clip_at_infinity));
+    for scan in [false, true] {
+        let (graph, loss) = must!(loop_with_custom_body(rule.clone(), scan));
+        assert_eq!(must!(graph.compile_cpu(loss)).validate_cuda(), Ok(()));
+        let (op, message) = must!(compile(
+            must!(gradient_graph(rule.clone(), scan)),
+            QuablaPrecision::Default
+        ));
+        assert_eq!(op, "constant", "{message}");
+        assert!(
+            message.contains("host-driven loop region")
+                && message.contains("derived from its body"),
+            "{message}"
+        );
+    }
+    // precision="float64" refuses float32 nodes, including those of a rule
+    // applied in the loop's derivative, which used to run in double.
+    let rule = must!(custom_square_rule_through(round_through_float32));
+    for scan in [false, true] {
+        let (graph, gradient) = must!(gradient_graph(rule.clone(), scan));
+        let plan = must!(graph.compile_cpu(gradient));
+        assert_eq!(plan.validate_cuda(), Ok(()));
+        let (op, message) = must!(compile((graph, gradient), QuablaPrecision::Float64));
+        assert_eq!(op, "float32", "{message}");
+        assert!(
+            message.contains("reverse-mode body plan") && message.contains("derived from its body"),
+            "{message}"
+        );
+    }
+}
+
 /// `exp(x)` with a reverse rule and a tangent graph that reads the output
 /// (`exp(x) t`), as the implicit solvers' rules read the solution.
 fn custom_exp_rule_reading_its_output() -> Result<std::sync::Arc<TensorCustomRule>, String> {

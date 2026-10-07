@@ -606,13 +606,10 @@ fn graph_input_names(graph: &TensorIr) -> BTreeSet<String> {
         .collect()
 }
 
-/// Validates that every region of the host-driven fallback lowers to CUDA.
-pub(super) fn validate_cuda_host_loop(op: &TensorOp) -> Result<(), (String, String)> {
-    let (_, regions) = host_loop_ir(op).map_err(|error| ("loop".to_string(), error))?;
-    for region in &regions {
-        super::validate_cuda_plan(region)?;
-    }
-    Ok(())
+/// The region programs the host-driven fallback compiles for a loop node, for
+/// the validation walk (`super::validate_cuda_plan` checks each of them).
+pub(super) fn cuda_host_loop_regions(op: &TensorOp) -> Result<Vec<TensorExecutionPlan>, String> {
+    host_loop_ir(op).map(|(_, regions)| regions)
 }
 
 impl<T: CudaReal> CudaHostLoop<T> {

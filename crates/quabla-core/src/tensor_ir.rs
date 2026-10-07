@@ -14899,31 +14899,38 @@ impl TensorExecutionPlan {
 
     /// Checks lazy MLX lowering without allocating arrays or executing a branch.
     /// The compatibility helpers keep their historical execution-time errors.
+    ///
+    /// Every plan MLX may run is checked: this plan, both branches of each
+    /// `Cond`, and each loop's body regions and the symbolic derivative plans
+    /// its MLX executor runs (`region::evaluator_region_plans`), which this
+    /// builds if they are still lazy. They are the plans the first execution
+    /// would otherwise build, so results do not change; an unsupported
+    /// derivative plan fails here instead of in the middle of an execution.
     pub fn validate_mlx(&self) -> Result<(), (String, String)> {
-        for node in self.nodes.iter() {
-            if node
-                .shape
-                .iter()
-                .any(|extent| i32::try_from(*extent).is_err())
-            {
-                return Err(("shape".into(), "MLX shape extent exceeds i32".into()));
-            }
-            match &node.op {
-                TensorOp::ScalarConstant { value } if !value.is_finite() => {
-                    return Err((
-                        "constant".into(),
-                        "MLX backend does not support non-finite constants".into(),
-                    ))
+        self.try_for_each_plan(&region::evaluator_region_plans, &mut |plan| {
+            for (node_id, node) in plan.nodes.iter().enumerate() {
+                if node
+                    .shape
+                    .iter()
+                    .any(|extent| i32::try_from(*extent).is_err())
+                {
+                    return Err(("shape".into(), "MLX shape extent exceeds i32".into()));
                 }
-                TensorOp::Region(region) => {
-                    for plan in region.regions().into_iter().chain(region.derived_regions()) {
-                        plan.validate_mlx()?;
+                if let TensorOp::ScalarConstant { value } = &node.op {
+                    if !value.is_finite() {
+                        return Err((
+                            "constant".into(),
+                            format!(
+                                "MLX backend does not support non-finite constants (node \
+                                     {node_id} is {value}); use a finite bound instead, or run \
+                                     the function on the CPU"
+                            ),
+                        ));
                     }
                 }
-                _ => {}
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub fn node_count(&self) -> usize {

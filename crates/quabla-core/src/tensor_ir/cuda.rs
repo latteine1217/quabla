@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use std::mem::ManuallyDrop;
@@ -21,6 +22,7 @@ use cudarc::nvrtc::compile_ptx;
 #[cfg(feature = "cuda-nccl")]
 use cudarc::nccl::{group_end, group_start, Comm as NcclComm, ReduceOp as NcclReduceOp};
 
+use super::region::{evaluator_region_plans, RegionPlan};
 use super::{
     contiguous_strides, cuda_elementwise_formula, cuda_scalar_literal, element_count,
     tensor_op_inputs, DynamicTensor, LinalgKind, RegionKind, RegionNode, TensorBackend,
@@ -860,47 +862,85 @@ fn create_nccl_communicators(replicas: &[CudaExecutionPlan]) -> Result<Vec<NcclC
 }
 
 /// Pure lowering validation shared by v0.1 compilation and the typed v0.2 facade.
+///
+/// Every plan CUDA runs for `plan` ([`cuda_region_plans`]) must execute in `float` and have
+/// only finite scalar constants, which no CUDA program can spell.
 pub(super) fn validate_cuda_plan(plan: &TensorExecutionPlan) -> Result<(), (String, String)> {
-    ensure_cuda_f32_execution(plan).map_err(|message| ("dtype".into(), message))?;
-    for (node_id, node) in plan.nodes.iter().enumerate() {
-        let TensorOp::Region(region) = &node.op else {
-            continue;
-        };
-        if !region.is_loop() {
-            // A `Cond` runs its selected branch as a separate region plan.
-            for branch in region.regions() {
-                validate_cuda_plan(branch)?;
-            }
-            continue;
-        }
-        let op = region.label();
-        if let TensorOp::Region(RegionNode {
-            kind: RegionKind::ScanVjpJvp { group, .. },
-            ..
-        }) = &node.op
-        {
-            cuda_scan_vjp_jvp_group(plan, *group).map_err(|error| {
-                (
-                    op.to_string(),
-                    format!("CUDA {op} node {node_id} has invalid group bindings: {error}"),
-                )
-            })?;
-        }
-        let Some(Err(error)) = cuda_fused_loop_lowering(&node.op) else {
-            continue;
-        };
-        // A loop the fused per-lane kernel cannot lower runs as a host-driven region loop when
-        // each of its regions lowers on its own.
-        let fallback = match host_loop::validate_cuda_host_loop(&node.op) {
-            Ok(()) => continue,
-            Err((_, region_error)) => {
-                format!("; its host-driven region loop cannot lower either: {region_error}")
-            }
-        };
-        return Err((
+    plan.try_for_each_plan(&cuda_region_plans, &mut |plan| {
+        ensure_cuda_f32_execution(plan).map_err(|message| ("dtype".into(), message))?;
+        cuda_reject_non_finite_constants(plan)
+    })
+}
+
+/// The plans CUDA runs for region node `node_id` of `plan`, in the plan walk of
+/// [`validate_cuda_plan`]: both branches of a `Cond`, which compile as region programs; the
+/// traced body of a loop that the fused per-lane kernel lowers, whose symbolic derivative the
+/// kernel inlines expression by expression and `cuda_fused_loop_lowering` checks itself; and
+/// for a loop that runs host-driven instead, the region programs that `host_loop` builds
+/// from it (its body JVP or VJP among them), built here as they will be at compilation.
+fn cuda_region_plans<'p>(
+    plan: &'p TensorExecutionPlan,
+    node_id: TensorNodeId,
+    region: &'p RegionNode,
+) -> Result<Vec<RegionPlan<'p>>, (String, String)> {
+    let traced = || {
+        region
+            .regions()
+            .into_iter()
+            .map(RegionPlan::traced)
+            .collect::<Vec<_>>()
+    };
+    if !region.is_loop() {
+        return Ok(traced());
+    }
+    let op = region.label();
+    if let RegionKind::ScanVjpJvp { group, .. } = &region.kind {
+        cuda_scan_vjp_jvp_group(plan, *group).map_err(|error| {
+            (
+                op.to_string(),
+                format!("CUDA {op} node {node_id} has invalid group bindings: {error}"),
+            )
+        })?;
+    }
+    let node_op = &plan.nodes[node_id].op;
+    let Some(Err(error)) = cuda_fused_loop_lowering(node_op) else {
+        return Ok(traced());
+    };
+    // A loop the fused per-lane kernel cannot lower runs as a host-driven region loop when
+    // each of its regions lowers on its own.
+    let regions = host_loop::cuda_host_loop_regions(node_op).map_err(|region_error| {
+        (
             op.to_string(),
-            format!("CUDA {op} node {node_id} cannot lower to a device loop: {error}{fallback}"),
-        ));
+            format!(
+                "CUDA {op} node {node_id} cannot lower to a device loop: {error}; its \
+                 host-driven region loop cannot lower either: {region_error}"
+            ),
+        )
+    })?;
+    Ok(regions
+        .into_iter()
+        .map(|region| RegionPlan {
+            plan: Cow::Owned(region),
+            derived: Some("host-driven loop region"),
+        })
+        .collect())
+}
+
+/// Rejects a non-finite scalar constant, which neither the per-node device program nor a fused
+/// kernel can spell as a CUDA literal.
+fn cuda_reject_non_finite_constants(plan: &TensorExecutionPlan) -> Result<(), (String, String)> {
+    for (node_id, node) in plan.nodes.iter().enumerate() {
+        if let TensorOp::ScalarConstant { value } = &node.op {
+            if !value.is_finite() {
+                return Err((
+                    "constant".into(),
+                    format!(
+                        "CUDA backend does not support non-finite constants (node {node_id} is \
+                         {value}); use a finite bound instead, or run the function on the CPU"
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -957,30 +997,32 @@ pub(super) fn cuda_fused_loop_lowering(op: &TensorOp) -> Option<Result<(), Strin
 /// plan would skip the per-operation `f32` rounding the CPU reference applies,
 /// so such a program is refused instead of silently running at another
 /// precision. Bool nodes stay `0`/`1` values of the plan's element type.
+///
+/// The walk covers every region plan and the symbolic derivative plans of each
+/// loop ([`evaluator_region_plans`], built here if still lazy): a fused loop kernel
+/// and a host-driven loop's region programs differentiate the same body with
+/// the same symbolic transforms, splicing in the same custom rule graphs, so
+/// those plans hold every node, and so every dtype, that the CUDA loop
+/// programs are built from.
 pub(super) fn validate_cuda_float64_plan(
     plan: &TensorExecutionPlan,
 ) -> Result<(), (String, String)> {
-    for (node_id, node) in plan.nodes.iter().enumerate() {
-        if node.dtype == TensorDType::F32 {
-            return Err((
-                "float32".into(),
-                format!(
-                    "CUDA precision=\"float64\" cannot execute float32 node {node_id} ({}): the \
-                     float64 lowering runs every floating node in double; cast the value to \
-                     float64 or use the default precision",
-                    cuda_op_name(&node.op)
-                ),
-            ));
+    plan.try_for_each_plan(&evaluator_region_plans, &mut |plan| {
+        for (node_id, node) in plan.nodes.iter().enumerate() {
+            if node.dtype == TensorDType::F32 {
+                return Err((
+                    "float32".into(),
+                    format!(
+                        "CUDA precision=\"float64\" cannot execute float32 node {node_id} ({}): \
+                         the float64 lowering runs every floating node in double; cast the \
+                         value to float64 or use the default precision",
+                        cuda_op_name(&node.op)
+                    ),
+                ));
+            }
         }
-        let nested = match &node.op {
-            TensorOp::Region(region) => region.regions(),
-            _ => Vec::new(),
-        };
-        for nested in nested {
-            validate_cuda_float64_plan(nested)?;
-        }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(feature = "cuda-nccl")]
