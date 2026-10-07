@@ -71,8 +71,10 @@ running on CUDA or MLX.
 ## Status
 
 The latest release is **v0.6.1**, a research-grade pre-release published as
-a git tag and GitHub Release; the PyPI distributions are built by CI and not
-yet uploaded. The v0.2 series introduced the JAX-style API
+a git tag, a GitHub Release, and on PyPI as
+[`quabla`](https://pypi.org/project/quabla/) and
+[`quabla-mlx`](https://pypi.org/project/quabla-mlx/) (v0.6.1 is the first
+PyPI release). The v0.2 series introduced the JAX-style API
 ([CHANGELOG](CHANGELOG.md#020---2026-10-06), [design](docs/api_v0_2_design.md)):
 `grad`, `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `vmap`, and
 `jit(device="cpu" | "cuda:N" | "mlx")` over arrays and pytrees, `quabla.optim`

@@ -15,8 +15,9 @@ matrices, CUDA fusion unification, and MLX fused loop kernels are not in it.
 
 All items shipped in v0.6.0, validated on the CPU, MLX, a single-GPU CUDA
 host (NVRTC 13.1), and the two-GPU NCCL host with NVRTC 12.6, which also
-covers the v0.4 and v0.5 changes that had not run there. Still open: the
-first PyPI upload once TestPyPI registration works.
+covers the v0.4 and v0.5 changes that had not run there. The first PyPI
+release followed as v0.6.1 (`quabla` and `quabla-mlx`), after a packaging
+fix for source builds on macOS 27.
 
 ## Before v1.0: Retiring the v0.1 Derivative Engines (2026-10-07)
 
