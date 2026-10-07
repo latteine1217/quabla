@@ -7,7 +7,7 @@ traced program on CPU, CUDA, and Apple silicon.**
 [![CI](https://github.com/latteine1217/quabla/actions/workflows/ci.yml/badge.svg)](https://github.com/latteine1217/quabla/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation)
-[![Release v0.6.0](https://img.shields.io/badge/release-v0.6.0-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.6.0)
+[![Release v0.6.1](https://img.shields.io/badge/release-v0.6.1-orange)](https://github.com/latteine1217/quabla/releases/tag/v0.6.1)
 [![Docs](https://img.shields.io/badge/docs-developer%20guide-blue)](https://latteine1217.github.io/quabla/guide/)
 
 **Documentation: [Developer Guide](https://latteine1217.github.io/quabla/guide/)
@@ -70,7 +70,7 @@ running on CUDA or MLX.
 
 ## Status
 
-The latest release is **v0.6.0**, a research-grade pre-release published as
+The latest release is **v0.6.1**, a research-grade pre-release published as
 a git tag and GitHub Release; the PyPI distributions are built by CI and not
 yet uploaded. The v0.2 series introduced the JAX-style API
 ([CHANGELOG](CHANGELOG.md#020---2026-10-06), [design](docs/api_v0_2_design.md)):

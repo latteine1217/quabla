@@ -9,6 +9,22 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-07
+
+Packaging fixes for the first PyPI release; the library is unchanged.
+
+### Fixed
+
+- Installing `quabla` from the source distribution on macOS 27 built an
+  extension module that failed to import (`mis-aligned LINKEDIT string
+  pool`): Cargo's default release `strip` of debug info corrupts it with
+  that toolchain. The release profile keeps the symbols (`strip = false`),
+  about 150 KB more per module; the published wheels were not affected.
+- The `Wheels` workflow can publish both distributions to an index for the
+  first time: the PyPI upload skips files that already exist, so the job
+  can be re-run after the pending publisher of `quabla-mlx` is registered
+  (PyPI turns one pending publisher into a project per upload).
+
 ## [0.6.0] - 2026-10-07
 
 The v0.6 plan in `docs/jax_like_roadmap.md` (custom derivative rules inside
@@ -790,7 +806,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/latteine1217/quabla/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/latteine1217/quabla/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/latteine1217/quabla/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/latteine1217/quabla/compare/v0.3.0...v0.4.0
