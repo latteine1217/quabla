@@ -27,6 +27,21 @@ deprecated names keep working until 1.0 (see
   function compiles, naming the derivative plan and node. MLX builds the
   loop derivative plans at compile time instead of at the first run; they
   are the same plans, so results are unchanged.
+- CUDA kernels that need more than 64 registers per thread no longer fail
+  with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`. Every one-thread-per-element
+  launch (fused regions, per-node kernels, device loops, linear-algebra
+  helpers, and optimizer updates) used 1024 threads per block, which a
+  block's 64K registers hold only at up to 64 registers per thread; the
+  fused second-derivative kernel of a long chain of math functions in
+  `precision="float64"` (for example `jit(hessian(f), device="cuda",
+  precision="float64")`) needs 72 on a CUDA host, so it could not launch.
+  These launches now use at most the compiled kernel's own limit
+  (`CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK`). The block size of such a
+  kernel does not affect its results, and a kernel that fits 1024 threads
+  still gets 1024, so every program that ran before gives the same bits.
+  Kernels whose block shape is fixed (reductions, tiled matmul, Cholesky,
+  the global norm) keep it and, if a device cannot run that shape, fail
+  with an error that names the limit and the kernel's register count.
 
 ## [0.6.1] - 2026-10-07
 

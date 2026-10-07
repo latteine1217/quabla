@@ -693,5 +693,46 @@ def test_cuda_float64_precision_matches_cpu():
     assert value.tolist() == qb.jit(lambda a: qb.exp(a), device="cuda")(single).tolist()
 
 
+def test_cuda_register_heavy_kernels_launch_within_the_device_limit():
+    """A long chain of `double` math functions differentiated twice fuses into
+    kernels that need more registers per thread than a block of 1024 threads
+    can hold; the launch must use the compiled kernel's own thread limit
+    instead of failing with CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES."""
+    require("cuda")
+
+    def chain(a):
+        return (
+            qb.tanh(qb.sin(a) * qb.exp(-a * a)) + qb.erfc(a) * qb.log1p(a * a)
+            + qb.atan2(a, 1.0 + a * a) + qb.fmod(a, 0.75) + qb.expm1(qb.cos(a) * 0.5)
+            + qb.erf(a) + qb.log(1.0 + a * a) + qb.tan(a * 0.1) + qb.arctan(a)
+            + (a * a + 1.0) ** 0.75
+        )
+
+    def loss(a):
+        return qb.sum(chain(a))
+
+    x = qb.asarray([0.0, -0.0, 0.5, -0.5, 1.0, -1.0, 2.0, 1e-8], dtype=qb.float64)
+    # Several thousand elements span several blocks of any launchable size.
+    many = qb.asarray([0.001 * i - 1.5 for i in range(3000)], dtype=qb.float64)
+    programs = {
+        "hessian": (qb.hessian(loss), x),
+        "vmap hvp": (
+            qb.vmap(lambda v: qb.jvp(qb.grad(loss), (x,), (v,))[1]),
+            qb.eye(8, dtype=qb.float64),
+        ),
+        "hvp": (lambda a: qb.jvp(qb.grad(loss), (a,), (qb.ones_like(a),))[1], many),
+    }
+    for precision, tolerance in ((None, 1e-5), ("float64", 1e-12)):
+        options = {"device": "cuda"} | ({"precision": precision} if precision else {})
+        for name, (function, argument) in programs.items():
+            expected = qb.jit(function)(argument)
+            with warnings.catch_warnings():
+                # The default precision warns that float64 runs as float32.
+                warnings.simplefilter("ignore")
+                actual = qb.jit(function, **options)(argument)
+            assert actual.shape == expected.shape, (name, precision)
+            close_normwise(actual.astype(qb.float64), expected, tolerance)
+
+
 if __name__ == "__main__":
     run(globals())
