@@ -9,6 +9,26 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Fixed
+
+- CUDA results that add partial sums across threads are the same on every
+  run. A full `sum` or `mean` over more than 256 elements added one partial
+  per block into the output with `atomicAdd`, and the gradient of a
+  `fori_loop` or `scan` capture that broadcasts into the carry (a scalar or
+  per-row weight used by every lane) added one value per lane the same way;
+  floating-point addition rounds in whatever order the hardware finishes
+  the blocks or lanes, so repeated runs of one program returned different
+  last bits. Each block or lane now stores its value, and a second kernel
+  adds them in a fixed order: fewer than 256 lanes of a capture element
+  serially in increasing order, and the block partials of a sum or 256
+  lanes or more of a capture element by one block that accumulates them in
+  double with a fixed tree and rounds once. A
+  sum or mean over at most 256 elements keeps the bits it had; the others
+  differ from earlier runs within rounding, and a long `float32` capture
+  gradient is more accurate. CUDA kernels no longer use floating-point
+  atomics, so the `float64` compare-and-swap fallback for devices below
+  compute capability 6.0 is gone.
+
 ## [0.7.0] - 2026-10-07
 
 The v0.7 plan in `docs/jax_like_roadmap.md`: two robustness fixes found
