@@ -20,13 +20,16 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
-use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 use super::super::device_optimizer::{cuda_adam_update, cuda_sgd_update};
 use super::super::{
     AdamCoefficients, AdamOrder, DeviceOptimizerConfig, DeviceUpdateRule, TensorNodeId,
 };
-use super::{cuda_value_mut, input_node_id, CudaAdamState, CudaExecutionPlan, CudaReal};
+use super::{
+    cuda_elementwise_launch, cuda_fixed_block_launch, cuda_value_mut, input_node_id, CudaAdamState,
+    CudaExecutionPlan, CudaReal,
+};
 
 /// Threads per block of the global-norm kernels; the kernels' shared arrays
 /// have exactly this many entries and the tree reduction needs a power of two.
@@ -218,14 +221,18 @@ fn global_norm_blocks(count: usize) -> usize {
         .min(GLOBAL_NORM_MAX_BLOCKS)
 }
 
-fn reduction_config(blocks: usize) -> Result<LaunchConfig, String> {
+fn reduction_config(kernel: &CudaFunction, blocks: usize) -> Result<LaunchConfig, String> {
     let blocks = u32::try_from(blocks)
         .map_err(|_| "CUDA global-norm block count exceeds u32".to_string())?;
-    Ok(LaunchConfig {
-        grid_dim: (blocks, 1, 1),
-        block_dim: (GLOBAL_NORM_THREADS, 1, 1),
-        shared_mem_bytes: 0,
-    })
+    cuda_fixed_block_launch(
+        kernel,
+        LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (GLOBAL_NORM_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        "global-norm",
+    )
 }
 
 impl<T: CudaReal> CudaExecutionPlan<T> {
@@ -335,7 +342,7 @@ impl<T: CudaReal> CudaExecutionPlan<T> {
                     // `index < count`, and only the mutably passed `parameter` is written.
                     unsafe {
                         launch
-                            .launch(LaunchConfig::for_num_elems(launch_count))
+                            .launch(cuda_elementwise_launch(&kernel, launch_count)?)
                             .map_err(|error| {
                                 format!("failed to launch CUDA SGD kernel: {error:?}")
                             })?;
@@ -419,7 +426,7 @@ impl<T: CudaReal> CudaExecutionPlan<T> {
                     // `index < count`, and only the mutably passed buffers are written.
                     unsafe {
                         launch
-                            .launch(LaunchConfig::for_num_elems(launch_count))
+                            .launch(cuda_elementwise_launch(&kernel, launch_count)?)
                             .map_err(|error| {
                                 format!("failed to launch CUDA Adam kernel: {error:?}")
                             })?;
@@ -518,7 +525,7 @@ impl<T: CudaReal> CudaExecutionPlan<T> {
                 // entries allocated above; `scalars` holds three elements.
                 unsafe {
                     launch
-                        .launch(reduction_config(block_count)?)
+                        .launch(reduction_config(&partials_kernel, block_count)?)
                         .map_err(|error| {
                             format!("failed to launch CUDA global-norm kernel: {error:?}")
                         })?;
@@ -537,9 +544,11 @@ impl<T: CudaReal> CudaExecutionPlan<T> {
             // block of `GLOBAL_NORM_THREADS` threads, and writes only `scalars[0]`,
             // `scalars[1]`, or `scalars[2]` of its three elements.
             unsafe {
-                launch.launch(reduction_config(1)?).map_err(|error| {
-                    format!("failed to launch CUDA global-norm kernel: {error:?}")
-                })?;
+                launch
+                    .launch(reduction_config(&reduce_kernel, 1)?)
+                    .map_err(|error| {
+                        format!("failed to launch CUDA global-norm kernel: {error:?}")
+                    })?;
             }
         }
         Ok(())

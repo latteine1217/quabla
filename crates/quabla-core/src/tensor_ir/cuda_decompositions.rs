@@ -136,10 +136,11 @@ fn load_column_major<T: CudaReal>(
     launch.arg(&m);
     launch.arg(&n);
     launch.arg(&stride_u64);
+    let config = linalg_launch_config(&kernel, stack.batch * stack.m * stack.n)?;
     // SAFETY: the arguments match `quabla_column_major_load(const float*, float*, unsigned long
     // long x4)`; `matrix` holds `batch * m * n` floats and `factor` `batch * stride` floats with
     // `stride >= m * n`, and the kernel guards its index against `batch * m * n`.
-    unsafe { launch.launch(linalg_launch_config(stack.batch * stack.m * stack.n)?) }
+    unsafe { launch.launch(config) }
         .map_err(|error| format!("failed to launch CUDA column-major load: {error:?}"))?;
     Ok(factor)
 }
@@ -315,7 +316,7 @@ fn launch_qr<T: CudaReal>(
         // SAFETY: the arguments match `quabla_qr_signs(const float*, float*, unsigned long long
         // x4)`; `factor` holds `batch` slots of `stride >= m * k` floats, `signs` `batch * k`
         // floats, and the kernel guards its index against `batch * k`.
-        unsafe { launch.launch(linalg_launch_config(batch * k)?) }
+        unsafe { launch.launch(linalg_launch_config(&kernel, batch * k)?) }
             .map_err(|error| format!("failed to launch CUDA QR sign kernel: {error:?}"))?;
     }
     if !want_q {
@@ -333,7 +334,7 @@ fn launch_qr<T: CudaReal>(
         // long long x5)`; `factor` holds `batch` column-major `m x n` slots of `stride` floats,
         // `signs` `batch * k` floats, `output` `batch * k * n` floats (the `qr_r` node), and
         // the kernel guards its index against `batch * k * n`.
-        return unsafe { launch.launch(linalg_launch_config(batch * k * n)?) }
+        return unsafe { launch.launch(linalg_launch_config(&kernel, batch * k * n)?) }
             .map(|_| ())
             .map_err(|error| format!("failed to launch CUDA QR R kernel: {error:?}"));
     }
@@ -379,7 +380,7 @@ fn launch_qr<T: CudaReal>(
     // long x5)`; `factor` holds `batch` column-major `m x q_columns` slots of `stride` floats,
     // `signs` `batch * k` floats, `output` `batch * m * q_columns` floats (the `qr_q` or
     // `qr_q_complete` node), and the kernel guards its index against that count.
-    unsafe { launch.launch(linalg_launch_config(batch * m * q_columns)?) }
+    unsafe { launch.launch(linalg_launch_config(&kernel, batch * m * q_columns)?) }
         .map(|_| ())
         .map_err(|error| format!("failed to launch CUDA QR Q kernel: {error:?}"))
 }
@@ -532,7 +533,7 @@ fn launch_svd<T: CudaReal>(
     // holds `batch` row-major `m x u_columns` matrices and `right` `batch` row-major
     // `vh_rows x n` matrices, and each thread (guarded against `batch * k`) touches only its own
     // column of `U` and row of `Vh`.
-    unsafe { launch.launch(linalg_launch_config(batch * k)?) }
+    unsafe { launch.launch(linalg_launch_config(&kernel, batch * k)?) }
         .map_err(|error| format!("failed to launch CUDA SVD sign kernel: {error:?}"))?;
     let source = if matches!(kind, LinalgKind::SvdU | LinalgKind::SvdUFull) {
         &u

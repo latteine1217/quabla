@@ -39,6 +39,9 @@ const CUDA_MATMUL_TILE: usize = 32;
 const CUDA_MATMUL_TILE_U64: u64 = 32;
 const CUDA_MATMUL_BLOCK: u32 = 16;
 const CUDA_REDUCTION_BLOCK: u32 = 256;
+/// Threads per block of a one-thread-per-element launch the kernel can run
+/// with; see [`cuda_elementwise_launch`].
+const CUDA_ELEMENTWISE_BLOCK: u32 = 1024;
 
 #[path = "cuda_cholesky.rs"]
 mod cholesky_backend;
@@ -1458,7 +1461,7 @@ impl CudaExecutionPlan<f32> {
         // the mutably passed `parameter` is written.
         unsafe {
             launch
-                .launch(LaunchConfig::for_num_elems(launch_count))
+                .launch(cuda_elementwise_launch(&kernel, launch_count)?)
                 .map_err(|error| format!("failed to launch CUDA SGD kernel: {error:?}"))?;
         }
         Ok(())
@@ -1591,7 +1594,7 @@ impl CudaExecutionPlan<f32> {
         // `index < count`, and only the mutably passed buffers are written.
         unsafe {
             launch
-                .launch(LaunchConfig::for_num_elems(launch_count))
+                .launch(cuda_elementwise_launch(&kernel, launch_count)?)
                 .map_err(|error| format!("failed to launch CUDA Adam kernel: {error:?}"))?;
         }
         Ok(())
@@ -1787,7 +1790,7 @@ impl TensorBackend for CudaBackend {
         // `index < count`.
         unsafe {
             launch
-                .launch(LaunchConfig::for_num_elems(launch_count))
+                .launch(cuda_elementwise_launch(&kernel, launch_count)?)
                 .map_err(|error| format!("failed to launch CUDA elementwise kernel: {error:?}"))?;
         }
         let data = stream
@@ -3006,12 +3009,9 @@ fn execute_cuda_device_program<T: CudaReal>(
                 }
                 launch.arg(slot.as_mut().expect("allocated above"));
                 launch.arg(&mut scratch);
-                // SAFETY: generated derivative kernels accept the ordered operand pointers,
-                // n*n output lanes, and the exact checked Jet workspace allocation above.
-                // One block owns each matrix's factorization and column-ordered reverse
-                // traversal, synchronizing its threads between dependent phases.
-                unsafe {
-                    launch.launch(LaunchConfig {
+                let config = cuda_fixed_block_launch(
+                    &kernel,
+                    LaunchConfig {
                         grid_dim: (
                             u32::try_from(
                                 node.shape[..node.shape.len() - 2].iter().product::<usize>(),
@@ -3022,9 +3022,14 @@ fn execute_cuda_device_program<T: CudaReal>(
                         ),
                         block_dim: (256, 1, 1),
                         shared_mem_bytes: 0,
-                    })
-                }
-                .map_err(|error| {
+                    },
+                    "Cholesky derivative",
+                )?;
+                // SAFETY: generated derivative kernels accept the ordered operand pointers,
+                // n*n output lanes, and the exact checked Jet workspace allocation above.
+                // One block owns each matrix's factorization and column-ordered reverse
+                // traversal, synchronizing its threads between dependent phases.
+                unsafe { launch.launch(config) }.map_err(|error| {
                     format!("failed to launch CUDA Cholesky derivative kernel: {error:?}")
                 })?;
                 free_buffers.recycle(scratch);
@@ -3201,7 +3206,7 @@ fn execute_cuda_fusion_region<T: CudaReal>(
     // elements, and the kernel guards `index < count`.
     unsafe {
         launch
-            .launch(LaunchConfig::for_num_elems(launch_count))
+            .launch(cuda_elementwise_launch(&kernel, launch_count)?)
             .map_err(|error| format!("failed to launch CUDA fusion region: {error:?}"))?;
     }
     Ok(())
@@ -3279,7 +3284,7 @@ fn execute_cuda_fused_elementwise_program<T: CudaReal>(
         // kernel guards `index < count`.
         unsafe {
             launch
-                .launch(LaunchConfig::for_num_elems(launch_count))
+                .launch(cuda_elementwise_launch(&kernel, launch_count)?)
                 .map_err(|error| {
                     format!("failed to launch CUDA fused elementwise kernel: {error:?}")
                 })?;
@@ -3370,10 +3375,11 @@ fn execute_cuda_matmul_bias_tanh_program<T: CudaReal>(
         // buffer size and the bound the kernel guards.
         unsafe {
             launch
-                .launch(LaunchConfig::for_num_elems(
+                .launch(cuda_elementwise_launch(
+                    &kernel,
                     u32::try_from(count)
                         .map_err(|_| "CUDA epilogue launch exceeds u32".to_string())?,
-                ))
+                )?)
                 .map_err(|error| format!("failed to launch CUDA matmul epilogue: {error:?}"))?;
         }
         if copy_output {
@@ -3480,11 +3486,15 @@ impl CudaBackend {
         // bounds-checked against `rows`, `inner`, and `cols`.
         unsafe {
             launch
-                .launch(LaunchConfig {
-                    grid_dim: (grid_x, grid_y, 1),
-                    block_dim: (CUDA_MATMUL_BLOCK, CUDA_MATMUL_BLOCK, 1),
-                    shared_mem_bytes: 0,
-                })
+                .launch(cuda_fixed_block_launch(
+                    &kernel,
+                    LaunchConfig {
+                        grid_dim: (grid_x, grid_y, 1),
+                        block_dim: (CUDA_MATMUL_BLOCK, CUDA_MATMUL_BLOCK, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    "matmul",
+                )?)
                 .map_err(|error| format!("failed to launch CUDA matmul kernel: {error:?}"))?;
         }
         let data = stream
@@ -3579,6 +3589,68 @@ fn cuda_scalar_predicate<T: CudaReal>(value: &[T]) -> Result<bool, String> {
         return Err("conditional predicate must be finite".to_string());
     }
     Ok(value != 0.0)
+}
+
+/// The most threads per block `kernel` can be launched with on its device.
+///
+/// `CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK` is derived from the compiled
+/// kernel's register and shared-memory use and the device's per-block limits.
+/// It falls below 1024 for kernels that need many registers per thread: a
+/// block holds at most 64K registers on current devices, so 1024 threads fit
+/// only at up to 64 registers each, and a long fused chain of `double` math
+/// functions needs more. A launch with more threads than this fails with
+/// `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`.
+fn cuda_kernel_thread_limit(kernel: &CudaFunction) -> Result<u32, String> {
+    let limit = kernel
+        .max_threads_per_block()
+        .map_err(|error| format!("failed to query the CUDA kernel thread limit: {error:?}"))?;
+    u32::try_from(limit)
+        .ok()
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| format!("CUDA kernel reports an invalid thread limit of {limit}"))
+}
+
+/// A one-dimensional launch of one thread per element for `count` elements.
+///
+/// It serves kernels whose thread `blockIdx.x * blockDim.x + threadIdx.x`
+/// computes its element alone and returns past the count. Each element is
+/// then the same arithmetic whatever the block size (only the interleaving
+/// of the loop VJP kernels' atomic additions follows the hardware schedule,
+/// in any case), so the block only has to be launchable: it is
+/// `CUDA_ELEMENTWISE_BLOCK` whenever the kernel allows that, and otherwise
+/// the kernel's own limit.
+fn cuda_elementwise_launch(kernel: &CudaFunction, count: u32) -> Result<LaunchConfig, String> {
+    let block = CUDA_ELEMENTWISE_BLOCK.min(cuda_kernel_thread_limit(kernel)?);
+    Ok(LaunchConfig {
+        grid_dim: (count.div_ceil(block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    })
+}
+
+/// Checks a launch whose block shape the kernel fixes (shared-memory tiles,
+/// or a reduction tree whose summation order follows the block) against the
+/// kernel's thread limit, so a kernel that cannot run with that block fails
+/// with the limit named instead of `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`.
+fn cuda_fixed_block_launch(
+    kernel: &CudaFunction,
+    config: LaunchConfig,
+    name: &str,
+) -> Result<LaunchConfig, String> {
+    let (x, y, z) = config.block_dim;
+    let threads = x * y * z;
+    let limit = cuda_kernel_thread_limit(kernel)?;
+    if threads > limit {
+        let registers = kernel
+            .num_regs()
+            .map_or_else(|_| "an unknown number of".to_string(), |r| r.to_string());
+        return Err(format!(
+            "CUDA {name} kernel needs {threads} threads per block, but this device can launch \
+             it with at most {limit} (CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK; the kernel uses \
+             {registers} registers per thread)"
+        ));
+    }
+    Ok(config)
 }
 
 struct CudaNodeLaunch<'a, T: CudaReal> {
@@ -3753,14 +3825,16 @@ fn launch_cuda_node<T: CudaReal>(
             ))
         }
     }
-    let config = match op {
+    // Reductions, tiled matmul, and Cholesky fix their block shape; every other
+    // node kernel computes one element per thread.
+    let fixed_block = match op {
         TensorOp::Matmul { lhs, rhs }
             if use_tiled_rank_two_matmul(plan, *lhs, *rhs, output_shape) =>
         {
             let dimensions = dimensions
                 .as_ref()
                 .ok_or_else(|| "CUDA matmul launch dimensions are missing".to_string())?;
-            LaunchConfig {
+            Some(LaunchConfig {
                 grid_dim: (
                     u32::try_from(dimensions[2].div_ceil(CUDA_MATMUL_TILE_U64))
                         .map_err(|_| "CUDA matmul grid width exceeds u32".to_string())?,
@@ -3770,13 +3844,13 @@ fn launch_cuda_node<T: CudaReal>(
                 ),
                 block_dim: (CUDA_MATMUL_BLOCK, CUDA_MATMUL_BLOCK, 1),
                 shared_mem_bytes: 0,
-            }
+            })
         }
         TensorOp::Sum { .. } | TensorOp::Mean { .. } => {
             let dimensions = dimensions
                 .as_ref()
                 .ok_or_else(|| "CUDA reduction launch dimensions are missing".to_string())?;
-            LaunchConfig {
+            Some(LaunchConfig {
                 grid_dim: (
                     u32::try_from(dimensions[0].div_ceil(CUDA_REDUCTION_BLOCK as u64))
                         .map_err(|_| "CUDA reduction grid size exceeds u32".to_string())?,
@@ -3785,9 +3859,9 @@ fn launch_cuda_node<T: CudaReal>(
                 ),
                 block_dim: (CUDA_REDUCTION_BLOCK, 1, 1),
                 shared_mem_bytes: 0,
-            }
+            })
         }
-        TensorOp::Cholesky { .. } => LaunchConfig {
+        TensorOp::Cholesky { .. } => Some(LaunchConfig {
             grid_dim: (
                 u32::try_from(
                     output_shape[..output_shape.len() - 2]
@@ -3800,19 +3874,23 @@ fn launch_cuda_node<T: CudaReal>(
             ),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
-        },
+        }),
         TensorOp::SumAxis { input, axis }
         | TensorOp::MeanAxis { input, axis }
         | TensorOp::ExtremumAxis { input, axis, .. }
             if plan.nodes[*input].shape[*axis] >= CUDA_REDUCTION_BLOCK as usize =>
         {
-            LaunchConfig {
+            Some(LaunchConfig {
                 grid_dim: (launch_count, 1, 1),
                 block_dim: (CUDA_REDUCTION_BLOCK, 1, 1),
                 shared_mem_bytes: 0,
-            }
+            })
         }
-        _ => LaunchConfig::for_num_elems(launch_count),
+        _ => None,
+    };
+    let config = match fixed_block {
+        Some(config) => cuda_fixed_block_launch(kernel, config, cuda_op_name(op))?,
+        None => cuda_elementwise_launch(kernel, launch_count)?,
     };
     // SAFETY: the argument pushes above follow the per-op signatures emitted by
     // `cuda_program_source` for this node, and the launch shape matches the emitted variant: the
@@ -3856,7 +3934,7 @@ fn launch_cuda_fori_node<T: CudaReal>(
     // by shared reference and written buffers by `&mut`.
     unsafe {
         launch
-            .launch(LaunchConfig::for_num_elems(launch_count))
+            .launch(cuda_elementwise_launch(kernel, launch_count)?)
             .map_err(|error| format!("failed to launch CUDA Fori device loop: {error:?}"))?;
     }
     Ok(())
@@ -3894,7 +3972,7 @@ fn launch_cuda_fori_jvp_node<T: CudaReal>(
     // written buffers by `&mut`.
     unsafe {
         launch
-            .launch(LaunchConfig::for_num_elems(launch_count))
+            .launch(cuda_elementwise_launch(kernel, launch_count)?)
             .map_err(|error| format!("failed to launch CUDA Fori JVP device loop: {error:?}"))?;
     }
     Ok(())
@@ -3931,7 +4009,7 @@ fn launch_cuda_fori_vjp_node<T: CudaReal>(
     // Read-only operands are passed by shared reference and written buffers by `&mut`.
     unsafe {
         launch
-            .launch(LaunchConfig::for_num_elems(launch_count))
+            .launch(cuda_elementwise_launch(kernel, launch_count)?)
             .map_err(|error| format!("failed to launch CUDA Fori VJP device loop: {error:?}"))?;
     }
     Ok(())
@@ -3970,7 +4048,7 @@ fn launch_cuda_fori_vjp_group<T: CudaReal>(
     // are passed by shared reference and written buffers by `&mut`.
     unsafe {
         launch
-            .launch(LaunchConfig::for_num_elems(launch_count))
+            .launch(cuda_elementwise_launch(kernel, launch_count)?)
             .map_err(|error| {
                 format!("failed to launch grouped CUDA Fori VJP device loop: {error:?}")
             })?;
@@ -4020,7 +4098,7 @@ fn launch_cuda_fori_vjp_jvp_node<T: CudaReal>(
     // buffers by `&mut`.
     unsafe {
         launch
-            .launch(LaunchConfig::for_num_elems(launch_count))
+            .launch(cuda_elementwise_launch(kernel, launch_count)?)
             .map_err(|error| {
                 format!("failed to launch CUDA Fori VJP JVP device loop: {error:?}")
             })?;
@@ -4061,7 +4139,7 @@ fn launch_cuda_scan_node<T: CudaReal>(
     // reference and written buffers by `&mut`.
     unsafe {
         launch
-            .launch(LaunchConfig::for_num_elems(launch_count))
+            .launch(cuda_elementwise_launch(kernel, launch_count)?)
             .map_err(|error| format!("failed to launch CUDA Scan device loop: {error:?}"))?;
     }
     Ok(())
@@ -4102,7 +4180,7 @@ fn launch_cuda_scan_vjp_node<T: CudaReal>(
     // and written buffers by `&mut`.
     unsafe {
         launch
-            .launch(LaunchConfig::for_num_elems(launch_count))
+            .launch(cuda_elementwise_launch(kernel, launch_count)?)
             .map_err(|error| format!("failed to launch CUDA Scan VJP device loop: {error:?}"))?;
     }
     Ok(())
@@ -4148,7 +4226,7 @@ fn launch_cuda_scan_vjp_group<T: CudaReal>(
     // buffers by `&mut`.
     unsafe {
         launch
-            .launch(LaunchConfig::for_num_elems(launch_count))
+            .launch(cuda_elementwise_launch(kernel, launch_count)?)
             .map_err(|error| {
                 format!("failed to launch grouped CUDA Scan VJP device loop: {error:?}")
             })?;
@@ -4206,7 +4284,7 @@ fn launch_cuda_scan_vjp_jvp_group<T: CudaReal>(
     // reference and written buffers by `&mut`.
     unsafe {
         launch
-            .launch(LaunchConfig::for_num_elems(launch_count))
+            .launch(cuda_elementwise_launch(kernel, launch_count)?)
             .map_err(|error| {
                 format!("failed to launch grouped CUDA Scan VJP JVP device loop: {error:?}")
             })?;
@@ -4400,7 +4478,7 @@ fn launch_cuda_transpose_copy<T: CudaReal>(
     // `batch * rows * columns` elements, and the kernel guards `index < batch * rows * columns`.
     unsafe {
         launch
-            .launch(LaunchConfig::for_num_elems(count))
+            .launch(cuda_elementwise_launch(&kernel, count)?)
             .map_err(|error| format!("failed to launch CUDA transpose kernel: {error:?}"))?;
     }
     Ok(())
@@ -4630,11 +4708,11 @@ fn linalg_kernel(module: &Arc<CudaModule>, name: &str) -> Result<CudaFunction, S
         .map_err(|error| format!("failed to load CUDA kernel {name}: {error:?}"))
 }
 
-/// A one-dimensional launch over `count` independent elements.
-fn linalg_launch_config(count: usize) -> Result<LaunchConfig, String> {
+/// A one-dimensional launch of `kernel` over `count` independent elements.
+fn linalg_launch_config(kernel: &CudaFunction, count: usize) -> Result<LaunchConfig, String> {
     let count =
         u32::try_from(count).map_err(|_| "CUDA linalg thread count exceeds u32".to_string())?;
-    Ok(LaunchConfig::for_num_elems(count.max(1)))
+    cuda_elementwise_launch(kernel, count.max(1))
 }
 
 /// Evaluates one [`LinalgKind`] output for `batch` row-major `n x n`
@@ -4704,7 +4782,7 @@ fn launch_cusolver_linalg<T: CudaReal>(
         // SAFETY: the arguments match `quabla_symmetric_part(const float*, float*, unsigned long
         // long, unsigned long long)`; `matrix` and `factor` hold `batch * n * n` floats and the
         // kernel guards its index against that count.
-        unsafe { launch.launch(linalg_launch_config(matrix_count)?) }
+        unsafe { launch.launch(linalg_launch_config(&kernel, matrix_count)?) }
             .map_err(|error| format!("failed to launch CUDA symmetrization: {error:?}"))?;
     }
     let mut workspace_elements = 0_i32;
@@ -4821,7 +4899,7 @@ fn launch_cusolver_linalg<T: CudaReal>(
             // unsigned long long, unsigned long long, int)`; `factor` holds `batch` LU factors of
             // `n * n` floats, `pivots` `batch * n` ints, `output` `batch` floats, and the kernel
             // guards its index against `batch`.
-            unsafe { launch.launch(linalg_launch_config(batch)?) }
+            unsafe { launch.launch(linalg_launch_config(&kernel, batch)?) }
                 .map(|_| ())
                 .map_err(|error| format!("failed to launch CUDA slogdet kernel: {error:?}"))
         }
@@ -4838,7 +4916,7 @@ fn launch_cusolver_linalg<T: CudaReal>(
             // SAFETY: the arguments match `quabla_eigenvector_signs(float*, unsigned long long,
             // unsigned long long)`; `output` holds `batch` row-major `n x n` matrices, and each
             // thread (guarded against `batch * n`) touches only its own column.
-            unsafe { launch.launch(linalg_launch_config(batch * n)?) }
+            unsafe { launch.launch(linalg_launch_config(&kernel, batch * n)?) }
                 .map(|_| ())
                 .map_err(|error| {
                     format!("failed to launch CUDA eigenvector sign kernel: {error:?}")
