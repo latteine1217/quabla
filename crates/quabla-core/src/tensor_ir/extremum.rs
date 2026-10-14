@@ -188,38 +188,4 @@ impl DynamicTensor {
         }
         Self::new(output_shape, data)
     }
-
-    /// The runtime form of [`TensorIr::extremum_axis_indicators`] for the
-    /// input `self` and its reduced extremum `value`.
-    fn extremum_axis_indicators(&self, value: &Self, axis: usize) -> Result<(Self, Self), String> {
-        let expanded = value.expand_reduced_axis(&self.shape, axis)?;
-        let mask = self.compare(&expanded, TensorComparison::Equal)?;
-        let count = mask.reduce_axis(axis, 1.0)?;
-        Ok((mask, count))
-    }
-
-    /// The runtime form of [`TensorIr::extremum_axis_jvp`] for the input
-    /// `self`.
-    pub(super) fn extremum_axis_tangent(
-        &self,
-        value: &Self,
-        tangent: &Self,
-        axis: usize,
-    ) -> Result<Self, String> {
-        let (mask, count) = self.extremum_axis_indicators(value, axis)?;
-        tangent.mul(&mask)?.reduce_axis(axis, 1.0)?.div(&count)
-    }
-
-    /// The runtime form of [`TensorIr::extremum_axis_vjp`] for the input
-    /// `self`.
-    pub(super) fn extremum_axis_cotangent(
-        &self,
-        value: &Self,
-        cotangent: &Self,
-        axis: usize,
-    ) -> Result<Self, String> {
-        let (mask, count) = self.extremum_axis_indicators(value, axis)?;
-        mask.mul(&cotangent.expand_reduced_axis(&self.shape, axis)?)?
-            .div(&count.expand_reduced_axis(&self.shape, axis)?)
-    }
 }

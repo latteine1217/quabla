@@ -1198,22 +1198,6 @@ fn scan_region_stacks_fixed_shape_outputs_without_unrolling_the_body_plan() {
     ));
     assert_eq!(tape.len(), 4);
     assert_eq!(must!(tape.carry_at(2)).data().as_ref(), &[5.0]);
-    let ((carry, outputs), (carry_tangent, output_tangents)) = must!(scan.jvp(
-        must!(DynamicTensor::new(vec![], vec![1.0])),
-        must!(DynamicTensor::new(vec![], vec![0.0])),
-        &BTreeMap::from([(
-            "scale".to_string(),
-            must!(DynamicTensor::new(vec![], vec![2.0])),
-        )]),
-        &BTreeMap::from([(
-            "scale".to_string(),
-            must!(DynamicTensor::new(vec![], vec![1.0])),
-        )]),
-    ));
-    assert_eq!(carry.data().as_ref(), &[12.0]);
-    assert_eq!(outputs.data().as_ref(), &[2.0, 5.0, 12.0]);
-    assert_eq!(carry_tangent.data().as_ref(), &[13.0]);
-    assert_eq!(output_tangents.data().as_ref(), &[1.0, 4.0, 13.0]);
     let (_, _, initial_gradient, gradients) = must!(scan.value_and_vjp(
         must!(DynamicTensor::new(vec![], vec![1.0])),
         &BTreeMap::from([(

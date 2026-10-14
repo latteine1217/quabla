@@ -42,6 +42,19 @@ deprecated names keep working until 1.0 (see
   the helper functions and classes of `tensor_trace.rs`, about 4,200).
   `Compiler().compile()` returns the same plans as before, so its results
   and errors are unchanged.
+- The numeric derivative engines that only the removed helpers used: the
+  runtime VJP and JVP evaluators of `quabla_core::tensor_ir` and the mixed
+  second-order dual evaluator behind `hessian_scalar`/`hvp_scalar`, with
+  their per-op numeric rules (about 3,200 lines). The Rust methods
+  `TensorIr::vjp`, `value_and_vjp`, `value_and_vjp_many`, `jvp`,
+  `hessian_scalar`, and `hvp_scalar` (and their `TensorExecutionPlan`
+  forms) remain: they now build the symbolic transform, compile it, and run
+  it on the CPU, so their results change in the last bits, a `float32`
+  derivative rounds per operation, and nodes the outputs do not use are
+  pruned instead of evaluated. Second derivatives at a non-finite or
+  domain-edge input follow the IEEE arithmetic of the symbolic derivative
+  instead of the dual evaluator's. The Python API never reached these
+  engines, so its results are unchanged.
 - The examples and benchmarks that exercised only the removed helpers. The
   PINN examples are now `examples/pinn_poisson.py` and
   `examples/pinn_mlp.py`, which take `--device`; the two NCCL validation

@@ -179,11 +179,11 @@ Since derivative graphs are ordinary IR, applying a transform again needs no
 special support; `grad(grad(f))` is two symbolic VJPs, `hessian` is a
 symbolic JVP of a VJP vectorized with `vmap`.
 
-**Runtime (direct) evaluation** computes derivatives numerically without
-building a graph: `TensorIr::vjp`, `value_and_vjp_many`, `jvp`, `jvp_many`,
-and a mixed second-order dual evaluator (`evaluate_mixed`). The v0.1 helpers
-and the reference paths of `hessian_scalar`/`hvp_scalar` use them, and tests
-use them as an independent check of the symbolic rules.
+`TensorIr::vjp`, `value_and_vjp_many`, `jvp`, `hessian_scalar`, and
+`hvp_scalar` evaluate derivatives directly for tests and Rust callers: each
+builds the symbolic transform, compiles it, and runs it on the CPU. (Before
+v1.0 they ran separate numeric engines, including a mixed second-order dual
+evaluator.)
 
 ### Loop derivatives and checkpointing
 

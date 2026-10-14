@@ -60,13 +60,12 @@ hardware to test it, say so in the pull request.
 
 | Location | Covers |
 | --- | --- |
-| `crates/quabla-core/tests/tensor_ir.rs` | The main IR suite: ops, symbolic and runtime AD, regions, batching, the compiler facade, device parity |
+| `crates/quabla-core/tests/tensor_ir.rs` | The main IR suite: ops, AD, regions, batching, the compiler facade, device parity |
 | `crates/quabla-core/tests/tensor_ir_linalg.rs` | Batched solve and decompositions, their AD and batching |
 | `crates/quabla-core/tests/compiler_liveness.rs`, `cpu_execution_memory.rs` | Folding, CSE, pruning, buffer liveness and reuse |
 | `crates/quabla-core/tests/cpu_loop_checkpoint.rs` | Checkpointed loop VJP is bit-identical to the full tape |
-| `crates/quabla-core/tests/higher_order_optimization.rs` | Symbolic HVP/Hessian against the mixed-dual reference |
 | `crates/quabla-core/tests/cuda_*.rs` | CUDA-only: codegen size, `float64`, Cholesky, retained losses, solve profiles |
-| `crates/quabla-core/src/tensor_ir/*_tests.rs` | In-crate unit tests (region batching, MLX checkpoints, Cholesky, solve replay) |
+| `crates/quabla-core/src/tensor_ir/*_tests.rs` | In-crate unit tests (region batching, MLX checkpoints, Cholesky) |
 | `tests/python/test_api.py` | Public API, exports, operations, AD |
 | `tests/python/test_tensor_api.py` | Eager `Tensor` operations, dtypes, and the compiler facade |
 | `tests/python/test_devices_api.py`, `test_lower_program.py` | Device `jit` and ahead-of-time lowering |
@@ -121,12 +120,12 @@ backend, or an explicit rejection.
 An elementwise math function of one or two operands is a new kind of
 `UnaryMathKind` or `BinaryMathKind` in `tensor_ir/elementwise.rs`, not a new
 op. Adding the variant makes the compiler ask for every rule of the
-function there (name, `f64` value, numeric and symbolic derivatives, CUDA
+function there (name, `f64` value, symbolic derivatives, CUDA
 spelling) and for its MLX lowering in `mlx_unary_math` or
 `mlx_binary_math`; the questions with a default (CUDA fusion and loop
 admission, folding, StableHLO) are answered next to them. Nothing else in
-steps 1 to 9 below changes; the Python surface and the tests (steps 10 to
-15) still do.
+steps 1 to 8 below changes; the Python surface and the tests (steps 9 to
+14) still do.
 
 **Core IR** (`crates/quabla-core/src/tensor_ir.rs`):
 
@@ -136,10 +135,8 @@ steps 1 to 9 below changes; the Python surface and the tests (steps 10 to
    and rounded through `TensorDType::round`.
 4. Symbolic JVP rule (`symbolic_jvp_many_with_seed`) and symbolic VJP rule
    (`symbolic_vjp_many_impl`), written with IR ops so higher orders work.
-5. Runtime JVP/VJP (`jvp_many`, `value_and_vjp_many`) and the mixed
-   second-order evaluator (`evaluate_mixed_with_input_mixed`).
-6. Batching in `push_batched` (and `specialize_mapped_axis_zero`).
-7. The plumbing that every op passes through: `tensor_op_inputs`,
+5. Batching in `push_batched` (and `specialize_mapped_axis_zero`).
+6. The plumbing that every op passes through: `tensor_op_inputs`,
    `remap_tensor_op`, `tensor_op_name`, `lower_text`, constant folding
    (`fold_scalar_constant_op`, `fold_tensor_constant_op`), the CSE key
    (`pure_tensor_op_cse_key`; include every attribute that distinguishes two
@@ -147,32 +144,32 @@ steps 1 to 9 below changes; the Python surface and the tests (steps 10 to
 
 **Backends**:
 
-8. CUDA (`tensor_ir/cuda.rs`): per-node launch, the elementwise formula
+7. CUDA (`tensor_ir/cuda.rs`): per-node launch, the elementwise formula
    that every CUDA generator shares (`cuda_elementwise_formula` in
    `tensor_ir.rs`), fusion
    admission (`is_fusable_elementwise_compute_op`), loop-body lowerability,
    and the `float64` forms.
-9. MLX (`tensor_ir/mlx.rs`): lowering in `lower_arrays_with_retained` and
+8. MLX (`tensor_ir/mlx.rs`): lowering in `lower_arrays_with_retained` and
    the op name. If MLX lacks the function, implement it from MLX ops within
    a stated accuracy (as `cbrt` and `erfc` are) or reject it explicitly.
 
 **Python**:
 
-10. The eager method on `Tensor` (`crates/quabla-python/src/tensor.rs`) and
-    the traced method on `TraceTensor`
-    (`crates/quabla-python/src/tensor_trace.rs`).
-11. The module-level function in `python/quabla/_ops.py`.
-12. The type stub `python/quabla/_quabla.pyi`; `test_packaging_api.py` fails
+9. The eager method on `Tensor` (`crates/quabla-python/src/tensor.rs`) and
+   the traced method on `TraceTensor`
+   (`crates/quabla-python/src/tensor_trace.rs`).
+10. The module-level function in `python/quabla/_ops.py`.
+11. The type stub `python/quabla/_quabla.pyi`; `test_packaging_api.py` fails
     while an exported name is missing from it.
 
 **Tests and docs**:
 
-13. Rust tests in `crates/quabla-core/tests/tensor_ir.rs`: values against
+12. Rust tests in `crates/quabla-core/tests/tensor_ir.rs`: values against
     a reference, derivatives against finite differences or a closed form,
     every order you claim, and batching.
-14. Python tests in `tests/python/test_api.py` and device parity in
+13. Python tests in `tests/python/test_api.py` and device parity in
     `tests/python/test_devices_api.py`.
-15. `docs/api.md` (contract and numerics), `CHANGELOG.md`, and where it
+14. `docs/api.md` (contract and numerics), `CHANGELOG.md`, and where it
     applies `docs/jax_like_roadmap.md`.
 
 Region-level code (`region_batching.rs`, `cuda_host_loop.rs`) works on whole

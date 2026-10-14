@@ -227,7 +227,7 @@ fn structural_key_compile_cost_probe() -> Result<(), String> {
 }
 
 #[test]
-fn linear_reverse_chain_and_dead_errors_preserve_vjp_contract() -> Result<(), String> {
+fn linear_reverse_chain_vjp_ignores_dead_nodes() -> Result<(), String> {
     for dtype in [TensorDType::F64, TensorDType::F32] {
         let mut graph = TensorIr::new();
         let x = graph.input_typed("x", vec![4], dtype)?;
@@ -255,9 +255,11 @@ fn linear_reverse_chain_and_dead_errors_preserve_vjp_contract() -> Result<(), St
         let singular = graph.constant(DynamicTensor::filled(vec![1, 1], 0.0)?, false);
         let rhs = graph.constant(DynamicTensor::filled(vec![1, 1], 1.0)?, false);
         graph.solve(singular, rhs)?;
-        assert!(graph
-            .value_and_vjp(output, &inputs, DynamicTensor::filled(vec![4], 1.0)?)
-            .is_err());
+        // The VJP compiles only what the output needs, as every compiled
+        // plan does, so a failing node it does not depend on is pruned.
+        let (_, after) =
+            graph.value_and_vjp(output, &inputs, DynamicTensor::filled(vec![4], 1.0)?)?;
+        assert_eq!(after["x"].data().as_ref(), &[1.0; 4]);
     }
     Ok(())
 }

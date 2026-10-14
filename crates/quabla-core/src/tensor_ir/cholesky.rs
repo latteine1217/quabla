@@ -145,13 +145,6 @@ fn reverse(
     gradient
 }
 
-pub(super) fn evaluate(
-    kind: CholeskyAdKind,
-    inputs: &[&DynamicTensor],
-) -> Result<DynamicTensor, String> {
-    evaluate_with_rules(kind, inputs, false)
-}
-
 pub(super) fn evaluate_symbolic(
     kind: CholeskyAdKind,
     inputs: &[&DynamicTensor],

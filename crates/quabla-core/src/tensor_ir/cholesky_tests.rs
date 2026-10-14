@@ -137,10 +137,6 @@ fn compact_cholesky_derivatives_match_reference_and_stay_bounded() -> Result<(),
             &expected_vjp["matrix"],
         );
 
-        let actual_mixed = native.evaluate_mixed(output, &inputs, &directions, &directions)?;
-        let expected_mixed =
-            reference.evaluate_mixed(reference_output, &inputs, &directions, &directions)?;
-        assert_close(&actual_mixed.mixed, &expected_mixed.mixed);
         let hvp = reverse.graph.symbolic_jvp_with_tangent_inputs(
             reverse.gradients["matrix"],
             &BTreeMap::from([("matrix".into(), "direction".into())]),
@@ -257,9 +253,6 @@ fn compact_cholesky_shape_checks_and_native_f32_derivatives() -> Result<(), Stri
     let actual = hvp.graph.evaluate(hvp.tangent, &seeded)?;
     assert_eq!(actual.dtype(), TensorDType::F32);
     assert_close(&actual, &old_hvp.graph.evaluate(old_hvp.tangent, &seeded)?);
-    let actual = native.evaluate_mixed(output, &inputs, &directions, &directions)?;
-    let expected = reference.evaluate_mixed(reference_output, &inputs, &directions, &directions)?;
-    assert_close(&actual.mixed, &expected.mixed);
     Ok(())
 }
 
