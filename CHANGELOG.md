@@ -9,6 +9,21 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-10-14
+
+The v1.0 plan in `docs/jax_like_roadmap.md`: the v0.1 surface that the 0.x
+compatibility policy kept, and that v0.2 deprecated for removal at 1.0, is
+gone, together with the native code and the derivative engines that only
+it used. The core API (`grad`, `jit`, `vmap`, `optim`, `linalg`, `ode`, ...)
+and the compiler facade are unchanged; from 1.0 the public API follows
+Semantic Versioning (see `CONTRIBUTING.md`). Code that ran on 0.7.1 without
+a `DeprecationWarning` runs unchanged, with three exceptions: the plan
+classes `TensorCpuExecutionPlan`, `TensorCudaExecutionPlan`, and
+`TensorMlxExecutionPlan` and the helper `tensor_while_loop_region` are gone
+although they did not warn (only removed or internal code produced or used
+them), and `optim.Adam.step` now rounds as `optim.Adam.update`.
+`docs/guide/15-migration.md` maps every removed name to its replacement.
+
 ### Added
 
 - `Program.stablehlo_text()` prints a single-output `Compiler.trace`
@@ -946,7 +961,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/latteine1217/quabla/compare/v0.7.1...v1.0.0
 [0.7.1]: https://github.com/latteine1217/quabla/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/latteine1217/quabla/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/latteine1217/quabla/compare/v0.6.0...v0.6.1

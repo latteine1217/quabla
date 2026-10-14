@@ -27,7 +27,12 @@ private to `_quabla`.
 | 2 | Bindings: delete the pyclasses and pyfunctions only removed names reached (`trace.rs`, `matrix.rs`, most of `tensor_trace.rs`), their stubs, and registrations | clippy, Rust tests, `test_packaging_api` | Done: `trace.rs` and `matrix.rs` deleted; `tensor_trace.rs` keeps the tracer, region builders, staged executables, the data-parallel executor, and the trainer executors (9,632 to about 5,400 lines); `Executable` holds the core `QuablaExecutable`; the trainer executor keeps only its shared value-and-gradient plan; `stablehlo_text` moved to `Program` |
 | 3 | Core engines (S3, S4): delete the runtime VJP/JVP engines and the mixed second-order evaluator; `TensorIr::vjp`/`jvp` become symbolic adapters for the core tests | op, region, solver, and Adam golden baselines byte-identical | Done: `TensorIr::value_and_vjp_many` and `jvp` compile `symbolic_vjp_many`/`symbolic_jvp_many_with_tangent_inputs` graphs and run them on the CPU; `hessian_scalar`/`hvp_scalar` always take the forward-over-reverse path; the runtime evaluators, the mixed dual evaluator (`evaluate_mixed`, `MixedTangent`), the solve replay, the region plans' runtime rules, and the numeric per-op derivative rules are deleted (`tensor_ir.rs` 19,068 to 16,319 lines). Tests that compared the deleted engines with each other (`scan_numeric_jvp.rs`, `direct_solve_jvp.rs`, `higher_order_optimization.rs`, `solve_replay_tests.rs`) are deleted; a test of dead-node errors now checks that the VJP prunes them. Solver golden: no solver script exists on the CUDA host; the op, region, and Adam baselines cover the shipped paths |
 | 4 | Adam (A1): `_quabla.Adam.step` uses the canonical rule; the legacy CUDA Adam kernels go with `cuda_adam_*` | `optim.Adam.step` equals `.update` bit for bit; Adam golden changes only on the `step` path | Done: `optim.Adam.step` keeps the `init` state and calls `update`, so it is the canonical rule by construction and also takes schedules and `clip_norm`; the native `_quabla.Adam`, `AdamOrder::V01` (and the enum), and the v0.1 CUDA kernels with the per-plan device step methods are deleted; their CUDA tests are deleted and the retained-loss test uses `optimizer_step` |
-| 5 | Release 1.0.0 | all gates locally and on the CUDA host | Open |
+| 5 | Release 1.0.0 | all gates locally and on the CUDA host | Done: released as v1.0.0 on 2026-10-14 |
+
+Every step was validated on the CPU, MLX, and a single-GPU CUDA host
+(NVRTC 13.1), with the op, region, and Adam golden baselines compared bit
+for bit between consecutive steps; the two-GPU NCCL run with NVRTC 12.6
+was not repeated for v1.0.
 
 ## v0.7 Plan (2026-10-07)
 
