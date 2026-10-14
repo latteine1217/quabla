@@ -1067,7 +1067,7 @@ operations still fail explicitly during backend compilation or execution.
 | Transform | Build symbolic first-order coordinate JVP or named VJP programs | `Program.jvp(...)`, `Program.vjp(...)` |
 | Compilation | Freeze reachability-pruned IR and select one target | `Program.compile(target, device_ordinal=0)` |
 | Runtime | Bind eager `Tensor` inputs and execute the frozen plan | `Executable(inputs)` / `Executable.evaluate(inputs)` |
-| Inspection | Report build-time target availability and frozen graph text | `Compiler.capabilities()`, `Program.lower_text()` |
+| Inspection | Report build-time target availability and frozen graph text | `Compiler.capabilities()`, `Program.lower_text()`, `Program.stablehlo_text()` |
 
 `Compiler.capabilities()` answers only whether this extension was built with a
 target backend. It is not a hardware probe and it does not guarantee that a
@@ -1297,7 +1297,7 @@ the dtype rules below.
 - Data parallelism is single-node CUDA + NCCL only: equal axis-zero batch
   shards, replicated parameter gradients, and an optimizer on the host. There
   is no multi-node transport, tensor parallelism, or sharded matmul.
-- StableHLO export (`stablehlo_text`) covers only a small inspection subset
+- StableHLO export (`Program.stablehlo_text()`) covers only a small inspection subset
   and is not an execution path.
 - `quabla.vmap` batches `cond`, `fori_loop`, `scan`, and `while_loop`
   regions over mapped arguments. A batched `cond` with a per-example

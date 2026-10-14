@@ -9,6 +9,13 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Added
+
+- `Program.stablehlo_text()` prints a single-output `Compiler.trace`
+  program in the StableHLO inspection subset. It replaces
+  `trace_tensor(...).graph.stablehlo_text(node_id)`, which went with the
+  v0.1 helpers.
+
 ### Removed
 
 - The v0.1 names that v0.2 deprecated, as the 0.x compatibility policy
@@ -30,6 +37,11 @@ deprecated names keep working until 1.0 (see
 - The v0.1 call forms `grad(fn, input_specs, values, output_cotangent)`,
   `jit(input_specs)`, and `trace(fn, input_specs)`: `grad`, `jit`, and
   `trace` accept only their core-API forms.
+- The native bindings behind the removed names (the 2D `Matrix` and
+  `TraceGraph` engine in `trace.rs` and `matrix.rs`, about 5,000 lines, and
+  the helper functions and classes of `tensor_trace.rs`, about 4,200).
+  `Compiler().compile()` returns the same plans as before, so its results
+  and errors are unchanged.
 - The examples and benchmarks that exercised only the removed helpers. The
   PINN examples are now `examples/pinn_poisson.py` and
   `examples/pinn_mlp.py`, which take `--device`; the two NCCL validation

@@ -44,7 +44,7 @@ batched, and lower to every backend.
 | Crate | Role |
 | --- | --- |
 | `crates/quabla-core` | The tensor IR, CPU interpreter, runtime and symbolic autodiff, batching, plan compilation, and the CUDA and MLX backends. Pure Rust; no Python dependency. |
-| `crates/quabla-python` | The PyO3 extension module `quabla._quabla`: eager `Tensor`, the tracer, the compiler facade, the legacy APIs. |
+| `crates/quabla-python` | The PyO3 extension module `quabla._quabla`: eager `Tensor`, the tracer, and the compiler facade. |
 | `crates/quabla-macros` | Experimental `forward_diff!`/`forward_gradient!` source-to-source forward-mode macros over a small Rust expression subset. |
 | `python/quabla` | The public Python package: the v0.2+ API written in Python on top of the extension. |
 
@@ -77,11 +77,11 @@ so the rest of the code compiles unchanged.
 | Module | Responsibility |
 | --- | --- |
 | `tensor.rs` | Eager `Tensor` and `TensorView`; methods dispatch to the tracer when an operand is traced |
-| `tensor_trace.rs` | `TensorTraceGraph`, `TraceTensor`, the bridge methods used by `_transforms.py`, region builders, staged executables, device trainer executors, and the v0.1 `tensor_*_fn` helpers |
+| `tensor_trace.rs` | `TensorTraceGraph`, `TraceTensor`, the bridge methods used by `_transforms.py`, region builders, staged executables, the data-parallel executor, and the device trainer executors |
 | `compiler.rs` | The Python `Compiler`/`Program`/`Executable` facade |
 | `interop.rs` | Construction from sequences and the buffer protocol, `tolist`, read-only buffer export (never links NumPy) |
 | `repr.rs` | NumPy-style printing |
-| `trace.rs`, `matrix.rs`, `optim.rs` | The legacy 2D `TraceGraph`/`Matrix` API and the v0.1 host `Adam` |
+| `optim.rs` | The native host `Adam` behind `optim.Adam.step` |
 | `dtype.rs`, `errors.rs` | dtype objects; raising the Python exception classes from Rust |
 
 ## 13.3 The Tensor IR

@@ -536,5 +536,23 @@ def test_bool_dtype_object_and_eager_comparisons_follow_ieee_semantics():
     assert (x > 1.5).astype(quabla.float32).dtype == quabla.float32
 
 
+
+def test_program_exports_the_verified_stablehlo_subset():
+    program = quabla.Compiler().trace(
+        lambda a, b: (a + b).tanh(), [("a", [2, 1]), ("b", [2, 1])]
+    )
+    assert program.stablehlo_text() == "\n".join(
+        [
+            "module {",
+            "  func.func @main(%arg0: tensor<2x1xf64> // a, %arg1: tensor<2x1xf64> // b) -> tensor<2x1xf64> {",
+            "    %v2 = stablehlo.add %arg0, %arg1 : tensor<2x1xf64>",
+            "    %v3 = stablehlo.tanh %v2 : tensor<2x1xf64>",
+            "    return %v3 : tensor<2x1xf64>",
+            "  }",
+            "}",
+        ]
+    ) + "\n"
+
+
 if __name__ == "__main__":
     run(globals())

@@ -1,7 +1,5 @@
-//! Python-facing compiler facade for the rank-N Tensor IR path.
-//!
-//! Existing transform helpers remain compatibility APIs. New code should use
-//! `Compiler -> Program -> Executable` to make tracing, transformation, and
+//! Python-facing compiler facade for the rank-N Tensor IR path:
+//! `Compiler -> Program -> Executable` makes tracing, transformation, and
 //! backend compilation one explicit lifecycle.
 
 use std::collections::BTreeMap;
@@ -10,14 +8,13 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 use quabla_core::compiler::{
-    QuablaCompileError, QuablaCompiler, QuablaMultiOutputExecutable, QuablaTarget,
+    QuablaCompileError, QuablaCompiler, QuablaExecutable, QuablaMultiOutputExecutable, QuablaTarget,
 };
-use quabla_core::tensor_ir::MlxBackend;
 
 use crate::tensor::PyTensor;
 use crate::tensor_trace::{
-    extract_tensor_map, trace_tensor, TensorCpuExecutionPlan, TensorCudaExecutionPlan,
-    TensorInputSpec, TensorMlxExecutionPlan, TensorTraceGraph, TensorTraceResult, TraceTensor,
+    extract_tensor_map, trace_tensor, TensorInputSpec, TensorTraceGraph, TensorTraceResult,
+    TraceTensor,
 };
 
 #[pyclass(name = "Compiler", skip_from_py_object)]
@@ -47,9 +44,7 @@ pub struct PyQuablaExecutable {
 
 #[derive(Clone, Debug)]
 enum PyExecutable {
-    Cpu(TensorCpuExecutionPlan),
-    Cuda(TensorCudaExecutionPlan),
-    Mlx(TensorMlxExecutionPlan),
+    Single(QuablaExecutable),
     Many(QuablaMultiOutputExecutable),
 }
 
@@ -195,6 +190,19 @@ impl PyQuablaProgram {
         }
     }
 
+    /// The program in the StableHLO inspection subset (single-output
+    /// programs only); not an execution path.
+    fn stablehlo_text(&self, py: Python<'_>) -> PyResult<String> {
+        let traced = self.single_trace(py, "stablehlo_text")?;
+        traced
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| PyValueError::new_err("tensor trace graph lock is poisoned"))?
+            .stablehlo_text(traced.output.node_id)
+            .map_err(PyValueError::new_err)
+    }
+
     fn jvp(&self, py: Python<'_>, input_name: &str) -> PyResult<Self> {
         self.single_trace(py, "jvp")?
             .symbolic_jvp_result(input_name)
@@ -221,7 +229,11 @@ impl PyQuablaProgram {
         target: &str,
         device_ordinal: usize,
     ) -> PyResult<PyQuablaExecutable> {
-        let parsed = parse_target(target, device_ordinal)?;
+        let target = match parse_target(target, device_ordinal)? {
+            PyExecutableTarget::Cpu => QuablaTarget::Cpu,
+            PyExecutableTarget::Cuda { device_ordinal } => QuablaTarget::Cuda { device_ordinal },
+            PyExecutableTarget::Mlx => QuablaTarget::Mlx,
+        };
         let traced = match &self.inner {
             PyProgram::Single(traced) => traced,
             PyProgram::Many { graph, outputs } => {
@@ -230,13 +242,6 @@ impl PyQuablaProgram {
                         py, "an inspection Program with no array outputs has no native executable; use Lowered.compile() to assemble constant outputs", "compile",
                     ));
                 }
-                let target = match parsed {
-                    PyExecutableTarget::Cpu => QuablaTarget::Cpu,
-                    PyExecutableTarget::Cuda { device_ordinal } => {
-                        QuablaTarget::Cuda { device_ordinal }
-                    }
-                    PyExecutableTarget::Mlx => QuablaTarget::Mlx,
-                };
                 let program = graph
                     .clone()
                     .into_multi_output_program(
@@ -265,27 +270,15 @@ impl PyQuablaProgram {
                 });
             }
         };
-        let inner = match parsed {
-            PyExecutableTarget::Cpu => PyExecutable::Cpu(
-                traced
-                    .graph
-                    .compile_cpu_plan(traced.output.node_id)
-                    .map_err(PyValueError::new_err)?,
-            ),
-            PyExecutableTarget::Cuda { device_ordinal } => PyExecutable::Cuda(
-                traced
-                    .graph
-                    .compile_cuda_plan(traced.output.node_id, device_ordinal)
-                    .map_err(PyValueError::new_err)?,
-            ),
-            PyExecutableTarget::Mlx => PyExecutable::Mlx(
-                traced
-                    .graph
-                    .compile_mlx_plan(traced.output.node_id)
-                    .map_err(PyValueError::new_err)?,
-            ),
-        };
-        Ok(PyQuablaExecutable { inner })
+        // Without the build check: a target missing from the build keeps its
+        // backend's own error (CUDA when compiling, MLX on first execution).
+        let executable = traced
+            .graph
+            .compile_executable(traced.output.node_id, target)
+            .map_err(PyValueError::new_err)?;
+        Ok(PyQuablaExecutable {
+            inner: PyExecutable::Single(executable),
+        })
     }
 
     fn __repr__(&self, py: Python<'_>) -> String {
@@ -306,62 +299,39 @@ impl PyQuablaProgram {
 impl PyQuablaExecutable {
     #[getter]
     fn target(&self) -> &'static str {
-        match self.inner {
-            PyExecutable::Cpu(_) => "cpu",
-            PyExecutable::Cuda(_) => "cuda",
-            PyExecutable::Mlx(_) => "mlx",
-            PyExecutable::Many(ref plan) => plan.target().name(),
+        match &self.inner {
+            PyExecutable::Single(executable) => executable.target().name(),
+            PyExecutable::Many(plan) => plan.target().name(),
         }
     }
 
     #[getter]
     fn node_count(&self) -> usize {
         match &self.inner {
-            PyExecutable::Cpu(plan) => plan.plan.node_count(),
-            PyExecutable::Cuda(plan) => plan.plan.node_count(),
-            PyExecutable::Mlx(plan) => plan.plan.node_count(),
+            PyExecutable::Single(executable) => executable.plan().node_count(),
             PyExecutable::Many(plan) => plan.plan().node_count(),
         }
     }
 
     fn evaluate(&self, py: Python<'_>, inputs: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {
         let inputs = extract_tensor_map(inputs)?;
-        if let PyExecutable::Many(plan) = &self.inner {
-            let values = plan
-                .execute(&inputs)
-                .map_err(PyValueError::new_err)?
-                .into_iter()
-                .map(PyTensor::from_dynamic_tensor)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(PyValueError::new_err)?;
-            return Ok(PyList::new(py, values)?.into_any().unbind());
-        }
-        let value = match &self.inner {
-            PyExecutable::Cpu(plan) => plan.plan.evaluate(&inputs),
-            PyExecutable::Cuda(plan) => plan.plan.execute(&inputs),
-            PyExecutable::Mlx(plan) => {
-                let retained = plan
-                    .retained_inputs
-                    .lock()
-                    .map_err(|_| PyValueError::new_err("MLX retained input lock is poisoned"))?;
-                MlxBackend
-                    .execute_many_with_state(
-                        &plan.plan,
-                        &[plan.plan.output_node_id()],
-                        &inputs,
-                        &retained,
-                    )
-                    .and_then(|mut values| {
-                        values
-                            .pop()
-                            .ok_or_else(|| "MLX execution produced no output".to_string())
-                    })
+        match &self.inner {
+            PyExecutable::Single(executable) => {
+                let value = executable.execute(&inputs).map_err(PyValueError::new_err)?;
+                let value = PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)?;
+                Ok(Py::new(py, value)?.into_any())
             }
-            PyExecutable::Many(_) => unreachable!("multi-output programs return above"),
+            PyExecutable::Many(plan) => {
+                let values = plan
+                    .execute(&inputs)
+                    .map_err(PyValueError::new_err)?
+                    .into_iter()
+                    .map(PyTensor::from_dynamic_tensor)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(PyValueError::new_err)?;
+                Ok(PyList::new(py, values)?.into_any().unbind())
+            }
         }
-        .map_err(PyValueError::new_err)?;
-        let value = PyTensor::from_dynamic_tensor(value).map_err(PyValueError::new_err)?;
-        Ok(Py::new(py, value)?.into_any())
     }
 
     fn __call__(&self, py: Python<'_>, inputs: &Bound<'_, PyDict>) -> PyResult<Py<PyAny>> {

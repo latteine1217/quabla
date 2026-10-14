@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString};
+use pyo3::types::{PyDict, PyString};
 use quabla_core::tensor_ir::{AdamCoefficients, AdamOrder, F64Arith};
 
 use crate::tensor::PyTensor;
@@ -15,62 +15,6 @@ pub struct PyAdam {
     epsilon: f64,
     step: u64,
     moments: BTreeMap<String, (Vec<f64>, Vec<f64>)>,
-}
-
-#[pyfunction]
-#[pyo3(signature = (gradient_sets, parameter_names = None))]
-pub fn sum_gradients(
-    gradient_sets: &Bound<'_, PyList>,
-    parameter_names: Option<Vec<String>>,
-) -> PyResult<BTreeMap<String, PyTensor>> {
-    if gradient_sets.is_empty() {
-        return Err(PyValueError::new_err(
-            "sum_gradients requires at least one gradient dictionary",
-        ));
-    }
-
-    let first_item = gradient_sets.get_item(0)?;
-    let first = first_item.cast::<PyDict>()?;
-    let strict_keys = parameter_names.is_none();
-    let names = match parameter_names {
-        Some(names) => names,
-        None => {
-            let mut names = Vec::with_capacity(first.len());
-            for (key, _) in first.iter() {
-                names.push(key.cast::<PyString>()?.to_str()?.to_string());
-            }
-            names
-        }
-    };
-    let mut total = BTreeMap::new();
-    for name in names {
-        let tensor = first
-            .get_item(&name)?
-            .ok_or_else(|| PyValueError::new_err(format!("missing gradient for {name:?}")))?
-            .extract::<PyRef<'_, PyTensor>>()?
-            .clone();
-        total.insert(name, tensor);
-    }
-
-    for index in 1..gradient_sets.len() {
-        let gradient_item = gradient_sets.get_item(index)?;
-        let gradients = gradient_item.cast::<PyDict>()?;
-        if strict_keys && gradients.len() != total.len() {
-            return Err(PyValueError::new_err(
-                "gradient dictionaries must have identical keys",
-            ));
-        }
-        for (name, accumulated) in &mut total {
-            let gradient = gradients
-                .get_item(name)?
-                .ok_or_else(|| PyValueError::new_err(format!("missing gradient for {name:?}")))?
-                .extract::<PyRef<'_, PyTensor>>()?;
-            *accumulated = accumulated
-                .try_add(&gradient)
-                .map_err(PyValueError::new_err)?;
-        }
-    }
-    Ok(total)
 }
 
 #[pymethods]

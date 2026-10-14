@@ -10,36 +10,18 @@ mod composite;
 mod dtype;
 mod errors;
 mod interop;
-mod matrix;
 mod optim;
 mod repr;
 mod tensor;
 mod tensor_trace;
-mod trace;
 
 pub use compiler::{PyQuablaCompiler, PyQuablaExecutable, PyQuablaProgram};
 pub use dtype::PyDType;
-pub use matrix::PyMatrix;
-pub use optim::{sum_gradients, PyAdam};
+pub use optim::PyAdam;
 pub use tensor::{PyTensor, PyTensorView};
 pub use tensor_trace::{
-    InlineBinding, StagedExecutable, TensorBatchCudaJitFunction,
-    TensorBatchCudaValueAndGradFunction, TensorBatchJitFunction,
-    TensorBatchMlxValueAndGradFunction, TensorBatchValueAndGradFunction, TensorCondFunction,
-    TensorCondJvpFunction, TensorCondValueAndGradFunction, TensorCpuExecutionPlan,
-    TensorCudaAdamOptimizer, TensorCudaExecutionPlan, TensorCudaValueAndGradFunction,
-    TensorGradScalarFunction, TensorHessianScalarFunction, TensorHvpScalarFunction,
-    TensorJacobianFunction, TensorJitFunction, TensorJvpFunction, TensorMlxAdamOptimizer,
-    TensorMlxExecutionPlan, TensorMlxValueAndGradFunction, TensorTraceGraph, TensorTraceResult,
-    TensorValueAndGradFunction, TensorVjpFunction, TensorVmapCudaFunction,
-    TensorVmapCudaHvpScalarFunction, TensorVmapCudaJvpFunction, TensorVmapCudaVjpFunction,
-    TensorVmapFunction, TensorVmapHvpScalarFunction, TensorVmapJvpFunction, TensorVmapMlxFunction,
-    TensorVmapMlxJvpFunction, TensorVmapMlxVjpFunction, TensorVmapVjpFunction, TraceTensor,
-};
-pub use trace::{
-    CpuExecutionPlan, GradFunction, GradScalarFunction, GradScalarTransform, IrAttrValue,
-    JacobianFunction, JacobiansFunction, JitFunction, JitTransform, JvpFunction, TraceGraph,
-    TraceMatrix, TraceResult, ValueAndGradFunction, VjpFunction,
+    InlineBinding, StagedExecutable, TensorCudaAdamOptimizer, TensorMlxAdamOptimizer,
+    TensorTraceGraph, TraceTensor,
 };
 
 #[pyfunction(name = "where")]
@@ -49,16 +31,6 @@ fn py_where(
     on_true: &Bound<'_, PyAny>,
     on_false: &Bound<'_, PyAny>,
 ) -> PyResult<Py<PyAny>> {
-    if let (Ok(mask), Ok(on_true), Ok(on_false)) = (
-        mask.extract::<PyRef<'_, PyMatrix>>(),
-        on_true.extract::<PyRef<'_, PyMatrix>>(),
-        on_false.extract::<PyRef<'_, PyMatrix>>(),
-    ) {
-        let output = PyMatrix::try_where(&mask, &on_true, &on_false)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        return Ok(output.into_pyobject(py)?.into_any().unbind());
-    }
-
     // Tensor and TraceTensor branches may be Python scalars (weakly typed, adopting the other
     // branch's dtype).
     let eager_branch = |value: &Bound<'_, PyAny>| -> Option<PyTensor> {
@@ -73,16 +45,6 @@ fn py_where(
         eager_branch(on_false),
     ) {
         let output = PyTensor::try_where(&mask, &on_true, &on_false)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        return Ok(output.into_pyobject(py)?.into_any().unbind());
-    }
-
-    if let (Ok(mask), Ok(on_true), Ok(on_false)) = (
-        mask.extract::<PyRef<'_, TraceMatrix>>(),
-        on_true.extract::<PyRef<'_, TraceMatrix>>(),
-        on_false.extract::<PyRef<'_, TraceMatrix>>(),
-    ) {
-        let output = TraceMatrix::try_where(&mask, &on_true, &on_false)
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
         return Ok(output.into_pyobject(py)?.into_any().unbind());
     }
@@ -115,8 +77,8 @@ fn py_where(
     }
 
     Err(pyo3::exceptions::PyTypeError::new_err(
-        "where expects three Matrix or TraceMatrix operands, or a Tensor or TraceTensor mask \
-         with Tensor, TraceTensor, or numeric scalar branches",
+        "where expects a Tensor or TraceTensor mask with Tensor, TraceTensor, or numeric \
+         scalar branches",
     ))
 }
 
@@ -216,25 +178,6 @@ fn py_isfinite(value: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
 fn py_concat(py: Python<'_>, matrices: &Bound<'_, PySequence>, axis: usize) -> PyResult<Py<PyAny>> {
     let len = matrices.len()?;
 
-    let mut eager_matrices = Vec::with_capacity(len);
-    let mut all_eager = true;
-    for index in 0..len {
-        let item = matrices.get_item(index)?;
-        match item.extract::<PyRef<'_, PyMatrix>>() {
-            Ok(matrix) => eager_matrices.push(matrix.clone()),
-            Err(_) => {
-                all_eager = false;
-                break;
-            }
-        }
-    }
-
-    if all_eager {
-        let output = PyMatrix::try_concat(&eager_matrices, axis)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        return Ok(output.into_pyobject(py)?.into_any().unbind());
-    }
-
     let mut eager_tensors = Vec::with_capacity(len);
     let mut all_tensors = true;
     for index in 0..len {
@@ -260,20 +203,9 @@ fn py_concat(py: Python<'_>, matrices: &Bound<'_, PySequence>, axis: usize) -> P
         return Ok(output.into_pyobject(py)?.into_any().unbind());
     }
 
-    let mut trace_matrices = Vec::with_capacity(len);
-    for index in 0..len {
-        let item = matrices.get_item(index)?;
-        let matrix = item.extract::<PyRef<'_, TraceMatrix>>().map_err(|_| {
-            pyo3::exceptions::PyTypeError::new_err(
-                "concat expects a sequence containing only Matrix, Tensor, TraceMatrix, or TraceTensor operands",
-            )
-        })?;
-        trace_matrices.push(matrix.clone());
-    }
-
-    let output = TraceMatrix::try_concat(&trace_matrices, axis)
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    Ok(output.into_pyobject(py)?.into_any().unbind())
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "concat expects a sequence containing only Tensor or TraceTensor operands",
+    ))
 }
 
 #[pyfunction(name = "stack")]
@@ -386,9 +318,7 @@ fn quabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyQuablaCompiler>()?;
     m.add_class::<PyQuablaProgram>()?;
     m.add_class::<PyQuablaExecutable>()?;
-    m.add_class::<PyMatrix>()?;
     m.add_class::<PyAdam>()?;
-    m.add_function(wrap_pyfunction!(optim::sum_gradients, m)?)?;
     m.add_class::<PyDType>()?;
     m.add("float32", PyDType::from(TensorDType::F32))?;
     m.add("float64", PyDType::from(TensorDType::F64))?;
@@ -412,136 +342,20 @@ fn quabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTensorView>()?;
     m.add_class::<TensorTraceGraph>()?;
     m.add_class::<TraceTensor>()?;
-    m.add_class::<TensorTraceResult>()?;
-    m.add_class::<TensorCpuExecutionPlan>()?;
-    m.add_class::<TensorCudaExecutionPlan>()?;
-    m.add_class::<TensorMlxExecutionPlan>()?;
     m.add_class::<TensorCudaAdamOptimizer>()?;
     m.add_class::<TensorMlxAdamOptimizer>()?;
-    m.add_class::<TensorGradScalarFunction>()?;
-    m.add_class::<TensorValueAndGradFunction>()?;
-    m.add_class::<TensorHessianScalarFunction>()?;
-    m.add_class::<TensorHvpScalarFunction>()?;
-    m.add_class::<TensorJitFunction>()?;
-    m.add_class::<TensorCondFunction>()?;
-    m.add_class::<TensorCondJvpFunction>()?;
-    m.add_class::<TensorCondValueAndGradFunction>()?;
-    m.add_class::<TensorBatchJitFunction>()?;
-    m.add_class::<TensorBatchValueAndGradFunction>()?;
-    m.add_class::<TensorBatchMlxValueAndGradFunction>()?;
-    m.add_class::<TensorBatchCudaJitFunction>()?;
-    m.add_class::<TensorBatchCudaValueAndGradFunction>()?;
-    m.add_class::<TensorCudaValueAndGradFunction>()?;
-    m.add_class::<TensorMlxValueAndGradFunction>()?;
-    m.add_class::<TensorVjpFunction>()?;
-    m.add_class::<TensorJvpFunction>()?;
-    m.add_class::<TensorJacobianFunction>()?;
-    m.add_class::<TraceGraph>()?;
-    m.add_class::<TraceMatrix>()?;
-    m.add_class::<TraceResult>()?;
-    m.add_class::<CpuExecutionPlan>()?;
-    m.add_class::<GradFunction>()?;
-    m.add_class::<GradScalarFunction>()?;
-    m.add_class::<GradScalarTransform>()?;
-    m.add_class::<ValueAndGradFunction>()?;
-    m.add_class::<VjpFunction>()?;
-    m.add_class::<JacobianFunction>()?;
-    m.add_class::<JacobiansFunction>()?;
-    m.add_class::<JvpFunction>()?;
-    m.add_class::<JitFunction>()?;
-    m.add_class::<JitTransform>()?;
-    m.add_function(wrap_pyfunction!(trace::trace, m)?)?;
-    m.add_function(wrap_pyfunction!(trace::grad, m)?)?;
-    m.add_function(wrap_pyfunction!(trace::grad_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(trace::grad_scalar_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(trace::value_and_grad_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(trace::vjp_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(trace::jacobian_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(trace::jacobians_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(trace::jvp_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(trace::grad_scalar, m)?)?;
-    m.add_function(wrap_pyfunction!(trace::jit, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::trace_tensor, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_grad_scalar_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_value_and_grad_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_hessian_scalar_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_hvp_scalar_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_fn, m)?)?;
+    // The region builders and the data-parallel constructor behind the
+    // core control flow and `distributed.value_and_grad`.
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_cond, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_cond_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_cond_jvp_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        tensor_trace::tensor_cond_value_and_grad_fn,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_batch_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_batch_cuda_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        tensor_trace::tensor_value_and_grad_batch_fn,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        tensor_trace::tensor_value_and_grad_batch_cuda_fn,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        tensor_trace::tensor_value_and_grad_batch_mlx_fn,
-        m
-    )?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_fori_loop, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_fori_loop_region, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_while_loop_region, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_scan_region, m)?)?;
     m.add_function(wrap_pyfunction!(tensor_trace::tensor_scan, m)?)?;
-    m.add_class::<TensorVmapFunction>()?;
-    m.add_class::<TensorVmapHvpScalarFunction>()?;
-    m.add_class::<TensorVmapCudaFunction>()?;
-    m.add_class::<TensorVmapCudaHvpScalarFunction>()?;
-    m.add_class::<TensorVmapCudaJvpFunction>()?;
-    m.add_class::<TensorVmapMlxFunction>()?;
-    m.add_class::<TensorVmapMlxJvpFunction>()?;
-    m.add_class::<TensorVmapMlxVjpFunction>()?;
-    m.add_class::<TensorVmapVjpFunction>()?;
-    m.add_class::<TensorVmapJvpFunction>()?;
-    m.add_class::<TensorVmapCudaVjpFunction>()?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_jit_cuda_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        tensor_trace::tensor_value_and_grad_cuda_fn,
-        m
-    )?)?;
     m.add_function(wrap_pyfunction!(
         tensor_trace::tensor_value_and_grad_data_parallel_cuda_fn,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(
-        tensor_trace::tensor_value_and_grad_mlx_fn,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::mlx_adam_loss_optimizer, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_cuda_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_mlx_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_vjp_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_vjp_mlx_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_vjp_cuda_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_jvp_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_jvp_mlx_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vmap_jvp_cuda_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        tensor_trace::tensor_vmap_hvp_scalar_fn,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        tensor_trace::tensor_vmap_hvp_scalar_cuda_fn,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_vjp_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_jvp_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::tensor_jacobian_fn, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::cuda_adam_step, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::cuda_adam_optimizer, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::cuda_adam_vjp_optimizer, m)?)?;
-    m.add_function(wrap_pyfunction!(tensor_trace::cuda_adam_loss_optimizer, m)?)?;
     // `Trainer`'s private executors: plain attributes, so they stay out of
     // `__all__` and the public type stub.
     m.setattr(

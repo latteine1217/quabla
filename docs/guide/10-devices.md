@@ -235,7 +235,7 @@ Tensor([0.87758255, 1.7551651 ], dtype=float64)
 | Transform | `Program.vjp(cotangent_name) -> {input: Program}`; `Program.jvp(input_name) -> Program`, the derivative along an all-ones tangent of that input |
 | Compile | `Program.compile(target, device_ordinal=0) -> Executable` |
 | Run | `Executable(inputs)` or `Executable.evaluate(inputs)` |
-| Inspect | `Compiler.capabilities()`, `Compiler.capability(target)`, `Program.lower_text()`, `Program.output_shape` |
+| Inspect | `Compiler.capabilities()`, `Compiler.capability(target)`, `Program.lower_text()`, `Program.stablehlo_text()`, `Program.output_shape` |
 
 `capabilities()` reports what the build contains; it is not a hardware probe
 and does not promise that every graph lowers on every target.
