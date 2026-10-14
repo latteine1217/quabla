@@ -22,13 +22,10 @@ The jax.numpy-style functions added in v0.4 (`flip` through `nan_to_num`,
 after the shape helpers) are compositions of the same kind: reshapes,
 transposes, broadcasts, slices, static-index gathers, `concat`, `where`, and
 `matmul`. Their integer arguments (shifts, pad widths, repeats, axes) are
-static Python ints, since quabla has no integer arrays. `trace` also keeps
-the v0.1 call form `trace(function, input_specs)`, recognized by its
-callable first argument, with its deprecation warning.
+static Python ints, since quabla has no integer arrays.
 """
 
 import builtins
-import inspect
 import math
 import numbers
 import operator
@@ -36,7 +33,6 @@ import operator
 from . import linalg as _linalg
 from ._array import _shape, arange, asarray, full
 from ._quabla import Tensor, TraceTensor, bool_, concat, float32, stack
-from ._quabla import trace as _legacy_trace
 from ._quabla import where as _where
 
 __all__ = [
@@ -911,26 +907,10 @@ def diagonal(a, offset=0, axis1=0, axis2=1):
     return flat if length == 1 else flat[..., :: length + 1]
 
 
-def _trace(a, offset=0, axis1=0, axis2=1):
-    return diagonal(a, offset=offset, axis1=axis1, axis2=axis2).sum(axis=-1)
-
-
-def trace(*args, **kwargs):
+def trace(a, offset=0, axis1=0, axis2=1):
     """`trace(a, offset=0, axis1=0, axis2=1)`: the sum along a diagonal,
-    `diagonal(a, offset, axis1, axis2).sum(-1)`, as NumPy.
-
-    The v0.1 form `trace(function, input_specs)` of the 2D `Matrix` API
-    still works, with its deprecation warning (use `quabla.legacy.trace`);
-    it is recognized by its callable first argument."""
-    if (args and callable(args[0])) or "function" in kwargs or "input_specs" in kwargs:
-        from ._compat import warn
-
-        warn("trace")
-        return _legacy_trace(*args, **kwargs)
-    return _trace(*args, **kwargs)
-
-
-trace.__signature__ = inspect.signature(_trace)
+    `diagonal(a, offset, axis1, axis2).sum(-1)`, as NumPy."""
+    return diagonal(a, offset=offset, axis1=axis1, axis2=axis2).sum(axis=-1)
 
 
 def diag(v, k=0):

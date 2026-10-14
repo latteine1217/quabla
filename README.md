@@ -115,15 +115,12 @@ backend validate all the plans it runs when the function compiles; v0.7.1
 ([CHANGELOG](CHANGELOG.md#071---2026-10-08)) makes CUDA results the same on
 every run.
 
-All v0.1 call forms keep working. Migrated top-level names emit a
-`DeprecationWarning` once per name on explicit access (`from quabla import *`
-binds them silently); the 2D API is available without warnings
-in `quabla.legacy`, and `quabla.Adam` aliases `quabla.optim.Adam` while
-preserving its stateful dictionary `step`.
-The 0.x API may still change between releases through additions and
-deprecations (see the [compatibility policy](CONTRIBUTING.md#scope-and-status)). The 2D `Matrix`,
-`trace(...)`, and `TraceGraph` API is legacy, kept for compatibility without
-new backend features.
+v1.0 removes the v0.1 call forms that 0.x kept: the `trace_tensor` and
+`tensor_*_fn` helpers, the device optimizer helpers, the 2D `Matrix` API
+with `quabla.legacy`, and the other names deprecated since v0.2. The
+[migration guide](docs/guide/15-migration.md) maps each of them to the
+current API. The [compatibility policy](CONTRIBUTING.md#scope-and-status)
+describes what 1.x keeps stable.
 
 "JAX-style" describes the API only: Quabla does not depend on JAX and is not
 affiliated with JAX or with the `nabla-ml` project. It was formerly named
@@ -338,17 +335,15 @@ cpu 0.6748224496841431 [-0.0, 0.09867792576551437, 0.53318190574646, 1.279399991
 mlx 0.6748223900794983 [-0.0, 0.09867792576551437, 0.53318190574646, 1.279400110244751]
 ```
 
-For device training, `tensor_value_and_grad_{mlx,cuda}_fn` compute a loss
-and its gradients in one device plan, and `mlx_adam_loss_optimizer` and
-`cuda_adam_vjp_optimizer` keep parameters and Adam moments on the device; see
+For device training, `qb.optim.Trainer(loss, params, optimizer, *data,
+device="cuda:0")` keeps parameters and optimizer moments on the device; see
 [docs/api.md](docs/api.md#device-execution) and the PINN examples in
-[examples/README.md](examples/README.md), which use the v0.1 helpers.
+[examples/README.md](examples/README.md).
 
 ## Known Limitations
 
 - The CPU backend interprets frozen plans; there is no machine-code JIT.
-- Shapes are static (bounded per-batch-size specialization, no symbolic
-  dimensions), and dtypes are limited to `float32`, `float64`, and `bool`.
+- Shapes are static (one trace per shape, no symbolic dimensions), and dtypes are limited to `float32`, `float64`, and `bool`.
 - Indexing takes static Python integers; dynamic index tensors and
   boolean-mask indexing are unsupported.
 - CUDA runs loop bodies that are not purely elementwise as host-driven loops,
@@ -371,7 +366,7 @@ The full list is in [docs/api.md](docs/api.md#known-limitations).
   [docs/guide/](docs/guide/README.md)): a chapter-by-chapter walkthrough of
   the API, a PINN tutorial, and the architecture for contributors.
 - [docs/api.md](docs/api.md): function transforms, device execution, the
-  compiler facade, the v0.1 API reference, and the full list of known
+  compiler facade, the tensor reference, and the full list of known
   limitations.
 - [docs/api_v0_2_design.md](docs/api_v0_2_design.md): the accepted v0.2 API
   design and its implementation status.

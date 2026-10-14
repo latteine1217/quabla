@@ -1,21 +1,21 @@
 # Quabla API Reference
 
 This document is the reference companion to the [README](https://github.com/latteine1217/quabla/blob/main/README.md). It
-describes the Python API on `main` in two layers:
+describes the Python API on `main`:
 
-- The **core API** released in v0.2.0 (slices S0-S9 of
+- The **core API** (introduced in v0.2.0 by
   [api_v0_2_design.md](api_v0_2_design.md)): arrays with NumPy interop,
   module-level math, and the JAX-style function transforms `grad`,
   `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `vmap`, and `jit`.
-  New code should start here. Device execution uses explicit
-  `jit(device="cpu" | "cuda:N" | "mlx")`.
-- The **v0.1 layer**, released in v0.1.0 and kept unchanged: the rank-N
-  compiler facade (`Compiler`, `Program`, `Executable`), which is the
-  advanced layer for explicit compilation; the `trace_tensor` and `tensor_*_fn`
-  helpers with their device variants and device optimizers; the control-flow
-  builders; and the legacy 2D `Matrix` API. The design deprecates most
-  `tensor_*_fn` helpers in favour of the core API from v0.2. Migrated top-level
-  names warn once, and all old call forms keep working through 0.x.
+  Device execution uses explicit `jit(device="cpu" | "cuda:N" | "mlx")`.
+- The **compiler facade** (`Compiler`, `Program`, `Executable`), the
+  advanced layer for explicit compilation and inspection.
+
+v1.0 removed the v0.1 surface that 0.x kept for compatibility: the
+`trace_tensor` and `tensor_*_fn` helpers, the device optimizer helpers, the
+2D `Matrix` API with `quabla.legacy`, and the other names deprecated since
+v0.2. The [migration guide](guide/15-migration.md) maps each of them to the
+core API.
 
 Paths in code spans (for example `examples/pinn_poisson.py`) are relative to
 the repository root. Per-feature status and validation records are in
@@ -34,10 +34,8 @@ the repository root. Per-feature status and validation records are in
   - [Version and Type Stubs](#version-and-type-stubs)
 - [Device Execution](#device-execution)
 - [Compiler Facade](#compiler-facade)
-- [v0.1 API Reference](#v01-api-reference)
-  - [Rank-N Tensor API](#rank-n-tensor-api)
-  - [Legacy 2D API](#legacy-2d-api)
-  - [Rust Core Crate](#rust-core-crate)
+- [Tensor Reference](#tensor-reference)
+- [Rust Core Crate](#rust-core-crate)
 - [Known Limitations](#known-limitations)
 
 ## Core API
@@ -86,7 +84,7 @@ qb.eye(n, m=None, dtype=None)
   `transpose`,
   `reshape`, `broadcast_to`, `astype`, `maximum`, `minimum`, `atan2`,
   `fmod`, `power`, `solve` (see `qb.linalg` below), `cholesky`, `tril`, and
-  `triu`, next to the v0.1
+  `triu`, next to the
   functions `where`, `concat`, `stack`, `einsum`, and the comparison and
   logical functions. Other operands (numbers, lists, NumPy arrays) go
   through `asarray`; a Python number stays a weak scalar. `abs`, `round`,
@@ -203,8 +201,7 @@ qb.eye(n, m=None, dtype=None)
     `symmetric`, and `wrap`, `tile`, `repeat` (an int, or one count per
     entry), `moveaxis`, `swapaxes`, `ravel`, `diag(v, k=0)` (1-D to 2-D and
     back), `diagonal(x, offset=0, axis1=0, axis2=1)`, and `trace` with the
-    same arguments. `trace(function, input_specs)`, the v0.1 call form, is
-    still dispatched to `quabla.legacy.trace` with its deprecation warning.
+    same arguments.
   - Products: `outer`, `dot` (NumPy's rules: a `tensordot` over the last
     axis of `a` and the second-to-last of `b` beyond rank 2), `tensordot(a,
     b, axes=2)`, `kron`, and `cross(a, b, axisa=-1, axisb=-1, axisc=-1,
@@ -229,9 +226,9 @@ qb.eye(n, m=None, dtype=None)
 - Operators: `-x` and `x ** y` work on traced values as on eager ones;
   `x ** y` with a non-integer or tensor exponent is the differentiable
   elementwise `pow` op (`qb.power`), described under
-  [Rank-N Tensor API](#rank-n-tensor-api).
-- The dtype rules, bool masks, and the operation set are the v0.1 rules of
-  the [Rank-N Tensor API](#rank-n-tensor-api).
+  [Tensor Reference](#tensor-reference).
+- The dtype rules, bool masks, and the operation set are those of the
+  [Tensor Reference](#tensor-reference).
 
 ### Function Transforms
 
@@ -402,9 +399,6 @@ decorator: `@qb.jit(device="mlx", static_argnums=1)`, `@qb.grad(argnums=1)`.
   must be hashable and are part of the trace cache key. A static keyword
   argument cannot be passed to a `jit` of another transform
   (`jit(grad(f))`); pass it positionally there.
-- `quabla.grad` and `quabla.jit` still accept the legacy 2D forms
-  `grad(fn, input_specs, values, output_cotangent)` and `jit(input_specs)`
-  and dispatch them to the v0.1 functions below.
 - A `TraceTensor` has no value while it is traced: Python control flow,
   `float()`, `int()`, `item()`, `tolist()`, `numpy()`, and `np.asarray` on
   it raise `quabla.TracerError`. A NumPy array is not captured: as the
@@ -655,9 +649,9 @@ The package ships `py.typed` and a stub, `quabla/_quabla.pyi`, for the
 compiled extension. It types `Tensor`, `TensorView`, `TraceTensor`,
 `dtype` and the dtype objects in detail, including that an operator with a
 traced operand gives a `TraceTensor`; the other extension functions and
-classes (the comparison functions, the v0.1 low-level transform entry
-points, execution plans, and legacy classes) are declared with their
-parameter names but loose (`Any`) types. The
+classes (the comparison functions, the compiler facade, and the private
+helpers the Python layers call) are declared with their parameter names but
+loose (`Any`) types. The
 pure-Python modules (`quabla.optim`, `quabla.tree`, the transforms) are not
 annotated yet, so checkers infer their types.
 
@@ -781,10 +775,8 @@ raises `UnsupportedOperationError` on MLX.
 replaces them in the declared order, with unchanged pytree/shapes/dtypes;
 `step()` reuses data without Python flattening on devices. Device parameters
 and moments stay retained; `.loss()` and `.params` explicitly read back.
-Compare the native and new training path with
-`python examples/benchmark_v02_training.py --device cuda:0 --max-step-ratio 1.02`
-(or `--device mlx`). This reports training parity and interleaved synchronized
-step samples separately from trace/compile and diagnostic readback.
+`python examples/pinn_mlp.py --device cuda` (or `--device mlx`) trains a
+small PINN on the device and checks it against the CPU trainer.
 
 `qb.cond(pred, true_fun, false_fun, *operands)` runs one branch lazily.
 `qb.fori_loop(lower, upper, body, init, operands=(), unroll=False)` calls
@@ -1047,36 +1039,20 @@ them. Mapped-input gradients and nested execution inside another transform
 are rejected. Optimizer updates stay on the host. The cache retains at most
 eight signatures; changed static values, shapes or dtypes specialize it.
 
-The v0.1 entrypoints below keep their original spec/dictionary call forms:
-
-| Task | CUDA (Linux, `cuda` feature) | MLX (Apple silicon, `mlx` feature) |
-| --- | --- | --- |
-| Primal function, any target | `Compiler().trace(fn, specs).compile("cuda")` | `Compiler().trace(fn, specs).compile("mlx")` |
-| Symbolic JVP/VJP programs | `Program.jvp(name)`, `Program.vjp(cotangent_name)`, then `compile(target)` | same |
-| Scalar loss with named gradients | `tensor_value_and_grad_cuda_fn` | `tensor_value_and_grad_mlx_fn` |
-| Bounded batch-size specialization | `tensor_jit_batch_cuda_fn`, `tensor_value_and_grad_batch_cuda_fn` | `tensor_value_and_grad_batch_mlx_fn` |
-| `vmap` and its JVP/VJP/HVP | `tensor_vmap_cuda_fn`, `tensor_vmap_{jvp,vjp}_cuda_fn`, `tensor_vmap_hvp_scalar_cuda_fn` | `tensor_vmap_mlx_fn`, `tensor_vmap_{jvp,vjp}_mlx_fn` |
-| Device-resident Adam training | `cuda_adam_vjp_optimizer`, `cuda_adam_loss_optimizer` | `mlx_adam_loss_optimizer` |
-| Data parallelism (`cuda-nccl`) | `tensor_value_and_grad_data_parallel_cuda_fn` | not available |
-
-The core control-flow wrappers reuse the region builders `tensor_cond`,
-`tensor_fori_loop_region`, `tensor_scan_region`, and
-`tensor_while_loop_region`, with their existing backend limits.
-`Compiler.capabilities()` reports which targets the build contains; it is
-not a hardware probe. The PINN examples in
-`examples/pinn_poisson_{mlx,cuda}.py` and `examples/pinn_mlp_{mlx,cuda}.py`
-train on each device with these helpers. Their behaviour and limits are
-described under [Compiler Facade](#compiler-facade) and
-[Rank-N Tensor API](#rank-n-tensor-api).
+Explicit compilation for a device goes through the
+[Compiler Facade](#compiler-facade): `Compiler().trace(fn, specs).compile("cuda")`
+or `compile("mlx")`, with `Program.jvp(name)` and `Program.vjp(cotangent_name)`
+for symbolic derivative programs. `Compiler.capabilities()` reports which
+targets the build contains; it is not a hardware probe. The PINN examples
+`examples/pinn_poisson.py` and `examples/pinn_mlp.py` take `--device` and
+train with `Trainer` on each device.
 
 ## Compiler Facade
 
 The rank-N compiler path has one explicit lifecycle. It is the advanced
 layer of the v0.2 design, for explicit compilation and inspection from
 name-keyed input specs on CPU, CUDA and MLX. Integrations that need a
-compiled program should use this facade instead of coupling to a
-backend-specific execution plan class; the legacy 2D `Matrix` tracer is
-intentionally outside it. The [Quickstart](https://github.com/latteine1217/quabla/blob/main/README.md#quickstart) shows the
+compiled program should use this facade. The [Quickstart](https://github.com/latteine1217/quabla/blob/main/README.md#quickstart) shows the
 lifecycle end to end.
 
 `Program.jvp(input_name)` and `Program.vjp(cotangent_name)` produce new
@@ -1084,8 +1060,6 @@ programs that can be compiled through the same interface. `compile("cuda")`
 and `compile("mlx")` use the existing verified backend lowerings; build
 availability is reported by `compiler.capabilities()`, while unsupported IR
 operations still fail explicitly during backend compilation or execution.
-The `trace_tensor(...)` and `tensor_*_fn` helpers remain supported; most of
-them compile through the facade internally, as listed below.
 
 | Layer | Stable responsibility | Public boundary |
 | --- | --- | --- |
@@ -1105,28 +1079,13 @@ reshape, or a per-step output that directly broadcasts a carry-shaped value.
 Its symbolic JVP paired carry uses a leading extent of two. In the direct
 broadcast case, `ScanVjp` and `ScanVjpJvp` aggregate output cotangents, and
 their tangents for HVP, back to each carry lane before reverse replay;
-broadcast capture gradients use device-side atomic reduction. General
+broadcast capture gradients are reduced on the device in a fixed order. General
 unequal-count output graphs and indexed bodies have no fused `ScanVjpJvp`
 kernel; like their primal Scan and first-order `ScanVjp`, they run as
 host-driven region loops.
 
-Current migration status:
+Notes:
 
-- The facade owns the new rank-N `TensorTraceGraph` lifecycle.
-- Single-output CPU helpers (`tensor_jit_fn`, `tensor_*grad*_fn`, `tensor_vjp_fn`,
-  `tensor_jvp_fn`, `tensor_jacobian_fn`, CPU vmap, batch, and cond helpers),
-  `tensor_vmap_mlx_fn`, and the single-output CUDA helpers
-  (`tensor_jit_cuda_fn`, `tensor_vmap_cuda_fn`,
-  `tensor_vmap_hvp_scalar_cuda_fn`, `tensor_jit_batch_cuda_fn`) compile
-  through `QuablaCompiler`; their public signatures and results are
-  unchanged. The multi-output helpers (`tensor_value_and_grad_{mlx,cuda}_fn`,
-  their batch variants, `tensor_vmap_{vjp,jvp}_{mlx,cuda}_fn`,
-  `mlx_adam_loss_optimizer`, `cuda_adam_vjp_optimizer`, and
-  `cuda_adam_loss_optimizer`) compile one ordered multi-output program through
-  `QuablaCompiler::compile_many` and read their outputs by position. Retained
-  MLX inputs, device-resident CUDA buffers, and Adam state stay in those
-  executors rather than in `QuablaExecutable`; `docs/jax_like_roadmap.md`
-  records that remaining gap and the helpers that stay outside the facade.
 - The Rust `QuablaCompiler::compile` rejects a target missing from the build
   before lowering. These Python entrypoints, including `Program.compile`, keep
   their earlier errors in such a build: MLX constructs and fails on first
@@ -1143,9 +1102,9 @@ Current migration status:
   through the paired-carry CUDA path against CPU, including a carry/output
   reshape with equal element count, plus primal, first-order VJP, and HVP
   parity for a direct `[2, 1] -> [2, 3]` broadcast Scan. `Program.compile`
-  shares its MLX and CUDA lowering with `compile_mlx()`/`compile_cuda()`;
-  MLX CPU parity for those plans is covered by the Rust MLX tests and the
-  Python matrix with `QUABLA_MLX_TEST=1` on Apple silicon.
+  shares its MLX and CUDA lowering with `jit`; MLX CPU parity for those
+  plans is covered by the Rust MLX tests and the Python suites with
+  `QUABLA_MLX_TEST=1` on Apple silicon.
 
 The corresponding Rust lifecycle is
 `QuablaCompiler -> QuablaProgram -> QuablaExecutable` in
@@ -1156,22 +1115,16 @@ Python frontend / PyO3 -> TensorTraceGraph -> TensorIr / AD transforms
                        -> frozen TensorExecutionPlan -> CPU | CUDA | MLX
 ```
 
-## v0.1 API Reference
+## Tensor Reference
 
-These entrypoints shipped in v0.1.0 and work unchanged on `main`. The v0.2
-design ([Appendix A](api_v0_2_design.md#appendix-a-name-mapping)) maps each
-of them to its core-API equivalent and deprecates most `tensor_*_fn` helpers
-from v0.2 on; migrated names now warn once on top-level access, and every
-name keeps working through 0.x.
-
-### Rank-N Tensor API
+The eager `Tensor` and traced `TraceTensor` share one operation set and
+the dtype rules below.
 
 - Pure-Rust `TensorIr` compiler core (`quabla_core::tensor_ir`) for dynamic
   rank-N tensors with typed dtypes, CPU evaluation, direct JVP and
   reverse-mode VJP with cotangent reduction back through broadcast axes,
   symbolic JVP/VJP graph transforms, structured `Cond`/`Fori`/`Scan` regions,
-  and deterministic lowering text. The Python rank-N API below traces into it;
-  the legacy 2D `TraceGraph` is a separate tracer.
+  and deterministic lowering text. The Python transforms trace into it.
 - Python-facing eager `Tensor` class backed by contiguous row-major Rust storage,
   with `zeros`/`ones`/`full`/`arange`/`linspace`/`eye` creation, positive runtime
   shape validation, rank-N trailing-axis broadcasting for add/subtract/multiply/divide,
@@ -1186,7 +1139,7 @@ name keeps working through 0.x.
   and element-count-preserving reshape.
   Eager `Tensor` operations run immediately on the host; differentiation and
   compilation apply to traced functions, whose arguments are `TraceTensor`
-  values (see `trace_tensor` below). `Tensor.slice(...)` returns a
+  values (see [Function Transforms](#function-transforms)). `Tensor.slice(...)` returns a
   zero-copy, read-only `TensorView` with explicit shape, strides, and offset;
   source tensors and views share immutable storage, while every arithmetic
   operation returns a new contiguous allocation.
@@ -1207,8 +1160,8 @@ name keeps working through 0.x.
   `Tensor(shape, data, dtype=quabla.float32)` rounds `data` to `f32`, and
   `Tensor.dtype`/`Tensor.astype(dtype)` and `TraceTensor.dtype`/
   `TraceTensor.astype(dtype)` inspect and convert; `to_flat_list()` of a
-  `float32` tensor returns the rounded values. Input specs accept `(name,
-  shape)` (still `float64`) or `(name, shape, dtype)`. Mixing `float32` and
+  `float32` tensor returns the rounded values. `Compiler.trace` input specs
+  accept `(name, shape)` (`float64`) or `(name, shape, dtype)`. Mixing `float32` and
   `float64` tensors raises an error that asks for an explicit `astype`, while
   Python scalars adopt the tensor's dtype. Host data bound to a `float32`
   input is rounded like a JAX jit argument. On the CPU each `float32` op is the
@@ -1217,9 +1170,7 @@ name keeps working through 0.x.
   keep lowering `float64` programs to `f32` kernels as before. `kernel_ir()`
   reports `"f32"`/`"f64"`. Immutable host storage uses 8/4/1 bytes per
   element for F64/F32/Bool, with no persistent widened cache. Factories such as
-  `zeros`/`arange` create `float64`, and batch-specialized functions
-  (`tensor_jit_batch_fn` and its value-and-grad variants) trace `float64`
-  inputs.
+  `zeros`/`arange` create `float64`.
 - Boolean masks with dtype `quabla.bool_` (dtype phase D2; `str` is `"bool"`,
   and `lower_text`/`stablehlo_text` print it as `i1`). `Tensor` and
   `TraceTensor` provide `greater`, `greater_equal`, `less`, `less_equal`,
@@ -1230,7 +1181,7 @@ name keeps working through 0.x.
   combine with `logical_and`/`logical_or`/`logical_not` or `&`/`|`/`~`
   (bool operands only), `isfinite()`/`isnan()` classify float tensors, and
   `any`/`all` reduce with the `axis`/`keepdims` contract of `sum`. `where`
-  and `tensor_cond` accept bool predicates as well as the existing 0/1
+  and `cond` accept bool predicates as well as the existing 0/1
   float masks, and `quabla.where` accepts Python scalar branches, so
   `quabla.where(x.isfinite(), x, 0.0)` guards `NaN`/`inf` before any
   arithmetic (a float mask product such as `x.gt(0.0) * x` still yields
@@ -1250,161 +1201,6 @@ name keeps working through 0.x.
   derivative with respect to a bool input or of a bool output is an error.
   CUDA and MLX hold bool values as `f32` `0`/`1`; `cond` results and loop
   (`fori`/`scan`) region inputs must stay floating for now.
-- Python `trace_tensor(fn, input_specs)` bridge for the rank-N `TensorIr` core.
-  `TensorTraceGraph.stablehlo_text(output_node_id)` exports the verified static
-  `f64` input/add/multiply/power/tanh subset as deterministic textual StableHLO for
-  compiler-tool inspection. It rejects unsupported operations and is not an
-  execution backend or a complete StableHLO lowering.
-- `tensor_jacobian_fn(fn, input_specs, input_name)` freezes one rank-N trace
-  and returns an output-flat by input-flat dense Jacobian for the selected input.
-  Its `TraceTensor` values currently support broadcasted add/subtract/multiply/divide,
-  batched `matmul`, rank-N `concat`, `stack([...], axis=...)`, `slice(axis, start, stop)`, `broadcast_to(shape)`, rank-N `transpose`, `tanh`, `exp`, `sin`, `cos`, `sqrt`, non-negative integer `powi`, `pow` (`x ** y` and `quabla.power`), `log`, `log1p`, reshape, global or single-axis `sum`/`mean`/L2 `norm`, `maximum`/`minimum`, `gt`/`where` masks, and the bool comparison, logical, `isfinite`/`isnan`, and `any`/`all` operations. `stack` is composed from reshape plus concat, so it inherits the same direct and symbolic CPU/CUDA AD rules. `concat` is linear: direct and symbolic VJP split the upstream cotangent with internal slice nodes, while its JVP and mixed second-direction transform concatenate the corresponding tangents. `slice` supports normalized negative axes and uses a zero-padded internal reverse node, keeping direct and symbolic gradients on the selected original coordinates. `broadcast_to` is a dedicated shape node whose VJP reduces repeated axes back to the input shape. `sqrt` is a native IR primitive: negative values, `-inf` included, follow IEEE floating-point `NaN` semantics for the value and every derivative order, while every derivative order at zero is defined as zero, avoiding `log(0)` during higher-order AD; CPU, CUDA, and MLX agree on these points. A `TraceTensor` `x ** y` lowers a non-negative Python int `y` to the exact `powi` and every other exponent (floats, negative ints, traced tensors, and `c ** x`) to the elementwise `pow` op, which follows `f64::powf` (NaN for a negative base with a non-integer exponent, `0 ** 0 == 1`) and differentiates in both operands: `d/dx = y x^(y-1)`, defined as zero where `x == 0` and `y < 1` (the `sqrt` convention; `y >= 1` keeps the finite limit, so `x ** 2.0` has second derivative 2 at zero), and `d/dy = x^y ln x`, defined as zero for every `x <= 0` (JAX returns `NaN` for `x < 0`). The rules mask these points out of the inner power too, so second derivatives stay finite there wherever the value is finite; at `x <= 0` the two mixed second partials follow the conventions and need not be equal. `pow` lowers to NVRTC `powf` on CUDA, including fused elementwise kernels and elementwise loop bodies, and to `power` on MLX. Comparisons are explicitly non-differentiable; `where` routes VJP/JVP contributions only through the selected data branch. `maximum` and `minimum` are composed from those primitives as `where(isnan(x) | (x > y), x, y)` and `where(isnan(x) | (x < y), x, y)`: they route equality subgradients to their right operand and propagate `NaN` from either operand like NumPy, and so does `relu`; the `max`/`min` reductions also propagate `NaN` from any position, but split tie derivatives equally (see `Tensor.max`). `log1p` is a native IR primitive, `ln(1 + x)` with derivative `1 / (1 + x)`, that follows IEEE semantics on every backend instead of raising: `log1p(-1)` is `-inf` and `log1p(x)` is `NaN` for `x < -1`; it lowers to `log1pf` on CUDA and to `log1p` on MLX. `expm1` (`exp(x) - 1`, accurate for small `|x|`, derivative `exp(x)`), `erf` (the f64 musl `erf` of the `libm` crate on the CPU, derivative `2 / sqrt(pi) * exp(-x^2)`), `erfc` (`1 - erf(x)` without cancellation: the musl `erfc` on the CPU and `erfcf` on CUDA, derivative `-2 / sqrt(pi) * exp(-x^2)`; MLX has no `erfc`, so it evaluates the Numerical Recipes Chebyshev fit `t exp(-z^2 + P(t))`, `t = 1 / (1 + z / 2)`, relative error below `1.2e-7`, with `exp(-z^2)` split as `exp(-h^2) exp(-(z - h)(z + h))` for `h = floor(16 z) / 16` and the reflection `2 - erfc(-x)` for negative `x`, within about 8 float32 ulp of the correctly rounded value; CUDA loop bodies do not lower `erfc` yet), and the broadcasting binary `atan2(y, x)` (`f64::atan2`) are native IR primitives that lower to `expm1f`, `erff` and `atan2f` on CUDA (per-node kernels and elementwise loop bodies) and to `erf` and `arctan2` on MLX, where `expm1` is Kahan's `(u - 1) * x / log(u)` with `u = exp(x)` for `|x| < 0.5` and `exp(x) - 1` elsewhere, because MLX's own `expm1` is off by hundreds of float32 ulp; device float32 results differ from the correctly rounded CPU values by a few ulp (MLX `erf` by up to about 13). The `atan2` partials `x / (x^2 + y^2)` and `-y / (x^2 + y^2)` are evaluated after dividing both operands by `s = |x| + |y|`, so they neither overflow nor underflow before the true value does, and every derivative order is defined as zero where `s` is zero or infinite (JAX's rule gives NaN at the origin and for tiny inputs whose squares underflow); a NaN operand gives a NaN derivative. `stop_gradient(x)` is the identity on values with a zero derivative in every mode (zero JVP tangent, no VJP contribution, zero Hessian blocks), so `x - stop_gradient(x) + stop_gradient(f(x))` has the value of `f(x)` and the gradient of `x`; backends execute it as a copy, and an eager `Tensor.stop_gradient()` returns the value. `cumsum(x, axis=None, reverse=False)` is a native inclusive prefix sum (`axis=None` flattens like NumPy, `reverse` scans from the last entry) whose CPU evaluation rounds every running sum to the dtype; its JVP is the cumsum of the tangent, its VJP the opposite-direction cumsum of the cotangent, and `vmap` shifts its axis. CUDA scans each line in one thread with `__fadd_rn`, matching the CPU float32 result bitwise; MLX uses its parallel `cumsum`, whose float32 rounding can differ from the sequential CPU sums. `TensorTraceGraph.evaluate_vjp(...)` and
-  `TensorTraceGraph.evaluate_jvp(...)` execute the corresponding rank-N CPU
-  reverse and forward transforms. `TensorTraceGraph.hessian_scalar(...)`
-  computes an exact dense Hessian for one named input and a scalar output using
-  mixed second-direction AD, not finite differences.
-  `TensorTraceGraph.hvp_scalar(...)` returns the corresponding exact
-  Hessian-vector product without materializing that dense matrix.
-  `TensorTraceResult.symbolic_jvp(input_name)` instead emits a new transformable
-  rank-N trace whose output is the coordinate JVP; it can be applied again for
-  second derivatives and then differentiated with VJP with respect to model
-  parameters. Its rules cover every current rank-N `TensorIr` primitive.
-  A `TraceTensor` cannot be used as a Python boolean, preventing accidental
-  data-dependent host branches during tracing; use `quabla.where` for
-  elementwise selection, or the structured `tensor_cond` and loop-region APIs
-  described below.
-  `tensor_fori_loop(lower, upper, body, init)` statically unrolls a
-  fixed-bounds, shape-preserving TraceTensor carry into that same IR.
-  `tensor_fori_loop_region(lower, upper, body, init, operands)` instead
-  traces `body(index, carry, *operands)` once into a runtime CPU loop region;
-  captures must be explicit and the scalar `index` is a TraceTensor.
-  On Linux CUDA, its first-order VJP also lowers to a device kernel when the
-  body is pure elementwise and every explicit capture broadcasts to the carry
-  shape. The kernel keeps a per-element carry tape on device; grouped `ForiVjp`
-  results share that tape and reverse traversal. `tensor_scan_region` also
-  lowers primal and first-order VJP Scan when its output matches the carry
-  shape. Scalar and trailing-axis broadcast captures use device-side atomic
-  gradient reduction. CUDA also lowers `ForiVjpJvp` for pure-elementwise,
-  fixed-bound regions whose explicit captures match the carry shape, keeping
-  primal and tangent carry tapes on device. CUDA `ScanVjpJvp` supports the
-  same pure-elementwise fixed-bound subset with broadcast-compatible explicit
-  captures and matching carry/output shapes,
-  plus a per-step output that directly broadcasts a carry-shaped value; the
-  latter aggregates primal and tangent output cotangents per carry lane.
-  Every loop node outside these fused subsets (bodies that slice,
-  concatenate, reshape across lanes, reduce, contain `Cond` or array
-  constants; capture gradients that reduce over broadcast axes inside the
-  body VJP; `While`; Hessian-vector products through such a `Scan`) runs as
-  a host-driven region loop instead: each region (body, predicate, body JVP
-  or body VJP) is compiled once to the per-node CUDA program, and the host
-  launches it once per iteration on device-resident carry buffers, with no
-  host copy per iteration except the `While` predicate. Loop-invariant
-  captures are bound once per loop execution. After two eager iterations, a
-  region whose program only launches NVRTC kernels, device copies and cuBLAS
-  products (no `Cond`, nested loop or cuSOLVER call) is recorded once as a
-  CUDA graph, and every later iteration retargets the graph's input and
-  output copies and launches it as one graph; the replay runs the same
-  kernels in the same order, so results are bit-identical to eager
-  iterations. Reverse passes keep the carry tape on the device, in full for
-  short loops and as square-root checkpoint blocks replayed in reverse
-  otherwise (the CPU scheme), and accumulate each capture gradient once per
-  iteration in reverse order, its broadcast axes reduced inside the body
-  VJP; float32 results differ from the CPU only by rounding order. Launch
-  cost still dominates small bodies: on a GTX 1660 SUPER (WSL) a small
-  rotating body costs about 30-50 µs per `fori_loop` or `scan` iteration
-  (120-180 µs before graph replay), about 100 µs per `while_loop` iteration
-  (which waits for its predicate), and about 120-140 µs per iteration of
-  their reverse passes; `examples/benchmark_host_loop_cuda.py` measures
-  them.
-  `tensor_scan_region(lower, upper, body, init, operands)` applies the same
-  one-time region tracing contract to a `(next_carry, output)` body and returns
-  the final carry plus a leading-axis stack of fixed-shape outputs.
-  `tensor_scan(length, body, init)` similarly returns a final carry and a
-  leading-axis stack of fixed-shape outputs, but remains the compatibility API
-  that statically unrolls the body.
-  `TensorTraceResult.symbolic_vjp(cotangent_name)` and
-  `TraceTensor.symbolic_vjp(cotangent_name)` emit one transformable
-  gradient trace per original input, all sharing a graph with the explicit
-  output-cotangent input. This is the reverse graph needed for backend lowering;
-  the established eager VJP evaluators remain available.
-  `tensor_grad_scalar_fn(fn, input_specs)` traces and compiles a rank-N
-  scalar-loss function once, then returns a reusable Python gradient callable
-  backed by its frozen CPU plan.
-- `tensor_value_and_grad_fn(fn, input_specs)` traces and compiles a rank-N
-  scalar-loss function once, then returns its scalar value and named VJP
-  gradients from one frozen-plan execution.
-- `tensor_jit_cuda_fn(fn, input_specs, device_ordinal=0)` traces and compiles
-  a fixed-shape rank-N function to a reusable callable CUDA plan on Linux.
-- `tensor_value_and_grad_cuda_fn(fn, input_specs, parameter_names,
-  device_ordinal=0)` traces a scalar loss and compiles its value plus named
-  VJP gradients into one CUDA union plan. It inserts the scalar loss cotangent
-  internally and returns host values only when its callable is invoked.
-  `cuda_adam_loss_optimizer(loss, parameter_names, inputs, learning_rate, ...)`
-  accepts a scalar `TraceTensor` or `TensorTraceResult`, retains static inputs,
-  parameters, and Adam state on the GPU, and performs device-only `step()`
-  calls. `loss()` is an explicit diagnostic host readback.
-- `tensor_value_and_grad_mlx_fn(fn, input_specs, parameter_names)` builds one
-  symbolic VJP graph and evaluates its scalar loss plus requested gradients
-  from a shared MLX GPU value table. Results are materialized on the host when
-  called. `mlx_adam_loss_optimizer(loss, parameter_names, inputs,
-  learning_rate, ...)` retains parameters, selected static inputs, gradients,
-  and bias-corrected Adam moments on the MLX GPU stream; `step()` performs no
-  parameter or gradient host readback, while `loss()` and `parameters()` are
-  explicit diagnostics. Inputs omitted from `retained_input_names` can be
-  replaced through `step({"batch_input": tensor, ...})` without resetting the
-  retained parameter or moment state.
-- `tensor_vmap_fn(fn, input_specs, batch_size, in_axes=None, out_axis=0)`
-  traces one fixed-size batched plan. `input_specs` describe one example;
-  `in_axes` supports mapped axes (including normalized negative axes) and
-  unmapped `None` inputs, while `out_axis` selects the returned batch layout.
-  The trace tracks batch semantics through elementwise operations, matmul,
-  reductions, transpose, reshape, broadcast, concat, slice, and `where`.
-  `tensor_vmap_cuda_fn(...)` and `tensor_vmap_mlx_fn(...)` lower the same
-  canonical trace for CUDA and MLX. Batch extent remains static.
-- `tensor_jit_batch_fn(fn, input_names, in_axes=None, batch_axis=0,
-  max_specializations=4)` lazily traces CPU plans for observed batch sizes.
-  Non-batch dimensions and unmapped inputs must remain fixed; the bounded cache
-  raises instead of silently retracing after its specialization limit.
-- `tensor_value_and_grad_batch_fn(...)` applies the same bounded CPU batch
-  specialization contract to scalar losses and returns frozen-plan VJP
-  gradients, including aggregated gradients for unmapped parameters.
-- `tensor_value_and_grad_batch_mlx_fn(...)` caches one MLX multi-output
-  value-and-gradient plan per bounded batch specialization. Its returned loss
-  and requested gradients are diagnostic host readbacks; use the MLX Adam API
-  for device-resident parameter updates.
-- `tensor_jit_batch_cuda_fn(...)` and `tensor_value_and_grad_batch_cuda_fn(...)`
-  apply the same bounded-specialization contract to CUDA. Each observed batch
-  size owns one CUDA plan; runtime execution requires a Linux CUDA driver and
-  `libnvrtc.so`.
-- `tensor_cond(predicate, on_true, on_false, operands)` traces a scalar
-  Tensor predicate into CPU Tensor IR. Branches receive only explicit operands,
-  which become parent-region capture bindings; the CPU evaluator materializes
-  only the selected branch and supports direct first-order JVP/VJP. MLX and
-  CUDA lower the same regions, including symbolic JVP/VJP and nested `Cond`:
-  each reads the scalar predicate back to the host once per `Cond` evaluation
-  (one device stream synchronization) and runs only the selected branch on the
-  device, so an inactive branch such as `log(x)` for `x <= 0` cannot inject
-  NaN into values or gradients. CUDA compiles both branch regions with the
-  parent plan and binds captures as device buffers; a `Fori`/`Scan` body
-  containing `Cond` runs as a host-driven region loop. Vmapped predicates or
-  operands are
-  rejected at trace time.
-  `tensor_cond_fn(on_true, on_false, input_specs)` remains the host-boolean
-  function-level boundary; `tensor_cond_value_and_grad_fn(...)` and
-  `tensor_cond_jvp_fn(...)` apply the matching branch VJP or JVP.
-- `tensor_vmap_jvp_fn(...)` and `tensor_vmap_vjp_fn(...)` apply the same
-  batch-layout contract to runtime tangents and cotangents. Mapped input
-  gradients are restored to their declared `in_axes`; unmapped input gradients
-  aggregate over the mapped batch as required by reverse-mode AD.
-  `tensor_vmap_vjp_cuda_fn(...)`, `tensor_vmap_vjp_mlx_fn(...)`,
-  `tensor_vmap_jvp_cuda_fn(...)`, and `tensor_vmap_jvp_mlx_fn(...)` lower
-  their primal plus AD outputs into one CUDA or MLX multi-output plan.
-- `tensor_vmap_hvp_scalar_fn(fn, input_specs, batch_size, input_name, ...)`
-  differentiates the sum of one scalar loss per mapped example through symbolic
-  VJP then runtime-tangent JVP. `tensor_vmap_hvp_scalar_cuda_fn(...)` lowers
-  that structural HVP plan to CUDA for the supported loop subset. The selected
-  HVP input must be mapped; unmapped parameter HVPs and MLX lowering remain
-  explicit future work.
 - `Tensor.sum(axis=None, keepdims=False)` and `Tensor.mean(...)` accept a
   single integer axis or a sequence of normalized axes. Trace tensors expose
   the same contract; multi-axis reductions lower to existing axis-reduction
@@ -1445,216 +1241,13 @@ name keeps working through 0.x.
   final reshape, so reverse-mode AD and CUDA/MLX lowering preserve the same
   semantics. Empty slices and advanced (array or boolean-mask) indexing are
   not supported.
-- `tensor_hessian_scalar_fn(fn, input_specs, input_name)` and
-  `tensor_hvp_scalar_fn(fn, input_specs, input_name)` freeze a scalar rank-N
-  trace for dense Hessian or Hessian-vector-product evaluation. They are
-  correctness-first CPU transforms; dense Hessian materialization is O(n^2).
-  `tensor_jit_fn(fn, input_specs)` similarly returns a reusable rank-N primal
-  callable backed by a frozen CPU plan.
-  `tensor_vjp_fn(fn, input_specs)` returns a reusable rank-N VJP callable that
-  accepts an output cotangent at invocation time.
-  `tensor_jvp_fn(fn, input_specs)` returns a reusable rank-N JVP callable that
-  accepts input tangents at invocation time.
-  `TraceTensor` add/subtract/multiply/divide accept numeric scalar literals on either
-  side, lowered as broadcastable rank-0 constant IR nodes.
-- `TensorTraceGraph.compile_cpu(output_node_id)` freezes an immutable
-  `TensorCpuExecutionPlan` containing only output-reachable rank-N IR nodes.
-  The plan remaps operands after dead-code elimination, commons structurally
-  identical pure nodes, and evaluates without accessing the mutable trace graph;
-  it is a CPU execution boundary, not yet a machine-code JIT.
-  `plan.lower_text()` emits its optimized deterministic rank-N lowering artifact.
-  `plan.evaluate_vjp(...)` and
-  `plan.evaluate_jvp(...)` execute cached-plan AD transforms without returning
-  to the mutable tracer. `plan.kernel_ir()` exposes the same plan as structured
-  op, operand, shape, and input-name records for later backend lowering.
-  For a scalar replica-local loss,
-  `plan.value_and_grad_data_parallel(inputs, mapped_input_names, shard_count,
-  reduction="mean")` is the deterministic CPU reference for equal axis-zero
-  sharding; it validates the shard contract and returns the aggregated value
-  and gradients without claiming CPU parallel execution.
-- The optional Linux `cuda-nccl` feature adds an experimental single-node
-  data-parallel path. `tensor_value_and_grad_data_parallel_cuda_fn(...)`
-  shards named axis-zero batch inputs across explicit CUDA ordinals and
-  all-reduces only requested replicated parameter gradients. It reports
-  enqueue, collective, and output-readback timing after a call. On two RTX
-  3090s, single calls match the deterministic CPU reference exactly for `Sum`
-  and `Mean`, and 200 SGD steps of a small MLP
-  (`examples/validate_data_parallel_training_cuda.py`) stay within `2.1e-8`
-  normwise parameter error of the single-GPU run. NCCL communicators are
-  created once per compiled callable; the steady-state collective takes about
-  0.1 ms per step there. Mapped-input gradients are rejected rather than
-  all-reduced, and parameter updates run on the host.
-- `TensorBackend` defines the rank-N plan execution contract. `CpuBackend` is
-  the default implementation. On Linux, the optional `cuda` feature adds an
-  NVRTC-compiled FP32 `CudaBackend` and immutable `TensorCudaExecutionPlan`.
-  It lowers rank-two and broadcast-batched matmul, rank-N concat plus the internal slice/pad-slice reverse nodes, global and single-axis reductions, transpose,
-  broadcasting, `where`, `div`, `log`, and the current differentiable unary
-  primitives. Global sum/mean use a block-parallel reduction with atomic scalar
-  accumulation. `compile_cuda()` retains its CUDA context and loaded module, so
-  repeated `evaluate()` calls do not recompile NVRTC code. Pure elementwise
-  graphs use one fused CUDA kernel; general plans additionally fuse maximal
-  elementwise tails after materialized leaves such as matmul outputs and bias.
-  `plan.fused_region_count` exposes the selected regions. `div` and `log`
-  retain their checked-domain semantics through general per-operation lowering.
-  It requires a CUDA driver plus `libnvrtc.so` at runtime. Host inputs and
-  outputs still cross the device boundary on every `evaluate()`. Intermediate
-  device buffers are reclaimed after their final consumer and reused by later
-  nodes; retained inputs, the output buffer, and optimizer state keep stable
-  allocations. `plan.device_buffer_count` reports the plan's current retained
-  plus reusable device-buffer count for benchmark diagnostics.
-  `TensorCudaExecutionPlan.evaluate_device(inputs, retained_input_names=...)`
-  executes without materializing an output; supplied retained inputs upload on
-  the first call and remain device-resident for subsequent static evaluations.
-  Call `synchronize()` before timing asynchronous device-only evaluations, or
-  use `benchmark_device(...)` to repeat and synchronize static evaluations in
-  Rust without per-iteration Python dispatch. Rank-two FP32 GEMM automatically
-  uses cuBLAS when `libcublas` is available; otherwise it uses the NVRTC tiled
-  fallback. Inspect `plan.backend` to report the selected backend in a run log.
-  A CUDA plan whose output is a gradient for one retained input can call
-  `sgd_step(inputs, parameter_name, learning_rate, retained_input_names)` or
-  `adam_step(inputs, parameter_name, learning_rate, retained_input_names,
-  beta1=0.9, beta2=0.999, epsilon=1e-8)` to update that parameter on the
-  device, then `retained_input(name)` to read it back after training. Adam
-  keeps its first and second moments in device memory. Separate gradient plans
-  can share retained parameters with
-  `sync_retained_input_to(source_name, target_plan, target_name=None)`, which
-  performs a same-device GPU-to-GPU copy after each participating update.
-  `cuda_adam_step({parameter_name: gradient_plan, ...}, inputs, learning_rate,
-  retained_input_names=...)` performs those Adam updates and cross-plan
-  parameter synchronizations as one Python call while retaining every mapped
-  parameter automatically. It still requires the caller to construct the
-  symbolic gradient plans explicitly. For static collocation tensors,
-  `cuda_adam_optimizer(...)` stores the Rust input tensors once and exposes
-  `step()` plus `parameters()`. Calling `step({"batch_input": tensor, ...})`
-  refreshes only the supplied mini-batch tensors without rebuilding plans or
-  resetting GPU-resident parameter and Adam state.
-  `cuda_adam_vjp_optimizer({parameter_name: symbolic_vjp_result, ...}, ...)`
-  is the preferred multi-parameter path: it compiles all outputs from one
-  symbolic VJP graph into one union plan, computes every gradient from the
-  same parameter snapshot, and updates them without any gradient D2H copy.
-  Fused GEMM+bias+activation kernels remain future work; multi-GPU execution
-  is the separate `cuda-nccl` data-parallel path described above.
 - `Tensor.split_key(key, count)`, `Tensor.random_normal(shape, key, ...)`,
   `Tensor.random_uniform(shape, key, minval, maxval, dtype)`,
   `Tensor.fold_in_key(key, data)`, and `Tensor.glorot_normal(shape, key)`
   provide stateless, deterministic host-side initialization; `quabla.random`
-  is the keyed API over them. They do not retain global RNG state; generated parameters are
-  uploaded once when a CUDA optimizer is created.
-- On Apple silicon, the `mlx` feature executes supported frozen
-  Tensor IR plans as MLX arrays on `StreamOrDevice::gpu()`. Python exposes this
-  through `TensorTraceGraph.compile_mlx()`, `TraceTensor.compile_mlx()`, and
-  `TensorTraceResult.compile_mlx()`. The backend has CPU-parity coverage for
-  elementwise operations, matmul, global reductions, reshape, transpose,
-  concat, and broadcast, plus `Cond`, `Fori`, and `Scan` regions with their
-  first-order VJP and forward-over-reverse (HVP) forms; loop carries and
-  captures stay on the GPU stream between host-dispatched iterations.
-  `tensor_value_and_grad_mlx_fn(...)` uses the same
-  backend for a scalar loss and named symbolic VJP gradients. Contiguous
-  `slice` and internal reverse `pad_slice` nodes execute on MLX through
-  device-side take/pad lowering. `TensorMlxExecutionPlan.retain_inputs(...)`
-  retains selected fixed bindings on the MLX GPU stream; later `evaluate(...)`
-  and `evaluate_device(...)` calls may omit those bindings. Call
-  `clear_retained_inputs()` to release that plan-owned state.
-  `mlx_adam_loss_optimizer(...)` keeps fixed parameters and Adam moments on
-  that GPU stream across `step()` calls; `loss()` and `parameters()` are the
-  only host diagnostics. It is not a JIT,
-  and unsupported reverse graphs return an explicit error rather than falling
-  back to the host. Build requirements are listed under
-  [Installation From Source](https://github.com/latteine1217/quabla/blob/main/README.md#installation-from-source).
-- Python `Adam` updates immutable dictionaries of named rank-N `Tensor`
-  parameters from VJP gradients, including the gradient dictionaries that
-  `qb.grad` and `qb.value_and_grad` return for a flat dict of parameters
-  (README "At a Glance"). It is the deprecated top-level alias of
-  `quabla.optim.Adam` (see [Device Execution](#device-execution)), which keeps
-  this stateful `step`. The test suite includes a manufactured 1D
-  Poisson residual in which two symbolic coordinate JVP transforms form
-  `u_xx`, then VJP and Adam recover one scalar MLP weight. This is a
-  vertical-slice correctness proof. It includes batched collocation points and
-  explicitly aggregated boundary/residual VJPs, but is not yet a general PINN
-  framework.
+  is the keyed API over them. They do not retain global RNG state.
 
-### Legacy 2D API
-
-These `Matrix`/`TraceGraph` entrypoints predate the rank-N path and are kept
-for compatibility; they are deliberately 2D and outside the compiler facade.
-
-- Python-facing `Matrix` class backed by Rust storage, elementwise add/subtract,
-  elementwise multiply/divide, numeric scalar add/subtract/multiply/divide,
-  elementwise tanh/exp/log/sqrt/sin/cos, greater-than masks, `where` select,
-  concat, transpose, reshape, matmul, and global or axis-0/axis-1 sum/mean
-  reductions.
-- Python-facing `TraceGraph` / `TraceMatrix` seed that records add, subtract,
-  multiply, divide, greater-than, `where`, concat, powf, tanh, exp, log, sqrt,
-  sin, cos, transpose, reshape, matmul, and sum/mean nodes.
-- Eager and traced add/subtract/multiply support numeric scalar literals. Traced
-  scalar literals are recorded as shape-local scalar constant nodes. Unary
-  negation and division by numeric scalars lower to scalar multiplication.
-  Non-negative integer powers lower to repeated multiplication, while
-  floating-point powers lower to a traced `powf` primitive with reverse-mode
-  support for scalar exponents. Eager and traced elementwise add/subtract/multiply/divide
-  support 2D NumPy-style broadcasting where each axis is equal or one side is
-  `1`, including reverse-mode cotangent reduction back to the original input
-  shapes. Sum/mean reductions accept `axis=0` or `axis=1` and keep reduced rank
-  as `(1, cols)` or `(rows, 1)`, with reverse-mode broadcast back to the input
-  shape. Concat accepts `axis=0` or `axis=1`, validates non-concatenated
-  dimensions, and splits reverse-mode cotangents back to each input. Reshape
-  preserves row-major storage order and requires element count to stay unchanged.
-  General rank-N broadcasting is available on eager `Tensor` and the rank-N
-  `TraceTensor` path; `Matrix` and the legacy `TraceGraph` transforms remain
-  deliberately 2D.
-- Python `trace(fn, input_specs)` function that runs user code with traced
-  inputs.
-- Structured `graph.ir()` output for AD and backend lowering experiments,
-  including typed `attrs` for lowering-sensitive parameters such as scalar
-  constants, `powf` exponents, reduction axes, and concat axes.
-- Deterministic `graph.lower_text()` backend-text seed that renders the traced
-  graph with SSA-like node ids, operand references, tensor shapes, and typed
-  attributes. This is an inspection/lowering-contract prototype, not an MLIR
-  or StableHLO-compatible serialization yet.
-- Minimal `graph.vjp_ir(output_node_id)` reverse-mode seed for add, subtract,
-  multiply, divide, `where`, concat, powf, tanh, exp, log, sqrt, sin, cos,
-  transpose, reshape, matmul, and sum/mean outputs.
-- CPU `graph.evaluate_vjp(output_node_id, inputs, output_cotangent)` evaluator
-  with reverse cotangent accumulation over
-  add/sub/mul/div/where/concat/powf/tanh/exp/log/sqrt/sin/cos/transpose/reshape/matmul/sum/mean
-  trace graphs. Greater-than mask nodes are treated as non-differentiable
-  control values.
-- Python `grad(fn, input_specs, values, output_cotangent)` convenience API
-  (`quabla.grad` dispatches this form here; other calls are the v0.2
-  transform above).
-- Python `grad_fn(fn, input_specs, output_cotangent)` callable transform for
-  reusing a cached trace across value dictionaries.
-- Python `grad_scalar_fn(fn, input_specs)` callable transform that seeds a
-  `(1, 1)` scalar-loss cotangent automatically over a cached trace.
-- Python `grad_scalar(input_specs)` decorator factory for scalar-loss gradient
-  functions that trace once when the decorator is applied.
-- Python `value_and_grad_fn(fn, input_specs, output_cotangent)` callable
-  transform that returns both the primal output and VJP gradients from one
-  cached trace evaluation.
-- Python `vjp_fn(fn, input_specs)` callable transform that accepts the output
-  cotangent at call time and returns `(primal_output, gradients)`.
-- Python `jacobian_fn(fn, input_specs)` callable transform for a single matrix
-  input, returning a dense row-major Jacobian via repeated VJP over one cached
-  trace.
-- Python `jacobians_fn(fn, input_specs)` callable transform for one or more
-  matrix inputs, returning a dictionary of dense row-major Jacobian matrices by
-  input name via repeated VJP over one cached trace.
-- CPU `graph.evaluate_jvp(output_node_id, inputs, input_tangents)` evaluator
-  that propagates primal values and tangents in one forward pass.
-- Python `jvp_fn(fn, input_specs)` callable transform for one or more matrix
-  inputs, returning `(primal_output, tangent_output)` through direct
-  forward-mode propagation instead of materializing dense Jacobians.
-- `graph.compile_cpu(output_node_id)` freezes only the output-reachable traced
-  subgraph into an immutable `CpuExecutionPlan`, eliminating unused nodes while
-  remapping internal operands and commoning identical pure unary subexpressions.
-  It supports CPU primal, JVP, VJP, and value-and-VJP evaluation; reusable AD
-  transforms and `jit(...)` evaluate this frozen plan. It is an execution-plan
-  boundary, not machine-code JIT compilation.
-- Python `jit(input_specs)` decorator factory that traces a function once and
-  evaluates a frozen CPU execution plan for later value dictionaries
-  (`quabla.jit` dispatches a non-callable first argument here).
-
-### Rust Core Crate
+## Rust Core Crate
 
 - Scalar forward-mode automatic differentiation with `Dual`.
 - Experimental `forward_diff!(|x| expression)` procedural macro for a
@@ -1681,9 +1274,8 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
 
 - No machine-code JIT for the CPU backend, which interprets frozen plans.
   CUDA generates NVRTC kernels; MLX dispatches MLX operations.
-- Shapes are static. Variable batch sizes use bounded per-size
-  specialization (`tensor_jit_batch_fn` and its variants); there are no
-  symbolic dimensions.
+- Shapes are static. Variable batch sizes trace once per shape, up to
+  `jit(max_traces=...)` signatures; there are no symbolic dimensions.
 - Dtypes are `float32`, `float64`, and `bool`. `float16`/`bfloat16`, integer
   tensors, and mixed-precision training are not implemented. Native device
   `f64` is opt-in on CUDA through `jit(precision="float64")` and
@@ -1695,8 +1287,7 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
   nested regions, and `cond` inside `fori`/`scan` are rejected. `cond`
   results and loop-region inputs must be floating, not `bool`.
 - Derivatives beyond forward-over-reverse of `fori`/`scan` regions are
-  explicit errors. The legacy `tensor_vmap_*` helpers reject a batched
-  `cond` predicate or operand at trace time; `quabla.vmap` batches `cond`.
+  explicit errors.
 - MLX runs its factorizations on the CPU stream (see `quabla.linalg`), and
   `vmap` HVP has no MLX lowering. Triangular solves use the general LU
   `solve` on devices.
@@ -1708,7 +1299,6 @@ for compatibility; they are deliberately 2D and outside the compiler facade.
   is no multi-node transport, tensor parallelism, or sharded matmul.
 - StableHLO export (`stablehlo_text`) covers only a small inspection subset
   and is not an execution path.
-- The legacy 2D `Matrix`/`TraceGraph` API is not migrated to the facade.
 - `quabla.vmap` batches `cond`, `fori_loop`, `scan`, and `while_loop`
   regions over mapped arguments. A batched `cond` with a per-example
   predicate runs both branches, and a batched `while_loop` with a

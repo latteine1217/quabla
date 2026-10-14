@@ -8,12 +8,12 @@ Every mode trains the same deterministic tanh MLP regression with the same
 host-side SGD update, so the only differences are the value-and-gradient
 backend and its floating-point evaluation order:
 
-- `two_gpu_mean`: `tensor_value_and_grad_data_parallel_cuda_fn`, `mean`.
-- `two_gpu_sum`: the same callable with `sum`; the loss is divided by the
+- `two_gpu_mean`: `distributed.value_and_grad` with `reduction="mean"`.
+- `two_gpu_sum`: the same with `reduction="sum"`; the loss is divided by the
   replica count and the learning rate is scaled by `1 / replica_count`
   (a power of two, so the host update is exact).
-- `single_gpu`: `tensor_value_and_grad_cuda_fn` on the full batch.
-- `cpu`: the full-batch CPU `tensor_value_and_grad_fn` (f64 evaluation).
+- `single_gpu`: `jit(value_and_grad(loss), device="cuda:0")` on the full batch.
+- `cpu`: the full-batch CPU `jit(value_and_grad(loss))` (f64 evaluation).
 
 The script fails when any compared pair exceeds the tolerances below or when
 training does not reduce the loss. Timing is reported for the first step and
@@ -32,8 +32,10 @@ import statistics
 import subprocess
 import sys
 import time
+import warnings
 
 import quabla
+import quabla as qb
 
 
 DEFAULT_GRID = 16  # grid * grid == batch input points on [-1, 1]^2.
@@ -72,13 +74,12 @@ BASE_TOLERANCE_BATCH = 256
 # `--max-loss-ratio` relaxes this for short scale runs that rely on the
 # first-step gradient comparison instead.
 MAX_FINAL_TO_INITIAL_LOSS = 0.5
-TIMING_KEYS = ["replica_enqueue", "collective", "output_readback"]
 
 
-def loss_fn(x, target, w1, b1, w2, b2, w3, b3):
-    hidden = (x @ w1 + b1).tanh()
-    hidden = (hidden @ w2 + b2).tanh()
-    return (hidden @ w3 + b3 - target).powi(2).mean()
+def loss_fn(params, x, target):
+    hidden = qb.tanh(x @ params["w1"] + params["b1"])
+    hidden = qb.tanh(hidden @ params["w2"] + params["b2"])
+    return qb.mean((hidden @ params["w3"] + params["b3"] - target) ** 2)
 
 
 def parameter_shapes(hidden):
@@ -90,12 +91,6 @@ def parameter_shapes(hidden):
         "w3": [hidden, 1],
         "b3": [1, 1],
     }
-
-
-def input_specs(batch, hidden):
-    return [("x", [batch, 2]), ("target", [batch, 1])] + list(
-        parameter_shapes(hidden).items()
-    )
 
 
 def relative_tolerance(batch):
@@ -126,21 +121,18 @@ def build_problem(grid, hidden):
     return x, target, parameters
 
 
-def build_callable(mode, specs):
+def build_callable(mode):
+    """`(params, x, target) -> (loss, gradients)` for `mode`. The CUDA modes
+    evaluate the float64 data in float32, as CUDA does by default."""
     if mode == "cpu":
-        return quabla.tensor_value_and_grad_fn(loss_fn, specs)
+        return qb.jit(qb.value_and_grad(loss_fn))
     if mode == "single_gpu":
-        return quabla.tensor_value_and_grad_cuda_fn(
-            loss_fn, specs, PARAMETER_NAMES, DEVICE_ORDINALS[0]
-        )
-    reduction = mode.removeprefix("two_gpu_")
-    return quabla.tensor_value_and_grad_data_parallel_cuda_fn(
+        return qb.jit(qb.value_and_grad(loss_fn), device=f"cuda:{DEVICE_ORDINALS[0]}")
+    return qb.distributed.value_and_grad(
         loss_fn,
-        specs,
-        PARAMETER_NAMES,
-        MAPPED_INPUTS,
-        DEVICE_ORDINALS,
-        reduction,
+        devices=[f"cuda:{ordinal}" for ordinal in DEVICE_ORDINALS],
+        shard_argnums=(1, 2),
+        reduction=mode.removeprefix("two_gpu_"),
     )
 
 
@@ -153,30 +145,30 @@ def train(mode, steps, lr, grid, hidden):
     step_lr = lr / scale
 
     construct_start = time.perf_counter()
-    value_and_grad = build_callable(mode, input_specs(batch, hidden))
+    value_and_grad = build_callable(mode)
     construct_seconds = time.perf_counter() - construct_start
 
-    fixed = {
-        "x": quabla.Tensor([batch, 2], x),
-        "target": quabla.Tensor([batch, 1], target),
-    }
+    x = qb.array(x).reshape([batch, 2])
+    target = qb.array(target).reshape([batch, 1])
     losses = []
     timings = []
     first_gradient = None
     for _ in range(steps):
-        inputs = dict(fixed)
-        for name, shape in shapes.items():
-            inputs[name] = quabla.Tensor(shape, parameters[name])
+        params = {
+            name: qb.array(parameters[name]).reshape(shape)
+            for name, shape in shapes.items()
+        }
         call_start = time.perf_counter()
-        value, gradients = value_and_grad(inputs)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            value, gradients = value_and_grad(params, x, target)
         call_wall = time.perf_counter() - call_start
-        timing = {"call_wall": call_wall}
-        if mode.startswith("two_gpu_"):
-            timing.update(value_and_grad.last_timing)
-        timings.append(timing)
-        (loss,) = value.to_flat_list()
+        timings.append({"call_wall": call_wall})
+        loss = value.item()
         losses.append(loss / scale)
-        gradients = {name: gradients[name].to_flat_list() for name in PARAMETER_NAMES}
+        gradients = {
+            name: gradients[name].reshape(-1).tolist() for name in PARAMETER_NAMES
+        }
         if first_gradient is None:
             # Dividing by the power-of-two scale is exact.
             first_gradient = [

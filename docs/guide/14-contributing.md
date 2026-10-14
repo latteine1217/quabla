@@ -46,8 +46,8 @@ function and prints `PASS <name>`. Run one file directly while iterating.
 GPU suites are opt-in, because CI has no GPUs:
 
 ```sh
-QUABLA_MLX_TEST=1 python tests/python/test_matrix.py          # MLX build on Apple silicon
-QUABLA_CUDA_TEST=1 python tests/python/test_matrix.py         # CUDA build
+QUABLA_MLX_TEST=1 python tests/python/test_api.py             # MLX build on Apple silicon
+QUABLA_CUDA_TEST=1 python tests/python/test_api.py            # CUDA build
 QUABLA_CUDA_TEST=1 cargo test -p quabla-core --features cuda
 QUABLA_CUDA_NCCL_TEST=1 cargo test -p quabla-core --features cuda-nccl   # two GPUs
 cargo test --workspace --features quabla-core/mlx              # Rust MLX tests (macOS)
@@ -68,7 +68,7 @@ hardware to test it, say so in the pull request.
 | `crates/quabla-core/tests/cuda_*.rs` | CUDA-only: codegen size, `float64`, Cholesky, retained losses, solve profiles |
 | `crates/quabla-core/src/tensor_ir/*_tests.rs` | In-crate unit tests (region batching, MLX checkpoints, Cholesky, solve replay) |
 | `tests/python/test_api.py` | Public API, exports, operations, AD |
-| `tests/python/test_matrix.py` | Broad tensor and trace behavior, legacy API, device parity under the opt-in flags |
+| `tests/python/test_tensor_api.py` | Eager `Tensor` operations, dtypes, and the compiler facade |
 | `tests/python/test_devices_api.py`, `test_lower_program.py` | Device `jit` and ahead-of-time lowering |
 | `tests/python/test_control_api.py`, `test_custom_api.py` | Control flow; custom rules |
 | `tests/python/test_optim_api.py`, `test_linalg_api.py`, `test_solvers_api.py`, `test_ode_api.py`, `test_random_api.py`, `test_numpy_api.py` | The libraries |
@@ -181,9 +181,10 @@ regions and normally needs no per-op change.
 ## 14.6 Changing Public Behavior
 
 - The compatibility policy is in
-  [CONTRIBUTING.md](https://github.com/latteine1217/quabla/blob/main/CONTRIBUTING.md#scope-and-status): every v0.1 name
-  keeps working through 0.x; replacements deprecate with a once-per-name
-  `DeprecationWarning`. Backends, the IR, and Rust APIs are not covered and
+  [CONTRIBUTING.md](https://github.com/latteine1217/quabla/blob/main/CONTRIBUTING.md#scope-and-status): public names keep
+  their behaviour through 1.x, and a name to be removed emits a
+  `DeprecationWarning` for at least one minor release before the next major
+  release removes it. Backends, the IR, and Rust APIs are not covered and
   may change.
 - Raise an existing exception class from `python/quabla/_errors.py` rather
   than inventing a new one; each subclasses the builtin exception that

@@ -181,9 +181,9 @@ loss 1.235e-04
 ```
 
 For this tiny model the GPU is not faster than the CPU: per-step dispatch
-dominates. GPUs pay off for wider networks and many collocation points; the
-benchmarks in `examples/` (`benchmark_pinn_mlx.py`, `benchmark_pinn_cuda.py`)
-let you measure the crossover on your hardware.
+dominates. GPUs pay off for wider networks and many collocation points;
+time `trainer.step()` for your model on each device to find the crossover
+on your hardware.
 
 ## 11.8 Variations
 
@@ -219,5 +219,5 @@ formulations, integrate the semi-discrete system with `qb.ode.odeint`
 pytree (for example `{"net": mlp_params, "k": qb.array(1.0)}`) and use it in
 the residual; `grad` returns its gradient alongside the network's.
 
-The repository's `examples/` directory contains further PINN scripts,
-including device-resident training with the lower-level v0.1 helpers.
+The repository's `examples/` directory contains further PINN scripts
+(`pinn_poisson.py`, `pinn_mlp.py`) that train on any device with `--device`.

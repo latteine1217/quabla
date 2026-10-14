@@ -1,57 +1,56 @@
-"""Train a one-parameter PINN for u_xx + pi^2 sin(pi x) = 0 on [0, 1]."""
+"""Train a one-parameter PINN for u_xx + pi^2 sin(pi x) = 0 on [0, 1].
 
+The model is u(x) = sin(w x), so the exact solution is w = pi. The PDE
+residual differentiates the model twice per collocation point with
+`vmap(grad(grad(u)))`, and `optim.Trainer` runs Adam on the chosen device:
+
+    python examples/pinn_poisson.py
+    python examples/pinn_poisson.py --device mlx    # extension built with mlx
+    python examples/pinn_poisson.py --device cuda   # extension built with cuda
+"""
+
+import argparse
 import math
 
-import quabla
+import quabla as qb
+
+
+def u(w, x):
+    return qb.sin(w * x)
+
+
+u_xx = qb.vmap(qb.grad(qb.grad(u, argnums=1), argnums=1), in_axes=(None, 0))
+
+
+def loss(w, x, forcing, x_boundary):
+    residual = u_xx(w, x) + forcing
+    boundary = qb.vmap(u, in_axes=(None, 0))(w, x_boundary)
+    return qb.mean(residual**2) + qb.mean(boundary**2)
 
 
 def main() -> None:
-    coordinates = [0.15, 0.35, 0.55, 0.75, 0.9]
-    forcing = [math.pi**2 * math.sin(math.pi * x) for x in coordinates]
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--device", default="cpu", help="cpu, mlx, or cuda[:N]")
+    parser.add_argument("--steps", type=int, default=2000)
+    args = parser.parse_args()
 
-    residual_trace = quabla.trace_tensor(
-        lambda x, weight, forcing: (x * weight).sin(),
-        [("x", [5, 1]), ("weight", [1, 1]), ("forcing", [5, 1])],
+    x = qb.array([0.15, 0.35, 0.55, 0.75, 0.9])
+    forcing = math.pi**2 * qb.sin(math.pi * x)
+    x_boundary = qb.array([0.0, 1.0])
+    trainer = qb.optim.Trainer(
+        loss,
+        qb.array(2.5),
+        qb.optim.Adam(learning_rate=0.01),
+        x,
+        forcing,
+        x_boundary,
+        device=args.device,
     )
-    second_derivative = residual_trace.symbolic_jvp("x").symbolic_jvp("x")
-    residual = second_derivative.output + second_derivative.graph.input("forcing")
-    residual_loss = (residual * residual).mean()
-    residual_plan = residual_loss.compile_cpu()
-
-    boundary_trace = quabla.trace_tensor(
-        lambda x, weight, target: (x * weight).sin(),
-        [("x", [2, 1]), ("weight", [1, 1]), ("target", [2, 1])],
-    )
-    boundary_error = boundary_trace.output - boundary_trace.graph.input("target")
-    boundary_loss = (boundary_error * boundary_error).mean()
-    boundary_plan = boundary_loss.compile_cpu()
-
-    parameters = {"weight": quabla.Tensor([1, 1], [2.5])}
-    optimizer = quabla.Adam(learning_rate=0.01)
-
-    for _ in range(2000):
-        _, residual_gradients = residual_plan.evaluate_value_and_vjp(
-            {
-                "x": quabla.Tensor([5, 1], coordinates),
-                "forcing": quabla.Tensor([5, 1], forcing),
-                **parameters,
-            },
-            quabla.Tensor([], [1.0]),
-        )
-        _, boundary_gradients = boundary_plan.evaluate_value_and_vjp(
-            {
-                "x": quabla.Tensor([2, 1], [0.0, 1.0]),
-                "target": quabla.Tensor([2, 1], [0.0, 0.0]),
-                **parameters,
-            },
-            quabla.Tensor([], [1.0]),
-        )
-        parameters = optimizer.step(
-            parameters,
-            quabla.sum_gradients([residual_gradients, boundary_gradients], ["weight"]),
-        )
-
-    print(parameters["weight"].to_flat_list()[0])
+    initial = trainer.loss().item()
+    for _ in range(args.steps):
+        trainer.step()
+    w = trainer.params.item()
+    print(f"w={w:.6f} (pi={math.pi:.6f}) loss={initial:.3e}->{trainer.loss().item():.3e}")
 
 
 if __name__ == "__main__":

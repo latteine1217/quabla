@@ -114,38 +114,25 @@ def test_invalid_sharding_and_gradient_requests():
     expect(
         qb.UnsupportedOperationError,
         "another transform",
-        lambda: qb.trace_tensor(
-            lambda w, x: transform()({"w": w, "b": w}, {"x": x, "y": x})[0],
-            [("w", [1, 1]), ("x", [8, 1])],
-        ),
+        lambda: qb.jit(
+            lambda w, x: transform()({"w": w, "b": w}, {"x": x, "y": x})[0]
+        )(qb.ones([1, 1]), qb.ones([8, 1])),
     )
 
 
 def cpu_shards(params, batch, reduction, scale=1.0):
     half = batch["x"].shape[0] // 2
-    evaluate = qb.tensor_value_and_grad_fn(
+    evaluate = qb.value_and_grad(
         lambda w, b, x, y: loss({"w": w, "b": b}, {"x": x, "y": y}, scale),
-        [
-            ("w", params["w"].shape, params["w"].dtype),
-            ("b", params["b"].shape, params["b"].dtype),
-        ]
-        + [
-            (name, [half, *value.shape[1:]], value.dtype)
-            for name, value in batch.items()
-        ],
+        argnums=(0, 1),
     )
     results = []
     for replica in range(2):
-        value, all_gradients = evaluate(
-            {
-                **params,
-                **{
-                    name: value.slice(0, replica * half, half).to_tensor()
-                    for name, value in batch.items()
-                },
-            }
+        x, y = (
+            batch[name].slice(0, replica * half, half).to_tensor() for name in ("x", "y")
         )
-        results.append((value, {name: all_gradients[name] for name in params}))
+        value, (w_gradient, b_gradient) = evaluate(params["w"], params["b"], x, y)
+        results.append((value, {"w": w_gradient, "b": b_gradient}))
     factor = qb.array(0.5 if reduction == "mean" else 1.0, dtype=results[0][0].dtype)
     value = (results[0][0] + results[1][0]) * factor
     gradients = qb.tree.map(lambda a, b: (a + b) * factor, results[0][1], results[1][1])
@@ -158,18 +145,30 @@ def test_adapter_structure_signatures_and_cache_bound():
 
     def cpu_constructor(fun, specs, parameters, mapped, devices, reduction):
         builds.append((specs, parameters, mapped, devices, reduction))
-        shards = [
-            (name, [shape[0] // 2, *shape[1:]] if name in mapped else shape, dtype)
-            for name, shape, dtype in specs
-        ]
-        traced = qb.trace_tensor(fun, shards)
-        plan = traced.output.compile_cpu()
+        names = [name for name, _, _ in specs]
+        evaluate = qb.value_and_grad(
+            fun, argnums=tuple(names.index(name) for name in parameters)
+        )
+
+        def shard(value, name, replica):
+            if name not in mapped:
+                return value
+            half = value.shape[0] // 2
+            return value.slice(0, replica * half, half).to_tensor()
 
         def execute(inputs):
-            value, gradients = plan.value_and_grad_data_parallel(
-                inputs, mapped, 2, reduction
-            )
-            return value, {name: gradients[name] for name in parameters}
+            # Two CPU replicas of the mapped inputs, combined as NCCL would.
+            results = [
+                evaluate(*[shard(inputs[name], name, replica) for name in names])
+                for replica in range(2)
+            ]
+            factor = 0.5 if reduction == "mean" else 1.0
+            value = (results[0][0] + results[1][0]) * factor
+            gradients = {
+                name: (results[0][1][index] + results[1][1][index]) * factor
+                for index, name in enumerate(parameters)
+            }
+            return value, gradients
 
         return execute
 
@@ -258,28 +257,9 @@ def test_nccl_numerical_parity():
             expected, expected_grads = cpu_shards(params, batch, reduction)
             close(actual, expected)
             qb.tree.map(close, grads, expected_grads)
-            legacy = qb.tensor_value_and_grad_data_parallel_cuda_fn(
-                lambda w, b, x, y: loss({"w": w, "b": b}, {"x": x, "y": y}),
-                [
-                    (name, value.shape, dtype)
-                    for name, value in [
-                        ("w", params["w"]),
-                        ("b", params["b"]),
-                        ("x", batch["x"]),
-                        ("y", batch["y"]),
-                    ]
-                ],
-                ["w", "b"],
-                ["x", "y"],
-                [0, 1],
-                reduction,
-            )
-            legacy_value, legacy_grads = legacy({**params, **batch})
-            close(actual, legacy_value)
-            qb.tree.map(close, grads, legacy_grads)
-            assert actual.dtype == legacy_value.dtype
+            assert actual.dtype == dtype
             for name in grads:
-                assert grads[name].dtype == legacy_grads[name].dtype
+                assert grads[name].dtype == dtype
             print(
                 f"NCCL parity passed: dtype={dtype.name} reduction={reduction} loss={actual.to_flat_list()[0]}"
             )

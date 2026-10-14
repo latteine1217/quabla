@@ -5,30 +5,26 @@ Quabla v0.1 exposed transforms as spec-based helpers (`trace_tensor`,
 combination of transform and backend. v0.2 replaced them with the
 composable core API. This chapter shows how to move existing code.
 
-## 15.1 Compatibility Guarantees
+## 15.1 What v1.0 Removed
 
-- Every Python name released in v0.1 keeps working, with unchanged behavior,
-  through all 0.x releases.
-- Names that have a replacement emit a `DeprecationWarning` once per name on
-  explicit access. The message names the replacement:
+Through 0.x every v0.1 name kept working, and from v0.2 the names with a
+replacement emitted a `DeprecationWarning` on first access. v1.0 removes
+them all:
 
-  ```text
-  DeprecationWarning: quabla.tensor_jit_fn is deprecated; use qb.jit(f). The old name remains available through 0.x.
-  ```
+- the spec-based helpers (`trace_tensor`, `tensor_*_fn`) and their result
+  types, and the device optimizer helpers (`mlx_adam_loss_optimizer`,
+  `cuda_adam_*`);
+- the legacy 2D API (`Matrix`, `TraceGraph`, `grad_fn`, ...) and the
+  `quabla.legacy` namespace that held it;
+- the plan classes `TensorCpuExecutionPlan`, `TensorCudaExecutionPlan`, and
+  `TensorMlxExecutionPlan`, which only the removed helpers returned;
+- the aliases `quabla.Adam`, `quabla.quabla`, and `sum_gradients`;
+- the v0.1 call forms `qb.grad(fn, input_specs, values, output_cotangent)`,
+  `qb.jit(input_specs)`, and `qb.trace(fn, input_specs)`; `grad`, `jit`, and
+  `trace` now accept only their core-API forms.
 
-- `from quabla import *` binds the old names silently; only explicit access
-  warns.
-- The legacy 2D API (`Matrix`, `TraceGraph`, `grad_fn`, ...) is available
-  without warnings from `quabla.legacy`.
-- `quabla.Adam` aliases `quabla.optim.Adam`, which keeps the v0.1 stateful
-  `step(params, grads)` method.
-- `qb.grad(fn, input_specs, values, output_cotangent)`, `qb.jit(input_specs)`,
-  and `qb.trace(fn, input_specs)` (the v0.1 call forms) are still dispatched
-  to the v0.1 functions.
-- Deprecated names are removed at 1.0.
-
-To find every use of a deprecated name in your code, turn the warnings into
-errors while running your tests:
+To find every use before upgrading, run your code on the last 0.x release
+(0.7.1) with the warnings turned into errors:
 
 ```sh
 python -W error::DeprecationWarning your_script.py
@@ -47,7 +43,7 @@ python -W error::DeprecationWarning your_script.py
 
 ## 15.3 A Worked Example
 
-The v0.1 example `examples/pinn_poisson.py` fits one weight `w` so that
+The v0.1 version of `examples/pinn_poisson.py` fits one weight `w` so that
 `sin(w x)` solves `u'' = -pi^2 sin(pi x)` with zero boundary values. In
 v0.1 it builds two separately traced plans, takes symbolic JVPs by input
 name, and sums the gradients by hand:
@@ -132,12 +128,11 @@ The most common replacements:
 | `tensor_value_and_grad_data_parallel_cuda_fn` | `qb.distributed.value_and_grad(f, devices=..., shard_argnums=...)` |
 | `mlx_adam_loss_optimizer`, `cuda_adam_*_optimizer`, `cuda_adam_step` | `qb.optim.Trainer(..., device="mlx" \| "cuda")` |
 | `sum_gradients` | `qb.tree.map(operator.add, a, b)` |
-| `Adam` | `qb.optim.Adam` (`init`/`update`; `step` still works) |
-| `Matrix`, `TraceGraph`, `grad_fn`, `jvp_fn`, ... | `quabla.legacy.<name>` |
+| `Adam` | `qb.optim.Adam` (`init`/`update`, or `step`) |
+| `Matrix`, `TraceGraph`, `grad_fn`, `jvp_fn`, ... | `qb.array` and the core transforms (`qb.grad`, `qb.jvp`, `qb.jit`) |
 
 The complete mapping, with the status of each name, is Appendix A of the
-[v0.2 API design](../api_v0_2_design.md#appendix-a-name-mapping); the
-deprecation messages come from `python/quabla/_compat.py`.
+[v0.2 API design](../api_v0_2_design.md#appendix-a-name-mapping).
 
 ## 15.5 Things That Behave Differently
 
@@ -152,7 +147,8 @@ deprecation messages come from `python/quabla/_compat.py`.
 - **Jacobian layout.** `tensor_jacobian_fn` returned an output-flat by
   input-flat matrix; `qb.jacobian` returns blocks of shape
   `[*out.shape, *in.shape]`.
-- **Device helpers versus `Trainer`.** The v0.1 device optimizers expose
+- **Device helpers versus `Trainer`.** The v0.1 device optimizers exposed
   low-level controls (retained input names, per-plan synchronization).
-  `Trainer` covers the common training loop; the low-level helpers remain
-  available when you need those controls.
+  `Trainer` covers the training loop: it retains the parameters, the
+  optimizer moments, and the data not listed in `batch_argnums` on the
+  device.

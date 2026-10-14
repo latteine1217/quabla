@@ -59,14 +59,14 @@ right after the code.
 14. [Contributing and Extending](14-contributing.md): the development
     workflow, the test suites, and how to add a new operation.
 15. [Migrating From the v0.1 API](15-migration.md): mapping the v0.1
-    helpers to the core API.
+    helpers that v1.0 removed to the core API.
 
 ## Conventions
 
 - `import quabla as qb` is assumed in every example.
 - "The core API" means the JAX-style API introduced in v0.2 (`qb.grad`,
   `qb.vmap`, `qb.jit`, ...). "The v0.1 API" means the spec-based helpers
-  (`trace_tensor`, `tensor_*_fn`) and the 2D `Matrix` API, which keep working
-  but are not the recommended entry point.
+  (`trace_tensor`, `tensor_*_fn`) and the 2D `Matrix` API, which v1.0
+  removed.
 - Paths such as `python/quabla/optim.py` are relative to the repository
   root.

@@ -1,5 +1,34 @@
 # Rust SciML Runtime Roadmap
 
+## v1.0 Plan (2026-10-14)
+
+v1.0 removes the v0.1 surface that the v0.2 compatibility policy scheduled
+for removal and the engines that only it used. Scope chosen by the owner on
+2026-10-14, building on the "Before v1.0" section below.
+
+Two findings narrow that section. First, every entry point that S3 and S4
+serve (`tensor_value_and_grad_fn`, `tensor_vjp_fn`, `tensor_jvp_fn`,
+`tensor_jacobian_fn`, `tensor_hessian_scalar_fn`, `tensor_hvp_scalar_fn`
+and their result types) is a deprecated name removed at 1.0, so the runtime
+engines are deleted rather than rebuilt as adapters. Second, the advanced
+plan classes `TensorCpuExecutionPlan`, `TensorCudaExecutionPlan`, and
+`TensorMlxExecutionPlan`, which the v0.2 design kept at 1.0, can only be
+obtained through deprecated names (`compile_cpu()`, `tensor_jit_cuda_fn`,
+...). The owner decided on 2026-10-14 to remove them as well; `jit`,
+`Trainer`, `distributed`, and `Compiler().compile()` cover what they did.
+The native functions the current API calls internally
+(`_quabla.tensor_cond`, `tensor_fori_loop`, `tensor_scan`, the
+`*_region` loops, and `tensor_value_and_grad_data_parallel_cuda_fn`) stay
+private to `_quabla`.
+
+| # | Step | Verification | Status |
+| --- | --- | --- | --- |
+| 1 | Python surface (S5): remove `quabla.legacy`, every name in `_compat.py`, the `quabla.Adam` alias, the v0.1 call forms of `grad`/`jit`/`trace`, and the tests of removed names; move README, `docs/api.md`, and examples to the current API | remaining Python suites on CPU, MLX, CUDA; removed names raise `AttributeError` | Done: the eager-tensor tests of `test_matrix.py` moved to `test_tensor_api.py`; tests that used a removed helper as an oracle use analytic derivatives, per-example loops, or CPU replicas instead; the PINN examples became `pinn_poisson.py` and `pinn_mlp.py` with `--device`, and examples that only exercised removed helpers (seven benchmarks and `benchmark_v02_training.py`, whose baseline was the removed native optimizer) were deleted |
+| 2 | Bindings: delete the pyclasses and pyfunctions only removed names reached (`trace.rs`, `matrix.rs`, most of `tensor_trace.rs`), their stubs, and registrations | clippy, Rust tests, `test_packaging_api` | Open |
+| 3 | Core engines (S3, S4): delete the runtime VJP/JVP engines and the mixed second-order evaluator; `TensorIr::vjp`/`jvp` become symbolic adapters for the core tests | op, region, solver, and Adam golden baselines byte-identical | Open |
+| 4 | Adam (A1): `_quabla.Adam.step` uses the canonical rule; the legacy CUDA Adam kernels go with `cuda_adam_*` | `optim.Adam.step` equals `.update` bit for bit; Adam golden changes only on the `step` path | Open |
+| 5 | Release 1.0.0 | all gates locally and on the CUDA host | Open |
+
 ## v0.7 Plan (2026-10-07)
 
 v0.7 fixes the robustness gaps found during v0.6 before the v1.0 work of

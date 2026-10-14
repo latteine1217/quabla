@@ -1,12 +1,20 @@
-"""Check complete two-GPU loss/gradient calls against CPU replica oracles."""
+"""Check complete two-GPU loss/gradient calls against CPU replica oracles.
+
+`distributed.value_and_grad` splits the batch across CUDA ordinals 0 and 1
+and reduces the shard losses and gradients with NCCL. The oracle evaluates
+the same two shards on the CPU with `value_and_grad` and combines them with
+the same reduction.
+"""
 
 import argparse
 import hashlib
 import json
 import math
+import warnings
 from pathlib import Path
 
 import quabla
+import quabla as qb
 
 
 DEVICE_ORDINALS = [0, 1]
@@ -14,47 +22,65 @@ TOLERANCE = 1e-5
 STEPS = 5
 
 
-def loss_fn(x, target, weight, bias):
-    return ((x * weight + bias - target).powi(2)).mean()
-
-
-def flat(tensor):
-    return tensor.to_flat_list()
+def loss_fn(params, x, target):
+    return qb.mean((x * params["weight"] + params["bias"] - target) ** 2)
 
 
 def maximum_error(actual, reference):
     assert actual.shape == reference.shape
-    pairs = list(zip(flat(actual), flat(reference), strict=True))
+    pairs = list(
+        zip(actual.reshape(-1).tolist(), reference.reshape(-1).tolist(), strict=True)
+    )
     assert all(math.isfinite(a) and math.isfinite(b) for a, b in pairs)
     return max(abs(a - b) for a, b in pairs)
 
 
+def cpu_replicas(params, x, target, reduction):
+    """The CPU value and gradients of `len(DEVICE_ORDINALS)` equal shards."""
+    replicas = len(DEVICE_ORDINALS)
+    size = x.shape[0] // replicas
+    value_and_grad = qb.value_and_grad(loss_fn)
+    results = [
+        value_and_grad(
+            params,
+            x.slice(0, index * size, size).to_tensor(),
+            target.slice(0, index * size, size).to_tensor(),
+        )
+        for index in range(replicas)
+    ]
+    factor = 1.0 / replicas if reduction == "mean" else 1.0
+    value = sum((result[0] for result in results[1:]), results[0][0]) * factor
+    gradients = {
+        name: sum((result[1][name] for result in results[1:]), results[0][1][name])
+        * factor
+        for name in params
+    }
+    return value, gradients
+
+
 def validate_case(shape, parameter_shape, dtype, reduction):
     count = math.prod(shape)
-    parameter_count = math.prod(parameter_shape)
-    inputs = {
-        "x": quabla.Tensor(
-            shape, [(i % 17 - 8) / 16 for i in range(count)], dtype=dtype
-        ),
-        "target": quabla.Tensor(
-            shape, [(i % 13 - 6) / 16 for i in range(count)], dtype=dtype
-        ),
-        "weight": quabla.Tensor(parameter_shape, [0.25] * parameter_count, dtype=dtype),
-        "bias": quabla.Tensor(parameter_shape, [-0.125] * parameter_count, dtype=dtype),
-    }
-    specs = [(name, tensor.shape, dtype) for name, tensor in inputs.items()]
-    cpu_plan = quabla.trace_tensor(loss_fn, specs).output.compile_cpu()
-    cuda_fn = quabla.tensor_value_and_grad_data_parallel_cuda_fn(
-        loss_fn, specs, ["weight", "bias"], ["x", "target"], DEVICE_ORDINALS, reduction
+    x = qb.array([(i % 17 - 8) / 16 for i in range(count)], dtype=dtype).reshape(shape)
+    target = qb.array([(i % 13 - 6) / 16 for i in range(count)], dtype=dtype).reshape(
+        shape
     )
-    assert cuda_fn.replica_count == len(DEVICE_ORDINALS)
-    assert cuda_fn.device_ordinals == DEVICE_ORDINALS
+    params = {
+        "weight": qb.full(parameter_shape, 0.25, dtype),
+        "bias": qb.full(parameter_shape, -0.125, dtype),
+    }
+    cuda_fn = qb.distributed.value_and_grad(
+        loss_fn,
+        devices=[f"cuda:{ordinal}" for ordinal in DEVICE_ORDINALS],
+        shard_argnums=(1, 2),
+        reduction=reduction,
+    )
     results = []
     for step in range(STEPS):
-        cpu_value, cpu_gradients = cpu_plan.value_and_grad_data_parallel(
-            inputs, ["x", "target"], len(DEVICE_ORDINALS), reduction
-        )
-        cuda_value, cuda_gradients = cuda_fn(inputs)
+        cpu_value, cpu_gradients = cpu_replicas(params, x, target, reduction)
+        with warnings.catch_warnings():
+            # CUDA evaluates float64 data in float32 by default.
+            warnings.simplefilter("ignore", UserWarning)
+            cuda_value, cuda_gradients = cuda_fn(params, x, target)
         assert set(cuda_gradients) == {"weight", "bias"}
         loss_error = maximum_error(cuda_value, cpu_value)
         gradient_errors = {
@@ -65,35 +91,20 @@ def validate_case(shape, parameter_shape, dtype, reduction):
         assert all(error <= TOLERANCE for error in gradient_errors.values()), (
             gradient_errors
         )
-        timing = cuda_fn.last_timing
-        assert timing is not None
-        assert set(timing) == {"replica_enqueue", "collective", "output_readback"}
-        assert all(
-            math.isfinite(duration) and duration >= 0.0 for duration in timing.values()
-        )
         results.append(
             {
                 "step": step,
-                "cpu_loss": flat(cpu_value)[0],
-                "cuda_loss": flat(cuda_value)[0],
+                "cpu_loss": cpu_value.item(),
+                "cuda_loss": cuda_value.item(),
                 "loss_abs_error": loss_error,
                 "gradient_abs_errors": gradient_errors,
-                "timing_seconds": timing,
             }
         )
         # Use the CPU oracle update for common inputs: each subsequent call
         # tests changed parameters without conflating accumulated optimizer drift.
-        for name in ("weight", "bias"):
-            inputs[name] = quabla.Tensor(
-                parameter_shape,
-                [
-                    value - 0.01 * gradient
-                    for value, gradient in zip(
-                        flat(inputs[name]), flat(cpu_gradients[name]), strict=True
-                    )
-                ],
-                dtype=dtype,
-            )
+        params = {
+            name: params[name] - 0.01 * cpu_gradients[name] for name in ("weight", "bias")
+        }
     return {
         "shape": shape,
         "parameter_shape": parameter_shape,

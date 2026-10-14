@@ -7,7 +7,6 @@ import importlib.machinery
 import inspect
 import math
 import pathlib
-import pickle
 import struct
 import subprocess
 import sys
@@ -25,51 +24,45 @@ except ImportError:
 from _support import assert_close, enabled, require, run, skip
 from _support import raises as assert_raises
 
-# The 132 non-underscore names of `dir(quabla)` on the v0.1 build, generated
-# before the move to the mixed Rust/Python layout. Every later build must keep
-# exporting them (docs/api_v0_2_design.md, slice S0 and Appendix A).
-V0_1_NAMES_FILE = pathlib.Path(__file__).with_name("v0_1_public_names.txt")
+# A sample of the v0.1 names that v1.0 removed (the deprecated and legacy
+# names of docs/api_v0_2_design.md, Appendix A), across every kind: 2D Matrix
+# API, rank-N helpers and their result types, plan classes, optimizer
+# helpers, the module alias, and the legacy namespace.
+REMOVED_NAMES = [
+    "Adam",
+    "CpuExecutionPlan",
+    "Matrix",
+    "TensorCpuExecutionPlan",
+    "TensorCudaExecutionPlan",
+    "TensorMlxExecutionPlan",
+    "TensorValueAndGradFunction",
+    "TraceGraph",
+    "cuda_adam_step",
+    "grad_fn",
+    "legacy",
+    "mlx_adam_loss_optimizer",
+    "quabla",
+    "sum_gradients",
+    "tensor_fori_loop_region",
+    "tensor_jit_fn",
+    "tensor_value_and_grad_fn",
+    "tensor_while_loop_region",
+    "trace_tensor",
+    "vjp_fn",
+]
 
 
-def v0_1_names():
-    names = V0_1_NAMES_FILE.read_text().split()
-    assert len(names) == len(set(names)) == 132
-    return set(names)
+def test_removed_v0_1_names_raise_attribute_error():
+    for name in REMOVED_NAMES:
+        assert not hasattr(quabla, name), name
+        assert name not in quabla.__all__, name
+    assert_raises(ImportError, importlib.import_module, "quabla.legacy")
+    assert_raises(ImportError, importlib.import_module, "quabla.quabla")
 
 
-def test_v0_1_names_are_exported():
-    missing = v0_1_names() - set(dir(quabla))
-    assert not missing, f"v0.1 names missing from quabla: {sorted(missing)}"
-    for name in v0_1_names():
-        getattr(quabla, name)
-
-
-def test_all_covers_v0_1_star_import_and_resolves():
-    # v0.1 took __all__ from the extension, which does not list the `quabla`
-    # alias, so `from quabla import *` never bound it.
-    assert v0_1_names() - {"quabla"} <= set(quabla.__all__)
+def test_all_names_resolve():
     for name in quabla.__all__:
         getattr(quabla, name)
-
-
-def test_star_import_binds_deprecated_names_without_warning():
-    # A fresh interpreter keeps the once-per-name warning state clean. The star
-    # import must neither warn (so it survives -W error) nor spend the warning
-    # that explicit access still emits.
-    script = """
-import warnings
-from quabla import *
-assert Adam is not None and tensor_jit_fn is not None and Matrix is not None
-import quabla
-with warnings.catch_warnings(record=True) as caught:
-    warnings.simplefilter("always")
-    quabla.Adam
-    from quabla import Matrix
-assert [str(w.message).split(" is")[0] for w in caught] == ["quabla.Adam", "quabla.Matrix"]
-"""
-    subprocess.run(
-        [sys.executable, "-W", "error::DeprecationWarning", "-c", script], check=True
-    )
 
 
 def test_private_extension_module():
@@ -79,24 +72,6 @@ def test_private_extension_module():
     assert native.__file__.endswith(tuple(importlib.machinery.EXTENSION_SUFFIXES))
     # The public package itself is pure Python.
     assert quabla.__file__.endswith("__init__.py")
-
-
-def test_quabla_alias_resolves():
-    assert quabla.quabla is quabla._quabla
-    assert importlib.import_module("quabla.quabla") is quabla._quabla
-
-    import quabla.quabla as alias
-    from quabla.quabla import Tensor
-
-    assert alias is quabla._quabla
-    assert Tensor is quabla.Tensor
-
-
-def test_v0_1_pickled_function_path_loads():
-    # A v0.1 pickle names module-level functions by `quabla.quabla.<name>`;
-    # `grad` there is the native v0.1 function, which `quabla.grad` wraps (D17).
-    assert pickle.loads(b"cquabla.quabla\ngrad\n.") is quabla._quabla.grad
-    assert pickle.loads(b"cquabla.quabla\ntensor_jit_fn\n.") is quabla.tensor_jit_fn
 
 
 def test_dtype_reprs_are_unchanged():
@@ -197,7 +172,7 @@ def test_array_abc_registers_tensor_types():
         seen.append(isinstance(x, qb.Array))
         return x.sum()
 
-    qb.tensor_jit_fn(loss, [("x", [2])])
+    qb.jit(loss)(qb.array([1.0, 2.0]))
     assert seen == [True]
 
 
@@ -239,15 +214,12 @@ def test_single_element_tensors_stay_tensor_operands():
     ]:
         assert_raises(
             ValueError,
-            qb.tensor_jit_fn,
-            function,
-            [("x", [2])],
+            qb.jit(function),
+            qb.array([1.0, 2.0]),
             match="mismatched dtypes",
         )
-        compiled = qb.tensor_jit_fn(function, [("x", [2], qb.float32)])
-        assert (
-            compiled({"x": qb.array([1.0, 2.0], dtype=qb.float32)}).dtype == qb.float32
-        )
+        compiled = qb.jit(function)
+        assert compiled(qb.array([1.0, 2.0], dtype=qb.float32)).dtype == qb.float32
 
 
 def test_factories():
@@ -474,11 +446,7 @@ def test_numpy_round_trip_of_a_million_values_is_fast():
 
 def traced(function, *arrays):
     """Evaluates `function` on `arrays` through a CPU trace."""
-    specs = [
-        (f"a{index}", array.shape, array.dtype) for index, array in enumerate(arrays)
-    ]
-    compiled = qb.tensor_jit_fn(function, specs)
-    return compiled({f"a{index}": array for index, array in enumerate(arrays)})
+    return qb.jit(function)(*arrays)
 
 
 def test_module_level_unary_and_reduction_ops_match_methods():
@@ -1085,17 +1053,13 @@ def test_traced_negation_and_integer_powers_with_gradients():
     assert_close(traced(lambda a: -a, x), [-value for value in values])
     for exponent in [0, 1, 2, 3, np.int64(2) if np is not None else 2]:
         assert_close(traced(lambda a, n=exponent: a**n, x), x ** int(exponent))
-        value, gradients = qb.tensor_value_and_grad_fn(
-            lambda a, n=exponent: (a**n).sum(), [("x", [3])]
-        )({"x": x})
+        value, gradient = qb.value_and_grad(lambda a, n=exponent: (a**n).sum())(x)
         n = int(exponent)
         assert_close(value, sum(v**n for v in values))
-        assert_close(gradients["x"], [n * v ** (n - 1) if n else 0.0 for v in values])
-    value, gradients = qb.tensor_value_and_grad_fn(
-        lambda a: qb.sum(-(a**2) + qb.sin(a)), [("x", [3])]
-    )({"x": x})
+        assert_close(gradient, [n * v ** (n - 1) if n else 0.0 for v in values])
+    value, gradient = qb.value_and_grad(lambda a: qb.sum(-(a**2) + qb.sin(a)))(x)
     assert_close(value, sum(-(v**2) + math.sin(v) for v in values))
-    assert_close(gradients["x"], [-2.0 * v + math.cos(v) for v in values])
+    assert_close(gradient, [-2.0 * v + math.cos(v) for v in values])
     # -0.0 keeps its sign, as for eager tensors.
     assert math.copysign(1.0, traced(lambda a: -a, qb.array([0.0])).item()) == -1.0
     # float32 stays float32.
@@ -1153,24 +1117,21 @@ def test_power_values_follow_powf_eagerly_and_traced():
         assert_raises(ValueError, function, mask, match="pow is not defined for bool")
         assert_raises(
             ValueError,
-            qb.tensor_jit_fn,
-            function,
-            [("m", [2], qb.bool_)],
+            qb.jit(function),
+            mask,
             match="pow is not defined for bool",
         )
     assert_raises(
         TypeError,
-        qb.tensor_jit_fn,
-        lambda a: pow(a, 2, 3),
-        [("x", [2])],
+        qb.jit(lambda a: pow(a, 2, 3)),
+        qb.array([1.0, 2.0]),
         match="modulo",
     )
     assert_raises(TypeError, lambda: pow(x, 2, 3), match="modulo")
     assert_raises(
         ValueError,
-        qb.tensor_jit_fn,
-        lambda a: -a,
-        [("x", [2], qb.bool_)],
+        qb.jit(lambda a: -a),
+        mask,
         match="negative is not defined for bool",
     )
 
@@ -1184,52 +1145,45 @@ def test_traced_power_gradients_in_both_operands():
         (lambda a: (a**-1).sum(), [-(v**-2) for v in xs]),
         (lambda a: (2.0**a).sum(), [2.0**v * math.log(2.0) for v in xs]),
     ]:
-        value, gradients = qb.tensor_value_and_grad_fn(function, [("x", [3])])({"x": x})
+        value, gradient = qb.value_and_grad(function)(x)
         assert_close(value, function(x))
-        assert_close(gradients["x"], base_gradient)
-    value, gradients = qb.tensor_value_and_grad_fn(
-        lambda a, b: qb.power(a, b).sum(), [("x", [3]), ("y", [3])]
-    )({"x": x, "y": y})
+        assert_close(gradient, base_gradient)
+    value, (x_gradient, y_gradient) = qb.value_and_grad(
+        lambda a, b: qb.power(a, b).sum(), argnums=(0, 1)
+    )(x, y)
     assert_close(value, sum(a**b for a, b in zip(xs, ys)))
-    assert_close(gradients["x"], [b * a ** (b - 1.0) for a, b in zip(xs, ys)])
-    assert_close(gradients["y"], [a**b * math.log(a) for a, b in zip(xs, ys)])
+    assert_close(x_gradient, [b * a ** (b - 1.0) for a, b in zip(xs, ys)])
+    assert_close(y_gradient, [a**b * math.log(a) for a, b in zip(xs, ys)])
     # Conventions at x <= 0: d/dx is the zero subgradient where x == 0 and y < 1 (like sqrt at
     # the origin) and the finite limit for y >= 1; d/dy is 0 for every x <= 0.
     base = qb.array([0.0, 0.0, 0.0, -2.0])
     exponent = qb.array([0.5, 1.0, 2.0, 3.0])
-    _, gradients = qb.tensor_value_and_grad_fn(
-        lambda a, b: (a**b).sum(), [("x", [4]), ("y", [4])]
-    )({"x": base, "y": exponent})
-    assert gradients["x"].tolist() == [0.0, 1.0, 0.0, 12.0]
-    assert gradients["y"].tolist() == [0.0, 0.0, 0.0, 0.0]
-    # Second derivatives compose through the traced graph: d^2/dx^2 x^2.0 is 2, also at 0.
-    inputs = {"x": qb.array([0.0, 1.5])}
-    traced_power = qb.trace_tensor(lambda a: (a**2.0).sum(), [("x", [2])])
-    hessian = traced_power.graph.hessian_scalar(
-        traced_power.output.node_id, "x", inputs
+    x_gradient, y_gradient = qb.grad(lambda a, b: (a**b).sum(), argnums=(0, 1))(
+        base, exponent
     )
-    assert hessian == [[2.0, 0.0], [0.0, 2.0]]
-    hvp = qb.tensor_hvp_scalar_fn(lambda a: (a**2.0).sum(), [("x", [2])], "x")
-    assert hvp(inputs, qb.array([1.0, -1.0])).tolist() == [2.0, -2.0]
+    assert x_gradient.tolist() == [0.0, 1.0, 0.0, 12.0]
+    assert y_gradient.tolist() == [0.0, 0.0, 0.0, 0.0]
+    # Second derivatives compose through the traced graph: d^2/dx^2 x^2.0 is 2, also at 0.
+    point = qb.array([0.0, 1.5])
+    square_sum = lambda a: (a**2.0).sum()  # noqa: E731
+    assert qb.hessian(square_sum)(point).tolist() == [[2.0, 0.0], [0.0, 2.0]]
+    _, hvp = qb.jvp(qb.grad(square_sum), (point,), (qb.array([1.0, -1.0]),))
+    assert hvp.tolist() == [2.0, -2.0]
 
 
-def assert_power_device_parity(value_and_grad_fn):
+def assert_power_device_parity(device):
     x = qb.array([0.0, 0.5, 1.5, 2.25, -2.0])
     y = qb.array([0.5, 0.5, -1.0, 2.5, 3.0])
-    specs = [("x", [5]), ("y", [5])]
 
     def loss(a, b):
         return (a**b + 2.0**b * a**0.5 + a**2).sum()
 
-    cpu_value, cpu_gradients = qb.tensor_value_and_grad_fn(loss, specs)(
-        {"x": x, "y": y}
-    )
-    value, gradients = value_and_grad_fn(loss, specs, ["x", "y"])({"x": x, "y": y})
+    value_and_grad = qb.value_and_grad(loss, argnums=(0, 1))
+    cpu_value, cpu_gradients = value_and_grad(x, y)
+    value, gradients = qb.jit(value_and_grad, device=device)(x, y)
     assert math.isnan(cpu_value.item()) and math.isnan(value.item())
-    for name in ["x", "y"]:
-        for actual, expected in zip(
-            gradients[name].tolist(), cpu_gradients[name].tolist()
-        ):
+    for name, gradient, cpu_gradient in zip(["x", "y"], gradients, cpu_gradients):
+        for actual, expected in zip(gradient.tolist(), cpu_gradient.tolist()):
             if math.isnan(expected):
                 assert math.isnan(actual), (name, actual)
             else:
@@ -1242,16 +1196,12 @@ def assert_power_device_parity(value_and_grad_fn):
 
 def test_mlx_power_matches_cpu():
     require("mlx")
-    assert_power_device_parity(qb.tensor_value_and_grad_mlx_fn)
+    assert_power_device_parity("mlx")
 
 
 def test_cuda_power_matches_cpu():
     require("cuda")
-    assert_power_device_parity(
-        lambda loss, specs, names: qb.tensor_value_and_grad_cuda_fn(
-            loss, specs, names, 0
-        )
-    )
+    assert_power_device_parity("cuda")
 
 
 # -- S2: pytrees and errors ---------------------------------------
@@ -1571,24 +1521,33 @@ QX = [-1.0, 0.5, 1.0, 2.0]
 QW = [0.3, -0.2, 0.1, 0.4]
 
 
-def test_value_and_grad_matches_tensor_value_and_grad_fn():
+def masked_loss_reference():
+    """`masked_loss` at (QX, QW) and its gradients, in float64 by hand:
+    d/dx tanh(xw)^2 = 2 tanh(xw) (1 - tanh(xw)^2) w where x > 0, else 0."""
+    value, gx, gw = 0.0, [], []
+    for x, w in zip(QX, QW):
+        y = math.tanh(x * w)
+        slope = 2.0 * y * (1.0 - y * y) if x > 0.0 else 0.0
+        value += y * y if x > 0.0 else 0.0
+        gx.append(slope * w)
+        gw.append(slope * x)
+    return value, gx, gw
+
+
+def test_value_and_grad_matches_the_analytic_gradient():
+    expected_value, expected_gx, expected_gw = masked_loss_reference()
     for dtype in [qb.float64, qb.float32]:
         x, w = qb.array(QX, dtype=dtype), qb.array(QW, dtype=dtype)
-        specs = [("x", [4], dtype), ("w", [4], dtype)]
-        old_value, old_grads = qb.tensor_value_and_grad_fn(masked_loss, specs)(
-            {"x": x, "w": w}
-        )
         value, (gx, gw) = qb.value_and_grad(masked_loss, argnums=(0, 1))(x, w)
         tolerance = 1e-6 if dtype == qb.float32 else 1e-14
         for tensor in [value, gx, gw]:
             assert tensor.dtype == dtype, tensor.dtype
-        assert_close(value, old_value, tolerance)
-        assert_close(gx, old_grads["x"], tolerance)
-        assert_close(gw, old_grads["w"], tolerance)
-        assert_close(qb.grad(masked_loss, 1)(x, w), old_grads["w"], tolerance)
-        assert_close(qb.jit(qb.grad(masked_loss))(x, w), old_grads["x"], tolerance)
-        grad_scalar = qb.tensor_grad_scalar_fn(masked_loss, specs)({"x": x, "w": w})
-        assert_close(qb.grad(masked_loss, -1)(x, w), grad_scalar["w"], tolerance)
+        assert_close(value, expected_value, tolerance)
+        assert_close(gx, expected_gx, tolerance)
+        assert_close(gw, expected_gw, tolerance)
+        assert_close(qb.grad(masked_loss, 1)(x, w), expected_gw, tolerance)
+        assert_close(qb.jit(qb.grad(masked_loss))(x, w), expected_gx, tolerance)
+        assert_close(qb.grad(masked_loss, -1)(x, w), expected_gw, tolerance)
 
 
 def test_argnums_forms_select_and_structure_gradients():
@@ -1638,7 +1597,7 @@ def mlp_loss(params, x, y):
     return qb.mean((hidden - y) ** 2)
 
 
-def test_dict_params_of_an_mlp_match_the_name_keyed_helper():
+def test_dict_params_of_an_mlp_match_positional_arguments():
     for dtype in [qb.float64, qb.float32]:
         params = init_mlp(dtype)
         x = qb.array([[0.5, -1.0], [0.25, 0.75], [-0.5, 1.5], [1.0, 0.0]], dtype=dtype)
@@ -1651,24 +1610,17 @@ def test_dict_params_of_an_mlp_match_the_name_keyed_helper():
             return mlp_loss({"layers": layers}, x, y)
 
         layers = params["layers"]
-        inputs = {
-            "w0": layers[0]["w"],
-            "b0": layers[0]["b"],
-            "w1": layers[1]["w"],
-            "b1": layers[1]["b"],
-            "x": x,
-            "y": y,
-        }
-        specs = [(name, tensor.shape, dtype) for name, tensor in inputs.items()]
-        old_value, old_grads = qb.tensor_value_and_grad_fn(named, specs)(inputs)
+        flat_value, flat_grads = qb.value_and_grad(named, argnums=(0, 1, 2, 3))(
+            layers[0]["w"], layers[0]["b"], layers[1]["w"], layers[1]["b"], x, y
+        )
         tolerance = 1e-6 if dtype == qb.float32 else 1e-13
         assert value.dtype == dtype
-        assert_close(value, old_value, tolerance)
+        assert_close(value, flat_value, tolerance)
         for index in range(2):
-            for leaf in ["w", "b"]:
+            for position, leaf in enumerate(["w", "b"]):
                 gradient = grads["layers"][index][leaf]
                 assert gradient.dtype == dtype
-                assert_close(gradient, old_grads[f"{leaf}{index}"], tolerance)
+                assert_close(gradient, flat_grads[2 * index + position], tolerance)
 
 
 def test_has_aux_returns_auxiliary_pytrees_from_the_same_program():
@@ -1750,11 +1702,15 @@ def test_second_order_by_direct_composition():
 
     x, v = qb.array([1.0, 2.0, -1.0]), qb.array([0.5, -1.0, 2.0])
     _, hvp = qb.jvp(qb.grad(cubic), (x,), (v,))
-    old = qb.tensor_hvp_scalar_fn(cubic, [("x", [3])], "x")({"x": x}, v)
-    assert_close(hvp, old, 1e-14)
+    # The Hessian is diag(6 x) + e0 1^T + 1 e0^T.
+    xs, vs = x.tolist(), v.tolist()
+    expected = [
+        6.0 * xs[i] * vs[i] + vs[0] + (sum(vs) if i == 0 else 0.0) for i in range(3)
+    ]
+    assert_close(hvp, expected, 1e-14)
 
 
-def test_jvp_matches_tensor_jvp_fn_and_keeps_float32():
+def test_jvp_matches_the_analytic_tangent_and_keeps_float32():
     def model(x, w):
         return qb.tanh(x @ w)
 
@@ -1763,15 +1719,15 @@ def test_jvp_matches_tensor_jvp_fn_and_keeps_float32():
         w = qb.array([[0.3], [-0.7]], dtype=dtype)
         dx = qb.array([[1.0, 0.0], [0.5, -0.5]], dtype=dtype)
         dw = qb.array([[0.2], [0.1]], dtype=dtype)
-        specs = [("x", [2, 2], dtype), ("w", [2, 1], dtype)]
-        old_value, old_tangent = qb.tensor_jvp_fn(model, specs)(
-            {"x": x, "w": w}, {"x": dx, "w": dw}
-        )
         value, tangent = qb.jvp(model, (x, w), (dx, dw))
+        # d tanh(x w) = (1 - tanh(x w)^2) (dx w + x dw), evaluated eagerly in float64.
+        x64, w64, dx64, dw64 = (t.astype(qb.float64) for t in (x, w, dx, dw))
+        expected_value = qb.tanh(x64 @ w64)
+        expected_tangent = (1.0 - expected_value**2) * (dx64 @ w64 + x64 @ dw64)
         tolerance = 1e-6 if dtype == qb.float32 else 1e-14
         assert value.dtype == tangent.dtype == dtype
-        assert_close(value, old_value, tolerance)
-        assert_close(tangent, old_tangent, tolerance)
+        assert_close(value, expected_value, tolerance)
+        assert_close(tangent, expected_tangent, tolerance)
     # Python number tangents adopt the primal dtype; pytrees of outputs work.
     x32 = qb.array(2.0, dtype=qb.float32)
     (square, pair), (dsquare, dpair) = qb.jvp(
@@ -1794,21 +1750,21 @@ def test_jvp_matches_tensor_jvp_fn_and_keeps_float32():
     )
 
 
-def test_vjp_matches_tensor_vjp_fn_with_pytree_outputs():
+def test_vjp_matches_the_analytic_pullback_with_pytree_outputs():
     def model(x, w):
         return qb.tanh(x @ w)
 
     x = qb.array([[0.5, -1.0], [2.0, 0.25]])
     w = qb.array([[0.3], [-0.7]])
     ct = qb.array([[1.0], [-2.0]])
-    old_value, old_grads = qb.tensor_vjp_fn(model, [("x", [2, 2]), ("w", [2, 1])])(
-        {"x": x, "w": w}, ct
-    )
     value, pullback = qb.vjp(model, x, w)
-    assert_close(value, old_value)
+    expected_value = qb.tanh(x @ w)
+    assert_close(value, expected_value)
+    # The cotangent of x @ w is ct (1 - tanh^2); it maps to x and w by the matmul rules.
+    inner = ct * (1.0 - expected_value**2)
     gx, gw = pullback(ct)
-    assert_close(gx, old_grads["x"])
-    assert_close(gw, old_grads["w"])
+    assert_close(gx, inner @ w.transpose([1, 0]))
+    assert_close(gw, x.transpose([1, 0]) @ inner)
     # Several outputs: the pullback sums their VJPs.
     out, pullback = qb.vjp(
         lambda x: {"a": x * 2.0, "b": qb.sum(x)}, qb.array([1.0, 2.0])
@@ -1824,17 +1780,16 @@ def test_vjp_matches_tensor_vjp_fn_with_pytree_outputs():
     assert_close(aux, [4.0])
 
 
-def test_jacobian_and_hessian_match_the_dense_helpers():
+def test_jacobian_and_hessian_match_the_analytic_derivatives():
     def model(x, w):
         return qb.tanh(x @ w)
 
     x = qb.array([[0.5, -1.0], [2.0, 0.25]])
     w = qb.array([[0.3], [-0.7]])
-    specs = [("x", [2, 2]), ("w", [2, 1])]
-    old = qb.tensor_jacobian_fn(model, specs, "w")({"x": x, "w": w})
     jac = qb.jacobian(model, argnums=1)(x, w)
     assert jac.shape == [2, 1, 2, 1]
-    assert_close(jac.reshape([2, 2]), old)
+    # d tanh((x w)_i) / d w_k = (1 - tanh((x w)_i)^2) x_ik.
+    assert_close(jac.reshape([2, 2]), (1.0 - qb.tanh(x @ w) ** 2) * x)
     jx, jw = qb.jacobian(model, argnums=(0, 1))(x, w)
     assert jx.shape == [2, 1, 2, 2] and jw.shape == [2, 1, 2, 1]
 
@@ -1842,11 +1797,23 @@ def test_jacobian_and_hessian_match_the_dense_helpers():
         return qb.sum(qb.sin(x) * x**2) + qb.sum(x) ** 2
 
     point = qb.array([0.5, -1.0, 2.0])
-    old_hessian = qb.tensor_hessian_scalar_fn(loss, [("x", [3])], "x")({"x": point})
+    # diag(d^2/dx^2 sin(x) x^2) plus the constant 2 of (sum x)^2 in every entry.
+    expected_hessian = [
+        [
+            2.0
+            + (
+                -math.sin(p) * p * p + 4.0 * p * math.cos(p) + 2.0 * math.sin(p)
+                if i == j
+                else 0.0
+            )
+            for j in range(3)
+        ]
+        for i, p in enumerate(point.tolist())
+    ]
     hessian = qb.hessian(loss)(point)
     assert hessian.shape == [3, 3]
-    assert_close(hessian, old_hessian, 1e-13)
-    assert_close(qb.jit(qb.hessian(loss))(point), old_hessian, 1e-13)
+    assert_close(hessian, expected_hessian, 1e-13)
+    assert_close(qb.jit(qb.hessian(loss))(point), expected_hessian, 1e-13)
     point32 = qb.array([0.5, -1.0, 2.0], dtype=qb.float32)
     assert qb.hessian(loss)(point32).dtype == qb.float32
     # A pytree argument gives pytree blocks.
@@ -1871,9 +1838,9 @@ def test_jacobian_and_hessian_match_the_dense_helpers():
         assert_close(third[index], expected, 1e-7)
 
 
-def test_jit_matches_tensor_jit_fn_with_pytrees_and_static_argnums():
+def test_jit_matches_eager_evaluation_with_pytrees_and_static_argnums():
     x, w = qb.array(QX), qb.array(QW)
-    old = qb.tensor_jit_fn(masked_loss, [("x", [4]), ("w", [4])])({"x": x, "w": w})
+    old = masked_loss(x, w)
     assert_close(qb.jit(masked_loss)(x, w), old)
     assert_close(qb.jit(masked_loss, device="cpu")(x, w), old)
     out = qb.jit(lambda p: {"sum": p[0] + p[1], "list": [p[0] * 2.0, None, 3]})((x, w))
@@ -2070,7 +2037,7 @@ def test_transforms_called_on_tracers_inline_their_graphs():
     assert_close(grads["b"], fd_b, 1e-8)
 
 
-def test_inlined_transforms_cache_their_staged_graph_and_reject_unsupported_calls():
+def test_inlined_transforms_cache_their_staged_graph():
     traces = []
 
     def u(x, w):
@@ -2093,25 +2060,15 @@ def test_inlined_transforms_cache_their_staged_graph_and_reject_unsupported_call
         [math.cos(value) for value in x.tolist()],
         1e-14,
     )
-    error = assert_raises(
-        qb.UnsupportedOperationError,
-        qb.tensor_vmap_fn,
-        lambda row: qb.grad(lambda y: qb.sum(y * y))(row),
-        [("row", [2])],
-        3,
-        match="batched tracer",
-    )
-    assert error.op == "nested transform"
     # Second-order reverse mode through an inlined region matches forward
     # over reverse.
 
     def scan_loss(initial, scale):
-        carry, outputs = qb.tensor_scan_region(
-            0,
-            3,
-            lambda index, current, s: (current * current * s + index, current * s),
+        carry, outputs = qb.scan(
+            lambda current, index, s: (current * current * s + index, current * s),
             initial,
-            [scale],
+            length=3,
+            operands=(scale,),
         )
         return carry + outputs.sum()
 
@@ -2147,29 +2104,27 @@ def pinn_loss(w, x):
     return qb.mean((u_xx + math.pi**2 * qb.sin(math.pi * x)) ** 2)
 
 
-def readme_symbolic_jvp_loss():
-    """The v0.1 README "At a Glance" loss: two symbolic coordinate JVPs."""
-    u = qb.trace_tensor(
-        lambda x, w: (x * w).sin(), [("x", [PINN_POINTS, 1]), ("w", [1, 1])]
-    )
-    u_xx = u.symbolic_jvp("x").symbolic_jvp("x")
-    x = u_xx.graph.input("x")
-    return (u_xx.output + math.pi**2 * (math.pi * x).sin()).powi(2).mean()
+def pinn_loss_reference(w, xs):
+    """`pinn_loss` and its w-derivative by hand: u_xx = -w^2 sin(x w), so the
+    residual r = -w^2 sin(x w) + pi^2 sin(pi x) has
+    dr/dw = -2 w sin(x w) - w^2 x cos(x w)."""
+    value = gradient = 0.0
+    for x in xs:
+        r = -(w**2) * math.sin(x * w) + math.pi**2 * math.sin(math.pi * x)
+        dr = -2.0 * w * math.sin(x * w) - w**2 * x * math.cos(x * w)
+        value += r * r / len(xs)
+        gradient += 2.0 * r * dr / len(xs)
+    return value, gradient
 
 
 def test_pinn_loss_with_a_nested_second_derivative_reproduces_the_readme():
     x, w = qb.linspace(0.05, 0.95, PINN_POINTS), qb.array(2.5)
     step = qb.jit(qb.value_and_grad(pinn_loss))
     value, grad_w = step(w, x)
-    # Same loss and gradient as the README's symbolic_jvp().symbolic_jvp() path.
-    plan = readme_symbolic_jvp_loss().compile_cpu()
-    readme_inputs = {"x": x.reshape([PINN_POINTS, 1]), "w": w.reshape([1, 1])}
-    old_value, old_grads = plan.evaluate_value_and_vjp(
-        readme_inputs, qb.Tensor([], [1.0])
-    )
-    assert_close(value, old_value.item(), 1e-12)
-    assert_close(grad_w, old_grads["w"].item(), 1e-12)
-    params, adam = {"w": w}, qb.Adam(learning_rate=0.05)
+    expected_value, expected_grad_w = pinn_loss_reference(w.item(), x.tolist())
+    assert_close(value, expected_value, 1e-12)
+    assert_close(grad_w, expected_grad_w, 1e-12)
+    params, adam = {"w": w}, qb.optim.Adam(learning_rate=0.05)
     for _ in range(300):
         value, grad_w = step(params["w"], x)
         params = adam.step(params, {"w": grad_w})
@@ -2195,7 +2150,7 @@ def test_pinn_loss_with_eager_forcing_terms_reproduces_the_readme():
     )
     assert_close(value, traced_value, 1e-12)
     assert_close(grad_w, traced_grad_w, 1e-12)
-    w, adam = {"w": qb.array(2.5)}, qb.Adam(learning_rate=0.05)
+    w, adam = {"w": qb.array(2.5)}, qb.optim.Adam(learning_rate=0.05)
     for _ in range(300):
         value, grad_w = step(w["w"], xs)
         w = adam.step(w, {"w": grad_w})
@@ -2288,34 +2243,29 @@ def test_captured_constants_keep_their_dtype():
     assert_tensor(qb.jit(lambda t: mask | (t > 1.0))(x32), [True, False], qb.bool_)
 
 
-def assert_constant_device_parity(value_and_grad_fn):
+def assert_constant_device_parity(device):
     c = qb.array([0.5, -1.25, 2.0, 0.75])
     x = qb.array([0.1, 0.2, -0.3, 0.4])
-    specs = [("x", [4])]
 
     def loss(t):
         return (qb.sin(t * c) + c * t).sum()
 
-    cpu_value, cpu_gradients = qb.tensor_value_and_grad_fn(loss, specs)({"x": x})
-    device = value_and_grad_fn(loss, specs, ["x"])
+    cpu_value, cpu_gradient = qb.value_and_grad(loss)(x)
+    compiled = qb.jit(qb.value_and_grad(loss), device=device)
     for _ in range(2):  # the second call reuses the uploaded constant
-        value, gradients = device({"x": x})
+        value, gradient = compiled(x)
         assert_close(value, cpu_value, 1e-5)
-        assert_close(gradients["x"], cpu_gradients["x"], 1e-5)
+        assert_close(gradient, cpu_gradient, 1e-5)
 
 
 def test_mlx_captured_constants_match_cpu():
     require("mlx")
-    assert_constant_device_parity(qb.tensor_value_and_grad_mlx_fn)
+    assert_constant_device_parity("mlx")
 
 
 def test_cuda_captured_constants_match_cpu():
     require("cuda")
-    assert_constant_device_parity(
-        lambda loss, specs, names: qb.tensor_value_and_grad_cuda_fn(
-            loss, specs, names, 0
-        )
-    )
+    assert_constant_device_parity("cuda")
 
 
 def test_nested_second_derivatives_grow_the_graph_linearly_in_the_points():
@@ -2338,41 +2288,10 @@ def test_nested_second_derivatives_grow_the_graph_linearly_in_the_points():
         assert counts[8][index] - counts[4][index] == 4 * per_point, counts
 
 
-def test_legacy_grad_and_jit_call_forms_keep_v0_1_results():
-    def model(a, b):
-        return a @ b
-
-    specs = [("a", (2, 3)), ("b", (3, 2))]
-    values = {
-        "a": qb.Matrix([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
-        "b": qb.Matrix([[7.0, 8.0], [9.0, 10.0], [11.0, 12.0]]),
-    }
-    cotangent = qb.Matrix([[1.0, 0.5], [-1.0, 2.0]])
-    for gradients in [
-        qb.grad(model, specs, values, cotangent),
-        qb.grad(model, tuple(specs), values, output_cotangent=cotangent),
-        qb.grad(
-            function=model, input_specs=specs, values=values, output_cotangent=cotangent
-        ),
-    ]:
-        assert gradients["a"].to_list() == [[11.0, 14.0, 17.0], [9.0, 11.0, 13.0]]
-        assert gradients["b"].to_list() == [[-3.0, 8.5], [-3.0, 11.0], [-3.0, 13.5]]
-
-    @qb.jit([("a", (2, 2))])
-    def double(a):
-        return a + a
-
-    assert type(double).__name__ == "JitFunction"
-    assert double({"a": qb.Matrix([[1.0, 2.0], [3.0, 4.0]])}).to_list() == [
-        [2.0, 4.0],
-        [6.0, 8.0],
-    ]
-    assert type(qb.jit(input_specs=[("a", (2, 2))])).__name__ == "JitTransform"
-    # A list of ints is v0.2 argnums, not a v0.1 input spec list.
+def test_grad_takes_a_list_of_ints_as_argnums():
     x, y = qb.array([1.0, 2.0]), qb.array([3.0, 4.0])
     grad_x, grad_y = qb.grad(lambda a, b: qb.sum(a * b), [0, 1])(x, y)
     assert (grad_x.tolist(), grad_y.tolist()) == ([3.0, 4.0], [1.0, 2.0])
-    assert qb.grad is not qb._quabla.grad and qb.jit is not qb._quabla.jit
     assert list(inspect.signature(qb.grad).parameters) == ["fun", "argnums", "has_aux"]
 
 
@@ -2398,14 +2317,6 @@ def test_tracer_escapes_raise_tracer_error():
     for function, message in escapes:
         error = assert_raises(qb.TracerError, qb.jit(function), x, match=message)
         assert isinstance(error, TypeError)
-    # The v0.1 helpers raise the same class, which is still a TypeError.
-    assert_raises(
-        TypeError,
-        qb.tensor_jit_fn,
-        lambda t: t if t else t,
-        [("x", [])],
-        match="control flow",
-    )
 
 
 def test_eager_arrays_meeting_tracers_are_captured_as_constants():
@@ -2562,17 +2473,10 @@ def test_vmap_rejects_invalid_axes_and_unbatchable_ops():
     )
 
     def looped(initial, scale):
-        return qb.tensor_fori_loop_region(
-            0, 3, lambda i, c, s: c + i * s, initial, [scale]
-        )
+        return qb.fori_loop(0, 3, lambda i, c, s: c + i * s, initial, operands=(scale,))
 
-    # A mapped loop region batches its body, as the deprecated helper does.
+    # A mapped loop region batches its body: c + (0 + 1 + 2) s per example.
     assert_close(qb.vmap(looped)(qb.array([1.0, 2.0]), qb.array([2.0, 3.0])), [7.0, 11.0])
-    old = qb.tensor_vmap_fn(looped, [("initial", []), ("scale", [])], 2)
-    assert_close(
-        old({"initial": qb.array([1.0, 2.0]), "scale": qb.array([2.0, 3.0])}),
-        [7.0, 11.0],
-    )
     # A mapped cond predicate selects each example's branch.
     assert_close(
         qb.vmap(lambda x: qb.cond(x > 0.0, lambda t: t * 2.0, lambda t: -t, x))(
@@ -2582,7 +2486,7 @@ def test_vmap_rejects_invalid_axes_and_unbatchable_ops():
     )
 
 
-def test_vmap_matches_the_tensor_vmap_helpers():
+def test_vmap_matches_per_example_evaluation():
     def model(x, weight):
         return x.matmul(weight).tanh()
 
@@ -2590,21 +2494,12 @@ def test_vmap_matches_the_tensor_vmap_helpers():
         [[[1.0, 0.0], [0.0, 1.0]], [[2.0, 1.0], [1.0, 2.0]], [[3.0, 0.0], [0.0, 3.0]]]
     )
     weight = qb.array([[[1.0], [-1.0]], [[1.0], [0.5]], [[2.0], [1.0]]])
-    old = qb.tensor_vmap_fn(model, [("x", [2, 2]), ("weight", [2, 1])], 3)
-    assert_close(qb.vmap(model)(x, weight), old({"x": x, "weight": weight}), 1e-15)
-    # The helpers align a mapped [B] operand with a mapped [B, 3] one by
-    # trailing axes, so a per-example scalar times a vector fails there;
-    # quabla.vmap batches the per-example graph and handles it.
+    assert_close(
+        qb.vmap(model)(x, weight), per_example(model, (True, True), x, weight), 1e-15
+    )
+    # A per-example scalar times a per-example vector.
     rows = qb.array([[0.1, 0.2, 0.3], [-0.4, 0.5, 0.6]])
     scales = qb.array([0.8, 1.1])
-    assert_raises(
-        ValueError,
-        qb.tensor_vmap_fn,
-        lambda r, c: r * c,
-        [("r", [3]), ("c", [])],
-        2,
-        match="cannot broadcast",
-    )
     assert_close(
         qb.vmap(lambda r, c: r * c)(rows, scales),
         [[0.08, 0.16, 0.24], [-0.44, 0.55, 0.66]],
@@ -2613,99 +2508,83 @@ def test_vmap_matches_the_tensor_vmap_helpers():
     def dot(a, b):
         return (a * b).sum()
 
+    # Columns of xt are the examples: [1, 2], [3, 4], [5, 6] against [2, -1].
     xt = qb.array([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]])
     b = qb.array([2.0, -1.0])
-    old = qb.tensor_vmap_fn(
-        dot, [("x", [2]), ("weight", [2])], 3, in_axes=[-1, None], out_axis=-1
-    )
-    assert_close(
-        qb.vmap(dot, in_axes=(-1, None), out_axes=-1)(xt, b),
-        old({"x": xt, "weight": b}),
-    )
+    assert_close(qb.vmap(dot, in_axes=(-1, None), out_axes=-1)(xt, b), [0.0, 2.0, 4.0])
     cube = qb.array(
         [
             [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]],
             [[4.0, 40.0], [5.0, 50.0], [6.0, 60.0]],
         ]
     )
-    old = qb.tensor_vmap_fn(
-        lambda t: t.transpose().mean(axis=1),
-        [("x", [2, 3])],
-        2,
-        in_axes=[2],
-        out_axis=1,
-    )
+    # Example k is cube[:, :, k]; the mean over its rows lands in column k.
     new = qb.vmap(lambda t: t.transpose().mean(axis=1), in_axes=2, out_axes=1)(cube)
-    assert_close(new, old({"x": cube}))
+    assert_close(new, [[2.5, 25.0], [3.5, 35.0], [4.5, 45.0]])
 
     # jvp of vmap: forward mode over the batched function.
     def f(x, s):
         return qb.sin(x * s) * s + x**2
 
-    # `s` has one element per example: the helpers cannot batch a scalar
-    # against a vector (above).
-    specs = [("x", [3]), ("s", [1])]
-    values = {
-        "x": qb.array([[0.1, 0.2, 0.3], [-0.4, 0.5, 0.6]]),
-        "s": qb.array([[0.8], [1.1]]),
-    }
-    tangents = {
-        "x": qb.array([[1.0, -1.0, 0.5], [0.0, 2.0, 1.0]]),
-        "s": qb.array([[0.3], [-0.2]]),
-    }
-    old_out, old_tangent = qb.tensor_vmap_jvp_fn(f, specs, 2)(values, tangents)
-    out, tangent = qb.jvp(
-        qb.vmap(f), (values["x"], values["s"]), (tangents["x"], tangents["s"])
+    xs = qb.array([[0.1, 0.2, 0.3], [-0.4, 0.5, 0.6]])
+    ss = qb.array([[0.8], [1.1]])
+    dxs = qb.array([[1.0, -1.0, 0.5], [0.0, 2.0, 1.0]])
+    dss = qb.array([[0.3], [-0.2]])
+    out, tangent = qb.jvp(qb.vmap(f), (xs, ss), (dxs, dss))
+    every = (True, True, True, True)
+    assert_close(out, per_example(f, every[:2], xs, ss), 1e-15)
+    assert_close(
+        tangent,
+        per_example(lambda x, s, dx, ds: qb.jvp(f, (x, s), (dx, ds))[1], every, xs, ss, dxs, dss),
+        1e-14,
     )
-    assert_close(out, old_out, 1e-15)
-    assert_close(tangent, old_tangent, 1e-14)
     # vjp of vmap: mapped cotangents give per-example gradients, and the
-    # gradient of an unmapped argument sums over the batch, as the helper's.
+    # gradient of an unmapped argument sums over the batch.
     cotangent = qb.array([[1.0, -0.5, 0.25], [-0.75, 0.5, 1.0]])
-    old_out, old_grads = qb.tensor_vmap_vjp_fn(f, specs, 2)(values, cotangent)
-    out, pullback = qb.vjp(qb.vmap(f), values["x"], values["s"])
+
+    def pullback_of(x, s, ct):
+        return qb.vjp(f, x, s)[1](ct)
+
+    out, pullback = qb.vjp(qb.vmap(f), xs, ss)
     gx, gs = pullback(cotangent)
-    assert_close(out, old_out, 1e-15)
-    assert_close(gx, old_grads["x"], 1e-14)
-    assert_close(gs, old_grads["s"], 1e-14)
+    assert_close(out, per_example(f, every[:2], xs, ss), 1e-15)
+    assert_close(gx, per_example(lambda *a: pullback_of(*a)[0], every[:3], xs, ss, cotangent), 1e-14)
+    assert_close(gs, per_example(lambda *a: pullback_of(*a)[1], every[:3], xs, ss, cotangent), 1e-14)
     s_shared = qb.array([0.9])
-    old_out, old_grads = qb.tensor_vmap_vjp_fn(f, specs, 2, in_axes=[0, None])(
-        {"x": values["x"], "s": s_shared}, cotangent
-    )
-    out, pullback = qb.vjp(qb.vmap(f, in_axes=(0, None)), values["x"], s_shared)
+    shared = (True, False, True)
+    out, pullback = qb.vjp(qb.vmap(f, in_axes=(0, None)), xs, s_shared)
     gx, gs = pullback(cotangent)
-    assert_close(gx, old_grads["x"], 1e-14)
-    assert_close(gs, old_grads["s"], 1e-14)
-    # Where the semantics differ: vmap(grad) with respect to an unmapped
-    # argument gives one gradient per example (JAX); the helper's VJP sums
-    # them over the batch.
+    assert_close(gx, per_example(lambda *a: pullback_of(*a)[0], shared, xs, s_shared, cotangent), 1e-14)
+    assert_close(
+        gs,
+        qb.sum(per_example(lambda *a: pullback_of(*a)[1], shared, xs, s_shared, cotangent), 0),
+        1e-14,
+    )
+    # vmap(grad) with respect to an unmapped argument gives one gradient per
+    # example (JAX); their sum is the VJP of the batched function.
     per_point = qb.vmap(
         qb.grad(lambda x, s: qb.sum(f(x, s)), argnums=1), in_axes=(0, None)
     )
-    per_example = per_point(values["x"], s_shared)
-    assert per_example.shape == [2, 1]
-    ones = qb.ones([2, 3])
-    _, summed = qb.tensor_vmap_vjp_fn(f, specs, 2, in_axes=[0, None])(
-        {"x": values["x"], "s": s_shared}, ones
-    )
-    assert_close(qb.sum(per_example, 0), summed["s"], 1e-14)
+    per_grad = per_point(xs, s_shared)
+    assert per_grad.shape == [2, 1]
+    _, pullback = qb.vjp(qb.vmap(f, in_axes=(0, None)), xs, s_shared)
+    assert_close(qb.sum(per_grad, 0), pullback(qb.ones([2, 3]))[1], 1e-14)
 
     # HVP of the summed per-example scalar loss with respect to a mapped input.
     def g(x, s):
         return qb.sum(qb.tanh(x * s) * x)
 
     direction = qb.array([[0.7, -0.4, 0.2], [0.1, 0.3, -0.5]])
-    old_hvp = qb.tensor_vmap_hvp_scalar_fn(g, specs, 2, "x")(values, direction)
+
+    def example_hvp(x, s, v):
+        return qb.jvp(qb.grad(g), (x, s), (v, qb.zeros([1])))[1]
+
+    expected_hvp = per_example(example_hvp, every[:3], xs, ss, direction)
     batched_loss = qb.grad(lambda x, s: qb.sum(qb.vmap(g)(x, s)))
-    _, hvp = qb.jvp(
-        batched_loss, (values["x"], values["s"]), (direction, qb.zeros([2, 1]))
-    )
-    assert_close(hvp, old_hvp, 1e-14)
+    _, hvp = qb.jvp(batched_loss, (xs, ss), (direction, qb.zeros([2, 1])))
+    assert_close(hvp, expected_hvp, 1e-14)
     # The same HVP per example, as vmap of a jvp of grad.
-    per_example_hvp = qb.vmap(
-        lambda x, s, v: qb.jvp(qb.grad(g), (x, s), (v, qb.zeros([1])))[1]
-    )
-    assert_close(per_example_hvp(values["x"], values["s"], direction), old_hvp, 1e-14)
+    assert_close(qb.vmap(example_hvp)(xs, ss, direction), expected_hvp, 1e-14)
 
 
 def test_vmap_composes_with_grad_jit_and_itself():
@@ -2795,22 +2674,18 @@ def test_pinn_in_the_canonical_vmap_form_reproduces_the_readme():
     assert_close(u_xx(x, w), [-(2.5**2) * math.sin(2.5 * p) for p in x.tolist()], 1e-14)
     step = qb.jit(qb.value_and_grad(loss))
     value, grad_w = step(w, x)
-    # The per-point S3 form and the README's symbolic_jvp path agree.
+    # The per-point S3 form and the hand-derived loss agree.
     loop_value, loop_grad = qb.jit(qb.value_and_grad(pinn_loss))(w, x)
     assert_close(value, loop_value, 1e-13)
     assert_close(grad_w, loop_grad, 1e-13)
-    plan = readme_symbolic_jvp_loss().compile_cpu()
-    readme_inputs = {"x": x.reshape([PINN_POINTS, 1]), "w": w.reshape([1, 1])}
-    old_value, old_grads = plan.evaluate_value_and_vjp(
-        readme_inputs, qb.Tensor([], [1.0])
-    )
-    assert_close(value, old_value.item(), 1e-12)
-    assert_close(grad_w, old_grads["w"].item(), 1e-12)
+    expected_value, expected_grad_w = pinn_loss_reference(w.item(), x.tolist())
+    assert_close(value, expected_value, 1e-12)
+    assert_close(grad_w, expected_grad_w, 1e-12)
     # Finite differences in w.
     h = 1e-6
     fd = (step(w + h, x)[0].item() - step(w - h, x)[0].item()) / (2.0 * h)
     assert_close(grad_w, fd, 1e-7)
-    params, adam = {"w": w}, qb.Adam(learning_rate=0.05)
+    params, adam = {"w": w}, qb.optim.Adam(learning_rate=0.05)
     for _ in range(300):
         value, grad_w = step(params["w"], x)
         params = adam.step(params, {"w": grad_w})
@@ -3169,8 +3044,8 @@ def test_jax_style_pinn_closing_over_params_matches_explicit_arguments():
 
     closure_params, explicit_params = params, params
     closure_adam, explicit_adam = (
-        qb.Adam(learning_rate=0.01),
-        qb.Adam(learning_rate=0.01),
+        qb.optim.Adam(learning_rate=0.01),
+        qb.optim.Adam(learning_rate=0.01),
     )
     losses = []
     for _ in range(5):
@@ -3200,15 +3075,6 @@ def test_escaped_tracers_raise_tracer_error_instead_of_mixing_graphs():
         error = assert_raises(qb.TracerError, qb.jit(function), x, match="escaped")
         assert isinstance(error, TypeError)
     assert_raises(qb.TracerError, qb.grad(lambda t: qb.sum(qb.sin(t) + leaked[0])), x)
-    # The trace of a v0.1 helper is not an enclosing transform: its tracers
-    # cannot be captured by a v0.2 transform inside it.
-    assert_raises(
-        qb.TracerError,
-        qb.tensor_jit_fn,
-        lambda a: qb.grad(lambda y: y * a)(1.0),
-        [("a", [])],
-        match="tensor_* helper",
-    )
 
 
 def lowered_node_count(function, *args):

@@ -188,13 +188,12 @@ step = qb.jit(qb.value_and_grad(loss), device="mlx")    # or "cuda", "cuda:1", "
 An operation that a backend cannot lower raises
 `UnsupportedOperationError`; Quabla never silently falls back to the host.
 
-## 1.4 The Three API Layers
+## 1.4 The Two API Layers
 
 | Layer | Entry points | Use it for |
 | --- | --- | --- |
 | Core API (v0.2+) | `qb.array`, `qb.grad`, `qb.vmap`, `qb.jit`, `qb.optim`, `qb.linalg`, `qb.ode`, ... | All new code. The rest of this guide uses it. |
 | Compiler facade | `qb.Compiler`, `Program`, `Executable`, `qb.jit(f).lower(...)` | Explicit compilation from named input specs, inspection of the IR, integration with other tools. See [Devices](10-devices.md#107-the-compiler-facade). |
-| v0.1 API | `trace_tensor`, `tensor_*_fn`, device optimizers, `Matrix` | Existing code. Kept working through 0.x; migrated names warn once. See [Migration](15-migration.md). |
 
 ## 1.5 Where to Go Next
 

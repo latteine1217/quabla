@@ -9,6 +9,32 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Removed
+
+- The v0.1 names that v0.2 deprecated, as the 0.x compatibility policy
+  announced: the spec-based helpers `trace_tensor` and `tensor_*_fn` with
+  their result types, the device optimizer helpers `mlx_adam_loss_optimizer`
+  and `cuda_adam_*`, `sum_gradients`, and the aliases `quabla.Adam` (use
+  `quabla.optim.Adam`) and `quabla.quabla` (the module path
+  `quabla.quabla` no longer imports). Accessing one raises
+  `AttributeError`. `docs/guide/15-migration.md` maps each to the core API.
+- The legacy 2D API (`Matrix`, `TraceGraph`, `grad_fn`, `jvp_fn`, ...) and
+  the `quabla.legacy` namespace, decided by the owner on 2026-10-07 instead
+  of keeping `quabla.legacy` past 1.0.
+- The plan classes `TensorCpuExecutionPlan`, `TensorCudaExecutionPlan`, and
+  `TensorMlxExecutionPlan`, which the v0.2 design listed as advanced names
+  but which only the removed helpers returned; `jit(device=...)`,
+  `optim.Trainer`, `distributed.value_and_grad`, and
+  `Compiler().compile()` cover them. `tensor_while_loop_region`, an internal
+  helper of `while_loop`, is no longer exported either.
+- The v0.1 call forms `grad(fn, input_specs, values, output_cotangent)`,
+  `jit(input_specs)`, and `trace(fn, input_specs)`: `grad`, `jit`, and
+  `trace` accept only their core-API forms.
+- The examples and benchmarks that exercised only the removed helpers. The
+  PINN examples are now `examples/pinn_poisson.py` and
+  `examples/pinn_mlp.py`, which take `--device`; the two NCCL validation
+  scripts use `distributed.value_and_grad`.
+
 ## [0.7.1] - 2026-10-08
 
 CUDA results are the same on every run: partial sums are added in a fixed

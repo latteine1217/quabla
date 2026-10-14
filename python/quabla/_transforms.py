@@ -2041,16 +2041,7 @@ def grad(*args, **kwargs):
     gradient of its scalar output with respect to the arguments selected by
     `argnums`, or `(grads, aux)` with `has_aux=True`; see `value_and_grad`.
     Called with keywords only (`@grad(argnums=1)`), returns a decorator.
-
-    The v0.1 form `grad(function, input_specs, values, output_cotangent)` of
-    the 2D `Matrix` API still works unchanged: it is recognized by its input
-    spec list (design D17).
     """
-    if _is_legacy_grad_call(args, kwargs):
-        from ._compat import warn
-
-        warn("grad")
-        return _quabla.grad(*args, **kwargs)
     if not args and "fun" not in kwargs:
         return _decorator(_new_grad, kwargs)
     return _new_grad(*args, **kwargs)
@@ -2073,15 +2064,7 @@ def jit(*args, **kwargs):
     `UserWarning`). `precision="float64"` runs them natively in double on
     CUDA instead; such a program must not also contain `float32` values.
     It is a no-op on the CPU and raises `UnsupportedOperationError` on MLX.
-
-    The v0.1 decorator form `jit(input_specs)` of the 2D `Matrix` API still
-    works unchanged: it is recognized by its non-callable spec list (D17).
     """
-    if _is_legacy_jit_call(args, kwargs):
-        from ._compat import warn
-
-        warn("jit")
-        return _quabla.jit(*args, **kwargs)
     if not args and "fun" not in kwargs:
         return _decorator(_new_jit, kwargs)
     return _new_jit(*args, **kwargs)
@@ -2089,30 +2072,6 @@ def jit(*args, **kwargs):
 
 grad.__signature__ = inspect.signature(_new_grad)
 jit.__signature__ = inspect.signature(_new_jit)
-
-_LEGACY_GRAD_KEYWORDS = frozenset(
-    {"function", "input_specs", "values", "output_cotangent"}
-)
-
-
-def _is_input_specs(value):
-    # v0.1 specs are `(name, shape)` pairs, so a list or tuple of ints is argnums.
-    return isinstance(value, (list, tuple)) and not all(
-        isinstance(item, int) for item in value
-    )
-
-
-def _is_legacy_grad_call(args, kwargs):
-    # v0.1 takes four arguments with an input spec list second; the new form
-    # takes at most three, with an int or a sequence of ints second.
-    if len(args) > 3 or not _LEGACY_GRAD_KEYWORDS.isdisjoint(kwargs):
-        return True
-    return len(args) >= 2 and _is_input_specs(args[1])
-
-
-def _is_legacy_jit_call(args, kwargs):
-    # v0.1 takes a single input spec list, which is not callable.
-    return "input_specs" in kwargs or (len(args) >= 1 and not callable(args[0]))
 
 
 def jvp(fun, primals, tangents):

@@ -2,9 +2,10 @@
 
 Problem: u''(x) = -pi^2 sin(pi x) on [0, 1] with u(0) = u(1) = 0, whose exact
 solution is u(x) = sin(pi x). The network is a one-hidden-layer tanh MLP; the
-PDE residual uses two symbolic coordinate JVPs for the exact u'' (no finite
-differences), and training runs Adam on the CPU backend, so every build of
-the extension (CPU, MLX, or CUDA) can regenerate the figure.
+PDE residual differentiates it twice per collocation point with
+`vmap(grad(grad(u)))` for the exact u'' (no finite differences), and training
+runs Adam on the CPU, so every build of the extension (CPU, MLX, or CUDA) can
+regenerate the figure.
 
 Requires matplotlib, which is not a Quabla dependency. From the repository
 root, with the extension built (`maturin develop --release`):
@@ -23,7 +24,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-import quabla  # noqa: E402
+import quabla as qb  # noqa: E402
 
 WIDTH = 16
 COLLOCATION = 32
@@ -31,84 +32,50 @@ STEPS = 3000
 LEARNING_RATE = 0.01
 PLOT_POINTS = 201
 SEED = 2026
-PARAMETERS = ["w1", "b1", "w2", "b2"]
 OUTPUT = Path(__file__).resolve().parent.parent / "docs" / "assets" / "pinn_poisson.png"
 
 
-def mlp(x, w1, b1, w2, b2):
-    return (x @ w1 + b1).tanh() @ w2 + b2
+def mlp(params, x):
+    """The network at one point x."""
+    hidden = qb.tanh(x * params["w1"] + params["b1"])
+    return qb.sum(hidden * params["w2"]) + params["b2"]
 
 
-def build_loss_plan():
-    """Freeze residual + boundary loss into one CPU plan."""
-    specs = [
-        ("x", [COLLOCATION, 1]),
-        ("x_boundary", [2, 1]),
-        ("w1", [1, WIDTH]),
-        ("b1", [1, WIDTH]),
-        ("w2", [WIDTH, 1]),
-        ("b2", [1, 1]),
-    ]
-    traced = quabla.trace_tensor(
-        lambda x, x_boundary, w1, b1, w2, b2: mlp(x, w1, b1, w2, b2), specs
-    )
-    u_xx = traced.symbolic_jvp("x").symbolic_jvp("x")
-    graph = u_xx.graph
-    x = graph.input("x")
-    params = [graph.input(name) for name in PARAMETERS]
-    residual = u_xx.output + math.pi**2 * (math.pi * x).sin()
-    boundary = mlp(graph.input("x_boundary"), *params)
-    loss = residual.powi(2).mean() + boundary.powi(2).mean()
-    return loss.compile_cpu()
+u = qb.vmap(mlp, in_axes=(None, 0))
+u_xx = qb.vmap(qb.grad(qb.grad(mlp, argnums=1), argnums=1), in_axes=(None, 0))
 
 
-def build_predict_plan():
-    specs = [
-        ("x", [PLOT_POINTS, 1]),
-        ("w1", [1, WIDTH]),
-        ("b1", [1, WIDTH]),
-        ("w2", [WIDTH, 1]),
-        ("b2", [1, 1]),
-    ]
-    return quabla.trace_tensor(mlp, specs).output.compile_cpu()
+def loss(params, x, x_boundary):
+    residual = u_xx(params, x) + math.pi**2 * qb.sin(math.pi * x)
+    return qb.mean(residual**2) + qb.mean(u(params, x_boundary) ** 2)
 
 
 def train():
-    keys = quabla.Tensor.split_key(SEED, 2)
-    parameters = {
-        "w1": quabla.Tensor.glorot_normal([1, WIDTH], keys[0]),
-        "b1": quabla.Tensor([1, WIDTH], [0.0] * WIDTH),
-        "w2": quabla.Tensor.glorot_normal([WIDTH, 1], keys[1]),
-        "b2": quabla.Tensor([1, 1], [0.0]),
+    keys = qb.Tensor.split_key(SEED, 2)
+    params = {
+        "w1": qb.Tensor.glorot_normal([1, WIDTH], keys[0]).reshape([WIDTH]),
+        "b1": qb.zeros([WIDTH]),
+        "w2": qb.Tensor.glorot_normal([WIDTH, 1], keys[1]).reshape([WIDTH]),
+        "b2": qb.array(0.0),
     }
     # Interior collocation points: a uniform grid that excludes the boundary.
     step = 1.0 / (COLLOCATION + 1)
     collocation = [step * (i + 1) for i in range(COLLOCATION)]
-    data = {
-        "x": quabla.Tensor([COLLOCATION, 1], collocation),
-        "x_boundary": quabla.Tensor([2, 1], [0.0, 1.0]),
-    }
-    plan = build_loss_plan()
-    optimizer = quabla.Adam(learning_rate=LEARNING_RATE)
-    seed = quabla.Tensor([], [1.0])
+    x, x_boundary = qb.array(collocation), qb.array([0.0, 1.0])
+    value_and_grad = qb.jit(qb.value_and_grad(loss))
+    optimizer = qb.optim.Adam(learning_rate=LEARNING_RATE)
     losses = []
     for _ in range(STEPS):
-        value, gradients = plan.evaluate_value_and_vjp({**data, **parameters}, seed)
-        losses.append(value.to_flat_list()[0])
-        parameters = optimizer.step(
-            parameters, {name: gradients[name] for name in PARAMETERS}
-        )
-    return collocation, parameters, losses
+        value, gradients = value_and_grad(params, x, x_boundary)
+        losses.append(value.item())
+        params = optimizer.step(params, gradients)
+    return collocation, params, losses
 
 
 def main() -> None:
     collocation, parameters, losses = train()
     grid = [i / (PLOT_POINTS - 1) for i in range(PLOT_POINTS)]
-    predicted = (
-        build_predict_plan()
-        .evaluate({"x": quabla.Tensor([PLOT_POINTS, 1], grid), **parameters})
-        .to_flat_list()
-    )
+    predicted = u(parameters, qb.array(grid)).tolist()
     exact = [math.sin(math.pi * x) for x in grid]
     max_error = max(abs(p - e) for p, e in zip(predicted, exact))
     print(

@@ -7,62 +7,21 @@ The commands below assume the virtual environment from
 [Installation From Source](../README.md#installation-from-source) is active and the
 extension was built with the named feature.
 
-CPU build: a one-dimensional Poisson PINN and the frozen CPU plan benchmark.
+PINN examples: a one-parameter Poisson PINN, and a two-layer tanh-MLP
+Poisson PINN that trains on a device with `optim.Trainer` and checks the
+trained parameters against the same training on the CPU. Both take
+`--device cpu | mlx | cuda[:N]` (the default is `cpu`):
 
 ```sh
 python examples/pinn_poisson.py
-python examples/benchmark_tensor_cpu.py
+python examples/pinn_mlp.py --device mlx    # --features mlx
+python examples/pinn_mlp.py --device cuda   # --features cuda
 ```
 
 `examples/plot_readme_figure.py` trains a small tanh-MLP Poisson PINN on the
-CPU backend and regenerates the README figure `docs/assets/pinn_poisson.png`.
+CPU and regenerates the README figure `docs/assets/pinn_poisson.png`.
 It needs matplotlib (`python -m pip install matplotlib`), which is not a
 Quabla dependency.
-
-MLX build (`--features mlx`): one-graph Poisson PINNs keep parameters and Adam
-moments on the MLX GPU stream; the two-layer MLP example checks PDE and
-boundary residuals plus trained parameters against CPU:
-
-```sh
-python examples/pinn_poisson_mlx.py
-python examples/pinn_mlp_mlx.py
-python examples/benchmark_pinn_mlx.py
-python examples/benchmark_mlp_value_and_grad_mlx.py
-python examples/benchmark_forward_mlx.py
-python examples/benchmark_loop_value_and_grad_mlx.py
-```
-
-Use `examples/benchmark_forward_mlx.py --device-only` to exclude only output
-readback; dynamic host input upload remains part of that timing. Add
-`--retain-static-inputs` to upload model weights once and time only dynamic
-input upload on later calls. `examples/benchmark_pinn_mlx.py --hidden-layers N
---hidden-width W` replaces the one-parameter model with a tanh MLP.
-
-The MLX benchmarks report reproducibility metadata for both the one-parameter
-Poisson optimizer path and an end-to-end batched MLP value-and-gradient path.
-The former excludes diagnostic readbacks; the latter includes input uploads and
-loss/gradient readbacks, so neither is a CUDA/JAX comparison.
-
-CUDA build (`--features cuda`): a two-point batched Poisson PINN whose Adam
-optimizer state and collocation tensors stay on the GPU, and a two-layer,
-four-parameter Poisson PINN with combined residual and boundary losses:
-
-```sh
-python examples/pinn_poisson_cuda.py
-python examples/pinn_mlp_cuda.py
-```
-
-Measure end-to-end broadcast-batched matmul or fused elementwise-chain
-throughput (including the current host/device transfers), and device-resident
-two-layer Poisson PINN Adam steps with separate compile, warm-up, and
-synchronized training timings:
-
-```sh
-python examples/benchmark_tensor_cuda.py
-python examples/benchmark_tensor_cuda.py --elementwise --rows 1024 --inner 1024
-python examples/benchmark_tensor_cuda.py --rank-two --device-resident
-python examples/benchmark_pinn_cuda.py
-```
 
 Measure the per-iteration cost of host-driven CUDA loops (bodies that are not
 elementwise: `fori_loop`, `scan`, `while_loop`, their reverse passes, and a
@@ -74,21 +33,9 @@ python examples/benchmark_host_loop_cuda.py --dump results.json
 python examples/benchmark_host_loop_cuda.py --compare results.json
 ```
 
-The v0.2 retained-training benchmark compares `optim.Trainer` against the
-native Adam executor on the same analytic Poisson residual. It checks loss
-and parameter trajectories and separates construction, submission,
-synchronization, and readback timings. The optional ratio gate applies to
-this workload and run; it does not establish a general performance bound.
-Use an extension built for the selected device:
-
-```sh
-python examples/benchmark_v02_training.py --device cuda:0 --max-step-ratio 1.02
-python examples/benchmark_v02_training.py --device mlx --max-step-ratio 1.02
-```
-
 CUDA + NCCL build (`--features cuda-nccl`, two GPUs):
-`examples/validate_data_parallel_cuda.py` checks single-call two-GPU parity
-against the CPU reference, and
+`examples/validate_data_parallel_cuda.py` checks single-call
+`distributed.value_and_grad` parity against CPU replicas, and
 `examples/validate_data_parallel_training_cuda.py` checks 200-step training
 parity against one GPU and CPU. Both use CUDA ordinals 0 and 1 (select the
 devices with `CUDA_VISIBLE_DEVICES`) and need `libnccl.so` to be loadable.

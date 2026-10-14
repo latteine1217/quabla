@@ -9,7 +9,6 @@ is accurate to about 1e-8 relative.
 """
 
 import math
-import warnings
 
 try:
     import numpy as np
@@ -305,20 +304,6 @@ def test_unsupported_arguments_raise_clear_errors():
     raises(ValueError, qb.linalg.norm, qb.ones([2, 2, 2]), 1, match="dimensions")
     raises(TypeError, qb.linalg.matrix_power, qb.eye(2), 1.5, match="integer")
     raises(ValueError, qb.linalg.matrix_power, x, 2, match="square")
-
-
-def test_trace_keeps_the_v0_1_call_form():
-    from quabla import _compat
-
-    _compat._WARNED.discard("trace")
-    with warnings.catch_warnings(record=True) as seen:
-        warnings.simplefilter("always", DeprecationWarning)
-        legacy = qb.trace(lambda a: a, [("x", (2, 2))])
-        assert qb.trace(qb.eye(3)).item() == 3.0
-    assert isinstance(legacy, qb.legacy.TraceResult)
-    assert [w.category for w in seen] == [DeprecationWarning]
-    assert "quabla.legacy.trace" in str(seen[0].message)
-    assert "trace" in qb.__all__ and qb.trace is qb._ops.trace
 
 
 # Gradients against central differences of the eager float64 function.

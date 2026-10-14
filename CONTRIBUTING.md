@@ -5,24 +5,27 @@ before it can be reviewed.
 
 ## Scope and Status
 
-Quabla is a research-grade project at version 0.x. For anything beyond a
+Quabla is a research-grade project. For anything beyond a
 small fix, open an issue first to discuss the approach.
 
-Public Python names follow the compatibility policy accepted in the v0.2 API
-design ([docs/api_v0_2_design.md](docs/api_v0_2_design.md), decision D14 and
-section 5):
+From 1.0 the public Python API follows
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html):
 
-- Every Python name released in v0.1 keeps working, with unchanged
-  behaviour, through all 0.x releases.
-- From v0.2, names that have a replacement in the new API emit a
-  `DeprecationWarning` once per name on first access, and the legacy 2D
-  `Matrix` API moves to `quabla.legacy`, with a warning on top-level access.
-- Deprecated names and the top-level legacy names are removed at 1.0;
-  whether `quabla.legacy` stays is decided then. The new API and the
-  `Compiler` facade are kept.
+- A name exported by `quabla` (its `__all__` and public submodules) keeps
+  its behaviour through 1.x. Minor releases may add names and arguments.
+- A name to be removed first emits a `DeprecationWarning` for at least one
+  minor release and is removed only in the next major release.
+- Numerical results may change in the last bits between releases when an
+  operation's evaluation order changes; such changes are listed in the
+  CHANGELOG.
 
-Backends, the tensor IR, execution plans, and the Rust crate APIs are not
-covered by this policy and may change between releases.
+v1.0 removed the v0.1 names that the v0.2 API design
+([docs/api_v0_2_design.md](docs/api_v0_2_design.md), decision D14 and
+section 5) had deprecated, together with `quabla.legacy`.
+
+Backends, the tensor IR, execution plans, the private module
+`quabla._quabla`, and the Rust crate APIs are not covered by this policy
+and may change between releases.
 
 ## Building From Source
 
@@ -46,7 +49,7 @@ cargo clippy --workspace --all-targets --features quabla-core/cuda-nccl \
 cargo test --workspace
 
 maturin develop --release              # add --features mlx or --features cuda
-python tests/python/test_matrix.py
+python tests/python/test_tensor_api.py
 python tests/python/test_api.py
 python tests/python/test_devices_api.py
 python tests/python/test_lower_program.py
@@ -58,7 +61,6 @@ python tests/python/test_adam_fused.py
 python tests/python/test_jacobian_chunks.py
 python tests/python/test_cholesky_native.py
 python tests/python/test_buffer_narrow_import.py
-python tests/python/test_legacy_jacobian_direction.py
 python tests/python/test_ode_api.py
 python tests/python/test_linalg_api.py
 python tests/python/test_packaging_api.py
@@ -121,9 +123,9 @@ fails; a gated-off Rust test returns early and passes:
 
 ```sh
 # MLX build on Apple silicon:
-QUABLA_MLX_TEST=1 python tests/python/test_matrix.py
+QUABLA_MLX_TEST=1 python tests/python/test_api.py
 # CUDA build with an NVIDIA GPU:
-QUABLA_CUDA_TEST=1 python tests/python/test_matrix.py
+QUABLA_CUDA_TEST=1 python tests/python/test_api.py
 QUABLA_CUDA_TEST=1 cargo test -p quabla-core --features cuda
 # Two CUDA GPUs and a loadable libnccl.so:
 QUABLA_CUDA_NCCL_TEST=1 cargo test -p quabla-core --features cuda-nccl

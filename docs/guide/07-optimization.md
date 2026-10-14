@@ -233,6 +233,6 @@ Tensor(1.8750973e-13, dtype=float32) 3.0000007152557373
 - `step()` without arguments on a device reuses the retained data without
   flattening any Python pytree, which keeps per-step overhead minimal.
 
-`examples/benchmark_v02_training.py` compares `Trainer` with the native
-device Adam executor and reports compile, step, and readback timings
-separately.
+`examples/pinn_mlp.py --device cuda` (or `--device mlx`) trains a small
+PINN with a device `Trainer` and checks the parameters against the CPU
+trainer.

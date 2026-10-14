@@ -74,7 +74,7 @@ jobs:
           .venv-ci/bin/python -m pip install 'maturin>=1.14,<2' 'numpy>=2,<3'
           VIRTUAL_ENV="$PWD/.venv-ci" .venv-ci/bin/maturin develop
       # The script's __main__ runner executes every test_*; exit 0 == pass.
-      - run: .venv-ci/bin/python tests/python/test_matrix.py
+      - run: .venv-ci/bin/python tests/python/test_tensor_api.py
       - run: .venv-ci/bin/python tests/python/test_api.py
       - run: .venv-ci/bin/python tests/python/test_devices_api.py
       - run: .venv-ci/bin/python tests/python/test_lower_program.py
@@ -86,7 +86,6 @@ jobs:
       - run: .venv-ci/bin/python tests/python/test_jacobian_chunks.py
       - run: .venv-ci/bin/python tests/python/test_cholesky_native.py
       - run: .venv-ci/bin/python tests/python/test_buffer_narrow_import.py
-      - run: .venv-ci/bin/python tests/python/test_legacy_jacobian_direction.py
       - run: .venv-ci/bin/python tests/python/test_ode_api.py
       - run: .venv-ci/bin/python tests/python/test_linalg_api.py
       - run: .venv-ci/bin/python tests/python/test_packaging_api.py
