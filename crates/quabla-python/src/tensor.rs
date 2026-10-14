@@ -1641,7 +1641,7 @@ impl PyTensor {
                 ));
             }
         }
-        use quabla_core::tensor_ir::{AdamCoefficients, AdamOrder, F64Arith};
+        use quabla_core::tensor_ir::{AdamCoefficients, F64Arith};
 
         let (learning_rate, b1, b2, eps, correction1, correction2) = hyperparameters;
         if correction1 == 0.0 || correction2 == 0.0 {
@@ -1671,14 +1671,7 @@ impl PyTensor {
             .zip(first.data.iter())
             .zip(second.data.iter())
         {
-            let (parameter, m, v) = arith.adam(
-                AdamOrder::Canonical,
-                &coefficients,
-                parameter,
-                gradient,
-                m,
-                v,
-            );
+            let (parameter, m, v) = arith.adam(&coefficients, parameter, gradient, m, v);
             // The corrections are nonzero, so a zero divisor is a zero
             // denominator `sqrt(v / c2) + eps`.
             if arith.zero_divisor {

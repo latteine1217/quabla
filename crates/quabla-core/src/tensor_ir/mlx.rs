@@ -17,7 +17,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
-    adam_element, sgd_element, sqrt_derivative_coefficient, AdamArith, AdamCoefficients, AdamOrder,
+    adam_element, sgd_element, sqrt_derivative_coefficient, AdamArith, AdamCoefficients,
     BinaryMathKind, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, RegionKind, RegionNode,
     TensorBackend, TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend,
     TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
@@ -372,7 +372,6 @@ impl MlxAdamPlan {
             .map(|value| Array::from_f32(value as f32));
             let (updated_parameter, first_moment, second_moment) = adam_element(
                 &mut arith,
-                AdamOrder::Canonical,
                 &coefficients,
                 &parameter,
                 &gradient,
@@ -450,9 +449,6 @@ impl AdamArith for MlxArith<'_> {
     type Value = Array;
     type Error = mlx_rs::error::Exception;
 
-    fn constant(&mut self, value: f64) -> Result<Array, Self::Error> {
-        Ok(Array::from_f32(value as f32))
-    }
     fn add(&mut self, lhs: &Array, rhs: &Array) -> Result<Array, Self::Error> {
         lhs.add_device(rhs, self.stream)
     }

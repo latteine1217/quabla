@@ -6,7 +6,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyFloat, PyInt, PyString, PyTuple};
 use quabla_core::tensor_ir::{
-    AdamCoefficients, AdamOrder, BatchingError, CudaBackend, CudaDataParallelExecutionPlan,
+    AdamCoefficients, BatchingError, CudaBackend, CudaDataParallelExecutionPlan,
     CudaDataParallelTiming, CudaExecutionPlan, DeviceOptimizerConfig, DeviceUpdateRule,
     DynamicTensor, F64Arith, FusedKernel, MlxAdamPlan, SymbolicCotangent, TensorComparison,
     TensorCondExecutionPlan, TensorCustomRule, TensorCustomTangent, TensorDType,
@@ -4975,18 +4975,7 @@ impl TensorCudaAdamOptimizer {
             let decayed = value
                 .data()
                 .iter()
-                .map(|parameter| {
-                    arith
-                        .adam(
-                            AdamOrder::Canonical,
-                            &coefficients,
-                            *parameter,
-                            0.0,
-                            0.0,
-                            0.0,
-                        )
-                        .0
-                })
+                .map(|parameter| arith.adam(&coefficients, *parameter, 0.0, 0.0, 0.0).0)
                 .collect();
             *value = DynamicTensor::from_storage(
                 value.shape().to_vec(),

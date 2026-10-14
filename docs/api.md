@@ -701,14 +701,15 @@ its single-output Tensor contract.
 `qb.optim.Adam(learning_rate=1e-3, b1=0.9, b2=0.999, eps=1e-8)` and
 `qb.optim.SGD(learning_rate=1e-2)` provide `init(params)` and pure
 `update(params, grads, state) -> (params, state)` over floating Tensor pytrees.
-Adam also preserves the old dictionary `step` and the keyword aliases
-`beta1`, `beta2`, `epsilon`. Pure host moments use float64 as the old host
-Adam does, and parameters keep their dtype.
+Adam also has a stateful `step(params, grads)`, which keeps the `init`
+state on the optimizer and returns `update`'s parameters bit for bit, and
+accepts the keyword aliases `beta1`, `beta2`, `epsilon`. Host moments are
+float64, and parameters keep their dtype.
 `qb.optim.AdamW(learning_rate=1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=1e-4)`
 applies decoupled weight decay as optax's `adamw` does:
 `p - lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * p)` with the
 pre-update `p`; its state and precision rules are Adam's, and it has no
-legacy `step`.
+`step`.
 
 Every `learning_rate` also accepts a schedule, a callable `f(step) -> float`
 evaluated on the host at the number of completed updates (0 for the first

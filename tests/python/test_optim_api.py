@@ -36,17 +36,22 @@ def test_adam_pure_analytic_updates_and_state_independence():
     )
 
 
-def test_legacy_adam_step_matches_native_and_accepts_alias_keywords():
-    native = qb._quabla.Adam(0.05, beta1=0.8, beta2=0.95, epsilon=0.01)
-    new = Adam(0.05, beta1=0.8, beta2=0.95, epsilon=0.01)
-    a = b = {"w": qb.array([1.0, -2.0], dtype=qb.float32)}
-    for gradients in ([0.5, 2.0], [-1.0, 1.5], [3.0, -0.25]):
-        grads = {"w": qb.array(gradients)}
-        a = native.step(a, grads)
-        b = new.step(b, grads)
-        assert a["w"].to_flat_list() == b["w"].to_flat_list()
-    # Native compatibility permits extra gradient keys and keeps moment state.
-    assert new.step(b, {"w": qb.array([1.0, 1.0]), "extra": qb.array(0.0)})
+def test_adam_step_equals_update_bit_for_bit_and_accepts_alias_keywords():
+    for options in ({}, {"clip_norm": 1.5}, {"learning_rate": lambda n: 0.05 / (n + 1)}):
+        config = {"learning_rate": 0.05, **options}
+        stateful = Adam(beta1=0.8, beta2=0.95, epsilon=0.01, **config)
+        pure = Adam(b1=0.8, b2=0.95, eps=0.01, **config)
+        a = b = {"w": qb.array([1.0, -2.0], dtype=qb.float32)}
+        state = pure.init(b)
+        for gradients in ([0.5, 2.0], [-1.0, 1.5], [3.0, -0.25]):
+            grads = {"w": qb.array(gradients, dtype=qb.float32)}
+            a = stateful.step(a, grads)
+            b, state = pure.update(b, grads, state)
+            assert memoryview(a["w"]).tobytes() == memoryview(b["w"]).tobytes()
+    # Extra gradient keys are ignored, and the moments carry over.
+    stepped = stateful.step(a, {"w": qb.array([1.0, 1.0], dtype=qb.float32), "extra": qb.array(0.0)})
+    assert stepped["w"].dtype == qb.float32
+    raises(ValueError, stateful.step, a, {"extra": qb.array(0.0)}, match="missing gradient")
 
 
 def test_sgd_fused_update_matches_f64_intermediates_and_keeps_inputs():
@@ -82,20 +87,26 @@ def test_sgd_pytree_analytic_update():
     assert params[0].to_flat_list() == [2.0, -1.0]
 
 
-def test_pure_adam_matches_native_trajectory_with_varying_gradients():
+def test_pure_adam_matches_the_textbook_trajectory_with_varying_gradients():
+    lr, b1, b2, eps = 0.03, 0.7, 0.95, 0.001
     for dtype in (qb.float32, qb.float64):
-        optimizer = Adam(0.03, b1=0.7, b2=0.95, eps=0.001)
-        native = qb._quabla.Adam(0.03, 0.7, 0.95, 0.001)
-        functional = legacy = {"w": qb.array([1.0, -2.0], dtype=dtype)}
+        optimizer = Adam(lr, b1=b1, b2=b2, eps=eps)
+        functional = {"w": qb.array([1.0, -2.0], dtype=dtype)}
         state = optimizer.init(functional)
-        for values in ([2.0, -4.0], [-1.0, 0.0], [0.5, 1.0], [0.0, -3.0]):
+        # Kingma and Ba's update in float64, rounded to the parameter dtype.
+        reference, m, v = functional["w"].tolist(), [0.0, 0.0], [0.0, 0.0]
+        for step, values in enumerate(
+            ([2.0, -4.0], [-1.0, 0.0], [0.5, 1.0], [0.0, -3.0]), start=1
+        ):
             gradients = {"w": qb.array(values, dtype=dtype)}
             functional, state = optimizer.update(functional, gradients, state)
-            legacy = native.step(legacy, gradients)
+            for i, g in enumerate(values):
+                m[i] = b1 * m[i] + (1 - b1) * g
+                v[i] = b2 * v[i] + (1 - b2) * g * g
+                update = (m[i] / (1 - b1**step)) / (math.sqrt(v[i] / (1 - b2**step)) + eps)
+                reference[i] = qb.array(reference[i] - lr * update, dtype=dtype).item()
             assert functional["w"].dtype == dtype
-            for actual, expected in zip(
-                functional["w"].to_flat_list(), legacy["w"].to_flat_list()
-            ):
+            for actual, expected in zip(functional["w"].to_flat_list(), reference):
                 assert math.isclose(actual, expected, abs_tol=1e-14)
 
 
@@ -572,7 +583,6 @@ def test_schedules_drive_adam_and_sgd_at_the_completed_step():
         expected -= rate * 2 / (2 + 1e-8)
         assert math.isclose(scalar(params), expected, rel_tol=1e-15)
     assert calls == [0, 1, 2]
-    raises(TypeError, optimizer.step, {"w": params}, {"w": params})
 
     sgd = SGD(piecewise_constant([1], [0.5, 0.25]))
     params, state = qb.array([1.0]), sgd.init(qb.array([1.0]))
@@ -650,7 +660,6 @@ def test_clip_norm_option_clips_before_the_update():
     for value in (0.0, -1.0, math.nan):
         raises(ValueError, Adam, clip_norm=value)
         raises(ValueError, SGD, clip_norm=value)
-    raises(TypeError, Adam(clip_norm=1.0).step, {"w": qb.array([1.0])}, {})
 
 
 def test_cpu_trainer_adamw_and_schedules():

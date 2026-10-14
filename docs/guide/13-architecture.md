@@ -81,7 +81,6 @@ so the rest of the code compiles unchanged.
 | `compiler.rs` | The Python `Compiler`/`Program`/`Executable` facade |
 | `interop.rs` | Construction from sequences and the buffer protocol, `tolist`, read-only buffer export (never links NumPy) |
 | `repr.rs` | NumPy-style printing |
-| `optim.rs` | The native host `Adam` behind `optim.Adam.step` |
 | `dtype.rs`, `errors.rs` | dtype objects; raising the Python exception classes from Rust |
 
 ## 13.3 The Tensor IR

@@ -23,9 +23,7 @@ use std::sync::{Arc, LazyLock};
 use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 use super::super::device_optimizer::{cuda_adam_update, cuda_sgd_update};
-use super::super::{
-    AdamCoefficients, AdamOrder, DeviceOptimizerConfig, DeviceUpdateRule, TensorNodeId,
-};
+use super::super::{AdamCoefficients, DeviceOptimizerConfig, DeviceUpdateRule, TensorNodeId};
 use super::{
     cuda_elementwise_launch, cuda_fixed_block_launch, cuda_value_mut, input_node_id, CudaAdamState,
     CudaExecutionPlan, CudaReal,
@@ -107,60 +105,20 @@ extern "C" __global__ void quabla_global_norm_reduce(
 
 "#;
 
-/// The optimizer kernels of every CUDA module: the legacy v0.1 update
-/// kernels, the global-norm reduction, and the fused update kernels. The
-/// update statements come from the shared rules in `device_optimizer.rs`
-/// (`cuda_adam_update`, `cuda_sgd_update`); the templates below only load,
-/// clip, and store.
+/// The optimizer kernels of every CUDA module: the global-norm reduction and
+/// the fused update kernels. The update statements come from the shared
+/// rules in `device_optimizer.rs` (`cuda_adam_update`, `cuda_sgd_update`);
+/// the templates below only load, clip, and store.
 pub(super) fn cuda_optimizer_source() -> &'static str {
     static SOURCE: LazyLock<String> = LazyLock::new(|| {
-        let mut source = legacy_update_kernels();
-        source.push_str(GLOBAL_NORM_SOURCE);
+        let mut source = GLOBAL_NORM_SOURCE.to_string();
         source.push_str(&device_update_kernels());
         source
     });
     &SOURCE
 }
 
-/// The v0.1 kernels behind `adam_step`, `sgd_step`, `cuda_adam_step`, and
-/// `cuda_adam_optimizer`. They take `float` hyperparameters and keep
-/// [`AdamOrder::V01`] until v1.0.
-fn legacy_update_kernels() -> String {
-    let sgd = cuda_sgd_update("parameter[index]", "gradient[index]");
-    let (statements, [parameter, first, second]) = cuda_adam_update(
-        AdamOrder::V01,
-        "parameter[index]",
-        "gradient_value",
-        "first_moment[index]",
-        "second_moment[index]",
-    );
-    format!(
-        r#"
-extern "C" __global__ void quabla_sgd(
-    float* parameter, const float* gradient, float learning_rate, unsigned long long count
-) {{
-    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (index < count) parameter[index] = {sgd};
-}}
-
-extern "C" __global__ void quabla_adam(
-    float* parameter, const float* gradient, float* first_moment, float* second_moment,
-    float learning_rate, float beta1, float beta2, float epsilon,
-    float correction1, float correction2, unsigned long long count
-) {{
-    unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= count) return;
-    float gradient_value = gradient[index];
-{statements}    first_moment[index] = {first};
-    second_moment[index] = {second};
-    parameter[index] = {parameter};
-}}
-"#
-    )
-}
-
-/// The fused kernels of [`CudaExecutionPlan::optimizer_step`], in
-/// [`AdamOrder::Canonical`]. `1 - beta` and the bias corrections arrive
+/// The fused kernels of [`CudaExecutionPlan::optimizer_step`]. `1 - beta` and the bias corrections arrive
 /// formed in float64 from the float64 betas (see [`AdamCoefficients`]).
 fn device_update_kernels() -> String {
     // Clipping scales in double and rounds once, as clip_by_global_norm.
@@ -171,7 +129,6 @@ fn device_update_kernels() -> String {
     if (clipped) gradient_value = (float)((double)gradient_value * scalars[1]);";
     let sgd = cuda_sgd_update("parameter[index]", "gradient_value");
     let (statements, [parameter, first, second]) = cuda_adam_update(
-        AdamOrder::Canonical,
         "value",
         "gradient_value",
         "first_moment[index]",

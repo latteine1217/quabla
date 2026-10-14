@@ -12,8 +12,8 @@ mod custom;
 pub use custom::{TensorCustomRule, TensorCustomTangent};
 mod device_optimizer;
 pub use device_optimizer::{
-    adam_element, sgd_element, AdamArith, AdamCoefficients, AdamOrder, AdamUpdate,
-    DeviceOptimizerConfig, DeviceUpdateRule, F64Arith,
+    adam_element, sgd_element, AdamArith, AdamCoefficients, AdamUpdate, DeviceOptimizerConfig,
+    DeviceUpdateRule, F64Arith,
 };
 mod eager;
 pub use eager::{EagerKernel, EagerOperand};
@@ -367,50 +367,10 @@ impl<T> CudaExecutionPlan<T> {
         self.execute_retaining(inputs, retained_inputs)
     }
 
-    pub fn sgd_step_input_from_output(
-        &self,
-        _parameter_name: &str,
-        _learning_rate: f32,
-    ) -> Result<(), String> {
-        Err(format!(
-            "CUDA backend is unavailable for device {}: build Quabla on Linux with --features cuda",
-            self.device_ordinal
-        ))
-    }
-
     pub fn execute_retaining_without_output(
         &self,
         _inputs: &BTreeMap<String, DynamicTensor>,
         _retained_inputs: &BTreeSet<String>,
-    ) -> Result<(), String> {
-        Err(format!(
-            "CUDA backend is unavailable for device {}: build Quabla on Linux with --features cuda",
-            self.device_ordinal
-        ))
-    }
-
-    pub fn adam_step_input_from_output(
-        &self,
-        _parameter_name: &str,
-        _learning_rate: f32,
-        _beta1: f32,
-        _beta2: f32,
-        _epsilon: f32,
-    ) -> Result<(), String> {
-        Err(format!(
-            "CUDA backend is unavailable for device {}: build Quabla on Linux with --features cuda",
-            self.device_ordinal
-        ))
-    }
-
-    pub fn adam_step_input_from_node(
-        &self,
-        _parameter_name: &str,
-        _gradient_node_id: usize,
-        _learning_rate: f32,
-        _beta1: f32,
-        _beta2: f32,
-        _epsilon: f32,
     ) -> Result<(), String> {
         Err(format!(
             "CUDA backend is unavailable for device {}: build Quabla on Linux with --features cuda",
@@ -444,18 +404,6 @@ impl<T> CudaExecutionPlan<T> {
     }
 
     pub fn computed_node_to_host(&self, _node_id: usize) -> Result<DynamicTensor, String> {
-        Err(format!(
-            "CUDA backend is unavailable for device {}: build Quabla on Linux with --features cuda",
-            self.device_ordinal
-        ))
-    }
-
-    pub fn sync_retained_input_to(
-        &self,
-        _source_name: &str,
-        _target: &Self,
-        _target_name: &str,
-    ) -> Result<(), String> {
         Err(format!(
             "CUDA backend is unavailable for device {}: build Quabla on Linux with --features cuda",
             self.device_ordinal

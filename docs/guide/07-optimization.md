@@ -52,10 +52,10 @@ print(value.item(), params["w"].item(), params["b"].item())
 | `AdamW` | `AdamW(learning_rate=1e-3, b1=0.9, b2=0.999, eps=1e-8, weight_decay=1e-4, *, clip_norm=None)` | Decoupled weight decay as optax's `adamw`: `p - lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * p)` |
 | `SGD` | `SGD(learning_rate=1e-2, *, clip_norm=None)` | `p - lr * g`; its state is `None` (or `{"step": n}` with a schedule) |
 
-For compatibility with v0.1, `Adam` also accepts `beta1`, `beta2`, and
-`epsilon`, and keeps a stateful `step(params, grads)` method that returns
-new parameters while storing the moments inside the optimizer object. New
-code should use `init`/`update`.
+`Adam` also accepts `beta1`, `beta2`, and `epsilon`, and has a stateful
+`step(params, grads)` method: it keeps the `init` state inside the optimizer
+object and returns the parameters `update` would, bit for bit, so short
+scripts need not thread the state themselves.
 
 ## 7.2 Learning-Rate Schedules
 

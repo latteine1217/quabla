@@ -10,14 +10,12 @@ mod composite;
 mod dtype;
 mod errors;
 mod interop;
-mod optim;
 mod repr;
 mod tensor;
 mod tensor_trace;
 
 pub use compiler::{PyQuablaCompiler, PyQuablaExecutable, PyQuablaProgram};
 pub use dtype::PyDType;
-pub use optim::PyAdam;
 pub use tensor::{PyTensor, PyTensorView};
 pub use tensor_trace::{
     InlineBinding, StagedExecutable, TensorCudaAdamOptimizer, TensorMlxAdamOptimizer,
@@ -318,7 +316,6 @@ fn quabla(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyQuablaCompiler>()?;
     m.add_class::<PyQuablaProgram>()?;
     m.add_class::<PyQuablaExecutable>()?;
-    m.add_class::<PyAdam>()?;
     m.add_class::<PyDType>()?;
     m.add("float32", PyDType::from(TensorDType::F32))?;
     m.add("float64", PyDType::from(TensorDType::F64))?;

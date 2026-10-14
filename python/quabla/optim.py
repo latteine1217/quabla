@@ -199,7 +199,7 @@ class _AdamBase:
 
 
 class Adam(_AdamBase):
-    """Adam configuration with pure updates and the v0.1 stateful ``step``.
+    """Adam configuration with pure updates and a stateful ``step``.
 
     ``learning_rate`` is a positive float or a schedule ``f(step) -> float``
     called with the completed-update count. ``clip_norm`` clips each update's
@@ -227,19 +227,22 @@ class Adam(_AdamBase):
             eps if epsilon is None else epsilon,
             clip_norm,
         )
-        # The native v0.1 optimizer has a fixed rate and no clipping.
-        self._legacy = None
-        if not callable(self.learning_rate) and self.clip_norm is None:
-            self._legacy = _quabla.Adam(self.learning_rate, self.b1, self.b2, self.eps)
+        self._state = None
 
     def step(self, parameters, gradients):
-        """Apply a stateful v0.1 dictionary update with native compatibility."""
-        if self._legacy is None:
-            raise TypeError(
-                "legacy Adam.step needs a constant learning_rate and no "
-                "clip_norm; use init/update"
-            )
-        return self._legacy.step(parameters, gradients)
+        """``update`` with the state kept on the optimizer: returns the new
+        parameters, bit for bit those of ``update``. The parameter pytree
+        must keep its structure between calls. For a dict of parameters,
+        ``gradients`` may hold extra keys, which are ignored."""
+        if isinstance(parameters, dict) and isinstance(gradients, dict):
+            missing = [name for name in parameters if name not in gradients]
+            if missing:
+                raise ValueError(f"missing gradient for {missing[0]!r}")
+            gradients = {name: gradients[name] for name in parameters}
+        if self._state is None:
+            self._state = self.init(parameters)
+        parameters, self._state = self.update(parameters, gradients, self._state)
+        return parameters
 
 
 class AdamW(_AdamBase):

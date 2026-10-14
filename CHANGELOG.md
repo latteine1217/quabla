@@ -16,6 +16,16 @@ deprecated names keep working until 1.0 (see
   `trace_tensor(...).graph.stablehlo_text(node_id)`, which went with the
   v0.1 helpers.
 
+### Changed
+
+- `optim.Adam.step` applies the same update as `optim.Adam.update`, bit
+  for bit: it keeps the `init` state on the optimizer and calls `update`.
+  It used to run the v0.1 native Adam, whose operation order and `powi`
+  bias corrections differ in the last bits, and it now also accepts a
+  learning-rate schedule and `clip_norm`. Parameters trained with `step`
+  change at the ulp level; the README example still prints
+  `w = 3.141593, loss = 1.5e-13`.
+
 ### Removed
 
 - The v0.1 names that v0.2 deprecated, as the 0.x compatibility policy
@@ -55,6 +65,14 @@ deprecated names keep working until 1.0 (see
   domain-edge input follow the IEEE arithmetic of the symbolic derivative
   instead of the dual evaluator's. The Python API never reached these
   engines, so its results are unchanged.
+- The native `quabla._quabla.Adam`, the v0.1 Adam operation order
+  (`AdamOrder` is gone, as only one order remains), and the v0.1 CUDA
+  `quabla_sgd`/`quabla_adam` kernels with the per-plan device steps
+  (`sgd_step_input_from_output`, `adam_step_input_from_output`,
+  `adam_step_input_from_node`, `sync_retained_input_to` on
+  `CudaExecutionPlan`), which only the removed `cuda_adam_*` helpers and
+  plan methods used. Device training runs through `optimizer_step`, as
+  `optim.Trainer` always has.
 - The examples and benchmarks that exercised only the removed helpers. The
   PINN examples are now `examples/pinn_poisson.py` and
   `examples/pinn_mlp.py`, which take `--device`; the two NCCL validation

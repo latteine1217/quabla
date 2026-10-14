@@ -34,7 +34,7 @@ fn primary_loss_compilation_excludes_backward_nodes() -> Result<(), String> {
 #[test]
 fn retained_loss_uses_updated_parameters_and_latest_batch_without_adam_mutation(
 ) -> Result<(), String> {
-    use quabla_core::tensor_ir::CudaBackend;
+    use quabla_core::tensor_ir::{CudaBackend, DeviceOptimizerConfig, DeviceUpdateRule};
     use std::collections::BTreeSet;
     if !crate::support::Gate::Cuda.enabled() {
         return Ok(());
@@ -60,6 +60,17 @@ fn retained_loss_uses_updated_parameters_and_latest_batch_without_adam_mutation(
         ("batch".into(), DynamicTensor::new(vec![4], vec![0.0; 4])?),
     ]);
     let retained = BTreeSet::from(["parameter".into(), "batch".into()]);
+    let adam = DeviceOptimizerConfig {
+        rule: DeviceUpdateRule::Adam {
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+            weight_decay: 0.0,
+        },
+        learning_rate: 0.01,
+        clip_norm: None,
+    };
+    let gradients = BTreeMap::from([("parameter".to_string(), outputs[1])]);
     let parameter_only = BTreeSet::from(["parameter".into()]);
     assert_eq!(
         candidate
@@ -89,7 +100,7 @@ fn retained_loss_uses_updated_parameters_and_latest_batch_without_adam_mutation(
         // to the forward query. Repeated loss queries must not advance Adam.
         candidate.execute_retaining_without_output(&inputs, &retained)?;
         for plan in [&candidate, &reference] {
-            plan.adam_step_input_from_node("parameter", outputs[1], 0.01, 0.9, 0.999, 1e-8)?;
+            plan.optimizer_step(&gradients, &adam)?;
         }
         assert_eq!(
             candidate.retained_input_to_host("parameter")?.data(),
