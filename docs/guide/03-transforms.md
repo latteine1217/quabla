@@ -280,7 +280,7 @@ step = qb.jit(qb.value_and_grad(loss), device="cuda:0") # CUDA device 0
 step = qb.jit(qb.value_and_grad(loss), device="mlx")    # Apple GPU
 ```
 
-Device execution, `precision="float64"`, and ahead-of-time lowering are
+Device execution, device precision, and ahead-of-time lowering are
 covered in [Chapter 10](10-devices.md).
 
 ### Static arguments

@@ -87,7 +87,7 @@ learning-rate schedules; `quabla.linalg` (batched `solve`, `slogdet`, `eigh`,
 Dormand-Prince integration; `while_loop`; `custom_vjp`, `custom_jvp`, and
 `checkpoint`; registered pytree nodes; keyed `quabla.random`; stable
 `softmax`/`logsumexp`/`var`; NumPy-style shape helpers; `save`/`load`; and
-opt-in native `float64` on CUDA. v0.4
+native `float64` on CUDA. v0.4
 ([CHANGELOG](CHANGELOG.md#040---2026-10-06)) adds native trigonometric,
 hyperbolic, logarithmic, and rounding functions and `fmod`/`mod`; the
 jax.numpy shape, product, and calculus functions (`pad`, `roll`,
@@ -130,17 +130,20 @@ v0.1.
 
 ## Backend Support
 
-`float64` programs execute as `f32` on MLX, and on CUDA unless
-`jit(..., device="cuda", precision="float64")` selects native double
-precision; `bool` values are held as `f32` `0`/`1` on both devices. Device
-`jit` warns once for logical `float64` programs that run as `f32`. The v0.2 API inherits the backend limits below; it does not widen
+CUDA runs every value in its own dtype: a `float64` program in double
+precision, a `float32` one in single precision, and a program that mixes the
+two raises `UnsupportedOperationError` instead of converting. MLX runs
+`float32` only: Apple GPUs have no double-precision arithmetic, so a
+`float64` program raises `UnsupportedOperationError` there (create MLX
+arrays with `dtype=qb.float32`). `bool`
+values are held as `f32` `0`/`1` on both devices. The v0.2 API inherits the backend limits below; it does not widen
 the supported loop bodies or derivatives. The per-feature status and validation
 records are in [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md).
 
 | Backend | Platform | Build feature | Execution dtype | Autodiff | Control flow | Notable limitations |
 | --- | --- | --- | --- | --- | --- | --- |
 | CPU | macOS, Linux | default | `f64` reference; each `float32` op is the `f64` result rounded to `f32` | Runtime and symbolic JVP/VJP, dense Jacobian and Hessian, HVP, `vmap` JVP/VJP/HVP | `cond`, `fori`, `scan` regions with JVP, VJP, and forward-over-reverse HVP | Interprets frozen plans (no machine-code JIT) |
-| CUDA | Linux, NVIDIA driver | `cuda` | `f32`; `f64` with `precision="float64"` | Symbolic JVP/VJP plans, multi-output value-and-gradient, `vmap` JVP/VJP/HVP, device `Trainer` with SGD/Adam/AdamW and global-norm clipping | `cond` via one host predicate readback; `fori`/`scan` as fused kernels for pure-elementwise bodies and as host-driven region loops otherwise; `while_loop` with one predicate readback per iteration | Host-driven loops cost one CUDA graph launch per iteration (eager launches for bodies with `cond`, nested loops, or cuSOLVER); requires `libnvrtc` at runtime (cuBLAS optional, cuSOLVER for `solve` and the decompositions) |
+| CUDA | Linux, NVIDIA driver | `cuda` | `f32` and `f64`, each in its own dtype | Symbolic JVP/VJP plans, multi-output value-and-gradient, `vmap` JVP/VJP/HVP, device `Trainer` with SGD/Adam/AdamW and global-norm clipping | `cond` via one host predicate readback; `fori`/`scan` as fused kernels for pure-elementwise bodies and as host-driven region loops otherwise; `while_loop` with one predicate readback per iteration | Host-driven loops cost one CUDA graph launch per iteration (eager launches for bodies with `cond`, nested loops, or cuSOLVER); requires `libnvrtc` at runtime (cuBLAS optional, cuSOLVER for `solve` and the decompositions) |
 | CUDA + NCCL | Linux, two or more GPUs on one node | `cuda-nccl` | `f32` | Scalar value-and-gradient with all-reduced replicated parameter gradients | As CUDA | Single node; equal axis-zero batch shards; mapped-input gradients rejected; optimizer update on the host; requires a loadable `libnccl.so` |
 | MLX | macOS, Apple silicon | `mlx` | `f32` | Symbolic JVP/VJP, multi-output value-and-gradient, `vmap` JVP/VJP, device `Trainer` with SGD/Adam/AdamW and global-norm clipping | `cond` via one host predicate readback; `fori`/`scan` dispatched from the host on device-resident arrays, with first-order VJP and forward-over-reverse HVP | LU, `eigh`, QR, and SVD factorizations run with LAPACK on MLX's CPU stream (MLX 0.32.2 has no GPU kernels for them), and `solve` reads one pivot flag back; `vmap` HVP not lowered; no fused Metal loop kernels |
 

@@ -220,8 +220,8 @@ impl UnaryMathKind {
     }
 
     /// The single-precision CUDA math function; `double_precision_source`
-    /// rewrites each to its double overload (`tanf` -> `tan`) for
-    /// `precision="float64"`. `rintf` rounds halfway cases to even in the
+    /// rewrites each to its double overload (`tanf` -> `tan`) for `float64`
+    /// programs. `rintf` rounds halfway cases to even in the
     /// default rounding mode, whereas `roundf` rounds them away from zero.
     pub(super) fn cuda_function(self) -> &'static str {
         match self {
@@ -347,7 +347,7 @@ impl BinaryMathKind {
     }
 
     /// The single-precision CUDA math function; `double_precision_source`
-    /// rewrites each to its double overload for `precision="float64"`.
+    /// rewrites each to its double overload for `float64` programs.
     pub(super) fn cuda_function(self) -> &'static str {
         match self {
             Self::Pow => "powf",

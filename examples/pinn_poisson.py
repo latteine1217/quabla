@@ -34,12 +34,14 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=2000)
     args = parser.parse_args()
 
-    x = qb.array([0.15, 0.35, 0.55, 0.75, 0.9])
+    # MLX has no float64 arithmetic, so it trains in float32.
+    dtype = qb.float32 if args.device == "mlx" else qb.float64
+    x = qb.array([0.15, 0.35, 0.55, 0.75, 0.9], dtype=dtype)
     forcing = math.pi**2 * qb.sin(math.pi * x)
-    x_boundary = qb.array([0.0, 1.0])
+    x_boundary = qb.array([0.0, 1.0], dtype=dtype)
     trainer = qb.optim.Trainer(
         loss,
-        qb.array(2.5),
+        qb.array(2.5, dtype=dtype),
         qb.optim.Adam(learning_rate=0.01),
         x,
         forcing,

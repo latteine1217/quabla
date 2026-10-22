@@ -73,6 +73,9 @@ def main() -> None:
 
     params, data = problem(width=2)
     _, cpu_final, cpu_params = train(params, data, "cpu", args.steps)
+    if args.device == "mlx":
+        # MLX has no float64 arithmetic, so it trains a float32 copy.
+        params, data = qb.tree.map(lambda a: a.astype(qb.float32), (params, data))
     initial, final, trained = train(params, data, args.device, args.steps)
     residual, boundary = (value.item() for value in losses(trained, *data))
     difference = max(
@@ -87,7 +90,8 @@ def main() -> None:
         f"residual={residual:.3e}, boundary={boundary:.3e}, "
         f"max_parameter_difference={difference:.3e}"
     )
-    # The device trains in float32, the CPU in float64.
+    # CUDA trains the float64 arrays in float64 and MLX a float32 copy,
+    # hence the tolerance.
     if not (math.isfinite(final) and final < initial * 1e-4 and difference < 2e-3):
         raise SystemExit(f"{args.device} training does not match the CPU reference")
 

@@ -144,9 +144,9 @@ struct SharedCudaAdamPlan {
     gradient_node_ids: BTreeMap<String, TensorNodeId>,
 }
 
-/// The value-and-gradient plan of a device trainer in its element type: the
-/// default float32 lowering, or the opt-in float64 one that keeps parameters
-/// and optimizer moments in double on the device.
+/// The value-and-gradient plan of a device trainer in its element type:
+/// float32 for a float32 loss, float64 (parameters and optimizer moments in
+/// double on the device) for a float64 one.
 #[derive(Clone, Debug)]
 enum CudaTrainingPlan {
     Float32(CudaExecutionPlan),
@@ -302,29 +302,12 @@ impl TensorTraceGraph {
             .compile_region(output_node_id)
     }
 
-    /// Compiles several traced outputs as one ordered facade program.
-    ///
-    /// Value-and-gradient and primal/tangent helpers funnel through here, so
-    /// `QuablaCompiler` owns freezing, frozen output ids, and target selection
-    /// for them as well. The handle is consumed: a graph built only for this
-    /// compilation, such as a symbolic transform result, moves into the
-    /// program, while a graph still shared with Python traces is snapshotted
-    /// like single-output compilation. It skips the build-availability check
-    /// for the same compatibility reason as [`Self::compile_executable`].
-    fn compile_multi_output_executable(
-        self,
-        output_node_ids: Vec<TensorNodeId>,
-        target: QuablaTarget,
-    ) -> Result<QuablaMultiOutputExecutable, String> {
-        QuablaCompiler.compile_many_without_build_check(
-            &self.into_multi_output_program(output_node_ids)?,
-            target,
-        )
-    }
-
-    /// Builds the ordered facade program behind
-    /// [`Self::compile_multi_output_executable`]; the CUDA data-parallel
-    /// helper freezes it directly because it targets a replica set.
+    /// Builds an ordered facade program of several traced outputs. The handle
+    /// is consumed: a graph built only for this compilation, such as a
+    /// symbolic transform result, moves into the program, while a graph still
+    /// shared with Python traces is snapshotted. The MLX trainer compiles it
+    /// through the checked facade; the CUDA data-parallel helper freezes it
+    /// directly because it targets a replica set.
     pub(crate) fn into_multi_output_program(
         self,
         output_node_ids: Vec<TensorNodeId>,
@@ -2397,8 +2380,8 @@ impl TensorTraceGraph {
     }
 
     /// Compiles the ordered v0.2 output program for an explicitly selected backend.
-    /// `precision="float64"` runs `float64` nodes natively on CUDA (see
-    /// `QuablaPrecision`); `None` keeps the backend default.
+    /// Every node runs in its own dtype; `precision="float64"` only states
+    /// that request (see `QuablaPrecision`) and is rejected on MLX.
     #[pyo3(
         name = "_compile",
         signature = (outputs, input_names, target = "cpu", device_ordinal = 0, precision = None)
@@ -4398,39 +4381,9 @@ pub fn tensor_scan(
 const CUDA_LOSS_COTANGENT_NAME: &str = "__quabla_loss_cotangent";
 const MLX_LOSS_COTANGENT_NAME: &str = "__quabla_mlx_loss_cotangent";
 
-fn compile_cuda_scalar_value_and_grad(
-    loss: &TensorTraceResult,
-    parameter_names: Vec<String>,
-    device_ordinal: usize,
-) -> PyResult<(
-    CudaExecutionPlan,
-    TensorNodeId,
-    BTreeMap<String, TensorNodeId>,
-)> {
-    let (program, parameter_names) =
-        build_cuda_scalar_value_and_grad_program(loss, parameter_names)?;
-    let target = QuablaTarget::Cuda { device_ordinal };
-    let executable = QuablaCompiler
-        .compile_many_without_build_check(&program, target)
-        .map_err(PyValueError::new_err)?;
-    let (loss_node_id, gradient_node_ids) =
-        value_and_named_outputs(executable.output_node_ids(), parameter_names);
-    let plan = match executable.into_executable() {
-        QuablaExecutable::Cuda(plan) => plan,
-        executable => {
-            return Err(PyValueError::new_err(unexpected_executable(
-                target,
-                &executable,
-            )))
-        }
-    };
-    Ok((plan, loss_node_id, gradient_node_ids))
-}
-
-/// [`compile_cuda_scalar_value_and_grad`] through the checked facade with an
-/// explicit `precision`, as `jit(..., precision=...)` compiles: `float64`
-/// lowers a program with float64 nodes to `f64` device buffers, and a program
-/// without them compiles as the default.
+/// Compiles the scalar loss and its parameter gradients into one CUDA plan
+/// through the checked facade, as `jit` compiles: a float64 loss gets `f64`
+/// device buffers and a float32 one `f32`.
 fn compile_cuda_scalar_value_and_grad_with_precision(
     py: Python<'_>,
     loss: &TensorTraceResult,
@@ -4623,6 +4576,22 @@ pub fn tensor_value_and_grad_data_parallel_cuda_fn(
     let (program, parameter_names) =
         build_cuda_scalar_value_and_grad_program(&traced, parameter_names)?;
     let plan = program.freeze().map_err(PyValueError::new_err)?;
+    // The NCCL replicas run `f32` plans; a float64 loss is rejected rather
+    // than converted. A build without data parallelism reports that first.
+    if cfg!(all(feature = "cuda-nccl", target_os = "linux"))
+        && plan
+            .has_float64_values()
+            .map_err(|(_, message)| PyValueError::new_err(message))?
+    {
+        return Err(crate::errors::device_operation_error(
+            py,
+            "CUDA data-parallel execution supports float32 programs only; cast the \
+             parameters and data to float32 with astype"
+                .to_string(),
+            "float64",
+            "cuda",
+        ));
+    }
     let (loss_node_id, gradient_node_ids) =
         value_and_named_outputs(plan.output_node_ids(), parameter_names);
     let plan = CudaBackend::new(device_ordinals[0])
@@ -4781,6 +4750,7 @@ impl TensorCudaDataParallelValueAndGradFunction {
 }
 
 fn compile_mlx_scalar_value_and_grad(
+    py: Python<'_>,
     loss: &TensorTraceResult,
     parameter_names: Vec<String>,
 ) -> PyResult<(
@@ -4820,9 +4790,25 @@ fn compile_mlx_scalar_value_and_grad(
         requested_names.push(parameter_name);
         output_node_ids.push(gradient_node_id);
     }
-    let executable = graph
-        .compile_multi_output_executable(output_node_ids, QuablaTarget::Mlx)
+    // The checked facade, as `jit` compiles: it validates the MLX lowering
+    // and rejects a float64 loss, which MLX cannot run.
+    use quabla_core::compiler::QuablaCompileError;
+    let program = graph
+        .into_multi_output_program(output_node_ids)
         .map_err(PyValueError::new_err)?;
+    let executable = QuablaCompiler
+        .compile_many_checked(&program, QuablaTarget::Mlx)
+        .map_err(|error| match error {
+            QuablaCompileError::Unavailable(message) => {
+                crate::errors::device_operation_error(py, message, "Trainer", "mlx")
+            }
+            QuablaCompileError::Unsupported { op, message } => {
+                crate::errors::device_operation_error(py, message, &op, "mlx")
+            }
+            QuablaCompileError::InvalidProgram(message) | QuablaCompileError::Backend(message) => {
+                PyValueError::new_err(message)
+            }
+        })?;
     let (loss_node_id, gradient_node_ids) =
         value_and_named_outputs(executable.output_node_ids(), requested_names);
     let plan = match executable.into_executable() {
@@ -4905,9 +4891,10 @@ fn build_mlx_loss_optimizer(
     let loss = loss
         .extract::<PyRef<'_, TraceTensor>>()
         .map_err(|_| PyTypeError::new_err(format!("{function} loss must be a TraceTensor")))?;
+    let function_py = inputs.py();
     let loss = TensorTraceResult::new(loss.graph.clone(), loss.clone());
     let (plan, loss_node_id, gradient_node_ids) =
-        compile_mlx_scalar_value_and_grad(&loss, parameter_names)?;
+        compile_mlx_scalar_value_and_grad(function_py, &loss, parameter_names)?;
     let parameter_names = gradient_node_ids.keys().cloned().collect::<BTreeSet<_>>();
     let mut values = extract_tensor_map(inputs)?;
     if values.contains_key(MLX_LOSS_COTANGENT_NAME) {
@@ -5221,19 +5208,13 @@ fn build_cuda_loss_optimizer(
         .extract::<PyRef<'_, TraceTensor>>()
         .map_err(|_| PyTypeError::new_err(format!("{function} loss must be a TraceTensor")))?;
     let loss = TensorTraceResult::new(loss.graph.clone(), loss.clone());
-    let (plan, mut gradient_node_ids) = if precision == QuablaPrecision::Default {
-        let (plan, _, gradient_node_ids) =
-            compile_cuda_scalar_value_and_grad(&loss, parameter_names, device_ordinal)?;
-        (CudaTrainingPlan::Float32(plan), gradient_node_ids)
-    } else {
-        compile_cuda_scalar_value_and_grad_with_precision(
-            py,
-            &loss,
-            parameter_names,
-            device_ordinal,
-            precision,
-        )?
-    };
+    let (plan, mut gradient_node_ids) = compile_cuda_scalar_value_and_grad_with_precision(
+        py,
+        &loss,
+        parameter_names,
+        device_ordinal,
+        precision,
+    )?;
     let mut values = extract_tensor_map(inputs)?;
     let frozen_names = gradient_node_ids
         .keys()

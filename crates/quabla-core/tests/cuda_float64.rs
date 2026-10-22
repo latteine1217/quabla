@@ -111,10 +111,11 @@ fn float64_precision_only_changes_programs_with_float64_nodes() -> Result<(), St
     )]);
     let native = run(graph, vec![product], CUDA, QuablaPrecision::Float64, &third)?;
     assert_eq!(native, vec![vec![2f64.powi(-12) / 3.0]]);
-    // The default lowering keeps executing float64 nodes as float32.
+    // The default precision runs float64 nodes in double as well: no
+    // program is converted to float32.
     let (graph, outputs) = tenth(TensorDType::F64)?;
     let default = run(graph, outputs, CUDA, QuablaPrecision::Default, &inputs)?;
-    assert_eq!(default, vec![vec![f64::from(0.1_f32)]]);
+    assert_eq!(default, vec![vec![0.1]]);
     // A float32 program has no float64 node and compiles as by default.
     let (graph, outputs) = tenth(TensorDType::F32)?;
     let single = run(graph, outputs, CUDA, QuablaPrecision::Float64, &inputs)?;
@@ -133,16 +134,19 @@ fn float64_precision_rejects_float32_nodes() -> Result<(), String> {
     let widened = graph.cast(y, TensorDType::F64)?;
     let sum = graph.add(x, widened)?;
     let program = QuablaMultiOutputProgram::new(graph, vec![sum])?;
-    let error = QuablaCompiler
-        .compile_many_checked_with_precision(&program, CUDA, QuablaPrecision::Float64)
-        .expect_err("a float32 node must not run inside a double plan");
-    let QuablaCompileError::Unsupported { op, message } = error else {
-        return Err(format!(
-            "expected an unsupported-operation error, got {error:?}"
-        ));
-    };
-    assert_eq!(op, "float32");
-    assert!(message.contains("float32 node"), "{message}");
+    // Either precision: a mixed program is rejected rather than converted.
+    for precision in [QuablaPrecision::Default, QuablaPrecision::Float64] {
+        let error = QuablaCompiler
+            .compile_many_checked_with_precision(&program, CUDA, precision)
+            .expect_err("a float32 node must not run inside a double plan");
+        let QuablaCompileError::Unsupported { op, message } = error else {
+            return Err(format!(
+                "expected an unsupported-operation error, got {error:?}"
+            ));
+        };
+        assert_eq!(op, "float32");
+        assert!(message.contains("float32 node"), "{message}");
+    }
     Ok(())
 }
 

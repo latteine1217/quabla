@@ -10,7 +10,6 @@ import argparse
 import hashlib
 import json
 import math
-import warnings
 from pathlib import Path
 
 import quabla
@@ -77,10 +76,7 @@ def validate_case(shape, parameter_shape, dtype, reduction):
     results = []
     for step in range(STEPS):
         cpu_value, cpu_gradients = cpu_replicas(params, x, target, reduction)
-        with warnings.catch_warnings():
-            # CUDA evaluates float64 data in float32 by default.
-            warnings.simplefilter("ignore", UserWarning)
-            cuda_value, cuda_gradients = cuda_fn(params, x, target)
+        cuda_value, cuda_gradients = cuda_fn(params, x, target)
         assert set(cuda_gradients) == {"weight", "bias"}
         loss_error = maximum_error(cuda_value, cpu_value)
         gradient_errors = {
@@ -126,7 +122,8 @@ def main():
             ([8, 2, 3], [1, 2, 3]),
             ([1024, 2], [1, 2]),
         )
-        for dtype in (quabla.float64, quabla.float32)
+        # Data parallelism runs float32 programs only (float64 raises).
+        for dtype in (quabla.float32,)
         for reduction in ("sum", "mean")
     ]
     extension = Path(quabla._quabla.__file__)

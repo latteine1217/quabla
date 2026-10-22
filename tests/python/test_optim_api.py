@@ -144,13 +144,19 @@ def loss(params, x, target):
 
 
 def train(device, optimizer):
-    params = {"layers": [qb.array([0.0])], "bias": qb.array([0.0])}
-    x, target = qb.array([-1.0, 1.0]), qb.array([-1.0, 3.0])
+    # MLX has no float64 arithmetic, so it trains in float32.
+    dtype = qb.float32 if device == "mlx" else qb.float64
+
+    def array(values):
+        return qb.array(values, dtype=dtype)
+
+    params = {"layers": [array([0.0])], "bias": array([0.0])}
+    x, target = array([-1.0, 1.0]), array([-1.0, 3.0])
     trainer = Trainer(
         loss, params, optimizer, x, target, device=device, batch_argnums=(0, 1)
     )
     initial = scalar(trainer.loss())
-    trainer.step(qb.array([-2.0, 2.0]), qb.array([-3.0, 5.0]))
+    trainer.step(array([-2.0, 2.0]), array([-3.0, 5.0]))
     for _ in range(299):
         trainer.step()
     assert scalar(trainer.loss()) < initial * 1e-5
@@ -204,7 +210,11 @@ def test_optimizers_and_trainer_keep_custom_node_parameters():
     for device in ("mlx", "cuda:0"):
         if not enabled(device):
             continue
-        on_device = Trainer(affine_loss, params, Adam(0.05), x, target, device=device)
+        # float32, which every device runs (MLX has no float64).
+        single = lambda tree: qb.tree.map(lambda a: a.astype(qb.float32), tree)  # noqa: E731
+        on_device = Trainer(
+            affine_loss, single(params), Adam(0.05), single(x), single(target), device=device
+        )
         for _ in range(300):
             on_device.step()
         assert type(on_device.params.first) is Affine, device
@@ -403,6 +413,14 @@ def test_mlx_trainer_convergence():
 
     require("mlx")
     train("mlx", Adam(0.05))
+    # A float64 loss is rejected: MLX has no float64 arithmetic, and quabla
+    # does not convert it to float32.
+    params = {"layers": [qb.array([0.0])], "bias": qb.array([0.0])}
+    x, target = qb.array([-1.0, 1.0]), qb.array([-1.0, 3.0])
+    error = raises(
+        qb.UnsupportedOperationError, Trainer, loss, params, Adam(0.05), x, target, device="mlx"
+    )
+    assert (error.op, error.device) == ("float64", "mlx")
     train("mlx", AdamW(0.05, weight_decay=1e-5, clip_norm=1.0))
     train("mlx", SGD(0.05, clip_norm=5.0))
 
@@ -727,8 +745,10 @@ def test_mlx_trainer_schedule_matches_cpu():
     from quabla.optim import warmup_cosine_decay
 
     schedule = warmup_cosine_decay(0.0, 0.05, 3, 12, end_value=0.005)
-    params = {"layers": [qb.array([0.0])], "bias": qb.array([0.0])}
-    x, target = qb.array([-1.0, 1.0]), qb.array([-1.0, 3.0])
+    # float32 on both, since MLX has no float64 arithmetic.
+    f32 = qb.float32
+    params = {"layers": [qb.array([0.0], dtype=f32)], "bias": qb.array([0.0], dtype=f32)}
+    x, target = qb.array([-1.0, 1.0], dtype=f32), qb.array([-1.0, 3.0], dtype=f32)
     cpu = Trainer(loss, params, Adam(schedule), x, target)
     mlx = Trainer(loss, params, Adam(schedule), x, target, device="mlx")
     assert mlx._executor.learning_rate == 0.0

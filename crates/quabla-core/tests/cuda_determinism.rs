@@ -5,9 +5,10 @@
 //! that broadcasts into the carry add many partial results. They are added in
 //! a fixed order, with no floating-point atomics, so the result depends only
 //! on the inputs, the device and the program, never on the order in which the
-//! hardware schedules blocks. Each case runs `RUNS` times and must return one
-//! bit pattern, and it must match the CPU float64 reference within the device
-//! tolerance.
+//! hardware schedules blocks. Each case runs in a `float32` and a `float64`
+//! program (`f32` and `f64` kernels) `RUNS` times each, must return one bit
+//! pattern, and must match the CPU float64 reference within the tolerance of
+//! its dtype.
 
 mod support;
 
@@ -17,40 +18,41 @@ use quabla_core::tensor_ir::{
     DynamicTensor, TensorDType, TensorForiExecutionPlan, TensorIr, TensorNodeId,
     TensorScanExecutionPlan,
 };
-use quabla_core::{QuablaCompiler, QuablaMultiOutputProgram, QuablaPrecision, QuablaTarget};
+use quabla_core::{QuablaCompiler, QuablaMultiOutputProgram, QuablaTarget};
 
 const CUDA: QuablaTarget = QuablaTarget::Cuda { device_ordinal: 0 };
 const RUNS: usize = 100;
-const PRECISIONS: [QuablaPrecision; 2] = [QuablaPrecision::Default, QuablaPrecision::Float64];
+const DTYPES: [TensorDType; 2] = [TensorDType::F32, TensorDType::F64];
 
 type Inputs = BTreeMap<String, DynamicTensor>;
 /// The outputs of one execution, each as its flat data.
 type Outputs = Vec<Vec<f64>>;
 
 /// The relative tolerance of a device result against the CPU float64 one.
-fn tolerance(precision: QuablaPrecision) -> f64 {
-    match precision {
-        QuablaPrecision::Float64 => 1e-12,
+fn tolerance(dtype: TensorDType) -> f64 {
+    match dtype {
+        TensorDType::F64 => 1e-12,
         _ => 1e-5,
     }
 }
 
-/// Runs the program `RUNS` times on CUDA, requires one bit pattern, and
-/// returns that result with the CPU float64 result.
+/// Runs the program built in `dtype` `RUNS` times on CUDA, requires one bit
+/// pattern, and returns that result with the CPU result of the float64
+/// program.
 fn repeated(
-    build: impl Fn() -> Result<(TensorIr, Vec<TensorNodeId>), String>,
+    build: impl Fn(TensorDType) -> Result<(TensorIr, Vec<TensorNodeId>), String>,
     inputs: &Inputs,
-    precision: QuablaPrecision,
+    dtype: TensorDType,
     case: &str,
 ) -> Result<(Outputs, Outputs), String> {
-    let compile = |target, precision| -> Result<_, String> {
-        let (graph, outputs) = build()?;
+    let compile = |target, dtype| -> Result<_, String> {
+        let (graph, outputs) = build(dtype)?;
         let program = QuablaMultiOutputProgram::new(graph, outputs)?;
         QuablaCompiler
-            .compile_many_checked_with_precision(&program, target, precision)
+            .compile_many_checked(&program, target)
             .map_err(|error| format!("{error:?}"))
     };
-    let device = compile(CUDA, precision)?;
+    let device = compile(CUDA, dtype)?;
     let data = |outputs: Vec<DynamicTensor>| {
         outputs
             .into_iter()
@@ -80,20 +82,20 @@ fn repeated(
     assert_eq!(
         distinct.len(),
         1,
-        "{case} ({precision:?}): {} distinct results over {RUNS} runs",
+        "{case} ({dtype:?}): {} distinct results over {RUNS} runs",
         distinct.len()
     );
-    let reference = data(compile(QuablaTarget::Cpu, QuablaPrecision::Float64)?.execute(inputs)?);
+    let reference = data(compile(QuablaTarget::Cpu, TensorDType::F64)?.execute(inputs)?);
     Ok((first, reference))
 }
 
 /// Checks `actual` against `reference` with an error bound relative to
 /// `scale` (the magnitude the rounding errors are proportional to).
-fn assert_close(actual: f64, reference: f64, scale: f64, precision: QuablaPrecision, case: &str) {
-    let bound = tolerance(precision) * scale.max(1.0);
+fn assert_close(actual: f64, reference: f64, scale: f64, dtype: TensorDType, case: &str) {
+    let bound = tolerance(dtype) * scale.max(1.0);
     assert!(
         (actual - reference).abs() <= bound,
-        "{case} ({precision:?}): device {actual:e}, CPU {reference:e}, bound {bound:e}"
+        "{case} ({dtype:?}): device {actual:e}, CPU {reference:e}, bound {bound:e}"
     );
 }
 
@@ -103,9 +105,13 @@ fn values(count: usize, phase: f64) -> Vec<f64> {
         .collect()
 }
 
-fn reduction(count: usize, mean: bool) -> Result<(TensorIr, Vec<TensorNodeId>), String> {
+fn reduction(
+    count: usize,
+    mean: bool,
+    dtype: TensorDType,
+) -> Result<(TensorIr, Vec<TensorNodeId>), String> {
     let mut graph = TensorIr::new();
-    let x = graph.input_typed("x", vec![count], TensorDType::F64)?;
+    let x = graph.input_typed("x", vec![count], dtype)?;
     let output = if mean { graph.mean(x)? } else { graph.sum(x)? };
     Ok((graph, vec![output]))
 }
@@ -143,23 +149,17 @@ fn full_reductions_are_deterministic_and_match_the_cpu() -> Result<(), String> {
             "x".to_string(),
             DynamicTensor::with_dtype(vec![count], data.clone(), TensorDType::F64)?,
         )]);
-        for precision in PRECISIONS {
+        for dtype in DTYPES {
             for mean in [false, true] {
                 let case = format!("{} of {count}", if mean { "mean" } else { "sum" });
                 let (device, reference) =
-                    repeated(|| reduction(count, mean), &inputs, precision, &case)?;
+                    repeated(|dtype| reduction(count, mean, dtype), &inputs, dtype, &case)?;
                 let divisor = if mean { count as f64 } else { 1.0 };
-                assert_close(
-                    device[0][0],
-                    reference[0][0],
-                    scale / divisor,
-                    precision,
-                    &case,
-                );
+                assert_close(device[0][0], reference[0][0], scale / divisor, dtype, &case);
                 // One block keeps the bits of its fixed tree (the kernel's value before the
                 // multi-block pass was made deterministic).
                 if count <= 256 {
-                    let expected = if precision == QuablaPrecision::Float64 {
+                    let expected = if dtype == TensorDType::F64 {
                         one_block_tree(&data, 0.0f64, mean.then_some(count as f64))
                     } else {
                         let single = data.iter().map(|value| *value as f32).collect::<Vec<_>>();
@@ -168,7 +168,7 @@ fn full_reductions_are_deterministic_and_match_the_cpu() -> Result<(), String> {
                     assert_eq!(
                         device[0][0].to_bits(),
                         expected.to_bits(),
-                        "{case} ({precision:?})"
+                        "{case} ({dtype:?})"
                     );
                 }
             }
@@ -180,8 +180,8 @@ fn full_reductions_are_deterministic_and_match_the_cpu() -> Result<(), String> {
         "x".to_string(),
         DynamicTensor::with_dtype(vec![1000], vec![-0.0; 1000], TensorDType::F64)?,
     )]);
-    for precision in PRECISIONS {
-        let (device, _) = repeated(|| reduction(1000, false), &inputs, precision, "-0")?;
+    for dtype in DTYPES {
+        let (device, _) = repeated(|dtype| reduction(1000, false, dtype), &inputs, dtype, "-0")?;
         assert_eq!(device[0][0].to_bits(), 0.0f64.to_bits());
     }
     Ok(())
@@ -211,8 +211,8 @@ fn loop_gradients(
     kind: Loop,
     carry: &[usize],
     capture: &[usize],
+    dtype: TensorDType,
 ) -> Result<(TensorIr, Vec<TensorNodeId>), String> {
-    let dtype = TensorDType::F64;
     let mut body = TensorIr::new();
     let state = body.input_typed("carry", carry.to_vec(), dtype)?;
     let index = body.input_typed("index", vec![], dtype)?;
@@ -329,12 +329,12 @@ fn loop_capture_gradients_are_deterministic_and_match_the_cpu() -> Result<(), St
             if matches!(kind, Loop::Scan) && carry.iter().product::<usize>() > 20_000 {
                 continue;
             }
-            for precision in PRECISIONS {
+            for dtype in DTYPES {
                 let case = format!("{kind:?} carry {carry:?} capture {capture:?}");
                 let (device, reference) = repeated(
-                    || loop_gradients(kind, carry, capture),
+                    |dtype| loop_gradients(kind, carry, capture, dtype),
                     &inputs,
-                    precision,
+                    dtype,
                     &case,
                 )?;
                 // Relative to the largest entry of each gradient: the float32 loop
@@ -346,7 +346,7 @@ fn loop_capture_gradients_are_deterministic_and_match_the_cpu() -> Result<(), St
                         .iter()
                         .fold(0.0f64, |peak, value| peak.max(value.abs()));
                     for (actual, expected) in device.iter().zip(reference) {
-                        assert_close(*actual, *expected, peak, precision, &case);
+                        assert_close(*actual, *expected, peak, dtype, &case);
                     }
                 }
             }
@@ -371,21 +371,21 @@ fn short_capture_reductions_add_the_lanes_in_order() -> Result<(), String> {
             "w".to_string(),
             DynamicTensor::with_dtype(vec![lanes], vec![0.7; lanes], TensorDType::F64)?,
         );
-        for precision in PRECISIONS {
+        for dtype in DTYPES {
             let case = format!("{lanes} lanes");
             let (reduced, _) = repeated(
-                || loop_gradients(Loop::Fori, &[lanes], &[1]),
+                |dtype| loop_gradients(Loop::Fori, &[lanes], &[1], dtype),
                 &inputs,
-                precision,
+                dtype,
                 &case,
             )?;
             let (per_lane, _) = repeated(
-                || loop_gradients(Loop::Fori, &[lanes], &[lanes]),
+                |dtype| loop_gradients(Loop::Fori, &[lanes], &[lanes], dtype),
                 &per_lane_inputs,
-                precision,
+                dtype,
                 &case,
             )?;
-            let expected = if precision == QuablaPrecision::Float64 {
+            let expected = if dtype == TensorDType::F64 {
                 per_lane[0].iter().fold(0.0f64, |sum, value| sum + value)
             } else {
                 per_lane[0]
@@ -395,7 +395,7 @@ fn short_capture_reductions_add_the_lanes_in_order() -> Result<(), String> {
             assert_eq!(
                 reduced[0][0].to_bits(),
                 expected.to_bits(),
-                "{case} ({precision:?})"
+                "{case} ({dtype:?})"
             );
         }
     }

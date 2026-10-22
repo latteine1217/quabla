@@ -157,7 +157,7 @@ tight comparisons.
 | `ValueError: reverse-mode differentiation through while_loop is not supported` | `grad` of a `while_loop` | Bounded `fori_loop` with masking, or `jvp` |
 | `ValueError: forward-mode differentiation ... of custom_vjp(...) is not supported` | `jvp` of a `custom_vjp` | Use reverse mode, or define `custom_jvp` |
 | `UnsupportedOperationError: ... target is unavailable in this build` | `device=` names a backend that was not compiled in | Install `quabla-mlx` or build with `--features` |
-| `UnsupportedOperationError` with `.op == "float32"` | A `precision="float64"` program contains `float32` values | Cast everything to `float64` |
+| `UnsupportedOperationError` with `.op == "float32"` | A CUDA program mixes `float32` and `float64` values | Cast everything to one dtype with `astype` |
 | `RuntimeError: ... stopped at t=... before t1 after max_steps=...` | An adaptive ODE solve did not finish | Raise `max_steps`, loosen `rtol`/`atol`, or use `rosenbrock23` for stiff problems |
 | `RetraceWarning: ... exceeded max_traces` | Many signatures | See [Avoid retracing](#avoid-retracing) |
 

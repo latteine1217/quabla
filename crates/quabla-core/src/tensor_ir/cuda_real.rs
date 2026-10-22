@@ -1,8 +1,8 @@
 //! Element type of the floating device buffers of one CUDA plan.
 //!
-//! The default lowering keeps every buffer `f32` and runs logical `float64`
-//! nodes in single precision. The opt-in double lowering
-//! ([`crate::compiler::QuablaPrecision::Float64`]) instantiates the same plan with
+//! A `float32` program keeps every buffer `f32`. A program with `float64`
+//! values, which the compiler facade never converts to `f32`, instantiates the
+//! same plan with
 //! `f64` buffers: the generated NVRTC program is rewritten to `double` by
 //! [`double_precision_source`], and cuBLAS and cuSOLVER calls use their `D`
 //! variants. Keeping one element type per plan (rather than per node) lets
@@ -145,7 +145,7 @@ type GesvdjFn<T> = unsafe fn(
 
 /// Element type of every floating (and `0`/`1` bool) buffer of one CUDA plan.
 ///
-/// Sealed: only `f32` (the default) and `f64` (`precision="float64"`) exist.
+/// Sealed: only `f32` (`float32` programs) and `f64` (`float64` programs) exist.
 /// The associated `fn` constants are the matching cuSOLVER entry points, so a
 /// call site reads `(T::GETRF)(...)` for both precisions.
 pub trait CudaReal:

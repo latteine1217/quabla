@@ -7,8 +7,8 @@ GPUs, and the lower-level compilation APIs.
 | Backend | Platform | Build feature | Execution dtype |
 | --- | --- | --- | --- |
 | CPU | macOS, Linux | default | `float64` reference; each `float32` op is the `float64` result rounded to `float32` |
-| CUDA | Linux, NVIDIA GPU | `cuda` | `float32`; native `float64` with `precision="float64"` |
-| CUDA + NCCL | Linux, 2+ GPUs on one node | `cuda-nccl` | `float32` |
+| CUDA | Linux, NVIDIA GPU | `cuda` | Each program in its own dtype, `float32` or `float64` |
+| CUDA + NCCL | Linux, 2+ GPUs on one node | `cuda-nccl` | `float32` programs only |
 | MLX | macOS 14+, Apple silicon | `mlx` | `float32` |
 
 ## 10.1 Choosing a Device
@@ -52,36 +52,37 @@ test suites check GPU results with absolute and relative tolerances of
 
 ## 10.2 Precision
 
-Programs whose arrays are `float64` (the default dtype) still run in `float32`
-on a GPU unless you opt in, and `jit` warns once per compiled function:
-
-```text
-UserWarning: mlx executes float64 programs as float32
-```
-
-For GPU work, create parameters and data as `float32` explicitly (or convert
-them once with `qb.tree.map(lambda t: t.astype(qb.float32), params)`). This
-keeps the CPU reference and the device computing the same thing and avoids
-the warning.
-
-On CUDA, `precision="float64"` runs a `float64` program natively in double
-precision, including NVRTC kernels, cuBLAS `dgemm`, and cuSOLVER:
+CUDA runs each program in its own dtype and never converts between them.
+Arrays are `float64` by default, so a CUDA program runs natively in double
+precision, including NVRTC kernels, cuBLAS `dgemm`, and cuSOLVER, unless you
+create the arrays as `float32`:
 
 ```python
-step = qb.jit(qb.value_and_grad(loss), device="cuda", precision="float64")
+step = qb.jit(qb.value_and_grad(loss), device="cuda")
+step(params, x)  # float64 arrays: double precision on the GPU
 ```
 
-- Results match the CPU `float64` reference to about `1e-13` relative.
+- `float64` results match the CPU reference to about `1e-13` relative.
 - Consumer GPUs run `f64` at a small fraction of their `f32` rate (a
-  matmul-heavy step took about 9x longer on a GTX 1660 SUPER), so `float32`
-  stays the default.
-- One compiled program has one floating type: a program that also contains
-  `float32` values raises `UnsupportedOperationError` with
-  `.op == "float32"`.
-- The option is a no-op on the CPU, raises `UnsupportedOperationError` on MLX
-  (which has no `float64` arithmetic), and is part of the trace-cache key.
-- `Trainer(..., precision="float64")` accepts the same option. The NCCL
-  data-parallel path stays `float32`.
+  matmul-heavy step took about 9x longer on a GTX 1660 SUPER). For speed,
+  create parameters and data as `float32` explicitly (or convert them once
+  with `qb.tree.map(lambda t: t.astype(qb.float32), params)`).
+- One compiled program has one floating type: a program that mixes `float32`
+  and `float64` values raises `UnsupportedOperationError` with
+  `.op == "float32"` instead of converting; cast them to one dtype.
+- `precision="float64"` states the request explicitly; it changes nothing
+  on the CPU and CUDA and is part of the trace-cache key. `Trainer` takes
+  the same keyword. The NCCL data-parallel path runs `float32` programs
+  only and raises for a `float64` one.
+
+MLX runs `float32` only: Apple GPUs have no double-precision arithmetic.
+A program with `float64` values raises `UnsupportedOperationError`
+(`.op == "float64"`, `.device == "mlx"`) instead of running in `float32`,
+in `jit`, `Trainer`, and `Compiler().compile("mlx")` alike. `qb.array`
+creates `float64` by default, so create MLX inputs with
+`dtype=qb.float32` (or cast with `astype`) and keep the CPU reference in
+`float32` when comparing results. `precision="float64"` raises the same
+error on MLX.
 
 `bool_` values are held as `float32` 0/1 on both GPUs.
 
@@ -274,8 +275,8 @@ transport, tensor parallelism, or sharded matmul.
 
 ## 10.9 Checklist for Device Training
 
-1. Make parameters and data `float32` (or use `precision="float64"` on
-   CUDA when you need double precision).
+1. Choose the dtype deliberately: `float32` for speed (and always on MLX),
+   `float64` on CUDA when you need double precision.
 2. Validate on the CPU first: run the same function with `device="cpu"` and
    compare, since the CPU is the reference.
 3. Use `optim.Trainer` (or `jit(value_and_grad)` plus a host optimizer for

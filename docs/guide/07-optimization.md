@@ -226,10 +226,12 @@ Tensor(1.8750973e-13, dtype=float32) 3.0000007152557373
   on the device too, so gradients are never read back.
 - A schedule is evaluated on the host before every step and sets the native
   optimizer's rate.
-- Device plans compute in `float32` and agree with the CPU trainer up to
-  `float32` rounding. `precision="float64"` trains a `float64` loss natively
-  in double precision on CUDA (parameters and moments included); it is a
-  no-op on the CPU and rejected on MLX.
+- Device plans keep the loss's dtype, as `jit` does: on CUDA a `float64`
+  loss trains in double precision (parameters and moments included) and a
+  `float32` one in single precision; MLX trains `float32` losses and
+  rejects `float64` ones.
+  `precision="float64"` changes nothing on the CPU and CUDA and is rejected
+  on MLX.
 - `step()` without arguments on a device reuses the retained data without
   flattening any Python pytree, which keeps per-step overhead minimal.
 

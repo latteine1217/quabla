@@ -486,14 +486,16 @@ def test_while_loop_bodies_apply_custom_jvp_rules():
 
 
 def test_custom_rules_on_devices_match_cpu():
-    params = mlp_params()
-    x = qb.array([[0.3, -0.2, 0.5, 0.1]])
+    # float32, which every device runs (MLX has no float64).
+    single = lambda tree: qb.tree.map(lambda a: a.astype(qb.float32), tree)  # noqa: E731
+    params = single(mlp_params())
+    x = qb.array([[0.3, -0.2, 0.5, 0.1]], dtype=qb.float32)
     functions = (
         qb.grad(lambda v: qb.sum(log1pexp(v))),
         qb.grad(lambda v: qb.sum(sinc(v))),
         qb.grad(lambda p: mlp(p, x, True)),
     )
-    arguments = (qb.array([0.0, 1.0, 50.0]), qb.array([0.0, 1.0]), params)
+    arguments = single((qb.array([0.0, 1.0, 50.0]), qb.array([0.0, 1.0]), params))
     for device in devices():
         for function, argument in zip(functions, arguments):
             expected = qb.tree.leaves(qb.jit(function)(argument))
@@ -628,8 +630,11 @@ def test_cuda_float64_rejects_float32_nodes_in_loop_derivatives():
     error = raises(qb.UnsupportedOperationError, lowered.compile, match="float32 node")
     assert error.op == "float32", error.op
     assert "derived from its body" in str(error), str(error)
-    # The default precision runs float32 nodes as float32.
-    assert_close(qb.jit(qb.grad(loss), device=device)(x), qb.jit(qb.grad(loss))(x), 2e-5)
+    # The default precision rejects them the same way: a float64 program is
+    # never run in float32.
+    lowered = qb.jit(qb.grad(loss), device=device).lower(x)
+    error = raises(qb.UnsupportedOperationError, lowered.compile, match="float32 node")
+    assert error.op == "float32", error.op
 
 
 if __name__ == "__main__":

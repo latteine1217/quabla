@@ -95,8 +95,8 @@ qb.eye(n, m=None, dtype=None)
   native IR op (`UnaryMath`) evaluated with each platform's own function:
   Rust std on the CPU (the musl `asinh`, `acosh`, and `atanh` of the `libm`
   crate, since std's `acosh` loses accuracy near 1), the CUDA math library
-  (`tanf`, `asinf`, ..., `rintf`, and their double forms under
-  `precision="float64"`), and the MLX op of the same name; MLX has no
+  (`tanf`, `asinf`, ..., `rintf`, and their double forms in `float64`
+  programs), and the MLX op of the same name; MLX has no
   `cbrt`, so it takes `|x|^(1/3)` from `power` and one Newton step, within
   about one float32 ulp. `round` rounds halfway cases to even, as NumPy and
   JAX do. Values follow IEEE semantics and never raise: outside a domain
@@ -662,30 +662,32 @@ default, or explicitly `"cuda"`, `"cuda:N"`, or `"mlx"`. A missing build
 target raises `UnsupportedOperationError`; device lowering rejections carry
 `.op` and `.device`. Invalid device spellings
 are `ValueError`. Eager array operations remain on the host. Device calls
-upload inputs and return host output pytrees; logical float64 device programs
-emit one `UserWarning` per compiled function because execution is float32.
-`qb.devices()` lists built targets, not physical GPU ordinals.
+upload inputs and return host output pytrees; MLX, whose Apple GPUs have no
+float64 arithmetic, raises `UnsupportedOperationError` (`.op == "float64"`)
+for a program with float64 values instead of running it in float32.
+`qb.devices()` lists built targets,
+not physical GPU ordinals.
 
-`qb.jit(fun, device="cuda", precision="float64")` executes float64 programs
-natively in double precision on CUDA, without the warning. Consumer GPUs run
-f64 arithmetic at a small fraction of their f32 rate (a matmul-heavy
-value-and-gradient step takes about 9x longer on a GTX 1660 SUPER), so
-float32 execution stays the default. Under `precision="float64"`
-every operation the CUDA backend lowers runs in double: the NVRTC kernels
+CUDA runs each program in its dtype and never converts between them: a
+float64 program runs natively in double precision and a float32 one in
+single precision (`precision="float64"` states the first explicitly and
+changes nothing). Consumer GPUs run f64 arithmetic at a small fraction of
+their f32 rate (a matmul-heavy value-and-gradient step takes about 9x longer
+on a GTX 1660 SUPER), so create arrays with `dtype=qb.float32` for speed. In
+a float64 program every operation the CUDA backend lowers runs in double:
+the NVRTC kernels
 (elementwise, reductions, `cumsum`, Cholesky and its derivatives, fused and
 host-driven `fori`/`scan`/`while`/`cond` regions) and cuBLAS `dgemm` and
 cuSOLVER `getrf`/`getrs`/`syevd`/`geqrf`/`orgqr`/`gesvdj`; results match
 the CPU float64 reference to about `1e-13` relative. One compiled program
 has one floating element type, so a program that also contains float32
 values raises `UnsupportedOperationError` with `.op == "float32"`; cast them
-to float64 or use the default precision. A program without float64 values
-compiles as with the default. The argument is a no-op on the CPU, which
-already runs float64 natively, raises `UnsupportedOperationError` on MLX,
-which has no float64 arithmetic, and is part of the trace-cache
-configuration, so the two precisions never share a compiled program. Other
-values than `None` and `"float64"` are `ValueError`. `qb.optim.Trainer`
-takes the same `precision` keyword; the NCCL data-parallel paths keep
-float32 device execution.
+to one dtype with `astype`. `precision` is part of the trace-cache
+configuration, raises `UnsupportedOperationError` on MLX when it is
+`"float64"`, and accepts only `None` and `"float64"` (other values are
+`ValueError`); `qb.optim.Trainer` takes the same keyword. The NCCL
+data-parallel paths run float32 programs only and raise
+`UnsupportedOperationError` (`.op == "float64"`) for a float64 one.
 
 `qb.jit(fun).lower(*args)` accepts arrays or `qb.ShapeDtype(shape, dtype)`
 inside pytrees and traces without execution. The lowered object exposes
@@ -767,11 +769,12 @@ is at most one, so neither overflows), then every gradient is scaled by
 norm leaves the gradients unchanged and a NaN or infinite norm makes every
 parameter NaN. A parameter the loss ignores has a zero gradient: it changes
 only by AdamW's decay, or to NaN after a non-finite clipped norm, as on the
-CPU. Device plans compute in float32 by default and agree with the CPU
-trainer to float32 rounding. `precision="float64"` (validated as in `jit`)
-runs a float64 loss natively on CUDA with float64 parameters and moments,
-agreeing with the CPU to float64 rounding; it is a no-op on the CPU and
-raises `UnsupportedOperationError` on MLX.
+CPU. Device plans keep the dtype of the loss, as `jit` does: on CUDA a
+float64 loss trains with float64 parameters and moments, agreeing with the
+CPU to float64 rounding, and a float32 one in float32; MLX trains float32
+losses and raises `UnsupportedOperationError` for a float64 one.
+`precision="float64"` (validated as in `jit`) changes nothing on
+the CPU and CUDA and raises `UnsupportedOperationError` on MLX.
 `batch_argnums` indexes data positions, excluding params. `step(*batch)`
 replaces them in the declared order, with unchanged pytree/shapes/dtypes;
 `step()` reuses data without Python flattening on devices. Device parameters
@@ -1278,9 +1281,9 @@ the dtype rules below.
 - Shapes are static. Variable batch sizes trace once per shape, up to
   `jit(max_traces=...)` signatures; there are no symbolic dimensions.
 - Dtypes are `float32`, `float64`, and `bool`. `float16`/`bfloat16`, integer
-  tensors, and mixed-precision training are not implemented. Native device
-  `f64` is opt-in on CUDA through `jit(precision="float64")` and
-  `Trainer(precision="float64")`, and unavailable on MLX. Host storage is physically typed F64/F32/Bool; narrow
+  tensors, and mixed-precision training are not implemented. CUDA runs
+  `f64` natively and rejects a program that mixes `float32` and `float64`;
+  MLX has no `f64`. Host storage is physically typed F64/F32/Bool; narrow
   storage widens transiently only when an F64 view is requested.
 - `gather`/`scatter_add` take static Python integer indices; dynamic index
   tensors, boolean-mask indexing, and empty slices are unsupported.

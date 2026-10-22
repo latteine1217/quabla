@@ -101,7 +101,7 @@ _TANGENT_PREFIX = "__quabla_tangent/"
 _COTANGENT_PREFIX = "__quabla_cotangent/"
 # Bounds each dense Jacobian JVP batch without changing the public transform.
 _JACOBIAN_CHUNK_SIZE = 64
-# Coordinate digits stay exact on backends that execute float64 as float32.
+# Coordinate digits stay exact in float32, the dtype of a float32 program's basis.
 _JACOBIAN_INDEX_RADIX = 1 << 24
 
 # -- argument signatures -------------------------------------------------------
@@ -949,13 +949,12 @@ class _Jit(_Transform):
             raise ValueError(f'precision must be None or "float64", got {precision!r}')
         if precision == "float64" and self._target == "mlx":
             raise UnsupportedOperationError(
-                'MLX has no float64 arithmetic; precision="float64" is supported on '
-                "the CPU and CUDA",
+                "MLX cannot run float64 programs: Apple GPUs have no double-precision "
+                'arithmetic; precision="float64" is supported on the CPU and CUDA',
                 op="float64",
                 device=self._device,
             )
         self._precision = precision
-        self._warned_precision = False
         if isinstance(static_argnums, int):
             static_argnums = (static_argnums,)
         static_argnums = tuple(static_argnums)
@@ -1027,23 +1026,6 @@ class _Jit(_Transform):
             self._ordinal,
             self._precision,
         )
-        if (
-            self._target != "cpu"
-            and self._precision is None
-            and not self._warned_precision
-        ):
-            if any(
-                _is_traced(output) and output.dtype == float64
-                for output in staged.outputs
-            ) or any(
-                staged.graph.input(name).dtype == float64 for name in staged.input_names
-            ):
-                warnings.warn(
-                    f"{self._target} executes float64 programs as float32",
-                    UserWarning,
-                    stacklevel=_user_stacklevel(),
-                )
-                self._warned_precision = True
         return program
 
     def _bind_keywords(self, args, kwargs):
@@ -1744,20 +1726,23 @@ def _graft(node, block_node):
     return node[:-1] + (tuple(_graft(child, block_node) for child in node[-1]),)
 
 
-def _jacobian_basis_indices(graph, total):
+def _jacobian_basis_indices(graph, total, arrays):
     """Exact radix digits of flattened indices, using only linear storage.
 
-    Every digit is below 2**24, so backend float32 execution preserves it.
+    Every digit is below 2**24, so it is exact in float32 too. The digits are
+    float32 when no array in `arrays` (the basis directions) is float64, so a
+    float32 program stays in one dtype, as the CUDA backend requires.
     Broadcasting digits avoids Python lists and quadratic identity constants.
     Each padded coordinate vector has fewer than twice `total` elements.
     """
+    dtype = float64 if any(array.dtype == float64 for array in arrays) else float32
     radix = _JACOBIAN_INDEX_RADIX
     if total <= radix:
-        return [graph._constant(arange(total, dtype=float64))]
+        return [graph._constant(arange(total, dtype=dtype))]
     groups = (total + radix - 1) // radix
     padded = groups * radix
     low = (
-        graph._constant(arange(radix, dtype=float64))
+        graph._constant(arange(radix, dtype=dtype))
         .reshape([1, radix])
         .broadcast_to([groups, radix])
         .reshape([padded])
@@ -1768,7 +1753,7 @@ def _jacobian_basis_indices(graph, total):
         .broadcast_to([groups, radix])
         .reshape([padded])
         .slice(0, 0, total)
-        for digit in _jacobian_basis_indices(graph, groups)
+        for digit in _jacobian_basis_indices(graph, groups, arrays)
     ]
     return [low] + high
 
@@ -1857,7 +1842,7 @@ class _Jacobian(_Transform):
             reverse_graph, _, gradients = staged.graph._symbolic_vjp(
                 traced, cotangent_names, []
             )
-            indices = _jacobian_basis_indices(graph, output_total)
+            indices = _jacobian_basis_indices(graph, output_total, traced)
             output_offsets = []
             offset = 0
             for size in output_sizes:
@@ -1913,7 +1898,9 @@ class _Jacobian(_Transform):
             jvp_graph, _, jvp_tangents = staged.graph._symbolic_jvp(
                 traced, tangent_names
             )
-            indices = _jacobian_basis_indices(graph, total)
+            indices = _jacobian_basis_indices(
+                graph, total, [leaves[position] for position in selected]
+            )
             leaf_indices = [
                 [
                     digit.slice(0, offset, offset + size).reshape([1, size])
@@ -2060,10 +2047,12 @@ def jit(*args, **kwargs):
     least recently used trace with a `RetraceWarning`. Called with keywords
     only (`@jit(device="mlx", static_argnums=1)`), returns a decorator.
 
-    CUDA executes `float64` programs as `float32` by default (with a
-    `UserWarning`). `precision="float64"` runs them natively in double on
-    CUDA instead; such a program must not also contain `float32` values.
-    It is a no-op on the CPU and raises `UnsupportedOperationError` on MLX.
+    Each value runs in its own dtype: CUDA runs a `float64` program in
+    double precision and a `float32` one in single precision, and never
+    converts between them; a CUDA program that mixes `float32` and `float64`
+    values raises `UnsupportedOperationError` (cast with `astype`).
+    `precision="float64"` states that request explicitly; it changes nothing
+    on the CPU and CUDA and raises `UnsupportedOperationError` on MLX.
     """
     if not args and "fun" not in kwargs:
         return _decorator(_new_jit, kwargs)

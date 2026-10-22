@@ -32,7 +32,6 @@ import statistics
 import subprocess
 import sys
 import time
-import warnings
 
 import quabla
 import quabla as qb
@@ -122,8 +121,7 @@ def build_problem(grid, hidden):
 
 
 def build_callable(mode):
-    """`(params, x, target) -> (loss, gradients)` for `mode`. The CUDA modes
-    evaluate the float64 data in float32, as CUDA does by default."""
+    """`(params, x, target) -> (loss, gradients)` for `mode`."""
     if mode == "cpu":
         return qb.jit(qb.value_and_grad(loss_fn))
     if mode == "single_gpu":
@@ -148,20 +146,22 @@ def train(mode, steps, lr, grid, hidden):
     value_and_grad = build_callable(mode)
     construct_seconds = time.perf_counter() - construct_start
 
-    x = qb.array(x).reshape([batch, 2])
-    target = qb.array(target).reshape([batch, 1])
+    # The CPU reference computes in float64; the CUDA modes in float32, the
+    # dtype data parallelism supports. The data are float32-representable, so
+    # every mode starts from the same values.
+    dtype = qb.float64 if mode == "cpu" else qb.float32
+    x = qb.array(x, dtype=dtype).reshape([batch, 2])
+    target = qb.array(target, dtype=dtype).reshape([batch, 1])
     losses = []
     timings = []
     first_gradient = None
     for _ in range(steps):
         params = {
-            name: qb.array(parameters[name]).reshape(shape)
+            name: qb.array(parameters[name], dtype=dtype).reshape(shape)
             for name, shape in shapes.items()
         }
         call_start = time.perf_counter()
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            value, gradients = value_and_grad(params, x, target)
+        value, gradients = value_and_grad(params, x, target)
         call_wall = time.perf_counter() - call_start
         timings.append({"call_wall": call_wall})
         loss = value.item()

@@ -1172,8 +1172,9 @@ def test_traced_power_gradients_in_both_operands():
 
 
 def assert_power_device_parity(device):
-    x = qb.array([0.0, 0.5, 1.5, 2.25, -2.0])
-    y = qb.array([0.5, 0.5, -1.0, 2.5, 3.0])
+    # float32, which every device runs (MLX has no float64).
+    x = qb.array([0.0, 0.5, 1.5, 2.25, -2.0], dtype=qb.float32)
+    y = qb.array([0.5, 0.5, -1.0, 2.5, 3.0], dtype=qb.float32)
 
     def loss(a, b):
         return (a**b + 2.0**b * a**0.5 + a**2).sum()
@@ -2244,8 +2245,9 @@ def test_captured_constants_keep_their_dtype():
 
 
 def assert_constant_device_parity(device):
-    c = qb.array([0.5, -1.25, 2.0, 0.75])
-    x = qb.array([0.1, 0.2, -0.3, 0.4])
+    # float32, which every device runs (MLX has no float64).
+    c = qb.array([0.5, -1.25, 2.0, 0.75], dtype=qb.float32)
+    x = qb.array([0.1, 0.2, -0.3, 0.4], dtype=qb.float32)
 
     def loss(t):
         return (qb.sin(t * c) + c * t).sum()
@@ -3101,16 +3103,18 @@ def test_jit_gather_and_scatter_add_are_constant_size_and_match_eager():
     assert sized(64) == sized(1024), (sized(64), sized(1024))
 
     # Values and derivatives match eager for repeated indices on both axes.
-    # Dyadic data keeps every sum exact, so equality holds in any order.
-    x = qb.array([[0.25 * i - 0.5 * j for j in range(5)] for i in range(4)])
+    # Dyadic data keeps every sum exact, so equality holds in any order; it is
+    # float32, which every device runs (MLX has no float64).
+    x = qb.array([[0.25 * i - 0.5 * j for j in range(5)] for i in range(4)], dtype=qb.float32)
     devices = ["cpu"] + [device for device in ("mlx", "cuda") if enabled(device)]
     for axis, indices in ((0, [3, 1, 3, 0, 3]), (1, [4, 0, 4, 4, 2, 1])):
         shape = [4, 5]
         shape[axis] = len(indices)
-        u = qb.array([[0.5 * i + 0.25 * j for j in range(shape[1])] for i in range(shape[0])])
-        w = qb.array([[1.0 - 0.75 * i + j for j in range(shape[1])] for i in range(shape[0])])
-        c = qb.array([[0.5 * i - j for j in range(5)] for i in range(4)])
-        zeros = qb.zeros([4, 5])
+        f32 = qb.float32
+        u = qb.array([[0.5 * i + 0.25 * j for j in range(shape[1])] for i in range(shape[0])], dtype=f32)
+        w = qb.array([[1.0 - 0.75 * i + j for j in range(shape[1])] for i in range(shape[0])], dtype=f32)
+        c = qb.array([[0.5 * i - j for j in range(5)] for i in range(4)], dtype=f32)
+        zeros = qb.zeros([4, 5], dtype=f32)
         for device in devices:
             jit = lambda f: qb.jit(f, device=device)  # noqa: E731
             assert_close(jit(lambda y: y.gather(indices, axis=axis))(x), x.gather(indices, axis=axis), 0)

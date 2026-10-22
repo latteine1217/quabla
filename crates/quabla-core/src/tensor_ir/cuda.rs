@@ -466,7 +466,8 @@ impl CudaBackend {
     }
 
     /// Compiles `plan` with `f64` device buffers: every logical `float64` node
-    /// executes in double precision (the opt-in `precision="float64"` lowering).
+    /// executes in double precision, as the compiler facade lowers every
+    /// program with `float64` values.
     ///
     /// The plan must not contain `float32` nodes: one plan has one floating
     /// element type, and running them in double would silently change their
@@ -1016,9 +1017,9 @@ pub(super) fn validate_cuda_float64_plan(
                 return Err((
                     "float32".into(),
                     format!(
-                        "CUDA precision=\"float64\" cannot execute float32 node {node_id} ({}): \
-                         the float64 lowering runs every floating node in double; cast the \
-                         value to float64 or use the default precision",
+                        "CUDA cannot run float32 node {node_id} ({}) in a program with float64 \
+                         values: a CUDA program computes in one floating dtype, and quabla does \
+                         not convert between them; cast the arrays to one dtype with astype",
                         cuda_op_name(&node.op)
                     ),
                 ));

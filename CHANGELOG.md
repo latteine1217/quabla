@@ -9,6 +9,33 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Fixed
+
+- CUDA no longer converts `float64` programs to `float32`. `jit`, `Trainer`,
+  and `Compiler().compile("cuda")` used to run a `float64` program in single
+  precision with a `UserWarning` unless `precision="float64"` was given, so a
+  default `float64` array silently lost precision on the GPU. Every program
+  now runs in its own dtype: `float64` natively in double (the former
+  `precision="float64"` path, now a no-op that states the request) and
+  `float32` in single precision. A program that mixes the two raises
+  `UnsupportedOperationError` (`.op == "float32"`) instead of being run in
+  either dtype, and `distributed.value_and_grad`, whose NCCL replicas are
+  `float32`, raises `UnsupportedOperationError` (`.op == "float64"`) for a
+  `float64` loss. Python scalars and the constants that differentiation
+  adds are weakly typed and take the program's dtype, and the basis that
+  `jacobian` and `hessian` build for a `float32` input is `float32`, so a
+  `float32` program stays `float32`. Code that relied on the conversion
+  gets double-precision results, slower on consumer GPUs; create arrays
+  with `dtype=qb.float32` to keep single precision. The owner classified
+  the silent conversion as a defect on 2026-10-14, so the fix ships in
+  1.0.x.
+- MLX no longer converts `float64` programs to `float32`. Apple GPUs have no
+  double-precision arithmetic, so `jit`, `Trainer`, and
+  `Compiler().compile("mlx")` now raise `UnsupportedOperationError`
+  (`.op == "float64"`) for a program with `float64` values, where they used
+  to run it in single precision with a `UserWarning`. Create MLX inputs
+  with `dtype=qb.float32`. The owner chose rejection on 2026-10-22.
+
 ## [1.0.0] - 2026-10-14
 
 The v1.0 plan in `docs/jax_like_roadmap.md`: the v0.1 surface that the 0.x

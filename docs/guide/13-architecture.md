@@ -289,7 +289,7 @@ loaded dynamically):
   iterations, a capturable body is recorded as a CUDA graph and replayed.
 - Device optimizers (fused SGD/Adam/AdamW steps and the global-norm clip)
   live in `cuda_optimizer.rs`.
-- `CudaReal` selects `f32` (default) or `f64` (`precision="float64"`).
+- `CudaReal` selects `f32` (`float32` programs) or `f64` (`float64` programs).
 - The `cuda-nccl` feature adds `CudaDataParallelExecutionPlan`.
 
 ### MLX

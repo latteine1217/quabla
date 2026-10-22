@@ -188,7 +188,7 @@ pub struct CudaBackend {
 
 #[cfg(not(all(feature = "cuda", target_os = "linux")))]
 /// `T` is the device element type of the CUDA build's plan (`f32`, or `f64`
-/// for the `precision="float64"` lowering); this build never constructs one.
+/// for a program with `float64` values); this build never constructs one.
 #[derive(Clone, Debug)]
 pub struct CudaExecutionPlan<T = f32> {
     plan: TensorExecutionPlan,
@@ -5200,9 +5200,11 @@ impl TensorIr {
 
     /// True when any element of a `Bool` tensor is true (scalar `Bool`).
     ///
-    /// Lowered as `sum(cast(input, f64)) > 0`: a sum of non-negative 0/1
-    /// values is zero only when every term is zero, even when a device
-    /// accumulates in `f32`, so no dedicated reduction kernel is needed.
+    /// Lowered as `sum(cast(input, f64)) > 0` with a weak cast: a sum of
+    /// non-negative 0/1 values is zero only when every term is zero in any
+    /// floating dtype, so the count takes the dtype of the program it is in
+    /// (a `float32` program stays `float32` on a device) and no dedicated
+    /// reduction kernel is needed.
     pub fn any(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
         self.bool_count_reduction("any", input, None, false)
     }
@@ -5230,7 +5232,15 @@ impl TensorIr {
     ) -> Result<TensorNodeId, String> {
         self.ensure_bool_operands(op_name, &[input])?;
         let counted = if all { self.logical_not(input)? } else { input };
-        let counted = self.cast(counted, TensorDType::F64)?;
+        // Weak, like a Python scalar: the count is only compared with zero,
+        // which gives the same answer in every floating dtype.
+        let shape = self.node(counted)?.shape.clone();
+        let counted = self.push_node(
+            TensorOp::Cast { input: counted },
+            shape,
+            TensorDType::F64,
+            true,
+        );
         let count = match axis {
             Some(axis) => self.sum_axis(counted, axis)?,
             None => self.sum(counted)?,
@@ -12199,8 +12209,9 @@ impl TensorExecutionPlan {
         }
     }
 
-    /// Checks the `precision="float64"` CUDA lowering, which gives the plan
-    /// `f64` device buffers: no node, nested regions included, may be `float32`.
+    /// Checks the CUDA `f64` lowering of a program with `float64` values,
+    /// which gives the plan `f64` device buffers: no node, nested regions
+    /// included, may be `float32`.
     pub fn validate_cuda_float64(&self) -> Result<(), (String, String)> {
         #[cfg(all(feature = "cuda", target_os = "linux"))]
         {
@@ -12215,9 +12226,25 @@ impl TensorExecutionPlan {
         }
     }
 
-    /// Whether any node of this plan (outside nested regions) is `float64`.
-    pub fn has_float64_nodes(&self) -> bool {
-        self.nodes.iter().any(|node| node.dtype == TensorDType::F64)
+    /// Whether this plan computes `float64` values: a strong `float64` node
+    /// in it or in a plan it runs (region bodies and the derivative plans of
+    /// `region::evaluator_region_plans`), or a `float64` output. Weak nodes
+    /// (Python scalars and AD-internal constants) are not counted: they take
+    /// the dtype of the strong operand they are combined with, so a `float32`
+    /// program that holds a weak `float64` zero is still a `float32` program.
+    pub fn has_float64_values(&self) -> Result<bool, (String, String)> {
+        let outputs = self.output_node_ids.iter();
+        let mut found = outputs
+            .map(|&id| &self.nodes[id])
+            .any(|node| node.dtype == TensorDType::F64);
+        self.try_for_each_plan(&region::evaluator_region_plans, &mut |plan| {
+            found |= plan
+                .nodes
+                .iter()
+                .any(|node| node.dtype == TensorDType::F64 && !node.weak);
+            Ok(())
+        })?;
+        Ok(found)
     }
 
     /// Checks lazy MLX lowering without allocating arrays or executing a branch.
@@ -13397,8 +13424,8 @@ fn cuda_broadcast_offset_function_named(
 
 /// A CUDA `float` literal that rounds `value` like `value as f32`, spelled
 /// with the shortest round-trip `f64` digits: a value exact in `f32` keeps an
-/// `f` suffix, any other is cast to `float`. A program retyped to `double` for
-/// `precision="float64"` drops the suffix and the cast and so keeps every bit
+/// `f` suffix, any other is cast to `float`. A program with `float64` values,
+/// retyped to `double`, drops the suffix and the cast and so keeps every bit
 /// of the `f64` constant (the shortest `f32` digits would not: `2^-12` would
 /// become `0.00024414062`).
 fn cuda_scalar_literal(value: f64) -> String {

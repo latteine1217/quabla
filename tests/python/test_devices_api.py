@@ -81,12 +81,17 @@ def test_device_jit_matches_cpu_for_nested_transforms_and_pytrees():
         f = qb.jit(lambda y: y * y, device=device)
         with warnings.catch_warnings(record=True) as seen:
             warnings.simplefilter("always", UserWarning)
-            f(qb.array([2.0, 3.0]))
-            f(qb.array([3.0, 4.0]))
-            f(qb.array([1.0]))
-        assert len(seen) == 1
-        # The warning names the caller's line, not quabla's cache layers.
-        assert seen[0].filename == __file__, seen[0].filename
+            if device == "mlx":
+                # MLX has no float64 arithmetic: a float64 program is
+                # rejected instead of being run in float32.
+                error = raises(qb.UnsupportedOperationError, f, qb.array([2.0, 3.0]))
+                assert (error.op, error.device) == ("float64", "mlx")
+                assert "Apple GPUs" in str(error)
+                assert f(qb.array([2.0, 3.0], dtype=qb.float32)).dtype == qb.float32
+            else:
+                # CUDA runs a float64 program in float64.
+                assert f(qb.array([2.0, 3.0])).dtype == qb.float64
+        assert not seen, [str(w.message) for w in seen]
         if device == "mlx":
             unsupported = qb.jit(lambda a: a + float("inf"), device="mlx")
             error = raises(
@@ -652,15 +657,20 @@ def test_cuda_float64_precision_matches_cpu():
         qb.array(series(8, 0.5)),
     )
 
-    # The default lowering still warns and computes in float32.
+    # The default precision runs the float64 program in float64 too, with no
+    # warning: no program is converted to float32.
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         default = qb.jit(lambda a: qb.sum(a), device="cuda")(many)
-    assert any("float32" in str(warning.message) for warning in caught)
-    assert abs(default.item() - qb.jit(lambda a: qb.sum(a))(many).item()) > 1e-9
+    assert not caught, [str(warning.message) for warning in caught]
+    assert default.dtype == qb.float64
+    expected = qb.jit(lambda a: qb.sum(a))(many).item()
+    # A different summation order: double rounding, about 1e-12 relative.
+    assert abs(default.item() - expected) <= 1e-11 * abs(expected)
 
-    # One plan has one floating element type: float32 values are rejected.
-    mixed = qb.jit(lambda a, b: a + b.astype(qb.float64), device="cuda", precision="float64")
+    # One plan has one floating element type: float32 values are rejected,
+    # with either precision, rather than run in double.
+    mixed = qb.jit(lambda a, b: a + b.astype(qb.float64), device="cuda")
     error = raises(
         qb.UnsupportedOperationError, mixed, qb.array([1.0]), qb.array([2.0], dtype=qb.float32)
     )
@@ -701,16 +711,14 @@ def test_cuda_register_heavy_kernels_launch_within_the_device_limit():
         ),
         "hvp": (lambda a: qb.jvp(qb.grad(loss), (a,), (qb.ones_like(a),))[1], many),
     }
-    for precision, tolerance in ((None, 1e-5), ("float64", 1e-12)):
+    for precision in (None, "float64"):
         options = {"device": "cuda"} | ({"precision": precision} if precision else {})
         for name, (function, argument) in programs.items():
             expected = qb.jit(function)(argument)
-            with warnings.catch_warnings():
-                # The default precision warns that float64 runs as float32.
-                warnings.simplefilter("ignore")
-                actual = qb.jit(function, **options)(argument)
+            actual = qb.jit(function, **options)(argument)
             assert actual.shape == expected.shape, (name, precision)
-            close_normwise(actual.astype(qb.float64), expected, tolerance)
+            assert actual.dtype == qb.float64, (name, precision)
+            close_normwise(actual, expected, 1e-12)
 
 
 if __name__ == "__main__":

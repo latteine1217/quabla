@@ -92,8 +92,8 @@ MLX. The exact rules are listed in the
 - **CPU**: decompositions run in `float64` and are rounded for `float32`
   inputs.
 - **CUDA**: cuSOLVER (`getrf`/`getrs`, `syevd`, `geqrf`/`orgqr`, `gesvdj`),
-  one call per batch element, in `float32` or, with
-  `precision="float64"`, in `float64`.
+  one call per batch element, in the program's dtype (`float32` or
+  `float64`).
 - **MLX**: MLX 0.32 has no GPU kernels for LU, `eigh`, QR, or SVD, so they
   run with LAPACK on MLX's CPU stream (unified memory, no copies), and the
   CPU's sign conventions are applied on the GPU. `solve` substitutes in a

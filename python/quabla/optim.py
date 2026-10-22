@@ -318,13 +318,14 @@ class Trainer:
     Every device accepts Adam, AdamW, and SGD with the CPU's update rules,
     including ``clip_norm``: the global norm and its clip factor are reduced on
     the device, so gradients are never read back. A schedule is evaluated on
-    the host and sets the native rate before every step. Device plans compute
-    in float32 by default and agree with the CPU trainer up to that rounding.
+    the host and sets the native rate before every step. Parameters, moments,
+    and the loss keep their dtype, as in ``jit``: a float64 loss trains in
+    double precision on CUDA and a float32 one in single precision; MLX, which
+    has no float64 arithmetic, rejects a float64 loss.
 
-    ``precision`` is ``jit``'s opt-in: ``"float64"`` on CUDA runs a float64
-    loss natively in double and keeps parameters and moments in float64 on
-    the device. The CPU already trains in float64, and MLX, which has no
-    float64 arithmetic, rejects it.
+    ``precision`` is ``jit``'s: ``"float64"`` states the request explicitly,
+    changes nothing on the CPU and CUDA, and is rejected on MLX, which has no
+    float64 arithmetic.
     """
 
     def __init__(
@@ -348,8 +349,8 @@ class Trainer:
         target, ordinal = parse_device(device)
         if precision == "float64" and target == "mlx":
             raise _UnsupportedOperationError(
-                'MLX has no float64 arithmetic; precision="float64" is supported on '
-                "the CPU and CUDA",
+                "MLX cannot run float64 programs: Apple GPUs have no double-precision "
+                'arithmetic; precision="float64" is supported on the CPU and CUDA',
                 op="float64",
                 device=device,
             )

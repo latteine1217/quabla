@@ -250,7 +250,13 @@ def test_feature_unavailable_contract():
 
 def test_nccl_numerical_parity():
     require("nccl")
-    for dtype in (qb.float64, qb.float32):
+    # The NCCL replicas run float32 plans; a float64 loss is rejected rather
+    # than converted to float32.
+    error = expect(
+        qb.UnsupportedOperationError, "float32 programs only", lambda: transform()(*arguments())
+    )
+    assert (error.op, error.device) == ("float64", "cuda")
+    for dtype in (qb.float32,):
         params, batch = arguments(dtype=dtype)
         for reduction in ("sum", "mean"):
             actual, grads = transform(reduction=reduction)(params, batch)

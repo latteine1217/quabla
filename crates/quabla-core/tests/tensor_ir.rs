@@ -499,6 +499,18 @@ fn assert_f32_mlp_parity(target: QuablaTarget) {
         must!(DynamicTensor::new(vec![3], vec![0.1, -2.5e-3, 7.0 / 3.0])),
     )]);
     let cpu = must!(must!(compiler.compile_many(&program, QuablaTarget::Cpu)).execute(&inputs));
+    if matches!(target, QuablaTarget::Cuda { .. }) {
+        // A CUDA program computes in one floating dtype and converts nothing,
+        // so a program with float32 and float64 values is rejected.
+        let error = compiler
+            .compile_many_checked(&program, target)
+            .expect_err("CUDA rejects a mixed float32/float64 program");
+        assert!(
+            matches!(&error, QuablaCompileError::Unsupported { op, .. } if op == "float32"),
+            "{error:?}"
+        );
+        return;
+    }
     let device = must!(must!(compiler.compile_many(&program, target)).execute(&inputs));
     for (actual, expected) in device.iter().zip(&cpu) {
         assert_eq!(actual.dtype(), expected.dtype());
@@ -7050,14 +7062,14 @@ fn bool_inputs(x: &[f64]) -> BTreeMap<String, DynamicTensor> {
 /// Output nodes paired with their expected CPU values.
 type ExpectedOutputs = Vec<(TensorNodeId, Vec<f64>)>;
 
-/// Every D2 primitive over `x`/`y` (NaN, ±inf and ties) plus the promotion
-/// rules against an `f32` residual `r`. Outputs are exact 0/1 masks or
-/// finite values, paired with their expected CPU results.
-fn bool_primitive_program() -> Result<(TensorIr, ExpectedOutputs), String> {
+/// Every D2 primitive over `x`/`y` of `dtype` (NaN, ±inf and ties) plus the
+/// promotion rules against an `f32` residual `r`. Outputs are exact 0/1
+/// masks or finite values, paired with their expected CPU results.
+fn bool_primitive_program(dtype: TensorDType) -> Result<(TensorIr, ExpectedOutputs), String> {
     use TensorComparison::*;
     let mut graph = TensorIr::new();
-    let x = graph.input("x", vec![2, 3])?;
-    let y = graph.input("y", vec![2, 3])?;
+    let x = graph.input_typed("x", vec![2, 3], dtype)?;
+    let y = graph.input_typed("y", vec![2, 3], dtype)?;
     let r = graph.input_typed("r", vec![2, 3], TensorDType::F32)?;
     let mut outputs = Vec::new();
     let expected_compare = [
@@ -7187,7 +7199,7 @@ fn bool_dtype_rounds_to_zero_one_and_lowers_to_f32_on_devices() {
 
 #[test]
 fn comparisons_logical_ops_and_reductions_follow_ieee_semantics_on_cpu() {
-    let (graph, outputs) = must!(bool_primitive_program());
+    let (graph, outputs) = must!(bool_primitive_program(TensorDType::F64));
     let inputs = bool_inputs(&BOOL_X);
     let text = graph.lower_text();
     assert!(
@@ -7714,8 +7726,18 @@ fn cond_regions_capture_bool_masks_without_differentiating_them() {
 ))]
 fn assert_bool_parity(target: QuablaTarget) {
     let compiler = QuablaCompiler;
-    let inputs = bool_inputs(&BOOL_X);
-    let (graph, outputs) = must!(bool_primitive_program());
+    // `x` and `y` are float32 like the residual: a device program computes
+    // in one floating dtype.
+    let mut inputs = bool_inputs(&BOOL_X);
+    for (name, values) in [("x", BOOL_X), ("y", BOOL_Y)] {
+        let value = must!(DynamicTensor::with_dtype(
+            vec![2, 3],
+            values.to_vec(),
+            TensorDType::F32
+        ));
+        inputs.insert(name.to_string(), value);
+    }
+    let (graph, outputs) = must!(bool_primitive_program(TensorDType::F32));
     let program = must!(QuablaMultiOutputProgram::new(
         graph,
         outputs.iter().map(|(output, _)| *output).collect()
@@ -7741,6 +7763,7 @@ fn assert_bool_parity(target: QuablaTarget) {
     let vjp = must!(graph.symbolic_vjp(loss, "seed"));
     let outputs = vec![vjp.value, vjp.gradients["x"], vjp.gradients["w"]];
     let program = must!(QuablaMultiOutputProgram::new(vjp.graph, outputs));
+    let inputs = bool_inputs(&BOOL_X);
     let cpu = must!(must!(compiler.compile_many(&program, QuablaTarget::Cpu)).execute(&inputs));
     let device = must!(must!(compiler.compile_many(&program, target)).execute(&inputs));
     let error = max_scaled_error(&device, &cpu);

@@ -178,8 +178,9 @@ details.
 
 The CPU backend is the `float64` reference implementation: it interprets the
 frozen plan, rounding every `float32` operation to `f32`. CUDA and MLX lower
-the same plan to GPU kernels and run in `f32` (CUDA can opt into native
-`f64`). You choose a backend per compiled function:
+the same plan to GPU kernels: CUDA runs each program in its own dtype,
+`f32` or `f64`, and MLX, which has no `f64` arithmetic, runs `f32`
+programs and rejects `f64` ones. You choose a backend per compiled function:
 
 ```python
 step = qb.jit(qb.value_and_grad(loss), device="mlx")    # or "cuda", "cuda:1", "cpu"

@@ -8,7 +8,6 @@ eigenvalue gaps above ~0.3, so a float64 solve is accurate to ~1e-13 and a
 central difference with step 1e-6 to ~1e-8.
 """
 
-import warnings
 
 try:
     import numpy as np
@@ -764,11 +763,14 @@ def test_mlx_linalg_matches_the_cpu():
             assert np.all(np.isnan(got[nonfinite])) and np.all(np.isnan(want[nonfinite]))
             assert_close(got[1 - nonfinite], want[1 - nonfinite], 1e-4)
 
-    # float64 programs run in float32 on MLX and keep their logical dtype.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning)
-        assert_device_matches_cpu("mlx", qb.linalg.solve, (a.astype(np.float64), b.astype(np.float64)), 1e-4)
-        assert_device_matches_cpu("mlx", lambda m: tuple(qb.linalg.svd(m)), (tall.astype(np.float64),), 1e-4)
+    # MLX has no float64 arithmetic: float64 programs are rejected, not run
+    # in float32.
+    for function, arguments in (
+        (qb.linalg.solve, (a.astype(np.float64), b.astype(np.float64))),
+        (lambda m: tuple(qb.linalg.svd(m)), (tall.astype(np.float64),)),
+    ):
+        error = raises(qb.UnsupportedOperationError, on_mlx(function), *arguments)
+        assert (error.op, error.device) == ("float64", "mlx")
 
 
 if __name__ == "__main__":
