@@ -9,6 +9,15 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-22
+
+The first patch of the v1.0.x plan in `docs/jax_like_roadmap.md`: devices no
+longer change a program's precision, the public Python API is typed, and
+Linux aarch64 gets wheels. The precision fix changes results: a `float64`
+program now runs in double precision on CUDA and raises on MLX, where 1.0.0
+ran it in single precision with a `UserWarning` (see Fixed). Programs built
+from `float32` arrays behave as before.
+
 ### Added
 
 - Linux `aarch64` wheels (manylinux_2_28) with the CPU and CUDA backends,
@@ -1004,7 +1013,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/latteine1217/quabla/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/latteine1217/quabla/compare/v0.7.1...v1.0.0
 [0.7.1]: https://github.com/latteine1217/quabla/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/latteine1217/quabla/compare/v0.6.1...v0.7.0
