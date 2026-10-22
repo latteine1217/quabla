@@ -9,6 +9,13 @@ deprecated names keep working until 1.0 (see
 
 ## [Unreleased]
 
+### Added
+
+- Linux `aarch64` wheels (manylinux_2_28) with the CPU and CUDA backends,
+  built on a native Arm runner. The CUDA backend of these wheels is built
+  but not yet validated on an Arm GPU host. Windows is not supported; use
+  WSL.
+
 ### Fixed
 
 - CUDA no longer converts `float64` programs to `float32`. `jit`, `Trainer`,

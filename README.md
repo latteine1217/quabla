@@ -163,7 +163,7 @@ finite CPU derivative results use `1e-12`.
 ## Installation
 
 ```sh
-pip install quabla       # Linux x86_64: CPU + CUDA; macOS arm64: CPU
+pip install quabla       # Linux x86_64/aarch64: CPU + CUDA; macOS arm64: CPU
 pip install quabla-mlx   # macOS 14+ on Apple silicon: CPU + MLX
 ```
 
@@ -237,9 +237,9 @@ MACOSX_DEPLOYMENT_TARGET=14.0 maturin build --release --features mlx
 
 The `Wheels` workflow ([.github/workflows/wheels.yml](.github/workflows/wheels.yml))
 builds the published distributions for CPython 3.10 to 3.14: `quabla` wheels
-for Linux x86_64 (manylinux_2_28, `cuda-nccl` features) and macOS arm64 (CPU),
-the `quabla` source distribution, and `quabla-mlx` wheels for macOS arm64
-(`mlx` feature). Version tags publish them to TestPyPI and then PyPI through
+for Linux x86_64 and aarch64 (manylinux_2_28, `cuda-nccl` features) and macOS
+arm64 (CPU), the `quabla` source distribution, and `quabla-mlx` wheels for
+macOS arm64 (`mlx` feature). Version tags publish them to TestPyPI and then PyPI through
 trusted publishing, each upload after approval; a manual run builds them and
 can publish to TestPyPI only.
 

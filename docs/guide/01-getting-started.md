@@ -19,7 +19,7 @@ Two distributions provide the same `quabla` package. Install exactly one of
 them per environment:
 
 ```sh
-pip install quabla       # Linux x86_64: CPU + CUDA; macOS arm64: CPU
+pip install quabla       # Linux x86_64/aarch64: CPU + CUDA; macOS arm64: CPU
 pip install quabla-mlx   # macOS 14+ on Apple silicon: CPU + MLX
 ```
 
