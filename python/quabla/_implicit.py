@@ -32,7 +32,11 @@ reverse passes (`grad(grad(...))`, `jvp(grad(...))`, `jvp(jvp(...))`, ...)
 uses the rules, and so does one more reverse pass.
 """
 
+from __future__ import annotations
+
 import operator
+from collections.abc import Callable
+from typing import Any
 
 from . import tree
 from ._custom import custom_vjp
@@ -46,7 +50,13 @@ from ._transforms import jvp, vjp
 ORDER = 2
 
 
-def implicit(name, solve, adjoint, tangent, order=ORDER):
+def implicit(
+    name: str,
+    solve: Callable[..., Any],
+    adjoint: Callable[..., Any],
+    tangent: Callable[..., Any],
+    order: int = ORDER,
+) -> Callable[..., Any]:
     """`solve(*operands) -> (x, stats)` with derivatives of `order` passes
     (see the module notes; a negative order is the plain `solve`).
     `adjoint(order, x, operands, x_bar)` returns one cotangent per operand

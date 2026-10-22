@@ -10,7 +10,11 @@ function theorem at the root (see `_implicit`), not from the iterations,
 which also makes the `while_loop`'s lack of a reverse mode irrelevant.
 """
 
+from __future__ import annotations
+
 import math
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from . import _quabla
 from ._array import asarray, eye, zeros
@@ -27,6 +31,9 @@ from ._implicit import (
     tolerance,
 )
 from ._quabla import Tensor, TraceTensor, float32, float64
+
+if TYPE_CHECKING:
+    from ._typing import Array, ArrayLike
 from ._transforms import jacobian
 from .linalg import qr as _qr
 from .linalg import solve as _solve
@@ -184,7 +191,35 @@ def _solver(apply, tol, maxiter, order):
     return implicit("newton", _iteration(apply, tol, maxiter), adjoint, tangent, order)
 
 
-def newton(f, x0, *, args=(), tol=None, maxiter=50, info=False):
+@overload
+def newton(
+    f: Callable[..., Any],
+    x0: ArrayLike,
+    *,
+    args: Sequence[Any] = (),
+    tol: float | None = None,
+    maxiter: int = 50,
+    info: Literal[False] = False,
+) -> Array: ...
+@overload
+def newton(
+    f: Callable[..., Any],
+    x0: ArrayLike,
+    *,
+    args: Sequence[Any] = (),
+    tol: float | None = None,
+    maxiter: int = 50,
+    info: Literal[True],
+) -> tuple[Array, dict[str, Any]]: ...
+def newton(
+    f: Callable[..., Any],
+    x0: ArrayLike,
+    *,
+    args: Sequence[Any] = (),
+    tol: float | None = None,
+    maxiter: int = 50,
+    info: bool = False,
+) -> Array | tuple[Array, dict[str, Any]]:
     """A root `x` of `f(x, *args) = 0`, by Newton's method from `x0`.
 
     `f` maps an array shaped like `x0` (any shape; the solve treats it as a

@@ -6,42 +6,45 @@ and argument order follow the optax schedule of the same role; invalid
 configurations raise ``ValueError`` where optax warns and falls back.
 """
 
+from __future__ import annotations
+
 import math as _math
 import operator as _operator
+from collections.abc import Callable, Sequence
 
 
-def _finite(value, name):
+def _finite(value: float, name: str) -> float:
     value = float(value)
     if not _math.isfinite(value):
         raise ValueError(f"{name} must be finite")
     return value
 
 
-def _steps(value, name):
+def _steps(value: int, name: str) -> int:
     value = _operator.index(value)
     if value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
 
 
-def constant(value):
+def constant(value: float) -> Callable[[int], float]:
     """Return ``value`` at every step (optax ``constant_schedule``)."""
     value = _finite(value, "value")
 
-    def schedule(step):
+    def schedule(step: int) -> float:
         return value
 
     return schedule
 
 
 def exponential_decay(
-    init_value,
-    transition_steps,
-    decay_rate,
-    transition_begin=0,
-    staircase=False,
-    end_value=None,
-):
+    init_value: float,
+    transition_steps: int,
+    decay_rate: float,
+    transition_begin: int = 0,
+    staircase: bool = False,
+    end_value: float | None = None,
+) -> Callable[[int], float]:
     """``init_value * decay_rate ** ((step - transition_begin) / transition_steps)``.
 
     The rate holds ``init_value`` until ``transition_begin``; ``staircase``
@@ -57,12 +60,12 @@ def exponential_decay(
     transition_begin = _operator.index(transition_begin)
     if transition_begin < 0:
         raise ValueError("transition_begin must be nonnegative")
+    clip = max if decay_rate < 1 else min
     if end_value is not None:
         end_value = _finite(end_value, "end_value")
-        clip = max if decay_rate < 1 else min
     staircase = bool(staircase)
 
-    def schedule(step):
+    def schedule(step: int) -> float:
         count = step - transition_begin
         if count <= 0:
             value = init_value
@@ -78,7 +81,7 @@ def exponential_decay(
     return schedule
 
 
-def cosine_decay(init_value, decay_steps, alpha=0.0):
+def cosine_decay(init_value: float, decay_steps: int, alpha: float = 0.0) -> Callable[[int], float]:
     """``init_value * ((1 - alpha) * 0.5 * (1 + cos(pi * t / decay_steps)) + alpha)``.
 
     ``t = min(step, decay_steps)``, so the rate stays at
@@ -89,7 +92,7 @@ def cosine_decay(init_value, decay_steps, alpha=0.0):
     decay_steps = _steps(decay_steps, "decay_steps")
     alpha = _finite(alpha, "alpha")
 
-    def schedule(step):
+    def schedule(step: int) -> float:
         count = min(step, decay_steps)
         cosine = 0.5 * (1 + _math.cos(_math.pi * count / decay_steps))
         return init_value * ((1 - alpha) * cosine + alpha)
@@ -98,8 +101,12 @@ def cosine_decay(init_value, decay_steps, alpha=0.0):
 
 
 def warmup_cosine_decay(
-    init_value, peak_value, warmup_steps, decay_steps, end_value=0.0
-):
+    init_value: float,
+    peak_value: float,
+    warmup_steps: int,
+    decay_steps: int,
+    end_value: float = 0.0,
+) -> Callable[[int], float]:
     """Linear warmup to ``peak_value``, then cosine decay to ``end_value``.
 
     ``decay_steps`` includes the warmup, as in optax
@@ -118,7 +125,7 @@ def warmup_cosine_decay(
     alpha = 0.0 if peak_value == 0 else end_value / peak_value
     decay = cosine_decay(peak_value, decay_steps - warmup_steps, alpha)
 
-    def schedule(step):
+    def schedule(step: int) -> float:
         if step < warmup_steps:
             # optax linear_schedule: the fraction of warmup left, times the
             # rise, plus the end point.
@@ -129,7 +136,7 @@ def warmup_cosine_decay(
     return schedule
 
 
-def piecewise_constant(boundaries, values):
+def piecewise_constant(boundaries: Sequence[int], values: Sequence[float]) -> Callable[[int], float]:
     """``values[i]`` for ``boundaries[i - 1] <= step < boundaries[i]``.
 
     ``values`` has one more entry than the strictly increasing
@@ -145,7 +152,7 @@ def piecewise_constant(boundaries, values):
     ):
         raise ValueError("boundaries must be nonnegative and strictly increasing")
 
-    def schedule(step):
+    def schedule(step: int) -> float:
         return values[sum(step >= b for b in boundaries)]
 
     return schedule

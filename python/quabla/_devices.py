@@ -1,14 +1,16 @@
 """Explicit build targets and abstract array inputs for ahead-of-time tracing."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from ._errors import UnsupportedOperationError
 from ._quabla import Compiler, bool_, float32, float64
+from ._quabla import dtype as _DType
 
 __all__ = ["ShapeDtype", "devices"]
 
 
-def parse_device(device):
+def parse_device(device: str | None) -> tuple[str, int]:
     if device is None or device == "cpu":
         return "cpu", 0
     if device in ("cuda", "mlx"):
@@ -20,7 +22,7 @@ def parse_device(device):
     )
 
 
-def require_device(device, op):
+def require_device(device: str | None, op: str) -> tuple[str, int]:
     target, ordinal = parse_device(device)
     if not Compiler().capability(target):
         raise UnsupportedOperationError(
@@ -29,7 +31,7 @@ def require_device(device, op):
     return target, ordinal
 
 
-def devices():
+def devices() -> list[str]:
     """Built targets; this does not probe hardware or enumerate physical GPUs."""
     return [target for target, built in Compiler().capabilities().items() if built]
 
@@ -38,10 +40,10 @@ def devices():
 class ShapeDtype:
     """An array signature without storage, accepted by `jit(...).lower`."""
 
-    shape: tuple
-    dtype: object = float64
+    shape: Sequence[int]
+    dtype: _DType = float64
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         shape = tuple(self.shape)
         if any(type(extent) is not int or extent < 0 for extent in shape):
             raise ValueError("shape extents must be non-negative integers")

@@ -58,6 +58,10 @@ jobs:
       # pipx ships with the runner image. Ruff is pinned to a minor series so
       # a new release cannot turn the gate red without a code change.
       - run: pipx run --spec 'ruff>=0.15,<0.16' ruff check tests examples python
+      # Type check of the public Python API (pyrightconfig.json: standard
+      # mode over python/quabla, reading the extension's `_quabla.pyi`, so no
+      # build is needed). Pinned exactly: new pyright releases add checks.
+      - run: pipx run --spec 'pyright==1.1.414' pyright
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Compile-only check of the CUDA/NCCL backend, which macOS development
       # machines cannot compile at all. cudarc is built with

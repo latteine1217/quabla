@@ -7,6 +7,10 @@ losses and ``mean`` averages them, independently of the loss's own reduction.
 """
 
 # Imported under private aliases so the public module namespace is `__all__`.
+from collections.abc import Callable as _Callable
+from collections.abc import Sequence as _Sequence
+from typing import Any as _Any
+
 from . import _quabla
 from ._devices import parse_device as _parse_device
 from ._errors import UnsupportedOperationError as _UnsupportedOperationError
@@ -183,7 +187,14 @@ class _DistributedValueAndGrad:
         return value, _unflatten(grad_node, iter(grad_values))
 
 
-def value_and_grad(fun, *, devices, shard_argnums, argnums=0, reduction="mean"):
+def value_and_grad(
+    fun: _Callable[..., _Any],
+    *,
+    devices: _Sequence[str],
+    shard_argnums: int | _Sequence[int],
+    argnums: int | _Sequence[int] = 0,
+    reduction: str = "mean",
+) -> _Callable[..., _Any]:
     """Return a scalar loss and replicated parameter gradients using NCCL.
 
     ``shard_argnums`` selects positional batch pytrees, whose array leaves

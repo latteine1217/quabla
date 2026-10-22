@@ -25,15 +25,24 @@ transposes, broadcasts, slices, static-index gathers, `concat`, `where`, and
 static Python ints, since quabla has no integer arrays.
 """
 
+from __future__ import annotations
+
 import builtins
 import math
 import numbers
 import operator
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any
 
 from . import linalg as _linalg
 from ._array import _shape, arange, asarray, full
 from ._quabla import Tensor, TraceTensor, bool_, concat, float32, stack
 from ._quabla import where as _where
+
+if TYPE_CHECKING:
+    from typing_extensions import TypeIs
+
+    from ._typing import Array, ArrayLike, Axis, DType, Reduction, Shape
 
 __all__ = [
     "arccos",
@@ -132,12 +141,23 @@ __all__ = [
 _ARRAYS = (Tensor, TraceTensor)
 
 
-def _array(x):
+def _is_number(value: object) -> TypeIs[float]:
+    """Whether `value` is a Python or NumPy number, which stays a weak
+    scalar."""
+    return isinstance(value, numbers.Number)
+
+
+def _is_integral(value: object) -> TypeIs[int]:
+    """Whether `value` is a Python or NumPy integer."""
+    return isinstance(value, numbers.Integral)
+
+
+def _array(x: ArrayLike) -> Array:
     return x if isinstance(x, _ARRAYS) else asarray(x)
 
 
-def _unary(name):
-    def function(x):
+def _unary(name: str) -> Callable[[ArrayLike], Array]:
+    def function(x: ArrayLike) -> Array:
         return getattr(_array(x), name)()
 
     function.__name__ = function.__qualname__ = name
@@ -145,8 +165,8 @@ def _unary(name):
     return function
 
 
-def _reduction(name):
-    def function(x, axis=None, keepdims=False):
+def _reduction(name: str) -> Reduction:
+    def function(x: ArrayLike, axis: Axis = None, keepdims: bool = False) -> Array:
         return getattr(_array(x), name)(axis=axis, keepdims=keepdims)
 
     function.__name__ = function.__qualname__ = name
@@ -157,11 +177,11 @@ def _reduction(name):
     return function
 
 
-def _symmetric_binary(name):
-    def function(x1, x2):
-        if isinstance(x1, numbers.Number) and isinstance(x2, _ARRAYS):
+def _symmetric_binary(name: str) -> Callable[[ArrayLike, ArrayLike], Array]:
+    def function(x1: ArrayLike, x2: ArrayLike) -> Array:
+        if _is_number(x1) and isinstance(x2, _ARRAYS):
             x1, x2 = x2, x1
-        return getattr(_array(x1), name)(x2 if isinstance(x2, numbers.Number) else _array(x2))
+        return getattr(_array(x1), name)(x2 if _is_number(x2) else _array(x2))
 
     function.__name__ = function.__qualname__ = name
     function.__doc__ = f"Elementwise `{name}` of two arrays, or of an array and a Python number."
@@ -215,7 +235,7 @@ maximum = _symmetric_binary("maximum")
 minimum = _symmetric_binary("minimum")
 
 
-def power(x1, x2):
+def power(x1: ArrayLike, x2: ArrayLike) -> Array:
     """Elementwise `x1 ** x2`; `quabla.power(x, y)` is `x ** y`.
 
     Either operand may be a Python number, which stays a weak scalar adopting
@@ -226,13 +246,13 @@ def power(x1, x2):
     array, to the differentiable `pow` op, whose derivative conventions at
     `x1 <= 0` are listed in `docs/api.md`.
     """
-    if isinstance(x1, numbers.Number) and not isinstance(x2, numbers.Number):
+    if _is_number(x1) and not _is_number(x2):
         # Called directly: `x1 ** x2` would let a NumPy scalar base take over.
         return _array(x2).__rpow__(x1)
-    return _array(x1) ** (x2 if isinstance(x2, numbers.Number) else _array(x2))
+    return _array(x1) ** (x2 if _is_number(x2) else _array(x2))
 
 
-def atan2(x1, x2):
+def atan2(x1: ArrayLike, x2: ArrayLike) -> Array:
     """Elementwise four-quadrant `atan2(x1, x2)`, the angle of the point
     `(x2, x1)`; `quabla.atan2(y, x)` is `y.atan2(x)`.
 
@@ -241,13 +261,13 @@ def atan2(x1, x2):
     `(x2, -x1) / (x1^2 + x2^2)`, evaluated without overflow, and is defined as
     zero at the origin (see `docs/api.md`).
     """
-    if isinstance(x1, numbers.Number) and not isinstance(x2, numbers.Number):
+    if _is_number(x1) and not _is_number(x2):
         x2 = _array(x2)
         return asarray(x1, dtype=x2.dtype).atan2(x2)
-    return _array(x1).atan2(x2 if isinstance(x2, numbers.Number) else _array(x2))
+    return _array(x1).atan2(x2 if _is_number(x2) else _array(x2))
 
 
-def fmod(x1, x2):
+def fmod(x1: ArrayLike, x2: ArrayLike) -> Array:
     """Elementwise C `fmod(x1, x2)`: the remainder `x1 - n x2` of the quotient
     `n` truncated toward zero, which has the sign of `x1` (NumPy's `fmod`);
     `quabla.fmod(x, y)` is `x.fmod(y)`.
@@ -257,13 +277,13 @@ def fmod(x1, x2):
     infinite `x1`, and `x1` for an infinite `x2`. The derivative is `1` in
     `x1` and `-trunc(x1 / x2)` in `x2` (zero second derivatives).
     """
-    if isinstance(x1, numbers.Number) and not isinstance(x2, numbers.Number):
+    if _is_number(x1) and not _is_number(x2):
         x2 = _array(x2)
         return asarray(x1, dtype=x2.dtype).fmod(x2)
-    return _array(x1).fmod(x2 if isinstance(x2, numbers.Number) else _array(x2))
+    return _array(x1).fmod(x2 if _is_number(x2) else _array(x2))
 
 
-def mod(x1, x2):
+def mod(x1: ArrayLike, x2: ArrayLike) -> Array:
     """Elementwise floor-mod remainder with NumPy's `mod`/`remainder`
     semantics: `x1 - floor(x1 / x2) x2`, which has the sign of `x2`, as
     Python's `%` on floats.
@@ -277,7 +297,7 @@ def mod(x1, x2):
     same function.
     """
     r = fmod(x1, x2)
-    y = asarray(x2, dtype=r.dtype) if isinstance(x2, numbers.Number) else _array(x2)
+    y = asarray(x2, dtype=r.dtype) if _is_number(x2) else _array(x2)
     y_negative = y < 0.0
     adjust = ((r < 0.0) & (y > 0.0)) | ((r > 0.0) & y_negative)
     floored = _where(adjust, r + y, r)
@@ -289,14 +309,14 @@ def mod(x1, x2):
 remainder = mod
 
 
-def cumsum(x, axis=None, reverse=False):
+def cumsum(x: ArrayLike, axis: int | None = None, reverse: bool = False) -> Array:
     """Inclusive prefix sums along `axis`, over the flattened array when
     `axis` is `None` (as in NumPy), from the last entry when `reverse`;
     `quabla.cumsum(x, axis)` is `x.cumsum(axis)`."""
     return _array(x).cumsum(axis=axis, reverse=reverse)
 
 
-def matmul(x1, x2):
+def matmul(x1: ArrayLike, x2: ArrayLike) -> Array:
     """Matrix product with NumPy's rules: for operands of rank 2 or more it
     is `x1 @ x2`, batched over the leading axes. A rank-1 `x1` is a row
     vector and a rank-1 `x2` a column vector, whose unit axis is removed
@@ -319,39 +339,39 @@ def matmul(x1, x2):
     return product.reshape(shape)
 
 
-def solve(a, b):
+def solve(a: ArrayLike, b: ArrayLike) -> Array:
     """Solves `a @ x == b` for `x`; `quabla.solve` is `quabla.linalg.solve`
     (batched over leading axes, `b` a vector `[n]` or a stack `[..., n, k]`)."""
     return _linalg.solve(a, b)
 
 
-def reshape(x, shape):
+def reshape(x: ArrayLike, shape: Shape) -> Array:
     """`x` with a new shape of the same size (an int or a sequence of ints);
     one extent may be `-1`, inferred from the size."""
     return _array(x).reshape(_shape(shape))
 
 
-def transpose(x, axes=None):
+def transpose(x: ArrayLike, axes: Sequence[int] | None = None) -> Array:
     """`x` with its axes permuted by `axes` (reversed when `None`)."""
     return _array(x).transpose(None if axes is None else list(axes))
 
 
-def broadcast_to(x, shape):
+def broadcast_to(x: ArrayLike, shape: Shape) -> Array:
     """`x` broadcast to `shape` (an int or a sequence of ints)."""
     return _array(x).broadcast_to(_shape(shape))
 
 
-def astype(x, dtype):
+def astype(x: ArrayLike, dtype: DType) -> Array:
     """`x` converted to `dtype`; `quabla.astype(x, dtype)` is `x.astype(dtype)`."""
     return _array(x).astype(dtype)
 
 
-def _axes(axis, ndim):
+def _axes(axis: Axis, ndim: int) -> tuple[int, ...]:
     """`axis` (an int or a sequence of ints) as a tuple of distinct
     non-negative axes of a rank-`ndim` array; `None` means every axis."""
     if axis is None:
         return tuple(range(ndim))
-    axes = (axis,) if isinstance(axis, numbers.Integral) else tuple(axis)
+    axes = (axis,) if _is_integral(axis) else tuple(axis)
     normalized = []
     for value in axes:
         value = operator.index(value)
@@ -366,18 +386,18 @@ def _axes(axis, ndim):
 # Activations and elementwise helpers.
 
 
-def square(x):
+def square(x: ArrayLike) -> Array:
     """Elementwise `x * x`."""
     x = _array(x)
     return x * x
 
 
-def reciprocal(x):
+def reciprocal(x: ArrayLike) -> Array:
     """Elementwise `1 / x`."""
     return 1.0 / _array(x)
 
 
-def sign(x):
+def sign(x: ArrayLike) -> Array:
     """Elementwise sign: -1 for negative values, 0 for zeros of either sign,
     +1 for positive values, and NaN for NaN. Built from comparisons, so its
     derivative is zero everywhere, as in JAX. The NaN comes from `x - x`
@@ -388,7 +408,9 @@ def sign(x):
     return _where(x.isnan(), x - x, signs)
 
 
-def clip(x, lo=None, hi=None):
+def clip(
+    x: ArrayLike, lo: ArrayLike | None = None, hi: ArrayLike | None = None
+) -> Array:
     """`x` limited to `[lo, hi]` elementwise as `minimum(maximum(x, lo), hi)`;
     either bound may be `None`. A NaN in `x` or in a bound propagates, and at
     a bound the derivative goes to the bound (`maximum`/`minimum` route ties
@@ -401,7 +423,7 @@ def clip(x, lo=None, hi=None):
     return x
 
 
-def silu(x):
+def silu(x: ArrayLike) -> Array:
     """SiLU (swish), `x * sigmoid(x)`, on the overflow-free `sigmoid`."""
     x = _array(x)
     return x * x.sigmoid()
@@ -412,7 +434,7 @@ _GELU_SCALE = 2.0 * math.sqrt(2.0 / math.pi)
 _SQRT_HALF = math.sqrt(0.5)
 
 
-def gelu(x, approximate=True):
+def gelu(x: ArrayLike, approximate: bool = True) -> Array:
     """GELU with the tanh approximation
     `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`, evaluated through the
     identity `0.5 (1 + tanh(u)) == sigmoid(2u)`: the stable `sigmoid` keeps
@@ -432,7 +454,7 @@ def gelu(x, approximate=True):
 # and carry no rounding from the cancelled terms.
 
 
-def softmax(x, axis=-1):
+def softmax(x: ArrayLike, axis: int | Sequence[int] = -1) -> Array:
     """`exp(x) / sum(exp(x))` along `axis` (an int or a sequence of ints),
     computed as `exp(x - m) / sum(exp(x - m))` with `m` the maximum along
     `axis`, so no `exp` overflows: `softmax([1000, 0])` is `[1, 0]` with a
@@ -443,7 +465,7 @@ def softmax(x, axis=-1):
     return unnormalized / unnormalized.sum(axis=axis, keepdims=True)
 
 
-def log_softmax(x, axis=-1):
+def log_softmax(x: ArrayLike, axis: int | Sequence[int] = -1) -> Array:
     """`log(softmax(x))` along `axis`, computed as
     `(x - m) - log(sum(exp(x - m)))` with `m` the maximum along `axis`: it
     neither overflows nor takes the log of an underflowed probability, so
@@ -453,7 +475,7 @@ def log_softmax(x, axis=-1):
     return shifted - shifted.exp().sum(axis=axis, keepdims=True).log()
 
 
-def logsumexp(x, axis=None, keepdims=False):
+def logsumexp(x: ArrayLike, axis: Axis = None, keepdims: bool = False) -> Array:
     """`log(sum(exp(x)))` over `axis` (an int, a sequence of ints, or `None`
     for all axes), computed as `m + log(sum(exp(x - m)))` with `m` the
     maximum over `axis`. Where `m` is not finite the shift is zero instead,
@@ -467,7 +489,9 @@ def logsumexp(x, axis=None, keepdims=False):
     return result if keepdims else squeeze(result, axes)
 
 
-def var(x, axis=None, keepdims=False, ddof=0):
+def var(
+    x: ArrayLike, axis: Axis = None, keepdims: bool = False, ddof: int = 0
+) -> Array:
     """Variance over `axis` (an int, a sequence of ints, or `None` for all
     axes), `sum((x - mean(x))**2) / (n - ddof)` for `n` reduced elements.
     Two passes, the mean first and then the squared deviations, so there is
@@ -481,7 +505,9 @@ def var(x, axis=None, keepdims=False, ddof=0):
     return squares / float(builtins.max(count - ddof, 0))
 
 
-def std(x, axis=None, keepdims=False, ddof=0):
+def std(
+    x: ArrayLike, axis: Axis = None, keepdims: bool = False, ddof: int = 0
+) -> Array:
     """Standard deviation, `sqrt(var(x, axis, keepdims, ddof))`. Its
     derivative at zero variance is zero, following the `sqrt` convention
     (JAX gives NaN there)."""
@@ -491,7 +517,7 @@ def std(x, axis=None, keepdims=False, ddof=0):
 # Shape helpers: reshapes, slices, and broadcasts of their operand.
 
 
-def squeeze(x, axis=None):
+def squeeze(x: ArrayLike, axis: Axis = None) -> Array:
     """`x` without the unit axes `axis` (an int or a sequence of ints), or
     without every unit axis when `axis` is `None`. Selecting an axis whose
     extent is not 1 raises `ValueError`."""
@@ -510,18 +536,20 @@ def squeeze(x, axis=None):
     return x.reshape([extent for a, extent in enumerate(shape) if a not in axes])
 
 
-def expand_dims(x, axis):
+def expand_dims(x: ArrayLike, axis: int | Sequence[int]) -> Array:
     """`x` with unit axes inserted so that they sit at positions `axis` (an
     int or a sequence of ints) of the result."""
     x = _array(x)
-    count = 1 if isinstance(axis, numbers.Integral) else len(tuple(axis))
+    count = 1 if _is_integral(axis) else len(tuple(axis))
     ndim = len(x.shape) + count
     axes = _axes(axis, ndim)
     extents = iter(x.shape)
     return x.reshape([1 if a in axes else next(extents) for a in range(ndim)])
 
 
-def split(x, indices_or_sections, axis=0):
+def split(
+    x: ArrayLike, indices_or_sections: int | Sequence[int], axis: int = 0
+) -> list[Array]:
     """`x` split along `axis` into a list of slices: `n` equal pieces for an
     int `n` (which must divide the extent), or the pieces between the given
     increasing split indices. A piece may not be empty, since quabla arrays
@@ -529,7 +557,7 @@ def split(x, indices_or_sections, axis=0):
     x = _array(x)
     (axis,) = _axes(axis, len(x.shape))
     extent = x.shape[axis]
-    if isinstance(indices_or_sections, numbers.Integral):
+    if _is_integral(indices_or_sections):
         sections = operator.index(indices_or_sections)
         if sections <= 0 or extent % sections:
             raise ValueError(
@@ -551,7 +579,7 @@ def split(x, indices_or_sections, axis=0):
     return pieces
 
 
-def meshgrid(*xs, indexing="xy"):
+def meshgrid(*xs: ArrayLike, indexing: str = "xy") -> list[Array]:
     """Coordinate arrays from the 1-D arrays `xs` (others are flattened), as
     a list. Every result has one axis per input; with `indexing="ij"` the
     axes follow the inputs, and with the default `"xy"` (Cartesian) the
@@ -573,7 +601,7 @@ def meshgrid(*xs, indexing="xy"):
     return grids
 
 
-def full_like(x, fill_value, dtype=None):
+def full_like(x: ArrayLike, fill_value: float, dtype: DType | None = None) -> Tensor:
     """A `Tensor` with the shape of `x` filled with `fill_value`, of the
     dtype of `x` unless `dtype` is given. For a traced `x` it is a constant
     of the trace: it does not depend on the values of `x`."""
@@ -581,12 +609,12 @@ def full_like(x, fill_value, dtype=None):
     return full(x.shape, fill_value, x.dtype if dtype is None else dtype)
 
 
-def zeros_like(x, dtype=None):
+def zeros_like(x: ArrayLike, dtype: DType | None = None) -> Tensor:
     """`full_like(x, 0, dtype)`."""
     return full_like(x, 0.0, dtype)
 
 
-def ones_like(x, dtype=None):
+def ones_like(x: ArrayLike, dtype: DType | None = None) -> Tensor:
     """`full_like(x, 1, dtype)`."""
     return full_like(x, 1.0, dtype)
 
@@ -595,18 +623,18 @@ def ones_like(x, dtype=None):
 # ints; every function takes eager and traced arrays alike.
 
 
-def _axis(axis, ndim):
+def _axis(axis: Any, ndim: int) -> int:
     """A single axis as a non-negative int."""
     (value,) = _axes(_static_int(axis, "axis"), ndim)
     return value
 
 
-def _along(axis, ndim, index):
+def _along(axis: int, ndim: int, index: int | slice) -> tuple[int | slice, ...]:
     """An index tuple that applies `index` (an int or a slice) to `axis`."""
     return (slice(None),) * axis + (index,) + (slice(None),) * (ndim - axis - 1)
 
 
-def _static_int(value, name):
+def _static_int(value: Any, name: str) -> int:
     if isinstance(value, _ARRAYS):
         raise TypeError(
             f"{name} must be a Python int: quabla has no integer arrays, and it "
@@ -618,10 +646,11 @@ def _static_int(value, name):
         raise TypeError(f"{name} must be an int, got {type(value).__name__}") from None
 
 
-def _static_ints(value, name):
+def _static_ints(value: Any, name: str) -> tuple[int, ...]:
     """`value` (an int or a sequence of ints) as a tuple of ints."""
     if isinstance(value, _ARRAYS):
-        _static_int(value, name)
+        # Raises: an array is never a static int.
+        return (_static_int(value, name),)
     try:
         return (operator.index(value),)
     except TypeError:
@@ -635,24 +664,24 @@ def _static_ints(value, name):
     return tuple(_static_int(item, name) for item in items)
 
 
-def _operands(x1, x2):
+def _operands(x1: ArrayLike, x2: ArrayLike) -> tuple[Array, Array]:
     """The two operands of an elementwise binary function as arrays; a
     Python number adopts the dtype of the array beside it."""
-    if isinstance(x1, numbers.Number) and not isinstance(x2, numbers.Number):
+    if _is_number(x1) and not _is_number(x2):
         x2 = _array(x2)
         return asarray(x1, dtype=x2.dtype), x2
     x1 = _array(x1)
-    if isinstance(x2, numbers.Number):
+    if _is_number(x2):
         return x1, asarray(x2, dtype=x1.dtype)
     return x1, _array(x2)
 
 
-def _finfo_max(dtype):
+def _finfo_max(dtype: DType) -> float:
     """The largest finite value of the float `dtype`."""
     return 3.4028234663852886e38 if dtype == float32 else 1.7976931348623157e308
 
 
-def flip(m, axis=None):
+def flip(m: ArrayLike, axis: Axis = None) -> Array:
     """`m` with the order of its entries reversed along `axis` (an int, a
     sequence of ints, or `None` for every axis), as a reversed slice."""
     x = _array(m)
@@ -667,7 +696,7 @@ def flip(m, axis=None):
     return x[index]
 
 
-def roll(a, shift, axis=None):
+def roll(a: ArrayLike, shift: int | Sequence[int], axis: Axis = None) -> Array:
     """`a` with its entries shifted cyclically by `shift` positions along
     `axis`; entries leaving one end re-enter at the other. With `axis=None`
     the flattened array is rolled and the shape restored. `shift` and `axis`
@@ -701,12 +730,12 @@ def roll(a, shift, axis=None):
     return x
 
 
-def _pairs(value, ndim, name):
+def _pairs(value: Any, ndim: int, name: str) -> list[tuple[Any, Any]]:
     """`value` broadcast to one `(before, after)` pair per axis, following
     NumPy's `np.broadcast_to(value, (ndim, 2))`."""
 
-    def pair(item):
-        if isinstance(item, numbers.Number):
+    def pair(item: Any) -> tuple[Any, Any]:
+        if _is_number(item):
             return (item, item)
         item = tuple(item)
         if len(item) in (1, 2):
@@ -715,11 +744,11 @@ def _pairs(value, ndim, name):
 
     if isinstance(value, _ARRAYS):
         raise TypeError(f"{name} must be Python numbers or sequences of them, not an array")
-    if isinstance(value, numbers.Number):
+    if _is_number(value):
         rows = [pair(value)]
     else:
         items = tuple(value)
-        if builtins.all(isinstance(item, numbers.Number) for item in items):
+        if builtins.all(_is_number(item) for item in items):
             rows = [pair(items)]
         else:
             rows = [pair(item) for item in items]
@@ -730,7 +759,7 @@ def _pairs(value, ndim, name):
     return rows
 
 
-def _pad_index(i, n, mode):
+def _pad_index(i: int, n: int, mode: str) -> int:
     """The source index of position `i` (counted from the start of the
     unpadded axis of extent `n`, negative before it) under `mode`."""
     if mode == "edge":
@@ -751,7 +780,12 @@ def _pad_index(i, n, mode):
 _PAD_MODES = ("constant", "edge", "reflect", "symmetric", "wrap")
 
 
-def pad(array, pad_width, mode="constant", constant_values=0):
+def pad(
+    array: ArrayLike,
+    pad_width: int | Sequence[Any],
+    mode: str = "constant",
+    constant_values: float | Sequence[Any] = 0,
+) -> Array:
     """`array` padded along each axis by `pad_width` entries, with NumPy's
     broadcasting of `pad_width` (an int, `(before, after)`, or one pair per
     axis). Modes: `"constant"` (`constant_values`, numbers broadcast the
@@ -770,7 +804,7 @@ def pad(array, pad_width, mode="constant", constant_values=0):
     ]
     if builtins.any(width < 0 for pair in widths for width in pair):
         raise ValueError(f"pad_width must be non-negative, got {pad_width!r}")
-    values = _pairs(constant_values, ndim, "constant_values") if mode == "constant" else None
+    values = _pairs(constant_values, ndim, "constant_values") if mode == "constant" else []
     for axis, (before, after) in enumerate(widths):
         if not (before or after):
             continue
@@ -793,7 +827,7 @@ def pad(array, pad_width, mode="constant", constant_values=0):
     return x
 
 
-def tile(A, reps):
+def tile(A: ArrayLike, reps: int | Sequence[int]) -> Array:
     """`A` repeated `reps[i]` times along axis `i`, NumPy's `tile`: the
     shorter of `A.shape` and `reps` is padded with leading ones. One
     broadcast between two reshapes; every rep must be at least 1, since
@@ -813,7 +847,9 @@ def tile(A, reps):
     return tiled.reshape([r * extent for r, extent in zip(reps, shape)])
 
 
-def repeat(a, repeats, axis=None):
+def repeat(
+    a: ArrayLike, repeats: int | Sequence[int], axis: int | None = None
+) -> Array:
     """Each entry of `a` repeated `repeats` times along `axis` (over the
     flattened array when `axis` is `None`). `repeats` is an int, broadcast
     to every entry (a broadcast between reshapes), or one non-negative int
@@ -846,7 +882,9 @@ def repeat(a, repeats, axis=None):
     return x.gather([i for i, count in enumerate(counts) for _ in range(count)], axis=axis)
 
 
-def moveaxis(a, source, destination):
+def moveaxis(
+    a: ArrayLike, source: int | Sequence[int], destination: int | Sequence[int]
+) -> Array:
     """`a` with the axes `source` moved to the positions `destination`
     (ints or equal-length sequences of ints); the other axes keep their
     order."""
@@ -862,7 +900,7 @@ def moveaxis(a, source, destination):
     return x if order == list(range(ndim)) else x.transpose(order)
 
 
-def swapaxes(a, axis1, axis2):
+def swapaxes(a: ArrayLike, axis1: int, axis2: int) -> Array:
     """`a` with axes `axis1` and `axis2` interchanged."""
     x = _array(a)
     ndim = len(x.shape)
@@ -874,13 +912,13 @@ def swapaxes(a, axis1, axis2):
     return x.transpose(order)
 
 
-def ravel(a):
+def ravel(a: ArrayLike) -> Array:
     """`a` flattened to one axis in row-major order (a 0-D array gives
     shape `[1]`)."""
     return _array(a).reshape([-1])
 
 
-def diagonal(a, offset=0, axis1=0, axis2=1):
+def diagonal(a: ArrayLike, offset: int = 0, axis1: int = 0, axis2: int = 1) -> Array:
     """The diagonal `offset` (above the main one when positive, below when
     negative) of the matrices spanned by `axis1` and `axis2`, as NumPy: both
     axes are removed and the diagonal becomes the last axis. The square
@@ -907,13 +945,13 @@ def diagonal(a, offset=0, axis1=0, axis2=1):
     return flat if length == 1 else flat[..., :: length + 1]
 
 
-def trace(a, offset=0, axis1=0, axis2=1):
+def trace(a: ArrayLike, offset: int = 0, axis1: int = 0, axis2: int = 1) -> Array:
     """`trace(a, offset=0, axis1=0, axis2=1)`: the sum along a diagonal,
     `diagonal(a, offset, axis1, axis2).sum(-1)`, as NumPy."""
     return diagonal(a, offset=offset, axis1=axis1, axis2=axis2).sum(axis=-1)
 
 
-def diag(v, k=0):
+def diag(v: ArrayLike, k: int = 0) -> Array:
     """For a 1-D `v`, the square matrix with `v` on diagonal `k` and zeros
     elsewhere, a `where` over a constant diagonal mask (so an infinite or
     NaN entry does not leak off the diagonal, as it would through a product
@@ -939,14 +977,16 @@ def diag(v, k=0):
 # Products.
 
 
-def outer(a, b):
+def outer(a: ArrayLike, b: ArrayLike) -> Array:
     """The outer product of `a` and `b`, both flattened:
     `result[i, j] = a[i] * b[j]`."""
     a, b = ravel(a), ravel(b)
     return a.reshape([a.shape[0], 1]) * b.reshape([1, b.shape[0]])
 
 
-def tensordot(a, b, axes=2):
+def tensordot(
+    a: ArrayLike, b: ArrayLike, axes: int | Sequence[int | Sequence[int]] = 2
+) -> Array:
     """The sum of products of `a` and `b` over the axes `axes`: an int `n`
     pairs the last `n` axes of `a` with the first `n` of `b`; a pair
     `(axes_a, axes_b)` of ints or equal-length sequences names them. The
@@ -954,7 +994,7 @@ def tensordot(a, b, axes=2):
     between transposes and reshapes."""
     a, b = _array(a), _array(b)
     rank_a, rank_b = len(a.shape), len(b.shape)
-    if isinstance(axes, numbers.Integral):
+    if _is_integral(axes):
         count = operator.index(axes)
         if not 0 <= count <= builtins.min(rank_a, rank_b):
             raise ValueError(
@@ -992,7 +1032,7 @@ def tensordot(a, b, axes=2):
     return product.reshape(shape_a + shape_b)
 
 
-def dot(a, b):
+def dot(a: ArrayLike, b: ArrayLike) -> Array:
     """NumPy's `dot`: with a 0-D operand it is the elementwise product; with
     a 1-D operand, or two operands of rank at most 2, it is `matmul`;
     otherwise it sums over the last axis of `a` and the second-to-last of
@@ -1007,7 +1047,7 @@ def dot(a, b):
     return tensordot(a, b, ([rank_a - 1], [rank_b - 2]))
 
 
-def kron(a, b):
+def kron(a: ArrayLike, b: ArrayLike) -> Array:
     """The Kronecker product: the operand of smaller rank gets leading unit
     axes, and the result has extent `a.shape[i] * b.shape[i]` per axis.
     One broadcast product of interleaved reshapes."""
@@ -1022,7 +1062,14 @@ def kron(a, b):
     return (spread_a * spread_b).reshape([x * y for x, y in zip(shape_a, shape_b)])
 
 
-def cross(a, b, axisa=-1, axisb=-1, axisc=-1, axis=None):
+def cross(
+    a: ArrayLike,
+    b: ArrayLike,
+    axisa: int = -1,
+    axisb: int = -1,
+    axisc: int = -1,
+    axis: int | None = None,
+) -> Array:
     """The cross product of the vectors along `axisa` of `a` and `axisb` of
     `b` (`axis` sets all three axes), with the other axes broadcast, as
     NumPy; the result's vector axis is `axisc`. A 2-vector has a zero third
@@ -1059,12 +1106,12 @@ def cross(a, b, axisa=-1, axisb=-1, axisc=-1, axis=None):
 # Calculus and elementwise numerics.
 
 
-def _edge_values(value, x, axis, name):
+def _edge_values(value: ArrayLike, x: Array, axis: int, name: str) -> Array:
     """A `prepend`/`append` operand of `diff`: a number or a 0-D array is
     broadcast to `x`'s shape with extent 1 along `axis`."""
     shape = list(x.shape)
     shape[axis] = 1
-    if isinstance(value, numbers.Number):
+    if _is_number(value):
         return full(shape, value, x.dtype)
     value = _array(value)
     if len(value.shape) == 0:
@@ -1074,7 +1121,13 @@ def _edge_values(value, x, axis, name):
     return value
 
 
-def diff(a, n=1, axis=-1, prepend=None, append=None):
+def diff(
+    a: ArrayLike,
+    n: int = 1,
+    axis: int = -1,
+    prepend: ArrayLike | None = None,
+    append: ArrayLike | None = None,
+) -> Array:
     """The `n`-th forward difference along `axis`, `a[1:] - a[:-1]` applied
     `n` times, after `prepend` and `append` (numbers or arrays) are joined
     to `a` along `axis`, as NumPy; boolean input gives `a[1:] != a[:-1]`.
@@ -1105,7 +1158,9 @@ def diff(a, n=1, axis=-1, prepend=None, append=None):
     return x
 
 
-def trapezoid(y, x=None, dx=1.0, axis=-1):
+def trapezoid(
+    y: ArrayLike, x: ArrayLike | None = None, dx: float = 1.0, axis: int = -1
+) -> Array:
     """The integral of `y` along `axis` by the trapezoidal rule,
     `sum(d * (y[1:] + y[:-1]) / 2)`, with `d = diff(x)` for sample points
     `x` (1-D along `axis`, or of `y`'s shape) or the spacing `dx` otherwise,
@@ -1135,7 +1190,13 @@ def trapezoid(y, x=None, dx=1.0, axis=-1):
     return (d * (upper + lower) / 2.0).sum(axis=axis)
 
 
-def interp(x, xp, fp, left=None, right=None):
+def interp(
+    x: ArrayLike,
+    xp: ArrayLike,
+    fp: ArrayLike,
+    left: ArrayLike | None = None,
+    right: ArrayLike | None = None,
+) -> Array:
     """The piecewise-linear interpolant through `(xp, fp)` at `x`, as NumPy:
     `fp[0]` (or `left`) below `xp[0]`, `fp[-1]` (or `right`) above
     `xp[-1]`, and NaN at a NaN `x`. `xp` must be strictly increasing, which
@@ -1175,7 +1236,7 @@ def interp(x, xp, fp, left=None, right=None):
     return _where(x.isnan(), x, value)
 
 
-def polyval(p, x):
+def polyval(p: ArrayLike, x: ArrayLike) -> Array:
     """The polynomial with coefficients `p` (highest degree first) at `x`,
     by Horner's rule; `p` is a 1-D array or a sequence of numbers (Python
     numbers keep the dtype of `x`). The loop starts from `p[0]`, so an
@@ -1183,7 +1244,7 @@ def polyval(p, x):
     which start from `0 * x`, give NaN; a constant `p` gives NaN there in
     all three."""
     x = _array(x)
-    if isinstance(p, (list, tuple)) and builtins.all(isinstance(c, numbers.Number) for c in p):
+    if isinstance(p, (list, tuple)) and builtins.all(_is_number(c) for c in p):
         coefficients = list(p)
     else:
         p = _array(p)
@@ -1200,7 +1261,7 @@ def polyval(p, x):
     return result
 
 
-def logaddexp(x1, x2):
+def logaddexp(x1: ArrayLike, x2: ArrayLike) -> Array:
     """`log(exp(x1) + exp(x2))` elementwise, as `hi + log1p(exp(lo - hi))`
     with `hi` and `lo` the larger and smaller operand: `exp` cannot
     overflow and the sum keeps full accuracy. The expression is smooth in
@@ -1215,7 +1276,7 @@ def logaddexp(x1, x2):
     return _where(delta.isnan(), a + b, hi + delta.exp().log1p())
 
 
-def hypot(x1, x2):
+def hypot(x1: ArrayLike, x2: ArrayLike) -> Array:
     """`sqrt(x1**2 + x2**2)` elementwise, scaled by `m = max(|x1|, |x2|)`
     as `m * sqrt((x1/m)**2 + (x2/m)**2)`, so it neither overflows nor
     underflows where the squares would (float32 beyond about 1e19 or below
@@ -1232,20 +1293,26 @@ def hypot(x1, x2):
     return _where(infinite, _where(infinite_a, absolute_a, absolute_b), result)
 
 
-def exp2(x):
+def exp2(x: ArrayLike) -> Array:
     """`2 ** x` elementwise, through `power` rather than `exp(x * ln 2)`, so
     an integer `x` gives the exact power of two."""
     return power(2.0, x)
 
 
-def isinf(x):
+def isinf(x: ArrayLike) -> Array:
     """Elementwise test for positive or negative infinity (neither finite
     nor NaN), as `bool_`."""
     x = _array(x)
     return x.isfinite().logical_not().logical_and(x.isnan().logical_not())
 
 
-def nan_to_num(x, copy=True, nan=0.0, posinf=None, neginf=None):
+def nan_to_num(
+    x: ArrayLike,
+    copy: bool = True,
+    nan: float = 0.0,
+    posinf: float | None = None,
+    neginf: float | None = None,
+) -> Array:
     """`x` with NaN replaced by `nan`, `+inf` by `posinf`, and `-inf` by
     `neginf`, which default to the largest and the most negative finite
     value of the dtype, as NumPy. `copy` is accepted for NumPy

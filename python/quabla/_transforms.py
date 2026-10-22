@@ -50,12 +50,16 @@ tracers of this call, which must have the shapes and dtypes it was staged
 with.
 """
 
+from __future__ import annotations
+
 import dataclasses
 import inspect
 import os
 import sys
 import weakref
 import warnings
+from collections.abc import Callable, Iterator, Sequence
+from typing import Any, overload
 
 from . import _quabla
 from ._array import arange, asarray, zeros
@@ -666,8 +670,10 @@ class _Transform:
     transform out, which with the root function identifies the program."""
 
     _max_traces = _DEFAULT_MAX_TRACES
+    # Each transform stages itself with `_stage(in_node, leaves, names)`.
+    _stage: Callable[..., Any]
 
-    def __init__(self, fun, config):
+    def __init__(self, fun: Callable[..., Any], config: Any) -> None:
         if not callable(fun):
             raise TypeError(f"expected a callable, got {type(fun).__name__}")
         self._fun = fun
@@ -743,7 +749,7 @@ class _Transform:
             self._inline_cache().store_staged(key, captured.value, self)
             return None
 
-    def __call__(self, *args):
+    def __call__(self, *args: Any) -> Any:
         converted = self._converted_positions(len(args))
         in_node, leaves, arrays, key, traced = _signature(args, (), converted)
         if traced or self._inlines(key):
@@ -753,7 +759,7 @@ class _Transform:
             return self._call_traced(args, (), converted)
         return program.run(arrays)
 
-    def _compile(self, in_node, leaves):
+    def _compile(self, in_node: Any, leaves: Any) -> Any:
         (staged,) = _compilable((self._stage(in_node, leaves, self._names(in_node)),))
         return _Program(
             staged.graph, staged.input_names, staged.outputs, staged.out_node
@@ -1082,9 +1088,9 @@ class _Jit(_Transform):
             )
         )
 
-    def lower(self, *args, **kwargs):
+    def lower(self, *args: Any, **kwargs: Any) -> _Lowered:
         """Trace without execution; ShapeDtype leaves need no host storage."""
-        args, kwargs = self._bind_keywords(args, kwargs) if kwargs else (args, None)
+        args, keywords = self._bind_keywords(args, kwargs) if kwargs else (args, None)
         abstract = []
         node = _flatten(args, abstract)
         args = _unflatten(
@@ -1106,9 +1112,9 @@ class _Jit(_Transform):
                 "lower() requires arrays or ShapeDtype, not enclosing tracers"
             )
         (staged,) = _compilable(
-            (self._stage(in_node, leaves, self._names(in_node), kwargs),)
+            (self._stage(in_node, leaves, self._names(in_node), keywords),)
         )
-        return _Lowered(self, staged, self._keyed(key, kwargs), statics, converted)
+        return _Lowered(self, staged, self._keyed(key, keywords), statics, converted)
 
     def _statics(self, count):
         statics = self._static_by_count.get(count)
@@ -1119,23 +1125,23 @@ class _Jit(_Transform):
             self._static_by_count[count] = statics
         return statics
 
-    def __call__(self, *args, **kwargs):
-        args, kwargs = self._bind_keywords(args, kwargs) if kwargs else (args, None)
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        args, keywords = self._bind_keywords(args, kwargs) if kwargs else (args, None)
         count = len(args)
         statics = self._statics(count)
         converted = self._converted_positions(count)
         in_node, leaves, arrays, key, traced = _signature(args, statics, converted)
-        key = self._keyed(key, kwargs)
+        key = self._keyed(key, keywords)
         if not (traced or self._inlines(key)):
             program = self._compiled(
-                key, lambda: self._compile(in_node, leaves, kwargs)
+                key, lambda: self._compile(in_node, leaves, keywords)
             )
             if program is not None:
                 return program.run(arrays)
         if isinstance(self._fun, _Transform):
             return self._call_traced(args, statics, converted)
         # Inside another trace, tracing through a plain function inlines it.
-        return self._fun(*args, **kwargs) if kwargs else self._fun(*args)
+        return self._fun(*args, **keywords) if keywords else self._fun(*args)
 
 
 class _Lowered:
@@ -1152,23 +1158,24 @@ class _Lowered:
         self._converted = converted
         self._compiled_program = None
 
-    def as_text(self):
+    def as_text(self) -> str:
         return self.program.lower_text()
 
-    def compile(self):
-        if self._compiled_program is None:
-            self._compiled_program = self._jit._compile_staged(self._staged)
+    def compile(self) -> Callable[..., Any]:
+        program = self._compiled_program
+        if program is None:
+            program = self._compiled_program = self._jit._compile_staged(self._staged)
 
-        def execute(*args, **kwargs):
-            args, kwargs = (
+        def execute(*args: Any, **kwargs: Any) -> Any:
+            args, keywords = (
                 self._jit._bind_keywords(args, kwargs) if kwargs else (args, None)
             )
             _, _, arrays, key, traced = _signature(args, self._statics, self._converted)
-            if traced or self._jit._keyed(key, kwargs) != self._key:
+            if traced or self._jit._keyed(key, keywords) != self._key:
                 raise ValueError(
                     "compiled lower() call must match its input structure, shapes, dtypes and statics"
                 )
-            return self._compiled_program.run(arrays)
+            return program.run(arrays)
 
         return execute
 
@@ -1211,7 +1218,9 @@ class _Jvp(_Transform):
     def __init__(self, fun):
         super().__init__(fun, ("jvp",))
 
-    def __call__(self, primals, tangents):
+    def __call__(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, primals: Sequence[Any], tangents: Sequence[Any]
+    ) -> tuple[Any, Any]:
         if type(primals) not in (tuple, list) or type(tangents) not in (tuple, list):
             raise TypeError("jvp takes primals and tangents as tuples or lists")
         if len(primals) != len(tangents):
@@ -1413,7 +1422,7 @@ class _Vjp(_Transform):
         super().__init__(fun, ("vjp", bool(has_aux)))
         self._has_aux = bool(has_aux)
 
-    def __call__(self, *primals):
+    def __call__(self, *primals: Any) -> tuple[Any, ...]:
         converted = frozenset(range(len(primals)))
         in_node, leaves, arrays, key, traced = _signature(primals, (), converted)
         entry = None
@@ -1516,14 +1525,14 @@ class _Vjp(_Transform):
 # -- vectorization -------------------------------------------------------------------
 
 
-def _axes_config(axes, what):
+def _axes_config(axes: Any, what: str) -> Any:
     """`in_axes`/`out_axes` in a hashable form: an int or `None` applies to
     a whole subtree, and tuples, lists, dicts, NamedTuples, and registered
     nodes of them are pytree prefixes. `None` is a leaf here, unlike in
     argument pytrees."""
-    if axes is None or (isinstance(axes, int) and not isinstance(axes, bool)):
-        return axes
     kind = type(axes)
+    if axes is None or (issubclass(kind, int) and kind is not bool):
+        return axes
     if kind is tuple or kind is list:
         return (tuple, tuple(_axes_config(child, what) for child in axes))
     if kind is dict:
@@ -1658,6 +1667,7 @@ class _Vmap(_Transform):
         for name, source in zip(capture_names, inner.captures):
             bound[name] = (graph.input(name, source.shape, source.dtype), False)
         traced = [output for output in inner.outputs if _is_traced(output)]
+        spliced: Iterator[tuple[Any, bool]] = iter(())
         if traced:
             bindings = [bound[name] for name in inner.input_names]
             spliced = iter(
@@ -1945,8 +1955,7 @@ class _Jacobian(_Transform):
         pieces = iter(pieces)
         blocks = []
         for output in staged.outputs:
-            if _is_traced(output):
-                output_pieces = next(pieces)
+            output_pieces = next(pieces) if _is_traced(output) else []
             by_position = {}
             for index, (position, size) in enumerate(zip(selected, sizes)):
                 leaf = leaves[position]
@@ -2010,7 +2019,11 @@ def _decorator(transform, kwargs):
     return lambda fun: transform(fun, **kwargs)
 
 
-def value_and_grad(fun=None, argnums=0, has_aux=False):
+def value_and_grad(
+    fun: Callable[..., Any] | None = None,
+    argnums: int | Sequence[int] = 0,
+    has_aux: bool = False,
+) -> Callable[..., Any]:
     """`fun` transformed to return `(value, grads)`, where `grads` has the
     pytree structure of the arguments selected by `argnums` (an int, or a
     tuple giving a tuple of gradients). `fun` must return a scalar array, or
@@ -2023,7 +2036,7 @@ def value_and_grad(fun=None, argnums=0, has_aux=False):
     return _ValueAndGrad(fun, argnums, has_aux, "value_and_grad")
 
 
-def grad(*args, **kwargs):
+def grad(*args: Any, **kwargs: Any) -> Callable[..., Any]:
     """`grad(fun, argnums=0, has_aux=False)`: `fun` transformed to return the
     gradient of its scalar output with respect to the arguments selected by
     `argnums`, or `(grads, aux)` with `has_aux=True`; see `value_and_grad`.
@@ -2034,7 +2047,25 @@ def grad(*args, **kwargs):
     return _new_grad(*args, **kwargs)
 
 
-def jit(*args, **kwargs):
+@overload
+def jit(
+    fun: Callable[..., Any],
+    device: str | None = None,
+    static_argnums: int | Sequence[int] = (),
+    max_traces: int = _DEFAULT_MAX_TRACES,
+    static_argnames: str | Sequence[str] = (),
+    precision: str | None = None,
+) -> _Jit: ...
+@overload
+def jit(
+    *,
+    device: str | None = None,
+    static_argnums: int | Sequence[int] = (),
+    max_traces: int = _DEFAULT_MAX_TRACES,
+    static_argnames: str | Sequence[str] = (),
+    precision: str | None = None,
+) -> Callable[[Callable[..., Any]], _Jit]: ...
+def jit(*args: Any, **kwargs: Any) -> Any:
     """`jit(fun, device=None, static_argnums=(), max_traces=8,
     static_argnames=(), precision=None)`: `fun` traced and compiled on its first call per
     argument signature, then run from the cache. `device=None` means
@@ -2063,7 +2094,9 @@ grad.__signature__ = inspect.signature(_new_grad)
 jit.__signature__ = inspect.signature(_new_jit)
 
 
-def jvp(fun, primals, tangents):
+def jvp(
+    fun: Callable[..., Any], primals: Sequence[Any], tangents: Sequence[Any]
+) -> tuple[Any, Any]:
     """`(fun(*primals), J @ tangents)`: forward mode with one tangent per
     primal leaf, with the pytree structure, shape, and dtype of the primals
     (a Python number tangent adopts its primal's dtype). Python scalar
@@ -2072,7 +2105,9 @@ def jvp(fun, primals, tangents):
     return _Jvp(fun)(primals, tangents)
 
 
-def vjp(fun, *primals, has_aux=False):
+def vjp(
+    fun: Callable[..., Any], *primals: Any, has_aux: bool = False
+) -> tuple[Any, ...]:
     """`(fun(*primals), vjp_fun)`, or `(out, vjp_fun, aux)` with
     `has_aux=True`; `vjp_fun(cotangent)` returns a tuple with one cotangent
     pytree per primal (`None` for `bool_` leaves). Python scalar primals
@@ -2080,7 +2115,9 @@ def vjp(fun, *primals, has_aux=False):
     return _Vjp(fun, has_aux)(*primals)
 
 
-def jacobian(fun, argnums=0):
+def jacobian(
+    fun: Callable[..., Any], argnums: int | Sequence[int] = 0
+) -> Callable[..., Any]:
     """`fun` transformed to return its dense Jacobian: for each output leaf,
     blocks of shape `[*out.shape, *in.shape]` with the pytree structure of
     the arguments selected by `argnums`. Uses reverse mode when floating
@@ -2092,14 +2129,18 @@ def jacobian(fun, argnums=0):
     return _Jacobian(fun, argnums)
 
 
-def hessian(fun, argnums=0):
+def hessian(
+    fun: Callable[..., Any], argnums: int | Sequence[int] = 0
+) -> Callable[..., Any]:
     """`fun` transformed to return the dense Hessian of its scalar output,
     `jacobian(grad(fun, argnums), argnums)`: blocks of shape
     `[*in.shape, *in.shape]`, forward over reverse."""
     return _Jacobian(_ValueAndGrad(fun, argnums, False, "grad"), argnums, "hessian")
 
 
-def vmap(fun, in_axes=0, out_axes=0):
+def vmap(
+    fun: Callable[..., Any], in_axes: Any = 0, out_axes: Any = 0
+) -> Callable[..., Any]:
     """`fun` vectorized over a batch axis, with JAX semantics. `in_axes`
     gives the mapped axis of each argument (an int), or `None` for an
     argument shared by every example; an int or `None` applies to every

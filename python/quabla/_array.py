@@ -11,10 +11,17 @@ always copied into owned storage, so a tensor never aliases a NumPy array.
 NumPy stays optional (design D2): nothing here imports it.
 """
 
+from __future__ import annotations
+
 import abc
 import operator
+from typing import TYPE_CHECKING, Any, overload
 
 from ._quabla import Tensor, TensorView, TraceTensor
+
+if TYPE_CHECKING:
+    from ._typing import Array as _Array
+    from ._typing import ArrayLike, ConcreteLike, DType, Shape
 
 __all__ = [
     "Array",
@@ -29,24 +36,29 @@ __all__ = [
 ]
 
 
-class Array(abc.ABC):
-    """Abstract base of the quabla array types, for `isinstance` checks and
-    annotations: `Tensor`, `TensorView`, and `TraceTensor` are registered
-    (design D1 keeps `Tensor` as the concrete class name)."""
+if TYPE_CHECKING:
+    # Type checkers do not follow `ABC.register`, so they see the union the
+    # runtime class stands for.
+    Array = Tensor | TensorView | TraceTensor
+else:
 
-    __slots__ = ()
+    class Array(abc.ABC):
+        """Abstract base of the quabla array types, for `isinstance` checks and
+        annotations: `Tensor`, `TensorView`, and `TraceTensor` are registered
+        (design D1 keeps `Tensor` as the concrete class name)."""
 
+        __slots__ = ()
 
-Array.register(Tensor)
-Array.register(TensorView)
-Array.register(TraceTensor)
+    Array.register(Tensor)
+    Array.register(TensorView)
+    Array.register(TraceTensor)
 
 # Handled by the nested-sequence parser in the extension. NumPy scalars are
 # not listed: they take the buffer path, which keeps float32 and bool.
 _NESTED_TYPES = (list, tuple, bool, int, float)
 
 
-def _convert(obj, dtype):
+def _convert(obj: Any, dtype: DType | None) -> _Array:
     if isinstance(obj, (Tensor, TraceTensor)):
         return obj if dtype is None or obj.dtype == dtype else obj.astype(dtype)
     if isinstance(obj, TensorView):
@@ -65,7 +77,13 @@ def _convert(obj, dtype):
     return tensor
 
 
-def array(obj, dtype=None):
+@overload
+def array(obj: TraceTensor, dtype: DType | None = None) -> TraceTensor: ...
+@overload
+def array(obj: ConcreteLike, dtype: DType | None = None) -> Tensor: ...
+@overload
+def array(obj: ArrayLike, dtype: DType | None = None) -> _Array: ...
+def array(obj: ArrayLike, dtype: DType | None = None) -> _Array:
     """A new `Tensor` holding the values of `obj`, converted to `dtype` if
     given. Always returns a new object; storage is immutable, so a `Tensor`
     input shares its values instead of copying them. A `TraceTensor` is
@@ -76,40 +94,61 @@ def array(obj, dtype=None):
     return result
 
 
-def asarray(obj, dtype=None):
+@overload
+def asarray(obj: TraceTensor, dtype: DType | None = None) -> TraceTensor: ...
+@overload
+def asarray(obj: ConcreteLike, dtype: DType | None = None) -> Tensor: ...
+@overload
+def asarray(obj: ArrayLike, dtype: DType | None = None) -> _Array: ...
+def asarray(obj: ArrayLike, dtype: DType | None = None) -> _Array:
     """Like `array`, but returns a `Tensor` (or `TraceTensor`) input
     unchanged when it already has `dtype`."""
     return _convert(obj, dtype)
 
 
-def _shape(shape):
+def _shape(shape: Any) -> list[int]:
     """A shape as a list of extents; a bare integer is a rank-1 shape."""
     if isinstance(shape, (list, tuple)):
         return [operator.index(extent) for extent in shape]
     return [operator.index(shape)]
 
 
-def _typed(tensor, dtype):
+def _typed(tensor: Tensor, dtype: DType | None) -> Tensor:
     return tensor if dtype is None or tensor.dtype == dtype else tensor.astype(dtype)
 
 
-def zeros(shape, dtype=None):
+def zeros(shape: Shape, dtype: DType | None = None) -> Tensor:
     """A tensor of zeros; `dtype` defaults to `float64`."""
     return _typed(Tensor.zeros(_shape(shape)), dtype)
 
 
-def ones(shape, dtype=None):
+def ones(shape: Shape, dtype: DType | None = None) -> Tensor:
     """A tensor of ones; `dtype` defaults to `float64`."""
     return _typed(Tensor.ones(_shape(shape)), dtype)
 
 
-def full(shape, fill_value, dtype=None):
+@overload
+def full(
+    shape: Shape, fill_value: TraceTensor, dtype: DType | None = None
+) -> TraceTensor: ...
+@overload
+def full(
+    shape: Shape, fill_value: ConcreteLike, dtype: DType | None = None
+) -> Tensor: ...
+@overload
+def full(shape: Shape, fill_value: ArrayLike, dtype: DType | None = None) -> _Array: ...
+def full(shape: Shape, fill_value: ArrayLike, dtype: DType | None = None) -> _Array:
     """A tensor filled with `fill_value`, whose dtype is inferred as in
     `asarray` unless `dtype` is given."""
     return asarray(fill_value, dtype).broadcast_to(_shape(shape))
 
 
-def arange(start, stop=None, step=1.0, dtype=None):
+def arange(
+    start: float,
+    stop: float | None = None,
+    step: float = 1.0,
+    dtype: DType | None = None,
+) -> Tensor:
     """Values from `start` (inclusive) to `stop` (exclusive) by `step`;
     `arange(n)` counts from zero. The range must be non-empty."""
     if stop is None:
@@ -117,11 +156,11 @@ def arange(start, stop=None, step=1.0, dtype=None):
     return _typed(Tensor.arange(start, stop, step), dtype)
 
 
-def linspace(start, stop, num, dtype=None):
+def linspace(start: float, stop: float, num: int, dtype: DType | None = None) -> Tensor:
     """`num` evenly spaced values from `start` to `stop`, both inclusive."""
     return _typed(Tensor.linspace(start, stop, num), dtype)
 
 
-def eye(n, m=None, dtype=None):
+def eye(n: int, m: int | None = None, dtype: DType | None = None) -> Tensor:
     """An `n` x `m` identity matrix (`m` defaults to `n`)."""
     return _typed(Tensor.eye(n, m), dtype)

@@ -24,8 +24,12 @@ reads through `args`: closing over an outer tracer raises `TracerError`.
 Eager arrays and Python numbers may be closed over; they become constants.
 """
 
+from __future__ import annotations
+
 import math
 import operator
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from . import _quabla
 from ._array import asarray, eye, zeros
@@ -34,6 +38,9 @@ from ._ops import abs as _abs
 from ._ops import exp, log, maximum, mean, minimum, sqrt, square, stop_gradient
 from ._transforms import jvp, vmap
 from .linalg import solve
+
+if TYPE_CHECKING:
+    from ._typing import Array, ArrayLike
 
 __all__ = ["odeint"]
 
@@ -298,7 +305,7 @@ def _adaptive_step(f, method, linearize, carry, t1, direction, saveat, shape, si
     # Only the step that lands on t1 depends on t1; other step sizes are
     # controller outputs and carry no gradient (discretize-then-optimize).
     dt = _quabla.where(last, remaining, h) * direction
-    k1 = None
+    k1 = k7 = None
     if method == "dopri5":
         k1 = carry[offset : offset + size].reshape(shape)
         offset += size
@@ -479,21 +486,53 @@ def _save_times(saveat, t0, t1, dtype):
     return saveat
 
 
+@overload
 def odeint(
-    f,
-    y0,
-    t_span,
+    f: Callable[..., Any],
+    y0: ArrayLike,
+    t_span: tuple[ArrayLike, ArrayLike],
     *,
-    steps=None,
-    method="rk4",
-    args=(),
-    save=False,
-    saveat=None,
-    rtol=1e-6,
-    atol=1e-9,
-    max_steps=512,
-    info=False,
-):
+    steps: int | None = None,
+    method: str = "rk4",
+    args: Sequence[Any] = (),
+    save: bool = False,
+    saveat: ArrayLike | None = None,
+    rtol: float = 1e-6,
+    atol: float = 1e-9,
+    max_steps: int = 512,
+    info: Literal[False] = False,
+) -> Array: ...
+@overload
+def odeint(
+    f: Callable[..., Any],
+    y0: ArrayLike,
+    t_span: tuple[ArrayLike, ArrayLike],
+    *,
+    steps: int | None = None,
+    method: str = "rk4",
+    args: Sequence[Any] = (),
+    save: bool = False,
+    saveat: ArrayLike | None = None,
+    rtol: float = 1e-6,
+    atol: float = 1e-9,
+    max_steps: int = 512,
+    info: Literal[True],
+) -> tuple[Array, dict[str, Any]]: ...
+def odeint(
+    f: Callable[..., Any],
+    y0: ArrayLike,
+    t_span: tuple[ArrayLike, ArrayLike],
+    *,
+    steps: int | None = None,
+    method: str = "rk4",
+    args: Sequence[Any] = (),
+    save: bool = False,
+    saveat: ArrayLike | None = None,
+    rtol: float = 1e-6,
+    atol: float = 1e-9,
+    max_steps: int = 512,
+    info: bool = False,
+) -> Array | tuple[Array, dict[str, Any]]:
     """Integrate `dy/dt = f(y, t, *args)` over `t_span = (t0, t1)`.
 
     Fixed-step methods (`"rk4"`, the default, `"heun"`, `"euler"`) take

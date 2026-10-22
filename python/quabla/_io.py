@@ -34,11 +34,14 @@ not serialized: rebuilding them would mean importing classes named by the
 file. Save their fields (for example as a dict) instead.
 """
 
+from __future__ import annotations
+
 import array as _array
 import json
 import os
 import struct
 import sys
+from typing import TYPE_CHECKING, Any, BinaryIO, TypeAlias
 
 from ._quabla import Tensor, TensorView, TraceTensor
 
@@ -52,7 +55,19 @@ _DTYPES = {"float64": (8, "d"), "float32": (4, "f"), "bool": (1, "?")}
 _BIG_ENDIAN = sys.byteorder == "big"
 
 
-def save(file, tree):
+if TYPE_CHECKING:
+    from typing_extensions import TypeIs
+
+# A path, or a binary file object that `save` writes to and `load` reads.
+_File: TypeAlias = "str | bytes | os.PathLike[str] | os.PathLike[bytes] | BinaryIO"
+
+
+def _has(file: _File, method: str) -> TypeIs[BinaryIO]:
+    """Whether `file` is a file object (it has `method`) rather than a path."""
+    return hasattr(file, method)
+
+
+def save(file: _File, tree: Any) -> None:
     """Writes the pytree `tree` to `file`, a path or a binary file object.
 
     Leaves may be quabla arrays (`Tensor` or `TensorView`; float64, float32,
@@ -66,7 +81,7 @@ def save(file, tree):
     header = {"format": "quabla", "version": VERSION, "tree": _encode(tree, chunks, [0])}
     header = json.dumps(header, allow_nan=False, separators=(",", ":")).encode()
     payload = [MAGIC, _HEADER_SIZE.pack(len(header)), header, *chunks]
-    if hasattr(file, "write"):
+    if _has(file, "write"):
         for chunk in payload:
             file.write(chunk)
     else:
@@ -75,12 +90,12 @@ def save(file, tree):
                 handle.write(chunk)
 
 
-def load(file):
+def load(file: _File) -> Any:
     """Reads a pytree written by `save` from `file`, a path or a binary file
     object. Arrays come back as `Tensor`s with their saved dtype and shape,
     tuples as tuples, and dicts in their saved key order. A malformed or
     truncated file raises `ValueError`."""
-    if hasattr(file, "read"):
+    if _has(file, "read"):
         content = file.read()
     else:
         with open(os.fspath(file), "rb") as handle:
@@ -240,4 +255,7 @@ def _decode_array(node, data):
             flat.byteswap()
     # The buffer import copies the 1-D data into a new tensor, keeping the
     # dtype; the reshape restores the saved shape.
-    return Tensor._from_buffer(flat, None).reshape(shape)
+    tensor = Tensor._from_buffer(flat, None)
+    # An `array.array` or a memoryview always exports a buffer.
+    assert tensor is not None
+    return tensor.reshape(shape)

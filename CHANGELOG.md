@@ -15,6 +15,12 @@ deprecated names keep working until 1.0 (see
   built on a native Arm runner. The CUDA backend of these wheels is built
   but not yet validated on an Arm GPU host. Windows is not supported; use
   WSL.
+- Type annotations for the public Python API, checked with pyright in CI:
+  `quabla` ships `py.typed`, the extension stub declares the operand and
+  result types of `Tensor` and `TraceTensor` (an operation with a traced
+  operand returns a `TraceTensor`), the native names (`Tensor`, `float32`,
+  `where`, ...) are static re-exports that type checkers see, and
+  `linalg`'s result tuples are typed `NamedTuple`s.
 
 ### Fixed
 
@@ -42,6 +48,9 @@ deprecated names keep working until 1.0 (see
   (`.op == "float64"`) for a program with `float64` values, where they used
   to run it in single precision with a `UserWarning`. Create MLX inputs
   with `dtype=qb.float32`. The owner chose rejection on 2026-10-22.
+- The extension stub declared `Tensor == Tensor` and `TraceTensor ==
+  TraceTensor` as elementwise; both compare identity and return a Python
+  `bool` (use `equal` for the elementwise comparison).
 
 ## [1.0.0] - 2026-10-14
 

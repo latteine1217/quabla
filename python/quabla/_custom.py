@@ -22,8 +22,12 @@ so the result runs on every backend.
   of keeping them from the forward pass.
 """
 
+from __future__ import annotations
+
 import functools
 import threading
+from collections.abc import Callable, Sequence
+from typing import Any
 
 from ._array import zeros
 from ._quabla import Tensor, TensorTraceGraph, TraceTensor, bool_
@@ -251,23 +255,25 @@ class custom_vjp:
     enclosing transform.
     """
 
-    def __init__(self, fun, nondiff_argnums=()):
+    def __init__(
+        self, fun: Callable[..., Any], nondiff_argnums: Sequence[int] = ()
+    ) -> None:
         if not callable(fun):
             raise TypeError(f"custom_vjp expects a callable, got {type(fun).__name__}")
         functools.update_wrapper(self, fun)
         self.fun = fun
         self.nondiff_argnums = tuple(nondiff_argnums)
-        self.fwd = None
-        self.bwd = None
-        self._jvp = None
+        self.fwd: Callable[..., Any] | None = None
+        self.bwd: Callable[..., Any] | None = None
+        self._jvp: Callable[..., Any] | None = None
 
-    def defvjp(self, fwd, bwd):
+    def defvjp(self, fwd: Callable[..., Any], bwd: Callable[..., Any]) -> None:
         if not callable(fwd) or not callable(bwd):
             raise TypeError("defvjp expects callables fwd and bwd")
         self.fwd = fwd
         self.bwd = bwd
 
-    def _defjvp(self, jvp):
+    def _defjvp(self, jvp: Callable[..., Any]) -> None:
         """Also gives the function a forward-mode rule (private; the implicit
         solvers use it). `jvp(*nondiff_args, primals, tangents, outputs)`
         returns the output tangents with the structure of the outputs
@@ -281,7 +287,7 @@ class custom_vjp:
             raise TypeError("_defjvp expects a callable")
         self._jvp = jvp
 
-    def __call__(self, *args):
+    def __call__(self, *args: Any) -> Any:
         what = f"custom_vjp function {_name(self.fun)}"
         if self.fwd is None:
             raise AttributeError(f"no VJP is defined for {what}; call defvjp first")
@@ -289,8 +295,11 @@ class custom_vjp:
 
     def _rule(self, call, staged, wrapped):
         what = f"custom_vjp({_name(self.fun)})"
+        fwd, bwd = self.fwd, self.bwd
+        # `__call__` rejects a function without `defvjp`.
+        assert fwd is not None and bwd is not None
         _reject_captures(staged, what, "function")
-        forward = call.trace(self.fwd)
+        forward = call.trace(fwd)
         _reject_captures(forward, what, "fwd")
         node = forward.out_node
         if not (type(node) is tuple and node[0] is tuple and len(node[1]) == 2):
@@ -340,7 +349,7 @@ class custom_vjp:
                 names.append(None)
         nondiff = call.nondiff_values
         backward = _trace(
-            lambda res, cotangent: self.bwd(*nondiff, res, cotangent),
+            lambda res, cotangent: bwd(*nondiff, res, cotangent),
             (tuple, (residual_node, staged.out_node)),
             leaves,
             names,
@@ -476,21 +485,23 @@ class custom_jvp:
     an enclosing transform.
     """
 
-    def __init__(self, fun, nondiff_argnums=()):
+    def __init__(
+        self, fun: Callable[..., Any], nondiff_argnums: Sequence[int] = ()
+    ) -> None:
         if not callable(fun):
             raise TypeError(f"custom_jvp expects a callable, got {type(fun).__name__}")
         functools.update_wrapper(self, fun)
         self.fun = fun
         self.nondiff_argnums = tuple(nondiff_argnums)
-        self.jvp = None
+        self.jvp: Callable[..., Any] | None = None
 
-    def defjvp(self, jvp):
+    def defjvp(self, jvp: Callable[..., Any]) -> Callable[..., Any]:
         if not callable(jvp):
             raise TypeError("defjvp expects a callable")
         self.jvp = jvp
         return jvp
 
-    def __call__(self, *args):
+    def __call__(self, *args: Any) -> Any:
         what = f"custom_jvp function {_name(self.fun)}"
         if self.jvp is None:
             raise AttributeError(f"no JVP is defined for {what}; call defjvp first")
@@ -498,6 +509,9 @@ class custom_jvp:
 
     def _rule(self, call, staged, wrapped):
         what = f"custom_jvp({_name(self.fun)})"
+        jvp = self.jvp
+        # `__call__` rejects a function without `defjvp`.
+        assert jvp is not None
         _reject_captures(staged, what, "function")
         operands = _operand_positions(call)
         # The rule is traced on the primals, as inputs named like the primal
@@ -518,7 +532,7 @@ class custom_jvp:
                 names.append(None)
         nondiff = call.nondiff_values
         tangent = _trace(
-            lambda primals, tangents: self.jvp(*nondiff, primals, tangents),
+            lambda primals, tangents: jvp(*nondiff, primals, tangents),
             (tuple, (call.in_node, call.in_node)),
             leaves,
             names,

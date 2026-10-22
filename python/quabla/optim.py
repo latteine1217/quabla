@@ -3,6 +3,11 @@
 # Imported under private aliases so the public module namespace is `__all__`.
 import math as _math
 import operator as _operator
+from collections.abc import Callable as _Callable
+from collections.abc import Sequence as _Sequence
+from typing import TYPE_CHECKING as _TYPE_CHECKING
+from typing import Any as _Any
+from typing import TypeAlias as _TypeAlias
 
 from . import _quabla
 from . import tree as _tree
@@ -23,6 +28,15 @@ from ._schedules import (
     warmup_cosine_decay,
 )
 
+if _TYPE_CHECKING:
+    from ._quabla import Tensor as _TensorType
+    from .tree import TreeDef as _TreeDef
+
+# A learning rate: a constant, or a schedule `f(step) -> rate` called with the
+# completed-update count.
+_Schedule: _TypeAlias = "_Callable[[int], float]"
+_LearningRate: _TypeAlias = "float | _Schedule"
+
 __all__ = [
     "Adam",
     "AdamW",
@@ -38,19 +52,19 @@ __all__ = [
 ]
 
 
-def _positive(value, name):
+def _positive(value: float, name: str) -> float:
     value = float(value)
     if not _math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be positive and finite")
     return value
 
 
-def _learning_rate(value):
+def _learning_rate(value: _LearningRate) -> _LearningRate:
     """A positive constant rate, or a schedule called with the step count."""
     return value if callable(value) else _positive(value, "learning_rate")
 
 
-def _rate_at(learning_rate, step):
+def _rate_at(learning_rate: _LearningRate, step: int) -> float:
     if not callable(learning_rate):
         return learning_rate
     value = float(learning_rate(step))
@@ -62,11 +76,11 @@ def _rate_at(learning_rate, step):
     return value
 
 
-def _clip_norm(value):
+def _clip_norm(value: float | None) -> float | None:
     return None if value is None else _positive(value, "clip_norm")
 
 
-def clip_by_global_norm(grads, max_norm):
+def clip_by_global_norm(grads: _Any, max_norm: float) -> tuple[_Any, float]:
     """Scale a gradient pytree so its global L2 norm is at most ``max_norm``.
 
     Returns ``(clipped_grads, global_norm)``. The norm over all leaves is
@@ -100,7 +114,7 @@ def clip_by_global_norm(grads, max_norm):
     return _tree.unflatten(definition, clipped), norm
 
 
-def _parameters(params):
+def _parameters(params: _Any) -> "tuple[list[_TensorType], _TreeDef]":
     leaves, definition = _tree.flatten(params)
     if not leaves:
         raise ValueError("optimizer requires at least one parameter")
@@ -113,12 +127,16 @@ def _parameters(params):
     return leaves, definition
 
 
-def _matching(params, other, name):
+def _matching(
+    params: _Any, other: _Any, name: str
+) -> "tuple[list[_TensorType], list[_TensorType], _TreeDef]":
     leaves, definition = _parameters(params)
     return leaves, _matching_values(leaves, definition, other, name), definition
 
 
-def _matching_values(leaves, definition, other, name):
+def _matching_values(
+    leaves: "list[_TensorType]", definition: "_TreeDef", other: _Any, name: str
+) -> "list[_TensorType]":
     values, other_definition = _tree.flatten(other)
     if definition != other_definition:
         raise ValueError(f"{name} pytree structure must match parameters")
@@ -141,7 +159,14 @@ class _AdamBase:
 
     weight_decay = 0.0
 
-    def _configure(self, learning_rate, b1, b2, eps, clip_norm):
+    def _configure(
+        self,
+        learning_rate: _LearningRate,
+        b1: float,
+        b2: float,
+        eps: float,
+        clip_norm: float | None,
+    ) -> None:
         self.learning_rate = _learning_rate(learning_rate)
         self.b1 = float(b1)
         self.b2 = float(b2)
@@ -150,7 +175,7 @@ class _AdamBase:
             raise ValueError("Adam betas must be in [0, 1)")
         self.clip_norm = _clip_norm(clip_norm)
 
-    def init(self, params):
+    def init(self, params: _Any) -> dict[str, _Any]:
         """Create independent zero moments for ``params``."""
         leaves, definition = _parameters(params)
         return {
@@ -163,7 +188,9 @@ class _AdamBase:
             ),
         }
 
-    def update(self, params, grads, state):
+    def update(
+        self, params: _Any, grads: _Any, state: dict[str, _Any]
+    ) -> tuple[_Any, dict[str, _Any]]:
         """Return updated parameters and state without mutating either input."""
         parameters, gradients, definition = _matching(params, grads, "gradient")
         if type(state) is not dict or set(state) != {"step", "m", "v"}:
@@ -210,16 +237,16 @@ class Adam(_AdamBase):
 
     def __init__(
         self,
-        learning_rate=1e-3,
-        b1=0.9,
-        b2=0.999,
-        eps=1e-8,
+        learning_rate: _LearningRate = 1e-3,
+        b1: float = 0.9,
+        b2: float = 0.999,
+        eps: float = 1e-8,
         *,
-        beta1=None,
-        beta2=None,
-        epsilon=None,
-        clip_norm=None,
-    ):
+        beta1: float | None = None,
+        beta2: float | None = None,
+        epsilon: float | None = None,
+        clip_norm: float | None = None,
+    ) -> None:
         self._configure(
             learning_rate,
             b1 if beta1 is None else beta1,
@@ -229,7 +256,7 @@ class Adam(_AdamBase):
         )
         self._state = None
 
-    def step(self, parameters, gradients):
+    def step(self, parameters: _Any, gradients: _Any) -> _Any:
         """``update`` with the state kept on the optimizer: returns the new
         parameters, bit for bit those of ``update``. The parameter pytree
         must keep its structure between calls. For a dict of parameters,
@@ -256,14 +283,14 @@ class AdamW(_AdamBase):
 
     def __init__(
         self,
-        learning_rate=1e-3,
-        b1=0.9,
-        b2=0.999,
-        eps=1e-8,
-        weight_decay=1e-4,
+        learning_rate: _LearningRate = 1e-3,
+        b1: float = 0.9,
+        b2: float = 0.999,
+        eps: float = 1e-8,
+        weight_decay: float = 1e-4,
         *,
-        clip_norm=None,
-    ):
+        clip_norm: float | None = None,
+    ) -> None:
         self._configure(learning_rate, b1, b2, eps, clip_norm)
         self.weight_decay = float(weight_decay)
         if not _math.isfinite(self.weight_decay) or self.weight_decay < 0:
@@ -278,15 +305,19 @@ class SGD:
     ``clip_norm`` clips each update's gradients with ``clip_by_global_norm``.
     """
 
-    def __init__(self, learning_rate=1e-2, *, clip_norm=None):
+    def __init__(
+        self, learning_rate: _LearningRate = 1e-2, *, clip_norm: float | None = None
+    ) -> None:
         self.learning_rate = _learning_rate(learning_rate)
         self.clip_norm = _clip_norm(clip_norm)
 
-    def init(self, params):
+    def init(self, params: _Any) -> dict[str, int] | None:
         _parameters(params)
         return {"step": 0} if callable(self.learning_rate) else None
 
-    def update(self, params, grads, state):
+    def update(
+        self, params: _Any, grads: _Any, state: dict[str, int] | None
+    ) -> tuple[_Any, dict[str, int] | None]:
         parameters, gradients, definition = _matching(params, grads, "gradient")
         if callable(self.learning_rate):
             if (
@@ -330,14 +361,14 @@ class Trainer:
 
     def __init__(
         self,
-        loss,
-        params,
-        optimizer,
-        *data,
-        device="cpu",
-        batch_argnums=(),
-        precision=None,
-    ):
+        loss: _Callable[..., _Any],
+        params: _Any,
+        optimizer: Adam | AdamW | SGD,
+        *data: _Any,
+        device: str = "cpu",
+        batch_argnums: int | _Sequence[int] = (),
+        precision: str | None = None,
+    ) -> None:
         from ._devices import parse_device, require_device
 
         if not callable(loss):
@@ -371,9 +402,10 @@ class Trainer:
             )
         self._params = params
         self._optimizer = optimizer
-        self._executor = None
+        self._executor: _Any = None
         if target == "cpu":
-            self._state = optimizer.init(params)
+            # The state of whichever optimizer this is.
+            self._state: _Any = optimizer.init(params)
             self._value_and_grad = _jit(_value_and_grad(loss), device="cpu")
             self._evaluate_loss = _jit(loss, device="cpu")
             return
@@ -438,16 +470,19 @@ class Trainer:
         # Completed device steps, at which a host schedule is evaluated.
         self._device_steps = 0
 
-    def _device_step(self, *inputs):
+    def _device_step(self, *inputs: _Any) -> None:
+        executor = self._executor
+        # Only device trainers step through here.
+        assert executor is not None
         schedule = self._optimizer.learning_rate
         if callable(schedule):
-            self._executor.learning_rate = _rate_at(schedule, self._device_steps)
-        result = self._executor.step(*inputs)
+            executor.learning_rate = _rate_at(schedule, self._device_steps)
+        result = executor.step(*inputs)
         self._device_steps += 1
         return result
 
     @property
-    def params(self):
+    def params(self) -> _Any:
         """Read current parameters into their original pytree structure."""
         if self._executor is None:
             return self._params
@@ -456,7 +491,7 @@ class Trainer:
             self._param_def, [values[name] for name in self._parameter_names]
         )
 
-    def step(self, *batch):
+    def step(self, *batch: _Any) -> None:
         """Advance one optimizer step, optionally replacing dynamic data."""
         if self._executor is not None and not batch:
             return self._device_step()
@@ -491,7 +526,7 @@ class Trainer:
         params, state = self._optimizer.update(self._params, gradients, self._state)
         self._params, self._state, self._data = params, state, pending_data
 
-    def loss(self):
+    def loss(self) -> "_TensorType":
         """Evaluate loss with current parameters and the latest data."""
         if self._executor is not None:
             return self._executor.loss()

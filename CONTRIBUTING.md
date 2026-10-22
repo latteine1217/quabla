@@ -40,6 +40,7 @@ Run these before opening a pull request:
 ```sh
 cargo fmt --all --check
 ruff check tests examples python
+pyright                    # type check of python/quabla (pyrightconfig.json)
 cargo clippy --workspace --all-targets -- -D warnings
 # macOS:
 cargo clippy --workspace --all-targets --features quabla-core/mlx -- -D warnings

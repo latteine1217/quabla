@@ -64,14 +64,20 @@ solution, in forward and reverse mode (any two passes), not from the
 iterations.
 """
 
-import collections
+from __future__ import annotations
+
 import math
 import numbers
 import operator
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, overload
 
 from ._array import asarray, eye, zeros
 from ._krylov import cg, gmres
 from ._quabla import Tensor, TraceTensor, concat, float32, where
+
+if TYPE_CHECKING:
+    from ._typing import Array, ArrayLike, Axis
 
 __all__ = [
     "EighResult",
@@ -97,23 +103,47 @@ __all__ = [
     "svd",
 ]
 
-SlogdetResult = collections.namedtuple("SlogdetResult", ["sign", "logabsdet"])
-SlogdetResult.__doc__ = "`(sign, logabsdet)` of `slogdet`; a pytree like any namedtuple."
-EighResult = collections.namedtuple("EighResult", ["eigenvalues", "eigenvectors"])
-EighResult.__doc__ = "`(eigenvalues, eigenvectors)` of `eigh`; a pytree like any namedtuple."
-QRResult = collections.namedtuple("QRResult", ["Q", "R"])
-QRResult.__doc__ = "`(Q, R)` of `qr`; a pytree like any namedtuple."
-SVDResult = collections.namedtuple("SVDResult", ["U", "S", "Vh"])
-SVDResult.__doc__ = "`(U, S, Vh)` of `svd`; a pytree like any namedtuple."
-LstsqResult = collections.namedtuple("LstsqResult", ["solution", "residuals"])
-LstsqResult.__doc__ = "`(solution, residuals)` of `lstsq`; a pytree like any namedtuple."
+class SlogdetResult(NamedTuple):
+    """`(sign, logabsdet)` of `slogdet`; a pytree like any namedtuple."""
+
+    sign: Array
+    logabsdet: Array
 
 
-def _array(x):
+class EighResult(NamedTuple):
+    """`(eigenvalues, eigenvectors)` of `eigh`; a pytree like any namedtuple."""
+
+    eigenvalues: Array
+    eigenvectors: Array
+
+
+class QRResult(NamedTuple):
+    """`(Q, R)` of `qr`; a pytree like any namedtuple."""
+
+    Q: Array
+    R: Array
+
+
+class SVDResult(NamedTuple):
+    """`(U, S, Vh)` of `svd`; a pytree like any namedtuple."""
+
+    U: Array
+    S: Array
+    Vh: Array
+
+
+class LstsqResult(NamedTuple):
+    """`(solution, residuals)` of `lstsq`; a pytree like any namedtuple."""
+
+    solution: Array
+    residuals: Array
+
+
+def _array(x: ArrayLike) -> Array:
     return x if isinstance(x, (Tensor, TraceTensor)) else asarray(x)
 
 
-def _square(a, name):
+def _square(a: ArrayLike, name: str) -> Array:
     a = _array(a)
     shape = tuple(a.shape)
     if len(shape) < 2 or shape[-1] != shape[-2]:
@@ -121,20 +151,20 @@ def _square(a, name):
     return a
 
 
-def _matrix(a, name):
+def _matrix(a: ArrayLike, name: str) -> Array:
     a = _array(a)
     if len(a.shape) < 2:
         raise ValueError(f"{name} requires a stack of matrices [..., m, n], got {list(a.shape)}")
     return a
 
 
-def _matrix_transpose(x):
+def _matrix_transpose(x: Array) -> Array:
     axes = list(range(len(x.shape)))
     axes[-2], axes[-1] = axes[-1], axes[-2]
     return x.transpose(axes)
 
 
-def _broadcast_batch(*shapes):
+def _broadcast_batch(*shapes: Sequence[int]) -> tuple[int, ...]:
     """The NumPy broadcast of the batch shapes `shapes`."""
     rank = max(len(shape) for shape in shapes)
     result = []
@@ -147,12 +177,12 @@ def _broadcast_batch(*shapes):
     return tuple(result)
 
 
-def _to_batch(x, batch):
+def _to_batch(x: Array, batch: Sequence[int]) -> Array:
     shape = tuple(batch) + tuple(x.shape[-2:])
     return x if tuple(x.shape) == shape else x.broadcast_to(list(shape))
 
 
-def _solve_operands(a, b, name):
+def _solve_operands(a: ArrayLike, b: ArrayLike, name: str) -> tuple[Array, Array, bool]:
     """`a` and `b` broadcast to a common batch, `b` as a stack of column
     blocks, and whether `b` was a vector."""
     a = _square(a, name)
@@ -171,11 +201,11 @@ def _solve_operands(a, b, name):
     return _to_batch(a, batch), _to_batch(b, batch), vector
 
 
-def _restore_vector(x, vector):
+def _restore_vector(x: Array, vector: bool) -> Array:
     return x.reshape(list(x.shape[:-1])) if vector else x
 
 
-def solve(a, b):
+def solve(a: ArrayLike, b: ArrayLike) -> Array:
     """The solution `x` of `a @ x == b` for every matrix of the leading axes,
     by LU with partial pivoting; `b` is `[..., n, k]`, or a vector `[n]`
     shared by every matrix. A singular matrix raises."""
@@ -183,7 +213,7 @@ def solve(a, b):
     return _restore_vector(a.solve(b), vector)
 
 
-def _trans_flag(trans):
+def _trans_flag(trans: int | str) -> bool:
     if trans in (0, "N"):
         return False
     if trans in (1, "T", "C"):
@@ -191,7 +221,9 @@ def _trans_flag(trans):
     raise ValueError(f"trans must be 0, 1, 'N', 'T', or 'C', got {trans!r}")
 
 
-def solve_triangular(a, b, trans=0, lower=False):
+def solve_triangular(
+    a: ArrayLike, b: ArrayLike, trans: int | str = 0, lower: bool = False
+) -> Array:
     """The solution `x` of `t @ x == b` (`trans=0`) or `t^T @ x == b`
     (`trans=1`), where `t` is the lower (`lower=True`) or upper triangle of
     `a`; the other triangle of `a` is never read. Shapes follow `solve`."""
@@ -199,13 +231,13 @@ def solve_triangular(a, b, trans=0, lower=False):
     return _restore_vector(a.solve_triangular(b, bool(lower), _trans_flag(trans)), vector)
 
 
-def cholesky(a):
+def cholesky(a: ArrayLike) -> Array:
     """The lower Cholesky factor `L` (`a = L @ L^T`) of each symmetric
     positive-definite matrix of the leading axes."""
     return _square(a, "cholesky").cholesky()
 
 
-def cho_solve(c, b, lower=True):
+def cho_solve(c: ArrayLike, b: ArrayLike, lower: bool = True) -> Array:
     """The solution `x` of `a @ x == b` given the Cholesky factor `c` of
     `a`: lower (`a = c @ c^T`) by default, upper (`a = c^T @ c`) with
     `lower=False`. Two triangular solves; `a` is never formed."""
@@ -216,7 +248,7 @@ def cho_solve(c, b, lower=True):
     return solve_triangular(c, y, trans=0, lower=False)
 
 
-def slogdet(a):
+def slogdet(a: ArrayLike) -> SlogdetResult:
     """`SlogdetResult(sign, logabsdet)` of each matrix of the leading axes,
     from an LU factorization with partial pivoting: `det(a) = sign *
     exp(logabsdet)` without overflow. An exactly singular matrix gives
@@ -226,7 +258,7 @@ def slogdet(a):
     return SlogdetResult(a._linalg("det_sign"), a._linalg("log_abs_det"))
 
 
-def det(a):
+def det(a: ArrayLike) -> Array:
     """The determinant `sign * exp(logabsdet)` of each matrix of the leading
     axes (see `slogdet`); exactly `0` for an exactly singular matrix, whose
     derivative is undefined here."""
@@ -234,7 +266,7 @@ def det(a):
     return sign * logabsdet.exp()
 
 
-def inv(a):
+def inv(a: ArrayLike) -> Array:
     """The inverse of each matrix of the leading axes, as `solve(a, I)`.
     To apply an inverse, `solve(a, b)` is faster and more accurate than
     `inv(a) @ b`."""
@@ -244,7 +276,7 @@ def inv(a):
     return a.solve(_to_batch(identity, tuple(a.shape[:-2])))
 
 
-def eigh(a):
+def eigh(a: ArrayLike) -> EighResult:
     """`EighResult(eigenvalues, eigenvectors)` of the symmetric part
     `(a + a^T) / 2` of each matrix of the leading axes: eigenvalues
     ascending (`[..., n]`), eigenvectors as the columns of `[..., n, n]`, so
@@ -256,7 +288,11 @@ def eigh(a):
     return EighResult(a._linalg("eigh_values"), a._linalg("eigh_vectors"))
 
 
-def qr(a, mode="reduced"):
+@overload
+def qr(a: ArrayLike, mode: Literal["r"]) -> Array: ...
+@overload
+def qr(a: ArrayLike, mode: Literal["reduced", "complete"] = "reduced") -> QRResult: ...
+def qr(a: ArrayLike, mode: str = "reduced") -> QRResult | Array:
     """The QR factorization `a = Q @ R` of each matrix of the leading axes
     (`[..., m, n]`, any `m` and `n`), by Householder reflections in float64
     on the CPU, as `QRResult(Q, R)`.
@@ -286,7 +322,19 @@ def qr(a, mode="reduced"):
     return QRResult(a._linalg("qr_q_complete" if complete else "qr_q"), r)
 
 
-def svd(a, full_matrices=False, compute_uv=True):
+@overload
+def svd(
+    a: ArrayLike, full_matrices: bool = False, compute_uv: Literal[True] = True
+) -> SVDResult: ...
+@overload
+def svd(a: ArrayLike, full_matrices: bool, compute_uv: Literal[False]) -> Array: ...
+@overload
+def svd(
+    a: ArrayLike, full_matrices: bool = False, *, compute_uv: Literal[False]
+) -> Array: ...
+def svd(
+    a: ArrayLike, full_matrices: bool = False, compute_uv: bool = True
+) -> SVDResult | Array:
     """The singular value decomposition `a = U @ diag(S) @ Vh` of each
     matrix of the leading axes (`[..., m, n]`), as `SVDResult(U, S, Vh)`,
     or the singular values `S` alone when `compute_uv` is false.
@@ -319,7 +367,17 @@ def svd(a, full_matrices=False, compute_uv=True):
     return SVDResult(u, s, vh)
 
 
-def lstsq(a, b, return_residuals=False):
+@overload
+def lstsq(
+    a: ArrayLike, b: ArrayLike, return_residuals: Literal[False] = False
+) -> Array: ...
+@overload
+def lstsq(
+    a: ArrayLike, b: ArrayLike, return_residuals: Literal[True]
+) -> LstsqResult: ...
+def lstsq(
+    a: ArrayLike, b: ArrayLike, return_residuals: bool = False
+) -> Array | LstsqResult:
     """The least-squares solution `x` of `a @ x ~= b` for every matrix of the
     leading axes, from `qr` (leading batch axes broadcast as in `solve`).
 
@@ -368,7 +426,7 @@ def lstsq(a, b, return_residuals=False):
     return LstsqResult(solution, residuals)
 
 
-def _norm_axes(axis, ndim):
+def _norm_axes(axis: Any, ndim: int) -> tuple[int, ...]:
     """`axis` (an int or a sequence of ints) as distinct non-negative axes."""
     try:
         axes = (operator.index(axis),)
@@ -384,7 +442,7 @@ def _norm_axes(axis, ndim):
     return tuple(normalized)
 
 
-def _vector_norm(x, ord, axis, keepdims):
+def _vector_norm(x: Array, ord: Any, axis: int, keepdims: bool) -> Array:
     if ord is None or ord == 2:
         # The scaled native norm: no overflow or underflow of the squares.
         return x.norm(axis=axis, keepdims=keepdims)
@@ -414,7 +472,9 @@ def _vector_norm(x, ord, axis, keepdims):
     )
 
 
-def _matrix_norm(x, ord, axes, keepdims):
+def _matrix_norm(
+    x: Array, ord: float | str | None, axes: tuple[int, ...], keepdims: bool
+) -> Array:
     row, column = axes
     if ord is None or ord == "fro":
         return x.norm(axis=axes, keepdims=keepdims)
@@ -441,7 +501,12 @@ def _matrix_norm(x, ord, axes, keepdims):
     return result.reshape([extent for index, extent in enumerate(x.shape) if index not in axes])
 
 
-def norm(x, ord=None, axis=None, keepdims=False):
+def norm(
+    x: ArrayLike,
+    ord: float | str | None = None,
+    axis: Axis = None,
+    keepdims: bool = False,
+) -> Array:
     """The vector or matrix norm of `x`, as NumPy's `linalg.norm`.
 
     `axis` selects a vector norm (an int) or a matrix norm (a pair of
@@ -481,7 +546,7 @@ def norm(x, ord=None, axis=None, keepdims=False):
     raise ValueError(f"norm takes one axis (vector) or two (matrix), got {axis!r}")
 
 
-def matrix_power(a, n):
+def matrix_power(a: ArrayLike, n: int) -> Array:
     """`a` raised to the integer power `n` for each square matrix of the
     leading axes, by repeated squaring (about `2 log2 |n|` products); `n = 0`
     gives the identity and a negative `n` powers `inv(a)`."""
@@ -501,11 +566,13 @@ def matrix_power(a, n):
             result = power if result is None else result @ power
         n >>= 1
         if not n:
+            # The highest set bit of `n` assigned it.
+            assert result is not None
             return result
         power = power @ power
 
 
-def pinv(a, rtol=None):
+def pinv(a: ArrayLike, rtol: float | None = None) -> Array:
     """The Moore-Penrose pseudo-inverse of each matrix of the leading axes,
     `V diag(1/s) U^T` from `svd`, with every singular value at or below
     `rtol * max(s)` treated as zero. `rtol=None` means

@@ -23,10 +23,16 @@ not traced, so draw samples outside and pass them in as arguments when they
 must change between calls.
 """
 
+from __future__ import annotations
+
 import math
 import operator
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from ._quabla import Tensor, TraceTensor, bool_, float32, float64
+
+if TYPE_CHECKING:
+    from ._typing import DType, Shape
 
 __all__ = [
     "Key",
@@ -51,31 +57,31 @@ class Key:
 
     __slots__ = ("_value",)
 
-    def __init__(self, value):
+    def __init__(self, value: int) -> None:
         object.__setattr__(self, "_value", operator.index(value) & _MASK)
 
-    def __setattr__(self, name, value):
+    def __setattr__(self, name: str, value: Any) -> NoReturn:
         raise AttributeError("Key is immutable")
 
     @property
-    def value(self):
+    def value(self) -> int:
         """The 64-bit seed as an int, as accepted by `Tensor.random_normal`."""
         return self._value
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         return type(other) is Key and other._value == self._value
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash((Key, self._value))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Key({self._value:#018x})"
 
-    def __reduce__(self):
+    def __reduce__(self) -> tuple[type[Key], tuple[int]]:
         return (Key, (self._value,))
 
 
-def _not_traced(value, what):
+def _not_traced(value: object, what: str) -> None:
     if type(value) is TraceTensor:
         raise TypeError(
             f"{what} is a tracer: quabla.random samples on the host and keys are not "
@@ -84,7 +90,7 @@ def _not_traced(value, what):
         )
 
 
-def _key_value(key, what="key"):
+def _key_value(key: Key, what: str = "key") -> int:
     _not_traced(key, what)
     if type(key) is not Key:
         raise TypeError(
@@ -94,27 +100,27 @@ def _key_value(key, what="key"):
     return key._value
 
 
-def _shape(shape):
+def _shape(shape: Shape) -> list[int]:
     _not_traced(shape, "shape")
     if isinstance(shape, int):
         shape = (shape,)
     return [operator.index(extent) for extent in shape]
 
 
-def _float_dtype(dtype, what):
+def _float_dtype(dtype: DType, what: str) -> DType:
     if dtype != float64 and dtype != float32:
         raise TypeError(f"{what} requires dtype float32 or float64, got {dtype!r}")
     return dtype
 
 
-def key(seed):
+def key(seed: int) -> Key:
     """A key from the integer `seed`, taken modulo 2**64. `key(seed)` and
     `Tensor.random_normal(shape, seed)` draw from the same stream."""
     _not_traced(seed, "seed")
     return Key(seed)
 
 
-def split(key, num=2):
+def split(key: Key, num: int = 2) -> tuple[Key, ...]:
     """A tuple of `num` new keys derived from `key`."""
     num = operator.index(num)
     if num < 1:
@@ -122,14 +128,20 @@ def split(key, num=2):
     return tuple(Key(value) for value in Tensor.split_key(_key_value(key), num))
 
 
-def fold_in(key, data):
+def fold_in(key: Key, data: int) -> Key:
     """A new key derived from `key` and the integer `data` (taken modulo
     2**64), for example a step or device index."""
     _not_traced(data, "data")
     return Key(Tensor.fold_in_key(_key_value(key), operator.index(data) & _MASK))
 
 
-def uniform(key, shape=(), dtype=float64, minval=0.0, maxval=1.0):
+def uniform(
+    key: Key,
+    shape: Shape = (),
+    dtype: DType = float64,
+    minval: float = 0.0,
+    maxval: float = 1.0,
+) -> Tensor:
     """Samples uniform on `[minval, maxval)` with shape `shape` and dtype
     `dtype`; `minval` and `maxval` are finite Python numbers."""
     _not_traced(minval, "minval")
@@ -143,12 +155,12 @@ def uniform(key, shape=(), dtype=float64, minval=0.0, maxval=1.0):
     )
 
 
-def normal(key, shape=(), dtype=float64):
+def normal(key: Key, shape: Shape = (), dtype: DType = float64) -> Tensor:
     """Standard normal samples with shape `shape` and dtype `dtype`."""
     return _scaled_normal(key, shape, dtype, 1.0, "normal")
 
 
-def bernoulli(key, p=0.5, shape=()):
+def bernoulli(key: Key, p: float = 0.5, shape: Shape = ()) -> Tensor:
     """`bool_` samples that are `True` with probability `p`, a Python number
     in `[0, 1]`: `uniform(key, shape) < p`."""
     _not_traced(p, "p")
@@ -159,14 +171,16 @@ def bernoulli(key, p=0.5, shape=()):
     return Tensor(samples.shape, [float(value < p) for value in samples.to_flat_list()], bool_)
 
 
-def _scaled_normal(key, shape, dtype, stddev, what):
+def _scaled_normal(
+    key: Key, shape: Shape, dtype: DType, stddev: float, what: str
+) -> Tensor:
     samples = Tensor.random_normal(_shape(shape), _key_value(key), 0.0, stddev)
     if _float_dtype(dtype, what) == float32:
         samples = samples.astype(float32)
     return samples
 
 
-def _fans(shape, what):
+def _fans(shape: Shape, what: str) -> tuple[int, int]:
     """`(fan_in, fan_out)` of a weight of `shape`, as in JAX and Flax:
     `shape[-2]` and `shape[-1]` times the receptive field, the product of
     the leading dimensions."""
@@ -177,7 +191,7 @@ def _fans(shape, what):
     return shape[-2] * receptive, shape[-1] * receptive
 
 
-def glorot_normal(key, shape, dtype=float64):
+def glorot_normal(key: Key, shape: Shape, dtype: DType = float64) -> Tensor:
     """Glorot (Xavier) normal weights: standard deviation
     `sqrt(2 / (fan_in + fan_out))`, without truncation (JAX's
     `glorot_normal` truncates at two standard deviations). For a 2-D shape
@@ -187,7 +201,7 @@ def glorot_normal(key, shape, dtype=float64):
     return _scaled_normal(key, shape, dtype, stddev, "glorot_normal")
 
 
-def glorot_uniform(key, shape, dtype=float64):
+def glorot_uniform(key: Key, shape: Shape, dtype: DType = float64) -> Tensor:
     """Glorot (Xavier) uniform weights on `[-limit, limit)` with
     `limit = sqrt(6 / (fan_in + fan_out))`, as in JAX."""
     fan_in, fan_out = _fans(shape, "glorot_uniform")
@@ -195,7 +209,7 @@ def glorot_uniform(key, shape, dtype=float64):
     return uniform(key, shape, dtype, -limit, limit)
 
 
-def he_normal(key, shape, dtype=float64):
+def he_normal(key: Key, shape: Shape, dtype: DType = float64) -> Tensor:
     """He (Kaiming) normal weights: standard deviation `sqrt(2 / fan_in)`,
     without truncation (JAX's `he_normal` truncates at two standard
     deviations)."""

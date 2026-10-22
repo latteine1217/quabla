@@ -14,7 +14,11 @@ carry is a single array, so the solver state is packed into one vector and
 sliced apart in each iteration, as in `ode.py`.
 """
 
+from __future__ import annotations
+
 import math
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from . import _quabla
 from ._array import arange, asarray, eye, zeros
@@ -32,6 +36,9 @@ from ._implicit import (
     transpose,
 )
 from ._quabla import Tensor, TraceTensor, float32, float64
+
+if TYPE_CHECKING:
+    from ._typing import Array, ArrayLike
 
 __all__ = ["cg", "gmres"]
 
@@ -403,7 +410,44 @@ def _result(name, matvec, b, x, stats, args, info, advice):
     return finish(name, x, details, info, advice)
 
 
-def cg(matvec, b, *, args=(), x0=None, tol=1e-5, atol=0.0, maxiter=None, M=None, info=False):
+@overload
+def cg(
+    matvec: Callable[..., Any],
+    b: ArrayLike,
+    *,
+    args: Sequence[Any] = (),
+    x0: ArrayLike | None = None,
+    tol: float = 1e-5,
+    atol: float = 0.0,
+    maxiter: int | None = None,
+    M: Callable[..., Any] | None = None,
+    info: Literal[False] = False,
+) -> Array: ...
+@overload
+def cg(
+    matvec: Callable[..., Any],
+    b: ArrayLike,
+    *,
+    args: Sequence[Any] = (),
+    x0: ArrayLike | None = None,
+    tol: float = 1e-5,
+    atol: float = 0.0,
+    maxiter: int | None = None,
+    M: Callable[..., Any] | None = None,
+    info: Literal[True],
+) -> tuple[Array, dict[str, Any]]: ...
+def cg(
+    matvec: Callable[..., Any],
+    b: ArrayLike,
+    *,
+    args: Sequence[Any] = (),
+    x0: ArrayLike | None = None,
+    tol: float = 1e-5,
+    atol: float = 0.0,
+    maxiter: int | None = None,
+    M: Callable[..., Any] | None = None,
+    info: bool = False,
+) -> Array | tuple[Array, dict[str, Any]]:
     """The solution `x` of `A x = b` for a symmetric positive-definite
     operator `A`, by (preconditioned) conjugate gradients.
 
@@ -452,9 +496,47 @@ def cg(matvec, b, *, args=(), x0=None, tol=1e-5, atol=0.0, maxiter=None, M=None,
     )
 
 
+@overload
 def gmres(
-    matvec, b, *, args=(), x0=None, tol=1e-5, atol=0.0, restart=20, maxiter=None, M=None, info=False
-):
+    matvec: Callable[..., Any],
+    b: ArrayLike,
+    *,
+    args: Sequence[Any] = (),
+    x0: ArrayLike | None = None,
+    tol: float = 1e-5,
+    atol: float = 0.0,
+    restart: int = 20,
+    maxiter: int | None = None,
+    M: Callable[..., Any] | None = None,
+    info: Literal[False] = False,
+) -> Array: ...
+@overload
+def gmres(
+    matvec: Callable[..., Any],
+    b: ArrayLike,
+    *,
+    args: Sequence[Any] = (),
+    x0: ArrayLike | None = None,
+    tol: float = 1e-5,
+    atol: float = 0.0,
+    restart: int = 20,
+    maxiter: int | None = None,
+    M: Callable[..., Any] | None = None,
+    info: Literal[True],
+) -> tuple[Array, dict[str, Any]]: ...
+def gmres(
+    matvec: Callable[..., Any],
+    b: ArrayLike,
+    *,
+    args: Sequence[Any] = (),
+    x0: ArrayLike | None = None,
+    tol: float = 1e-5,
+    atol: float = 0.0,
+    restart: int = 20,
+    maxiter: int | None = None,
+    M: Callable[..., Any] | None = None,
+    info: bool = False,
+) -> Array | tuple[Array, dict[str, Any]]:
     """The solution `x` of `A x = b` for a general nonsingular operator `A`,
     by restarted GMRES with right preconditioning.
 

@@ -5,13 +5,20 @@ and eager bodies see a Python integer. Scan outputs stack on axis zero.
 `while_loop` is the one loop with a traced trip count.
 """
 
+from __future__ import annotations
+
 import math
 import operator
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any
 
 from . import _quabla
 from ._array import asarray
 from ._errors import TracerError
 from ._quabla import TensorTraceGraph, TraceTensor
+
+if TYPE_CHECKING:
+    from ._typing import Array, ArrayLike
 
 __all__ = ["cond", "fori_loop", "scan", "while_loop"]
 
@@ -84,7 +91,7 @@ def _concrete_predicate(pred):
     return value != 0
 
 
-def cond(pred, true_fun, false_fun, *operands):
+def cond(pred: Any, true_fun: Callable[..., Any], false_fun: Callable[..., Any], *operands: Any) -> Any:
     """Run the selected branch; traced scalar predicates form lazy regions.
 
     Branches receive the positional operands. Pass every outer tracer used
@@ -148,7 +155,15 @@ def _traced_like(carry, result):
     return result
 
 
-def fori_loop(lower, upper, body_fun, init_val, *, operands=(), unroll=False):
+def fori_loop(
+    lower: int,
+    upper: int,
+    body_fun: Callable[..., Any],
+    init_val: ArrayLike,
+    *,
+    operands: Sequence[Any] = (),
+    unroll: bool = False,
+) -> Array:
     """Apply `body_fun(i, carry, *operands)` over static [lower, upper).
 
     By default a traced body forms one runtime region; `unroll=True` expands
@@ -180,7 +195,9 @@ def fori_loop(lower, upper, body_fun, init_val, *, operands=(), unroll=False):
     return carry
 
 
-def while_loop(cond_fun, body_fun, init_val, *, operands=()):
+def while_loop(
+    cond_fun: Callable[..., Any], body_fun: Callable[..., Any], init_val: ArrayLike, *, operands: Sequence[Any] = ()
+) -> Array:
     """Apply `carry = body_fun(carry, *operands)` while `cond_fun(carry, *operands)`.
 
     `cond_fun` returns a scalar bool. A traced carry or operand forms one
@@ -227,7 +244,14 @@ def _eager_predicate(value):
     return bool(value)
 
 
-def scan(f, init, *, length, operands=(), unroll=False):
+def scan(
+    f: Callable[..., Any],
+    init: ArrayLike,
+    *,
+    length: int,
+    operands: Sequence[Any] = (),
+    unroll: bool = False,
+) -> tuple[Array, Array]:
     """Apply `f(carry, i, *operands) -> (carry, y)` and stack the outputs.
 
     `length` is a positive static integer. Traced scans form a runtime region

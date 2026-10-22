@@ -1,12 +1,12 @@
 # Public `quabla` package over the compiled extension `quabla._quabla`.
 #
-# The package re-exports the extension's public names (`_NATIVE`) and the
+# The package re-exports the extension's public names and the
 # pure-Python layers built on them. The extension's other names are the
 # private helpers those layers call.
 
 import importlib.metadata as _metadata
 
-from . import _array, _custom, _errors, _io, _newton, _ops, _quabla, _transforms
+from . import _array, _control, _custom, _errors, _io, _newton, _ops, _quabla, _transforms
 from . import tree as tree
 # Kept out of `__all__`, so a star import does not shadow the standard
 # library module `random`.
@@ -36,7 +36,50 @@ from ._ops import sum as sum
 from ._transforms import *  # noqa: F403
 from ._custom import *  # noqa: F403
 
-_NATIVE = [
+from ._quabla import (
+    Compiler,
+    Executable,
+    Program,
+    Tensor,
+    TensorCudaAdamOptimizer,
+    TensorMlxAdamOptimizer,
+    TensorView,
+    TraceTensor,
+    bool_,
+    concat,
+    dtype,
+    einsum,
+    equal,
+    float32,
+    float64,
+    greater,
+    greater_equal,
+    isfinite,
+    isnan,
+    less,
+    less_equal,
+    logical_and,
+    logical_not,
+    logical_or,
+    not_equal,
+    stack,
+    where,
+)
+
+__doc__ = _quabla.__doc__
+
+# The version of the installed distribution. The Cargo manifest of
+# `quabla-python` is the single source of truth: maturin derives the package
+# metadata version from it (`dynamic = ["version"]` in pyproject.toml), and
+# the extension carries the same string, which serves a source tree that is
+# importable without installed metadata.
+try:
+    __version__ = _metadata.version(__name__)
+except _metadata.PackageNotFoundError:
+    __version__ = _quabla.__version__
+
+# Static forms that type checkers follow, so the re-exports are public.
+__all__ = [
     "Compiler",
     "Executable",
     "Program",
@@ -65,41 +108,19 @@ _NATIVE = [
     "stack",
     "where",
 ]
-globals().update({name: getattr(_quabla, name) for name in _NATIVE})
-
-__doc__ = _quabla.__doc__
-
-# The version of the installed distribution. The Cargo manifest of
-# `quabla-python` is the single source of truth: maturin derives the package
-# metadata version from it (`dynamic = ["version"]` in pyproject.toml), and
-# the extension carries the same string, which serves a source tree that is
-# importable without installed metadata.
-try:
-    __version__ = _metadata.version(__name__)
-except _metadata.PackageNotFoundError:
-    __version__ = _quabla.__version__
-
-__all__ = list(
-    dict.fromkeys(
-        _NATIVE
-        + _array.__all__
-        + _errors.__all__
-        + _io.__all__
-        + _newton.__all__
-        + _ops.__all__
-        + _transforms.__all__
-        + _custom.__all__
-        + [
-            "ShapeDtype",
-            "devices",
-            "optim",
-            "distributed",
-            "ode",
-            "linalg",
-            "cond",
-            "fori_loop",
-            "scan",
-            "while_loop",
-        ]
-    )
-)
+__all__ += _array.__all__
+__all__ += _errors.__all__
+__all__ += _io.__all__
+__all__ += _newton.__all__
+__all__ += _ops.__all__
+__all__ += _transforms.__all__
+__all__ += _custom.__all__
+__all__ += [
+    "ShapeDtype",
+    "devices",
+    "optim",
+    "distributed",
+    "ode",
+    "linalg",
+]
+__all__ += _control.__all__

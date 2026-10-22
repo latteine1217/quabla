@@ -11,6 +11,9 @@ interpolation (eq. 3.59).
 import math as _math
 import operator as _operator
 from collections import deque as _deque
+from collections.abc import Callable as _Callable
+from collections.abc import Sequence as _Sequence
+from typing import Any as _Any
 
 from . import tree as _tree
 from ._quabla import Tensor as _Tensor
@@ -32,11 +35,11 @@ _CURVATURE_EPS = 1e-10
 _SAFEGUARD = 0.1
 
 
-def _dot(a, b):
+def _dot(a: _Tensor, b: _Tensor) -> float:
     return float((a * b).sum())
 
 
-def _max_abs(vector):
+def _max_abs(vector: _Tensor) -> float:
     # Python abs() normalizes a -0.0 maximum to 0.0 for reporting.
     return abs(float(vector.abs().max()))
 
@@ -143,7 +146,28 @@ def _zoom(phi, f0, slope0, lo, hi, budget):
     return lo, used
 
 
-def _strong_wolfe(phi, f0, slope0, step, budget):
+# A line-search point: (step, value, slope, payload).
+_Point = tuple[float, float, float, _Any]
+
+
+def _line(
+    evaluate: _Callable[[_Tensor], tuple[_Tensor, float, _Tensor]],
+    x: _Tensor,
+    direction: _Tensor,
+) -> _Callable[[float], _Point]:
+    """`phi(alpha)` of the line search from `x` along `direction`: the step,
+    the loss, the directional derivative, and `(trial point, gradient)`."""
+
+    def phi(alpha: float) -> _Point:
+        trial, value, gradient = evaluate(x + direction * alpha)
+        return alpha, value, _dot(gradient, direction), (trial, gradient)
+
+    return phi
+
+
+def _strong_wolfe(
+    phi: _Callable[[float], _Point], f0: float, slope0: float, step: float, budget: int
+) -> tuple[_Point, int]:
     """N&W Algorithm 3.5. Returns the accepted point (step, value, slope,
     payload) and the evaluation count; step 0 means no acceptable step."""
     start = (0.0, f0, slope0, None)
@@ -173,7 +197,9 @@ def _strong_wolfe(phi, f0, slope0, step, budget):
     return previous, used
 
 
-def _direction(gradient, pairs):
+def _direction(
+    gradient: _Tensor, pairs: _Sequence[tuple[_Tensor, _Tensor, float]]
+) -> _Tensor:
     """N&W Algorithm 7.4: ``-H g`` from the stored ``(s, y, rho)`` pairs."""
     q = gradient
     alphas = []
@@ -208,13 +234,13 @@ class LBFGS:
 
     def __init__(
         self,
-        history=10,
-        max_iterations=500,
-        max_evaluations=None,
-        tolerance_grad=1e-7,
-        tolerance_change=1e-9,
-        line_search="strong_wolfe",
-    ):
+        history: int = 10,
+        max_iterations: int = 500,
+        max_evaluations: int | None = None,
+        tolerance_grad: float = 1e-7,
+        tolerance_change: float = 1e-9,
+        line_search: str = "strong_wolfe",
+    ) -> None:
         self.history = _operator.index(history)
         self.max_iterations = _operator.index(max_iterations)
         if self.history <= 0 or self.max_iterations <= 0:
@@ -236,7 +262,9 @@ class LBFGS:
             raise ValueError('line_search must be "strong_wolfe"')
         self.line_search = line_search
 
-    def minimize(self, fun, params, *args):
+    def minimize(
+        self, fun: _Callable[..., _Any], params: _Any, *args: _Any
+    ) -> tuple[_Any, dict[str, _Any]]:
         """Minimize ``fun(params, *args)`` over ``params`` from its value."""
         if not callable(fun):
             raise TypeError("fun must be callable")
@@ -244,7 +272,7 @@ class LBFGS:
         value_and_grad = _jit(_value_and_grad(fun), device="cpu")
         evaluations = 0
 
-        def evaluate(x):
+        def evaluate(x: _Tensor) -> tuple[_Tensor, float, _Tensor]:
             nonlocal evaluations
             evaluations += 1
             point = layout.tree(x)
@@ -286,10 +314,7 @@ class LBFGS:
             # steepest-descent step is limited to unit length.
             step = 1.0 if pairs else min(1.0, 1 / _math.sqrt(-slope))
 
-            def phi(alpha, x=x, direction=direction):
-                trial, value, gradient = evaluate(x + direction * alpha)
-                return alpha, value, _dot(gradient, direction), (trial, gradient)
-
+            phi = _line(evaluate, x, direction)
             point, _ = _strong_wolfe(phi, f, slope, step, budget)
             if point[3] is None:
                 if pairs:

@@ -22,7 +22,11 @@ public API. A custom node records its class and its auxiliary data, so two
 classes, or two values of a static (`meta`) field, never share a trace.
 """
 
+from __future__ import annotations
+
 import dataclasses
+from collections.abc import Callable, Hashable, Iterable, Iterator
+from typing import Any, TypeVar, overload
 
 __all__ = [
     "TreeDef",
@@ -43,6 +47,14 @@ __all__ = [
 # children of a container node.
 _LEAF = "*"
 
+# A structure node: `_LEAF`, `None`, or one of the container tuples above.
+_Node = Any
+_T = TypeVar("_T")
+# `flatten_fn(value) -> (children, aux_data)` and
+# `unflatten_fn(aux_data, children) -> value` of a registered node type.
+_FlattenFn = Callable[[Any], tuple[Iterable[Any], Hashable]]
+_UnflattenFn = Callable[[Any, tuple[Any, ...]], Any]
+
 
 class _NodeType:
     """How a registered class flattens: `flatten(value)` returns
@@ -51,22 +63,31 @@ class _NodeType:
 
     __slots__ = ("flatten", "unflatten", "names")
 
-    def __init__(self, flatten, unflatten, names=None):
+    def __init__(
+        self,
+        flatten: _FlattenFn,
+        unflatten: _UnflattenFn,
+        names: tuple[str, ...] | None = None,
+    ) -> None:
         self.flatten = flatten
         self.unflatten = unflatten
         self.names = names
 
 
 # Registered node types by exact class.
-_REGISTRY = {}
+_REGISTRY: dict[type, _NodeType] = {}
 _BUILTIN_NODES = (dict, list, tuple, type(None))
 
 
-def _is_namedtuple_class(kind):
+def _is_namedtuple_class(kind: type) -> bool:
     return issubclass(kind, tuple) and hasattr(kind, "_fields")
 
 
-def register(cls, flatten_fn, unflatten_fn):
+def register(
+    cls: type[_T],
+    flatten_fn: Callable[[_T], tuple[Iterable[Any], Hashable]],
+    unflatten_fn: Callable[[Any, tuple[Any, ...]], _T],
+) -> type[_T]:
     """Registers `cls` as a pytree node type.
 
     `flatten_fn(value)` returns `(children, aux_data)`: an iterable of child
@@ -85,7 +106,23 @@ def register(cls, flatten_fn, unflatten_fn):
     return cls
 
 
-def register_dataclass(cls=None, data_fields=None, meta_fields=()):
+@overload
+def register_dataclass(
+    cls: type[_T],
+    data_fields: Iterable[str] | None = None,
+    meta_fields: Iterable[str] = (),
+) -> type[_T]: ...
+@overload
+def register_dataclass(
+    cls: None = None,
+    data_fields: Iterable[str] | None = None,
+    meta_fields: Iterable[str] = (),
+) -> Callable[[type[_T]], type[_T]]: ...
+def register_dataclass(
+    cls: type[_T] | None = None,
+    data_fields: Iterable[str] | None = None,
+    meta_fields: Iterable[str] = (),
+) -> type[_T] | Callable[[type[_T]], type[_T]]:
     """Registers the dataclass `cls` as a pytree node type and returns it,
     so it also works as a bare decorator (`@register_dataclass`).
 
@@ -114,18 +151,18 @@ def register_dataclass(cls=None, data_fields=None, meta_fields=()):
             f"{cls.__name__} must name each __init__ field {tuple(init_fields)!r} exactly once"
         )
 
-    def flatten(value):
+    def flatten(value: Any) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
         children = tuple(getattr(value, name) for name in data_fields)
         return children, tuple(getattr(value, name) for name in meta_fields)
 
-    def unflatten(aux, children):
+    def unflatten(aux: tuple[Any, ...], children: tuple[Any, ...]) -> _T:
         return cls(**dict(zip(data_fields, children)), **dict(zip(meta_fields, aux)))
 
     _REGISTRY[cls] = _NodeType(flatten, unflatten, data_fields)
     return cls
 
 
-def _check_registrable(cls):
+def _check_registrable(cls: object) -> None:
     if not isinstance(cls, type):
         raise TypeError(f"only classes can be registered as pytree nodes, got {cls!r}")
     if cls in _BUILTIN_NODES:
@@ -134,7 +171,7 @@ def _check_registrable(cls):
         raise ValueError(f"{cls.__qualname__} is already registered as a pytree node")
 
 
-def _sorted_keys(tree):
+def _sorted_keys(tree: dict[Any, Any]) -> tuple[Any, ...]:
     try:
         return tuple(sorted(tree))
     except TypeError:
@@ -144,7 +181,7 @@ def _sorted_keys(tree):
         ) from None
 
 
-def _flatten(tree, leaves):
+def _flatten(tree: Any, leaves: list[Any]) -> _Node:
     """Appends the leaves of `tree` to `leaves` and returns its structure node."""
     kind = type(tree)
     if kind is tuple or kind is list:
@@ -171,7 +208,7 @@ def _flatten(tree, leaves):
     return _LEAF
 
 
-def _unflatten(node, leaves):
+def _unflatten(node: _Node, leaves: Iterator[Any]) -> Any:
     """Rebuilds the structure `node` from the iterator `leaves`."""
     if node is _LEAF:
         return next(leaves)
@@ -191,7 +228,7 @@ def _unflatten(node, leaves):
     return kind(*children)
 
 
-def _leaf_count(node):
+def _leaf_count(node: _Node) -> int:
     if node is _LEAF:
         return 1
     if node is None:
@@ -199,7 +236,7 @@ def _leaf_count(node):
     return sum(_leaf_count(child) for child in node[-1])
 
 
-def _child_keys(node):
+def _child_keys(node: _Node) -> Iterable[Any]:
     """The key of each child of the container `node`: dict keys, field
     names of NamedTuples and registered dataclasses, positions otherwise."""
     kind = node[0]
@@ -213,7 +250,9 @@ def _child_keys(node):
     return range(len(node[-1]))
 
 
-def _key_paths(node, prefix, paths):
+def _key_paths(
+    node: _Node, prefix: tuple[Any, ...], paths: list[tuple[Any, ...]]
+) -> list[tuple[Any, ...]]:
     """Appends the key path tuple of every leaf of `node`, in leaf order."""
     if node is _LEAF:
         paths.append(prefix)
@@ -223,7 +262,7 @@ def _key_paths(node, prefix, paths):
     return paths
 
 
-def _leaf_paths(node, prefix):
+def _leaf_paths(node: _Node, prefix: str) -> list[str]:
     """The `/`-joined key path of every leaf of `node`, in leaf order."""
     return [
         "/".join([prefix] + [str(key) for key in path])
@@ -231,7 +270,7 @@ def _leaf_paths(node, prefix):
     ]
 
 
-def _describe(node, leaves=None):
+def _describe(node: _Node, leaves: Iterator[str] | None = None) -> str:
     """A readable rendering of a structure node, with `*` for leaves, or the
     next string of the iterator `leaves` for each leaf when given."""
     if node is _LEAF:
@@ -264,44 +303,44 @@ class TreeDef:
 
     __slots__ = ("_node", "num_leaves")
 
-    def __init__(self, node):
+    def __init__(self, node: _Node) -> None:
         self._node = node
         self.num_leaves = _leaf_count(node)
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         return isinstance(other, TreeDef) and self._node == other._node
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash(self._node)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"TreeDef({_describe(self._node)})"
 
-    def unflatten(self, leaves):
+    def unflatten(self, leaves: Iterable[Any]) -> Any:
         """`unflatten(self, leaves)`."""
         return unflatten(self, leaves)
 
 
-def flatten(tree):
+def flatten(tree: Any) -> tuple[list[Any], TreeDef]:
     """The leaves of `tree` in traversal order and its `TreeDef`."""
     leaves = []
     node = _flatten(tree, leaves)
     return leaves, TreeDef(node)
 
 
-def leaves(tree):
+def leaves(tree: Any) -> list[Any]:
     """The leaves of `tree` in traversal order."""
     result = []
     _flatten(tree, result)
     return result
 
 
-def structure(tree):
+def structure(tree: Any) -> TreeDef:
     """The `TreeDef` of `tree`."""
     return TreeDef(_flatten(tree, []))
 
 
-def flatten_with_path(tree):
+def flatten_with_path(tree: Any) -> tuple[list[tuple[tuple[Any, ...], Any]], TreeDef]:
     """`(path, leaf)` pairs in traversal order and the `TreeDef` of `tree`.
     A path is a tuple of keys: dict keys, field names of NamedTuples and
     registered dataclasses, and integer positions of lists, tuples, and
@@ -311,7 +350,7 @@ def flatten_with_path(tree):
     return list(zip(_key_paths(node, (), []), leaves)), TreeDef(node)
 
 
-def unflatten(treedef, leaves):
+def unflatten(treedef: TreeDef, leaves: Iterable[Any]) -> Any:
     """The pytree with structure `treedef` and the given leaves, in order."""
     leaves = list(leaves)
     if len(leaves) != treedef.num_leaves:
@@ -319,7 +358,7 @@ def unflatten(treedef, leaves):
     return _unflatten(treedef._node, iter(leaves))
 
 
-def map(f, tree, *rest):
+def map(f: Callable[..., Any], tree: Any, *rest: Any) -> Any:
     """Applies `f` leafwise: `f(leaf, *corresponding leaves of rest)`. Every
     tree in `rest` must have the structure of `tree`."""
     leaves, treedef = flatten(tree)
