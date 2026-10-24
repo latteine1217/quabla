@@ -15,6 +15,22 @@ v1.0.1 (2026-10-22) ships items 4, 8, and 10. Items 1, 2, 5, 6, and 7 remain
 the work of the later 1.0.x releases (owner, 2026-10-22); item 3 is still a
 proposal and item 11 stays deferred.
 
+Order of the remaining items (owner, 2026-10-25), ranked by how visible the
+gap is to users, its cost, and what it depends on:
+
+| Release | Items | Reason |
+| --- | --- | --- |
+| 1.0.2 | 1, 7, and the dependency audit of 6 | Item 1 is what users see first (the PyPI classifier, `SECURITY.md`) and is mostly documentation and metadata; the MSRV and the dependency audit are one CI job each. Item 3 may join this release at a similar cost if the owner adopts it |
+| 1.0.3 | 5, and the property-based or fuzz tests of 6 | A panic that reaches Python surfaces as `pyo3_runtime.PanicException`, a `BaseException` that `except Exception` does not catch, so this is the largest robustness gain; fuzzing tracing, shape inference, and indexing searches for user inputs that reach a panic and keeps the audit from regressing |
+| 1.0.4 | coverage and the performance regression gate of 6 | Coverage is cheap; the performance gate needs a threshold and comparison method that hosted runners' timing noise does not trip |
+| Not tied to a release | 2 | Needs infrastructure: a self-hosted runner on the CUDA host, the two-GPU NCCL host, an MLX runner, and protection against fork pull requests running on self-hosted runners of a public repository. Until it exists, every release keeps the manual CUDA run |
+
+Two questions in item 1 need the owner's decision before 1.0.2: whether
+removing `TensorCudaAdamOptimizer` and `TensorMlxAdamOptimizer` from
+`quabla.__all__` in a patch release breaks the 1.x SemVer policy (the
+alternative is to deprecate them and remove them in 2.0), and whether the
+Experimental `quabla.distributed` is covered by that policy.
+
 | # | Item | Status |
 | --- | --- | --- |
 | 1 | Statements that contradict 1.0: the PyPI classifier `Development Status :: 3 - Alpha`, `SECURITY.md` (supported versions list only `0.1.x`, "research project at version 0.x"), the guide's "research-grade 0.x library" (chapter 12) and CONTRIBUTING's "research-grade project", whether the Experimental `quabla.distributed` falls under the SemVer policy, and the unusable `TensorCudaAdamOptimizer`/`TensorMlxAdamOptimizer` in `quabla.__all__` | Open |
