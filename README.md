@@ -173,7 +173,7 @@ pip install quabla-mlx   # macOS 14+ on Apple silicon: CPU + MLX
 Both distributions provide the same `quabla` package, so install one of them
 per environment and uninstall it before switching to the other. Wheels cover
 CPython 3.10 to 3.14; on other platforms pip builds the source distribution,
-which needs a Rust toolchain and enables the CPU backend only.
+which needs Rust 1.88 or newer and enables the CPU backend only.
 
 The Linux wheel does not bundle CUDA. The CPU backend works on any host, and
 `device="cuda"` needs an NVIDIA driver and the CUDA libraries listed under
@@ -184,7 +184,8 @@ library.
 
 Prerequisites:
 
-- Rust stable toolchain (`rustup`).
+- Rust 1.88 or newer (`rustup`), the minimum supported Rust version (MSRV)
+  declared in `Cargo.toml`.
 - Python 3.10 or newer and maturin 1.x (1.9.3 or later).
 - MLX builds: macOS on Apple silicon, CMake, and Xcode's Metal Toolchain
   (`xcodebuild -downloadComponent MetalToolchain`). The Python `mlx` wheel is

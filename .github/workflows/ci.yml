@@ -1,9 +1,10 @@
 # Development gates. Every step runs the same command a contributor runs
 # locally, so a red check reproduces with the command shown in its log.
 #
-# One Linux job on purpose: the test suites finish in seconds, so the cost is
-# compilation. Sharing one job shares one build cache instead of recompiling
-# the workspace per job.
+# One Linux job for the gates on purpose: the test suites finish in seconds,
+# so the cost is compilation. Sharing one job shares one build cache instead
+# of recompiling the workspace per job. The MSRV check is a second job
+# because it compiles with another toolchain and cannot share that cache.
 #
 # Deliberately NOT run here:
 # - CUDA, NCCL and MLX runtime tests. Hosted runners have no NVIDIA GPU and no
@@ -96,3 +97,24 @@ jobs:
       - run: .venv-ci/bin/python tests/python/test_custom_api.py
       - run: .venv-ci/bin/python tests/python/test_solvers_api.py
       - run: .venv-ci/bin/python tests/python/test_numpy_api.py
+
+  msrv:
+    name: msrv (linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The workspace manifest is the single source of the MSRV.
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      # PyO3's build script needs an interpreter.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.10"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # --locked: the committed lockfile is what a source build resolves.
+      - run: cargo check --workspace --all-targets --locked
+      - run: cargo check --workspace --all-targets --locked --features quabla-core/cuda-nccl

@@ -1,9 +1,14 @@
 [workspace]
 members = ["crates/quabla-core", "crates/quabla-macros", "crates/quabla-python"]
-resolver = "2"
+# Resolver 3 prefers dependency versions whose `rust-version` the
+# workspace's MSRV satisfies, so `cargo update` cannot raise it silently.
+resolver = "3"
 
 [workspace.package]
 edition = "2021"
+# The minimum supported Rust version: `libloading`, used by the CUDA
+# backend, requires 1.88. It is raised only in minor releases.
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/latteine1217/quabla"
 

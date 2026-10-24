@@ -8,6 +8,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
 
 ## [Unreleased]
 
+### Added
+
+- A declared minimum supported Rust version, 1.88, checked in CI for the
+  CPU, CUDA/NCCL, and MLX builds. A source build with an older `rustc` now
+  stops with Cargo's MSRV message. The workspace uses Cargo's resolver 3, so
+  dependency updates keep to versions that build with 1.88.
+
 ### Deprecated
 
 - `quabla.TensorCudaAdamOptimizer` and `quabla.TensorMlxAdamOptimizer`. They

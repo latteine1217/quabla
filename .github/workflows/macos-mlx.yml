@@ -4,6 +4,9 @@
 # It runs on pull requests that touch the MLX backend, the Cargo manifests or
 # lockfile, or this workflow, and on demand (for example before a release).
 #
+# A second job compiles the mlx feature with the MSRV toolchain, in parallel
+# and with its own cache.
+#
 # MLX is compiled and linted only: hosted macOS runners have no usable Metal
 # device, and with the mlx feature cargo test would execute MLX GPU tests.
 name: macOS MLX check
@@ -78,3 +81,22 @@ jobs:
       - run: .venv-ci/bin/python tests/python/test_numpy_api.py
       - run: .venv-ci/bin/python tests/python/test_random_api.py
       - run: .venv-ci/bin/python tests/python/test_packaging_api.py
+
+  msrv:
+    name: macos (mlx check on the MSRV)
+    runs-on: macos-15
+    # A cold run builds MLX C++ through mlx-rs (cmake).
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The workspace manifest is the single source of the MSRV.
+      - id: msrv
+        run: echo "version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo check --workspace --all-targets --locked --features quabla-core/mlx

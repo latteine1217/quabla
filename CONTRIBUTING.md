@@ -16,6 +16,8 @@ From 1.0 the public Python API follows
   releases may add names and arguments.
 - A name to be removed first emits a `DeprecationWarning` for at least one
   minor release and is removed only in the next major release.
+- The minimum supported Rust version (`rust-version` in `Cargo.toml`) is
+  raised only in minor releases, and the CHANGELOG names the new version.
 - Numerical results may change in the last bits between releases when an
   operation's evaluation order changes; such changes are listed in the
   CHANGELOG.
