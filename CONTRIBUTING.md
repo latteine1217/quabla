@@ -5,14 +5,15 @@ before it can be reviewed.
 
 ## Scope and Status
 
-Quabla is a research-grade project. For anything beyond a
-small fix, open an issue first to discuss the approach.
+For anything beyond a small fix, open an issue first to discuss the
+approach.
 
 From 1.0 the public Python API follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
 
-- A name exported by `quabla` (its `__all__` and public submodules) keeps
-  its behaviour through 1.x. Minor releases may add names and arguments.
+- A name exported by `quabla` (its `__all__` and public submodules,
+  `quabla.distributed` included) keeps its behaviour through 1.x. Minor
+  releases may add names and arguments.
 - A name to be removed first emits a `DeprecationWarning` for at least one
   minor release and is removed only in the next major release.
 - Numerical results may change in the last bits between releases when an

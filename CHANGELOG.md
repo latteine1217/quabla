@@ -2,12 +2,29 @@
 
 All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
-project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before
-1.0, minor releases may add to the public Python API and deprecate names;
-deprecated names keep working until 1.0 (see
+project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
+1.0, a deprecated name keeps working until the next major release (see
 [CONTRIBUTING.md](CONTRIBUTING.md)).
 
 ## [Unreleased]
+
+### Deprecated
+
+- `quabla.TensorCudaAdamOptimizer` and `quabla.TensorMlxAdamOptimizer`. They
+  are the executors behind `qb.optim.Trainer(..., device="cuda")` and
+  `device="mlx"` and cannot be constructed on their own; explicit use of the
+  names now emits a `DeprecationWarning`, and they will be removed in 2.0.
+  They stay in `quabla.__all__`, `from quabla import *` binds them without a
+  warning, and `Trainer` is unaffected.
+
+### Changed
+
+- `quabla.distributed` is covered by the SemVer policy and is no longer
+  described as experimental; its behaviour is unchanged.
+- The package metadata declares `Development Status :: 5 -
+  Production/Stable`, and `SECURITY.md` lists 1.0.x as the supported
+  series. Documentation no longer calls Quabla a research-grade or 0.x
+  library.
 
 ## [1.0.1] - 2026-10-22
 

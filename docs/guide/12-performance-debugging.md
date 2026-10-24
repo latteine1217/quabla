@@ -163,8 +163,7 @@ tight comparisons.
 
 ## 12.4 Known Limitations
 
-Quabla is a research-grade 0.x library. These limits are deliberate or not
-yet addressed:
+These limits are deliberate or not yet addressed:
 
 - **Shapes are static.** There are no symbolic dimensions; each shape is a
   separate compiled program.

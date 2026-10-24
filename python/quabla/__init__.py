@@ -5,8 +5,11 @@
 # private helpers those layers call.
 
 import importlib.metadata as _metadata
+import sys as _sys
+import warnings as _warnings
+from typing import TYPE_CHECKING as _TYPE_CHECKING
 
-from . import _array, _control, _custom, _errors, _io, _newton, _ops, _quabla, _transforms
+from . import _array, _control, _custom, _deprecated, _errors, _io, _newton, _ops, _quabla, _transforms
 from . import tree as tree
 # Kept out of `__all__`, so a star import does not shadow the standard
 # library module `random`.
@@ -41,8 +44,6 @@ from ._quabla import (
     Executable,
     Program,
     Tensor,
-    TensorCudaAdamOptimizer,
-    TensorMlxAdamOptimizer,
     TensorView,
     TraceTensor,
     bool_,
@@ -67,6 +68,12 @@ from ._quabla import (
 )
 
 __doc__ = _quabla.__doc__
+
+# Type checkers see the deprecated names; at run time `__getattr__`
+# resolves them so that each explicit use warns.
+if _TYPE_CHECKING:
+    from ._quabla import TensorCudaAdamOptimizer as TensorCudaAdamOptimizer
+    from ._quabla import TensorMlxAdamOptimizer as TensorMlxAdamOptimizer
 
 # The version of the installed distribution. The Cargo manifest of
 # `quabla-python` is the single source of truth: maturin derives the package
@@ -124,3 +131,17 @@ __all__ += [
     "linalg",
 ]
 __all__ += _control.__all__
+
+
+def __getattr__(name):
+    if name in _deprecated.REPLACEMENTS:
+        # `from quabla import *` binds the deprecated names silently, so that
+        # only explicit use warns.
+        if not _deprecated.is_silent_lookup(_sys._getframe(1)):
+            _warnings.warn(_deprecated.message(name), DeprecationWarning, stacklevel=2)
+        return getattr(_quabla, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_deprecated.REPLACEMENTS))

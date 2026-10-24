@@ -2,13 +2,12 @@
 
 ## Supported Versions
 
-Quabla is a research project at version 0.x. Only the latest release series
-receives fixes.
+Only the latest release series receives fixes.
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | Yes       |
-| < 0.1   | No        |
+| 1.0.x   | Yes       |
+| < 1.0   | No        |
 
 ## Reporting a Vulnerability
 

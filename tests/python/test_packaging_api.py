@@ -10,10 +10,11 @@ import re
 import struct
 import tempfile
 import typing
+import warnings
 
 import quabla as qb
 
-from _support import raises, run, skip
+from _support import devices, raises, run, skip
 
 
 def bits(tensor):
@@ -70,6 +71,46 @@ def test_type_stub_declares_the_extension_names():
         }
         missing = {member for member in members if not hasattr(runtime, member)}
         assert not missing, (name, missing)
+
+
+
+def test_deprecated_optimizer_names_warn_only_on_explicit_use():
+    deprecated = ("TensorCudaAdamOptimizer", "TensorMlxAdamOptimizer")
+    for name in deprecated:
+        # The names stay exported through 1.x and resolve to the extension type.
+        assert name in qb.__all__ and name in dir(qb)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert getattr(qb, name) is getattr(qb._quabla, name)
+            exec(f"from quabla import {name}", {})
+        assert [w.category for w in caught] == [DeprecationWarning] * 2, caught
+        assert all(f"quabla.{name} is deprecated" in str(w.message) for w in caught)
+        assert "removed in 2.0" in str(caught[0].message)
+        # The warning points at the caller, not at quabla.
+        assert caught[0].filename == __file__, caught[0].filename
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        namespace = {}
+        exec("from quabla import *", namespace)
+    assert not caught, [str(w.message) for w in caught]
+    assert all(namespace[name] is getattr(qb._quabla, name) for name in deprecated)
+    raises(AttributeError, getattr, qb, "TensorCpuAdamOptimizer")
+
+
+def test_device_trainer_does_not_warn_about_its_executor():
+    for device in devices():
+        x = qb.array([1.0, 2.0], dtype=qb.float32)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            trainer = qb.optim.Trainer(
+                lambda w, x: ((w * x) ** 2).sum(),
+                qb.array([1.0], dtype=qb.float32),
+                qb.optim.Adam(0.1),
+                x,
+                device=device,
+            )
+            trainer.step()
+        assert not [w for w in caught if w.category is DeprecationWarning], device
 
 
 def test_eager_repr_shows_values_like_numpy():

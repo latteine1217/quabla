@@ -1,4 +1,4 @@
-"""Experimental single-node CUDA/NCCL data parallel differentiation.
+"""Single-node CUDA/NCCL data parallel differentiation.
 
 Batch arguments contain full, equally sized axis-zero batches. Parameters
 are replicated and only their gradients are reduced; optimizer updates stay

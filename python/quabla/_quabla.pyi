@@ -11,6 +11,8 @@
 from collections.abc import Sequence
 from typing import Any, TypeAlias, overload
 
+from typing_extensions import deprecated
+
 __version__: str
 
 class dtype:
@@ -477,9 +479,11 @@ class TensorTraceGraph:
     @staticmethod
     def _custom_rule(*args: Any, **kwargs: Any) -> Any: ...
     def __getattr__(self, name: str) -> Any: ...
+@deprecated('Use qb.optim.Trainer(..., device="cuda"); removed in 2.0.')
 class TensorCudaAdamOptimizer:
     def __init__(self, *args: Any, **kwargs: Any) -> None: ...
     def __getattr__(self, name: str) -> Any: ...
+@deprecated('Use qb.optim.Trainer(..., device="mlx"); removed in 2.0.')
 class TensorMlxAdamOptimizer:
     def __init__(self, *args: Any, **kwargs: Any) -> None: ...
     def __getattr__(self, name: str) -> Any: ...

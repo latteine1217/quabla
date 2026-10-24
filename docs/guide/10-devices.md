@@ -241,7 +241,7 @@ Tensor([0.87758255, 1.7551651 ], dtype=float64)
 `capabilities()` reports what the build contains; it is not a hardware probe
 and does not promise that every graph lowers on every target.
 
-## 10.8 Data Parallelism (Experimental)
+## 10.8 Data Parallelism
 
 With the `cuda-nccl` build feature, `qb.distributed.value_and_grad` shards a
 batch across GPUs of one node and all-reduces parameter gradients with NCCL:

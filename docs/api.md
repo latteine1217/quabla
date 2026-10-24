@@ -1036,7 +1036,7 @@ states differentiate with respect to `y0`, `args`, the span, and the save
 times. `saveat` cannot be combined with `save=True`.
 
 `qb.distributed.value_and_grad(fun, devices=["cuda:0", "cuda:1"], shard_argnums=(1,),
-argnums=0, reduction="mean")` is experimental single-node CUDA/NCCL execution.
+argnums=0, reduction="mean")` runs single-node CUDA/NCCL data parallelism.
 Arguments and replicated parameters may be pytrees. Full batches split equally
 on axis zero; `sum` sums shard losses/parameter gradients and `mean` averages
 them. Mapped-input gradients and nested execution inside another transform
