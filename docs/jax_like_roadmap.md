@@ -25,12 +25,6 @@ gap is to users, its cost, and what it depends on:
 | 1.0.4 | coverage and the performance regression gate of 6 | Coverage is cheap; the performance gate needs a threshold and comparison method that hosted runners' timing noise does not trip |
 | Not tied to a release | 2 | Needs infrastructure: a self-hosted runner on the CUDA host, the two-GPU NCCL host, an MLX runner, and protection against fork pull requests running on self-hosted runners of a public repository. Until it exists, every release keeps the manual CUDA run |
 
-Two questions in item 1 need the owner's decision before 1.0.2: whether
-removing `TensorCudaAdamOptimizer` and `TensorMlxAdamOptimizer` from
-`quabla.__all__` in a patch release breaks the 1.x SemVer policy (the
-alternative is to deprecate them and remove them in 2.0), and whether the
-Experimental `quabla.distributed` is covered by that policy.
-
 | # | Item | Status |
 | --- | --- | --- |
 | 1 | Statements that contradict 1.0: the PyPI classifier `Development Status :: 3 - Alpha`, `SECURITY.md` (supported versions list only `0.1.x`, "research project at version 0.x"), the guide's "research-grade 0.x library" (chapter 12) and CONTRIBUTING's "research-grade project", whether the Experimental `quabla.distributed` falls under the SemVer policy, and the unusable `TensorCudaAdamOptimizer`/`TensorMlxAdamOptimizer` in `quabla.__all__` | Open |
@@ -46,6 +40,11 @@ Experimental `quabla.distributed` is covered by that policy.
 
 Decisions:
 
+- Item 1 (owner, 2026-10-25): `TensorCudaAdamOptimizer` and
+  `TensorMlxAdamOptimizer` are deprecated, as the SemVer policy requires,
+  and removed in 2.0 rather than dropped from `quabla.__all__` in a patch
+  release. `quabla.distributed` is covered by the SemVer policy, so it is
+  no longer described as experimental.
 - Item 4 (owner, 2026-10-14 and 2026-10-22): the silent conversion is a
   defect fixed in 1.0.x. CUDA runs `float64` programs natively and rejects
   programs that mix `float32` and `float64`; MLX, whose Apple GPUs have no
