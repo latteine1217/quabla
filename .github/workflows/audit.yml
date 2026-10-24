@@ -1,0 +1,32 @@
+# Dependency audit with cargo-deny (deny.toml): RustSec advisories, yanked
+# versions, licenses, banned or wildcard dependencies, and sources. It
+# blocks pushes and pull requests, and the weekly run catches advisories
+# published against an unchanged lockfile. A red check reproduces locally
+# with `cargo deny check`.
+name: Dependency audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Mondays 03:17 UTC, off the hour to avoid the scheduler's peak.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Targets and features come from deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1

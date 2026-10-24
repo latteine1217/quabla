@@ -51,6 +51,7 @@ cargo clippy --workspace --all-targets --features quabla-core/mlx -- -D warnings
 cargo clippy --workspace --all-targets --features quabla-core/cuda-nccl \
   -- -D warnings
 cargo test --workspace
+cargo deny check           # dependency audit (deny.toml); cargo install cargo-deny
 
 maturin develop --release              # add --features mlx or --features cuda
 python tests/python/test_tensor_api.py
