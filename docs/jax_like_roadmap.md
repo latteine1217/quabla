@@ -12,15 +12,15 @@ adds API. The target users are the public research community (owner,
 platforms researchers use, not an enterprise support commitment.
 
 v1.0.1 (2026-10-22) ships items 4, 8, and 10. Items 1, 2, 5, 6, and 7 remain
-the work of the later 1.0.x releases (owner, 2026-10-22); item 3 is still a
-proposal and item 11 stays deferred.
+the work of the later 1.0.x releases (owner, 2026-10-22); item 3, then a
+proposal, joined 1.0.2 (owner, 2026-10-25), and item 11 stays deferred.
 
 Order of the remaining items (owner, 2026-10-25), ranked by how visible the
 gap is to users, its cost, and what it depends on:
 
 | Release | Items | Reason |
 | --- | --- | --- |
-| 1.0.2 | 1, 7, and the dependency audit of 6 | Item 1 is what users see first (the PyPI classifier, `SECURITY.md`) and is mostly documentation and metadata; the MSRV and the dependency audit are one CI job each. Item 3 may join this release at a similar cost if the owner adopts it |
+| 1.0.2 | 1, 3, 7, and the dependency audit of 6 | Item 1 is what users see first (the PyPI classifier, `SECURITY.md`) and is mostly documentation and metadata; the MSRV, the dependency audit, and the Python matrix are CI changes of similar cost |
 | 1.0.3 | 5, and the property-based or fuzz tests of 6 | A panic that reaches Python surfaces as `pyo3_runtime.PanicException`, a `BaseException` that `except Exception` does not catch, so this is the largest robustness gain; fuzzing tracing, shape inference, and indexing searches for user inputs that reach a panic and keeps the audit from regressing |
 | 1.0.4 | coverage and the performance regression gate of 6 | Coverage is cheap; the performance gate needs a threshold and comparison method that hosted runners' timing noise does not trip |
 | Not tied to a release | 2 | Needs infrastructure: a self-hosted runner on the CUDA host, the two-GPU NCCL host, an MLX runner, and protection against fork pull requests running on self-hosted runners of a public repository. Until it exists, every release keeps the manual CUDA run |
@@ -29,7 +29,7 @@ gap is to users, its cost, and what it depends on:
 | --- | --- | --- |
 | 1 | Statements that contradict 1.0: the PyPI classifier `Development Status :: 3 - Alpha`, `SECURITY.md` (supported versions list only `0.1.x`, "research project at version 0.x"), the guide's "research-grade 0.x library" (chapter 12) and CONTRIBUTING's "research-grade project", whether the Experimental `quabla.distributed` falls under the SemVer policy, and the unusable `TensorCudaAdamOptimizer`/`TensorMlxAdamOptimizer` in `quabla.__all__` | Done for 1.0.2: classifier `5 - Production/Stable`, `SECURITY.md` supports 1.0.x, the 0.x and research-grade wording is gone, `quabla.distributed` falls under the SemVer policy, and the two optimizer names warn on explicit use and are removed in 2.0 |
 | 2 | Automated GPU validation: a release gate that runs the CUDA suites (`QUABLA_CUDA_TEST=1`), the NCCL suites on two GPUs, and the MLX suites on every release candidate, on stated CUDA/NVRTC versions, driver minimums, and compute capabilities (the NVRTC 12.6 `atomicAdd(double)` miss of v0.3 shows one host is not enough). Today CUDA is validated by hand on one GTX 1660 SUPER, and the two-GPU run was skipped for v1.0 | Open |
-| 3 | CI Python matrix matching the classifiers (3.10 to 3.14; CI runs 3.10 only), and the full suites on the built wheels. Not named by the owner; proposed for 1.0.x | Proposed |
+| 3 | CI Python matrix matching the classifiers (3.10 to 3.14; CI runs 3.10 only), and the full suites on the built wheels. Not named by the owner; proposed for 1.0.x | Done for 1.0.2: CI builds the extension for and runs every suite on 3.10 to 3.14 in the gates job; the wheel build runs every suite against each wheel it builds (five CPythons on Linux x86_64, Linux aarch64, macOS, and `quabla-mlx`) and the sdist; `tests/python/run_suites.sh` replaces the per-suite lists. Hosted runners keep the GPU gates off |
 | 4 | No silent precision change: a `float64` program runs in `float64` and a `float32` program in `float32`; where a device cannot honour a dtype it raises instead of converting. 1.0.0 ran `float64` programs as `float32` on CUDA (with a `UserWarning` unless `precision="float64"`) and always on MLX | Done in 1.0.1: CUDA runs each program in its dtype and rejects a mix; MLX rejects `float64` programs; weak constants and the `jacobian` basis follow the program's dtype |
 | 5 | Panic audit of the Python/Rust boundary: no user input may reach a Rust `panic!`, `unwrap`, or `expect` (a raw count of non-test `src` finds about 240 `unwrap()`, 37 `expect(`, 23 `panic!`/`unreachable!`, inline test modules included), and every `unsafe` block keeps its `SAFETY` invariant (77 blocks) | Open |
 | 6 | Quality checks CI lacks: dependency audit (`cargo deny` or `cargo audit`), coverage measurement, a performance regression gate for the benchmarks, and property-based or fuzz tests of tracing, shape inference, and indexing | Dependency audit done for 1.0.2: `cargo deny` (`deny.toml`) checks advisories, licenses, wildcards, and sources for the Linux and macOS trees with every feature, on every push and pull request and weekly; `BSD-3-Clause` and `ISC` are allowed and RUSTSEC-2024-0436 (unmaintained `paste` via `mlx-rs`) is ignored (owner, 2026-10-25). Coverage, the performance gate, and property-based or fuzz tests remain open |
@@ -45,6 +45,9 @@ Decisions:
   and removed in 2.0 rather than dropped from `quabla.__all__` in a patch
   release. `quabla.distributed` is covered by the SemVer policy, so it is
   no longer described as experimental.
+- Item 3 (owner, 2026-10-25): adopted into 1.0.2. The interpreters share
+  the gates job and its build cache rather than a matrix job, and every
+  wheel is tested, not only the oldest and newest CPython.
 - Item 4 (owner, 2026-10-14 and 2026-10-22): the silent conversion is a
   defect fixed in 1.0.x. CUDA runs `float64` programs natively and rejects
   programs that mix `float32` and `float64`; MLX, whose Apple GPUs have no
