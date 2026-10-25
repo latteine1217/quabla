@@ -8,6 +8,16 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-10-25
+
+The second patch of the v1.0.x plan in `docs/jax_like_roadmap.md`: the
+package metadata and documentation describe a stable 1.0 release,
+`quabla.distributed` is covered by the SemVer policy, two optimizer names
+that cannot be used on their own are deprecated, and CI checks the minimum
+supported Rust version, audits dependencies, and runs every Python suite on
+Python 3.10 to 3.14 and against every wheel. Numerical results are
+unchanged.
+
 ### Added
 
 - A declared minimum supported Rust version, 1.88, checked in CI for the
@@ -1056,7 +1066,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/latteine1217/quabla/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/latteine1217/quabla/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/latteine1217/quabla/compare/v0.7.1...v1.0.0
 [0.7.1]: https://github.com/latteine1217/quabla/compare/v0.7.0...v0.7.1

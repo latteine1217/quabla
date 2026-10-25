@@ -7,7 +7,7 @@ traced program on CPU, CUDA, and Apple silicon.**
 [![CI](https://github.com/latteine1217/quabla/actions/workflows/ci.yml/badge.svg)](https://github.com/latteine1217/quabla/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation)
-[![Release v1.0.1](https://img.shields.io/badge/release-v1.0.1-orange)](https://github.com/latteine1217/quabla/releases/tag/v1.0.1)
+[![Release v1.0.2](https://img.shields.io/badge/release-v1.0.2-orange)](https://github.com/latteine1217/quabla/releases/tag/v1.0.2)
 [![Docs](https://img.shields.io/badge/docs-developer%20guide-blue)](https://latteine1217.github.io/quabla/guide/)
 
 **Documentation: [Developer Guide](https://latteine1217.github.io/quabla/guide/)
@@ -70,7 +70,7 @@ running on CUDA or MLX.
 
 ## Status
 
-The latest release is **v1.0.1**, published as a git tag, a GitHub
+The latest release is **v1.0.2**, published as a git tag, a GitHub
 Release, and on PyPI as
 [`quabla`](https://pypi.org/project/quabla/) and
 [`quabla-mlx`](https://pypi.org/project/quabla-mlx/) (v0.6.1 is the first
@@ -125,6 +125,9 @@ describes what 1.x keeps stable. v1.0.1
 ([CHANGELOG](CHANGELOG.md#101---2026-10-22)) runs every program in its own
 dtype (`float64` in double on CUDA, rejected on MLX, which has no `float64`
 arithmetic), types the public Python API, and adds Linux aarch64 wheels.
+v1.0.2 ([CHANGELOG](CHANGELOG.md#102---2026-10-25)) brings
+`quabla.distributed` under the compatibility policy, declares Rust 1.88 as
+the minimum supported version, and tests every wheel on Python 3.10 to 3.14.
 
 "JAX-style" describes the API only: Quabla does not depend on JAX and is not
 affiliated with JAX or with the `nabla-ml` project. It was formerly named

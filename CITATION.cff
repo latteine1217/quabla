@@ -11,5 +11,5 @@ repository-code: "https://github.com/latteine1217/quabla"
 license:
   - MIT
   - Apache-2.0
-version: 1.0.1
-date-released: "2026-10-22"
+version: 1.0.2
+date-released: "2026-10-25"
