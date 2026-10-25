@@ -240,12 +240,21 @@ def test_adapter_structure_signatures_and_cache_bound():
 def test_feature_unavailable_contract():
     if enabled("nccl"):
         skip("NCCL runtime validation enabled")
-    params, batch = arguments()
+    # float32 is the dtype NCCL builds accept, so a build without NCCL and a
+    # host without the driver, NCCL, or two GPUs must give the same error.
+    params, batch = arguments(dtype=qb.float32)
     error = expect(
         qb.UnsupportedOperationError, "CUDA", lambda: transform()(params, batch)
     )
     assert error.op == "distributed.value_and_grad"
     assert error.device == "cuda"
+    # A build with NCCL rejects float64 before it looks for hardware.
+    nccl_build = "cuda-nccl" not in str(error)
+    error = expect(
+        qb.UnsupportedOperationError, "CUDA", lambda: transform()(*arguments())
+    )
+    expected_op = "float64" if nccl_build else "distributed.value_and_grad"
+    assert (error.op, error.device) == (expected_op, "cuda")
 
 
 def test_nccl_numerical_parity():

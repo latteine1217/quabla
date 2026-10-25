@@ -43,6 +43,15 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
   series. Documentation no longer calls Quabla a research-grade or 0.x
   library.
 
+### Fixed
+
+- `qb.distributed.value_and_grad` raises `UnsupportedOperationError`
+  (`op="distributed.value_and_grad"`, `device="cuda"`) when the host has no
+  CUDA driver, no NCCL library, or fewer GPUs than `devices` names, as it
+  already did for a build without NCCL. These errors were a plain
+  `ValueError`; `UnsupportedOperationError` subclasses `ValueError`, so
+  existing handlers still catch them.
+
 ## [1.0.1] - 2026-10-22
 
 The first patch of the v1.0.x plan in `docs/jax_like_roadmap.md`: devices no

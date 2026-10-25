@@ -1042,6 +1042,10 @@ on axis zero; `sum` sums shard losses/parameter gradients and `mean` averages
 them. Mapped-input gradients and nested execution inside another transform
 are rejected. Optimizer updates stay on the host. The cache retains at most
 eight signatures; changed static values, shapes or dtypes specialize it.
+A build without NCCL, or a host without the CUDA driver, the NCCL library, or
+the named GPUs, raises `UnsupportedOperationError` with
+`op="distributed.value_and_grad"`. A build with NCCL runs `float32` programs
+only and rejects a `float64` one with `op="float64"`.
 
 Explicit compilation for a device goes through the
 [Compiler Facade](#compiler-facade): `Compiler().trace(fn, specs).compile("cuda")`

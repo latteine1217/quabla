@@ -157,10 +157,16 @@ class _DistributedValueAndGrad:
                     self._reduction,
                 )
             except ValueError as error:
+                # A build without NCCL and a host without the driver, NCCL, or
+                # enough GPUs raise the same error type, so callers can tell
+                # "cannot run here" from a bad program with one except clause.
                 message = str(error).lower()
                 if (
                     "cuda-nccl" in message
                     or "data-parallel backend is unavailable" in message
+                    or "cuda driver library is unavailable" in message
+                    or "nccl library is unavailable" in message
+                    or "data-parallel device ordinal" in message
                 ):
                     raise _UnsupportedOperationError(
                         str(error), op="distributed.value_and_grad", device="cuda"
