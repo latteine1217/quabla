@@ -54,24 +54,7 @@ cargo test --workspace
 cargo deny check           # dependency audit (deny.toml); cargo install cargo-deny
 
 maturin develop --release              # add --features mlx or --features cuda
-python tests/python/test_tensor_api.py
-python tests/python/test_api.py
-python tests/python/test_devices_api.py
-python tests/python/test_lower_program.py
-python tests/python/test_optim_api.py
-python tests/python/test_control_api.py
-python tests/python/test_random_api.py
-python tests/python/test_distributed_api.py
-python tests/python/test_adam_fused.py
-python tests/python/test_jacobian_chunks.py
-python tests/python/test_cholesky_native.py
-python tests/python/test_buffer_narrow_import.py
-python tests/python/test_ode_api.py
-python tests/python/test_linalg_api.py
-python tests/python/test_packaging_api.py
-python tests/python/test_custom_api.py
-python tests/python/test_solvers_api.py
-python tests/python/test_numpy_api.py
+tests/python/run_suites.sh python        # every tests/python/test_*.py
 actionlint .github/workflows/*.yml     # when a workflow changes
 ```
 
@@ -108,7 +91,8 @@ package version lives only in `crates/quabla-python/Cargo.toml`
 (`pyproject.toml` declares it dynamic).
 
 Each Python suite is a plain script built on the shared harness
-`tests/python/_support.py`. Its runner calls the `test_*` functions in
+`tests/python/_support.py`, and runs on its own with `python
+tests/python/test_x.py`. Its runner calls the `test_*` functions in
 definition order and prints one line per test: `PASS name`, `PASS name
 (gate off: ...)` when part of the test was gated off, `SKIP name: reason`
 when the test could not run, or `FAIL name` with the traceback; then a
@@ -116,6 +100,12 @@ summary line such as `test_api.py: 102 passed, 4 skipped, 0 failed`. The
 script exits non-zero when any test failed. A new suite ends with
 `run(globals())` and takes `raises`, `skip`, and the gate helpers from the
 harness.
+
+`tests/python/run_suites.sh PYTHON` runs every `tests/python/test_*.py`
+with the given interpreter, so a new suite needs no list entry, and exits
+non-zero when any suite failed. CI runs it on Python 3.10 to 3.14, the
+versions the classifiers in `pyproject.toml` list, and the wheel build runs
+it against every wheel it builds (`tests/python/check_wheels.sh`).
 
 GPU runtime suites are opt-in through environment variables and need the
 matching hardware, so CI does not run them. A gate is on exactly when its

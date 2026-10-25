@@ -18,6 +18,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
   advisories, yanked versions, licenses, wildcard dependencies, and
   sources, for the Linux and macOS dependency trees with every feature. It
   runs on every push and pull request and weekly.
+- CI runs every Python test suite on Python 3.10 to 3.14, the versions the
+  package classifiers list, instead of 3.10 only. The wheel build installs
+  each wheel it builds (every CPython on Linux x86_64 and aarch64 and on
+  macOS, for `quabla` and `quabla-mlx`) and runs every suite against it,
+  instead of two suites against the CPython 3.12 wheel.
+  `tests/python/run_suites.sh` runs all suites with one interpreter.
 
 ### Deprecated
 

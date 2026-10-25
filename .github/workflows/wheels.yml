@@ -11,11 +11,11 @@
 #   MLX's Metal kernels. It replaces `quabla` rather than extending it; the
 #   two distributions must not be installed into the same environment.
 #
-# Every CPython listed in `-i` gets a wheel. Each job installs its CPython 3.12
-# wheel into a fresh virtual environment and runs the packaging and core API
-# suites against it. Hosted runners have no NVIDIA driver and no usable Metal
-# device, so the GPU backends are built and packaged here but only exercised on
-# GPU hosts.
+# Every CPython listed in `-i` gets a wheel. Each job installs every wheel it
+# built into a fresh virtual environment and runs all Python test suites
+# against it (tests/python/check_wheels.sh). Hosted runners have no NVIDIA
+# driver and no usable Metal device, so the GPU backends are built and
+# packaged here but only exercised on GPU hosts.
 #
 # Publishing uses PyPI trusted publishing (OIDC); no API token is stored. A
 # version tag publishes to TestPyPI and then to PyPI, and a manual run can
@@ -76,19 +76,20 @@ jobs:
             -i python3.10 python3.11 python3.12 python3.13 python3.14
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
-      - name: Test the cp312 wheel
-        run: |
-          python -m venv .venv-wheel
-          .venv-wheel/bin/python -m pip install dist/*-cp312-*.whl
-          .venv-wheel/bin/python tests/python/test_packaging_api.py
-          .venv-wheel/bin/python tests/python/test_api.py
+          python-version: |
+            3.10
+            3.11
+            3.13
+            3.14
+            3.12
+      - name: Test the wheels
+        run: tests/python/check_wheels.sh dist
       # A CUDA request on a host without a driver must raise an ordinary
       # error; a Rust panic surfaces as a BaseException that `except
       # Exception` does not catch.
       - name: Check CUDA without a driver
         run: |
-          .venv-wheel/bin/python - <<'EOF'
+          .venv-wheel-3.12/bin/python - <<'EOF'
           import quabla as qb
           assert qb.devices() == ["cpu", "cuda"], qb.devices()
           try:
@@ -134,13 +135,10 @@ jobs:
           python -m pip install 'maturin==1.15.0'
           python -m maturin build --release --out dist \
             -i python3.10 python3.11 python3.12 python3.13 python3.14
-      - name: Test the cp312 wheel
+      - name: Test the wheels
         run: |
-          python -m venv .venv-wheel
-          .venv-wheel/bin/python -m pip install dist/*-cp312-*.whl
-          .venv-wheel/bin/python -c "import quabla; assert quabla.devices() == ['cpu'], quabla.devices()"
-          .venv-wheel/bin/python tests/python/test_packaging_api.py
-          .venv-wheel/bin/python tests/python/test_api.py
+          tests/python/check_wheels.sh dist
+          .venv-wheel-3.12/bin/python -c "import quabla; assert quabla.devices() == ['cpu'], quabla.devices()"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-macos-arm64
@@ -194,11 +192,10 @@ jobs:
           python -m pip install 'maturin==1.15.0'
           python -m maturin build --release --features mlx --out dist \
             -i python3.10 python3.11 python3.12 python3.13 python3.14
-      - name: Test the cp312 wheel
+      - name: Test the wheels
         run: |
-          python -m venv .venv-wheel
-          .venv-wheel/bin/python -m pip install dist/*-cp312-*.whl
-          .venv-wheel/bin/python - <<'EOF'
+          tests/python/check_wheels.sh dist
+          .venv-wheel-3.12/bin/python - <<'EOF'
           import importlib.metadata, pathlib, quabla
           assert (pathlib.Path(quabla.__file__).parent / "mlx.metallib").is_file()
           assert quabla.devices() == ["cpu", "mlx"], quabla.devices()
@@ -206,8 +203,6 @@ jobs:
           assert dist.version == quabla.__version__, (dist.version, quabla.__version__)
           assert any(f.name == "MLX.txt" for f in dist.files), "MLX license notice missing"
           EOF
-          .venv-wheel/bin/python tests/python/test_packaging_api.py
-          .venv-wheel/bin/python tests/python/test_api.py
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-macos-arm64-mlx
@@ -233,9 +228,8 @@ jobs:
           python -m pip install 'maturin==1.15.0'
           python -m maturin sdist --out dist
           python -m venv .venv-sdist
-          .venv-sdist/bin/python -m pip install dist/*.tar.gz
-          .venv-sdist/bin/python tests/python/test_packaging_api.py
-          .venv-sdist/bin/python tests/python/test_api.py
+          .venv-sdist/bin/python -m pip install dist/*.tar.gz 'numpy>=2,<3'
+          tests/python/run_suites.sh .venv-sdist/bin/python
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-sdist

@@ -3,8 +3,10 @@
 #
 # One Linux job for the gates on purpose: the test suites finish in seconds,
 # so the cost is compilation. Sharing one job shares one build cache instead
-# of recompiling the workspace per job. The MSRV check is a second job
-# because it compiles with another toolchain and cannot share that cache.
+# of recompiling the workspace per job, also across the Python versions the
+# suites run on (3.10 to 3.14, the classifiers in pyproject.toml). The MSRV
+# check is a second job because it compiles with another toolchain and
+# cannot share that cache.
 #
 # Deliberately NOT run here:
 # - CUDA, NCCL and MLX runtime tests. Hosted runners have no NVIDIA GPU and no
@@ -69,34 +71,39 @@ jobs:
       # fallback-dynamic-loading, so no CUDA toolkit is needed.
       - run: cargo clippy --workspace --all-targets --features quabla-core/cuda-nccl -- -D warnings
       - run: cargo test --workspace
+      # The Python suites run on every CPython the classifiers list. The
+      # extension is not abi3, so each interpreter gets its own build; only
+      # quabla-python links pyo3, so a rebuild reuses the compiled
+      # quabla-core. The steps above use 3.10, set up first so that it is
+      # the default `python` for the Rust builds and tests.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: |
+            3.11
+            3.12
+            3.13
+            3.14
       # NumPy is optional for quabla, but installed here so the NumPy
       # interop tests (buffer import and export) run instead of skipping.
       # Pinned to a major series so a new release cannot turn the gate red
-      # without a code change.
-      - name: Build extension
+      # without a code change. Every interpreter runs even after a failure;
+      # each failing one is reported as an error annotation.
+      - name: Build and test the extension on each Python
         run: |
-          python -m venv .venv-ci
-          .venv-ci/bin/python -m pip install 'maturin>=1.14,<2' 'numpy>=2,<3'
-          VIRTUAL_ENV="$PWD/.venv-ci" .venv-ci/bin/maturin develop
-      # The script's __main__ runner executes every test_*; exit 0 == pass.
-      - run: .venv-ci/bin/python tests/python/test_tensor_api.py
-      - run: .venv-ci/bin/python tests/python/test_api.py
-      - run: .venv-ci/bin/python tests/python/test_devices_api.py
-      - run: .venv-ci/bin/python tests/python/test_lower_program.py
-      - run: .venv-ci/bin/python tests/python/test_optim_api.py
-      - run: .venv-ci/bin/python tests/python/test_control_api.py
-      - run: .venv-ci/bin/python tests/python/test_random_api.py
-      - run: .venv-ci/bin/python tests/python/test_distributed_api.py
-      - run: .venv-ci/bin/python tests/python/test_adam_fused.py
-      - run: .venv-ci/bin/python tests/python/test_jacobian_chunks.py
-      - run: .venv-ci/bin/python tests/python/test_cholesky_native.py
-      - run: .venv-ci/bin/python tests/python/test_buffer_narrow_import.py
-      - run: .venv-ci/bin/python tests/python/test_ode_api.py
-      - run: .venv-ci/bin/python tests/python/test_linalg_api.py
-      - run: .venv-ci/bin/python tests/python/test_packaging_api.py
-      - run: .venv-ci/bin/python tests/python/test_custom_api.py
-      - run: .venv-ci/bin/python tests/python/test_solvers_api.py
-      - run: .venv-ci/bin/python tests/python/test_numpy_api.py
+          status=0
+          for version in 3.10 3.11 3.12 3.13 3.14; do
+            echo "::group::Python $version"
+            venv=".venv-ci-$version"
+            "python$version" -m venv "$venv"
+            "$venv/bin/python" -m pip install 'maturin>=1.14,<2' 'numpy>=2,<3'
+            VIRTUAL_ENV="$PWD/$venv" "$venv/bin/maturin" develop
+            tests/python/run_suites.sh "$venv/bin/python" || {
+              echo "::error::Python suites failed on Python $version"
+              status=1
+            }
+            echo "::endgroup::"
+          done
+          exit "$status"
 
   msrv:
     name: msrv (linux)

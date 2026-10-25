@@ -37,11 +37,12 @@ cargo fmt --all --check
 ruff check tests examples python
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-python tests/python/test_api.py          # and the other tests/python/*.py files
+tests/python/run_suites.sh python        # every tests/python/test_*.py file
 ```
 
 Each Python test file is a standalone script: it runs every `test_*`
-function and prints `PASS <name>`. Run one file directly while iterating.
+function and prints `PASS <name>`. Run one file directly while iterating
+(`python tests/python/test_api.py`).
 
 GPU suites are opt-in, because CI has no GPUs:
 
