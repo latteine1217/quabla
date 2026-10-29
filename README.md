@@ -8,10 +8,16 @@ traced program on CPU, CUDA, and Apple silicon.**
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation)
 [![Release v1.0.2](https://img.shields.io/badge/release-v1.0.2-orange)](https://github.com/latteine1217/quabla/releases/tag/v1.0.2)
+[![PyPI](https://img.shields.io/pypi/v/quabla)](https://pypi.org/project/quabla/)
 [![Docs](https://img.shields.io/badge/docs-developer%20guide-blue)](https://latteine1217.github.io/quabla/guide/)
 
 **Documentation: [Developer Guide](https://latteine1217.github.io/quabla/guide/)
 · [API Reference](https://latteine1217.github.io/quabla/api.html)**
+
+```sh
+pip install quabla       # Linux x86_64/aarch64: CPU + CUDA; macOS arm64: CPU
+pip install quabla-mlx   # macOS 14+ on Apple silicon: CPU + MLX
+```
 
 ![A tanh MLP trained with Quabla matches the exact solution of a 1D Poisson problem; its training loss falls from about 50 to 2.5e-4.](docs/assets/pinn_poisson.png)
 
@@ -70,64 +76,17 @@ running on CUDA or MLX.
 
 ## Status
 
-The latest release is **v1.0.2**, published as a git tag, a GitHub
-Release, and on PyPI as
+The latest release is **v1.0.2**, on PyPI as
 [`quabla`](https://pypi.org/project/quabla/) and
-[`quabla-mlx`](https://pypi.org/project/quabla-mlx/) (v0.6.1 is the first
-PyPI release). The v0.2 series introduced the JAX-style API
-([CHANGELOG](CHANGELOG.md#020---2026-10-06), [design](docs/api_v0_2_design.md)):
-`grad`, `value_and_grad`, `jvp`, `vjp`, `jacobian`, `hessian`, `vmap`, and
-`jit(device="cpu" | "cuda:N" | "mlx")` over arrays and pytrees, `quabla.optim`
-with a retained-buffer `Trainer`, `cond`/`fori_loop`/`scan`, and experimental
-single-node CUDA/NCCL data parallelism. v0.3
-([CHANGELOG](CHANGELOG.md#030---2026-10-06)) fills in what a PINN or
-scientific-ML user expects from the JAX ecosystem: L-BFGS, AdamW and
-learning-rate schedules; `quabla.linalg` (batched `solve`, `slogdet`, `eigh`,
-`qr`, `svd`, `lstsq`); `quabla.ode.odeint` with fixed-step and adaptive
-Dormand-Prince integration; `while_loop`; `custom_vjp`, `custom_jvp`, and
-`checkpoint`; registered pytree nodes; keyed `quabla.random`; stable
-`softmax`/`logsumexp`/`var`; NumPy-style shape helpers; `save`/`load`; and
-native `float64` on CUDA. v0.4
-([CHANGELOG](CHANGELOG.md#040---2026-10-06)) adds native trigonometric,
-hyperbolic, logarithmic, and rounding functions and `fmod`/`mod`; the
-jax.numpy shape, product, and calculus functions (`pad`, `roll`,
-`tensordot`, `kron`, `diff`, `trapezoid`, `interp`, ...) with
-`linalg.norm`/`matrix_power`/`pinv`; stiff integration
-(`odeint(method="rosenbrock23")`) and `saveat`; `linalg.cg`, `linalg.gmres`,
-and `newton` with implicit-function-theorem gradients; matrix
-factorizations on MLX; AdamW, SGD, global-norm clipping, and CUDA `float64`
-in the device `Trainer`; CUDA-graph replay of host-driven CUDA loops; and
-native `max`/`min` reductions. v0.5
-([CHANGELOG](CHANGELOG.md#050---2026-10-06)) lets `vmap` batch `cond`,
-`fori_loop`, `scan`, and `while_loop` and their derivatives, so `hessian`
-and `jacobian` work through loops and `vmap` composes with `odeint`,
-`linalg.cg`, `linalg.gmres`, and `newton`. v0.6
-([CHANGELOG](CHANGELOG.md#060---2026-10-07)) lets `custom_vjp` and
-`custom_jvp` functions run inside control-flow bodies (implicit time
-stepping with `linalg.cg` or `newton` inside `odeint`), gives the iterative
-solvers forward mode, and differentiates loops in reverse mode twice; eager
-`Tensor` ops now evaluate through the same CPU evaluator as `jit`, which
-fuses elementwise chains. v0.7
-([CHANGELOG](CHANGELOG.md#070---2026-10-07)) launches CUDA kernels within
-their compiled thread limit, so `float64` higher derivatives of long chains
-no longer fail with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`, and makes every
-backend validate all the plans it runs when the function compiles; v0.7.1
-([CHANGELOG](CHANGELOG.md#071---2026-10-08)) makes CUDA results the same on
-every run.
-
-v1.0 ([CHANGELOG](CHANGELOG.md#100---2026-10-14)) removes the v0.1 call
-forms that 0.x kept: the `trace_tensor` and `tensor_*_fn` helpers, the
-device optimizer helpers, the 2D `Matrix` API with `quabla.legacy`, and the
-other names deprecated since v0.2. The
-[migration guide](docs/guide/15-migration.md) maps each of them to the
-current API. The [compatibility policy](CONTRIBUTING.md#scope-and-status)
-describes what 1.x keeps stable. v1.0.1
-([CHANGELOG](CHANGELOG.md#101---2026-10-22)) runs every program in its own
-dtype (`float64` in double on CUDA, rejected on MLX, which has no `float64`
-arithmetic), types the public Python API, and adds Linux aarch64 wheels.
-v1.0.2 ([CHANGELOG](CHANGELOG.md#102---2026-10-25)) brings
-`quabla.distributed` under the compatibility policy, declares Rust 1.88 as
-the minimum supported version, and tests every wheel on Python 3.10 to 3.14.
+[`quabla-mlx`](https://pypi.org/project/quabla-mlx/). Beyond the transforms
+above, it provides optimizers (Adam, AdamW, SGD, L-BFGS) with a device
+`Trainer`, `quabla.linalg` and iterative solvers, `quabla.ode.odeint` with
+adaptive and stiff integrators, `custom_vjp`/`custom_jvp`, keyed
+`quabla.random`, and experimental single-node CUDA/NCCL data parallelism.
+The [compatibility policy](CONTRIBUTING.md#scope-and-status) describes what
+1.x keeps stable, the [migration guide](docs/guide/15-migration.md) maps the
+removed 0.x call forms to the current API, and the
+[CHANGELOG](CHANGELOG.md) records every release.
 
 "JAX-style" describes the API only: Quabla does not depend on JAX and is not
 affiliated with JAX or with the `nabla-ml` project. It was formerly named
