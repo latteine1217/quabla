@@ -1,0 +1,18 @@
+{
+  "status": "passed",
+  "release_commit": "0fe097509a15d8048522818d49e017c13246e7d4",
+  "results": {
+    "python-hosted-cpu.log": {
+      "suites": 20,
+      "passed": 352,
+      "skipped": 46
+    },
+    "python-hosted-mlx.log": {
+      "suites": 20,
+      "passed": 388,
+      "skipped": 10
+    }
+  },
+  "linux_evidence": "docs/benchmarks/v103-release-wheel-lab-20261107-01/verification.json",
+  "mlx_native_matches_wheel": true
+}

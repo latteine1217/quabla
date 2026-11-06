@@ -1,0 +1,131 @@
+{
+  "status": "passed",
+  "files": [
+    {
+      "filename": "quabla-1.0.3-cp310-cp310-manylinux_2_28_aarch64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "b96f264efca1fd50571d7244300b535458fc261e4fad08abf1f50a6f4a6d0bd5"
+    },
+    {
+      "filename": "quabla-1.0.3-cp311-cp311-manylinux_2_28_aarch64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "3aea804a61bc91797b486d22557cfc6f393277beafda84c3f2ea477b1dfebbc5"
+    },
+    {
+      "filename": "quabla-1.0.3-cp312-cp312-manylinux_2_28_aarch64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "944de57d613ee5d0ff3ab153f422a713a4a0fd17dfe76411347beedc72cfa1e9"
+    },
+    {
+      "filename": "quabla-1.0.3-cp313-cp313-manylinux_2_28_aarch64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "36f64ebd101c9408b32931568faa7346d7b5a3e7fbc240ba723a32fcafe983dc"
+    },
+    {
+      "filename": "quabla-1.0.3-cp314-cp314-manylinux_2_28_aarch64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "0c68ff1b57d004efba8922561a8f217e6eef5d73989b9124ef5615f35392bb55"
+    },
+    {
+      "filename": "quabla-1.0.3-cp310-cp310-manylinux_2_28_x86_64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "f0d28c6428bed4542d980c6b7113ecc46d0c8dff593370e00a3a17d0609d2276"
+    },
+    {
+      "filename": "quabla-1.0.3-cp311-cp311-manylinux_2_28_x86_64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "62d37ff911ac86f01eb95e915739d7dca488791d473d4e4a2ed0870d82a48fd2"
+    },
+    {
+      "filename": "quabla-1.0.3-cp312-cp312-manylinux_2_28_x86_64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "027c7b5312504909c109e55cdf214c7bb81aa0a7df9180a1aabb3e7feb3fe8a2"
+    },
+    {
+      "filename": "quabla-1.0.3-cp313-cp313-manylinux_2_28_x86_64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "5455a872b91035c09fba8e10e708bcbc49357d928e8693f95f0b4d92d6cff0e5"
+    },
+    {
+      "filename": "quabla-1.0.3-cp314-cp314-manylinux_2_28_x86_64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "544cec968f5ece8e6e880eb24c267781465a55c768e42dcc56d4d89fe5d62b0a"
+    },
+    {
+      "filename": "quabla-1.0.3-cp310-cp310-macosx_11_0_arm64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "183cba0f730384c1223df02111edd6da94a9477c6e04d966d28d591fcd54a2c2"
+    },
+    {
+      "filename": "quabla-1.0.3-cp311-cp311-macosx_11_0_arm64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "4c20809fe272c6e5166f7050bbba10c6b6330ff876687a7b6ec58141c122dbdb"
+    },
+    {
+      "filename": "quabla-1.0.3-cp312-cp312-macosx_11_0_arm64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "11bfe542d6a54d6dd927a061461cc6b14f83603d97ea5d167edb2cde4be39cbf"
+    },
+    {
+      "filename": "quabla-1.0.3-cp313-cp313-macosx_11_0_arm64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "a201191ffeec5e035c93990e2dd1449831cb48c6ac80806b2bb316a54fea1f13"
+    },
+    {
+      "filename": "quabla-1.0.3-cp314-cp314-macosx_11_0_arm64.whl",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "7177a3bd6837a557bcf8c9a5310e985e15aa4cfaf3a7e7493ee22ba92532843c"
+    },
+    {
+      "filename": "quabla-1.0.3.tar.gz",
+      "distribution": "quabla",
+      "version": "1.0.3",
+      "sha256": "c4f81c291a2b2944a607f60906e94c0d0fd7165b3eb7818651d60f2e33a0c3ff"
+    },
+    {
+      "filename": "quabla_mlx-1.0.3-cp310-cp310-macosx_14_0_arm64.whl",
+      "distribution": "quabla-mlx",
+      "version": "1.0.3",
+      "sha256": "59258eae15cd5f68fbe229464523feaff12df846cc3d1e38cf0507bf81cb5911"
+    },
+    {
+      "filename": "quabla_mlx-1.0.3-cp311-cp311-macosx_14_0_arm64.whl",
+      "distribution": "quabla-mlx",
+      "version": "1.0.3",
+      "sha256": "b332d13705d1e688ac9a45b24bc0da79f23a49b4c6e3d7558eabeb0063e1286c"
+    },
+    {
+      "filename": "quabla_mlx-1.0.3-cp312-cp312-macosx_14_0_arm64.whl",
+      "distribution": "quabla-mlx",
+      "version": "1.0.3",
+      "sha256": "a09a399a540ea63a5567582ffc7177c8e83d3e085704d0ed9f2d01fdf4576edd"
+    },
+    {
+      "filename": "quabla_mlx-1.0.3-cp313-cp313-macosx_14_0_arm64.whl",
+      "distribution": "quabla-mlx",
+      "version": "1.0.3",
+      "sha256": "d0f04735172c5857f7ee7a725e20d452d8d048e0d9c598f7e2c9625ad28d4259"
+    },
+    {
+      "filename": "quabla_mlx-1.0.3-cp314-cp314-macosx_14_0_arm64.whl",
+      "distribution": "quabla-mlx",
+      "version": "1.0.3",
+      "sha256": "e3df3499cd86f6b88fc88618e4ad728a060ba2ae106978b1176e1bd2329fcb38"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+/home/junyi/quabla-v103-wheel-20261107/tests/python/test_api.py:65: DeprecationWarning: quabla.TensorCudaAdamOptimizer is deprecated and will be removed in 2.0; use qb.optim.Trainer(..., device="cuda"), which creates it.
+  getattr(quabla, name)
+/home/junyi/quabla-v103-wheel-20261107/tests/python/test_api.py:65: DeprecationWarning: quabla.TensorMlxAdamOptimizer is deprecated and will be removed in 2.0; use qb.optim.Trainer(..., device="mlx"), which creates it.
+  getattr(quabla, name)

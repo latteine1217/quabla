@@ -1,0 +1,75 @@
+{
+  "run_id": "v103-release-20261107-01",
+  "date": "2026-11-07",
+  "timezone": "Asia/Taipei",
+  "status": "published and verified on TestPyPI/PyPI",
+  "version": "1.0.3",
+  "release_commit": "0fe097509a15d8048522818d49e017c13246e7d4",
+  "runtime_verified_commit": "c888f11aa826555a2cf923b45f13c67a2b2fcce9",
+  "commit_difference": "CITATION.cff version/date only",
+  "tag_object": "00e87228b10dbcecdfe493a2295dc5016c917341",
+  "ci_run": 42268863301,
+  "macos_ci_run": 42267070723,
+  "wheels_run": 42269943238,
+  "files": 21,
+  "wheel_files": 20,
+  "sdist_files": 1,
+  "python_versions": [
+    "3.10",
+    "3.11",
+    "3.12",
+    "3.13",
+    "3.14"
+  ],
+  "registry_hashes_match_artifacts": true,
+  "shipping_runtime": {
+    "status": "passed",
+    "release_commit": "0fe097509a15d8048522818d49e017c13246e7d4",
+    "results": {
+      "python-hosted-cpu.log": {
+        "suites": 20,
+        "passed": 352,
+        "skipped": 46
+      },
+      "python-hosted-mlx.log": {
+        "suites": 20,
+        "passed": 388,
+        "skipped": 10
+      }
+    },
+    "linux_evidence": "docs/benchmarks/v103-release-wheel-lab-20261107-01/verification.json",
+    "mlx_native_matches_wheel": true
+  },
+  "linux_shipping_wheel_record": "../v103-release-wheel-lab-20261107-01/verification.json",
+  "candidate_lifecycle_record": "../v103-lab-2gpu-20261107-01/verification.json",
+  "citation_schema": "1.2.0; cffconvert 2.0.0 passed",
+  "history": {
+    "initial_wheels_run": 42268403736,
+    "initial_state": "cancelled before any upload",
+    "tag_update": "explicit owner approval; forced tag update protected by the original tag-object lease"
+  },
+  "limits": [
+    "Hosted wheel tests run on CPU; actual Metal runtime acceptance uses CPython 3.13.11 on Apple M3/macOS 27.0.1.",
+    "Shipping Linux CUDA/NCCL acceptance uses CPython 3.13.11 and two RTX 3090 GPUs with CUDA 12.6; Arm CUDA hardware remains unvalidated.",
+    "Correctness, packaging and lifecycle checks do not establish a training performance advantage.",
+    "Home-gpu was not used for this release run."
+  ],
+  "evidence_sha256": {
+    "runtime.json": "c93b5184f8f2cff003fb536dea70eb645b27006a896e1510612f2560b59d0eab",
+    "audit.json": "952e73d769f48f34c15c2d089480e028eb595eaba53fdaa1b12b333db7ac7c5e",
+    "ci.json": "23b3c7fdcc9faebab6c2025fc12bf1efcc5723137887f2a855ce1c1af8be9629",
+    "twine.log": "f2bb65e22d0eb62a630335b167c44df7f093997b0fed6c2ff021568f111b5d46",
+    "python-cpu.log": "c3520b247ce4709e6524931f80633834e2bee3e2c94a2569002d928d4057f5d9",
+    "testpypi-quabla-mlx.json": "531f6275f37d54de7aa95af25a96a49a21a72c7cdb9ed80abe301a51b1504e10",
+    "metal-native.json": "b296d5ddacdd6817781b86962d241dca30115df9d79349fd67ae9ec7a983cdec",
+    "pypi-quabla.json": "6de76419d334876a234fcedfa94ed300970a83221c4f0e5bce8e884f447c2145",
+    "artifact-manifest.json": "cd7825c4e365ff43d280ccacb9c296c9830993aa2753a483499cc0b8f86bb1b5",
+    "verify_artifacts.py": "e0b49305374fb03c9a0f79b2723bc20d47e1ee9778dcfffd5936c5753060ca72",
+    "citation.log": "1ded7a8200757e40319f65fb0fc113ae79f572d89d32c3c3dd67e23fb8537cc2",
+    "python-metal.log": "d104d287dd909dc3fc8e6e69c1bbfb9d6fa4559ac6e42a671ffb4dd47f3d1d5c",
+    "wheels.json": "d6bed435f515cf19ef33f516c97406e140bd2b29f849435dabb4616d72ce1c67",
+    "macos-ci.json": "2b2159d0d20a8f1648e81f2704769f6290af8e8e4f5023d54ae055ce2781e0a6",
+    "testpypi-quabla.json": "a2600275f6f35291819d7db4de68a7a1c8b89275bf75fd0e2529822c2169bd66",
+    "pypi-quabla-mlx.json": "6b50c2b65165672eb918f79aba6280a758a7d31bc70158c1f7197cb51021aed4"
+  }
+}

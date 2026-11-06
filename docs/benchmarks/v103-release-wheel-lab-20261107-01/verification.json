@@ -1,0 +1,26 @@
+{
+  "status": "passed",
+  "job_id": 6938,
+  "state": "COMPLETED",
+  "exit_code": "0:0",
+  "release_commit": "0fe097509a15d8048522818d49e017c13246e7d4",
+  "workflow_run": 42269943238,
+  "wheel": "quabla-1.0.3-cp313-cp313-manylinux_2_28_x86_64.whl",
+  "wheel_sha256": "5455a872b91035c09fba8e10e708bcbc49357d928e8693f95f0b4d92d6cff0e5",
+  "native_sha256": "210fd9614b4353113f8a57276abfc5ace33b47a3fe7037ac0f156df6f6a95378",
+  "python_suites": 6,
+  "python_passed": 159,
+  "python_skipped": 4,
+  "parity_calls": 40,
+  "max_loss_abs_error": 1.4901161193847656e-08,
+  "max_gradient_abs_error": 1.4901161193847656e-08,
+  "evidence_sha256": {
+    "accounting.txt": "1845982f66733e0356ced446bc2cd9a742d7e364c34605913a49d24ff547d305",
+    "validate.sbatch": "944307852ace8b16144fb2196a833d17e9757a608c5dda454a7f9c75404831a9",
+    "parity-6938.json": "4d3895e0673faee5672a1b83c98e9bedd271d79758c4c6959ea8cfc3ac542d1f",
+    "job-6938.out": "ccce8dc07ddd28ead25d93c5c92ac9c1e3345b546282e269ffac087eaf2062dc",
+    "job-6938.err": "d8bc0510bb62ad515bafe92d9976e4d202829d605e678ada3894aeb1723ed655",
+    "wheel.sha256": "86abe91a079eb61b860ea56a3e5a3a94ab068ab5e8c5711791c08cd3f0fa7b52"
+  },
+  "native_matches_wheel": true
+}

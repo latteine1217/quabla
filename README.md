@@ -5,6 +5,9 @@ inputs, unaddressable allocations, and trace error propagation while preserving
 public signatures and dtype behavior. It adds reproducible property and crash
 regressions. See the [release notes](CHANGELOG.md#103---2026-11-07).
 
+Package and GPU verification are indexed in the
+[release acceptance record](docs/benchmarks/v103-release-20261107-01/README.md).
+
 **Differentiable scientific computing for physics-informed neural networks
 (PINNs): a Rust compiler and runtime with a JAX-style Python API that runs one
 traced program on CPU, CUDA, and Apple silicon.**

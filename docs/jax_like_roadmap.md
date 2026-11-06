@@ -13,8 +13,8 @@ platforms researchers use, not an enterprise support commitment.
 
 v1.0.1 (2026-10-22) ships items 4, 8, and 10. v1.0.2 (2026-10-25) ships
 items 1, 3, and 7 and the dependency audit of item 6; item 3, then a
-proposal, joined it (owner, 2026-10-25). The unreleased 1.0.3 candidate
-implements item 5 and the bounded property tests of item 6; its audit and
+proposal, joined it (owner, 2026-10-25). v1.0.3 (2026-11-07) ships
+item 5 and the bounded property tests of item 6; its audit and release
 validation scope are recorded below. Item 2, coverage and the performance
 gate remain open, and item 11 stays deferred.
 
@@ -34,8 +34,8 @@ gap is to users, its cost, and what it depends on:
 | 2 | Automated GPU validation: a release gate that runs the CUDA suites (`QUABLA_CUDA_TEST=1`), the NCCL suites on two GPUs, and the MLX suites on every release candidate, on stated CUDA/NVRTC versions, driver minimums, and compute capabilities (the NVRTC 12.6 `atomicAdd(double)` miss of v0.3 shows one host is not enough). Today CUDA is validated by hand on one GTX 1660 SUPER, and the two-GPU run was skipped for v1.0 | Open |
 | 3 | CI Python matrix matching the classifiers (3.10 to 3.14; CI runs 3.10 only), and the full suites on the built wheels. Not named by the owner; proposed for 1.0.x | Done in 1.0.2: CI builds the extension for and runs every suite on 3.10 to 3.14 in the gates job; the wheel build runs every suite against each wheel it builds (five CPythons on Linux x86_64, Linux aarch64, macOS, and `quabla-mlx`) and the sdist; `tests/python/run_suites.sh` replaces the per-suite lists. Hosted runners keep the GPU gates off |
 | 4 | No silent precision change: a `float64` program runs in `float64` and a `float32` program in `float32`; where a device cannot honour a dtype it raises instead of converting. 1.0.0 ran `float64` programs as `float32` on CUDA (with a `UserWarning` unless `precision="float64"`) and always on MLX | Done in 1.0.1: CUDA runs each program in its dtype and rejects a mix; MLX rejects `float64` programs; weak constants and the `jacobian` basis follow the program's dtype |
-| 5 | Audit user-input paths at the Python/Rust boundary, separate checked internal invariants from user errors, and review the bounds, ownership and `SAFETY` contracts of unsafe code | Implemented and verified for the unreleased 1.0.3 candidate: native recursion and nontermination regressions, checked Python sequence extraction, capacity/derived-shape checks, trace-frame error propagation, production panic/unwrap Clippy guards, and the invariant audit below. CPU, MLX, single-GPU CUDA and current-source two-GPU NCCL validation pass. No release has been published. |
-| 6 | Quality checks CI lacks: dependency audit (`cargo deny` or `cargo audit`), coverage measurement, a performance regression gate for the benchmarks, and property-based or fuzz tests of tracing, shape inference, and indexing | Dependency audit done in 1.0.2. The unreleased 1.0.3 candidate adds 480 bounded generated cases with four fixed seeds, independent standard-library oracles, invalid-trace cleanup checks, and subprocess crash/timeout regressions. The existing CI/wheel suite runner picks them up automatically. Coverage and the performance gate remain open for 1.0.4. |
+| 5 | Audit user-input paths at the Python/Rust boundary, separate checked internal invariants from user errors, and review the bounds, ownership and `SAFETY` contracts of unsafe code | Released in 1.0.3: native recursion and nontermination regressions, checked Python sequence extraction, capacity/derived-shape checks, trace-frame error propagation, production panic/unwrap Clippy guards, and the invariant audit below. CPU, MLX, single-GPU CUDA and current-source two-GPU NCCL validation pass. The release artifact matrix and publication are verified below. |
+| 6 | Quality checks CI lacks: dependency audit (`cargo deny` or `cargo audit`), coverage measurement, a performance regression gate for the benchmarks, and property-based or fuzz tests of tracing, shape inference, and indexing | Dependency audit done in 1.0.2. 1.0.3 adds 480 bounded generated cases with four fixed seeds, independent standard-library oracles, invalid-trace cleanup checks, and subprocess crash/timeout regressions. The existing CI/wheel suite runner picks them up automatically. Coverage and the performance gate remain open for 1.0.4. |
 | 7 | A declared MSRV (`rust-version`) checked in CI | Done in 1.0.2: Rust 1.88 (the floor of `libloading`, which the CUDA backend needs), raised only in minor releases (owner, 2026-10-25); CI checks the default, CUDA/NCCL, and MLX builds with it, and resolver 3 keeps dependency updates within it |
 | 8 | Type annotations: the pure-Python modules are unannotated and most extension declarations in `_quabla.pyi` are `Any`; annotate the public API and check it with a type checker in CI | Done in 1.0.1: public API annotated, pyright standard mode clean, gated in CI |
 | 10 | More platforms: Windows and Linux aarch64 wheels | Linux aarch64 done in 1.0.1 (its CUDA backend is unvalidated on Arm GPUs); Windows deferred by the owner (WSL covers it) |
@@ -61,10 +61,19 @@ Decisions:
   gates, Linux library names, no NCCL, no Windows GPU host), and WSL runs
   the Linux wheels.
 
-### 1.0.3 boundary audit and candidate verification (2026-11-06)
+### 1.0.3 boundary audit and release verification (2026-11-06/07)
 
-Release preparation (2026-11-07): version metadata and release notes are ready;
-release CI, wheel/sdist acceptance and publication remain pending.
+Release status (2026-11-07): **1.0.3 is published** as `quabla` and
+`quabla-mlx` on TestPyPI and PyPI. The final tag is `0fe0975`, including the
+validated citation version/date correction. All seven jobs in the
+[release workflow](https://github.com/latteine1217/quabla/actions/runs/42269943238)
+pass. Every wheel and the sdist pass the hosted installation matrix; all
+21 files match the accepted artifact hashes on both registries. The actual
+shipping CPU/Metal wheels pass local full suites and the Linux wheel passes
+selected suites plus two-GPU parity on lab-server. Scope, source identities,
+raw results and hash verification are indexed in the
+[release acceptance record](benchmarks/v103-release-20261107-01/README.md).
+GPU infrastructure automation, coverage and the performance gate remain open.
 
 The implementation is recorded under `CHANGELOG.md`'s 1.0.3 section. Runtime
 validation used the candidate's 1.0.2 package metadata; release preparation
@@ -129,7 +138,8 @@ The checked extractor was also tested against finite `range`, `__getitem__`
 sequences without `__len__`, and contradictory/endless sized iterators.
 The final remote source hashes match the local candidate, both native extension
 identities are recorded, and the AST check finds no unguarded vector parameter
-in the PyO3 bindings. Release automation and publication are not claimed.
+in the PyO3 bindings. Release artifact and registry acceptance is recorded
+in the release record above.
 Raw logs, crash reproductions and
 source inventories remain in locally ignored `logs/v103-robustness-20261106/`;
 `verification.json` identifies the accepted `verified-*` logs and frozen source
