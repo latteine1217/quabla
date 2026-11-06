@@ -1,0 +1,11 @@
+Currently Loaded Modulefiles:
+ 1) rust/stable   2) cuda/12.6  
+🍹 Building a mixed python/rust project
+🐍 Found CPython 3.13 at /home/junyi/quabla-v103-validation-20261107/.venv/bin/python
+🔗 Found pyo3 bindings
+   Compiling pyo3-ffi v0.29.2
+   Compiling pyo3 v0.29.2
+   Compiling quabla-python v1.0.2 (/home/junyi/quabla-v103-validation-20261107/crates/quabla-python)
+    Finished `release` profile [optimized] target(s) in 27.39s
+📦 Built wheel for CPython 3.13 to /tmp/.tmpp7DCII/quabla-1.0.2-cp313-cp313-linux_x86_64.whl
+🛠 Installed quabla-1.0.2

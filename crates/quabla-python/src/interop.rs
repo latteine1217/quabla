@@ -9,6 +9,7 @@
 //! so a tensor never aliases foreign memory. Exports pin immutable storage
 //! without copying for float64, float32, and bool.
 
+use std::collections::HashMap;
 use std::ffi::{c_int, c_void, CStr};
 use std::ptr;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use pyo3::buffer::{Element, ElementType, PyBuffer, PyUntypedBuffer};
 use pyo3::exceptions::{PyBufferError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyFloat, PyList, PyMemoryView, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyFloat, PyIterator, PyList, PyMemoryView, PyTuple};
 use quabla_core::tensor_ir::{HostTensorStorage, TensorDType};
 
 use crate::tensor::PyTensor;
@@ -38,7 +39,16 @@ pub(crate) fn tensor_from_nested(
     // then checks that every other element agrees with it.
     let mut shape = Vec::new();
     let mut probe = value.clone();
+    let mut ancestors = HashMap::new();
     while is_nested_sequence(&probe) {
+        if ancestors
+            .insert(probe.as_ptr() as usize, probe.clone())
+            .is_some()
+        {
+            return Err(PyValueError::new_err(
+                "cannot build a tensor from a cyclic nested sequence",
+            ));
+        }
         let extent = probe.len()?;
         shape.push(extent);
         if extent == 0 {
@@ -49,7 +59,8 @@ pub(crate) fn tensor_from_nested(
         probe = probe.get_item(0)?;
     }
 
-    let mut data = Vec::with_capacity(shape.iter().product());
+    let count = crate::tensor::element_count(&shape).map_err(PyValueError::new_err)?;
+    let mut data = Vec::with_capacity(count);
     let mut all_bool = true;
     fill_nested(value, &shape, 0, &mut data, &mut all_bool)?;
     let inferred = if all_bool {
@@ -68,14 +79,41 @@ fn fill_nested(
     data: &mut Vec<f64>,
     all_bool: &mut bool,
 ) -> PyResult<()> {
-    let nested = is_nested_sequence(value);
-    if depth == shape.len() {
+    enum Work<'py> {
+        Value(Bound<'py, PyAny>, usize),
+        Children(Bound<'py, PyIterator>, usize, usize),
+    }
+    // Iterator frames retain only the active path, rather than every scalar leaf.
+    let mut pending = vec![Work::Value(value.clone(), depth)];
+    while let Some(work) = pending.pop() {
+        let (value, depth) = match work {
+            Work::Value(value, depth) => (value, depth),
+            Work::Children(mut children, depth, remaining) => {
+                match (children.next().transpose()?, remaining) {
+                    (Some(item), remaining) if remaining > 0 => {
+                        pending.push(Work::Children(children, depth, remaining - 1));
+                        pending.push(Work::Value(item, depth));
+                    }
+                    (None, 0) => {}
+                    _ => return Err(ragged_error(shape, depth - 1)),
+                }
+                continue;
+            }
+        };
+        let nested = is_nested_sequence(&value);
+        if depth < shape.len() {
+            if !nested || value.len()? != shape[depth] {
+                return Err(ragged_error(shape, depth));
+            }
+            pending.push(Work::Children(value.try_iter()?, depth + 1, shape[depth]));
+            continue;
+        }
         if nested {
             return Err(ragged_error(shape, depth));
         }
         if let Ok(flag) = value.cast::<PyBool>() {
             data.push(f64::from(flag.is_true()));
-            return Ok(());
+            continue;
         }
         *all_bool = false;
         let number = value.extract::<f64>().map_err(|_| {
@@ -89,13 +127,6 @@ fn fill_nested(
             ))
         })?;
         data.push(number);
-        return Ok(());
-    }
-    if !nested || value.len()? != shape[depth] {
-        return Err(ragged_error(shape, depth));
-    }
-    for item in value.try_iter()? {
-        fill_nested(&item?, shape, depth + 1, data, all_bool)?;
     }
     Ok(())
 }
@@ -304,15 +335,35 @@ pub(crate) fn nested_list<'py>(
     data: &[f64],
     dtype: TensorDType,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let Some((extent, inner)) = shape.split_first() else {
-        return Ok(python_scalar(py, data[0], dtype));
-    };
-    let chunk = data.len() / extent;
-    let items = data
-        .chunks(chunk)
-        .map(|chunk| nested_list(py, inner, chunk, dtype))
-        .collect::<PyResult<Vec<_>>>()?;
-    Ok(PyList::new(py, items)?.into_any())
+    let mut values = data.iter();
+    if shape.is_empty() {
+        return values
+            .next()
+            .map(|value| python_scalar(py, *value, dtype))
+            .ok_or_else(|| PyValueError::new_err("tensor has no elements"));
+    }
+    // Keep only the active list path, avoiding a second flat array of Python objects.
+    let mut pending = vec![(0, PyList::empty(py))];
+    while let Some((axis, list)) = pending.last() {
+        if list.len() == shape[*axis] {
+            let (_, completed) = pending
+                .pop()
+                .ok_or_else(|| PyValueError::new_err("nested list path is missing"))?;
+            if let Some((_, parent)) = pending.last() {
+                parent.append(completed)?;
+            } else {
+                return Ok(completed.into_any());
+            }
+        } else if *axis + 1 == shape.len() {
+            let value = values
+                .next()
+                .ok_or_else(|| PyValueError::new_err("tensor data does not match its shape"))?;
+            list.append(python_scalar(py, *value, dtype))?;
+        } else {
+            pending.push((*axis + 1, PyList::empty(py)));
+        }
+    }
+    Err(PyValueError::new_err("nested list path is missing"))
 }
 
 /// The element of a single-element tensor as a Python scalar.

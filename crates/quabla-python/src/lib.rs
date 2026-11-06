@@ -1,5 +1,7 @@
 // Every unsafe block and impl must document its soundness invariant.
 #![warn(clippy::undocumented_unsafe_blocks)]
+// Do not leak an unconditional Rust panic through the Python boundary.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::panic))]
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PySequence};
@@ -11,6 +13,7 @@ mod dtype;
 mod errors;
 mod interop;
 mod repr;
+mod safe_extract;
 mod tensor;
 mod tensor_trace;
 
@@ -176,7 +179,7 @@ fn py_isfinite(value: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
 fn py_concat(py: Python<'_>, matrices: &Bound<'_, PySequence>, axis: usize) -> PyResult<Py<PyAny>> {
     let len = matrices.len()?;
 
-    let mut eager_tensors = Vec::with_capacity(len);
+    let mut eager_tensors = safe_extract::buffer(len)?;
     let mut all_tensors = true;
     for index in 0..len {
         let item = matrices.get_item(index)?;
@@ -210,7 +213,7 @@ fn py_concat(py: Python<'_>, matrices: &Bound<'_, PySequence>, axis: usize) -> P
 #[pyo3(signature = (tensors, axis=0))]
 fn py_stack(py: Python<'_>, tensors: &Bound<'_, PySequence>, axis: isize) -> PyResult<Py<PyAny>> {
     let len = tensors.len()?;
-    let mut eager = Vec::with_capacity(len);
+    let mut eager = safe_extract::buffer(len)?;
     let mut all_eager = true;
     for index in 0..len {
         match tensors.get_item(index)?.extract::<PyRef<'_, PyTensor>>() {
@@ -239,9 +242,7 @@ fn py_stack(py: Python<'_>, tensors: &Bound<'_, PySequence>, axis: isize) -> PyR
 /// tracer's graph, with eager `Tensor` and `TensorView` items captured as
 /// constants. `None` when there is no tracer or another kind of item.
 fn traced_sequence(items: &Bound<'_, PySequence>) -> PyResult<Option<Vec<TraceTensor>>> {
-    let items = (0..items.len()?)
-        .map(|index| items.get_item(index))
-        .collect::<PyResult<Vec<_>>>()?;
+    let items = safe_extract::vec::<Bound<'_, PyAny>>(items.as_any())?;
     let Some(tracer) = items
         .iter()
         .find_map(|item| item.extract::<TraceTensor>().ok())

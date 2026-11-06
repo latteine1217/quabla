@@ -1,0 +1,68 @@
+   Compiling pyo3-ffi v0.29.2
+   Compiling pyo3 v0.29.2
+   Compiling quabla-python v1.0.2 (/home/junyi/quabla-v103-validation-20261107/crates/quabla-python)
+    Finished `release` profile [optimized] target(s) in 46.44s
+     Running unittests src/lib.rs (target/release/deps/quabla_macros-a3692d5e4effa5f6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/release/deps/quabla-b9b503c0a92f4bdf)
+
+running 19 tests
+test repr::tests::prints_bools_padded_to_a_common_width ... ok
+test repr::tests::nests_rows_and_blocks ... ok
+test repr::tests::prints_values_with_numpy_float_rules ... ok
+test interop::typed_export_tests::all_typed_exports_pin_original_storage_without_conversion ... ok
+test repr::tests::summarizes_large_tensors_and_reads_only_printed_elements ... ok
+test repr::tests::switches_to_scientific_notation_like_numpy ... ok
+test tensor::adam_tests::pure_adam_allocates_three_independent_buffers_and_preserves_aliases ... ok
+test repr::tests::wraps_long_rows_at_the_line_width ... ok
+test tensor::adam_tests::same_shape_binary_preserves_rounding_and_broadcast_fallback ... ok
+test tensor::indexing_tests::composed_index_preserves_dropped_axes_scalar_results_and_empty_index ... ok
+test tensor::delegation_tests::scalar_broadcast_preserves_operand_order_and_shape_validation ... ok
+test tensor::owned_output_tests::conversion_preserves_storage_address_bits_dtype_and_strength ... ok
+test tensor::owned_output_tests::fused_sgd_preserves_f64_intermediate_bits_and_input_aliases ... ok
+test tensor::owned_output_tests::native_storage_is_dtype_sized_and_shape_views_share_it ... ok
+test tensor_trace::data_parallel_host_input_tests::mapped_leaves_cover_batch_once_and_preserve_dtype ... ok
+test tensor_trace::data_parallel_host_input_tests::runtime_validation_keeps_exact_shape_errors_and_precedence ... ok
+test tensor::indexing_tests::gather_preserves_order_duplicates_rounding_and_errors ... ok
+test tensor::delegation_tests::composites_equal_their_traced_graph ... ok
+test tensor::delegation_tests::direct_paths_equal_the_traced_graph ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/tensor_trace.rs (target/release/deps/tensor_trace-74ca89e3bcee2363)
+
+running 7 tests
+test inline_batched_batches_solve_and_rejects_foreign_bindings ... ok
+test staging_rejects_tracers_of_another_graph ... ok
+test tracers_of_an_enclosing_trace_lift_into_the_inner_trace ... ok
+test inline_batched_splices_a_per_example_graph_over_the_batch ... ok
+test staged_vjp_compiles_value_and_gradients_into_one_program ... ok
+test tracers_of_finished_traces_are_not_lifted ... ok
+test staged_jvp_over_a_ones_seeded_vjp_gives_hessian_columns ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests quabla_macros
+
+running 1 test
+test crates/quabla-macros/src/lib.rs - forward_diff (line 14) ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests quabla
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+    Finished `release` profile [optimized] target(s) in 0.17s
+   Doc-tests quabla_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

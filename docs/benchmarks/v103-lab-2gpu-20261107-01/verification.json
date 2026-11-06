@@ -1,0 +1,226 @@
+{
+  "run_id": "v103-lab-2gpu-20261107-01",
+  "status": "passed",
+  "date": "2026-11-07",
+  "candidate": "unreleased 1.0.3; package version remains 1.0.2",
+  "attempts": [
+    {
+      "job_id": 6936,
+      "state": "FAILED",
+      "exit_code": "127:0",
+      "cause": "Python Rust test loader lacked CPython library path; completed core results retained"
+    },
+    {
+      "job_id": 6937,
+      "state": "COMPLETED",
+      "exit_code": "0:0"
+    }
+  ],
+  "source": {
+    "candidate_files": 124,
+    "retry_manifest_files": 127,
+    "candidate_matches_prior_manifest": true,
+    "local_postrun_manifest_matches": true,
+    "manifest": "source-retry.json"
+  },
+  "native": {
+    "status": "passed",
+    "job_id": "6937",
+    "source_files": 127,
+    "extension_path": "/home/junyi/quabla-v103-validation-20261107/python/quabla/_quabla.cpython-313-x86_64-linux-gnu.so",
+    "extension_sha256": "81037711bcb754b3958f48c137f48959819ba993a11a534834f9d652779546ae"
+  },
+  "rust": {
+    "unique_passed": 381,
+    "ignored": 14,
+    "nccl_tests_run_serially_with_gate_on": 3,
+    "nccl_repeats_not_added_to_unique_count": true
+  },
+  "python": {
+    "top_level_suites": 20,
+    "passed": 391,
+    "skipped": 7,
+    "failed": 0,
+    "suites": {
+      "test_adam_fused.py": {
+        "passed": 3,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_api.py": {
+        "passed": 103,
+        "skipped": 2,
+        "failed": 0
+      },
+      "test_buffer_narrow_import.py": {
+        "passed": 4,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_cholesky_native.py": {
+        "passed": 2,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_control_api.py": {
+        "passed": 42,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_custom_api.py": {
+        "passed": 23,
+        "skipped": 1,
+        "failed": 0
+      },
+      "test_devices_api.py": {
+        "passed": 11,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_distributed_api.py": {
+        "passed": 5,
+        "skipped": 1,
+        "failed": 0
+      },
+      "test_jacobian_chunks.py": {
+        "passed": 10,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_linalg_api.py": {
+        "passed": 14,
+        "skipped": 1,
+        "failed": 0
+      },
+      "test_lower_program.py": {
+        "passed": 6,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_numpy_api.py": {
+        "passed": 14,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_ode_api.py": {
+        "passed": 33,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_optim_api.py": {
+        "passed": 31,
+        "skipped": 2,
+        "failed": 0
+      },
+      "test_packaging_api.py": {
+        "passed": 14,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_properties_api.py": {
+        "passed": 4,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_random_api.py": {
+        "passed": 9,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_robustness_api.py": {
+        "passed": 6,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_solvers_api.py": {
+        "passed": 30,
+        "skipped": 0,
+        "failed": 0
+      },
+      "test_tensor_api.py": {
+        "passed": 27,
+        "skipped": 0,
+        "failed": 0
+      }
+    },
+    "nested_suite_invocations": [
+      {
+        "suite": "test_buffer_narrow_import.py",
+        "passed": 4,
+        "skipped": 0,
+        "failed": 0
+      }
+    ],
+    "skip_reasons": [
+      "SKIP test_mlx_power_matches_cpu: set QUABLA_MLX_TEST=1",
+      "SKIP test_mlx_captured_constants_match_cpu: set QUABLA_MLX_TEST=1",
+      "SKIP test_mlx_reports_a_missing_loop_forward_rule_at_compile_time: set QUABLA_MLX_TEST=1",
+      "SKIP test_feature_unavailable_contract: NCCL runtime validation enabled",
+      "SKIP test_mlx_linalg_matches_the_cpu: set QUABLA_MLX_TEST=1",
+      "SKIP test_mlx_trainer_convergence: set QUABLA_MLX_TEST=1",
+      "SKIP test_mlx_trainer_schedule_matches_cpu: set QUABLA_MLX_TEST=1"
+    ]
+  },
+  "parity": {
+    "cases": 8,
+    "calls": 40,
+    "dtype": "float32",
+    "reductions": [
+      "sum",
+      "mean"
+    ],
+    "tolerance": 1e-05,
+    "max_loss_abs_error": 1.4901161193847656e-08,
+    "max_gradient_abs_error": 1.4901161193847656e-08,
+    "mixed_schedule_max_abs_error": 1.7069616564668877e-07
+  },
+  "lifecycle": {
+    "cycles": 50,
+    "intentional_failed_cycles": 25,
+    "recovery_test_intentional_failures": 2,
+    "recovered_clone_calls": 3,
+    "baseline_cycle": 1,
+    "baseline_free_bytes": [
+      24929959936,
+      24929959936
+    ],
+    "final_free_bytes": [
+      24929959936,
+      24929959936
+    ],
+    "final_drift_bytes": [
+      0,
+      0
+    ],
+    "allowed_drift_bytes": 67108864
+  },
+  "limits": [
+    "Correctness/lifecycle validation, not a framework training performance comparison.",
+    "Memory evidence covers these 50 cycles and their warmed baseline.",
+    "No home-gpu work, source API change, release, commit, push or publication in this run."
+  ],
+  "evidence_sha256": {
+    "accounting.txt": "6533e54ac4d11d64a22474695b88741c2c175dae32b721c1df9f7d611ce334e5",
+    "clippy-6936.log": "5b7cfffdfaf4108d42cbc3614bb3f105bb04a0ef63b7a6ca935475eb0c8b1ee1",
+    "clippy-6937.log": "32d47f791eadf1ea833d9f8c84fbfea5cab1f438e113e93be05bd5b908e1c2ac",
+    "completion-6937.json": "6672786a94ec25c563e2483843728d02e8b10fda414f591414d6458f4f74a8af",
+    "cuda_data_parallel_compile_execute_drop_cycles_keep_device_memory_stable_on_two_gpus-6937.log": "4a2ba527366488be659cdf280dab755540a58308209889c697c1c7f43c2287d4",
+    "cuda_data_parallel_recreates_communicators_after_a_failed_call_on_two_gpus-6937.log": "202e3b53ab557abd37d4f9e34256ccb5bdd4cddabd7207db1c74260511784fc2",
+    "cuda_data_parallel_sharded_schedule_matches_cpu_oracle_on_two_gpus-6937.log": "b4a31dda6cc786f3f51fd4fd8e557401f1ab466e014c3b328d719d73bcd742e6",
+    "environment.txt": "2bccdda02536bd94f4f7f962da6ecf8d91a6eda46b9fd58751487d8d796ab373",
+    "job-6936.err": "df05ffed0e0faa2575a146e8ea173bf62de82cf1a0e94fb8cd970eabfbcd3e1f",
+    "job-6936.out": "da59fb1dbaa5a91a3282c94784fbd0d5f877fb2b1d548fab9b584f70bb02b981",
+    "job-6937.err": "e3609053054baffb8a250398de73ad8af99815110bd0cdd3ea37b291f2ab4822",
+    "job-6937.out": "50d5472d6b17ab9ec7344525647139fa0ef22c072f7838f26532e75eb4f232b6",
+    "parity-6937.json": "85af47822694ec884dd83255e3e0b1bb9aaf2994ae841e58800662c8ed55d96c",
+    "parity-6937.log": "85af47822694ec884dd83255e3e0b1bb9aaf2994ae841e58800662c8ed55d96c",
+    "postrun-identity.txt": "9175057d4f5374545484492586f1973863b4356c5c1a9cd9539455033b55f697",
+    "python-6937.log": "4c4cd8206b0deb47fdc9a9d2a6c354d6d6c9f5f4dd0673b79d8ca7dd6ee10106",
+    "rust-6936.log": "5dc25bb97974f071f9c325f60caf5c18d16cf6a4306a9e427ea72e7a21c230e9",
+    "rust-remaining-6937.log": "e643147628e88bf804ed1be6ad2f159f0959c9117f701e810ae4b8af04307131",
+    "source-retry.json": "82d90a3b892e66ff16f603db4e2dcf55fb2b498fa3f2ab3423e38c6084c4c688",
+    "source.json": "279b91dc1b21b0e02fa6f052f6c5f142d2ea5e1b3d7864025ac8a6e23f72547c",
+    "validate-retry.sbatch": "d6f37caa9e5e7176a53bbc6160c084f7f79b336f5db8e32c6e52fd9c94fcee60",
+    "validate.sbatch": "b16778c2eaaf9970e57d38664cdd4df4de1379060970acd81f4b8cbb380425b6"
+  }
+}

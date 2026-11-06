@@ -124,7 +124,7 @@ impl PyQuablaCompiler {
         &self,
         py: Python<'_>,
         function: &Bound<'_, PyAny>,
-        input_specs: Vec<TensorInputSpec>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] input_specs: Vec<TensorInputSpec>,
     ) -> PyResult<PyQuablaProgram> {
         trace_tensor(py, function, input_specs).map(PyQuablaProgram::single)
     }

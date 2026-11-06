@@ -1899,7 +1899,9 @@ impl DynamicTensor {
         {
             return Err(format!(
                 "invalid slice [{start}..{}) on axis {axis} for shape {:?}",
-                start + length,
+                start
+                    .checked_add(length)
+                    .map_or_else(|| "overflow".to_string(), |end| end.to_string()),
                 self.shape
             ));
         }
@@ -7066,7 +7068,9 @@ impl TensorIr {
         {
             return Err(format!(
                 "invalid slice [{start}..{}) on axis {axis} for shape {input_shape:?}",
-                start + length
+                start
+                    .checked_add(length)
+                    .map_or_else(|| "overflow".to_string(), |end| end.to_string())
             ));
         }
         let mut shape = input_shape;
@@ -8097,6 +8101,8 @@ impl TensorIr {
     /// Appends an op whose dtype is that of its value operands (already
     /// coerced to one dtype); it is weak only when every value operand is.
     fn push_derived(&mut self, op: TensorOp, shape: Vec<usize>) -> Result<TensorNodeId, String> {
+        // Shape inference can overflow even when each operand shape is valid.
+        element_count(&shape)?;
         let operands = tensor_value_operands(&op);
         let first = *operands.first().ok_or_else(|| {
             format!(
@@ -11867,6 +11873,7 @@ impl TensorScanExecutionPlan {
                 .get(1)
                 .ok_or_else(|| "scan body output is missing".to_string())?,
         );
+        element_count(&shape)?;
         Ok(shape)
     }
 
@@ -15312,11 +15319,16 @@ fn element_count(shape: &[usize]) -> Result<usize, String> {
     if shape.contains(&0) {
         return Err("tensor extents must be greater than zero".to_string());
     }
-    shape.iter().try_fold(1usize, |count, extent| {
+    let count = shape.iter().try_fold(1usize, |count, extent| {
         count
             .checked_mul(*extent)
             .ok_or_else(|| "tensor element count overflows usize".to_string())
-    })
+    })?;
+    // CPU evaluation and dtype conversions require addressable F64 workspace.
+    if count > isize::MAX as usize / std::mem::size_of::<f64>() {
+        return Err("tensor allocation size exceeds addressable memory".to_string());
+    }
+    Ok(count)
 }
 
 fn concat_shape(shapes: &[&[usize]], axis: usize) -> Result<Vec<usize>, String> {

@@ -1,0 +1,6 @@
+81037711bcb754b3958f48c137f48959819ba993a11a534834f9d652779546ae  python/quabla/_quabla.cpython-313-x86_64-linux-gnu.so
+279b91dc1b21b0e02fa6f052f6c5f142d2ea5e1b3d7864025ac8a6e23f72547c  docs/benchmarks/v103-lab-2gpu-20261107-01/source.json
+82d90a3b892e66ff16f603db4e2dcf55fb2b498fa3f2ab3423e38c6084c4c688  docs/benchmarks/v103-lab-2gpu-20261107-01/source-retry.json
+maturin==1.16.0
+numpy==2.5.4
+-e file:///home/junyi/quabla-v103-validation-20261107

@@ -1,5 +1,7 @@
 // Every unsafe block and impl must document its soundness invariant.
 #![warn(clippy::undocumented_unsafe_blocks)]
+// Public input failures must be returned; test assertions remain unrestricted.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::panic))]
 
 pub mod autodiff;
 pub mod compiler;

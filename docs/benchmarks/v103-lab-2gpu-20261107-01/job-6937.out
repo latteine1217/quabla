@@ -1,0 +1,37 @@
+job=6937 node=acmt20 started=2026-11-06T17:25:00+00:00
+Fri Nov  6 17:25:00 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 560.35.05              Driver Version: 560.35.05      CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3090        On  |   00000000:3B:00.0 Off |                  N/A |
+| 30%   31C    P8             19W /  250W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 3090        On  |   00000000:AF:00.0 Off |                  N/A |
+| 33%   27C    P8             20W /  250W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+cargo 1.98.1 (797e8a9bc 2026-08-05)
+rustc 1.98.1 (48a229cea 2026-09-01)
+uv 0.9.26
+loader passed: libpython3.13.so.1.0
+loader passed: libcuda.so.1
+loader passed: libnvrtc.so.12
+loader passed: libnccl.so
+source manifest passed: 127 files
+3.13.11 (main, Jan 14 2026, 19:38:04) [Clang 21.1.4 ]
+✏️ Setting installed package as editable
+{"status": "passed", "job_id": "6937", "source_files": 127, "extension_path": "/home/junyi/quabla-v103-validation-20261107/python/quabla/_quabla.cpython-313-x86_64-linux-gnu.so", "extension_sha256": "81037711bcb754b3958f48c137f48959819ba993a11a534834f9d652779546ae"}
+stage=passed exit_code=0

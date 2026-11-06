@@ -107,6 +107,22 @@ non-zero when any suite failed. CI runs it on Python 3.10 to 3.14, the
 versions the classifiers in `pyproject.toml` list, and the wheel build runs
 it against every wheel it builds (`tests/python/check_wheels.sh`).
 
+The robustness suites use fixed seeds and bounded case counts, with scalar
+and Cartesian-coordinate oracles independent of the tensor evaluator. Failures
+report their seed/case for replay. `test_robustness_api.py` puts stack-exhaustion
+and nontermination regressions in subprocesses with timeouts; neither suite
+catches `BaseException`, so a leaked PyO3 panic fails the run. The production
+core and bindings also deny Clippy's `unwrap_used` and `panic` lints. Keep
+internal assertions that protect unsafe invariants; validate user inputs before
+they reach those assertions.
+
+PyO3 vector arguments use `safe_extract::vec` or `optional_vec` through
+`from_py_with`; nested input specifications must use checked extraction too.
+Do not delegate an untrusted length directly to PyO3's generic `Vec`
+conversion or `Vec::with_capacity`. The extractor preserves the sequence
+protocol, including finite unsized sequences, and returns allocation failures
+as ordinary Python errors.
+
 GPU runtime suites are opt-in through environment variables and need the
 matching hardware, so CI does not run them. A gate is on exactly when its
 variable is `1`; any other value, `0` included, leaves it off. The Python

@@ -10,7 +10,7 @@ name = "quabla"
 # Taken from crates/quabla-python/Cargo.toml by maturin, so the package
 # metadata and the extension's `__version__` cannot disagree.
 dynamic = ["version"]
-description = "Rust-backed SciML runtime experiment exposed to Python"
+description = "Differentiable scientific computing in Python, powered by Rust"
 readme = "README.md"
 requires-python = ">=3.10"
 # PEP 639 license expression; License :: classifiers must not be combined with it.
@@ -47,6 +47,7 @@ classifiers = [
 ]
 
 [project.urls]
+Documentation = "https://latteine1217.github.io/quabla/guide/"
 Homepage = "https://github.com/latteine1217/quabla"
 Repository = "https://github.com/latteine1217/quabla"
 Issues = "https://github.com/latteine1217/quabla/issues"

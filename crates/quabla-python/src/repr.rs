@@ -79,13 +79,24 @@ fn collect_printed(
     base: usize,
     out: &mut Vec<usize>,
 ) {
-    if axis == shape.len() {
-        out.push(base);
-        return;
+    // Explicit work keeps valid high-rank tensors off the native call stack.
+    let mut strides = vec![1; shape.len()];
+    for axis in (1..shape.len()).rev() {
+        strides[axis - 1] = strides[axis] * shape[axis];
     }
-    let stride = shape[axis + 1..].iter().product::<usize>();
-    for position in axis_positions(shape[axis], summarize).into_iter().flatten() {
-        collect_printed(shape, summarize, axis + 1, base + position * stride, out);
+    let mut pending = vec![(axis, base)];
+    while let Some((axis, base)) = pending.pop() {
+        if axis == shape.len() {
+            out.push(base);
+            continue;
+        }
+        for position in axis_positions(shape[axis], summarize)
+            .into_iter()
+            .rev()
+            .flatten()
+        {
+            pending.push((axis + 1, base + position * strides[axis]));
+        }
     }
 }
 
@@ -98,39 +109,68 @@ fn render(
     column: usize,
     items: &mut impl Iterator<Item = String>,
 ) -> String {
-    if axis == shape.len() {
-        return items
-            .next()
-            .expect("one formatted item per printed element");
+    enum Part {
+        Array(usize, usize),
+        Separator(usize, usize),
+        Ellipsis,
+        Close,
     }
-    let positions = axis_positions(shape[axis], summarize);
-    if axis + 1 == shape.len() {
-        let words = positions
-            .iter()
-            .map(|position| match position {
-                Some(_) => items
+    let mut out = String::new();
+    let mut pending = vec![Part::Array(axis, column)];
+    while let Some(part) = pending.pop() {
+        let (axis, column) = match part {
+            Part::Array(axis, column) => (axis, column),
+            Part::Separator(lines, spaces) => {
+                out.push(',');
+                out.extend(std::iter::repeat_n('\n', lines));
+                out.extend(std::iter::repeat_n(' ', spaces));
+                continue;
+            }
+            Part::Ellipsis => {
+                out.push_str("...");
+                continue;
+            }
+            Part::Close => {
+                out.push(']');
+                continue;
+            }
+        };
+        if axis == shape.len() {
+            out.push_str(
+                &items
                     .next()
                     .expect("one formatted item per printed element"),
-                None => "...".to_string(),
-            })
-            .collect::<Vec<_>>();
-        return wrap_row(&words, column);
+            );
+            continue;
+        }
+        let positions = axis_positions(shape[axis], summarize);
+        if axis + 1 == shape.len() {
+            let words = positions
+                .iter()
+                .map(|position| match position {
+                    Some(_) => items
+                        .next()
+                        .expect("one formatted item per printed element"),
+                    None => "...".to_string(),
+                })
+                .collect::<Vec<_>>();
+            out.push_str(&wrap_row(&words, column));
+            continue;
+        }
+        out.push('[');
+        pending.push(Part::Close);
+        for (index, position) in positions.into_iter().enumerate().rev() {
+            pending.push(match position {
+                Some(_) => Part::Array(axis + 1, column + 1),
+                None => Part::Ellipsis,
+            });
+            if index > 0 {
+                // One newline between rows, plus one blank line per further axis.
+                pending.push(Part::Separator(shape.len() - axis - 1, column + 1));
+            }
+        }
     }
-    // One newline between rows, plus one blank line per further axis, as
-    // in NumPy.
-    let separator = format!(
-        ",{}{}",
-        "\n".repeat(shape.len() - axis - 1),
-        " ".repeat(column + 1)
-    );
-    let children = positions
-        .iter()
-        .map(|position| match position {
-            Some(_) => render(shape, summarize, axis + 1, column + 1, items),
-            None => "...".to_string(),
-        })
-        .collect::<Vec<_>>();
-    format!("[{}]", children.join(&separator))
+    out
 }
 
 /// `[a, b, ...]`, wrapped so no line passes `LINE_WIDTH`; continuation lines

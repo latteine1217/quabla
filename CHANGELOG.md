@@ -8,6 +8,42 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-11-07
+
+### Added
+
+- Bounded property tests with four fixed seeds and 480 generated cases for
+  broadcasting, shape inference, indexing/gather, transposition, nested-list
+  roundtrips, tracing and analytical gradients. They use standard-library
+  oracles and run in the existing Python CI and wheel suites without NumPy.
+  Isolated-process regressions detect native crashes and nontermination.
+- Production core and Python bindings reject new direct `unwrap()` and
+  `panic!()` calls through Clippy. Internal invariant assertions remain
+  documented rather than hidden behind a blanket panic handler.
+
+### Fixed
+
+- Tensor display, nested-list construction and `tolist()` use iterative
+  traversal, preventing native stack exhaustion on valid high-rank inputs.
+  Nested traversal keeps only the active path, without another flat array
+  of Python scalar objects.
+- Cyclic nested sequences raise `ValueError`; list/tuple subclass iterators
+  must agree with their reported shape instead of being consumed indefinitely.
+- Unaddressable tensor sizes are rejected before F64 allocation, including
+  factories, random keys and nested construction. Derived shapes are checked
+  before entering the graph, including stacked Scan outputs, preventing
+  overflow in shape inference.
+- Python sequence arguments use checked, fallible extraction before PyO3 can
+  reserve an overflowing length. Consistent sized sequences and finite
+  `__getitem__` sequences without `__len__` remain accepted. Concatenation,
+  stacking, nested input specifications and unrolled Scan use the same
+  allocation checks.
+- `arange` rejects a nonadvancing floating-point step and unaddressable
+  cardinality. A short range is still accepted when only `stop - start`
+  overflows. Successful range values retain their original evaluation order.
+- Formatting an invalid Rust tensor slice no longer overflows while reporting
+  its error. Missing trace bindings/frames propagate errors instead of panicking.
+
 ## [1.0.2] - 2026-10-25
 
 The second patch of the v1.0.x plan in `docs/jax_like_roadmap.md`: the
@@ -1066,7 +1102,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v1.0.3...HEAD
+[1.0.3]: https://github.com/latteine1217/quabla/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/latteine1217/quabla/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/latteine1217/quabla/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/latteine1217/quabla/compare/v0.7.1...v1.0.0

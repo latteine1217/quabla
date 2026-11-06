@@ -47,17 +47,27 @@ impl<'a, 'py> FromPyObject<'a, 'py> for TensorInputSpec {
     type Error = PyErr;
 
     fn extract(spec: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
-        if let Ok((name, shape)) = spec.extract::<(String, Vec<usize>)>() {
-            return Ok(Self::new(name, shape, TensorDType::F64));
+        let invalid = || {
+            PyTypeError::new_err(
+            "tensor input spec must be (name, shape) or (name, shape, dtype) with a quabla dtype",
+        )
+        };
+        let tuple = spec.cast::<PyTuple>().map_err(|_| invalid())?;
+        if !(2..=3).contains(&tuple.len()) {
+            return Err(invalid());
         }
-        let (name, shape, dtype) = spec
-            .extract::<(String, Vec<usize>, PyDType)>()
-            .map_err(|_| {
-                PyTypeError::new_err(
-                    "tensor input spec must be (name, shape) or (name, shape, dtype) with a quabla dtype",
-                )
-            })?;
-        Ok(Self::new(name, shape, dtype.dtype))
+        let name = tuple.get_item(0)?.extract().map_err(|_| invalid())?;
+        let shape = crate::safe_extract::vec(&tuple.get_item(1)?).map_err(|_| invalid())?;
+        let dtype = if tuple.len() == 3 {
+            tuple
+                .get_item(2)?
+                .extract::<PyDType>()
+                .map_err(|_| invalid())?
+                .dtype
+        } else {
+            TensorDType::F64
+        };
+        Ok(Self::new(name, shape, dtype))
     }
 }
 
@@ -90,7 +100,7 @@ fn extract_reduction_axes(axis: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Ve
     if let Ok(axis) = axis.extract::<isize>() {
         return Ok(Some(vec![axis]));
     }
-    axis.extract::<Vec<isize>>().map(Some).map_err(|_| {
+    crate::safe_extract::vec(axis).map(Some).map_err(|_| {
         PyTypeError::new_err("axis must be None, an integer, or a sequence of integers")
     })
 }
@@ -539,7 +549,7 @@ impl TensorTraceGraph {
                 InlineBinding::Traced(_) => {
                     traced
                         .next()
-                        .expect("one lifted tracer per traced binding")
+                        .ok_or_else(|| "inlined traced binding is missing".to_string())?
                         .node_id
                 }
                 InlineBinding::Scalar(value) => {
@@ -882,7 +892,9 @@ impl TensorTraceGraph {
                 Some(frame) if Arc::ptr_eq(&frame.graph.ir, &self.ir) => {}
                 _ => return Err("this graph is not the innermost trace in progress".to_string()),
             }
-            let frame = frames.pop().expect("the innermost frame was just checked");
+            let frame = frames
+                .pop()
+                .ok_or_else(|| "the innermost trace frame is missing".to_string())?;
             Ok(frame
                 .captures
                 .into_iter()
@@ -2312,7 +2324,7 @@ impl TensorTraceGraph {
     fn input(
         &self,
         name: &str,
-        shape: Option<Vec<usize>>,
+        #[pyo3(from_py_with = crate::safe_extract::optional_vec)] shape: Option<Vec<usize>>,
         dtype: Option<PyDType>,
     ) -> PyResult<TraceTensor> {
         match (shape, dtype) {
@@ -2332,9 +2344,9 @@ impl TensorTraceGraph {
     #[pyo3(name = "_symbolic_vjp")]
     fn py_symbolic_vjp(
         &self,
-        outputs: Vec<TraceTensor>,
-        cotangent_names: Vec<Option<String>>,
-        retained: Vec<TraceTensor>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] outputs: Vec<TraceTensor>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] cotangent_names: Vec<Option<String>>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] retained: Vec<TraceTensor>,
     ) -> PyResult<StagedVjp> {
         if outputs.len() != cotangent_names.len() {
             return Err(PyValueError::new_err(format!(
@@ -2361,7 +2373,7 @@ impl TensorTraceGraph {
     #[pyo3(name = "_symbolic_jvp")]
     fn py_symbolic_jvp(
         &self,
-        outputs: Vec<TraceTensor>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] outputs: Vec<TraceTensor>,
         tangent_inputs: BTreeMap<String, String>,
     ) -> PyResult<StagedJvp> {
         self.symbolic_jvp_many(&outputs, &tangent_inputs)
@@ -2372,8 +2384,8 @@ impl TensorTraceGraph {
     #[pyo3(name = "_compile_cpu")]
     fn py_compile_cpu(
         &self,
-        outputs: Vec<TraceTensor>,
-        input_names: Vec<String>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] outputs: Vec<TraceTensor>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] input_names: Vec<String>,
     ) -> PyResult<StagedExecutable> {
         self.compile_cpu_many(&outputs, input_names)
             .map_err(PyValueError::new_err)
@@ -2389,8 +2401,8 @@ impl TensorTraceGraph {
     fn py_compile_target(
         &self,
         py: Python<'_>,
-        outputs: Vec<TraceTensor>,
-        input_names: Vec<String>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] outputs: Vec<TraceTensor>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] input_names: Vec<String>,
         target: &str,
         device_ordinal: usize,
         precision: Option<&str>,
@@ -2439,7 +2451,7 @@ impl TensorTraceGraph {
     #[pyo3(name = "_as_program")]
     fn py_as_program(
         &self,
-        outputs: Vec<TraceTensor>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] outputs: Vec<TraceTensor>,
     ) -> PyResult<crate::compiler::PyQuablaProgram> {
         self.ensure_owns(&outputs.iter().collect::<Vec<_>>())
             .map_err(PyValueError::new_err)?;
@@ -2452,9 +2464,9 @@ impl TensorTraceGraph {
     fn py_inline(
         &self,
         py: Python<'_>,
-        input_names: Vec<String>,
-        bindings: Vec<Bound<'_, PyAny>>,
-        outputs: Vec<TraceTensor>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] input_names: Vec<String>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] bindings: Vec<Bound<'_, PyAny>>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] outputs: Vec<TraceTensor>,
     ) -> PyResult<Vec<TraceTensor>> {
         let bindings = bindings
             .iter()
@@ -2499,9 +2511,9 @@ impl TensorTraceGraph {
         &self,
         py: Python<'_>,
         rule: PyRef<'_, PyCustomRule>,
-        input_names: Vec<String>,
-        bindings: Vec<Bound<'_, PyAny>>,
-        outputs: Vec<TraceTensor>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] input_names: Vec<String>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] bindings: Vec<Bound<'_, PyAny>>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] outputs: Vec<TraceTensor>,
     ) -> PyResult<Vec<TraceTensor>> {
         let bindings = bindings
             .iter()
@@ -2566,18 +2578,18 @@ impl TensorTraceGraph {
     fn py_custom_rule(
         name: String,
         forward: PyRef<'_, TensorTraceGraph>,
-        operand_names: Vec<String>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] operand_names: Vec<String>,
         output_count: usize,
-        forward_outputs: Vec<TraceTensor>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] forward_outputs: Vec<TraceTensor>,
         backward: PyRef<'_, TensorTraceGraph>,
-        residual_names: Vec<String>,
-        cotangent_names: Vec<String>,
-        backward_outputs: Vec<Option<TraceTensor>>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] residual_names: Vec<String>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] cotangent_names: Vec<String>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] backward_outputs: Vec<Option<TraceTensor>>,
         tangent: Option<PyRef<'_, TensorTraceGraph>>,
-        tangent_names: Vec<Option<String>>,
-        tangent_outputs: Vec<TraceTensor>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] tangent_names: Vec<Option<String>>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] tangent_outputs: Vec<TraceTensor>,
         rematerialize: bool,
-        output_names: Vec<String>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] output_names: Vec<String>,
         prefer_reverse: Option<bool>,
     ) -> PyResult<PyCustomRule> {
         let snapshot = |graph: &TensorTraceGraph, tensors: &[&TraceTensor]| {
@@ -2677,11 +2689,11 @@ impl TensorTraceGraph {
     fn py_inline_batched(
         &self,
         py: Python<'_>,
-        input_names: Vec<String>,
-        bindings: Vec<TraceTensor>,
-        mapped: Vec<bool>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] input_names: Vec<String>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] bindings: Vec<TraceTensor>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] mapped: Vec<bool>,
         batch_size: usize,
-        outputs: Vec<TraceTensor>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] outputs: Vec<TraceTensor>,
     ) -> PyResult<Vec<(TraceTensor, bool)>> {
         self.inline_batched_into(&input_names, &bindings, &mapped, batch_size, &outputs)
             .map_err(|error| match &error {
@@ -2766,7 +2778,10 @@ impl StagedExecutable {
         self.executable.plan().node_count()
     }
 
-    fn __call__(&self, inputs: Vec<PyRef<'_, PyTensor>>) -> PyResult<Vec<PyTensor>> {
+    fn __call__(
+        &self,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] inputs: Vec<PyRef<'_, PyTensor>>,
+    ) -> PyResult<Vec<PyTensor>> {
         let inputs = inputs
             .iter()
             .map(|tensor| tensor.to_dynamic_tensor())
@@ -3224,7 +3239,10 @@ impl TraceTensor {
         }
     }
 
-    fn broadcast_to(&self, shape: Vec<usize>) -> PyResult<Self> {
+    fn broadcast_to(
+        &self,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] shape: Vec<usize>,
+    ) -> PyResult<Self> {
         self.broadcast_to_tensor(shape)
             .map_err(PyValueError::new_err)
     }
@@ -3290,7 +3308,10 @@ impl TraceTensor {
     }
 
     #[pyo3(signature = (axes = None))]
-    fn transpose(&self, axes: Option<Vec<isize>>) -> PyResult<Self> {
+    fn transpose(
+        &self,
+        #[pyo3(from_py_with = crate::safe_extract::optional_vec)] axes: Option<Vec<isize>>,
+    ) -> PyResult<Self> {
         self.transpose_tensor(axes).map_err(PyValueError::new_err)
     }
 
@@ -3697,7 +3718,7 @@ pub fn tensor_cond(
     predicate: TraceTensor,
     on_true: &Bound<'_, PyAny>,
     on_false: &Bound<'_, PyAny>,
-    operands: Vec<TraceTensor>,
+    #[pyo3(from_py_with = crate::safe_extract::vec)] operands: Vec<TraceTensor>,
 ) -> PyResult<TraceTensor> {
     if !predicate.shape.is_empty() {
         return Err(PyValueError::new_err(format!(
@@ -3840,7 +3861,7 @@ pub fn tensor_fori_loop_region(
     upper: usize,
     body: &Bound<'_, PyAny>,
     init: TraceTensor,
-    operands: Vec<TraceTensor>,
+    #[pyo3(from_py_with = crate::safe_extract::vec)] operands: Vec<TraceTensor>,
 ) -> PyResult<TraceTensor> {
     if upper < lower {
         return Err(PyValueError::new_err(format!(
@@ -4053,7 +4074,7 @@ pub fn tensor_while_loop_region(
     cond: &Bound<'_, PyAny>,
     body: &Bound<'_, PyAny>,
     init: TraceTensor,
-    operands: Vec<TraceTensor>,
+    #[pyo3(from_py_with = crate::safe_extract::vec)] operands: Vec<TraceTensor>,
 ) -> PyResult<TraceTensor> {
     if init.batch_axis.is_some() || operands.iter().any(|operand| operand.batch_axis.is_some()) {
         return Err(PyValueError::new_err(
@@ -4121,7 +4142,7 @@ pub fn tensor_scan_region(
     upper: usize,
     body: &Bound<'_, PyAny>,
     init: TraceTensor,
-    operands: Vec<TraceTensor>,
+    #[pyo3(from_py_with = crate::safe_extract::vec)] operands: Vec<TraceTensor>,
 ) -> PyResult<Py<PyTuple>> {
     if upper <= lower {
         return Err(PyValueError::new_err(format!(
@@ -4329,7 +4350,7 @@ pub fn tensor_scan(
     let graph = init.graph.clone();
     let carry_shape = init.shape.clone();
     let mut carry = init;
-    let mut outputs = Vec::with_capacity(length);
+    let mut outputs = crate::safe_extract::buffer(length)?;
     let mut output_shape = None;
     for index in 0..length {
         let argument = Py::new(py, carry.clone())?;
@@ -4492,10 +4513,10 @@ fn build_cuda_scalar_value_and_grad_program(
 pub fn tensor_value_and_grad_data_parallel_cuda_fn(
     py: Python<'_>,
     function: &Bound<'_, PyAny>,
-    input_specs: Vec<TensorInputSpec>,
-    parameter_names: Vec<String>,
-    mapped_input_names: Vec<String>,
-    device_ordinals: Vec<usize>,
+    #[pyo3(from_py_with = crate::safe_extract::vec)] input_specs: Vec<TensorInputSpec>,
+    #[pyo3(from_py_with = crate::safe_extract::vec)] parameter_names: Vec<String>,
+    #[pyo3(from_py_with = crate::safe_extract::vec)] mapped_input_names: Vec<String>,
+    #[pyo3(from_py_with = crate::safe_extract::vec)] device_ordinals: Vec<usize>,
     reduction: &str,
 ) -> PyResult<TensorCudaDataParallelValueAndGradFunction> {
     if input_specs
@@ -4832,9 +4853,9 @@ fn compile_mlx_scalar_value_and_grad(
 #[allow(clippy::too_many_arguments)]
 pub fn mlx_trainer_optimizer(
     loss: &Bound<'_, PyAny>,
-    parameter_names: Vec<String>,
+    #[pyo3(from_py_with = crate::safe_extract::vec)] parameter_names: Vec<String>,
     inputs: &Bound<'_, PyDict>,
-    retained_input_names: Vec<String>,
+    #[pyo3(from_py_with = crate::safe_extract::vec)] retained_input_names: Vec<String>,
     optimizer: &str,
     learning_rate: f64,
     beta1: f64,
@@ -5112,9 +5133,9 @@ impl TensorCudaAdamOptimizer {
 pub fn cuda_trainer_optimizer(
     py: Python<'_>,
     loss: &Bound<'_, PyAny>,
-    parameter_names: Vec<String>,
+    #[pyo3(from_py_with = crate::safe_extract::vec)] parameter_names: Vec<String>,
     inputs: &Bound<'_, PyDict>,
-    retained_input_names: Vec<String>,
+    #[pyo3(from_py_with = crate::safe_extract::vec)] retained_input_names: Vec<String>,
     optimizer: &str,
     learning_rate: f64,
     beta1: f64,

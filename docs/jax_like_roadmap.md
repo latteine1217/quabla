@@ -13,8 +13,10 @@ platforms researchers use, not an enterprise support commitment.
 
 v1.0.1 (2026-10-22) ships items 4, 8, and 10. v1.0.2 (2026-10-25) ships
 items 1, 3, and 7 and the dependency audit of item 6; item 3, then a
-proposal, joined it (owner, 2026-10-25). Items 2 and 5 and the rest of item
-6 remain for the later 1.0.x releases, and item 11 stays deferred.
+proposal, joined it (owner, 2026-10-25). The unreleased 1.0.3 candidate
+implements item 5 and the bounded property tests of item 6; its audit and
+validation scope are recorded below. Item 2, coverage and the performance
+gate remain open, and item 11 stays deferred.
 
 Order of the remaining items (owner, 2026-10-25), ranked by how visible the
 gap is to users, its cost, and what it depends on:
@@ -32,8 +34,8 @@ gap is to users, its cost, and what it depends on:
 | 2 | Automated GPU validation: a release gate that runs the CUDA suites (`QUABLA_CUDA_TEST=1`), the NCCL suites on two GPUs, and the MLX suites on every release candidate, on stated CUDA/NVRTC versions, driver minimums, and compute capabilities (the NVRTC 12.6 `atomicAdd(double)` miss of v0.3 shows one host is not enough). Today CUDA is validated by hand on one GTX 1660 SUPER, and the two-GPU run was skipped for v1.0 | Open |
 | 3 | CI Python matrix matching the classifiers (3.10 to 3.14; CI runs 3.10 only), and the full suites on the built wheels. Not named by the owner; proposed for 1.0.x | Done in 1.0.2: CI builds the extension for and runs every suite on 3.10 to 3.14 in the gates job; the wheel build runs every suite against each wheel it builds (five CPythons on Linux x86_64, Linux aarch64, macOS, and `quabla-mlx`) and the sdist; `tests/python/run_suites.sh` replaces the per-suite lists. Hosted runners keep the GPU gates off |
 | 4 | No silent precision change: a `float64` program runs in `float64` and a `float32` program in `float32`; where a device cannot honour a dtype it raises instead of converting. 1.0.0 ran `float64` programs as `float32` on CUDA (with a `UserWarning` unless `precision="float64"`) and always on MLX | Done in 1.0.1: CUDA runs each program in its dtype and rejects a mix; MLX rejects `float64` programs; weak constants and the `jacobian` basis follow the program's dtype |
-| 5 | Panic audit of the Python/Rust boundary: no user input may reach a Rust `panic!`, `unwrap`, or `expect` (a raw count of non-test `src` finds about 240 `unwrap()`, 37 `expect(`, 23 `panic!`/`unreachable!`, inline test modules included), and every `unsafe` block keeps its `SAFETY` invariant (77 blocks) | Open |
-| 6 | Quality checks CI lacks: dependency audit (`cargo deny` or `cargo audit`), coverage measurement, a performance regression gate for the benchmarks, and property-based or fuzz tests of tracing, shape inference, and indexing | Dependency audit done in 1.0.2: `cargo deny` (`deny.toml`) checks advisories, licenses, wildcards, and sources for the Linux and macOS trees with every feature, on every push and pull request and weekly; `BSD-3-Clause` and `ISC` are allowed and RUSTSEC-2024-0436 (unmaintained `paste` via `mlx-rs`) is ignored (owner, 2026-10-25). Coverage, the performance gate, and property-based or fuzz tests remain open |
+| 5 | Audit user-input paths at the Python/Rust boundary, separate checked internal invariants from user errors, and review the bounds, ownership and `SAFETY` contracts of unsafe code | Implemented and verified for the unreleased 1.0.3 candidate: native recursion and nontermination regressions, checked Python sequence extraction, capacity/derived-shape checks, trace-frame error propagation, production panic/unwrap Clippy guards, and the invariant audit below. CPU, MLX, single-GPU CUDA and current-source two-GPU NCCL validation pass. No release has been published. |
+| 6 | Quality checks CI lacks: dependency audit (`cargo deny` or `cargo audit`), coverage measurement, a performance regression gate for the benchmarks, and property-based or fuzz tests of tracing, shape inference, and indexing | Dependency audit done in 1.0.2. The unreleased 1.0.3 candidate adds 480 bounded generated cases with four fixed seeds, independent standard-library oracles, invalid-trace cleanup checks, and subprocess crash/timeout regressions. The existing CI/wheel suite runner picks them up automatically. Coverage and the performance gate remain open for 1.0.4. |
 | 7 | A declared MSRV (`rust-version`) checked in CI | Done in 1.0.2: Rust 1.88 (the floor of `libloading`, which the CUDA backend needs), raised only in minor releases (owner, 2026-10-25); CI checks the default, CUDA/NCCL, and MLX builds with it, and resolver 3 keeps dependency updates within it |
 | 8 | Type annotations: the pure-Python modules are unannotated and most extension declarations in `_quabla.pyi` are `Any`; annotate the public API and check it with a type checker in CI | Done in 1.0.1: public API annotated, pyright standard mode clean, gated in CI |
 | 10 | More platforms: Windows and Linux aarch64 wheels | Linux aarch64 done in 1.0.1 (its CUDA backend is unvalidated on Arm GPUs); Windows deferred by the owner (WSL covers it) |
@@ -58,6 +60,104 @@ Decisions:
   be small, but CUDA on Windows is not (about 30 `target_os = "linux"`
   gates, Linux library names, no NCCL, no Windows GPU host), and WSL runs
   the Linux wheels.
+
+### 1.0.3 boundary audit and candidate verification (2026-11-06)
+
+Release preparation (2026-11-07): version metadata and release notes are ready;
+release CI, wheel/sdist acceptance and publication remain pending.
+
+The implementation is recorded under `CHANGELOG.md`'s 1.0.3 section. Runtime
+validation used the candidate's 1.0.2 package metadata; release preparation
+updates all crate versions to 1.0.3 without changing runtime code. It preserves public
+signatures, dtype policy and successful numerical evaluation order. User inputs
+that previously crashed, overflowed or never advanced now return ordinary
+Python errors. CPU workspace capacity is bounded by `isize::MAX / size_of::<f64>()`
+before materialization; this is an addressability check, not a guarantee that
+every addressable allocation fits available RAM.
+
+The source audit parses Rust syntax and excludes test-only items rather than
+treating the many test assertions as public-input failures. No production
+`unwrap()` or explicit `panic!()` remains in the parsed core/bindings sources.
+Clippy denies their introduction in non-test builds. Retained `expect`,
+`unreachable` and assertions have the following contracts:
+
+| Boundary | Input validation / retained invariant |
+| --- | --- |
+| Eager construction and interop (`tensor.rs`, `interop.rs`, `safe_extract.rs`) | Element counts and addressable F64 workspace are checked before allocation. All 54 vector parameters in PyO3 bindings use checked extraction; nested input specifications do too. Sized iterators must match their declared length; finite unsized sequences retain the old sequence-protocol support. Nested sequence inference detects cycles. `tolist()` and repr use explicit traversal state, avoiding native stack exhaustion without another flat array of Python objects. |
+| Tracing and shape inference (`tensor_trace.rs`, `tensor_ir.rs`) | Missing lifted bindings and trace frames return errors. Each derived shape is checked before insertion. Node fields are private and builder operands refer only to existing nodes, preserving the acyclic plan/remapping invariant. Higher-order Cholesky expansion runs before the matches that retain unreachable-arm assertions. |
+| CPU execution and fusion (`tensor_ir.rs`, `fusion.rs`) | Inputs are checked for shape/dtype and missing values before reads or storage reuse. Fusion resolves its input slots first; only F64 contiguous inputs become direct slices. Register destinations are assigned independently of instruction sources. Keep the frame bounds and lane-length assertions next to raw pointer access; removing them would weaken the safety contract. |
+| Buffer export (`interop.rs`, `tensor.rs`) | The immutable tensor's storage matches its dtype and shape. Each export owns an Arc pin, exports read-only data, and retains its shape/stride vectors until CPython releases the buffer. `fill_buffer` rejects invalid pointers and writable/unsupported-layout requests; release consumes its owned internal handle once. |
+| Metal FFI (`mlx_cholesky.rs`, `mlx_linalg.rs`, `mlx_scatter.rs`) | Dimensions are converted with checked integer conversions, C statuses propagate errors, and RAII wrappers free owned handles. MLX retains input handles; extracted output handles have independent ownership. Execution remains serialized by the existing MLX lock. No Metal unsafe code was added by 1.0.3. |
+| CUDA/NCCL (`cuda.rs`, `cuda_real.rs`, `cuda_host_loop.rs`, `cuda_optimizer.rs`, `cuda_decompositions.rs`) | Device input lengths and launch/library dimensions are checked. The element trait is sealed to F32/F64. Retained cache/slot/optimizer assertions follow checked key selection or fallible initialization, which returns before use on failure. Graph-copy pointers retain their graph/context and same-context buffers; NCCL access remains mutex-protected and failed calls abort communicators. This source audit is separate from a two-GPU runtime pass. |
+| Rust-only helpers (`tensor.rs`, `models.rs`, `optim.rs`) | Their bounds and optimizer-parameter assertions are Rust API preconditions, not registered Python entry points. They are not removed to make a textual panic count smaller. |
+
+The one new unsafe block queries CPython's `PySequence_Check` with a live
+bound object in the attached interpreter. It does not dereference object
+storage or cast an unregistered sequence to an ABC; it preserves the check
+PyO3's original vector extraction used, including NumPy and finite unsized
+sequence protocols.
+
+The repaired cases are exercised by `tests/python/test_robustness_api.py` and
+`crates/quabla-core/tests/robustness.rs`. Native crash/hang cases run in child
+interpreters, so neither a process abort nor a leaked PyO3 `BaseException` can
+pass silently. `test_properties_api.py` runs 480 cases with seeds 103, 1701,
+65537 and 8675309, covering broadcasting, scalar-coordinate indexing/gather,
+transposition, generated elementwise traces, analytical gradients, invalid-trace
+cleanup and F64/F32/Bool nested roundtrips. The tests require no extra runtime
+dependency and are included by `tests/python/run_suites.sh` in CI and wheels.
+This is bounded property testing, not an exhaustive proof or a continuous fuzzing
+service.
+
+Verification passes 293 default Rust tests, 336 tests with MLX enabled and its
+runtime gate on, and 377 release CUDA workspace tests on GTX 1660 SUPER. All
+20 top-level Python suites pass on CPU (352 passes, 46 explicit skips), with Metal
+enabled (388 passes, 10 skips), and with CUDA enabled on Linux (391 passes,
+7 skips), including six subprocess/boundary regressions and four property
+tests. The Python tests run on macOS/Python 3.13 and Linux/Python 3.14.4;
+the wider supported-interpreter matrix remains the existing CI's job.
+Default/MLX/CUDA-NCCL all-target Clippy, fmt, Ruff, Pyright with the project
+interpreter (zero errors and warnings), and `cargo deny check` pass. Linux
+initially lacked NVRTC on its loader path; exposing the existing CUDA 13.1
+libraries fixed the environment and the complete gates were rerun. Initial
+failed and intermediate runs remain archived rather than counted as passing.
+The earlier summary counted the narrow-buffer child suite's four passes again,
+reporting 21 suite executions and four more passes per configuration. The
+counts above describe the 20 top-level suites; original logs and summary
+artifacts retain their historical values.
+
+The checked extractor was also tested against finite `range`, `__getitem__`
+sequences without `__len__`, and contradictory/endless sized iterators.
+The final remote source hashes match the local candidate, both native extension
+identities are recorded, and the AST check finds no unguarded vector parameter
+in the PyO3 bindings. Release automation and publication are not claimed.
+Raw logs, crash reproductions and
+source inventories remain in locally ignored `logs/v103-robustness-20261106/`;
+`verification.json` identifies the accepted `verified-*` logs and frozen source
+manifest. Other similarly named logs in that directory are intermediate runs.
+
+On 2026-11-07 the same candidate passed current-source two-GPU CUDA/NCCL
+validation on lab-server's two RTX 3090 GPUs (Slurm `r740`, node `acmt20`).
+Job 6936 completed the core tests but failed when Rust's Python test executable
+could not load the installed CPython library. Job 6937 added its library path,
+completed the remaining workspace/doc tests, and finished `COMPLETED`, exit
+`0:0`. Together the completed suites cover 381 distinct Rust tests/doc tests
+and all 20 top-level Python suites (391 passed, seven explicit skips); the
+three NCCL runtime tests were rerun serially with their gate on, without
+double-counting their first gated invocations. Both all-target CUDA/NCCL
+Clippy runs pass.
+
+F32 public API parity covers four shapes, sum/mean reductions and five updated
+parameter calls per case (40 calls). Maximum loss and gradient absolute errors
+are both `1.4901161193847656e-8`, below `1e-5`; F64 requests retain the explicit
+unsupported-operation error. The mixed sharding schedule, communicator failure
+and clone recovery, and 50 compile/execute/drop cycles pass. Final free device
+memory equals the warmed cycle-1 baseline on both GPUs (zero observed final
+drift, 64 MiB threshold). Source hashes match the previous candidate and the
+post-run native module hash matches the parity report. This is correctness
+and lifecycle evidence, not a training speedup measurement. No home-gpu work
+was performed for this run. Configuration, failed and completed attempt logs,
+accounting, identities and results are preserved under
+[`v103-lab-2gpu-20261107-01`](benchmarks/v103-lab-2gpu-20261107-01/README.md).
 
 ## v1.0 Plan (2026-10-14)
 

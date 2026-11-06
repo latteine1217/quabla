@@ -223,10 +223,10 @@ pub fn parse_reshape_args(args: &Bound<'_, PyTuple>, size: usize) -> PyResult<Ve
             let arg = args.get_item(0)?;
             match arg.extract::<isize>() {
                 Ok(extent) => vec![extent],
-                Err(_) => arg.extract::<Vec<isize>>().map_err(|_| invalid())?,
+                Err(_) => crate::safe_extract::vec(&arg).map_err(|_| invalid())?,
             }
         }
-        _ => args.extract::<Vec<isize>>().map_err(|_| invalid())?,
+        _ => crate::safe_extract::vec(args.as_any()).map_err(|_| invalid())?,
     };
     let mut inferred = None;
     let mut known = 1usize;
@@ -259,8 +259,7 @@ pub fn parse_reshape_args(args: &Bound<'_, PyTuple>, size: usize) -> PyResult<Ve
 }
 
 pub fn parse_axis_indices(indices: &Bound<'_, PyAny>, axis_extent: usize) -> PyResult<Vec<usize>> {
-    let indices = indices
-        .extract::<Vec<isize>>()
+    let indices = crate::safe_extract::vec::<isize>(indices)
         .map_err(|_| PyTypeError::new_err("indices must be a sequence of integers"))?;
     if indices.is_empty() {
         return Err(PyValueError::new_err(
@@ -306,16 +305,21 @@ pub(crate) fn extract_scalar(value: &Bound<'_, PyAny>) -> Option<f64> {
     value.extract::<f64>().ok()
 }
 
-fn element_count(shape: &[usize]) -> Result<usize, String> {
+pub(crate) fn element_count(shape: &[usize]) -> Result<usize, String> {
     if shape.contains(&0) {
         return Err("tensor extents must be greater than zero".to_string());
     }
 
-    shape.iter().try_fold(1usize, |count, extent| {
+    let count = shape.iter().try_fold(1usize, |count, extent| {
         count
             .checked_mul(*extent)
             .ok_or_else(|| "tensor element count overflows usize".to_string())
-    })
+    })?;
+    // Constructors and CPU kernels materialize F64 buffers, even for narrow outputs.
+    if count > isize::MAX as usize / std::mem::size_of::<f64>() {
+        return Err("tensor allocation size exceeds addressable memory".to_string());
+    }
+    Ok(count)
 }
 
 fn next_random_key(key: &mut u64) -> u64 {
@@ -367,7 +371,7 @@ fn extract_reduction_axes(axis: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Ve
     if let Ok(axis) = axis.extract::<isize>() {
         return Ok(Some(vec![axis]));
     }
-    axis.extract::<Vec<isize>>().map(Some).map_err(|_| {
+    crate::safe_extract::vec(axis).map(Some).map_err(|_| {
         PyTypeError::new_err("axis must be None, an integer, or a sequence of integers")
     })
 }
@@ -1352,13 +1356,17 @@ impl PyTensor {
     /// `dtype` defaults to `quabla.float64`; `quabla.float32` rounds `data`.
     #[new]
     #[pyo3(signature = (shape, data, dtype = None))]
-    fn py_new(shape: Vec<usize>, data: Vec<f64>, dtype: Option<PyDType>) -> PyResult<Self> {
+    fn py_new(
+        #[pyo3(from_py_with = crate::safe_extract::vec)] shape: Vec<usize>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] data: Vec<f64>,
+        dtype: Option<PyDType>,
+    ) -> PyResult<Self> {
         let dtype = dtype.map_or(TensorDType::F64, |dtype| dtype.dtype);
         Self::from_shape_data_typed(shape, data, dtype).map_err(PyValueError::new_err)
     }
 
     #[staticmethod]
-    fn zeros(shape: Vec<usize>) -> PyResult<Self> {
+    fn zeros(#[pyo3(from_py_with = crate::safe_extract::vec)] shape: Vec<usize>) -> PyResult<Self> {
         let size = element_count(&shape).map_err(PyValueError::new_err)?;
 
         Ok(Self {
@@ -1370,12 +1378,15 @@ impl PyTensor {
     }
 
     #[staticmethod]
-    fn ones(shape: Vec<usize>) -> PyResult<Self> {
+    fn ones(#[pyo3(from_py_with = crate::safe_extract::vec)] shape: Vec<usize>) -> PyResult<Self> {
         Self::full(shape, 1.0)
     }
 
     #[staticmethod]
-    fn full(shape: Vec<usize>, value: f64) -> PyResult<Self> {
+    fn full(
+        #[pyo3(from_py_with = crate::safe_extract::vec)] shape: Vec<usize>,
+        value: f64,
+    ) -> PyResult<Self> {
         let size = element_count(&shape).map_err(PyValueError::new_err)?;
         Ok(Self {
             shape,
@@ -1390,13 +1401,19 @@ impl PyTensor {
         if count == 0 {
             return Err(PyValueError::new_err("split_key count must be positive"));
         }
+        element_count(&[count]).map_err(PyValueError::new_err)?;
         let mut state = key;
         Ok((0..count).map(|_| next_random_key(&mut state)).collect())
     }
 
     #[staticmethod]
     #[pyo3(signature = (shape, key, mean = 0.0, stddev = 1.0))]
-    fn random_normal(shape: Vec<usize>, key: u64, mean: f64, stddev: f64) -> PyResult<Self> {
+    fn random_normal(
+        #[pyo3(from_py_with = crate::safe_extract::vec)] shape: Vec<usize>,
+        key: u64,
+        mean: f64,
+        stddev: f64,
+    ) -> PyResult<Self> {
         if !(mean.is_finite() && stddev.is_finite() && stddev >= 0.0) {
             return Err(PyValueError::new_err(
                 "random_normal mean must be finite and stddev must be finite and non-negative",
@@ -1411,7 +1428,10 @@ impl PyTensor {
     }
 
     #[staticmethod]
-    fn glorot_normal(shape: Vec<usize>, key: u64) -> PyResult<Self> {
+    fn glorot_normal(
+        #[pyo3(from_py_with = crate::safe_extract::vec)] shape: Vec<usize>,
+        key: u64,
+    ) -> PyResult<Self> {
         if shape.len() != 2 {
             return Err(PyValueError::new_err(format!(
                 "glorot_normal requires a rank-2 shape, got {:?}",
@@ -1434,7 +1454,7 @@ impl PyTensor {
     #[staticmethod]
     #[pyo3(signature = (shape, key, minval = 0.0, maxval = 1.0, dtype = None))]
     fn random_uniform(
-        shape: Vec<usize>,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] shape: Vec<usize>,
         key: u64,
         minval: f64,
         maxval: f64,
@@ -1513,17 +1533,43 @@ impl PyTensor {
                 "arange start, stop, and step do not define a non-empty range",
             ));
         }
+        if start + step == start {
+            return Err(PyValueError::new_err(
+                "arange step is too small to advance from start",
+            ));
+        }
+        let width = stop - start;
+        let estimated_count = if width.is_finite() {
+            width / step
+        } else {
+            // Division first avoids rejecting a short range whose subtraction overflows.
+            stop / step - start / step
+        };
+        let capacity = isize::MAX as usize / std::mem::size_of::<f64>();
+        if !estimated_count.is_finite() || estimated_count.ceil() >= capacity as f64 {
+            return Err(PyValueError::new_err(
+                "arange allocation size exceeds addressable memory",
+            ));
+        }
         let mut data = Vec::new();
         let mut value = start;
         if step > 0.0 {
             while value < stop {
                 data.push(value);
-                value += step;
+                let next = value + step;
+                if next == value {
+                    return Err(PyValueError::new_err("arange step does not advance"));
+                }
+                value = next;
             }
         } else {
             while value > stop {
                 data.push(value);
-                value += step;
+                let next = value + step;
+                if next == value {
+                    return Err(PyValueError::new_err("arange step does not advance"));
+                }
+                value = next;
             }
         }
         Self::from_shape_data(vec![data.len()], data).map_err(PyValueError::new_err)
@@ -1539,6 +1585,7 @@ impl PyTensor {
         if num == 0 {
             return Err(PyValueError::new_err("linspace num must be positive"));
         }
+        element_count(&[num]).map_err(PyValueError::new_err)?;
         if num == 1 {
             return Self::from_shape_data(vec![1], vec![start]).map_err(PyValueError::new_err);
         }
@@ -1562,6 +1609,7 @@ impl PyTensor {
         let count = rows
             .checked_mul(cols)
             .ok_or_else(|| PyValueError::new_err("eye element count overflows usize"))?;
+        element_count(&[count]).map_err(PyValueError::new_err)?;
         let mut data = vec![0.0; count];
         for diagonal in 0..rows.min(cols) {
             data[diagonal * cols + diagonal] = 1.0;
@@ -1807,12 +1855,18 @@ impl PyTensor {
         self.try_reshape(shape).map_err(PyValueError::new_err)
     }
 
-    fn broadcast_to(&self, shape: Vec<usize>) -> PyResult<Self> {
+    fn broadcast_to(
+        &self,
+        #[pyo3(from_py_with = crate::safe_extract::vec)] shape: Vec<usize>,
+    ) -> PyResult<Self> {
         self.try_broadcast_to(shape).map_err(PyValueError::new_err)
     }
 
     #[pyo3(signature = (axes = None))]
-    fn transpose(&self, axes: Option<Vec<isize>>) -> PyResult<Self> {
+    fn transpose(
+        &self,
+        #[pyo3(from_py_with = crate::safe_extract::optional_vec)] axes: Option<Vec<isize>>,
+    ) -> PyResult<Self> {
         self.try_transpose(axes).map_err(PyValueError::new_err)
     }
 

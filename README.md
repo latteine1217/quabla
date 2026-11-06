@@ -1,5 +1,10 @@
 # Quabla
 
+Patch 1.0.3 fixes native stack exhaustion, cyclic and inconsistent sequence
+inputs, unaddressable allocations, and trace error propagation while preserving
+public signatures and dtype behavior. It adds reproducible property and crash
+regressions. See the [release notes](CHANGELOG.md#103---2026-11-07).
+
 **Differentiable scientific computing for physics-informed neural networks
 (PINNs): a Rust compiler and runtime with a JAX-style Python API that runs one
 traced program on CPU, CUDA, and Apple silicon.**
@@ -7,7 +12,7 @@ traced program on CPU, CUDA, and Apple silicon.**
 [![CI](https://github.com/latteine1217/quabla/actions/workflows/ci.yml/badge.svg)](https://github.com/latteine1217/quabla/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation)
-[![Release v1.0.2](https://img.shields.io/badge/release-v1.0.2-orange)](https://github.com/latteine1217/quabla/releases/tag/v1.0.2)
+[![Release v1.0.3](https://img.shields.io/badge/release-v1.0.3-orange)](https://github.com/latteine1217/quabla/releases/tag/v1.0.3)
 [![PyPI](https://img.shields.io/pypi/v/quabla)](https://pypi.org/project/quabla/)
 [![Docs](https://img.shields.io/badge/docs-developer%20guide-blue)](https://latteine1217.github.io/quabla/guide/)
 
@@ -76,7 +81,7 @@ running on CUDA or MLX.
 
 ## Status
 
-The latest release is **v1.0.2**, on PyPI as
+The latest release is **v1.0.3**, on PyPI as
 [`quabla`](https://pypi.org/project/quabla/) and
 [`quabla-mlx`](https://pypi.org/project/quabla-mlx/). Beyond the transforms
 above, it provides optimizers (Adam, AdamW, SGD, L-BFGS) with a device

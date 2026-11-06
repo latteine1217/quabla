@@ -1,0 +1,506 @@
+   Compiling quabla-core v1.0.2 (/home/junyi/quabla-v103-validation-20261107/crates/quabla-core)
+   Compiling pyo3-ffi v0.29.2
+   Compiling pyo3 v0.29.2
+   Compiling quabla-python v1.0.2 (/home/junyi/quabla-v103-validation-20261107/crates/quabla-python)
+   Compiling quabla-macros v1.0.2 (/home/junyi/quabla-v103-validation-20261107/crates/quabla-macros)
+    Finished `release` profile [optimized] target(s) in 1m 58s
+     Running unittests src/lib.rs (target/release/deps/quabla_core-e654a97352c09b08)
+
+running 73 tests
+test tensor_ir::broadcast_carry_tests::profile_broadcast_carry ... ignored, complete core broadcast release timing probe
+test tensor_ir::broadcast_carry_tests::profile_selection_carry ... ignored, complete where and unary broadcast release timing probe
+test tensor_ir::adaptive_remap_tests::sparse_source_graphs_do_not_allocate_dense_id_tables ... ok
+test tensor_ir::broadcast_carry_tests::carried_elementwise_preserves_f64_arithmetic_and_shapes ... ok
+test tensor_ir::broadcast_carry_tests::selection_and_unary_broadcast_preserve_bits_dtype_and_errors ... ok
+test tensor_ir::binary_reuse_tests::reused_binary_buffers_match_reference_bits_and_preserve_aliases ... ok
+test tensor_ir::cholesky_tests::compact_cholesky_internal_batches_match_independent_matrices ... ok
+test tensor_ir::cholesky_tests::compact_cholesky_exceptional_derivatives_preserve_reference ... ok
+test tensor_ir::cholesky_tests::compact_cholesky_shape_checks_and_native_f32_derivatives ... ok
+test tensor_ir::cholesky_tests::compact_cholesky_symbolic_exceptional_ad_matches_quotient_rules ... ok
+test tensor_ir::cpu_kernel_indexing_tests::axis_reduction_ad_fixtures_match_scalar_oracles ... ok
+test tensor_ir::cpu_kernel_indexing_tests::broadcasting_errors_precede_fast_paths_and_division_follows_ieee ... ok
+test tensor_ir::cpu_kernel_indexing_tests::cpu_kernel_paired_release_probe ... ignored, CPU release timing probe; run explicitly with --release --ignored --nocapture
+test tensor_ir::cpu_kernel_indexing_tests::axis_reductions_preserve_linear_order_identity_and_rounding ... ok
+test tensor_ir::cpu_kernel_indexing_tests::elementwise_fast_paths_and_broadcast_fallback_match_scalar_bits ... ok
+test tensor_ir::cholesky_tests::compact_cholesky_primal_preserves_staged_recurrence ... ok
+test tensor_ir::cpu_memory_regressions::shared_elementwise_dag_evaluates_each_node_once ... ok
+test tensor_ir::cpu_memory_regressions::frozen_forward_chain_retains_only_the_live_frontier ... ok
+test tensor_ir::cholesky_tests::compact_cholesky_derivatives_match_reference_and_stay_bounded ... ok
+test tensor_ir::cuda::host_loop_graph_tests::host_loop_graph_recordings_survive_concurrent_library_handle_drops ... ok
+test tensor_ir::cuda::loop_checkpoint_tests::checkpoint_layout_preserves_broadcast_fallback ... ok
+test tensor_ir::cuda::loop_checkpoint_tests::checkpoint_device_bounds_and_input_errors_match_full_tape ... ok
+test tensor_ir::cuda::loop_checkpoint_tests::profile_complete_checkpoint_vjp_on_device ... ok
+test tensor_ir::cuda::pool_profile_tests::profile_shrinking_shape_pool ... ok
+test tensor_ir::cuda::real::tests::rejects_identifiers_without_a_double_rename ... ok
+test tensor_ir::cuda::real::tests::rewrites_types_literals_math_and_intrinsics ... ok
+test tensor_ir::cuda::loop_checkpoint_tests::checkpoint_vjp_and_directional_match_full_tape_on_device ... ok
+test tensor_ir::cuda::region_codegen_tests::capture_gradients_reduce_lanes_in_a_fixed_order ... ok
+test tensor_ir::cuda::region_codegen_tests::packed_scan_keeps_distinct_half_references ... ok
+test tensor_ir::cuda::region_codegen_tests::shared_fori_and_scan_body_sources_are_linear ... ok
+test tensor_ir::cuda::solver_workspace_profile_tests::profile_solver_workspace_shape_changes ... ok
+test tensor_ir::device_optimizer::tests::adam_element_evaluates_its_documented_expression ... ok
+test tensor_ir::device_optimizer::tests::corrections_are_the_float64_powers ... ok
+test tensor_ir::device_optimizer::tests::cuda_statements_are_the_kernel_expressions ... ok
+test tensor_ir::device_optimizer::tests::validate_matches_the_host_optimizer_ranges ... ok
+test tensor_ir::device_optimizer::tests::zero_decay_keeps_infinite_parameters_and_flags_zero_divisors ... ok
+test tensor_ir::eager::tests::matches_one_node_graph ... ok
+test tensor_ir::eager::tests::nan_operands_propagate_like_the_evaluator ... ok
+test tensor_ir::eager::tests::rejects_operands_whose_graph_has_casts ... ok
+test tensor_ir::eager::tests::scalar_operand_matches_cast_weak_constant ... ok
+test tensor_ir::forward_storage_reuse_tests::graph_snapshots_share_metadata_until_mutation_and_keep_name_index ... ok
+test tensor_ir::forward_storage_reuse_tests::last_use_reuses_owned_storage_and_preserves_node_rounding ... ok
+test tensor_ir::forward_storage_reuse_tests::reshape_shares_typed_storage_and_unary_protects_external_alias ... ok
+test tensor_ir::forward_storage_reuse_tests::retained_outputs_and_reverse_tapes_keep_source_storage ... ok
+test tensor_ir::fusion::tests::broadcast_and_scalar_operands_match_node_by_node ... ok
+test tensor_ir::fusion::tests::fused_chains_match_node_by_node_bit_for_bit ... ok
+test tensor_ir::fusion::tests::fused_kernel_runs_a_whole_graph_over_its_operands ... ok
+test tensor_ir::fusion::tests::fused_region_stores_only_its_root ... ok
+test tensor_ir::fusion::tests::nan_pairs_fall_back_to_node_by_node ... ok
+test tensor_ir::fusion::tests::region_boundaries_keep_shared_and_retained_values ... ok
+test tensor_ir::fusion::tests::signaling_nan_inputs_round_like_the_evaluator ... ok
+test tensor_ir::gradient_accumulation_reuse_tests::accumulation_preserves_bits_dtype_broadcast_and_shared_seeds ... ok
+test tensor_ir::host_storage::device_conversion_tests::typed_device_conversion_preserves_bits_and_avoids_widened_buffers ... ok
+test tensor_ir::host_storage::tests::consuming_f64_storage_moves_unique_data_and_protects_shared_aliases ... ok
+test tensor_ir::host_storage::tests::cross_dtype_conversion_matches_widened_reference_and_preserves_aliases ... ok
+test tensor_ir::host_storage::tests::resident_payload_matches_dtype_without_a_widened_shadow ... ok
+test tensor_ir::host_storage::tests::typed_storage_preserves_rounding_zero_sign_and_boolean_conversion ... ok
+test tensor_ir::region_batching_tests::a_mapped_capture_maps_the_carry_by_the_fixed_point ... ok
+test tensor_ir::region_batching_tests::a_mapped_carry_leaves_unmapped_captures_unbatched ... ok
+test tensor_ir::region_batching_tests::a_mapped_predicate_maps_the_carry_and_masks_the_body ... ok
+test tensor_ir::region_batching_tests::a_mapped_predicate_selects_between_both_batched_branches ... ok
+test tensor_ir::region_batching_tests::a_masked_while_keeps_finished_examples_and_stops_when_all_are_done ... ok
+test tensor_ir::region_batching_tests::a_scan_capture_that_only_feeds_outputs_leaves_the_carry_unmapped ... ok
+test tensor_ir::region_batching_tests::a_while_with_an_unmapped_predicate_keeps_one_trip_count ... ok
+test tensor_ir::region_batching_tests::an_unmapped_predicate_keeps_one_cond_with_one_output_batchedness ... ok
+test tensor_ir::region_batching_tests::nested_loops_batch_the_inner_region_inside_the_outer_body ... ok
+test tensor_ir::region_batching_tests::reverse_pass_members_share_one_batched_group_with_every_input_mapped ... ok
+test tensor_ir::structural_key_tests::keys_preserve_scalar_bits_operation_shape_and_variable_boundaries ... ok
+test tensor_ir::triangular_solve_tests::triangular_substitution_matches_pivoted_lu_and_residuals ... ok
+test tensor_ir::triangular_solve_tests::triangular_substitution_preserves_exceptional_lu_fallbacks ... ok
+test tensor_ir::cuda::host_loop_graph_tests::host_loop_graph_replays_match_eager_runs_bit_for_bit has been running for over 60 seconds
+test tensor_ir::cuda::host_loop_graph_tests::host_loop_graphs_admit_every_elementwise_math_kind has been running for over 60 seconds
+test tensor_ir::cuda::host_loop_graph_tests::host_loop_graphs_admit_every_elementwise_math_kind ... ok
+test tensor_ir::cuda::region_batching_tests::batched_loops_fuse_checkpoint_and_match_the_cpu_on_device has been running for over 60 seconds
+test tensor_ir::cuda::region_batching_tests::batched_loops_fuse_checkpoint_and_match_the_cpu_on_device ... ok
+test tensor_ir::cuda::host_loop_graph_tests::host_loop_graph_replays_match_eager_runs_bit_for_bit ... ok
+
+test result: ok. 70 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 302.90s
+
+     Running tests/cholesky_memory.rs (target/release/deps/cholesky_memory-f569221b287785b8)
+
+running 2 tests
+test complete_cholesky_memory_probe ... ignored, isolated complete construction/compile/execution heap and timing profile
+test complete_native_cholesky_profiles_preserve_results ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/compiler_liveness.rs (target/release/deps/compiler_liveness-cdc95915183055c1)
+
+running 10 tests
+test constant_chain_compile_peak_follows_live_frontier ... ignored, isolated allocation measurement; run with --ignored --exact --test-threads=1
+test dead_symbolic_transform_cost_probe ... ignored, isolated transform allocation measurement
+test gradient_fanout_accumulation_probe ... ignored, isolated complete fanout VJP allocation and timing measurement
+test linear_reverse_peak_probe ... ignored, isolated reverse tape peak allocation measurement
+test narrow_cast_peak_probe ... ignored, isolated complete storage conversion allocation measurement
+test structural_key_compile_cost_probe ... ignored, isolated metadata allocation and timing measurement
+test folding_preserves_checked_constant_errors ... ok
+test folded_fanout_aliases_and_retained_outputs_match_node_execution ... ok
+test symbolic_pruning_keeps_unused_inputs_and_multi_vjp_primal_map ... ok
+test linear_reverse_chain_vjp_ignores_dead_nodes ... ok
+
+test result: ok. 4 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/cpu_execution_memory.rs (target/release/deps/cpu_execution_memory-2fc393c6deb66bbb)
+
+running 7 tests
+test forward_outputs_and_buffer_slots_protect_early_and_reshape_values ... ok
+test fused_memo_keeps_lazy_where_broadcasting_and_per_node_rounding ... ok
+test forward_loop_results_match_taped_paths_and_validation ... ok
+test grouped_scan_results_survive_interleaved_consumers ... ok
+test numerical_vjp_retains_input_seeds_and_accumulates_duplicate_operands ... ok
+test numerical_vjp_moves_joint_scan_seeds_without_losing_siblings ... ok
+test fusion_user_deduplication_preserves_duplicate_operands_and_wide_fanout ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/cpu_loop_checkpoint.rs (target/release/deps/cpu_loop_checkpoint-0451ba21e5fb9b44)
+
+running 6 tests
+test profile_checkpoint_vjp ... ignored, isolated complete loop VJP allocation and timing probe
+test scan_checkpoint_keeps_checked_output_errors_before_cotangent_validation ... ok
+test checkpoint_preserves_first_forward_failure ... ok
+test checkpoint_vjp_matches_full_tape_bits_across_block_boundaries ... ok
+test scan_checkpoint_matches_public_full_tape_and_preserves_outputs ... ok
+test higher_order_checkpoints_match_single_step_reverse_recurrence ... ok
+
+test result: ok. 5 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/cuda_axis_reduction.rs (target/release/deps/cuda_axis_reduction-66dd08d8a662b7b9)
+
+running 2 tests
+test profile_long_axis_reduction ... ignored, isolated complete-operation timing probe
+test long_axis_reductions_match_wide_reference ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.61s
+
+     Running tests/cuda_codegen_memory.rs (target/release/deps/cuda_codegen_memory-6b4613400ae7d6dd)
+
+running 3 tests
+test where_cuda_source_selects_shared_values_without_recursive_calls ... ok
+test shared_dag_cuda_source_is_linear_in_nodes ... ok
+test shared_dag_and_where_execute_with_cuda_cpu_parity ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.55s
+
+     Running tests/cuda_determinism.rs (target/release/deps/cuda_determinism-600aedf60efd1e49)
+
+running 3 tests
+test short_capture_reductions_add_the_lanes_in_order ... ok
+test full_reductions_are_deterministic_and_match_the_cpu ... ok
+test loop_capture_gradients_are_deterministic_and_match_the_cpu ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 32.63s
+
+     Running tests/cuda_float64.rs (target/release/deps/cuda_float64-c4859b64e57b67f5)
+
+running 4 tests
+test float64_precision_rejects_float32_nodes ... ok
+test float64_lowering_keeps_double_constants_and_wide_reductions ... ok
+test float64_precision_only_changes_programs_with_float64_nodes ... ok
+test float64_extremum_axis_matches_the_cpu_bitwise ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.37s
+
+     Running tests/cuda_native_cholesky.rs (target/release/deps/cuda_native_cholesky-e4054fc693ee7851)
+
+running 5 tests
+test native_cholesky_cuda_preserves_f32_public_dtype ... ok
+test profile_native_cholesky_cuda ... ignored, complete device operation and cold compilation profile
+test native_cholesky_cuda_preserves_exceptional_primal ... ok
+test native_cholesky_cuda_preserves_exceptional_ad ... ok
+test native_cholesky_cuda_matches_expanded_primal_and_ad has been running for over 60 seconds
+test native_cholesky_cuda_matches_expanded_primal_and_ad ... ok
+
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 157.35s
+
+     Running tests/cuda_retained_loss.rs (target/release/deps/cuda_retained_loss-0c2912cffaf3544f)
+
+running 3 tests
+test profile_primary_loss_against_shared_forward_backward ... ok
+test primary_loss_compilation_excludes_backward_nodes ... ok
+test retained_loss_uses_updated_parameters_and_latest_batch_without_adam_mutation ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.37s
+
+     Running tests/cuda_solve_profile.rs (target/release/deps/cuda_solve_profile-1999c1e09e589fed)
+
+running 1 test
+test profile_repeated_solve_workspace ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/dual.rs (target/release/deps/dual-8ca4e556c43543c1)
+
+running 5 tests
+test dual_derivative_matches_quadratic_product_rule ... ok
+test dual_supports_common_elementary_functions ... ok
+test forward_diff_macro_preserves_block_expressions_and_powi ... ok
+test forward_diff_macro_rewrites_a_pure_scalar_closure_to_dual_arithmetic ... ok
+test forward_gradient_macro_returns_ordered_multivariate_gradient ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ode.rs (target/release/deps/ode-fdfe27e6255630a8)
+
+running 10 tests
+test lotka_volterra_gradient_matches_finite_difference ... ok
+test lotka_volterra_alpha_helper_matches_full_gradient_bits ... ok
+test lotka_volterra_full_gradient_matches_finite_difference ... ok
+test rk4_final_state_returns_initial_state_for_zero_steps ... ok
+test rk4_final_state_matches_integrated_trajectory_endpoint ... ok
+test rk4_integrates_exponential_growth_with_small_error ... ok
+test rk4_workspace_matches_dual_reference_bits ... ok
+test rk4_workspace_preserves_zero_steps_and_empty_state ... ok
+test rk4_workspace_matches_reference_bits_and_mutable_partial_rhs ... ok
+test lotka_volterra_parameter_fit_reduces_loss ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/optim.rs (target/release/deps/optim-b58bdcea918fa40a)
+
+running 2 tests
+test gradient_descent_stops_when_initial_gradient_is_small ... ok
+test gradient_descent_minimizes_quadratic_objective ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/robustness.rs (target/release/deps/robustness-6d6bac16bb083d67)
+
+running 2 tests
+test invalid_slice_error_formatting_cannot_overflow ... ok
+test inferred_shapes_and_factory_capacity_are_checked ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tensor.rs (target/release/deps/tensor-7b3d77c38805d31f)
+
+running 4 tests
+test tensor2_matmul_preserves_inner_accumulation_and_empty_shapes ... ok
+test tensor2_map_supports_elementwise_transforms_without_losing_shape ... ok
+test tensor2_tracks_shape_in_type_and_indexes_values ... ok
+test tensor2_matmul_returns_compile_time_output_shape ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tensor_ir.rs (target/release/deps/tensor_ir-65c8a2c1cb90422d)
+
+running 215 tests
+test array_constants_deduplicate_by_bits_in_compiled_plans ... ok
+test array_constants_evaluate_with_a_strong_dtype ... ok
+test array_constants_fold_like_per_node_execution ... ok
+test a_mapped_floating_predicate_selects_by_nonzero_and_poisons_non_finite_examples ... ok
+test backend_precision_contract_keeps_cpu_reference_and_gpu_execution_explicit ... ok
+test bool_dtype_rounds_to_zero_one_and_lowers_to_f32_on_devices ... ok
+test a_mapped_predicate_keeps_nan_of_the_unselected_branch_out_of_values_and_derivatives ... ok
+test array_constants_have_zero_tangents_and_receive_no_cotangent ... ok
+test buffer_plan_preserves_reshape_as_an_input_alias ... ok
+test buffer_plan_reuses_temporary_slots_after_their_final_use ... ok
+test bool_operands_promote_like_arithmetic_and_reject_bool_arithmetic ... ok
+test cast_ad_rules_convert_tangents_and_cotangents_between_dtypes ... ok
+test cast_round_trips_are_kept_and_same_dtype_casts_are_removed ... ok
+test compile_cpu_canonicalizes_identity_broadcast_and_reshape_chains ... ok
+test compile_cpu_composes_non_identity_reshape_chains ... ok
+test compile_cpu_folds_scalar_constant_subgraphs ... ok
+test compile_cpu_many_preserves_every_requested_output_node ... ok
+test compiled_plans_common_subexpressions_after_inline ... ok
+test bool_masks_have_no_derivatives_and_nan_guards_keep_gradients_finite ... ok
+test compiler_build_check_bypass_leaves_unbuilt_errors_to_the_backend ... ok
+test compiler_facade_multi_output_build_check_matches_single_output ... ok
+test comparisons_logical_ops_and_reductions_follow_ieee_semantics_on_cpu ... ok
+test compiler_facade_multi_output_program_keeps_order_and_owns_frozen_ids ... ok
+test compiler_facade_owns_program_transform_and_cpu_execution_lifecycle ... ok
+test compiler_facade_rejects_unbuilt_targets_up_front ... ok
+test compiler_float64_precision_is_a_cpu_no_op_and_an_mlx_error ... ok
+test cond_region_transforms_do_not_leak_non_finite_captures ... ok
+test atan2_derivatives_avoid_overflow_and_vanish_at_the_origin ... ok
+test cond_vjp_gives_exact_zero_gradients_to_captures_unused_by_the_taken_branch ... ok
+test cpu_backend_executes_a_frozen_tensor_plan ... ok
+test cpu_f32_arithmetic_matches_ieee_single_precision_bitwise ... ok
+test compiled_plans_differentiate_scan_regions_with_a_pruned_sibling_result ... ok
+test cpu_plan_fuses_pure_elementwise_broadcast_and_mask_chains ... ok
+test cse_keeps_casts_distinct_from_their_sources_and_merges_identical_casts ... ok
+test cond_regions_capture_bool_masks_without_differentiating_them ... ok
+test cuda_backend_executes_array_constants_like_cpu_when_enabled ... ok
+test compiler_facade_multi_output_cuda_matches_cpu_when_enabled ... ok
+test cuda_backend_executes_direct_rank_two_matmul_when_enabled ... ok
+test cuda_backend_executes_elementwise_fixed_fori_regions_on_device ... ok
+test cuda_backend_executes_broadcast_batched_matmul_vjp_when_enabled ... ok
+test cuda_backend_executes_broadcast_batched_matmul_when_enabled ... ok
+test cuda_backend_executes_fixed_scan_regions_with_shared_device_results_when_enabled ... ok
+test cuda_backend_executes_fused_elementwise_plan_when_enabled ... ok
+test cuda_backend_executes_fixed_fori_vjp_with_device_resident_carry_tape_when_enabled ... ok
+test cuda_backend_executes_fixed_scan_vjp_with_device_resident_carry_tape_when_enabled ... ok
+test cuda_backend_executes_structural_fori_hvp_when_enabled ... ok
+test cuda_backend_executes_rank_two_solve_when_enabled ... ok
+test cuda_backend_executes_structural_fori_jvp_when_enabled ... ok
+test cuda_backend_executes_symbolic_vjp_for_broadcast_bias_when_enabled ... ok
+test cuda_backend_executes_tiled_rank_two_matmul_inside_generic_plan_when_enabled ... ok
+test cuda_backend_executes_two_layer_mlp_scalar_loss_when_enabled ... ok
+test cuda_backend_fuses_grouped_fori_vjp_targets_when_enabled ... ok
+test cuda_backend_fuses_grouped_scan_vjp_targets_when_enabled ... ok
+test cuda_backend_executes_while_loops_as_host_driven_region_loops_when_enabled ... ok
+test cuda_backend_reduces_broadcast_fori_capture_vjp_on_device_when_enabled ... ok
+test cuda_backend_reduces_broadcast_scan_capture_vjp_on_device_when_enabled ... ok
+test cuda_backend_reduces_scalar_fori_capture_vjp_on_device_when_enabled ... ok
+test cuda_backend_reduces_scalar_scan_capture_vjp_on_device_when_enabled ... ok
+test cuda_backend_reuses_cond_regions_and_rejects_non_finite_predicates_when_enabled ... ok
+test cuda_backend_matches_cpu_for_host_driven_fori_vjp_and_hvp_when_enabled ... ok
+test cuda_backend_runs_cond_inside_fori_and_scan_bodies_as_host_driven_loops_when_enabled ... ok
+test cuda_backend_uploads_array_constants_once_per_plan_when_enabled ... ok
+test cuda_backend_executes_only_the_selected_cond_region_with_ad_parity_when_enabled ... ok
+test cuda_compiled_cond_plan_alternates_branches_across_executions_when_enabled ... ok
+test cuda_compiled_grouped_fori_vjp_plan_executes_repeatedly_when_enabled ... ok
+test cuda_bool_masks_comparisons_and_guarded_gradients_match_cpu_when_enabled ... ok
+test cuda_compiled_grouped_scan_vjp_value_and_grad_plan_executes_repeatedly_when_enabled ... ok
+test cuda_compiled_grouped_scan_vjp_jvp_plan_executes_repeatedly_when_enabled ... ok
+test cuda_data_parallel_compile_execute_drop_cycles_keep_device_memory_stable_on_two_gpus ... ok
+test cuda_data_parallel_program_preserves_schedule_order_and_matches_cpu_oracle ... ok
+test cuda_data_parallel_program_rejects_mesh_outside_first_subset ... ok
+test cuda_data_parallel_program_rejects_redistribution_and_foreign_schedules ... ok
+test cuda_data_parallel_program_rejects_schedules_needing_mid_graph_collectives ... ok
+test cuda_data_parallel_recreates_communicators_after_a_failed_call_on_two_gpus ... ok
+test cuda_data_parallel_sharded_schedule_matches_cpu_oracle_on_two_gpus ... ok
+test cuda_data_parallel_validates_replica_device_contract_before_lowering ... ok
+test cuda_execution_plan_reuses_buffers_for_updated_inputs_when_enabled ... ok
+test cuda_compiled_scan_plan_retaining_carry_and_outputs_executes_repeatedly_when_enabled ... ok
+test cuda_f32_mlp_value_and_gradients_match_the_cpu_f32_reference_when_enabled ... ok
+test cuda_fuses_pow_chains_into_one_region_when_enabled ... ok
+test cuda_fusion_region_source_materializes_matmul_and_bias_leaves ... ok
+test cuda_gather_and_scatter_add_match_cpu_bits_with_repeated_indices ... ok
+test cuda_grouped_fori_vjp_matches_cpu_for_broadcast_captures_when_enabled ... ok
+test cuda_batched_while_loops_match_the_cpu_when_enabled ... ok
+test cuda_grouped_loop_capture_reductions_repeat_exactly_when_enabled ... ok
+test cuda_grouped_scan_vjp_jvp_matches_cpu_for_broadcast_and_equal_lane_outputs_when_enabled ... ok
+test cuda_log1p_matches_cpu_values_and_gradients ... ok
+test cuda_grouped_scan_vjp_matches_cpu_for_broadcast_and_equal_lane_outputs_when_enabled ... ok
+test cuda_matmul_bias_tanh_epilogue_only_fuses_plan_inputs_when_enabled ... ok
+test cuda_pow_values_derivatives_and_loop_bodies_match_cpu_when_enabled ... ok
+test cuda_sqrt_values_derivatives_and_loop_bodies_match_cpu_when_enabled ... ok
+test cuda_two_layer_mlp_matches_cpu_across_single_and_multi_output_plans_when_enabled ... ok
+test cuda_new_ops_match_cpu_values_and_gradients ... ok
+test cuda_validation_checks_the_programs_a_loop_builds_from_its_body ... ok
+test custom_rule_in_a_loop_body_is_applied_by_the_loop_derivatives ... ok
+test custom_rule_node_batches_with_its_rule ... ok
+test custom_rule_node_is_its_value_and_reverse_mode_applies_the_rule ... ok
+test custom_rule_rejects_mismatched_graphs ... ok
+test custom_tangent_graph_reads_the_call_outputs ... ok
+test data_parallel_vjp_matches_single_device_mean_loss ... ok
+test data_parallel_vjp_rejects_non_divisible_batch ... ok
+test differentiating_bool_values_is_an_error_and_bool_inputs_have_no_gradient ... ok
+test cumsum_rounds_every_running_sum_and_differentiates_by_reversal ... ok
+test expm1_erf_and_atan2_values_follow_the_f64_reference ... ok
+test expm1_and_erf_derivatives_agree_across_routes ... ok
+test extremum_axis_values_propagate_nan_and_order_signed_zeros ... ok
+test f32_fori_carry_adopts_a_typed_index_and_rejects_mixed_captures ... ok
+test f32_kernel_ir_validates_and_f64_kernel_ir_is_unchanged ... ok
+test f64_host_data_fed_to_an_f32_input_is_rounded ... ok
+test extremum_axis_derivatives_split_ties_and_compose ... ok
+test fori_region_allows_an_unused_index_input ... ok
+test fori_region_executes_and_differentiates_without_static_unrolling ... ok
+test fmod_derivatives_are_one_and_minus_the_truncated_quotient ... ok
+test fori_vjp_jvp_plan_matches_exact_loop_gradient_direction ... ok
+test fori_region_integrates_with_parent_ir_execution_and_ad ... ok
+test fusion_regions_do_not_duplicate_a_value_shared_by_two_elementwise_tails ... ok
+test fusion_regions_isolate_an_elementwise_tail_after_matmul ... ok
+test fusion_regions_materialize_values_with_non_elementwise_consumers ... ok
+test gather_and_scatter_add_follow_their_forward_and_derivative_rules ... ok
+test forward_over_reverse_binds_a_float32_seed_tangent_to_a_cond_region ... ok
+test hessian_and_hvp_propagate_exactly_through_fori_regions ... ok
+test hessian_scalar_propagates_through_nonlinear_scan_vjp_jvp ... ok
+test inline_batched_batches_solve_and_regions_and_rejects_invalid_bindings ... ok
+test hessian_and_hvp_support_cond_regions_through_symbolic_ad ... ok
+test inline_batched_conds_batch_again_for_nested_vmap ... ok
+test inline_batched_conds_match_per_example_conds_for_every_mapping ... ok
+test inline_batched_graphs_batch_again_for_nested_vmap ... ok
+test inline_batched_cond_derivatives_match_per_example_derivatives ... ok
+test inline_batched_loops_batch_again_for_nested_vmap ... ok
+test inline_batched_loops_match_per_example_loops_for_every_mapping ... ok
+test inline_batched_maps_extremum_axis_and_its_gradient ... ok
+test inline_batched_maps_the_new_ops_and_their_gradients ... ok
+test inline_batched_matches_a_per_example_loop_for_every_batching_rule ... ok
+test inline_batched_reverse_mode_graphs_give_per_example_gradients ... ok
+test inline_batched_while_freezes_finished_examples_bit_for_bit ... ok
+test inline_batched_while_jvps_match_per_example_jvps ... ok
+test inline_batched_loop_derivatives_match_per_example_derivatives ... ok
+test inline_preserves_dtypes_and_weak_constants ... ok
+test inline_rejects_mismatched_unknown_and_missing_bindings ... ok
+test inline_shares_array_constants_between_splices ... ok
+test inline_splices_region_graphs_and_keeps_two_splices_separate ... ok
+test inline_splices_the_reachable_callee_with_bound_inputs ... ok
+test kernel_ir_accepts_valid_typed_mesh_sharding ... ok
+test kernel_ir_placement_propagation_rejects_collectives_and_implicit_redistribution ... ok
+test kernel_ir_placement_propagation_rejects_concat_along_sharded_axis_only ... ok
+test kernel_ir_propagates_sharding_through_local_elementwise_and_transpose_ops ... ok
+test kernel_ir_rejects_invalid_typed_mesh_sharding ... ok
+test log1p_derivatives_agree_across_runtime_and_symbolic_routes ... ok
+test log1p_keeps_ieee_values_without_raising ... ok
+test mixing_strong_f32_and_f64_tensors_is_a_trace_time_error ... ok
+test mlx_lowering_validation_rejects_non_finite_constants_in_inactive_regions_without_execution ... ok
+test mlx_validation_checks_the_derivative_plans_a_loop_builds_from_its_body ... ok
+test mlx_validation_reports_a_loop_derivative_plan_that_cannot_be_built ... ok
+test pow_derivative_conventions_at_zero_and_negative_bases ... ok
+test pow_folds_constants_shares_cse_and_skips_constant_operand_derivatives ... ok
+test pow_follows_powf_for_edge_cases_broadcasting_and_f32 ... ok
+test pow_fuses_into_elementwise_kernels_and_exports_stablehlo ... ok
+test pow_gradients_in_both_operands_match_finite_differences ... ok
+test pow_hessians_agree_across_routes_and_with_the_closed_form ... ok
+test powi_zero_tangents_are_exact_zeros_at_non_finite_inputs ... ok
+test reduction_cotangent_broadcast_ignores_nan_and_infinite_values ... ok
+test reverse_mode_over_loop_vjp_and_jvp_nodes_matches_closed_forms ... ok
+test scan_region_allows_an_unused_index_input ... ok
+test scan_region_integrates_with_parent_ir_execution_jvp_and_vjp ... ok
+test inline_batched_while_loops_match_per_example_loops_for_every_mapping ... ok
+test scan_region_stacks_fixed_shape_outputs_without_unrolling_the_body_plan ... ok
+test scatter_add_rounds_duplicates_in_index_order_and_its_reverse_mode_mirrors_it ... ok
+test scan_vjp_gives_an_exact_zero_cotangent_to_an_unused_non_finite_output ... ok
+test sharding_plan_records_all_reduce_and_replication_for_sharded_mean_axis ... ok
+test solve_rejects_unsupported_shapes_and_singular_matrices ... ok
+test solve_evaluates_and_differentiates ... ok
+test stablehlo_export_preserves_a_pure_elementwise_static_graph ... ok
+test stablehlo_export_rejects_operations_without_a_verified_lowering ... ok
+test sqrt_derivatives_are_nan_below_zero_and_zero_at_the_origin ... ok
+test stop_gradient_passes_values_and_blocks_every_derivative ... ok
+test symbolic_hessians_stay_finite_where_the_loss_is_infinite ... ok
+test symbolic_hvp_through_fori_lowers_to_structural_fori_vjp_jvp ... ok
+test symbolic_jvp_gives_exact_zero_tangents_to_non_finite_inputs_without_a_direction ... ok
+test symbolic_ad_differentiates_cond_branch_scan_with_a_pruned_sibling_result ... ok
+test symbolic_jvp_of_scalar_vjp_gradient_propagates_cotangent_direction ... ok
+test symbolic_jvp_over_a_ones_seeded_vjp_is_the_hessian_vector_product ... ok
+test symbolic_jvp_preserves_parameter_vjp_for_second_coordinate_derivative ... ok
+test symbolic_jvp_preserves_transpose_reshape_and_axis_reduction ... ok
+test symbolic_jvp_supports_batched_matmul_mlp_nodes ... ok
+test symbolic_jvp_supports_division_and_parameter_vjp ... ok
+test symbolic_jvp_supports_log_and_parameter_vjp ... ok
+test symbolic_jvp_supports_sine_second_derivative_and_parameter_vjp ... ok
+test symbolic_jvp_transforms_cond_regions_with_explicit_captures ... ok
+test symbolic_jvp_transforms_fori_region_without_unrolling_parent_loop ... ok
+test symbolic_jvp_transforms_scan_region_without_unrolling_parent_loop ... ok
+test symbolic_jvp_with_tangent_inputs_uses_runtime_directions ... ok
+test symbolic_vjp_gives_exact_zero_gradients_to_unused_non_finite_inputs ... ok
+test symbolic_vjp_many_ones_seed_matches_an_input_seed_and_retains_primals ... ok
+test symbolic_vjp_many_rejects_invalid_seeds ... ok
+test symbolic_vjp_many_sums_the_vjps_of_several_outputs ... ok
+test symbolic_vjp_matches_direct_vjp_for_broadcasted_scalar_loss ... ok
+test symbolic_vjp_matches_direct_vjp_for_matmul_and_mean_axis ... ok
+test symbolic_vjp_transforms_cond_regions_with_explicit_captures ... ok
+test symbolic_vjp_transforms_fori_region_with_shared_reverse_loop_results ... ok
+test symbolic_vjp_transforms_scan_region_with_joint_carry_and_output_cotangents ... ok
+test tensor_ir_axis_mean_and_transpose_preserve_ad_layout ... ok
+test tensor_ir_cond_does_not_evaluate_an_inactive_failing_branch ... ok
+test tensor_ir_cond_executes_only_the_selected_cpu_region_and_routes_ad ... ok
+test tensor_ir_evaluates_broadcasted_expression_and_vjp ... ok
+test tensor_ir_sum_builds_a_scalar_loss_with_vjp_and_jvp ... ok
+test tensor_ir_where_routes_gradients_without_differentiating_the_condition ... ok
+test typed_f32_input_adopts_weak_scalars_and_lowers_as_f32 ... ok
+test unary_math_and_fmod_values_follow_the_f64_reference ... ok
+test unary_math_derivatives_agree_across_routes ... ok
+test where_and_cond_accept_bool_and_legacy_float_predicates ... ok
+test while_region_evaluates_forward_mode_and_rejects_reverse_mode ... ok
+test while_region_requires_a_scalar_bool_predicate ... ok
+test symbolic_jvp_many_retains_scan_vjp_jvp_sibling_targets ... ok
+test cuda_backend_differentiates_scan_regions_with_a_pruned_sibling_result_when_enabled has been running for over 60 seconds
+test cuda_extremum_axis_matches_cpu_bitwise ... ok
+test cuda_backend_differentiates_scan_regions_with_a_pruned_sibling_result_when_enabled ... ok
+
+test result: ok. 215 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 84.28s
+
+     Running tests/tensor_ir_linalg.rs (target/release/deps/tensor_ir_linalg-6cdf3593152bbde4)
+
+running 11 tests
+test eigh_kinds_sort_and_normalize_signs ... ok
+test complete_qr_and_full_svd_complements_are_not_differentiable ... ok
+test mlx_validation_accepts_solve_and_linalg ... ok
+test batched_solve_matches_per_matrix_solves_and_differentiates ... ok
+test prod_axis_is_a_division_free_product_tree ... ok
+test slogdet_kinds_follow_numpy_conventions ... ok
+test solve_shape_requires_equal_batch_axes ... ok
+test vmap_batches_linalg_and_solve_operands ... ok
+test qr_and_svd_kinds_reconstruct_their_input ... ok
+test numeric_and_symbolic_linalg_derivatives_agree ... ok
+test numeric_and_symbolic_qr_and_svd_derivatives_agree ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/release/deps/quabla_macros-a3692d5e4effa5f6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/release/deps/quabla-735ce2270035ba78)
+/home/junyi/quabla-v103-validation-20261107/target/release/deps/quabla-735ce2270035ba78: error while loading shared libraries: libpython3.13.so.1.0: cannot open shared object file: No such file or directory
+error: test failed, to rerun pass `-p quabla-python --lib`
+
+Caused by:
+  process didn't exit successfully: `/home/junyi/quabla-v103-validation-20261107/target/release/deps/quabla-735ce2270035ba78` (exit status: 127)
+note: test exited abnormally; to see the full output pass --no-capture to the harness.
