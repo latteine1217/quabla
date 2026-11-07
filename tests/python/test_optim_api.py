@@ -482,6 +482,60 @@ def test_trainer_releases_replaced_batch_payload():
     assert math.isclose(float(trainer.loss()), (0.5 - 0.01 * 4.0) ** 2 * 4.0)
 
 
+def test_warmup_cosine_preserves_zero_and_tiny_peak_endpoints():
+    from quabla.optim import warmup_cosine_decay
+
+    for peak in (0.0, 1e-320):
+        schedule = warmup_cosine_decay(1.0, peak, 2, 4, end_value=0.1)
+        for step, expected in ((0, 1.0), (2, peak), (3, 0.05), (4, 0.1), (5, 0.1)):
+            assert math.isclose(schedule(step), expected, rel_tol=1e-14, abs_tol=1e-320)
+
+
+def test_bounded_exponential_avoids_intermediate_overflow():
+    from quabla.optim import exponential_decay
+
+    assert exponential_decay(1.0, 1, 2.0, end_value=3.0)(1024) == 3.0
+    assert exponential_decay(0.0, 1, 2.0, end_value=3.0)(1024) == 0.0
+    # The power alone overflows, but the scaled value has not reached the cap.
+    value = exponential_decay(1e-300, 1, 2.0, end_value=1e300)(1024)
+    expected = math.ldexp(1e-300, 1024)
+    assert math.isclose(value, expected, rel_tol=1e-12), (value, expected)
+
+
+def test_lbfgs_tiny_gradient_does_not_divide_by_zero():
+    from quabla.optim import LBFGS
+
+    solution, info = LBFGS(tolerance_grad=0.0, tolerance_change=0.0).minimize(
+        lambda x: ((x * 1e-100) ** 2).sum(), qb.array([1.0])
+    )
+    assert info["converged"], info
+    assert solution.item() == 0.0, (solution, info)
+    assert info["loss"] == 0.0 and info["grad_norm"] == 0.0, info
+
+
+def test_exponential_preserves_representable_values_at_extreme_scales():
+    from quabla.optim import exponential_decay
+
+    for initial, rate, step, expected in (
+        (1e300, 0.5, 1100, math.ldexp(1e300, -1100)),
+        (1e-300, 2.0, 1024, math.ldexp(1e-300, 1024)),
+    ):
+        for endpoint in (None, 1e-300 if rate < 1 else 1e300):
+            actual = exponential_decay(initial, 1, rate, end_value=endpoint)(step)
+            assert math.isclose(actual, expected, rel_tol=1e-12), (actual, expected)
+
+
+def test_cosine_preserves_endpoints_without_cancellation_or_overflow():
+    from quabla.optim import cosine_decay, warmup_cosine_decay
+
+    decay = cosine_decay(1.0, 4, alpha=1e20)
+    assert decay(0) == 1.0
+    assert decay(4) == 1e20
+    warmup = warmup_cosine_decay(1e308, -1e308, 2, 4)
+    for step, expected in ((0, 1e308), (1, 0.0), (2, -1e308), (4, 0.0)):
+        assert warmup(step) == expected, (step, warmup(step), expected)
+
+
 def test_schedules_match_hand_computed_optax_values():
     from quabla.optim import (
         constant,

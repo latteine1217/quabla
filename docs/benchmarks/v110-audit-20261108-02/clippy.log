@@ -1,0 +1,5 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+    Checking quabla-core v1.0.3 (/Users/latteine/Documents/coding/nabla/crates/quabla-core)
+    Checking quabla-python v1.0.3 (/Users/latteine/Documents/coding/nabla/crates/quabla-python)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.43s

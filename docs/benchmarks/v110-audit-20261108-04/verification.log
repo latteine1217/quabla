@@ -1,0 +1,226 @@
+{
+  "status": "passed",
+  "source_files": 135,
+  "current_tree_files_checked": 132,
+  "archive_context_only": [
+    "AGENTS.md",
+    "README.md",
+    "examples/benchmark_frameworks.py"
+  ],
+  "accounting": {
+    "6947": {
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "elapsed": "00:24:00",
+      "node": "acmt20"
+    },
+    "6948": {
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "elapsed": "00:00:12",
+      "node": "acmt20"
+    },
+    "6949": {
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "elapsed": "00:00:20",
+      "node": "acmt20"
+    },
+    "6950": {
+      "state": "COMPLETED",
+      "exit_code": "0:0",
+      "elapsed": "00:00:05",
+      "node": "acmt20"
+    }
+  },
+  "target_release": "1.1.0",
+  "package_version_under_test": "1.0.3",
+  "release_published": false,
+  "actual_remote_extension_sha256": "110d3317934703f750273242bc236dbaf8e0086a8dd11b7633283154acc48300",
+  "verification_script_sha256": "0f1ed93200e342e51f87300ff831a5834cb42cf0e8bf12a0ca18632cb46f5c8a",
+  "python": {
+    "cpu-py310": {
+      "suites": 20,
+      "passed": 377,
+      "skipped": 48,
+      "failed": 0
+    },
+    "cpu-py311": {
+      "suites": 20,
+      "passed": 377,
+      "skipped": 48,
+      "failed": 0
+    },
+    "cpu-py312": {
+      "suites": 20,
+      "passed": 377,
+      "skipped": 48,
+      "failed": 0
+    },
+    "cpu-py313": {
+      "suites": 20,
+      "passed": 377,
+      "skipped": 48,
+      "failed": 0
+    },
+    "cpu-py314": {
+      "suites": 20,
+      "passed": 377,
+      "skipped": 48,
+      "failed": 0
+    },
+    "mlx-py313": {
+      "suites": 20,
+      "passed": 415,
+      "skipped": 10,
+      "failed": 0
+    },
+    "cuda-py313": {
+      "suites": 20,
+      "passed": 418,
+      "skipped": 7,
+      "failed": 0
+    }
+  },
+  "rust": {
+    "mlx": {
+      "passed": 337,
+      "ignored": 16
+    },
+    "cuda-nccl": {
+      "passed": 382,
+      "ignored": 14
+    }
+  },
+  "cuda_probes": {
+    "probes-cuda-6947.json": {
+      "checks": 140,
+      "device": "cuda",
+      "package_version": "1.0.3",
+      "probe_sha256": "5638eb8f706138306c15ea4a2da0abe7a2406f07b3c68281f3d3c38e3898deae",
+      "seeds": [
+        103,
+        1701,
+        65537,
+        8675309
+      ],
+      "status": "passed"
+    },
+    "float64-6947.json": {
+      "status": "passed",
+      "device": "cuda:0",
+      "dtype": "float64",
+      "checks": 41,
+      "probe_sha256": "449bc52b1717a216ebd48c824d6c7adc20583cae2b1dc844f435998b46401195"
+    },
+    "spread-cuda-6947.json": {
+      "status": "passed",
+      "device": "cuda:0",
+      "checks": 57,
+      "skipped": [],
+      "probe_sha256": "a7e6103c8646a9130c96d3c9e4a9ebce6d09f7cfd01b95a2b8065c3bf80dff7d"
+    },
+    "curvature-6948.json": {
+      "status": "passed",
+      "device": "cuda:0",
+      "checks": 14,
+      "probe_sha256": "d159eceece9220a4ffd436755fc2e93b61bf3e1da8e6e8d742e185aa180d2cdb"
+    },
+    "statistics-6949.json": {
+      "status": "passed",
+      "device": "cuda:0",
+      "checks": 480,
+      "skipped": 0,
+      "seed": 1701,
+      "decimal_precision": 128,
+      "probe_sha256": "52eae1fab5781f728e3ad2a235b3165e1cf9b188faa34c54e4c37ecaa66ec77b"
+    },
+    "nccl-timing-6950.json": {
+      "status": "passed",
+      "checks": 6,
+      "results": [
+        {
+          "reduction": "sum",
+          "weight": 2.0,
+          "loss": 10.0,
+          "gradient": 5.0,
+          "timing": {
+            "collective": 0.262801127,
+            "output_readback": 4.5788e-05,
+            "replica_enqueue": 0.009217441
+          }
+        },
+        {
+          "reduction": "sum",
+          "weight": 1.5,
+          "loss": 7.5,
+          "gradient": 5.0,
+          "timing": {
+            "collective": 4.2618e-05,
+            "output_readback": 1.4239e-05,
+            "replica_enqueue": 0.000128046
+          }
+        },
+        {
+          "reduction": "sum",
+          "weight": -0.25,
+          "loss": -1.25,
+          "gradient": 5.0,
+          "timing": {
+            "collective": 3.4792e-05,
+            "output_readback": 1.2326e-05,
+            "replica_enqueue": 7.6198e-05
+          }
+        },
+        {
+          "reduction": "mean",
+          "weight": 2.0,
+          "loss": 5.0,
+          "gradient": 2.5,
+          "timing": {
+            "collective": 0.260757348,
+            "output_readback": 2.7345e-05,
+            "replica_enqueue": 0.000559402
+          }
+        },
+        {
+          "reduction": "mean",
+          "weight": 1.5,
+          "loss": 3.75,
+          "gradient": 2.5,
+          "timing": {
+            "collective": 5.532e-05,
+            "output_readback": 1.5941e-05,
+            "replica_enqueue": 0.00015488
+          }
+        },
+        {
+          "reduction": "mean",
+          "weight": -0.25,
+          "loss": -0.625,
+          "gradient": 2.5,
+          "timing": {
+            "collective": 4.9823e-05,
+            "output_readback": 1.5007e-05,
+            "replica_enqueue": 0.00010814
+          }
+        }
+      ],
+      "probe_sha256": "7e48af87c60654459384d241a9715f9158fa54cc7aeb41dde1348b2930da603c"
+    }
+  },
+  "parity": {
+    "cases": 8,
+    "steps_per_case": 5,
+    "max_loss_error": 1.4901161193847656e-08,
+    "max_gradient_error": 1.4901161193847656e-08,
+    "tolerance": 1e-05
+  },
+  "source_archive_sha256": "1ec941255de73b039c72f127837d196aa1fde124da06634044d40ce225af4c94",
+  "limitations": [
+    "Finite tests cannot prove the absence of all bugs.",
+    "Metal flushes float32 subnormal results.",
+    "Reduction timing overhead is observed; resident PINN training was not remeasured.",
+    "Linux aarch64 and the full Linux wheel/Python matrix remain unverified."
+  ]
+}

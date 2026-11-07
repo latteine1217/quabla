@@ -1,0 +1,27 @@
+Sat Nov  7 03:09:55 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 560.35.05              Driver Version: 560.35.05      CUDA Version: 12.6     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3090        On  |   00000000:3B:00.0 Off |                  N/A |
+| 46%   51C    P0            118W /  250W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 3090        On  |   00000000:AF:00.0 Off |                  N/A |
+| 33%   28C    P8             25W /  250W |       2MiB /  24576MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+native source identity and binary reuse verified; Python source: /home/junyi/quabla-v110-audit-20261107-03/python/quabla/__init__.py
+{"checks": 140, "device": "cuda:0", "package_version": "1.0.3", "probe_sha256": "5638eb8f706138306c15ea4a2da0abe7a2406f07b3c68281f3d3c38e3898deae", "seeds": [103, 1701, 65537, 8675309], "status": "passed"}
+{"status":"passed","job_id":"6942"}

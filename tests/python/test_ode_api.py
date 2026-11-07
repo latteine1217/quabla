@@ -828,6 +828,54 @@ def backward_euler_closed_form(k, y0):
     return (vectors @ scaled.reshape([-1, 1])).sum()
 
 
+def test_fixed_saveat_mesh_knots_preserve_time_derivatives():
+    def rhs(y, t):
+        return y * 0.0 + 1.0
+
+    for method in ("euler", "heun", "rk4"):
+        def endpoint(end):
+            return qb.ode.odeint(
+                rhs, qb.array([0.0]), (0.0, end), steps=16, method=method,
+                saveat=qb.array([0.5]),
+            ).sum()
+
+        def query(time):
+            return qb.ode.odeint(
+                rhs, qb.array([0.0]), (0.0, 1.0), steps=16, method=method,
+                saveat=time.reshape([1]),
+            ).sum()
+
+        for function, argument, expected in (
+            (endpoint, qb.array(1.0), 0.0), (query, qb.array(0.5), 1.0),
+        ):
+            derivative = qb.grad(function)
+            for execute in (derivative, qb.jit(derivative)):
+                assert math.isclose(execute(argument).item(), expected, abs_tol=1e-12)
+
+
+def test_fixed_methods_preserve_finite_extreme_time_grids():
+    y0 = qb.array([0.0])
+
+    def rhs(y, t):
+        return qb.where(t.isfinite(), y * 0.0 + 1e-308, float("nan"))
+
+    for method in ("euler", "heun", "rk4"):
+        for output in ("final", "trajectory", "saveat"):
+            options = {"save": True} if output == "trajectory" else {}
+            if output == "saveat":
+                options = {"saveat": qb.array([-1e308, 0.0, 1e308])}
+
+            def solve(y):
+                return qb.ode.odeint(rhs, y, (-1e308, 1e308), steps=16, method=method, **options)
+
+            for execute in (solve, qb.jit(solve)):
+                values = execute(y0).to_flat_list()
+                assert all(math.isfinite(value) for value in values), (method, output, values)
+                assert math.isclose(values[-1], 2.0, rel_tol=1e-12), values
+                if output == "saveat":
+                    assert values[0] == 0.0 and math.isclose(values[1], 1.0, rel_tol=1e-12)
+
+
 def test_implicit_time_stepping_with_cg_has_closed_form_derivatives():
     # Each step calls linalg.cg; derivatives in k come from cg's implicit
     # rules inside the loop's reverse, forward, and second-order passes.

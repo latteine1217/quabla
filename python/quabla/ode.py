@@ -278,7 +278,10 @@ def _save(dense, saveat, saved, t, t_new, dt, direction, take):
     # A finished iteration has dt = 0; the guard keeps the unselected theta
     # finite, so its zero cotangent does not turn into NaN.
     safe = _quabla.where(dt.equal(0.0), 1.0, dt)
-    theta = minimum(maximum((times - t) / safe, 0.0), 1.0)
+    # The window already bounds theta. Clipping it again discards the time
+    # derivative at mesh knots; inactive queries bind to t before division.
+    point = _quabla.where(inside, times, t)
+    theta = (point - t) / safe
     return _quabla.where(inside, dense(theta), saved)
 
 
@@ -420,6 +423,19 @@ def _step(f, method, y, t, dt, args, first=None):
     return y + dt * increment
 
 
+def _fixed_dt(t0, t1, steps):
+    """Divide before subtracting if a finite-endpoint span overflows."""
+    span = t1 - t0
+    return _quabla.where(span.isfinite(), span / steps, t1 / steps - t0 / steps)
+
+
+def _fixed_time(t0, t1, dt, index, steps):
+    """Keep the regular grid's evaluation order unless its span overflows."""
+    fraction = index / steps
+    weighted = t0 * (1.0 - fraction) + t1 * fraction
+    return _quabla.where((t1 - t0).isfinite(), t0 + index * dt, weighted)
+
+
 def _fixed_saveat(f, method, y0, t0, t1, steps, saveat, args):
     """Fixed steps with the states at `saveat` from cubic Hermite
     interpolation of each step. The end slope f(y_new, t_new) is carried
@@ -428,7 +444,7 @@ def _fixed_saveat(f, method, y0, t0, t1, steps, saveat, args):
     per solve, not per step, and the steps are those of the solve without
     `saveat`."""
     shape, size, count = y0.shape, math.prod(y0.shape), saveat.shape[0]
-    dt = (t1 - t0) / steps
+    dt = _fixed_dt(t0, t1, steps)
     direction = _quabla.where(t1 >= t0, 1.0, -1.0).astype(y0.dtype)
     f0 = asarray(f(y0, t0, *args))
     initial = [
@@ -442,7 +458,8 @@ def _fixed_saveat(f, method, y0, t0, t1, steps, saveat, args):
         y = carry[:size].reshape(shape)
         k1 = carry[size : 2 * size].reshape(shape)
         saved = carry[2 * size :].reshape([count, size])
-        t, t_next = t0 + i * dt, t0 + (i + 1) * dt
+        t = _fixed_time(t0, t1, dt, i, steps)
+        t_next = _fixed_time(t0, t1, dt, i + 1, steps)
         y_new = _step(f, method, y, t, dt, args, first=k1)
         k2 = asarray(f(y_new, t_next, *args))
         # The last step closes the window at t1 itself, which t0 + steps * dt
@@ -610,19 +627,19 @@ def odeint(
         raise ValueError("info=True is only available for the adaptive methods")
     if saveat is not None:
         return _fixed_saveat(f, method, y0, t0, t1, steps, saveat, args)
-    dt = (t1 - t0) / steps
+    dt = _fixed_dt(t0, t1, steps)
     # The loop index is a scalar array of the state dtype inside a region and
     # a Python int otherwise; both give `t0 + i * dt` in the state dtype.
-    operands = (t0, dt, *args)
+    operands = (t0, t1, dt, *args)
 
-    def advance(i, y, t0, dt, *args):
-        return _step(f, method, y, t0 + i * dt, dt, args)
+    def advance(i, y, t0, t1, dt, *args):
+        return _step(f, method, y, _fixed_time(t0, t1, dt, i, steps), dt, args)
 
     if not save:
         return fori_loop(0, steps, advance, y0, operands=operands)
 
-    def record(y, i, t0, dt, *args):
-        next_y = advance(i, y, t0, dt, *args)
+    def record(y, i, t0, t1, dt, *args):
+        next_y = advance(i, y, t0, t1, dt, *args)
         return next_y, next_y
 
     _, states = scan(record, y0, length=steps, operands=operands)

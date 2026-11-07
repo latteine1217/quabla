@@ -1,0 +1,5 @@
+    Blocking waiting for file lock on build directory
+    Checking pyo3-ffi v0.29.2
+    Checking pyo3 v0.29.2
+    Checking quabla-python v1.0.3 (/Users/latteine/Documents/coding/nabla/crates/quabla-python)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.88s

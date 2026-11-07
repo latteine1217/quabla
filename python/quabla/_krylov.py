@@ -77,12 +77,23 @@ def _dot(u, v):
 
 
 def _norm(v):
-    """The 2-norm as `sqrt(v . v)`. The rescaling of `Tensor.norm` by
-    `max|v|` would buy nothing here: the squared norm only overflows beyond
-    about 1e154 in float64 and 1e19 in float32, where the CG and GMRES inner
-    products overflow anyway, and skipping the extra reduction keeps every
-    loop iteration cheaper."""
-    return _dot(v, v).sqrt()
+    """A scaled norm keeps residual diagnostics valid at extreme magnitudes."""
+    return v.norm()
+
+
+def _normalize_rhs(b, x0):
+    """Normalize RHS and initial-guess magnitudes before Krylov inner products.
+
+    Linearity preserves the operator and preconditioner; the solution and
+    absolute tolerance must be scaled by the same factor as the RHS.
+    """
+    rhs_peak = b.abs().max()
+    # A homogeneous linear system already has the exact solution zero;
+    # iterating from x0 cannot meet a zero relative threshold reliably.
+    x0 = _quabla.where(_quabla.equal(rhs_peak, 0.0), 0.0, x0)
+    peak = rhs_peak.maximum(x0.abs().max())
+    scale = _quabla.where(peak.isfinite() & (peak > 0.0), peak, 1.0)
+    return b / scale, x0 / scale, scale
 
 
 def _linear_adjoint(build, apply, precondition, symmetric):
@@ -130,7 +141,7 @@ def _linear_tangent(build, apply, precondition):
 
 def _threshold(b, tol, atol):
     """The residual norm at which a solve stops: `max(tol * ||b||, atol)`."""
-    return (_norm(b) * tol).maximum(atol)
+    return _norm(b * tol).maximum(atol)
 
 
 # -- conjugate gradients ----------------------------------------------------------
@@ -147,9 +158,10 @@ def _cg_solve(apply, precondition, tol, atol, maxiter):
     def solve(b, x0, *args):
         n = b.shape[0]
         arrays, rebuild = split_args(args)
+        b, x0, scale = _normalize_rhs(b, x0)
         r = b - apply(x0, *args)
         z = precondition(r, *args)
-        threshold = _threshold(b, tol, atol)
+        threshold = _threshold(b, tol, atol / scale)
         carry = _quabla.concat(
             _bindings((x0, r, z, _dot(r, z).reshape([1]), zeros([1], b.dtype))), 0
         )
@@ -157,17 +169,19 @@ def _cg_solve(apply, precondition, tol, atol, maxiter):
         def unpack(carry):
             return carry[:n], carry[n : 2 * n], carry[2 * n : 3 * n], carry[3 * n], carry[3 * n + 1]
 
-        def running(carry, threshold, *arrays):
+        def running(carry, b, threshold, *arrays):
             _, r, _, _, k = unpack(carry)
             return (_norm(r) > threshold) & (k < maxiter)
 
-        def step(carry, threshold, *arrays):
+        def step(carry, b, threshold, *arrays):
             args = rebuild(*arrays)
             x, r, p, rz, k = unpack(carry)
             ap = apply(p, *args)
             alpha = rz / _dot(p, ap)
             x = x + alpha * p
-            r = r - alpha * ap
+            # Recompute the residual: recursive subtraction can report
+            # convergence before the actual float32 iterate is accurate.
+            r = b - apply(x, *args)
             z = precondition(r, *args)
             rz_next = _dot(r, z)
             p = z + (rz_next / rz) * p
@@ -175,10 +189,11 @@ def _cg_solve(apply, precondition, tol, atol, maxiter):
                 [x, r, p, rz_next.reshape([1]), (k + 1.0).reshape([1])], 0
             )
 
-        carry = while_loop(running, step, carry, operands=(threshold, *arrays))
+        carry = while_loop(running, step, carry, operands=(b, threshold, *arrays))
         x, r, _, _, k = unpack(carry)
-        converged = (_norm(r) <= threshold).astype(b.dtype)
-        return x, _quabla.concat(_bindings((k.reshape([1]), converged.reshape([1]))), 0)
+        residual_norm = _norm(r)
+        converged = (residual_norm.isfinite() & (residual_norm <= threshold)).astype(b.dtype)
+        return x * scale, _quabla.concat(_bindings((k.reshape([1]), converged.reshape([1]))), 0)
 
     return solve
 
@@ -223,7 +238,8 @@ def _gmres_solve(apply, precondition, tol, atol, restart, maxiter):
         m = min(restart, n)
         dtype = b.dtype
         arrays, rebuild = split_args(args)
-        threshold = _threshold(b, tol, atol)
+        b, x0, scale = _normalize_rhs(b, x0)
+        threshold = _threshold(b, tol, atol / scale)
         rows = arange(m + 1, dtype=dtype)
         columns = arange(m, dtype=dtype)
         basis_size, triangle_size, rotation_size = (m + 1) * n, m * m, (m + 1) * (m + 1)
@@ -343,8 +359,9 @@ def _gmres_solve(apply, precondition, tol, atol, restart, maxiter):
         carry = _quabla.concat(_bindings((x0, r, zeros([2], dtype))), 0)
         carry = while_loop(running, cycle, carry, operands=(b, threshold, *arrays))
         x, r, _, iterations = unpack(carry)
-        converged = (_norm(r) <= threshold).astype(dtype)
-        return x, _quabla.concat(_bindings((iterations.reshape([1]), converged.reshape([1]))), 0)
+        residual_norm = _norm(r)
+        converged = (residual_norm.isfinite() & (residual_norm <= threshold)).astype(dtype)
+        return x * scale, _quabla.concat(_bindings((iterations.reshape([1]), converged.reshape([1]))), 0)
 
     return solve
 
@@ -398,14 +415,18 @@ def _setup(name, matvec, b, x0, args, tol, atol, M):
     )
 
 
-def _result(name, matvec, b, x, stats, args, info, advice):
+def _result(name, matvec, b, x, stats, args, info, tol, atol, advice):
     x = x.reshape(list(b.shape))
     stats = stats.stop_gradient()
     residual = b - asarray(matvec(x.stop_gradient(), *args))
+    residual_norm = _norm(residual).stop_gradient()
     details = {
         "iterations": stats[0],
-        "residual_norm": _norm(residual).stop_gradient(),
-        "success": stats[1] > 0.5,
+        "residual_norm": residual_norm,
+        "success": (
+            (stats[1] > 0.5) & residual_norm.isfinite()
+            & (residual_norm <= _threshold(b, tol, atol))
+        ),
     }
     return finish(name, x, details, info, advice)
 
@@ -491,7 +512,7 @@ def cg(
     solve = _cg(apply, precondition, tol, atol, maxiter, ORDER)
     x, stats = solve(flat_b, flat_x0, *args)
     return _result(
-        "cg", matvec, flat_b.reshape(shape), x, stats, args, info,
+        "cg", matvec, flat_b.reshape(shape), x, stats, args, info, tol, atol,
         "increase maxiter, add a preconditioner M, or check that A is positive definite",
     )
 
@@ -565,6 +586,6 @@ def gmres(
     solve = _gmres(apply, precondition, tol, atol, restart, maxiter, ORDER)
     x, stats = solve(flat_b, flat_x0, *args)
     return _result(
-        "gmres", matvec, flat_b.reshape(shape), x, stats, args, info,
+        "gmres", matvec, flat_b.reshape(shape), x, stats, args, info, tol, atol,
         "increase maxiter or restart, or add a preconditioner M",
     )

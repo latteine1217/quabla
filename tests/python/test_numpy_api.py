@@ -391,6 +391,146 @@ def test_gradients_match_central_differences():
         check_gradient(function, *arguments)
 
 
+def test_mean_and_constant_variance_do_not_overflow_finite_results():
+    for dtype, magnitude in ((qb.float32, 3e38), (qb.float64, 1e308)):
+        x = qb.full([2, 3], magnitude, dtype=dtype)
+        expected = x.to_flat_list()[0]
+        for axis in (None, 0, 1, (0, 1)):
+            def means(x):
+                return x.mean(axis=axis, keepdims=True)
+
+            for execute in (means, qb.jit(means)):
+                assert all(math.isclose(v, expected, rel_tol=1e-6)
+                           for v in execute(x).to_flat_list())
+            for function in (qb.var, qb.std):
+                def spread(x):
+                    return function(x, axis=axis)
+                for execute in (spread, qb.jit(spread)):
+                    assert all(v == 0.0 for v in execute(x).to_flat_list())
+        actual = qb.grad(lambda x: x.mean())(x).to_flat_list()
+        assert all(math.isclose(v, 1 / 6, rel_tol=1e-6) for v in actual)
+
+
+def test_mean_handles_overflowing_cancellation_and_dtype_maximum():
+    import sys
+
+    for values, expected in (([1e308, 1e308, -1e308, -1e308], 0.0),
+                             ([sys.float_info.max] * 3, sys.float_info.max)):
+        x = qb.array(values)
+        for execute in (qb.mean, qb.jit(qb.mean)):
+            assert execute(x).item() == expected
+    x = qb.array([1e154, -1e154])
+    for execute in (qb.var, qb.jit(qb.var)):
+        assert math.isclose(execute(x).item(), 1e308, rel_tol=1e-12)
+    x = qb.array([[5e-324, 5e-324]])
+    for axis in (None, 1):
+        assert x.mean(axis=axis).item() == 5e-324
+
+
+def test_scaled_variance_and_standard_deviation_extremes():
+    import sys
+
+    for magnitude in (sys.float_info.max, 1e308, 1e154, 1e-150):
+        x = qb.full([2, 3], magnitude)
+        for axis in (None, 0, 1, (0, 1)):
+            for function in (qb.var, qb.std):
+                for execute in (function, qb.jit(function)):
+                    assert all(v == 0.0 for v in execute(x, axis=axis).to_flat_list())
+    for magnitude in (1e308, 1e154, 1e-150):
+        x = qb.array([magnitude, -magnitude])
+        for execute in (qb.std, qb.jit(qb.std)):
+            assert math.isclose(execute(x).item(), magnitude, rel_tol=1e-12)
+        same(qb.grad(qb.std)(x), [0.5, -0.5], 1e-12)
+
+
+def test_spread_of_adjacent_large_floats_retains_precision():
+    for magnitude in (1e8, 1e154, 1e308, 1e-150):
+        neighbor = math.nextafter(magnitude, INF)
+        spread = (neighbor - magnitude) * 0.5
+        x = qb.array([magnitude, neighbor])
+        for execute in (qb.std, qb.jit(qb.std)):
+            assert execute(x).item() == spread
+        same(qb.grad(qb.std)(x), [-0.5, 0.5], 1e-12)
+        if math.isfinite(spread * spread):
+            for execute in (qb.var, qb.jit(qb.var)):
+                assert execute(x).item() == spread * spread
+
+
+def test_device_mean_and_variance_extreme_reduction_shapes():
+    for device in devices():
+        for shape in ([2, 3], [2, 600], [600, 2]):
+            x = qb.full(shape, 3e38, dtype=qb.float32)
+            expected = x.to_flat_list()[0]
+            for axis in (None, 0, 1):
+                for function in (qb.mean, qb.var, qb.std):
+                    def reduce(x):
+                        return function(x, axis=axis)
+                    result = qb.jit(reduce, device=device)(x).to_flat_list()
+                    want = expected if function is qb.mean else 0.0
+                    assert all(math.isclose(v, want, rel_tol=2e-6) for v in result), (
+                        device, shape, axis, function, result)
+        x = qb.array([3e38] * 300 + [-3e38] * 300, dtype=qb.float32)
+        assert qb.jit(qb.mean, device=device)(x).item() == 0.0
+        assert math.isclose(qb.jit(qb.std, device=device)(x).item(),
+                            x.to_flat_list()[0], rel_tol=2e-6)
+        gradient = qb.jit(qb.grad(qb.mean), device=device)(x)
+        same(gradient, [1 / 600] * 600, 1e-7)
+        for values, expected in (([INF, 1.0], INF), ([-INF, 1.0], -INF),
+                                 ([INF, -INF], NAN), ([NAN, 1.0], NAN)):
+            same(qb.jit(qb.mean, device=device)(qb.array(values, dtype=qb.float32)), [expected])
+
+
+def test_gelu_extreme_finite_values_preserve_first_and_second_derivatives():
+    for dtype, values in (
+        (qb.float32, [1e20, -1e20, 1e30, -1e30]),
+        (qb.float64, [1e200, -1e200, 1e308, -1e308]),
+    ):
+        x = qb.array(values, dtype=dtype)
+
+        def total(x):
+            return qb.gelu(x).sum()
+
+        gradient = qb.grad(total)
+        curvature = qb.grad(lambda x: gradient(x).sum())
+        expected = [value if value > 0 else 0.0 for value in x.to_flat_list()]
+        for execute in (qb.gelu, qb.jit(qb.gelu)):
+            assert execute(x).to_flat_list() == expected
+        for execute in (gradient, qb.jit(gradient)):
+            assert execute(x).to_flat_list() == [1.0, 0.0, 1.0, 0.0]
+        for execute in (curvature, qb.jit(curvature)):
+            assert execute(x).to_flat_list() == [0.0] * 4
+
+
+def test_interp_extreme_finite_intervals_keep_knots_and_gradients():
+    xp, fp = qb.array([-1e308, 1e308]), qb.array([0.0, 1.0])
+    query = qb.array([-1e308, 0.0, 1e308])
+    for execute in (qb.interp, qb.jit(qb.interp)):
+        assert execute(query, xp, fp).tolist() == [0.0, 0.5, 1.0]
+    derivative = qb.grad(lambda x: qb.interp(x, xp, fp))
+    for execute in (derivative, qb.jit(derivative)):
+        assert math.isclose(execute(qb.array(0.0)).item(), 5e-309, rel_tol=1e-12)
+
+
+def test_trapezoid_preserves_representable_extreme_scale_integrals():
+    cases = (
+        (qb.array([1e308, 1e308]), qb.array([0.0, 1e-308]), 1.0),
+        (qb.array([1e-308, 1e-308]), qb.array([-1e308, 1e308]), 2.0),
+        (qb.array([5e-324, 5e-324]), qb.array([0.0, 1e308]), 5e-324 * 1e308),
+    )
+    for y, x, expected in cases:
+        for execute in (qb.trapezoid, qb.jit(qb.trapezoid)):
+            actual = execute(y, x).item()
+            assert math.isclose(actual, expected, rel_tol=1e-12), (actual, expected)
+    def integral(y):
+        return qb.trapezoid(y, dx=1e-308)
+    for execute in (integral, qb.jit(integral)):
+        assert math.isclose(execute(qb.array([1e308, 1e308])).item(), 1.0, rel_tol=1e-12)
+    derivative = qb.grad(lambda y: qb.trapezoid(y, qb.array([-1e308, 1e308])))
+    for execute in (derivative, qb.jit(derivative)):
+        for value in execute(qb.array([1e-308, 1e-308])).to_flat_list():
+            assert math.isclose(value, 1e308, rel_tol=1e-12), value
+
+
 def test_interp_gradients_in_x_xp_and_fp():
     xp = qb.asarray([0.0, 1.0, 3.0, 4.0])
     fp = qb.asarray([1.0, 3.0, -1.0, 0.5])

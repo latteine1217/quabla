@@ -305,11 +305,14 @@ class LBFGS:
             direction = _direction(g, pairs)
             slope = _dot(g, direction)
             if not (slope < 0 and _math.isfinite(slope)):
-                # Roundoff can make -Hg a non-descent direction; restart
-                # from steepest descent.
+                # Scale steepest descent before its dot product so tiny
+                # gradients do not underflow to a zero directional slope.
                 pairs.clear()
-                direction = g * -1.0
-                slope = -_dot(g, g)
+                direction = (g / grad_norm) * -1.0
+                slope = _dot(g, direction)
+                if not (slope < 0 and _math.isfinite(slope)):
+                    reason = "line_search_failed"
+                    break
             # Unit steps suit a scaled quasi-Newton direction; the first
             # steepest-descent step is limited to unit length.
             step = 1.0 if pairs else min(1.0, 1 / _math.sqrt(-slope))

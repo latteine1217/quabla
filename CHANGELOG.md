@@ -8,6 +8,49 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
 
 ## [Unreleased]
 
+### Fixed
+
+- CPU, MLX and CUDA mean reductions retry finite-input overflow at a safe
+  scale, preserving ordinary cancellation and existing NaN/infinity handling.
+  CPU means also recover subnormal results lost by division before addition.
+- Variance uses binary scaling and sample centering to preserve narrow spreads
+  near large offsets and avoid overflowing intermediate sums of squares.
+  Standard deviation uses a scaled norm, retaining finite values and gradients
+  even when the variance itself overflows. Reordered arithmetic can change
+  last-bit rounding and adds reduction overhead; measured costs and hardware
+  limits are recorded in `docs/benchmarks/v110-audit-20261108-04/README.md`.
+- Approximate GELU avoids cubic overflow for extreme finite inputs, keeping
+  its first and second derivatives finite in float32 and float64. Its
+  existing NaN/infinity behaviour is preserved.
+- Saving to a binary stream completes partial writes and rejects stalled
+  writers instead of silently returning a truncated file. Loading rejects
+  malformed dtype/version metadata, duplicate dict keys, invalid bool bytes,
+  overflowing float encodings and excessive nesting with `ValueError`.
+- Python scalar `cond` predicates reject NaN and infinities like Tensor
+  predicates. Eager `while_loop` predicates require a scalar bool, matching
+  traced execution and preventing invalid float predicates from entering
+  the body.
+- `interp` preserves finite knot values and query gradients when an interval
+  width overflows. `trapezoid` avoids intermediate endpoint-sum and spacing
+  overflow when the integral and endpoint gradients remain representable;
+  the reordered arithmetic can change last-bit rounding.
+- Fixed-step Euler, Heun and RK4 construct finite step sizes and time grids
+  for finite endpoints whose span overflows, including trajectories and
+  `saveat` output. Saving exactly at an internal mesh knot preserves the
+  query-time and endpoint derivatives instead of clipping them away.
+- CG and GMRES normalize the right-hand side, initial guess, and absolute
+  tolerance to avoid overflow and underflow from RHS or initial-guess
+  magnitudes. A zero RHS uses the exact zero solution. Scaled
+  residual norms and a final true-residual check prevent false convergence
+  for extreme or non-finite inputs, including under `jit` and `vmap`.
+- L-BFGS rescales its steepest-descent fallback when the directional slope
+  underflows or overflows, avoiding division by zero for tiny gradients.
+- Cosine and warmup schedules preserve finite endpoints without cancellation
+  from large `alpha` or overflow from opposite-sign warmup endpoints,
+  including zero or tiny peaks. Exponential schedules handle intermediate
+  power overflow and underflow when the final scaled value is representable,
+  with or without an endpoint bound.
+
 ## [1.0.3] - 2026-11-07
 
 ### Added

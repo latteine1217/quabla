@@ -1839,6 +1839,16 @@ impl DynamicTensor {
                     *output += self.data.get(source_start + column) * scale;
                 }
             }
+            if scale != 1.0 {
+                for (column, output) in output_block.iter_mut().enumerate() {
+                    *output = finite_mean_fallback(
+                        (0..reduced)
+                            .map(|row| self.data.get((outer * reduced + row) * inner + column)),
+                        reduced,
+                        *output,
+                    );
+                }
+            }
         }
 
         Self::new(output_shape, data)
@@ -2034,7 +2044,14 @@ impl DynamicTensor {
     }
 
     fn mean_all(&self) -> Result<Self, String> {
-        self.sum_all()?.scale(1.0 / self.data.len() as f64)
+        let count = self.data.len();
+        let ordinary = self.data.iter().sum::<f64>() * (1.0 / count as f64);
+        let value = finite_mean_fallback(
+            (0..count).map(|index| self.data.get(index)),
+            count,
+            ordinary,
+        );
+        Self::new(vec![], vec![value])
     }
 
     fn powi(&self, exponent: u32) -> Result<Self, String> {
@@ -15367,6 +15384,29 @@ fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
         strides[axis - 1] = strides[axis] * shape[axis];
     }
     strides
+}
+
+/// Retry overflowed or zero finite-input means; ordinary nonzero results are unchanged.
+fn finite_mean_fallback(
+    values: impl Iterator<Item = f64> + Clone,
+    count: usize,
+    ordinary: f64,
+) -> f64 {
+    if ordinary.is_finite() && ordinary != 0.0 {
+        return ordinary;
+    }
+    let mut peak = 0.0_f64;
+    for value in values.clone() {
+        if !value.is_finite() {
+            return ordinary;
+        }
+        peak = peak.max(value.abs());
+    }
+    if peak == 0.0 || (ordinary == 0.0 && peak >= f64::MIN_POSITIVE) {
+        return ordinary;
+    }
+    let normalized = values.map(|value| value / peak).sum::<f64>() / count as f64;
+    peak * normalized.clamp(-1.0, 1.0)
 }
 
 fn normalize_axis(axis: isize, rank: usize) -> Result<usize, String> {

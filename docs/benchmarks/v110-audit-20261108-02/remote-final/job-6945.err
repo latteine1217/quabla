@@ -1,0 +1,54 @@
+Currently Loaded Modulefiles:
+ 1) rust/stable   2) cuda/12.6  
+🍹 Building a mixed python/rust project
+🐍 Found CPython 3.13 at /home/junyi/quabla-v110-audit-20261108-02/.venv/bin/python
+🔗 Found pyo3 bindings
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling target-lexicon v0.13.5
+   Compiling libc v0.2.186
+   Compiling cfg-if v1.0.4
+   Compiling libm v0.2.16
+   Compiling heck v0.5.0
+   Compiling cudarc v0.19.10
+   Compiling pyo3-build-config v0.29.2
+   Compiling libloading v0.9.0
+   Compiling syn v2.0.119
+   Compiling pyo3-ffi v0.29.2
+   Compiling pyo3 v0.29.2
+   Compiling syn v3.0.6
+   Compiling pyo3-macros-backend v0.29.2
+   Compiling quabla-macros v1.0.3 (/home/junyi/quabla-v110-audit-20261108-02/crates/quabla-macros)
+   Compiling once_cell v1.21.4
+   Compiling pyo3-macros v0.29.2
+   Compiling quabla-core v1.0.3 (/home/junyi/quabla-v110-audit-20261108-02/crates/quabla-core)
+error[E0308]: mismatched types
+   --> crates/quabla-core/src/tensor_ir/cuda_real.rs:327:45
+    |
+327 |   const DOUBLE_CONSTANTS: [(&str, &str); 3] = [
+    |  _________________________-----------------___^
+    | |                         |
+    | |                         expected because of the type of the constant
+328 | |     (
+329 | |         "__int_as_float(0x7fc00000)",
+330 | |         "__longlong_as_double(0x7ff8000000000000LL)",
+...   |
+337 | |     ("1.1754943508222875e-38f", "2.2250738585072014e-308"),
+338 | | ];
+    | |_^ expected an array with a size of 3, found one with a size of 4
+    |
+    = note: expected array `[(&'static str, &'static str); 3]`
+               found array `[(&'static str, &'static str); 4]`
+help: consider specifying the actual array length
+    |
+327 - const DOUBLE_CONSTANTS: [(&str, &str); 3] = [
+327 + const DOUBLE_CONSTANTS: [(&str, &str); 4] = [
+    |
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `quabla-core` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+💥 maturin failed
+  Caused by: Failed to build a native library through cargo
+  Caused by: Cargo build finished with "exit status: 101": `env -u CARGO PYO3_BUILD_EXTENSION_MODULE="1" PYO3_ENVIRONMENT_SIGNATURE="cpython-3.13-64bit" PYO3_PYTHON="/home/junyi/quabla-v110-audit-20261108-02/.venv/bin/python" PYTHON_SYS_EXECUTABLE="/home/junyi/quabla-v110-audit-20261108-02/.venv/bin/python" "cargo" "rustc" "--profile" "release" "--features" "cuda-nccl" "--message-format" "json-render-diagnostics" "--locked" "--offline" "--manifest-path" "/home/junyi/quabla-v110-audit-20261108-02/crates/quabla-python/Cargo.toml" "--lib" "--crate-type" "cdylib"`

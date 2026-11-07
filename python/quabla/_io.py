@@ -41,6 +41,7 @@ import json
 import os
 import struct
 import sys
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, BinaryIO, TypeAlias
 
 from ._quabla import Tensor, TensorView, TraceTensor
@@ -81,13 +82,15 @@ def save(file: _File, tree: Any) -> None:
     header = {"format": "quabla", "version": VERSION, "tree": _encode(tree, chunks, [0])}
     header = json.dumps(header, allow_nan=False, separators=(",", ":")).encode()
     payload = [MAGIC, _HEADER_SIZE.pack(len(header)), header, *chunks]
-    if _has(file, "write"):
+    context = nullcontext(file) if _has(file, "write") else open(os.fspath(file), "wb")
+    with context as handle:
         for chunk in payload:
-            file.write(chunk)
-    else:
-        with open(os.fspath(file), "wb") as handle:
-            for chunk in payload:
-                handle.write(chunk)
+            pending = memoryview(chunk)
+            while pending:
+                written = handle.write(pending)
+                if written is None or written <= 0 or written > len(pending):
+                    raise OSError("quabla.save stream did not make valid write progress")
+                pending = pending[written:]
 
 
 def load(file: _File) -> Any:
@@ -111,16 +114,19 @@ def load(file: _File) -> Any:
         raise ValueError("truncated quabla save file (incomplete header)")
     try:
         header = json.loads(bytes(content[prefix : prefix + size]), parse_constant=_reject_constant)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise ValueError(f"malformed quabla save file header: {error}") from None
     if not isinstance(header, dict) or header.get("format") != "quabla":
         raise ValueError("malformed quabla save file header: not a quabla header")
-    if header.get("version") != VERSION:
+    if type(header.get("version")) is not int or header.get("version") != VERSION:
         raise ValueError(
             f"unsupported quabla save file version {header.get('version')!r}; this quabla "
             f"reads version {VERSION}"
         )
-    return _decode(header.get("tree"), content[prefix + size :])
+    try:
+        return _decode(header.get("tree"), content[prefix + size :])
+    except RecursionError:
+        raise ValueError("malformed quabla save file header: tree nesting is too deep") from None
 
 
 def _reject_constant(name):
@@ -197,7 +203,7 @@ def _decode(node, data):
     if kind == "float":
         try:
             return float.fromhex(node["value"])
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):
             raise ValueError(f"malformed quabla save file header: bad float node {node!r}") from None
     if kind in ("list", "tuple"):
         items = node.get("items")
@@ -212,6 +218,7 @@ def _decode(node, data):
             or type(values) is not list
             or len(keys) != len(values)
             or any(type(key) is not str and type(key) is not int for key in keys)
+            or len(set(keys)) != len(keys)
         ):
             raise ValueError("malformed quabla save file header: bad dict node")
         return {key: _decode(value, data) for key, value in zip(keys, values)}
@@ -224,7 +231,8 @@ def _decode_array(node, data):
     dtype, shape = node.get("dtype"), node.get("shape")
     offset, nbytes = node.get("offset"), node.get("nbytes")
     if (
-        dtype not in _DTYPES
+        type(dtype) is not str
+        or dtype not in _DTYPES
         or type(shape) is not list
         or any(type(extent) is not int or extent < 0 for extent in shape)
         or type(offset) is not int
@@ -245,6 +253,8 @@ def _decode_array(node, data):
         raise ValueError("truncated quabla save file (array data past the end of the file)")
     raw = data[offset : offset + nbytes]
     if width == 1:
+        if any(byte not in (0, 1) for byte in raw):
+            raise ValueError("malformed quabla save file: bool data must contain only 0 or 1")
         flat = raw.cast(code)
     else:
         # Copied into an `array`, whose storage is aligned for its element

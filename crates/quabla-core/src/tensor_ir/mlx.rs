@@ -1249,9 +1249,10 @@ impl MlxBackend {
                 TensorOp::Sum { input } => mlx_value(&values, *input)?
                     .sum_device(None, &stream)
                     .map_err(|error| error.to_string()),
-                TensorOp::Mean { input } => mlx_value(&values, *input)?
-                    .mean_device(None, &stream)
-                    .map_err(|error| error.to_string()),
+                TensorOp::Mean { input } => {
+                    mlx_finite_mean(mlx_value(&values, *input)?, None, &stream)
+                        .map_err(|error| error.to_string())
+                }
                 TensorOp::SumAxis { input, axis } => mlx_value(&values, *input)?
                     .sum_axis_device(
                         i32::try_from(*axis).map_err(|_| "MLX sum axis exceeds i32".to_string())?,
@@ -1266,14 +1267,15 @@ impl MlxBackend {
                     &stream,
                 )
                 .map_err(|error| error.to_string()),
-                TensorOp::MeanAxis { input, axis } => mlx_value(&values, *input)?
-                    .mean_axis_device(
+                TensorOp::MeanAxis { input, axis } => mlx_finite_mean(
+                    mlx_value(&values, *input)?,
+                    Some(
                         i32::try_from(*axis)
                             .map_err(|_| "MLX mean axis exceeds i32".to_string())?,
-                        None,
-                        &stream,
-                    )
-                    .map_err(|error| error.to_string()),
+                    ),
+                    &stream,
+                )
+                .map_err(|error| error.to_string()),
                 TensorOp::Reshape { input } => mlx_value(&values, *input)?
                     .reshape_device(&mlx_shape(&node.shape)?, &stream)
                     .map_err(|error| error.to_string()),
@@ -2384,6 +2386,56 @@ fn mlx_fmod(
         &signed,
         stream,
     )
+}
+
+/// Keep ordinary mean results; rescale finite inputs if accumulation overflowed.
+fn mlx_finite_mean(
+    input: &Array,
+    axis: Option<i32>,
+    stream: &StreamOrDevice,
+) -> Result<Array, mlx_rs::error::Exception> {
+    let reduce = |value: &Array| match axis {
+        Some(axis) => value.mean_axis_device(axis, None, stream),
+        None => value.mean_device(None, stream),
+    };
+    let ordinary = reduce(input)?;
+    let magnitude = input.abs_device(stream)?;
+    let peak = match axis {
+        Some(axis) => magnitude.max_axis_device(axis, true, stream)?,
+        None => magnitude.max_device(None, stream)?,
+    };
+    let finite = peak.is_finite_device(stream)?;
+    let usable = ops::logical_and_device(
+        &finite,
+        peak.gt_device(Array::from_f32(0.0), stream)?,
+        stream,
+    )?;
+    let scale = ops::r#where_device(&usable, &peak, Array::from_f32(1.0), stream)?;
+    let normalized = reduce(&input.divide_device(&scale, stream)?)?;
+    let bounded = ops::minimum_device(
+        ops::maximum_device(normalized, Array::from_f32(-1.0), stream)?,
+        Array::from_f32(1.0),
+        stream,
+    )?;
+    let fallback =
+        bounded.multiply_device(scale.reshape_device(ordinary.shape(), stream)?, stream)?;
+    let retain = ops::logical_or_device(
+        ops::logical_and_device(
+            ordinary.is_finite_device(stream)?,
+            ops::logical_or_device(
+                ordinary.ne_device(Array::from_f32(0.0), stream)?,
+                peak.reshape_device(ordinary.shape(), stream)?
+                    .ge_device(Array::from_f32(f32::MIN_POSITIVE), stream)?,
+                stream,
+            )?,
+            stream,
+        )?,
+        usable
+            .reshape_device(ordinary.shape(), stream)?
+            .logical_not_device(stream)?,
+        stream,
+    )?;
+    ops::r#where_device(retain, ordinary, fallback, stream)
 }
 
 /// `TensorOp::ExtremumAxis` on MLX. MLX's max/min reductions propagate NaN

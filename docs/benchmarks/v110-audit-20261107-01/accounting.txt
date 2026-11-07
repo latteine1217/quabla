@@ -1,0 +1,5 @@
+JobID|State|ExitCode|Elapsed|AllocCPUS|ReqMem|MaxRSS|NodeList
+6939|COMPLETED|0:0|00:21:15|4|16G||acmt20
+6939.batch|COMPLETED|0:0|00:21:15|4|||acmt20
+6940|COMPLETED|0:0|00:02:04|4|4G||acmt20
+6940.batch|COMPLETED|0:0|00:02:04|4|||acmt20

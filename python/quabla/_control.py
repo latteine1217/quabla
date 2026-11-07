@@ -8,6 +8,7 @@ and eager bodies see a Python integer. Scan outputs stack on axis zero.
 from __future__ import annotations
 
 import math
+import numbers
 import operator
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
@@ -82,6 +83,10 @@ def _concrete_predicate(pred):
     non-finite one is rejected. `bool(Tensor)` cannot decide this, because
     a floating `Tensor` is always truthy."""
     if not isinstance(pred, _quabla.Tensor):
+        if isinstance(pred, numbers.Real) and (
+            pred != pred or pred == math.inf or pred == -math.inf
+        ):
+            raise ValueError("conditional predicate must be finite")
         return bool(pred)
     if pred.shape not in ([], [1]):
         raise ValueError(f"cond predicate must be scalar, got shape {list(pred.shape)}")
@@ -237,9 +242,10 @@ def while_loop(
 
 def _eager_predicate(value):
     value = asarray(value)
-    if len(value.shape) != 0:
+    if len(value.shape) != 0 or value.dtype != _quabla.bool_:
         raise TypeError(
-            f"while_loop cond_fun must return a scalar bool, got shape {value.shape}"
+            f"while_loop cond_fun must return a scalar bool, got shape {value.shape} "
+            f"and dtype {value.dtype}"
         )
     return bool(value)
 

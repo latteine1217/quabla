@@ -1,0 +1,13 @@
+    Finished `release` profile [optimized] target(s) in 0.12s
+     Running tests/tensor_ir.rs (target/release/deps/tensor_ir-b81257f244b147af)
+
+running 1 test
+test cuda_data_parallel_recreates_communicators_after_a_failed_call_on_two_gpus ... failure-contract attempt=0 error=missing input "x"; the plan's NCCL communicators were aborted and the next call recreates them
+failure-contract attempt=1 error=missing input "x"; the plan's NCCL communicators were aborted and the next call recreates them
+failure-contract recovered call=0 wall=110.291638ms timing=CudaDataParallelTiming { replica_enqueue: 109.509µs, collective: 71.540346ms, output_readback: 28.188µs }
+failure-contract recovered call=1 wall=146.183µs timing=CudaDataParallelTiming { replica_enqueue: 79.055µs, collective: 50.857µs, output_readback: 15.768µs }
+failure-contract recovered call=2 wall=114.538µs timing=CudaDataParallelTiming { replica_enqueue: 50.46µs, collective: 48.684µs, output_readback: 15.086µs }
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 214 filtered out; finished in 3.66s
+

@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-02/spread_probes.py", line 29, in <module>
+    assert all(math.isclose(a, b, rel_tol=1e-6) for a, b in zip(gradient, [-0.5, 0.5])), (dtype, exponent, gradient)
+           ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: (quabla.float64, 1000, [nan, nan])

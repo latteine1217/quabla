@@ -1,0 +1,55 @@
+python=3.10 interpreter=/Users/latteine/.local/share/uv/python/cpython-3.10.19-macos-aarch64-none/bin/python3.10
+Using CPython 3.10.19 interpreter at: /Users/latteine/.local/share/uv/python/cpython-3.10.19-macos-aarch64-none/bin/python3.10
+Creating virtual environment at: target/v110-python-matrix-mean4/py310/venv
+Activate with: source target/v110-python-matrix-mean4/py310/venv/bin/activate
+Using Python 3.10.19 environment at: target/v110-python-matrix-mean4/py310/venv
+Resolved 2 packages in 3ms
+Prepared 1 package in 10ms
+Installed 2 packages in 16ms
+ + numpy==2.2.6
+ + quabla==1.0.3 (from file:///Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py310/wheels/quabla-1.0.3-cp310-cp310-macosx_11_0_arm64.whl)
+python=3.10 passed
+python=3.11 interpreter=/Users/latteine/.local/share/uv/python/cpython-3.11.9-macos-aarch64-none/bin/python3.11
+Using CPython 3.11.9 interpreter at: /Users/latteine/.local/share/uv/python/cpython-3.11.9-macos-aarch64-none/bin/python3.11
+Creating virtual environment at: target/v110-python-matrix-mean4/py311/venv
+Activate with: source target/v110-python-matrix-mean4/py311/venv/bin/activate
+Using Python 3.11.9 environment at: target/v110-python-matrix-mean4/py311/venv
+Resolved 2 packages in 300ms
+Prepared 1 package in 13ms
+Installed 2 packages in 20ms
+ + numpy==2.4.6
+ + quabla==1.0.3 (from file:///Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py311/wheels/quabla-1.0.3-cp311-cp311-macosx_11_0_arm64.whl)
+python=3.11 passed
+python=3.12 interpreter=/Users/latteine/.local/share/uv/python/cpython-3.12.6-macos-aarch64-none/bin/python3.12
+Using CPython 3.12.6 interpreter at: /Users/latteine/.local/share/uv/python/cpython-3.12.6-macos-aarch64-none/bin/python3.12
+Creating virtual environment at: target/v110-python-matrix-mean4/py312/venv
+Activate with: source target/v110-python-matrix-mean4/py312/venv/bin/activate
+Using Python 3.12.6 environment at: target/v110-python-matrix-mean4/py312/venv
+Resolved 2 packages in 27ms
+Prepared 1 package in 17ms
+Installed 2 packages in 13ms
+ + numpy==2.5.4
+ + quabla==1.0.3 (from file:///Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py312/wheels/quabla-1.0.3-cp312-cp312-macosx_11_0_arm64.whl)
+python=3.12 passed
+python=3.13 interpreter=/Users/latteine/Documents/coding/nabla/.venv/bin/python3
+Using CPython 3.13.11 interpreter at: .venv/bin/python3
+Creating virtual environment at: target/v110-python-matrix-mean4/py313/venv
+Activate with: source target/v110-python-matrix-mean4/py313/venv/bin/activate
+Using Python 3.13.11 environment at: target/v110-python-matrix-mean4/py313/venv
+Resolved 2 packages in 2ms
+Prepared 1 package in 13ms
+Installed 2 packages in 13ms
+ + numpy==2.5.4
+ + quabla==1.0.3 (from file:///Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py313/wheels/quabla-1.0.3-cp313-cp313-macosx_11_0_arm64.whl)
+python=3.13 passed
+python=3.14 interpreter=/Users/latteine/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14
+Using CPython 3.14.2 interpreter at: /Users/latteine/.local/share/uv/python/cpython-3.14.2-macos-aarch64-none/bin/python3.14
+Creating virtual environment at: target/v110-python-matrix-mean4/py314/venv
+Activate with: source target/v110-python-matrix-mean4/py314/venv/bin/activate
+Using Python 3.14.2 environment at: target/v110-python-matrix-mean4/py314/venv
+Resolved 2 packages in 2ms
+Prepared 1 package in 10ms
+Installed 2 packages in 17ms
+ + numpy==2.5.4
+ + quabla==1.0.3 (from file:///Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py314/wheels/quabla-1.0.3-cp314-cp314-macosx_11_0_arm64.whl)
+python=3.14 passed

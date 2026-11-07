@@ -1,0 +1,57 @@
+{
+  "310": {
+    "python": "3.10.19",
+    "package": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py310/venv/lib/python3.10/site-packages/quabla/__init__.py",
+    "native": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py310/venv/lib/python3.10/site-packages/quabla/_quabla.cpython-310-darwin.so",
+    "numpy": "2.2.6",
+    "devices": [
+      "cpu"
+    ],
+    "wheel": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py310/wheels/quabla-1.0.3-cp310-cp310-macosx_11_0_arm64.whl",
+    "wheel_sha256": "d6eadbc3fb4c5ea61e47d4791a439da8ab2a33921b8e4a388381250be8a8f07d"
+  },
+  "311": {
+    "python": "3.11.9",
+    "package": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py311/venv/lib/python3.11/site-packages/quabla/__init__.py",
+    "native": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py311/venv/lib/python3.11/site-packages/quabla/_quabla.cpython-311-darwin.so",
+    "numpy": "2.4.6",
+    "devices": [
+      "cpu"
+    ],
+    "wheel": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py311/wheels/quabla-1.0.3-cp311-cp311-macosx_11_0_arm64.whl",
+    "wheel_sha256": "13ff4eef9c71ef23de4bbafd47c3299dae4eaffbb1f50ee7e5dc393ec3c13d71"
+  },
+  "312": {
+    "python": "3.12.6",
+    "package": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py312/venv/lib/python3.12/site-packages/quabla/__init__.py",
+    "native": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py312/venv/lib/python3.12/site-packages/quabla/_quabla.cpython-312-darwin.so",
+    "numpy": "2.5.4",
+    "devices": [
+      "cpu"
+    ],
+    "wheel": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py312/wheels/quabla-1.0.3-cp312-cp312-macosx_11_0_arm64.whl",
+    "wheel_sha256": "9b79a88ad2472a632a0b749ee3ef8093dc34f1bcc14f440030ed522f0c0e7e03"
+  },
+  "313": {
+    "python": "3.13.11",
+    "package": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py313/venv/lib/python3.13/site-packages/quabla/__init__.py",
+    "native": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py313/venv/lib/python3.13/site-packages/quabla/_quabla.cpython-313-darwin.so",
+    "numpy": "2.5.4",
+    "devices": [
+      "cpu"
+    ],
+    "wheel": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py313/wheels/quabla-1.0.3-cp313-cp313-macosx_11_0_arm64.whl",
+    "wheel_sha256": "44a5426f56dbfd34fbfcac5f86632b12339414a9f472a3c310f36037bf32a0a6"
+  },
+  "314": {
+    "python": "3.14.2",
+    "package": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py314/venv/lib/python3.14/site-packages/quabla/__init__.py",
+    "native": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py314/venv/lib/python3.14/site-packages/quabla/_quabla.cpython-314-darwin.so",
+    "numpy": "2.5.4",
+    "devices": [
+      "cpu"
+    ],
+    "wheel": "/Users/latteine/Documents/coding/nabla/target/v110-python-matrix-mean4/py314/wheels/quabla-1.0.3-cp314-cp314-macosx_11_0_arm64.whl",
+    "wheel_sha256": "2d4f82e1c5bc5262d8279d91e41fef708d1e95993bf924c1f9689a5b82cf47c0"
+  }
+}

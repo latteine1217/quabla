@@ -291,6 +291,40 @@ def test_file_layout_is_magic_size_json_header_then_little_endian_data():
     assert content[16 + size :] == struct.pack("<2f", 1.0, 2.0)
 
 
+def test_save_handles_partial_writes_and_rejects_stalled_streams():
+    class PartialWriter(io.BytesIO):
+        def write(self, data):
+            return super().write(data[:max(1, len(data) // 2)])
+
+    payload = {"w": qb.array([1.0, 2.0]), "step": 3}
+    stream = PartialWriter()
+    qb.save(stream, payload)
+    stream.seek(0)
+    restored = qb.load(stream)
+    assert restored["w"].tolist() == [1.0, 2.0] and restored["step"] == 3
+
+    class StalledWriter(io.BytesIO):
+        def write(self, data):
+            return 0
+
+    raises(OSError, qb.save, StalledWriter(), payload)
+
+
+def test_load_rejects_malformed_metadata_without_silent_coercion():
+    def bad(node, data=b"", version=1):
+        content = _with_header({"format": "quabla", "version": version, "tree": node}, data)
+        raises(ValueError, qb.load, io.BytesIO(content))
+
+    bad({"type": "array", "dtype": [], "shape": [1], "offset": 0, "nbytes": 8}, bytes(8))
+    bad({"type": "float", "value": "0x1p+999999"})
+    bad({"type": "dict", "keys": ["x", "x"], "values": [
+        {"type": "int", "value": 1}, {"type": "int", "value": 2},
+    ]})
+    for version in (True, 1.0):
+        bad({"type": "none"}, version=version)
+    bad({"type": "array", "dtype": "bool", "shape": [1], "offset": 0, "nbytes": 1}, b"\x02")
+
+
 def test_load_rejects_malformed_files():
     def bad(content, match):
         raises(ValueError, qb.load, io.BytesIO(content), match=match)
@@ -311,6 +345,41 @@ def test_load_rejects_malformed_files():
     bad(_with_header({"format": "quabla", "version": 1, "tree": array}, bytes(1)), "bad array")
     nan = b'{"format":"quabla","version":1,"tree":{"type":"float","value":NaN}}'
     bad(b"\x93QUABLA\n" + struct.pack("<Q", len(nan)) + nan, "NaN is not valid JSON")
+
+
+def test_load_rejects_mutated_array_metadata_and_boolean_payloads():
+    node = {"type": "array", "dtype": "float64", "shape": [1], "offset": 0, "nbytes": 8}
+    mutations = {
+        "type": [None, [], {}, 0, True],
+        "dtype": [None, [], {}, 0, True],
+        "shape": [None, {}, 0, True],
+        "offset": [None, [], {}, -1, True],
+        "nbytes": [None, [], {}, -1, True],
+    }
+    for field, values in mutations.items():
+        for value in values:
+            content = _with_header({
+                "format": "quabla", "version": 1, "tree": {**node, field: value},
+            }, bytes(8))
+            raises(ValueError, qb.load, io.BytesIO(content))
+    boolean = {"type": "array", "dtype": "bool", "shape": [1], "offset": 0, "nbytes": 1}
+    for value in range(256):
+        content = _with_header({"format": "quabla", "version": 1, "tree": boolean}, bytes([value]))
+        if value <= 1:
+            assert qb.load(io.BytesIO(content)).item() == bool(value)
+        else:
+            raises(ValueError, qb.load, io.BytesIO(content))
+
+
+def test_load_reports_excessive_nesting_as_a_format_error():
+    # Build JSON without recursing in the test's own encoder.
+    header = (
+        b'{"format":"quabla","version":1,"tree":'
+        + b'{"type":"list","items":[' * 1500
+        + b'{"type":"none"}' + b']}' * 1500 + b'}'
+    )
+    content = b"\x93QUABLA\n" + struct.pack("<Q", len(header)) + header
+    raises(ValueError, qb.load, io.BytesIO(content))
 
 
 if __name__ == "__main__":

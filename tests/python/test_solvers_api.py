@@ -46,6 +46,116 @@ def central_difference(function, value, step=1e-6):
 # -- conjugate gradients ----------------------------------------------------------
 
 
+def test_krylov_extreme_rhs_preserves_solution_and_convergence():
+    for dtype, magnitudes in (
+        (qb.float32, (1e20, 1e-25)),
+        (qb.float64, (1e200, 1e-200)),
+    ):
+        for solver in (qb.linalg.cg, qb.linalg.gmres):
+            for magnitude in magnitudes:
+                b = qb.array([magnitude, -magnitude], dtype=dtype)
+
+                def solve(b):
+                    return solver(lambda x: x * 2.0, b, info=True)
+
+                for execute in (solve, qb.jit(solve)):
+                    x, info = execute(b)
+                    assert bool(info["success"]), (dtype, solver, magnitude, info)
+                    assert info["iterations"].item() > 0, info
+                    assert math.isfinite(info["residual_norm"].item()), info
+                    for got, rhs in zip(x.to_flat_list(), b.to_flat_list()):
+                        assert math.isclose(got / rhs, 0.5, rel_tol=2e-6)
+
+
+def test_krylov_zero_rhs_with_extreme_initial_guess():
+    for dtype, magnitudes in (
+        (qb.float32, (1e20, 1e-25)),
+        (qb.float64, (1e200, 1e-200)),
+    ):
+        for solver in (qb.linalg.cg, qb.linalg.gmres):
+            for magnitude in magnitudes:
+                b = qb.zeros([2], dtype=dtype)
+                x0 = qb.array([magnitude, -magnitude], dtype=dtype)
+
+                def solve(b, x0):
+                    return solver(lambda x: x, b, x0=x0, info=True)
+
+                for execute in (solve, qb.jit(solve)):
+                    x, info = execute(b, x0)
+                    assert bool(info["success"]), (dtype, solver, magnitude, info)
+                    assert x.to_flat_list() == [0.0, 0.0], (x, info)
+                    assert info["residual_norm"].item() == 0.0, info
+
+
+def test_krylov_scaling_preserves_initial_guess_and_absolute_tolerance():
+    for solver in (qb.linalg.cg, qb.linalg.gmres):
+        for magnitude in (1e200, 1e-200):
+            b = qb.array([magnitude])
+            x0 = b * 0.25
+
+            def solve(b, x0):
+                return solver(
+                    lambda x: x * 2.0, b, x0=x0,
+                    tol=0.0, atol=magnitude, info=True,
+                )
+
+            for execute in (solve, qb.jit(solve)):
+                x, info = execute(b, x0)
+                assert bool(info["success"]) and info["iterations"].item() == 0.0, info
+                assert math.isclose(x.item() / magnitude, 0.25, rel_tol=1e-14)
+                assert math.isclose(info["residual_norm"].item() / magnitude, 0.5, rel_tol=1e-14)
+
+
+def test_krylov_nonfinite_residual_is_never_successful():
+    for solver in (qb.linalg.cg, qb.linalg.gmres):
+        for bad in (math.inf, math.nan):
+            b = qb.array([bad])
+
+            def solve(b):
+                return solver(lambda x: x, b, info=True)
+
+            for execute in (solve, qb.jit(solve)):
+                _, info = execute(b)
+                assert not bool(info["success"]), info
+            raises(RuntimeError, solver, lambda x: x, b)
+
+
+def test_krylov_success_checks_true_residual_after_rescaling():
+    # Normalization can lose a component outside the dtype's dynamic range;
+    # a nonzero true residual must not pass a zero-tolerance convergence test.
+    b = qb.array([1e200, 1e-200])
+    for solver in (qb.linalg.cg, qb.linalg.gmres):
+        def solve(b):
+            return solver(lambda x: x, b, tol=0.0, atol=0.0, info=True)
+
+        for execute in (solve, qb.jit(solve)):
+            x, info = execute(b)
+            assert bool(info["success"]) == (info["residual_norm"].item() == 0.0), (x, info)
+
+
+def test_optional_device_krylov_extreme_rhs_matches_analytic_solution():
+    for device in devices():
+        for solver in (qb.linalg.cg, qb.linalg.gmres):
+            for magnitude in (1e20, 1e-25):
+                b = qb.array([magnitude, -magnitude], dtype=qb.float32)
+
+                def solve(b):
+                    return solver(lambda x: x * 2.0, b, info=True)
+
+                x, info = qb.jit(solve, device=device)(b)
+                assert bool(info["success"]), (device, solver, magnitude, info)
+                assert info["iterations"].item() > 0, info
+                for got, rhs in zip(x.to_flat_list(), b.to_flat_list()):
+                    assert math.isclose(got / rhs, 0.5, rel_tol=2e-6)
+
+                def homogeneous(b, x0):
+                    return solver(lambda x: x, b, x0=x0, info=True)
+
+                x, info = qb.jit(homogeneous, device=device)(qb.zeros([2], dtype=qb.float32), b)
+                assert bool(info["success"]), (device, solver, magnitude, info)
+                assert x.to_flat_list() == [0.0, 0.0], (x, info)
+
+
 def test_cg_matches_dense_solve():
     n = 8
     a, b = spd(n), vector(n)

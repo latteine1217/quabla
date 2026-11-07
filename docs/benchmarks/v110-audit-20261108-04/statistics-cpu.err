@@ -1,0 +1,96 @@
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(var) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[2],) with ddof=static 0
+new signature:
+  (float64[2],) with ddof=static 0
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(std) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[2],) with ddof=static 0
+new signature:
+  (float64[2],) with ddof=static 0
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(var) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[2],) with ddof=static 1
+new signature:
+  (float64[2],) with ddof=static 1
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(std) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[2],) with ddof=static 1
+new signature:
+  (float64[2],) with ddof=static 1
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(var) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[3],) with ddof=static 0
+new signature:
+  (float64[3],) with ddof=static 0
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(std) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[3],) with ddof=static 0
+new signature:
+  (float64[3],) with ddof=static 0
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(var) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[3],) with ddof=static 1
+new signature:
+  (float64[3],) with ddof=static 1
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(std) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[3],) with ddof=static 1
+new signature:
+  (float64[3],) with ddof=static 1
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(var) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[7],) with ddof=static 0
+new signature:
+  (float64[7],) with ddof=static 0
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(std) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[7],) with ddof=static 0
+new signature:
+  (float64[7],) with ddof=static 0
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(var) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[7],) with ddof=static 1
+new signature:
+  (float64[7],) with ddof=static 1
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(std) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[7],) with ddof=static 1
+new signature:
+  (float64[7],) with ddof=static 1
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(var) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[32],) with ddof=static 0
+new signature:
+  (float64[32],) with ddof=static 0
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(std) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[32],) with ddof=static 0
+new signature:
+  (float64[32],) with ddof=static 0
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(var) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[32],) with ddof=static 1
+new signature:
+  (float64[32],) with ddof=static 1
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()
+/Users/latteine/Documents/coding/nabla/docs/benchmarks/v110-audit-20261108-04/statistics_probes.py:45: RetraceWarning: jit(std) exceeded max_traces=8 and evicted its least recently used trace:
+  (float32[32],) with ddof=static 1
+new signature:
+  (float64[32],) with ddof=static 1
+Each new signature is traced and compiled again. Python scalar arguments are static and part of the signature: pass quabla.array(value, dtype=...) to vary one without retracing, or raise max_traces with quabla.jit
+  actual = functions[name](x, ddof=ddof).item() if name != 'mean' else functions[name](x).item()

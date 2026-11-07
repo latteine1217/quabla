@@ -251,7 +251,11 @@ impl EagerKernel {
                     lanes => (0..count).map(|index| lanes.get(index)).sum(),
                 };
                 let value = if self == Self::Mean {
-                    sum * (1.0 / count as f64)
+                    super::finite_mean_fallback(
+                        (0..count).map(|index| lane(0).get(index)),
+                        count,
+                        sum * (1.0 / count as f64),
+                    )
                 } else {
                     sum
                 };

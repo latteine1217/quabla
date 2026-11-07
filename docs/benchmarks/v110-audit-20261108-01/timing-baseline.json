@@ -1,0 +1,105 @@
+{
+  "python": "3.13.11",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "package_path": "/Users/latteine/Documents/coding/nabla/target/v110-mean-baseline/python/quabla/__init__.py",
+  "native_path": "/Users/latteine/Documents/coding/nabla/target/v110-mean-baseline/python/quabla/_quabla.cpython-313-darwin.so",
+  "contract": "float32 [64,64], precreated host input, jit, scalar host return and item synchronization; 7 batches of 100 after 20 warmups",
+  "results": [
+    {
+      "device": "cpu",
+      "operation": "mean",
+      "value": 1.5906250476837158,
+      "first_call_ns": 3511541,
+      "samples_ns": [
+        7083.34,
+        6992.08,
+        6961.66,
+        10611.25,
+        9303.33,
+        9194.58,
+        9169.58
+      ],
+      "median_ns": 9169.58
+    },
+    {
+      "device": "cpu",
+      "operation": "var",
+      "value": 0.1364745944738388,
+      "first_call_ns": 959333,
+      "samples_ns": [
+        16874.16,
+        17203.34,
+        23788.75,
+        23833.75,
+        23875.83,
+        23695.83,
+        23766.25
+      ],
+      "median_ns": 23766.25
+    },
+    {
+      "device": "cpu",
+      "operation": "std",
+      "value": 0.3694246709346771,
+      "first_call_ns": 217708,
+      "samples_ns": [
+        25908.34,
+        21875.0,
+        20834.58,
+        23665.0,
+        24440.83,
+        15178.75,
+        23104.17
+      ],
+      "median_ns": 23104.17
+    },
+    {
+      "device": "mlx",
+      "operation": "mean",
+      "value": 1.5906250476837158,
+      "first_call_ns": 130014875,
+      "samples_ns": [
+        340245.42,
+        314175.84,
+        340152.92,
+        265522.08,
+        391221.25,
+        369578.33,
+        317980.41
+      ],
+      "median_ns": 340152.92
+    },
+    {
+      "device": "mlx",
+      "operation": "var",
+      "value": 0.1364745944738388,
+      "first_call_ns": 1951875,
+      "samples_ns": [
+        438436.66,
+        395952.08,
+        396979.17,
+        435029.58,
+        479761.25,
+        453094.58,
+        488407.5
+      ],
+      "median_ns": 438436.66
+    },
+    {
+      "device": "mlx",
+      "operation": "std",
+      "value": 0.3694246709346771,
+      "first_call_ns": 1978792,
+      "samples_ns": [
+        608493.34,
+        652405.42,
+        664958.75,
+        536351.67,
+        882328.34,
+        620882.08,
+        558316.25
+      ],
+      "median_ns": 620882.08
+    }
+  ]
+}

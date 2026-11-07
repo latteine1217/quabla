@@ -1,0 +1,72 @@
+{
+  "status": "measured",
+  "contract": "Three sequential baseline/candidate process pairs; each median uses seven batches of 100 host-returning calls after 20 warmups. Not resident training, no cross-framework performance claim.",
+  "rows": [
+    {
+      "device": "cpu",
+      "operation": "mean",
+      "baseline_median_ns": 4889.17,
+      "candidate_median_ns": 5069.17,
+      "paired_ratios": [
+        1.0382324628776243,
+        0.9887977445229353,
+        1.0409067387716116
+      ]
+    },
+    {
+      "device": "cpu",
+      "operation": "var",
+      "baseline_median_ns": 11419.17,
+      "candidate_median_ns": 29404.17,
+      "paired_ratios": [
+        2.7641349895569967,
+        2.563417357174008,
+        2.5749831204894926
+      ]
+    },
+    {
+      "device": "cpu",
+      "operation": "std",
+      "baseline_median_ns": 11422.92,
+      "candidate_median_ns": 46209.59,
+      "paired_ratios": [
+        4.241253549880416,
+        4.017438573526958,
+        4.091002370872442
+      ]
+    },
+    {
+      "device": "mlx",
+      "operation": "mean",
+      "baseline_median_ns": 178341.25,
+      "candidate_median_ns": 366442.5,
+      "paired_ratios": [
+        2.369165209251915,
+        2.0547265425132997,
+        1.9760818519724772
+      ]
+    },
+    {
+      "device": "mlx",
+      "operation": "var",
+      "baseline_median_ns": 220670.0,
+      "candidate_median_ns": 843537.5,
+      "paired_ratios": [
+        3.0263798885213213,
+        5.275681340997939,
+        4.396695240903855
+      ]
+    },
+    {
+      "device": "mlx",
+      "operation": "std",
+      "baseline_median_ns": 234874.17,
+      "candidate_median_ns": 614047.92,
+      "paired_ratios": [
+        2.4068259613221836,
+        2.5529572350254863,
+        3.8142789187555315
+      ]
+    }
+  ]
+}

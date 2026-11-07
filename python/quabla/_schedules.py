@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math as _math
 import operator as _operator
+import sys as _sys
 from collections.abc import Callable, Sequence
 
 
@@ -73,7 +74,24 @@ def exponential_decay(
             exponent = count / transition_steps
             if staircase:
                 exponent = _math.floor(exponent)
-            value = init_value * decay_rate**exponent
+            try:
+                factor = decay_rate**exponent
+            except OverflowError:
+                factor = _math.inf
+            if init_value == 0.0:
+                value = init_value
+            elif not _math.isfinite(factor) or factor < _sys.float_info.min:
+                # Combine scales before exponentiating: an overflowing or
+                # subnormal power can still give a representable product.
+                log_value = _math.log(abs(init_value)) + exponent * _math.log(decay_rate)
+                try:
+                    value = _math.copysign(_math.exp(log_value), init_value)
+                except OverflowError:
+                    if end_value is None:
+                        raise
+                    value = _math.copysign(_math.inf, init_value)
+            else:
+                value = init_value * factor
         if end_value is not None:
             value = clip(value, end_value)
         return value
@@ -95,7 +113,7 @@ def cosine_decay(init_value: float, decay_steps: int, alpha: float = 0.0) -> Cal
     def schedule(step: int) -> float:
         count = min(step, decay_steps)
         cosine = 0.5 * (1 + _math.cos(_math.pi * count / decay_steps))
-        return init_value * ((1 - alpha) * cosine + alpha)
+        return init_value * (cosine + alpha * (1.0 - cosine))
 
     return schedule
 
@@ -122,16 +140,16 @@ def warmup_cosine_decay(
     decay_steps = _operator.index(decay_steps)
     if decay_steps <= warmup_steps:
         raise ValueError("decay_steps must exceed warmup_steps")
-    alpha = 0.0 if peak_value == 0 else end_value / peak_value
-    decay = cosine_decay(peak_value, decay_steps - warmup_steps, alpha)
+    decay = cosine_decay(1.0, decay_steps - warmup_steps)
 
     def schedule(step: int) -> float:
         if step < warmup_steps:
-            # optax linear_schedule: the fraction of warmup left, times the
-            # rise, plus the end point.
-            fraction = 1 - step / warmup_steps
-            return (init_value - peak_value) * fraction + peak_value
-        return decay(step - warmup_steps)
+            # Weighted endpoints avoid overflowing their difference when
+            # finite endpoints have opposite signs.
+            fraction = step / warmup_steps
+            return init_value * (1.0 - fraction) + peak_value * fraction
+        fraction = decay(step - warmup_steps)
+        return peak_value * fraction + end_value * (1.0 - fraction)
 
     return schedule
 

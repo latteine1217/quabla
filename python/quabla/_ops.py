@@ -446,7 +446,13 @@ def gelu(x: ArrayLike, approximate: bool = True) -> Array:
     x = _array(x)
     if not approximate:
         return x * 0.5 * erfc(x * -_SQRT_HALF)
-    return x * (x * (x * x * 0.044715 + 1.0) * _GELU_SCALE).sigmoid()
+    # At |x| > 40 the sigmoid argument exceeds 4600 in magnitude, so its
+    # tail underflows even in float64. Guard the cubic before evaluating
+    # it: a saturated sigmoid's zero derivative must not multiply infinity.
+    tail = x.isfinite().logical_and(x.abs() > 40.0)
+    safe = _where(tail, 0.0, x)
+    value = safe * (safe * (safe * safe * 0.044715 + 1.0) * _GELU_SCALE).sigmoid()
+    return _where(tail, _where(x > 0.0, x, -0.0), value)
 
 
 # Normalizations and reductions. The max shift cancels from every result
@@ -494,24 +500,45 @@ def var(
 ) -> Array:
     """Variance over `axis` (an int, a sequence of ints, or `None` for all
     axes), `sum((x - mean(x))**2) / (n - ddof)` for `n` reduced elements.
-    Two passes, the mean first and then the squared deviations, so there is
-    no cancellation of `E[x^2] - E[x]^2` for data far from zero. `n <= ddof`
+    Two passes at unit scale avoid overflowing intermediate sums and squared
+    deviations, without subtracting `E[x^2] - E[x]^2` for data far from zero. `n <= ddof`
     divides by zero (inf or NaN), as NumPy does with a warning."""
+    deviation, scale, axes, denominator, count = _scaled_deviations(x, axis, keepdims, ddof)
+    variance = (deviation * deviation).mean(axis=axes, keepdims=keepdims)
+    variance = variance * (count / denominator) if denominator != 0 else variance / 0.0
+    return (variance * scale) * scale
+
+
+def _scaled_deviations(
+    x: ArrayLike, axis: Axis, keepdims: bool, ddof: int
+) -> tuple[Array, Array, tuple[int, ...], float, int]:
     x = _array(x)
     axes = _axes(axis, len(x.shape))
     count = math.prod(x.shape[a] for a in axes)
-    deviation = x - x.mean(axis=None if axis is None else axes, keepdims=True)
-    squares = (deviation * deviation).sum(axis=None if axis is None else axes, keepdims=keepdims)
-    return squares / float(builtins.max(count - ddof, 0))
+    peak = stop_gradient(abs(x).max(axis=axes, keepdims=True))
+    # Binary scaling preserves input differences; centering at one sample avoids
+    # losing a narrow spread when the mean lies between adjacent large floats.
+    exponent = (peak.log() / math.log(2.0)).floor()
+    exponent = clip(exponent, -126 if x.dtype == float32 else -1022,
+                    127 if x.dtype == float32 else 1023)
+    scale = _where(peak.isfinite() & (peak > 0.0), power(2.0, exponent), 1.0)
+    normalized = x / scale
+    anchor = tuple(slice(0, 1) if a in axes else slice(None) for a in range(len(x.shape)))
+    normalized = normalized - stop_gradient(normalized[anchor])
+    deviation = normalized - normalized.mean(axis=axes, keepdims=True)
+    denominator = float(builtins.max(count - ddof, 0))
+    return deviation, scale if keepdims else squeeze(scale, axes), axes, denominator, count
 
 
 def std(
     x: ArrayLike, axis: Axis = None, keepdims: bool = False, ddof: int = 0
 ) -> Array:
-    """Standard deviation, `sqrt(var(x, axis, keepdims, ddof))`. Its
+    """Standard deviation, computed at unit scale before restoring the input
+    scale to avoid overflow in an otherwise representable result. Its
     derivative at zero variance is zero, following the `sqrt` convention
     (JAX gives NaN there)."""
-    return var(x, axis=axis, keepdims=keepdims, ddof=ddof).sqrt()
+    deviation, scale, axes, denominator, _ = _scaled_deviations(x, axis, keepdims, ddof)
+    return (deviation.norm(axis=axes, keepdims=keepdims) / math.sqrt(denominator)) * scale
 
 
 # Shape helpers: reshapes, slices, and broadcasts of their operand.
@@ -1174,20 +1201,32 @@ def trapezoid(
         total = y.sum(axis=axis)
         # Zero, but computed from `y` so that traced code keeps a traced result.
         return _where(total.isnan().logical_or(total.isnan().logical_not()), 0.0, total)
-    if x is None:
-        d = dx
-    else:
-        x = _array(x)
-        if len(x.shape) == 1:
-            d = diff(x)
-            shape = [1] * ndim
-            shape[axis] = d.shape[0]
-            d = d.reshape(shape)
-        else:
-            d = diff(x, axis=axis)
     upper = y[_along(axis, ndim, slice(1, None))]
     lower = y[_along(axis, ndim, slice(None, -1))]
-    return (d * (upper + lower) / 2.0).sum(axis=axis)
+    total = upper + lower
+    # Preserve subnormal sums, but halve first if adding finite endpoints
+    # overflowed. Average before multiplying by the interval width.
+    average = _where(total.isfinite(), total * 0.5, upper * 0.5 + lower * 0.5)
+    if x is None:
+        return (dx * average).sum(axis=axis)
+    x = _array(x)
+    if len(x.shape) == 1:
+        d = diff(x)
+        half_d = diff(x * 0.5)
+        shape = [1] * ndim
+        shape[axis] = d.shape[0]
+        d = d.reshape(shape)
+        half_d = half_d.reshape(shape)
+    else:
+        d = diff(x, axis=axis)
+        half_d = diff(x * 0.5, axis=axis)
+    regular = d.isfinite()
+    width = _where(regular, d, half_d)
+    area = width * average
+    # Using the endpoint sum here keeps each endpoint's gradient equal to
+    # half the full width, even when the full width cannot be represented.
+    large_area = half_d * _where(regular, 0.0, total)
+    return _where(regular, area, large_area).sum(axis=axis)
 
 
 def interp(
@@ -1228,7 +1267,14 @@ def interp(
         last = asarray([False] * (count - 2) + [True])
         below_hi = (column < hi).logical_or(column.equal(hi).logical_and(last))
         inside = (column >= lo).logical_and(below_hi)
-        t = (_where(inside, column, lo) - lo) / (hi - lo)
+        point = _where(inside, column, lo)
+        width = hi - lo
+        regular = width.isfinite()
+        # Halving finite coordinates before subtracting handles intervals
+        # whose width overflows while keeping their interpolation finite.
+        numerator = _where(regular, point - lo, point * 0.5 - lo * 0.5)
+        denominator = _where(regular, width, hi * 0.5 - lo * 0.5)
+        t = numerator / denominator
         pieces = fp[:-1] * (1.0 - t) + fp[1:] * t
         value = _where(inside, pieces, 0.0).sum(axis=-1)
     value = _where(x > xp[-1], fp[-1] if right is None else right, value)

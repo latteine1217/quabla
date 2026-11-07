@@ -1,5 +1,45 @@
 # Rust SciML Runtime Roadmap
 
+## v1.1.0 Plan: Bug fixes and robustness (2026-11-08)
+
+The owner designated 1.1.0 as the bug-fix release on 2026-11-07. This is
+the current plan; the 1.0.x planning and release records below are history.
+Public signatures and supported successful behaviour remain compatible.
+Package metadata stays at 1.0.3 until release preparation; 1.1.0 is not
+published. Functional acceptance below is scoped to its recorded snapshot,
+platforms and checks.
+
+The audit repeats reproduction, a failing regression, a local fix, and
+regression verification. Acceptance requires normal, invalid, and extreme
+inputs across the public modules, composition tests, and no unresolved
+failures in the applicable full suites. Finite tests cannot prove the
+absence of all bugs. Unavailable hardware and Python versions remain
+explicit validation gaps rather than passing results.
+
+| Area | Current evidence / next check |
+| --- | --- |
+| Krylov solvers, L-BFGS, schedules | Extreme-scale, true-residual, homogeneous-system, interpolation and exponent regressions pass in the full local suites and independent probes. |
+| Serialization | Partial writes, malformed metadata, duplicate keys, invalid bool bytes and excessive nesting reproduced and fixed; local full suites pass. |
+| Array operations and linear algebra | Mean overflow, spread precision and standard-deviation gradient overflow repaired in snapshot 20261108-04. Full local/CUDA suites and independent Decimal/derivative probes pass. Earlier interpolation/integration/GELU regressions remain covered. |
+| Control flow | Python/Tensor non-finite cond validation and eager/traced while-loop predicate dtype checks repaired; local full suites pass. |
+| ODE, transforms, custom derivatives, pytrees, random, devices, optimizers | Fixed-step extreme time grids and time derivatives at internal `saveat` mesh knots repaired. Full local suites and 140 analytical CPU/MLX probes pass. |
+| Python 3.10–3.14 installation matrix | Snapshot 20261108-04: all five macOS arm64 CPU wheels pass full suites, each 377 passed, 48 skipped. Local Python 3.13 with MLX: 415 passed, 10 skipped. |
+| CUDA/NCCL | Jobs 6947–6950 COMPLETED, exit 0: Rust 382 passed/14 ignored plus three isolated NCCL cases; Python 418 passed/7 skipped; 732 independent CUDA checks and eight two-GPU parity cases pass. Maximum loss/gradient error 1.49e-8, tolerance 1e-5. Failed/cancelled jobs 6944–6946 remain rejected evidence. |
+
+The fixes and durable reproductions live in `CHANGELOG.md` (Unreleased),
+the affected modules, and `tests/python/test_*.py`; do not put execution
+logs into this protocol or replace older release evidence with this audit.
+Raw evidence, source identity, current limitations and remaining checks are
+indexed by [the latest 1.1.0 audit](benchmarks/v110-audit-20261108-04/README.md).
+The 2026-11-08 snapshot repairs finite-input mean overflow, variance
+precision/overflow, and standard-deviation value/gradient overflow. Current
+functional acceptance is complete within its recorded scope, including
+source and terminal-job checks. Rejected intermediate candidates remain
+linked from the audit. Release preparation/publication is separate.
+Host-returning reduction timing regressions are recorded; resident PINN
+training performance has not been remeasured. Linux aarch64 and the full
+Linux wheel/Python matrix remain unverified.
+
 ## v1.0.x Plan: Toward Production Quality (2026-10-14)
 
 v1.0.0 made the public API stable under Semantic Versioning. A review on

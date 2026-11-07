@@ -1,0 +1,51 @@
+PASS test_shape_functions_match_closed_forms
+PASS test_products_match_closed_forms
+PASS test_calculus_matches_closed_forms
+PASS test_elementwise_numerics_match_closed_forms
+PASS test_float32_hypot_and_norm_do_not_overflow_or_underflow
+PASS test_linalg_matches_closed_forms
+PASS test_dtypes_are_kept
+PASS test_unsupported_arguments_raise_clear_errors
+PASS test_gradients_match_central_differences
+FAIL test_mean_and_constant_variance_do_not_overflow_finite_results
+Traceback (most recent call last):
+  File "/Users/latteine/Documents/coding/nabla/tests/python/_support.py", line 130, in run
+    test()
+    ~~~~^^
+  File "/Users/latteine/Documents/coding/nabla/tests/python/test_numpy_api.py", line 403, in test_mean_and_constant_variance_do_not_overflow_finite_results
+    assert all(math.isclose(v, expected, rel_tol=1e-6)
+           ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+               for v in execute(x).to_flat_list())
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+FAIL test_mean_handles_overflowing_cancellation_and_dtype_maximum
+Traceback (most recent call last):
+  File "/Users/latteine/Documents/coding/nabla/tests/python/_support.py", line 130, in run
+    test()
+    ~~~~^^
+  File "/Users/latteine/Documents/coding/nabla/tests/python/test_numpy_api.py", line 421, in test_mean_handles_overflowing_cancellation_and_dtype_maximum
+    assert execute(x).item() == expected
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+FAIL test_scaled_variance_and_standard_deviation_extremes
+Traceback (most recent call last):
+  File "/Users/latteine/Documents/coding/nabla/tests/python/_support.py", line 130, in run
+    test()
+    ~~~~^^
+  File "/Users/latteine/Documents/coding/nabla/tests/python/test_numpy_api.py", line 438, in test_scaled_variance_and_standard_deviation_extremes
+    assert all(v == 0.0 for v in execute(x, axis=axis).to_flat_list())
+           ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+SKIP test_device_mean_and_variance_extreme_reduction_shapes: set QUABLA_MLX_TEST=1 or QUABLA_CUDA_TEST=1
+PASS test_gelu_extreme_finite_values_preserve_first_and_second_derivatives
+PASS test_interp_extreme_finite_intervals_keep_knots_and_gradients
+PASS test_trapezoid_preserves_representable_extreme_scale_integrals
+PASS test_interp_gradients_in_x_xp_and_fp
+PASS test_gradients_at_ties_kinks_and_the_origin
+PASS test_functions_under_jit_and_vmap_match_eager
+SKIP test_device_results_match_cpu: set QUABLA_MLX_TEST=1 or QUABLA_CUDA_TEST=1
+PASS test_functions_match_numpy_in_float64_and_float32
+test_numpy_api.py: 16 passed, 2 skipped, 3 failed

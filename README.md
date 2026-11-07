@@ -8,6 +8,12 @@ regressions. See the [release notes](CHANGELOG.md#103---2026-11-07).
 Package and GPU verification are indexed in the
 [release acceptance record](docs/benchmarks/v103-release-20261107-01/README.md).
 
+The upcoming 1.1.0 release focuses on bug fixes while preserving the public
+API. Numerical boundary, serialization, control-flow and solver repairs are
+covered by CPU, MLX and CUDA/NCCL acceptance. See the [current audit and its
+performance limitations](docs/benchmarks/v110-audit-20261108-04/README.md).
+Package metadata remains 1.0.3 until release preparation.
+
 **Differentiable scientific computing for physics-informed neural networks
 (PINNs): a Rust compiler and runtime with a JAX-style Python API that runs one
 traced program on CPU, CUDA, and Apple silicon.**

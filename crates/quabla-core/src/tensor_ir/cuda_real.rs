@@ -324,7 +324,7 @@ impl CudaReal for f64 {
 /// Bit-pattern constants of the single-precision sources and their double
 /// counterparts: quiet NaN, +inf, and `FLT_MAX` (the overflow guard of the
 /// wide axis reduction, which becomes `DBL_MAX`).
-const DOUBLE_CONSTANTS: [(&str, &str); 3] = [
+const DOUBLE_CONSTANTS: [(&str, &str); 4] = [
     (
         "__int_as_float(0x7fc00000)",
         "__longlong_as_double(0x7ff8000000000000LL)",
@@ -334,6 +334,7 @@ const DOUBLE_CONSTANTS: [(&str, &str); 3] = [
         "__longlong_as_double(0x7ff0000000000000LL)",
     ),
     ("3.4028234663852886e38f", "1.7976931348623157e308"),
+    ("1.1754943508222875e-38f", "2.2250738585072014e-308"),
 ];
 
 /// Single-precision CUDA math functions whose double overload is the same

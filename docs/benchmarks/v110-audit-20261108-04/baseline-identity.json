@@ -1,0 +1,33 @@
+{
+  "source_snapshot": "v110-audit-20261107-03",
+  "python_source_files": 24,
+  "python_source_hashes": {
+    "python/quabla/__init__.py": "ad811dfba8a4d3079239c66426dc2244ded5086fd10eddb45bc81428d3204f07",
+    "python/quabla/_array.py": "1208f94b0f1689b2601df6e768c9ccadcf4e33b1222dcff1e5c00d3c8366e82d",
+    "python/quabla/_control.py": "93b292deb19b7cc7669c6cac100374f98b316a48eb6724210c87d1682521c539",
+    "python/quabla/_custom.py": "34f8655c5e8af3c47b58e05f10f7452150f45d32d106e22099da1c64f754a14e",
+    "python/quabla/_deprecated.py": "adec2e555794038725571e72a671ed3566ad01da4e57991f6d78b9525867a3d0",
+    "python/quabla/_devices.py": "ff4f34ce3755c87e8407db3987279bc72d0785ba64e51e2a7ed6a51e8cf13b8f",
+    "python/quabla/_errors.py": "df6bfb10133d73352e81003578e691b0cb2a0767c5814db19f348d3ad92ca530",
+    "python/quabla/_implicit.py": "7183fe7338f84ac0a926e0ca8474c5f7e9fc9fa6543b657e82d65b1ff00f5b39",
+    "python/quabla/_io.py": "d7d44fe4f975a18d194efe6f5faa2b069fcc29f37833079a8b44e85960765f49",
+    "python/quabla/_krylov.py": "1acc9e18152f8a201cd969bb9679888ef9bf7605173a01cc00238e92a3130ce4",
+    "python/quabla/_lbfgs.py": "ce003a896919c5bcd45f3c691d0d8107579456c6cd49618e98332fb04b6e3a1b",
+    "python/quabla/_newton.py": "d861039851d9a7bf6336732aa9d6f87de65896cd7f45c687c9da16dcfb531312",
+    "python/quabla/_ops.py": "54b67c843cc898d3bed51482cbdc4621f3914ba918b41c3235d774f374cb61e4",
+    "python/quabla/_quabla.pyi": "e6d6eed93833be692db58c7aaa2e9f47e7fd2ead9b653f15c3b3ca4b8e2cba18",
+    "python/quabla/_schedules.py": "860007c7a19a1818c5ee1ecbe33d6b50ea3c1bfa17db3e64a3a2b3197ff8cb4a",
+    "python/quabla/_transforms.py": "be6803022b3b4e631efc53bfb3d2bad34a352637d4037702315d2b90a6675803",
+    "python/quabla/_typing.py": "89bd7546c282c3d5503af19b06a1123ec7542b835a4d16edd26a9f6ce6a4eb52",
+    "python/quabla/distributed.py": "737c2588af8a244b4bf515d5b32b4bc45e6eb64975af622c5efbd9a893b8146a",
+    "python/quabla/linalg.py": "0bb4e2e357b04431025e46af6d34d51bd1fb11bb7e64202c8813b5fdc42add2a",
+    "python/quabla/ode.py": "293bff73f425e4b911344871f264dc3058411d2c06267f947e509007465c0915",
+    "python/quabla/optim.py": "06ad6338d9b0012eaada10b53454d1127d4d34e2642ea40f982801d0f6df5daf",
+    "python/quabla/py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "python/quabla/random.py": "e6a9273c8f978a1d9bc163ccf74f66c6d514ad5f6c2a55f0888c118ad4944938",
+    "python/quabla/tree.py": "dc45db9fe4b121bd25fd6abff42dfcc5be90330dfe77fd782c793f2135784bed"
+  },
+  "extension_path": "/Users/latteine/Documents/coding/nabla/target/v110-mean-baseline/python/quabla/_quabla.cpython-313-darwin.so",
+  "extension_sha256": "3723739904711330c019413269a9264b3b11522d85b39f8610c4d20f09300ee3",
+  "provenance": "Local extension copied before the first new native build in this audit; the saved package reproduces the mean/spread failures."
+}

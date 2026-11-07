@@ -1,0 +1,39 @@
+   Compiling quabla-core v1.0.3 (/home/junyi/quabla-v110-audit-20261108-01/crates/quabla-core)
+   Compiling pyo3-ffi v0.29.2
+   Compiling pyo3 v0.29.2
+   Compiling quabla-python v1.0.3 (/home/junyi/quabla-v110-audit-20261108-01/crates/quabla-python)
+   Compiling quabla-macros v1.0.3 (/home/junyi/quabla-v110-audit-20261108-01/crates/quabla-macros)
+    Finished `release` profile [optimized] target(s) in 1m 56s
+     Running unittests src/lib.rs (target/release/deps/quabla_core-fa347f629decf1a6)
+
+running 73 tests
+test tensor_ir::adaptive_remap_tests::sparse_source_graphs_do_not_allocate_dense_id_tables ... ok
+test tensor_ir::binary_reuse_tests::reused_binary_buffers_match_reference_bits_and_preserve_aliases ... ok
+test tensor_ir::broadcast_carry_tests::carried_elementwise_preserves_f64_arithmetic_and_shapes ... ok
+test tensor_ir::broadcast_carry_tests::profile_broadcast_carry ... ignored, complete core broadcast release timing probe
+test tensor_ir::broadcast_carry_tests::profile_selection_carry ... ignored, complete where and unary broadcast release timing probe
+test tensor_ir::broadcast_carry_tests::selection_and_unary_broadcast_preserve_bits_dtype_and_errors ... ok
+test tensor_ir::cholesky_tests::compact_cholesky_derivatives_match_reference_and_stay_bounded ... ok
+test tensor_ir::cholesky_tests::compact_cholesky_exceptional_derivatives_preserve_reference ... ok
+test tensor_ir::cholesky_tests::compact_cholesky_internal_batches_match_independent_matrices ... ok
+test tensor_ir::cholesky_tests::compact_cholesky_primal_preserves_staged_recurrence ... ok
+test tensor_ir::cholesky_tests::compact_cholesky_shape_checks_and_native_f32_derivatives ... ok
+test tensor_ir::cholesky_tests::compact_cholesky_symbolic_exceptional_ad_matches_quotient_rules ... ok
+test tensor_ir::cpu_kernel_indexing_tests::axis_reduction_ad_fixtures_match_scalar_oracles ... ok
+test tensor_ir::cpu_kernel_indexing_tests::axis_reductions_preserve_linear_order_identity_and_rounding ... FAILED
+test tensor_ir::cpu_kernel_indexing_tests::broadcasting_errors_precede_fast_paths_and_division_follows_ieee ... ok
+test tensor_ir::cpu_kernel_indexing_tests::cpu_kernel_paired_release_probe ... ignored, CPU release timing probe; run explicitly with --release --ignored --nocapture
+test tensor_ir::cpu_kernel_indexing_tests::elementwise_fast_paths_and_broadcast_fallback_match_scalar_bits ... ok
+test tensor_ir::cpu_memory_regressions::frozen_forward_chain_retains_only_the_live_frontier ... ok
+test tensor_ir::cpu_memory_regressions::shared_elementwise_dag_evaluates_each_node_once ... ok
+test tensor_ir::cuda::host_loop_graph_tests::host_loop_graph_recordings_survive_concurrent_library_handle_drops ... ok
+test tensor_ir::cuda::host_loop_graph_tests::host_loop_graph_replays_match_eager_runs_bit_for_bit ... ok
+test tensor_ir::cuda::host_loop_graph_tests::host_loop_graphs_admit_every_elementwise_math_kind ... ok
+test tensor_ir::cuda::loop_checkpoint_tests::checkpoint_device_bounds_and_input_errors_match_full_tape ... ok
+test tensor_ir::cuda::loop_checkpoint_tests::checkpoint_layout_preserves_broadcast_fallback ... ok
+test tensor_ir::cuda::loop_checkpoint_tests::checkpoint_vjp_and_directional_match_full_tape_on_device ... ok
+test tensor_ir::cuda::loop_checkpoint_tests::profile_complete_checkpoint_vjp_on_device ... ok
+test tensor_ir::cuda::pool_profile_tests::profile_shrinking_shape_pool ... ok
+test tensor_ir::cuda::real::tests::rejects_identifiers_without_a_double_rename ... ok
+test tensor_ir::cuda::real::tests::rewrites_types_literals_math_and_intrinsics ... ok
+test tensor_ir::cuda::region_batching_tests::batched_loops_fuse_checkpoint_and_match_the_cpu_on_device ... 

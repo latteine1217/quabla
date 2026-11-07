@@ -1733,6 +1733,30 @@ def test_optional_device_float32_second_order_derivatives_through_regions():
                 assert_tree_close(actual, expected, tolerance)
 
 
+def test_python_nonfinite_cond_predicates_are_rejected():
+    def f(p, x):
+        return qb.cond(p, lambda v: v + 1.0, lambda v: v - 1.0, x)
+
+    x = qb.array(0.0)
+    for bad in (float("nan"), float("inf"), -float("inf")):
+        for execute in (f, qb.jit(f)):
+            assert_raises(ValueError, execute, bad, x, match="finite")
+    # Arbitrarily large finite Python integers remain valid static predicates.
+    assert f(10**400, x).item() == 1.0
+
+
+def test_eager_while_loop_rejects_nonboolean_predicates_before_body():
+    def body(x):
+        raise AssertionError("invalid predicates must not enter the loop body")
+
+    for bad in (0.0, 1.0, float("nan"), 0, qb.array(0.0)):
+        assert_raises(
+            TypeError, qb.while_loop, lambda x: bad, body, qb.array(0.0),
+            match="scalar bool",
+        )
+    assert qb.while_loop(lambda x: False, body, qb.array(3.0)).item() == 3.0
+
+
 def test_eager_cond_predicate_matches_the_traced_rule():
     # A floating predicate selects the true branch when nonzero, eagerly as
     # under jit; it used to be decided by `bool(Tensor)`, which is always true

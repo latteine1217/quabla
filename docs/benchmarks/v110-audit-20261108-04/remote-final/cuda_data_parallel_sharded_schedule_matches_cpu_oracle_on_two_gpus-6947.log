@@ -1,0 +1,11 @@
+    Finished `release` profile [optimized] target(s) in 0.19s
+     Running tests/tensor_ir.rs (target/release/deps/tensor_ir-b81257f244b147af)
+
+running 1 test
+test cuda_data_parallel_sharded_schedule_matches_cpu_oracle_on_two_gpus ... sharded-schedule output=0 cuda=[0.8093008995056152, -0.9272735118865967] cpu=[0.8093010702017809, -0.9272735244344645] max_abs_error=1.7069616564668877e-7
+sharded-schedule output=1 cuda=[-0.0073732733726501465] cpu=[-0.007373278389542749] max_abs_error=5.016892602738299e-9
+sharded-schedule timing=CudaDataParallelTiming { replica_enqueue: 10.41724ms, collective: 67.895588ms, output_readback: 47.348µs }
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 214 filtered out; finished in 2.23s
+

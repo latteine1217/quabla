@@ -2905,7 +2905,14 @@ fn execute_cuda_device_program<T: CudaReal>(
                     let blocks =
                         cuda_full_reduction_blocks(element_count(&plan.nodes[*input].shape)?);
                     if blocks > 1 {
-                        launch_cuda_full_reduction_blocks(stream, module, node_id, output)?;
+                        let mean_input = if matches!(node.op, TensorOp::Mean { .. }) {
+                            Some(cuda_value(before, *input)?)
+                        } else {
+                            None
+                        };
+                        launch_cuda_full_reduction_blocks(
+                            stream, module, node_id, mean_input, output,
+                        )?;
                     }
                 }
                 release_dead_cuda_values(
@@ -3720,6 +3727,7 @@ fn launch_cuda_full_reduction_blocks<T: CudaReal>(
     stream: &Arc<CudaStream>,
     module: &Arc<CudaModule>,
     node_id: TensorNodeId,
+    mean_input: Option<&CudaSlice<T>>,
     output: &mut CudaSlice<T>,
 ) -> Result<(), String> {
     let name = format!("{}_blocks", cuda_node_function_name(node_id));
@@ -3736,11 +3744,17 @@ fn launch_cuda_full_reduction_blocks<T: CudaReal>(
         "sum",
     )?;
     let count = 1u64;
+    let input_count = mean_input.map_or(0, |input| input.len() as u64);
     let mut launch = stream.launch_builder(&kernel);
+    if let Some(input) = mean_input {
+        launch.arg(input);
+        launch.arg(&input_count);
+    }
     launch.arg(output);
     launch.arg(&count);
     // SAFETY: the arguments follow the parameter list `(float* out, unsigned long long count)`
-    // emitted by `cuda_fixed_order_sum_source` for this node; `output` is the node's one-element
+    // emitted for sums, or the additional `(const float* input, unsigned long long input_count)`
+    // prefix for means. The input has input_count lanes; output is the node's one-element
     // buffer, written only by block 0 at `index = 0 < count`, and the kernel reads its module
     // array `{function}_partials` only below the block count it was sized with. The first pass
     // ran before on the same stream, so every partial is written.
@@ -7897,6 +7911,28 @@ fn cuda_program_source(
     return result;\n}\n",
     );
     source.push_str(optimizer::cuda_optimizer_source());
+    if plan
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, TensorOp::Mean { .. } | TensorOp::MeanAxis { .. }))
+    {
+        source.push_str(r#"
+__device__ float quabla_finite_mean(const float* input, unsigned long long count, unsigned long long step, float ordinary) {
+    if (isfinite(ordinary) && ordinary != 0.0f) return ordinary;
+    float peak = 0.0f;
+    for (unsigned long long k = 0; k < count; ++k) {
+        float value = input[k * step];
+        if (!isfinite(value)) return ordinary;
+        peak = fmaxf(peak, fabsf(value));
+    }
+    if (peak == 0.0f || (ordinary == 0.0f && peak >= 1.1754943508222875e-38f)) return ordinary;
+    double total = 0.0;
+    for (unsigned long long k = 0; k < count; ++k) total += (double)(input[k * step] / peak);
+    double average = fmin(1.0, fmax(-1.0, total / (double)count));
+    return (float)((double)peak * average);
+}
+"#);
+    }
     source.push_str(
         "extern \"C\" __global__ void quabla_transpose_copy(const float* input, float* output, unsigned long long batch, unsigned long long rows, unsigned long long columns) {\n\\
     unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;\n\\
@@ -8072,6 +8108,7 @@ fn cuda_program_source(
             // in a fixed order: an atomic add of the partials would round in whatever
             // order the blocks finish, so results differed from run to run.
             TensorOp::Sum { input } | TensorOp::Mean { input } => {
+                let mean = matches!(&node.op, TensorOp::Mean { .. });
                 let scale = if matches!(&node.op, TensorOp::Mean { .. }) {
                     " / (float)count".to_string()
                 } else {
@@ -8079,13 +8116,28 @@ fn cuda_program_source(
                 };
                 let blocks = cuda_full_reduction_blocks(element_count(&plan.nodes[*input].shape)?);
                 let (partials, store, finish) = if blocks == 1 {
-                    (String::new(), format!("out[0] = 0.0f + partial[0]{scale};"), String::new())
+                    let value = format!("0.0f + partial[0]{scale}");
+                    let value = if mean { format!("quabla_finite_mean(input, count, 1ULL, {value})") } else { value };
+                    (String::new(), format!("out[0] = {value};"), String::new())
                 } else {
                     let array = format!("{function}_partials");
                     (
                         format!("__device__ float {array}[{blocks}];\n"),
                         format!("{array}[blockIdx.x] = partial[0]{scale};"),
-                        cuda_fixed_order_sum_source(
+                        if mean { format!(r#"extern "C" __global__ void {function}_blocks(const float* input, unsigned long long input_count, float* out, unsigned long long count) {{
+    unsigned int thread = threadIdx.x;
+    __shared__ double partial[256];
+    double value = 0.0;
+    for (unsigned long long k = thread; k < {blocks}ULL; k += 256ULL) value += (double){array}[k];
+    partial[thread] = value;
+    __syncthreads();
+    for (unsigned int stride = 128U; stride > 0U; stride >>= 1U) {{
+        if (thread < stride) partial[thread] += partial[thread + stride];
+        __syncthreads();
+    }}
+    if (thread == 0U) out[0] = quabla_finite_mean(input, input_count, 1ULL, (float)partial[0]);
+}}
+"#) } else { cuda_fixed_order_sum_source(
                             &format!("{function}_blocks"),
                             "",
                             &array,
@@ -8093,7 +8145,7 @@ fn cuda_program_source(
                             "k",
                             blocks,
                             true,
-                        ),
+                        ) },
                     )
                 };
                 format!(
@@ -8149,6 +8201,9 @@ fn cuda_program_source(
                 )
             }
             TensorOp::SumAxis { input, axis } | TensorOp::MeanAxis { input, axis } => {
+                let retry = if matches!(node.op, TensorOp::MeanAxis { .. }) {
+                    format!("out[index] = quabla_finite_mean(input + base, {}ULL, {}ULL, out[index]);", plan.nodes[*input].shape[*axis], contiguous_strides(&plan.nodes[*input].shape)[*axis])
+                } else { String::new() };
                 let input_shape = &plan.nodes[*input].shape;
                 let base = cuda_axis_reduction_base(node_id, input_shape, &node.shape, *axis)?;
                 let input_strides = contiguous_strides(input_shape);
@@ -8191,6 +8246,7 @@ fn cuda_program_source(
             float serial = 0.0f;
             for (unsigned long long k = 0; k < {extent}ULL; ++k) serial += input[base + k * {stride}ULL];
             out[index] = serial{scale};
+            {retry}
         }}
         return;
     }}
@@ -8198,7 +8254,7 @@ fn cuda_program_source(
         if (thread < stride) partial[thread] += partial[thread + stride];
         __syncthreads();
     }}
-    if (thread == 0U) out[index] = (float)(partial[0]{divisor});
+    if (thread == 0U) {{ out[index] = (float)(partial[0]{divisor}); {retry} }}
 }}
 "#
                     )
@@ -8209,7 +8265,7 @@ fn cuda_program_source(
                         if (index >= count) return;\n\
                         unsigned long long base = {base}; float value = 0.0f;\n\
                         for (unsigned long long k = 0; k < {}ULL; ++k) value += input[base + k * {}ULL];\n\
-                        out[index] = value{scale};\n}}\n",
+                        out[index] = value{scale}; {retry}\n}}\n",
                     input_shape[*axis], input_strides[*axis]
                 )
                 }

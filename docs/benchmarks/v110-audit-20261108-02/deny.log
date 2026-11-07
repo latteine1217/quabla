@@ -1,0 +1,128 @@
+warning[parse-error]: error parsing SPDX license expression
+   ┌─ /Users/latteine/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mach-sys-0.5.4/Cargo.toml:39:12
+   │
+39 │ license = "GPL-3.0 OR Apache-2.0"
+   │            ─────── a deprecated license identifier was used
+   │
+   ├ mach-sys v0.5.4
+     └── mlx-rs v0.32.0
+         └── quabla-core v1.0.3
+             └── quabla-python v1.0.3
+
+warning[duplicate]: found 2 duplicate entries for crate 'itertools'
+   ┌─ /Users/latteine/Documents/coding/nabla/Cargo.lock:25:1
+   │  
+25 │ ╭ itertools 0.13.0 registry+https://github.com/rust-lang/crates.io-index
+26 │ │ itertools 0.14.0 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰──────────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ itertools v0.13.0
+     └── bindgen v0.72.1
+         └── (build) mlx-sys v0.6.0
+             ├── mlx-rs v0.32.0
+             │   └── quabla-core v1.0.3
+             │       └── quabla-python v1.0.3
+             └── quabla-core v1.0.3 (*)
+   ├ itertools v0.14.0
+     ├── mlx-internal-macros v0.32.0
+     │   └── mlx-rs v0.32.0
+     │       └── quabla-core v1.0.3
+     │           └── quabla-python v1.0.3
+     └── mlx-rs v0.32.0 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'libloading'
+   ┌─ /Users/latteine/Documents/coding/nabla/Cargo.lock:28:1
+   │  
+28 │ ╭ libloading 0.8.9 registry+https://github.com/rust-lang/crates.io-index
+29 │ │ libloading 0.9.0 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰──────────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ libloading v0.8.9
+     └── clang-sys v1.8.1
+         └── bindgen v0.72.1
+             └── (build) mlx-sys v0.6.0
+                 ├── mlx-rs v0.32.0
+                 │   └── quabla-core v1.0.3
+                 │       └── quabla-python v1.0.3
+                 └── quabla-core v1.0.3 (*)
+   ├ libloading v0.9.0
+     ├── cudarc v0.19.10
+     │   └── quabla-core v1.0.3
+     │       └── quabla-python v1.0.3
+     └── quabla-core v1.0.3 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'shlex'
+   ┌─ /Users/latteine/Documents/coding/nabla/Cargo.lock:67:1
+   │  
+67 │ ╭ shlex 1.3.0 registry+https://github.com/rust-lang/crates.io-index
+68 │ │ shlex 2.0.1 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰─────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ shlex v1.3.0
+     └── bindgen v0.72.1
+         └── (build) mlx-sys v0.6.0
+             ├── mlx-rs v0.32.0
+             │   └── quabla-core v1.0.3
+             │       └── quabla-python v1.0.3
+             └── quabla-core v1.0.3 (*)
+   ├ shlex v2.0.1
+     └── cc v1.2.67
+         ├── cmake v0.1.58
+         │   └── (build) mlx-sys v0.6.0
+         │       ├── mlx-rs v0.32.0
+         │       │   └── quabla-core v1.0.3
+         │       │       └── quabla-python v1.0.3
+         │       └── quabla-core v1.0.3 (*)
+         └── (build) mlx-sys v0.6.0 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'syn'
+   ┌─ /Users/latteine/Documents/coding/nabla/Cargo.lock:73:1
+   │  
+73 │ ╭ syn 2.0.119 registry+https://github.com/rust-lang/crates.io-index
+74 │ │ syn 3.0.6 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰───────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ syn v2.0.119
+     ├── bindgen v0.72.1
+     │   └── (build) mlx-sys v0.6.0
+     │       ├── mlx-rs v0.32.0
+     │       │   └── quabla-core v1.0.3
+     │       │       └── quabla-python v1.0.3
+     │       └── quabla-core v1.0.3 (*)
+     ├── darling_core v0.21.3
+     │   ├── darling v0.21.3
+     │   │   ├── mlx-internal-macros v0.32.0
+     │   │   │   └── mlx-rs v0.32.0 (*)
+     │   │   └── mlx-macros v0.32.0
+     │   │       └── mlx-rs v0.32.0 (*)
+     │   └── darling_macro v0.21.3
+     │       └── darling v0.21.3 (*)
+     ├── darling_macro v0.21.3 (*)
+     ├── mlx-internal-macros v0.32.0 (*)
+     ├── mlx-macros v0.32.0 (*)
+     ├── num_enum_derive v0.7.6
+     │   └── num_enum v0.7.6
+     │       └── mlx-rs v0.32.0 (*)
+     ├── prettyplease v0.2.37
+     │   └── bindgen v0.72.1 (*)
+     ├── pyo3-macros v0.29.2
+     │   └── pyo3 v0.29.2
+     │       └── quabla-python v1.0.3 (*)
+     ├── pyo3-macros-backend v0.29.2
+     │   └── pyo3-macros v0.29.2 (*)
+     ├── strum_macros v0.28.0
+     │   └── strum v0.28.0
+     │       └── mlx-rs v0.32.0 (*)
+     ├── thiserror-impl v2.0.18
+     │   └── thiserror v2.0.18
+     │       └── mlx-rs v0.32.0 (*)
+     └── zerocopy-derive v0.8.54
+         └── zerocopy v0.8.54
+             └── half v2.7.1
+                 └── mlx-rs v0.32.0 (*)
+   ├ syn v3.0.6
+     └── quabla-macros v1.0.3
+         └── quabla-core v1.0.3
+             └── quabla-python v1.0.3
+
+advisories ok, bans ok, licenses ok, sources ok

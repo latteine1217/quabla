@@ -155,11 +155,20 @@ qb.eye(n, m=None, dtype=None)
     with the shift `m` set to zero where the maximum is not finite, as in
     JAX: an all-`-inf` slice gives `-inf`, a slice holding `+inf` gives
     `+inf`, and NaN propagates. Its gradient is `softmax`.
-  - `var(x, axis=None, keepdims=False, ddof=0)` and `std(...)` take two
-    passes (the mean, then the mean squared deviation), never
-    `E[x^2] - E[x]^2`, so `var(1e8 + [1, 2, 3])` is exactly `2/3` in
-    `float64`. `n <= ddof` divides by zero (inf or NaN). `std` has
-    derivative zero at zero variance (the `sqrt` convention; JAX gives NaN).
+  - `mean(x, axis=None, keepdims=False)` rescales finite inputs when an
+    intermediate reduction overflows; a representable mean of large finite
+    values remains finite on CPU, MLX and CUDA. NaN/infinity handling remains
+    unchanged. Ordinary nonzero results retain the existing reduction order.
+  - `var(x, axis=None, keepdims=False, ddof=0)` uses binary scaling and
+    sample centering before two-pass squared deviations, never
+    `E[x^2] - E[x]^2`. This preserves nearby large values and avoids
+    overflowing intermediate sums; `var(1e8 + [1, 2, 3])` remains exactly
+    `2/3` in `float64`. `std(...)` uses a scaled norm so its value and
+    derivatives can remain finite even when the variance overflows.
+    `n <= ddof` divides by zero (inf or NaN). `std` has derivative zero at
+    zero variance (the `sqrt` convention; JAX gives NaN). Scaling can change
+    last-bit rounding and adds computation. Metal flushes float32 subnormal
+    results to zero; this hardware limitation is unchanged.
   - `silu(x)` is `x * sigmoid(x)`; `gelu(x, approximate=True)` is the tanh
     approximation `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`,
     evaluated as `x * sigmoid(2u)` so the negative tail keeps its relative
@@ -603,7 +612,9 @@ restored = qb.load("checkpoint.qb")
 ```
 
 `save(file, tree)` writes a pytree to a path or a binary file object, and
-`load(file)` reads it back. Leaves may be quabla arrays (`Tensor` or
+`load(file)` reads it back. Partial stream writes are completed; a stream
+that makes no write progress raises `OSError`. Caller-owned streams remain
+open. Leaves may be quabla arrays (`Tensor` or
 `TensorView`), `None`, and Python `bool`, `int`, `float`, and `str` values;
 containers may be `dict` with string or integer keys, `list`, and `tuple`.
 Arrays load as `Tensor`s with the saved shape and dtype, bit for bit;
@@ -618,8 +629,9 @@ dict, and rebuild the objects after loading. Other leaves (NumPy arrays,
 `random.Key` values) and traced values raise `TypeError`.
 
 The format needs neither NumPy nor pickle, so `load` never executes code
-from the file; a malformed or truncated file raises `ValueError`. Version 1
-is laid out as:
+from the file; malformed, excessively nested or truncated data raises
+`ValueError`. Duplicate dict keys and bool bytes other than 0 or 1 are
+rejected rather than silently coerced. Version 1 is laid out as:
 
 | Offset | Size | Content |
 | --- | --- | --- |
@@ -954,8 +966,17 @@ Iterative and implicit solvers take functions instead of matrices:
 
 Each runs eagerly in Python or, under `jit`, as one `while_loop` region that
 stops at convergence (`||b - A x|| <= max(tol * ||b||, atol)` for the linear
-solvers, `||dx|| <= tol * (1 + ||x||)` for `newton`). Derivatives with
-respect to `b` and the array leaves of `args` follow the implicit function
+solvers, `||dx|| <= tol * (1 + ||x||)` for `newton`). The linear solvers
+normalize the right-hand side, initial guess, and absolute tolerance during
+iteration, using the magnitudes of both the right-hand side and initial
+guess. A zero right-hand side starts from the exact zero solution. CG
+recomputes the residual from the current iterate instead of
+updating it recursively, adding one operator evaluation per iteration to
+avoid premature convergence from roundoff. Success also requires a finite
+true residual satisfying the tolerance after rescaling the solution; if the
+dtype cannot represent the required components, the solve reports failure
+instead of false convergence. Derivatives with respect to `b` and the array
+leaves of `args` follow the implicit function
 theorem at the solution instead of differentiating the iterations: reverse
 mode solves one adjoint system, and forward mode (`jvp`, or `vmap` of `jvp`
 for a forward-mode Jacobian) one tangent system, `x_dot = A^-1 (b_dot -
@@ -985,7 +1006,9 @@ Heun's method (`"heun"`), or forward Euler (`"euler"`), at times
 `n + 1` states stacked on axis zero), so solves differentiate with respect
 to `y0`, `t0`, `t1`, and `args` and run under `jit` on every device. `y0` is
 a single array, and `f` must receive traced values through `args`, as loop
-bodies do.
+bodies do. Fixed-step grids use division before subtraction and weighted
+endpoints when a finite time span would otherwise overflow, including
+trajectory and `saveat` outputs.
 
 `qb.ode.odeint(f, y0, (t0, t1), method="dopri5", rtol=1e-6, atol=1e-9,
 max_steps=512, info=False)` is the adaptive Dormand-Prince 5(4) pair with
