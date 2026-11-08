@@ -428,6 +428,8 @@ def lstsq(
 
 def _norm_axes(axis: Any, ndim: int) -> tuple[int, ...]:
     """`axis` (an int or a sequence of ints) as distinct non-negative axes."""
+    if isinstance(axis, bool):
+        raise TypeError("axis must be an integer, not a bool")
     try:
         axes = (operator.index(axis),)
     except TypeError:
@@ -585,6 +587,9 @@ def pinv(a: ArrayLike, rtol: float | None = None) -> Array:
     m, n = a.shape[-2], a.shape[-1]
     if rtol is None:
         rtol = max(m, n) * (2.0**-23 if a.dtype == float32 else 2.0**-52)
+    elif isinstance(rtol, numbers.Real) and math.isnan(rtol):
+        # A NaN cutoff would treat every singular value as zero.
+        raise ValueError("rtol must not be NaN")
     u, s, vh = svd(a)
     kept = s > s[..., :1] * rtol
     inverse = where(kept, 1.0 / where(kept, s, 1.0), 0.0)

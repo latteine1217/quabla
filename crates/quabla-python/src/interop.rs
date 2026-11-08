@@ -171,6 +171,12 @@ pub(crate) fn tensor_from_buffer(
     } else {
         buffer.shape().to_vec()
     };
+    if buffer.item_count() == 0 {
+        // Reported here because an empty export may have no aligned pointer.
+        return Err(PyValueError::new_err(
+            "tensor extents must be greater than zero",
+        ));
+    }
     let format = buffer.format().to_owned();
     if !is_native_byte_order(&format) {
         return Err(PyTypeError::new_err(format!(

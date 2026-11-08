@@ -773,5 +773,48 @@ def test_mlx_linalg_matches_the_cpu():
         assert (error.op, error.device) == ("float64", "mlx")
 
 
+def test_factorizations_are_homogeneous_at_extreme_scales():
+    # The squares inside Householder and Jacobi steps must not overflow or
+    # underflow: f(s A) equals s^p f(A) wherever that is representable.
+    rng = np.random.default_rng(0)
+    tall = rng.standard_normal((5, 3))
+    wide = rng.standard_normal((3, 5))
+    square = rng.standard_normal((3, 3))
+    symmetric = square + square.T
+    matrices = [m / np.abs(m).max() for m in (tall, wide, square)]
+    for scale in (1e308, 1e300, 1e155, 1e-155, 1e-300, 1e-308, 1e-315):
+        for matrix in matrices:
+            # Subnormal scales round the input, so compare with the rounded matrix.
+            scaled = qb.asarray(matrix * scale)
+            base = qb.asarray(matrix * scale / scale)
+            for function, power in (
+                (lambda m: qb.linalg.qr(m, "r"), 1.0),
+                (lambda m: qb.linalg.qr(m)[0], 0.0),
+                (lambda m: qb.linalg.svd(m, compute_uv=False), 1.0),
+                (lambda m: qb.linalg.svd(m)[0], 0.0),
+                (lambda m: qb.linalg.svd(m)[2], 0.0),
+            ):
+                actual = function(scaled).numpy()
+                expected = function(base).numpy() * scale**power
+                assert np.isfinite(actual).all(), (scale, matrix.shape, actual)
+                assert np.abs(actual - expected).max() <= 1e-9 * np.abs(expected).max(), (scale, matrix.shape)
+        unit = symmetric / np.abs(symmetric).max()
+        values, vectors = qb.linalg.eigh(qb.asarray(unit * scale))
+        expected_values, expected_vectors = qb.linalg.eigh(qb.asarray(unit * scale / scale))
+        peak = np.abs(expected_values.numpy()).max() * scale
+        assert np.abs(values.numpy() - expected_values.numpy() * scale).max() <= 1e-9 * peak, scale
+        assert np.abs(vectors.numpy() - expected_vectors.numpy()).max() <= 1e-9, scale
+    # Exactly as before for ordinary magnitudes, including the zero matrix.
+    assert qb.linalg.svd(qb.zeros([2, 2]), compute_uv=False).tolist() == [0.0, 0.0]
+    assert qb.linalg.qr(qb.zeros([2, 2]), "r").tolist() == [[0.0, 0.0], [0.0, 0.0]]
+    assert qb.linalg.eigh(qb.zeros([2, 2]))[0].tolist() == [0.0, 0.0]
+    solution = qb.linalg.lstsq(qb.asarray([[1e308, 0.0], [1e308, 1e308]]), qb.asarray([1e308, 1e308]))
+    assert np.allclose(solution.numpy(), [1.0, 0.0], atol=1e-12)
+
+
+def test_pinv_rejects_a_nan_cutoff():
+    raises(ValueError, qb.linalg.pinv, qb.eye(2), float("nan"))
+
+
 if __name__ == "__main__":
     run(globals(), skip_reason="numpy is not installed" if np is None else None)

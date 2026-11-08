@@ -374,6 +374,8 @@ def _axes(axis: Axis, ndim: int) -> tuple[int, ...]:
     axes = (axis,) if _is_integral(axis) else tuple(axis)
     normalized = []
     for value in axes:
+        if isinstance(value, bool):
+            raise TypeError("axis must be an integer, not a bool")
         value = operator.index(value)
         if not -ndim <= value < ndim:
             raise ValueError(f"axis {value} is out of bounds for rank {ndim}")
@@ -1276,6 +1278,10 @@ def interp(
         denominator = _where(regular, width, hi * 0.5 - lo * 0.5)
         t = numerator / denominator
         pieces = fp[:-1] * (1.0 - t) + fp[1:] * t
+        # A knot returns its own value: a non-finite neighbour must not reach
+        # it through `inf * 0`. Finite data keeps the weighted form's slopes.
+        pieces = _where(t.equal(0.0).logical_and(fp[1:].isfinite().logical_not()), fp[:-1], pieces)
+        pieces = _where(t.equal(1.0).logical_and(fp[:-1].isfinite().logical_not()), fp[1:], pieces)
         value = _where(inside, pieces, 0.0).sum(axis=-1)
     value = _where(x > xp[-1], fp[-1] if right is None else right, value)
     value = _where(x < xp[0], fp[0] if left is None else left, value)

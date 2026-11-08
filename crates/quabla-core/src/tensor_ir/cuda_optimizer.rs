@@ -95,12 +95,15 @@ extern "C" __global__ void quabla_global_norm_reduce(
     }
     double peak = scalars[0];
     double scale = isfinite(peak) && peak > 0.0 ? peak : 1.0;
-    double norm = scale * sqrt(cache[0]);
-    // As clip_by_global_norm: gradients at or below the bound are unchanged
-    // and a non-finite norm turns every gradient into NaN. The sticky flag
+    double root = sqrt(cache[0]);
+    double norm = scale * root;
+    // As clip_by_global_norm: gradients at or below the bound are unchanged,
+    // finite gradients whose norm exceeds the float range scale in stages, and
+    // a non-finite gradient turns every gradient into NaN. The sticky flag
     // records that for parameters the plan pruned (see `nonfinite_clip_seen`).
-    scalars[1] = norm <= max_norm ? 1.0 : (isfinite(norm) ? max_norm / norm : nan(""));
-    if (!isfinite(norm)) scalars[2] = 1.0;
+    int finite = isfinite(peak) && isfinite(root);
+    scalars[1] = norm <= max_norm ? 1.0 : (isfinite(norm) ? max_norm / norm : (finite ? (max_norm / scale) / root : nan("")));
+    if (!finite) scalars[2] = 1.0;
 }
 
 "#;

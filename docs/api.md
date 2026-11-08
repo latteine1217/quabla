@@ -741,10 +741,12 @@ warns, and a schedule value that is negative or not finite raises when used.
 
 `qb.optim.clip_by_global_norm(grads, max_norm)` returns
 `(clipped_grads, global_norm)`. The norm over all leaves is computed in
-float64 as `m * sqrt(sum((g / m) ** 2))` with `m = max |g|`, so it neither
-overflows nor underflows; leaves are scaled by `min(1, max_norm / norm)` and
-keep their dtype. A NaN or infinite norm returns all-NaN gradients rather
-than finite values; test `math.isfinite(global_norm)` to skip such steps.
+float64 as `m * sqrt(sum((g / m) ** 2))` with `m = max |g|`, so it underflows
+nowhere and overflows only when the norm itself exceeds float64; finite leaves
+are then still scaled and `global_norm` is infinite. Leaves are scaled by
+`min(1, max_norm / norm)` and keep their dtype. A NaN or infinite leaf entry
+returns all-NaN gradients rather than finite values; test
+`math.isfinite(global_norm)` to skip such steps.
 The keyword `clip_norm=` on `Adam`, `AdamW`, and `SGD` applies the same
 clipping to every `update`.
 
@@ -1014,7 +1016,8 @@ trajectory and `saveat` outputs.
 max_steps=512, info=False)` is the adaptive Dormand-Prince 5(4) pair with
 first-same-as-last stages. Steps are accepted when the RMS norm of the
 embedded error estimate scaled by `atol + rtol * max(|y|, |y_new|)` is at
-most one; a PI controller (gains 0.7/5 and 0.4/5, safety 0.9, factor
+most one, an exactly zero error counting as zero where `atol = 0` leaves a
+zero state component with a zero scale; a PI controller (gains 0.7/5 and 0.4/5, safety 0.9, factor
 clipped to [0.2, 10]) picks the next step, rejected steps fall back to the
 I-controller, and the first step follows Hairer and Wanner's starting-step
 algorithm. The last step lands exactly on `t1`, and integration may run
@@ -1270,8 +1273,8 @@ the dtype rules below.
   lower to a length-one slice plus reshape, a strided slice to the
   contiguous slice spanning its elements plus a `gather`, and `None` to a
   final reshape, so reverse-mode AD and CUDA/MLX lowering preserve the same
-  semantics. Empty slices and advanced (array or boolean-mask) indexing are
-  not supported.
+  semantics. Empty slices, advanced (array or boolean-mask) indexing, and a
+  Python `bool` as an index are not supported.
 - `Tensor.split_key(key, count)`, `Tensor.random_normal(shape, key, ...)`,
   `Tensor.random_uniform(shape, key, minval, maxval, dtype)`,
   `Tensor.fold_in_key(key, data)`, and `Tensor.glorot_normal(shape, key)`

@@ -90,20 +90,7 @@ fn normalize_reduction_axes(axes: Vec<isize>, rank: usize) -> Result<Vec<usize>,
     Ok(axes)
 }
 
-fn extract_reduction_axes(axis: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<isize>>> {
-    let Some(axis) = axis else {
-        return Ok(None);
-    };
-    if axis.is_none() {
-        return Ok(None);
-    }
-    if let Ok(axis) = axis.extract::<isize>() {
-        return Ok(Some(vec![axis]));
-    }
-    crate::safe_extract::vec(axis).map(Some).map_err(|_| {
-        PyTypeError::new_err("axis must be None, an integer, or a sequence of integers")
-    })
-}
+use crate::tensor::extract_reduction_axes;
 
 #[pyclass(name = "TensorTraceGraph", skip_from_py_object)]
 #[derive(Clone, Debug, Default)]
@@ -1585,9 +1572,19 @@ impl TraceTensor {
         } else {
             self.logical_not_tensor()?
         };
-        let counts = counted
-            .astype_tensor(TensorDType::F64)?
-            .reduce_axes_tensor(axes, keepdims, false)?;
+        let node_id = counted
+            .graph
+            .ir
+            .lock()
+            .map_err(|_| "tensor trace graph lock is poisoned".to_string())?
+            .bool_count_values(counted.node_id)?;
+        let counts = Self::from_node(
+            counted.graph.clone(),
+            node_id,
+            counted.shape.clone(),
+            counted.batch_axis,
+        )
+        .reduce_axes_tensor(axes, keepdims, false)?;
         let kind = if any {
             TensorComparison::Greater
         } else {

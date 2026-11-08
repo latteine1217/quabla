@@ -770,6 +770,34 @@ def compare_with_numpy(function, reference, arguments, keywords, native=False, *
     assert_close(qb.jit(traced)(*[narrowed[i] for i in positions]).numpy(), expected, tolerance)
 
 
+def test_interp_knots_ignore_a_nonfinite_neighbour():
+    # A knot returns its own value: `inf * 0` from the neighbouring knot must
+    # not turn it into NaN, as NumPy's exact knot match does not.
+    xp = qb.asarray([1.0, 2.0, 3.0])
+    cases = (
+        ([1.0, INF, 3.0], [(1.0, 1.0), (1.5, INF), (2.0, INF), (2.5, NAN), (3.0, 3.0)]),
+        ([1.0, NAN, 3.0], [(1.0, 1.0), (1.5, NAN), (2.0, NAN), (2.5, NAN), (3.0, 3.0)]),
+        ([INF, 2.0, 3.0], [(1.0, INF), (1.5, INF), (2.0, 2.0), (2.5, 2.5), (3.0, 3.0)]),
+        ([1.0, 2.0, INF], [(1.0, 1.0), (1.5, 1.5), (2.0, 2.0), (2.5, INF), (3.0, INF)]),
+    )
+    for fp, points in cases:
+        fp = qb.asarray(fp)
+        for x, expected in points:
+            for actual in (
+                qb.interp(qb.asarray(x), xp, fp).item(),
+                qb.jit(lambda u, v: qb.interp(u, xp, v))(qb.asarray(x), fp).item(),
+            ):
+                if math.isnan(expected):
+                    # NumPy's slope form and the weighted form may differ only
+                    # between NaN and an infinity beyond a non-finite knot.
+                    assert not math.isfinite(actual), (fp.tolist(), x, actual)
+                else:
+                    assert actual == expected, (fp.tolist(), x, actual, expected)
+    # Finite data keeps the right-hand slope at an interior knot.
+    fp = qb.asarray([0.0, 2.0, 3.0])
+    assert qb.grad(lambda u: qb.interp(u, xp, fp))(qb.asarray(2.0)).item() == 1.0
+
+
 if __name__ == "__main__":
     if np is None:
         print("note: numpy is not installed; NumPy comparisons are skipped")

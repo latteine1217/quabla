@@ -174,10 +174,27 @@ fn py_isfinite(value: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
     tensor_method(value, "isfinite", ())
 }
 
+/// `axis` of `concat` as a non-negative axis of the first operand. A later
+/// operand of another rank is rejected by the concatenation itself.
+fn concat_axis(matrices: &Bound<'_, PySequence>, len: usize, axis: isize) -> PyResult<usize> {
+    if axis >= 0 || len == 0 {
+        return usize::try_from(axis).map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err("concat expects at least one operand")
+        });
+    }
+    let rank = matrices.get_item(0)?.getattr("shape")?.len()?;
+    usize::try_from(axis + rank as isize).map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "axis {axis} is out of bounds for rank {rank}"
+        ))
+    })
+}
+
 #[pyfunction(name = "concat")]
 #[pyo3(signature = (matrices, axis))]
-fn py_concat(py: Python<'_>, matrices: &Bound<'_, PySequence>, axis: usize) -> PyResult<Py<PyAny>> {
+fn py_concat(py: Python<'_>, matrices: &Bound<'_, PySequence>, axis: isize) -> PyResult<Py<PyAny>> {
     let len = matrices.len()?;
+    let axis = concat_axis(matrices, len, axis)?;
 
     let mut eager_tensors = safe_extract::buffer(len)?;
     let mut all_tensors = true;

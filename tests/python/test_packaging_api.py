@@ -382,5 +382,18 @@ def test_load_reports_excessive_nesting_as_a_format_error():
     raises(ValueError, qb.load, io.BytesIO(content))
 
 
+def test_load_reports_zero_extent_arrays_as_format_errors():
+    for shape in ([0], [2**70, 0], [3, 0, 2]):
+        node = {"type": "array", "dtype": "float64", "shape": shape, "offset": 0, "nbytes": 0}
+        header = json.dumps({"format": "quabla", "version": 1, "tree": node}).encode()
+        content = b"\x93QUABLA\n" + struct.pack("<Q", len(header)) + header
+        try:
+            qb.load(io.BytesIO(content))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"shape {shape} must be rejected")
+
+
 if __name__ == "__main__":
     run(globals())

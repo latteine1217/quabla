@@ -4312,5 +4312,113 @@ def test_prod_is_exact_with_zeros_and_differentiates_without_division():
     assert_raises(ValueError, qb.prod, qb.array([True, False]), match="bool")
 
 
+def test_arccosh_is_nan_for_large_negative_arguments():
+    # Below 1 the function is undefined at every magnitude. musl's `acosh`
+    # selects its branch on the exponent alone, so without a domain guard
+    # arguments such as -77698.5 returned finite values.
+    points = [-77698.54311101382, -400382.0046634038, -3888930.75, -2.0**26, -1e300, -1.5]
+    for dtype in (qb.float64, qb.float32):
+        x = qb.asarray(points, dtype=dtype)
+        for result in (qb.arccosh(x), qb.jit(qb.arccosh)(x)):
+            assert all(math.isnan(value) for value in result.tolist()), result.tolist()
+
+
+def test_concat_accepts_negative_axes_like_stack():
+    a = qb.asarray([[1.0, 2.0], [3.0, 4.0]])
+    assert qb.concat([a, a], -1).shape == [2, 4]
+    assert qb.concat([a, a], -2).tolist() == qb.concat([a, a], 0).tolist()
+    assert qb.jit(lambda x: qb.concat([x, x], -1))(a).tolist() == qb.concat([a, a], 1).tolist()
+    for axis in (2, -3):
+        try:
+            qb.concat([a, a], axis)
+        except ValueError as error:
+            assert "out of bounds" in str(error)
+        else:
+            raise AssertionError(f"axis {axis} must be rejected")
+
+
+def test_python_bool_is_not_an_integer_index():
+    # NumPy reads a bool index as a new mask axis; quabla has no boolean
+    # indexing, so reading it as position 0 or 1 would select the wrong data.
+    x = qb.asarray([[1.0, 2.0], [3.0, 4.0]])
+    for key in (True, False, (True, 0), (0, False), (Ellipsis, True)):
+        for function in (lambda a, key=key: a[key], lambda a, key=key: qb.jit(lambda b: b[key])(a)):
+            try:
+                function(x)
+            except TypeError as error:
+                assert "supports integers" in str(error)
+            else:
+                raise AssertionError(f"index {key!r} must be rejected")
+
+
+def test_int_conversion_of_a_tensor():
+    assert int(qb.asarray(2.7)) == 2
+    assert int(qb.asarray(-2.7)) == -2
+    assert int(qb.asarray([3.0], dtype=qb.float32)) == 3
+    assert int(qb.asarray(True)) == 1
+    assert int(qb.asarray(1e30)) == int(1e30)
+    for value, error in ((math.nan, ValueError), (math.inf, OverflowError)):
+        try:
+            int(qb.asarray(value))
+        except error:
+            pass
+        else:
+            raise AssertionError(f"int({value}) must raise {error.__name__}")
+    try:
+        int(qb.asarray([1.0, 2.0]))
+    except TypeError as error:
+        assert "single-element" in str(error)
+    else:
+        raise AssertionError("a multi-element tensor has no int value")
+
+
+def test_empty_buffers_report_the_empty_shape():
+    import array
+
+    try:
+        qb.asarray(array.array("d"))
+    except ValueError as error:
+        assert "greater than zero" in str(error)
+    else:
+        raise AssertionError("an empty buffer has no tensor")
+
+
+def test_arange_counts_like_numpy_without_accumulating_rounding():
+    # Accumulating a fractional step drifted below `stop` (an eleventh element
+    # in the first case) and away from `start + i * step`.
+    assert len(qb.arange(0.0, 1.0, 0.1).tolist()) == 10
+    assert len(qb.arange(-2.0, 1.0, 0.2).tolist()) == 15
+    assert len(qb.arange(1.1, 16.3, 1.9).tolist()) == 9
+    assert qb.arange(0.0, 1.0, 0.1).tolist() == [i * 0.1 for i in range(10)]
+    assert qb.arange(3.0, 0.0, -1.0).tolist() == [3.0, 2.0, 1.0]
+    assert qb.arange(0.0, 0.3, 0.1, dtype=qb.float32).dtype == qb.float32
+    if np is not None:
+        for start, stop, step in ((0.3, 7.1, 0.7), (-5.0, 5.0, 0.125), (9.9, -3.3, -0.3), (0.0, 1e6, 1e4)):
+            # NumPy steps by `y[1] - y[0]`, which can differ from `step` in the last bits.
+            actual, expected = qb.arange(start, stop, step).numpy(), np.arange(start, stop, step)
+            assert actual.shape == expected.shape and np.allclose(actual, expected, rtol=1e-13)
+    # A finite range whose span or `i * step` exceeds the float range.
+    largest = 1.7976931348623157e308
+    assert qb.arange(-largest, largest, largest).tolist() == [-largest, 0.0]
+    values = qb.arange(-largest, largest, largest / 2.0).tolist()
+    expected = [-largest, -largest / 2.0, 0.0, largest / 2.0]
+    assert all(math.isclose(a, b, rel_tol=1e-15, abs_tol=1e-300) for a, b in zip(values, expected)), values
+
+
+def test_python_bool_is_not_a_reduction_axis():
+    # `quabla.sum(x, True)` written for keepdims must not reduce axis 1.
+    x = qb.ones([2, 3])
+    def traced(function, axis):
+        return qb.jit(lambda a: function(a, axis))
+
+    for function in (qb.sum, qb.mean, qb.max, qb.min, qb.prod, qb.norm, qb.var, qb.std, qb.logsumexp):
+        for axis in (True, False, (True,), (0, True)):
+            assert_raises(TypeError, function, x, axis)
+            assert_raises(TypeError, traced(function, axis), x)
+    assert_raises(TypeError, qb.linalg.norm, x, None, True)
+    assert_raises(TypeError, x.sum, True)
+    assert_raises(TypeError, qb.any, x > 0.0, True)
+
+
 if __name__ == "__main__":
     run(globals())

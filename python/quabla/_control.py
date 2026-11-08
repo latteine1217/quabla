@@ -77,16 +77,32 @@ def _bindings(values):
     ]
 
 
+def _exports_buffer(value):
+    """Whether `value` exports the buffer protocol. `__buffer__` exists only
+    from Python 3.12 (PEP 688), so earlier versions are probed with
+    `memoryview`, which every buffer exporter accepts."""
+    try:
+        memoryview(value).release()
+    except TypeError:
+        return False
+    return True
+
+
 def _concrete_predicate(pred):
     """The branch an eager `cond` takes, by the traced region's rule: a
     scalar predicate selects the true branch when it is nonzero, and a
     non-finite one is rejected. `bool(Tensor)` cannot decide this, because
-    a floating `Tensor` is always truthy."""
-    if not isinstance(pred, _quabla.Tensor):
-        if isinstance(pred, numbers.Real) and (
-            pred != pred or pred == math.inf or pred == -math.inf
-        ):
+    a floating `Tensor` is always truthy, and neither can the truthiness of a
+    list or an array-like, which would pass over a zero or a NaN."""
+    if isinstance(pred, numbers.Real):
+        if pred != pred or pred == math.inf or pred == -math.inf:
             raise ValueError("conditional predicate must be finite")
+        return bool(pred)
+    if isinstance(pred, (list, tuple, memoryview, _quabla.TensorView)) or hasattr(
+        pred, "__array__"
+    ) or _exports_buffer(pred):
+        pred = asarray(pred)
+    if not isinstance(pred, _quabla.Tensor):
         return bool(pred)
     if pred.shape not in ([], [1]):
         raise ValueError(f"cond predicate must be scalar, got shape {list(pred.shape)}")

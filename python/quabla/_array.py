@@ -149,8 +149,10 @@ def arange(
     step: float = 1.0,
     dtype: DType | None = None,
 ) -> Tensor:
-    """Values from `start` (inclusive) to `stop` (exclusive) by `step`;
-    `arange(n)` counts from zero. The range must be non-empty."""
+    """`ceil((stop - start) / step)` values `start + i * step`, as NumPy: from
+    `start` (inclusive) to `stop` (exclusive, up to the rounding of a
+    fractional `step`); `arange(n)` counts from zero. The range must be
+    non-empty."""
     if stop is None:
         start, stop = 0.0, start
     return _typed(Tensor.arange(start, stop, step), dtype)

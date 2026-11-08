@@ -1785,5 +1785,26 @@ def test_eager_cond_predicate_matches_the_traced_rule():
         raise AssertionError("a vector predicate was accepted")
 
 
+def test_cond_reads_array_like_predicates_by_value():
+    # Truthiness of the container would take the true branch for a zero and
+    # for a NaN; array-likes follow the rule of a Tensor predicate.
+    import array
+
+    assert cond([0.0], lambda: 1, lambda: 2) == 2
+    assert cond((1.0,), lambda: 1, lambda: 2) == 1
+    assert cond(array.array("d", [0.0]), lambda: 1, lambda: 2) == 2
+    assert_raises(ValueError, cond, [math.nan], lambda: 1, lambda: 2)
+    assert_raises(ValueError, cond, [1.0, 0.0], lambda: 1, lambda: 2)
+    try:
+        import numpy as np
+    except ImportError:
+        return
+    assert cond(np.array(0.0), lambda: 1, lambda: 2) == 2
+    assert cond(np.array(True), lambda: 1, lambda: 2) == 1
+    assert cond(np.bool_(False), lambda: 1, lambda: 2) == 2
+    assert_raises(ValueError, cond, np.array(math.nan), lambda: 1, lambda: 2)
+    assert_raises(ValueError, cond, np.array([1.0, 0.0]), lambda: 1, lambda: 2)
+
+
 if __name__ == "__main__":
     run(globals())

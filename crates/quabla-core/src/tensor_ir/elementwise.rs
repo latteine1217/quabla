@@ -104,6 +104,17 @@ pub(super) enum UnaryChain {
     Over(TensorNodeId),
 }
 
+/// `arccosh`, NaN below 1. musl's `acosh` selects its branch from the exponent
+/// bits alone, so a large negative argument reaches `log(2 x - 1 / (x + sqrt(x^2
+/// - 1)))`, whose rounding can give a finite result instead of a domain error.
+fn acosh(x: f64) -> f64 {
+    if x < 1.0 {
+        f64::NAN
+    } else {
+        libm::acosh(x)
+    }
+}
+
 impl UnaryMathKind {
     pub const ALL: [Self; 24] = [
         Self::Exp,
@@ -166,7 +177,8 @@ impl UnaryMathKind {
     /// once. The error functions and the inverse hyperbolic functions use
     /// the musl implementations of the `libm` crate: Rust std has no `erf`,
     /// and its `acosh` is `ln(x + sqrt(x^2 - 1))`, which loses relative
-    /// accuracy near `1`, where musl switches to `log1p`.
+    /// accuracy near `1`, where musl switches to `log1p`. [`acosh`] guards
+    /// musl's domain.
     pub(super) fn function(self) -> fn(f64) -> f64 {
         match self {
             Self::Exp => f64::exp,
@@ -185,7 +197,7 @@ impl UnaryMathKind {
             Self::Sinh => f64::sinh,
             Self::Cosh => f64::cosh,
             Self::Arcsinh => libm::asinh,
-            Self::Arccosh => libm::acosh,
+            Self::Arccosh => acosh,
             Self::Arctanh => libm::atanh,
             Self::Log2 => f64::log2,
             Self::Log10 => f64::log10,

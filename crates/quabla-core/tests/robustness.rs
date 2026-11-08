@@ -1,4 +1,4 @@
-use quabla_core::tensor_ir::{DynamicTensor, TensorIr};
+use quabla_core::tensor_ir::{DynamicTensor, TensorIr, UnaryMathKind};
 
 #[test]
 fn finite_mean_survives_overflow_in_full_and_axis_reductions() -> Result<(), String> {
@@ -61,4 +61,25 @@ fn inferred_shapes_and_factory_capacity_are_checked() -> Result<(), String> {
     let output = graph.sum(a)?;
     graph.compile_cpu(output)?;
     Ok(())
+}
+
+#[test]
+fn arccosh_rejects_every_argument_below_one() {
+    // musl's `acosh` picks its branch from the exponent alone; the kernel must
+    // keep large negative arguments out of it.
+    for x in [
+        -77698.54311101382,
+        -3888930.75,
+        -(2.0f64.powi(26)),
+        -1e300,
+        0.5,
+    ] {
+        assert!(UnaryMathKind::Arccosh.evaluate(x).is_nan(), "acosh({x})");
+    }
+    assert!(UnaryMathKind::Arccosh.evaluate(f64::NAN).is_nan());
+    assert_eq!(UnaryMathKind::Arccosh.evaluate(1.0), 0.0);
+    assert_eq!(
+        UnaryMathKind::Arccosh.evaluate(f64::INFINITY),
+        f64::INFINITY
+    );
 }

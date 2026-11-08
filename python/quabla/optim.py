@@ -85,12 +85,14 @@ def clip_by_global_norm(grads: _Any, max_norm: float) -> tuple[_Any, float]:
 
     Returns ``(clipped_grads, global_norm)``. The norm over all leaves is
     computed in float64 as ``m * sqrt(sum((g / m) ** 2))`` with ``m`` the
-    largest ``|g|``, so it neither overflows nor underflows for extreme
-    magnitudes. Leaves are multiplied by ``min(1, max_norm / global_norm)``
-    and rounded once to their dtype; below the bound the input leaves are
-    returned unchanged. A NaN or infinite global norm returns all-NaN leaves
-    instead of finite values, so the following update exposes the bad step;
-    test ``math.isfinite(global_norm)`` to skip such a step instead.
+    largest ``|g|``, so it underflows nowhere and overflows only when the
+    norm itself exceeds float64; finite leaves are still scaled then, and
+    ``global_norm`` is infinite. Leaves are multiplied by
+    ``min(1, max_norm / global_norm)`` and rounded once to their dtype; below
+    the bound the input leaves are returned unchanged. A NaN or infinite leaf
+    entry returns all-NaN leaves instead of finite values, so the following
+    update exposes the bad step; test ``math.isfinite(global_norm)`` to skip
+    such a step instead.
     """
     max_norm = _positive(max_norm, "max_norm")
     leaves, definition = _tree.flatten(grads)
@@ -106,10 +108,17 @@ def clip_by_global_norm(grads: _Any, max_norm: float) -> tuple[_Any, float]:
     peak = _math.nan if any(_math.isnan(p) for p in peaks) else max(peaks, default=0)
     scale = peak if _math.isfinite(peak) and peak > 0 else 1.0
     total = sum(float(((value / scale) * (value / scale)).sum()) for value in wide)
-    norm = scale * _math.sqrt(total)
+    root = _math.sqrt(total)
+    norm = scale * root
     if norm <= max_norm:
         return grads, norm
-    factor = max_norm / norm if _math.isfinite(norm) else _math.nan
+    if _math.isfinite(norm):
+        factor = max_norm / norm
+    elif _math.isfinite(peak):
+        # Only the norm overflowed: `root` is finite, so divide in stages.
+        factor = (max_norm / scale) / root
+    else:
+        factor = _math.nan
     clipped = [(leaf.astype(_float64) * factor).astype(leaf.dtype) for leaf in leaves]
     return _tree.unflatten(definition, clipped), norm
 

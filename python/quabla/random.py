@@ -26,6 +26,7 @@ must change between calls.
 from __future__ import annotations
 
 import math
+import numbers
 import operator
 from typing import TYPE_CHECKING, Any, NoReturn
 
@@ -102,8 +103,8 @@ def _key_value(key: Key, what: str = "key") -> int:
 
 def _shape(shape: Shape) -> list[int]:
     _not_traced(shape, "shape")
-    if isinstance(shape, int):
-        shape = (shape,)
+    if isinstance(shape, (int, numbers.Integral)):
+        return [operator.index(shape)]
     return [operator.index(extent) for extent in shape]
 
 
@@ -187,6 +188,8 @@ def _fans(shape: Shape, what: str) -> tuple[int, int]:
     shape = _shape(shape)
     if len(shape) < 2:
         raise ValueError(f"{what} requires a weight shape of rank >= 2, got {shape}")
+    if any(extent <= 0 for extent in shape):
+        raise ValueError(f"{what} requires positive extents, got {shape}")
     receptive = math.prod(shape[:-2])
     return shape[-2] * receptive, shape[-1] * receptive
 

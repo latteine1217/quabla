@@ -180,5 +180,22 @@ def test_keys_are_host_values_under_transforms():
     )
 
 
+def test_integer_like_shapes_and_empty_weight_shapes():
+    key = random.key(0)
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None:
+        assert random.uniform(key, np.int64(2)).shape == [2]
+        assert random.normal(key, np.int64(2)).shape == [2]
+    # Every sampler rejects an empty shape with ValueError, initializers too.
+    for function in (random.glorot_normal, random.glorot_uniform, random.he_normal):
+        raises(ValueError, function, key, (0, 3))
+        raises(ValueError, function, key, (0, 0))
+        raises(ValueError, function, key, (3, 0))
+        raises(ValueError, function, key, (2, 0, 3))
+
+
 if __name__ == "__main__":
     run(globals())

@@ -1,7 +1,9 @@
 use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyEllipsis, PyMemoryView, PySlice, PySliceMethods, PyTuple};
+use pyo3::types::{
+    PyAny, PyBool, PyEllipsis, PyFloat, PyMemoryView, PySlice, PySliceMethods, PyTuple,
+};
 use quabla_core::tensor_ir::{
     BinaryMathKind, EagerKernel, EagerOperand, FusedKernel, HostTensorStorage, TensorComparison,
     TensorDType, UnaryMathKind,
@@ -152,6 +154,13 @@ pub fn parse_index_plan(index: &Bound<'_, PyAny>, shape: &[usize]) -> PyResult<I
             continue;
         }
         let extent = shape[axis];
+        // `bool` is an `int` to Python, but NumPy reads it as a mask axis; with
+        // no boolean indexing here, position 0 or 1 would select the wrong data.
+        if item.is_instance_of::<PyBool>() {
+            return Err(PyTypeError::new_err(
+                "Tensor indexing supports integers, slices, None, and ... only",
+            ));
+        }
         if let Ok(value) = item.extract::<isize>() {
             let normalized = if value < 0 {
                 extent as isize + value
@@ -361,19 +370,40 @@ fn normalize_axis(axis: isize, rank: usize) -> Result<usize, String> {
     Ok(normalized as usize)
 }
 
-fn extract_reduction_axes(axis: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<isize>>> {
+/// Reads a reduction `axis` as `None`, an integer, or a sequence of integers.
+/// A Python `bool` is rejected, alone or in a sequence: to Python it is an
+/// `int`, but `sum(x, True)` is a misplaced `keepdims`. The sequence is
+/// materialized through `safe_extract` first, so its length is bounded before
+/// any element is inspected.
+pub(crate) fn extract_reduction_axes(
+    axis: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<Vec<isize>>> {
     let Some(axis) = axis else {
         return Ok(None);
     };
     if axis.is_none() {
         return Ok(None);
     }
+    let bool_axis = || PyTypeError::new_err("axis must be an integer, not a bool");
+    if axis.is_instance_of::<PyBool>() {
+        return Err(bool_axis());
+    }
     if let Ok(axis) = axis.extract::<isize>() {
         return Ok(Some(vec![axis]));
     }
-    crate::safe_extract::vec(axis).map(Some).map_err(|_| {
-        PyTypeError::new_err("axis must be None, an integer, or a sequence of integers")
-    })
+    let not_axes =
+        || PyTypeError::new_err("axis must be None, an integer, or a sequence of integers");
+    crate::safe_extract::vec::<Bound<'_, PyAny>>(axis)
+        .map_err(|_| not_axes())?
+        .iter()
+        .map(|item| {
+            if item.is_instance_of::<PyBool>() {
+                return Err(bool_axis());
+            }
+            item.extract::<isize>().map_err(|_| not_axes())
+        })
+        .collect::<PyResult<Vec<_>>>()
+        .map(Some)
 }
 
 fn view_offset(flat_index: usize, shape: &[usize], strides: &[usize], offset: usize) -> usize {
@@ -1551,26 +1581,19 @@ impl PyTensor {
                 "arange allocation size exceeds addressable memory",
             ));
         }
-        let mut data = Vec::new();
-        let mut value = start;
-        if step > 0.0 {
-            while value < stop {
-                data.push(value);
-                let next = value + step;
-                if next == value {
-                    return Err(PyValueError::new_err("arange step does not advance"));
-                }
-                value = next;
-            }
-        } else {
-            while value > stop {
-                data.push(value);
-                let next = value + step;
-                if next == value {
-                    return Err(PyValueError::new_err("arange step does not advance"));
-                }
-                value = next;
-            }
+        // NumPy's count and `start + i * step`: accumulating the step would
+        // drift, adding an element just below `stop` or dropping the last one.
+        // Halving covers a range whose `i * step` exceeds the float range.
+        let count = estimated_count.ceil() as usize;
+        let mut data = crate::safe_extract::buffer(count)?;
+        for index in 0..count {
+            let position = index as f64;
+            let value = start + position * step;
+            data.push(if value.is_finite() {
+                value
+            } else {
+                (0.5 * start + position * (0.5 * step)) * 2.0
+            });
         }
         Self::from_shape_data(vec![data.len()], data).map_err(PyValueError::new_err)
     }
@@ -1590,8 +1613,23 @@ impl PyTensor {
             return Self::from_shape_data(vec![1], vec![start]).map_err(PyValueError::new_err);
         }
         let denominator = (num - 1) as f64;
+        let last = num - 1;
         let data = (0..num)
-            .map(|index| start + (stop - start) * index as f64 / denominator)
+            .map(|index| {
+                // Both endpoints are included exactly. Weighting the endpoints
+                // covers a span, or a span times an index, beyond the float
+                // range for finite endpoints.
+                if index == last {
+                    return stop;
+                }
+                let value = start + (stop - start) * index as f64 / denominator;
+                if value.is_finite() {
+                    value
+                } else {
+                    let fraction = index as f64 / denominator;
+                    start * (1.0 - fraction) + stop * fraction
+                }
+            })
             .collect();
         Self::from_shape_data(vec![num], data).map_err(PyValueError::new_err)
     }
@@ -1781,6 +1819,18 @@ impl PyTensor {
             [value] => Ok(*value),
             _ => Err(PyTypeError::new_err(format!(
                 "only single-element tensors can be converted to a Python float, got shape {:?}",
+                self.shape
+            ))),
+        }
+    }
+
+    /// The single element truncated toward zero, as `int(float(x))`. Without
+    /// this method `int()` would parse the buffer export as text.
+    fn __int__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match self.data.to_f64().as_ref() {
+            [value] => PyFloat::new(py, *value).call_method0("__int__"),
+            _ => Err(PyTypeError::new_err(format!(
+                "only single-element tensors can be converted to a Python int, got shape {:?}",
                 self.shape
             ))),
         }

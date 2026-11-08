@@ -245,6 +245,15 @@ const JACOBI_MAX_SWEEPS: usize = 64;
 /// the eigenvectors of a repeated eigenvalue span the right space but are
 /// not unique. A non-finite input yields NaN everywhere.
 pub(super) fn eigh(matrix: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+    let Some((unit, scale)) = at_unit_scale(matrix) else {
+        return eigh_in_range(matrix, n);
+    };
+    let (values, vectors) = eigh_in_range(&unit, n);
+    (rescaled(values, scale), vectors)
+}
+
+/// [`eigh`] of a matrix whose squares neither overflow nor underflow.
+fn eigh_in_range(matrix: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
     let nan = || (vec![f64::NAN; n], vec![f64::NAN; n * n]);
     if matrix.iter().any(|value| !value.is_finite()) {
         return nan();
@@ -343,6 +352,40 @@ pub(super) fn eigh(matrix: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
     (values, vectors)
 }
 
+/// The largest magnitude that keeps the squares and rotations of the
+/// factorizations in range without rescaling: `2^200`, and `2^-200` below.
+const UNSCALED_PEAK: f64 = 1.606938044258990275541962092341162602522202993782792835301376e60;
+
+/// `matrix` divided by the power of two nearest its largest magnitude, and that
+/// power, when the magnitude lies outside `[1 / UNSCALED_PEAK, UNSCALED_PEAK]`.
+/// `None` otherwise, which keeps ordinary inputs bit for bit, and for a zero or
+/// non-finite matrix, which each factorization handles itself. Dividing by a
+/// power of two is exact, so no accuracy is lost beyond the subnormals of the
+/// input, and the factors of the result scale back the same way.
+fn at_unit_scale(matrix: &[f64]) -> Option<(Vec<f64>, f64)> {
+    let mut peak = 0.0_f64;
+    for value in matrix {
+        if !value.is_finite() {
+            return None;
+        }
+        peak = peak.max(value.abs());
+    }
+    if peak == 0.0 || (1.0 / UNSCALED_PEAK..=UNSCALED_PEAK).contains(&peak) {
+        return None;
+    }
+    let scale = libm::scalbn(1.0, peak.log2().floor() as i32);
+    Some((matrix.iter().map(|value| value / scale).collect(), scale))
+}
+
+/// `values` of a factorization of the matrix from [`at_unit_scale`] back at the
+/// scale of the original matrix.
+fn rescaled(mut values: Vec<f64>, scale: f64) -> Vec<f64> {
+    for value in &mut values {
+        *value *= scale;
+    }
+    values
+}
+
 /// The Euclidean norm of `values`, scaled by the largest magnitude so that
 /// no square overflows or underflows.
 fn scaled_norm(values: impl Iterator<Item = f64> + Clone) -> f64 {
@@ -371,6 +414,15 @@ fn scaled_norm(values: impl Iterator<Item = f64> + Clone) -> f64 {
 /// the identity, so it is orthonormal to working precision even when `A` is
 /// rank deficient. A non-finite input yields NaN everywhere.
 pub(super) fn qr(matrix: &[f64], m: usize, n: usize, complete: bool) -> (Vec<f64>, Vec<f64>) {
+    let Some((unit, scale)) = at_unit_scale(matrix) else {
+        return qr_in_range(matrix, m, n, complete);
+    };
+    let (q, r) = qr_in_range(&unit, m, n, complete);
+    (q, rescaled(r, scale))
+}
+
+/// [`qr`] of a matrix whose squares neither overflow nor underflow.
+fn qr_in_range(matrix: &[f64], m: usize, n: usize, complete: bool) -> (Vec<f64>, Vec<f64>) {
     let k = m.min(n);
     let q_columns = if complete { m } else { k };
     if matrix.iter().any(|value| !value.is_finite()) {
@@ -459,6 +511,15 @@ type SvdFactors = (Vec<f64>, Vec<f64>, Vec<f64>);
 /// first on ties) is positive, with the matching row of `Vh` signed alike.
 /// A non-finite input yields NaN everywhere.
 pub(super) fn svd(matrix: &[f64], m: usize, n: usize, full: bool) -> SvdFactors {
+    let Some((unit, scale)) = at_unit_scale(matrix) else {
+        return svd_in_range(matrix, m, n, full);
+    };
+    let (u, s, vh) = svd_in_range(&unit, m, n, full);
+    (u, rescaled(s, scale), vh)
+}
+
+/// [`svd`] of a matrix whose squares neither overflow nor underflow.
+fn svd_in_range(matrix: &[f64], m: usize, n: usize, full: bool) -> SvdFactors {
     let k = m.min(n);
     let u_columns = if full { m } else { k };
     let vh_rows = if full { n } else { k };

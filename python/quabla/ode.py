@@ -35,7 +35,7 @@ from . import _quabla
 from ._array import asarray, eye, zeros
 from ._control import _bindings, fori_loop, scan
 from ._ops import abs as _abs
-from ._ops import exp, log, maximum, mean, minimum, sqrt, square, stop_gradient
+from ._ops import exp, isinf, log, maximum, mean, minimum, sqrt, square, stop_gradient
 from ._transforms import jvp, vmap
 from .linalg import solve
 
@@ -134,18 +134,29 @@ def _rms(x):
     return sqrt(mean(square(x)))
 
 
+def _scaled(x, scale, atol):
+    """`x / scale` for an error scale `atol + rtol * |y|`. With `atol == 0` a
+    zero state component has a zero scale, where an exactly zero `x` has no
+    relative error rather than the NaN of `0 / 0`."""
+    if atol > 0.0:
+        return x / scale
+    return _quabla.where(x.equal(0.0), 0.0, x / scale)
+
+
 def _initial_step(f, y0, f0, t0, direction, rtol, atol, order, args):
-    """Starting step of Hairer & Wanner, Solving ODEs I, Section II.4."""
+    """Starting step of Hairer & Wanner, Solving ODEs I, Section II.4. An
+    infinite scaled norm means a zero scale under `atol == 0`, which says
+    nothing about the step, so it takes the same small steps as a flat one."""
     y0, f0 = stop_gradient(y0), stop_gradient(f0)
     scale = atol + rtol * _abs(y0)
-    d0, d1 = _rms(y0 / scale), _rms(f0 / scale)
-    tiny = minimum(d0, d1) < 1e-5
+    d0, d1 = _rms(_scaled(y0, scale, atol)), _rms(_scaled(f0, scale, atol))
+    tiny = (minimum(d0, d1) < 1e-5) | isinf(d1)
     # The guarded denominators keep the unselected `where` branch finite.
     h0 = _quabla.where(tiny, 1e-6, 0.01 * d0 / _quabla.where(tiny, 1.0, d1))
     f1 = stop_gradient(asarray(f(y0 + (direction * h0) * f0, t0 + direction * h0, *args)))
-    d2 = _rms((f1 - f0) / scale) / h0
+    d2 = _rms(_scaled(f1 - f0, scale, atol)) / h0
     largest = maximum(d1, d2)
-    flat = largest <= 1e-15
+    flat = (largest <= 1e-15) | isinf(largest)
     h1 = _quabla.where(
         flat,
         maximum(h0 * 1e-3, 1e-6),
@@ -316,7 +327,7 @@ def _adaptive_step(f, method, linearize, carry, t1, direction, saveat, shape, si
     else:
         y_new, error, dense = _rosenbrock23_attempt(f, linearize, y, t, dt, args)
     scale = atol + rtol * maximum(_abs(stop_gradient(y)), _abs(stop_gradient(y_new)))
-    norm = _rms(stop_gradient(error) / scale)
+    norm = _rms(_scaled(stop_gradient(error), scale, atol))
     accept = norm <= 1.0
     # A NaN or overflowing error norm compares false, so it is rejected and
     # takes the largest shrink.

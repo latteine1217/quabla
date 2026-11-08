@@ -942,5 +942,27 @@ def test_optional_device_implicit_time_stepping_parity():
             actual = qb.jit(function, **options)(k).item()
             assert abs(actual - expected) <= tolerance * max(1.0, abs(expected))
 
+def test_adaptive_methods_accept_zero_atol_with_zero_state_components():
+    # rtol alone is a documented configuration; a zero state component has a
+    # zero error scale, where 0 / 0 must read as "no error" rather than NaN.
+    for method, accuracy in (("dopri5", 1e-4), ("rosenbrock23", 1e-2)):
+        options = {"method": method, "atol": 0.0, "rtol": 1e-5, "max_steps": 4000}
+        start = qb.ode.odeint
+        # The whole state starts at zero, with a nonzero slope.
+        value = start(lambda y, t: 1.0 - y, qb.asarray(0.0), (0.0, 1.0), **options).item()
+        assert math.isclose(value, 1.0 - math.exp(-1.0), rel_tol=accuracy), (method, value)
+        # One component stays exactly zero for the whole solve.
+        frozen = start(lambda y, t: y * qb.asarray([0.0, -1.0]), qb.asarray([0.0, 1.0]), (0.0, 1.0), **options)
+        assert frozen.tolist()[0] == 0.0
+        assert math.isclose(frozen.tolist()[1], math.exp(-1.0), rel_tol=accuracy), (method, frozen)
+        # One zero component with a nonzero slope beside a nonzero state.
+        mixed = start(lambda y, t: qb.stack([qb.asarray(1.0), -y[1]]), qb.asarray([0.0, 1.0]), (0.0, 1.0), **options)
+        assert math.isclose(mixed.tolist()[0], 1.0, rel_tol=accuracy), (method, mixed)
+        assert math.isclose(mixed.tolist()[1], math.exp(-1.0), rel_tol=accuracy), (method, mixed)
+        # The traced solve takes the same path.
+        traced = qb.jit(lambda y: start(lambda y, t: 1.0 - y, y, (0.0, 1.0), **options))(qb.asarray(0.0))
+        assert math.isclose(traced.item(), 1.0 - math.exp(-1.0), rel_tol=accuracy), (method, traced)
+
+
 if __name__ == "__main__":
     run(globals())

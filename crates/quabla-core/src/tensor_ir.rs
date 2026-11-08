@@ -3298,8 +3298,8 @@ impl TensorIr {
                 TensorOp::Cast { input } => {
                     let (value, tangent) = pairs[*input];
                     (
-                        transformed.cast(value, node.dtype)?,
-                        transformed.cast(tangent, node.dtype)?,
+                        transformed.rebuild_cast(value, node.dtype, node.weak)?,
+                        transformed.rebuild_cast(tangent, node.dtype, node.weak)?,
                     )
                 }
                 TensorOp::Add { lhs, rhs } => {
@@ -3964,7 +3964,9 @@ impl TensorIr {
                     node.dtype,
                     node.weak,
                 ),
-                TensorOp::Cast { input } => transformed.cast(values[*input], node.dtype)?,
+                TensorOp::Cast { input } => {
+                    transformed.rebuild_cast(values[*input], node.dtype, node.weak)?
+                }
                 TensorOp::Add { lhs, rhs } => transformed.add(values[*lhs], values[*rhs])?,
                 TensorOp::Sub { lhs, rhs } => transformed.sub(values[*lhs], values[*rhs])?,
                 TensorOp::Div { lhs, rhs } => transformed.div(values[*lhs], values[*rhs])?,
@@ -5077,6 +5079,22 @@ impl TensorIr {
         self.push_node(TensorOp::ScalarConstant { value }, vec![], dtype, weak)
     }
 
+    /// A `Cast` of a source graph in a derived one. It keeps the weak type, so a
+    /// derivative or specialized plan of a `float32` program holding the weak
+    /// count of `any`/`all` stays `float32` on a device.
+    fn rebuild_cast(
+        &mut self,
+        input: TensorNodeId,
+        dtype: TensorDType,
+        weak: bool,
+    ) -> Result<TensorNodeId, String> {
+        if !weak || dtype == TensorDType::Bool {
+            return self.cast(input, dtype);
+        }
+        let shape = self.node(input)?.shape.clone();
+        Ok(self.push_node(TensorOp::Cast { input }, shape, dtype, true))
+    }
+
     /// Converts `input` to `dtype`. Same-dtype casts are kept here and removed
     /// when a plan is compiled; lossy round trips are never folded.
     ///
@@ -5242,6 +5260,15 @@ impl TensorIr {
         self.bool_count_reduction("all", input, Some(axis), true)
     }
 
+    /// `input` (`Bool`) as the 0/1 terms of a count that is only compared with
+    /// zero. Weak, like a Python scalar: that comparison gives the same answer
+    /// in every floating dtype, so the count does not make a `float32` program
+    /// a `float64` one on a device.
+    pub fn bool_count_values(&mut self, input: TensorNodeId) -> Result<TensorNodeId, String> {
+        let shape = self.node(input)?.shape.clone();
+        Ok(self.push_node(TensorOp::Cast { input }, shape, TensorDType::F64, true))
+    }
+
     fn bool_count_reduction(
         &mut self,
         op_name: &str,
@@ -5251,15 +5278,7 @@ impl TensorIr {
     ) -> Result<TensorNodeId, String> {
         self.ensure_bool_operands(op_name, &[input])?;
         let counted = if all { self.logical_not(input)? } else { input };
-        // Weak, like a Python scalar: the count is only compared with zero,
-        // which gives the same answer in every floating dtype.
-        let shape = self.node(counted)?.shape.clone();
-        let counted = self.push_node(
-            TensorOp::Cast { input: counted },
-            shape,
-            TensorDType::F64,
-            true,
-        );
+        let counted = self.bool_count_values(counted)?;
         let count = match axis {
             Some(axis) => self.sum_axis(counted, axis)?,
             None => self.sum(counted)?,
@@ -13075,7 +13094,9 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                     node.dtype,
                     node.weak,
                 ),
-                TensorOp::Cast { input } => specialized.cast(mapped(*input)?, node.dtype)?,
+                TensorOp::Cast { input } => {
+                    specialized.rebuild_cast(mapped(*input)?, node.dtype, node.weak)?
+                }
                 TensorOp::Add { lhs, rhs } => specialized.add(mapped(*lhs)?, mapped(*rhs)?)?,
                 TensorOp::Sub { lhs, rhs } => specialized.sub(mapped(*lhs)?, mapped(*rhs)?)?,
                 TensorOp::Div { lhs, rhs } => specialized.div(mapped(*lhs)?, mapped(*rhs)?)?,

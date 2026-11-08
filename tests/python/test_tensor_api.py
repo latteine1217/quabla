@@ -554,5 +554,22 @@ def test_program_exports_the_verified_stablehlo_subset():
     ) + "\n"
 
 
+def test_linspace_finite_endpoints_stay_exact_and_finite():
+    # The final point is `stop` itself rather than a rounded `start + span`.
+    for start, stop, num in ((0.1, 0.7, 4), (-3.3, 8.1, 7), (1e-3, 1e3, 11), (2.5, -7.25, 13)):
+        values = quabla.linspace(start, stop, num).tolist()
+        assert values[0] == start and values[-1] == stop, values
+
+    # Neither the span nor span * index may overflow for finite endpoints.
+    largest = 1.7976931348623157e308
+    assert quabla.linspace(-largest, largest, 3).tolist() == [-largest, 0.0, largest]
+    values = quabla.linspace(0.0, largest, 4).tolist()
+    expected = [0.0, largest / 3.0, 2.0 * (largest / 3.0), largest]
+    assert all(math.isclose(a, b, rel_tol=1e-15) for a, b in zip(values, expected)), values
+    values = quabla.linspace(1e308, -1.7e308, 3).tolist()
+    assert values[0] == 1e308 and values[-1] == -1.7e308
+    assert math.isclose(values[1], -3.5e307, rel_tol=1e-14), values
+
+
 if __name__ == "__main__":
     run(globals())

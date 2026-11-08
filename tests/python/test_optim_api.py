@@ -1268,5 +1268,39 @@ def test_public_namespace_is_all():
     assert sorted(optim.__all__) == public
 
 
+def test_clip_keeps_finite_gradients_when_only_their_norm_overflows():
+    from quabla.optim import clip_by_global_norm
+
+    largest = 1.7e308
+    clipped, norm = clip_by_global_norm(qb.asarray([largest, largest]), 2.0)
+    assert norm == math.inf
+    assert all(math.isclose(v, math.sqrt(2.0), rel_tol=1e-14) for v in clipped.tolist()), clipped
+    clipped, norm = clip_by_global_norm({"a": qb.asarray([largest]), "b": qb.asarray([-largest])}, 1.0)
+    assert norm == math.inf
+    assert math.isclose(clipped["a"].item(), math.sqrt(0.5), rel_tol=1e-14)
+    assert math.isclose(clipped["b"].item(), -math.sqrt(0.5), rel_tol=1e-14)
+    # A non-finite entry still poisons the whole tree.
+    clipped, norm = clip_by_global_norm([qb.asarray([largest, math.inf])], 1.0)
+    assert norm == math.inf and all(math.isnan(v) for v in clipped[0].tolist())
+
+
+def test_device_clip_keeps_finite_gradients_when_only_their_norm_overflows():
+    # float32 gradients of 3e38 have a norm beyond float32 but a finite factor.
+    def loss(p):
+        return 1.5e38 * (p * p).sum()
+
+    def trained(device):
+        params = qb.asarray([1.0, 1.0], dtype=qb.float32)
+        trainer = Trainer(loss, params, SGD(1.0, clip_norm=1.0), device=device)
+        trainer.step()
+        return trainer.params.tolist()
+
+    cpu = trained("cpu")
+    assert all(math.isclose(v, 1.0 - math.sqrt(0.5), rel_tol=1e-6) for v in cpu), cpu
+    for device in devices():
+        values = trained(device)
+        assert all(math.isclose(a, b, rel_tol=1e-5) for a, b in zip(cpu, values)), (device, values)
+
+
 if __name__ == "__main__":
     run(globals())

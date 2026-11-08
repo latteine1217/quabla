@@ -50,6 +50,41 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
   including zero or tiny peaks. Exponential schedules handle intermediate
   power overflow and underflow when the final scaled value is representable,
   with or without an endpoint bound.
+- `arccosh` returns NaN for every argument below 1; the musl kernel returned
+  finite values for large negative arguments.
+- `arange` uses NumPy's count `ceil((stop - start) / step)` and values
+  `start + i * step` instead of accumulating `step`, which drifted and could
+  add or drop an element, so `arange(0.0, 1.0, 0.1)` has 10 elements rather
+  than 11. The length changes for such fractional steps. `linspace` returns
+  `stop` exactly as its final value, and both stay finite for finite arguments
+  whose span or `i * step` overflows.
+- `qr`, `eigh`, and `svd` on the CPU rescale a matrix whose largest magnitude
+  lies outside `[2^-200, 2^200]` by a power of two, so subnormal and
+  near-overflow matrices no longer give infinities or NaN. Other matrices
+  keep their results bit for bit.
+- `any` and `all` under `jit` keep a float32 program float32, as `TensorIr`
+  already did: MLX rejected them as float64 programs.
+- `clip_by_global_norm` and CPU, MLX and CUDA trainers with `clip_norm` scale
+  finite gradients whose norm exceeds the float range, where they returned
+  NaN. MLX also applies its clip in two stages, because Metal flushed a
+  subnormal factor to zero and silently skipped the update.
+- `interp` returns a knot's own value beside a non-finite `fp` neighbour,
+  where `inf * 0` gave NaN.
+- Adaptive `odeint` accepts `atol=0` with exactly zero state components. A
+  zero error scale gave `0 / 0`, so the solve never advanced.
+- `cond` reads a list, tuple, buffer, or NumPy array predicate by value, as it
+  does a `Tensor`. The truthiness of the container took the true branch for
+  `[0.0]`, and a 0-D NumPy NaN was not rejected.
+- A Python `bool` raises `TypeError` as a `Tensor` index or reduction `axis`
+  instead of acting as 0 or 1, which NumPy reads differently or rejects; this
+  includes `quabla.sum(x, True)` written for `keepdims`.
+- `int(tensor)` truncates a single-element tensor. It previously parsed the
+  buffer export as text and raised a garbled `ValueError`.
+- `concat` accepts negative axes like `stack`.
+- Empty buffers and saved arrays with a zero extent raise the documented
+  `ValueError` instead of `BufferError`. Initializers do so for an empty shape
+  instead of `ZeroDivisionError`, and `quabla.random` samplers accept NumPy
+  integers as a shape. `pinv` rejects a NaN `rtol`, which returned zeros.
 
 ## [1.0.3] - 2026-11-07
 

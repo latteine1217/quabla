@@ -290,10 +290,10 @@ impl MlxAdamPlan {
             self.retained_inputs.arrays(),
         )?;
         let stream = StreamOrDevice::gpu();
-        let clip_factor = self
+        let clip_stages = self
             .config
             .clip_norm
-            .map(|clip_norm| mlx_global_norm_clip_factor(&gradients, clip_norm as f32, &stream))
+            .map(|clip_norm| mlx_global_norm_clip_stages(&gradients, clip_norm as f32, &stream))
             .transpose()
             .map_err(|error| format!("MLX global-norm clipping failed: {error}"))?;
         let learning_rate = Array::from_f32(self.config.learning_rate as f32);
@@ -312,9 +312,10 @@ impl MlxAdamPlan {
                 ));
             }
             // As clip_by_global_norm, scale before the update and the moments.
-            let gradient = match &clip_factor {
-                Some(factor) => gradient
-                    .multiply_device(factor, &stream)
+            let gradient = match &clip_stages {
+                Some((divisor, multiplier)) => gradient
+                    .divide_device(divisor, &stream)
+                    .and_then(|gradient| gradient.multiply_device(multiplier, &stream))
                     .map_err(|error| format!("MLX gradient clipping failed: {error}"))?,
                 None => gradient,
             };
@@ -480,18 +481,22 @@ impl AdamArith for MlxArith<'_> {
 }
 
 /// The factor `min(1, clip_norm / norm)` of `clip_by_global_norm` over all
-/// gradients, as a lazy scalar array, NaN when the norm is not finite.
+/// gradients, as lazy scalars `(divisor, multiplier)` to apply in that order:
+/// `(1, 1)` at or below the bound, and `multiplier` NaN when a gradient is not
+/// finite.
 ///
 /// The norm is `m * sqrt(sum((g / m)^2))` with `m` the largest `|g|`: every
 /// term is at most one, so the float32 sum cannot overflow for large
 /// gradients. A NaN or infinite gradient makes the sum non-finite whatever the
-/// maximum reduction does with NaN, so the factor is NaN exactly when the
-/// host norm is not finite.
-fn mlx_global_norm_clip_factor(
+/// maximum reduction does with NaN. Clipping applies `g / m` and then
+/// `clip_norm / sqrt(sum)`, because their product can be subnormal, which Metal
+/// flushes to zero, and the norm itself can exceed float32 while every gradient
+/// and the host's float64 norm stay finite.
+fn mlx_global_norm_clip_stages(
     gradients: &[Array],
     clip_norm: f32,
     stream: &StreamOrDevice,
-) -> Result<Array, mlx_rs::error::Exception> {
+) -> Result<(Array, Array), mlx_rs::error::Exception> {
     let present = gradients
         .iter()
         .filter(|gradient| gradient.size() != 0)
@@ -515,21 +520,25 @@ fn mlx_global_norm_clip_factor(
             .sum_device(None, stream)?;
         total = total.add_device(&squares, stream)?;
     }
-    let norm = scale.multiply_device(total.sqrt_device(stream)?, stream)?;
+    let root = total.sqrt_device(stream)?;
+    let norm = scale.multiply_device(&root, stream)?;
     let bound = Array::from_f32(clip_norm);
-    let ratio = bound.divide_device(&norm, stream)?;
-    let ratio = ops::r#where_device(
-        norm.is_finite_device(stream)?,
-        &ratio,
+    let finite = ops::logical_and_device(
+        peak.is_finite_device(stream)?,
+        root.is_finite_device(stream)?,
+        stream,
+    )?;
+    let multiplier = ops::r#where_device(
+        &finite,
+        bound.divide_device(&root, stream)?,
         Array::from_f32(f32::NAN),
         stream,
     )?;
-    ops::r#where_device(
-        norm.le_device(&bound, stream)?,
-        Array::from_f32(1.0),
-        &ratio,
-        stream,
-    )
+    let unchanged = norm.le_device(&bound, stream)?;
+    Ok((
+        ops::r#where_device(&unchanged, Array::from_f32(1.0), &scale, stream)?,
+        ops::r#where_device(&unchanged, Array::from_f32(1.0), &multiplier, stream)?,
+    ))
 }
 
 impl MlxBackend {

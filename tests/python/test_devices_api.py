@@ -721,5 +721,42 @@ def test_cuda_register_heavy_kernels_launch_within_the_device_limit():
             close_normwise(actual, expected, 1e-12)
 
 
+def test_any_and_all_keep_a_float32_program_on_the_device():
+    # The count behind any/all is only compared with zero, so it must not turn
+    # the program into a float64 one that MLX rejects.
+    x = qb.array([[1.0, -1.0], [2.0, 3.0]], dtype=qb.float32)
+    cases = [
+        (lambda a: qb.any(a > 0.0), True),
+        (lambda a: qb.all(a > 0.0), False),
+        (lambda a: qb.any(a > 0.0, 0), [True, True]),
+        (lambda a: qb.all(a > 0.0, 1), [False, True]),
+        (lambda a: qb.all(a > -9.0, 0, keepdims=True), [[True, True]]),
+        (lambda a: (a > 5.0).any(), False),
+        (lambda a: qb.where(qb.all(a > 0.0, 0), a[0], -a[0]), [1.0, 1.0]),
+        (lambda a: qb.vmap(lambda row: qb.any(row > 2.5))(a), [False, True]),
+    ]
+    for target in ("cpu", *devices()):
+        for function, expected in cases:
+            result = qb.jit(function, device=target)(x)
+            assert result.tolist() == expected, (target, result.tolist(), expected)
+        # Derivative plans rebuild the count and must keep it weak too.
+        def loss(a):
+            return qb.where(qb.all(a > -9.0), a * a, a).sum()
+
+        for gradient in (
+            qb.jit(qb.grad(loss), device=target)(x),
+            qb.jit(qb.value_and_grad(loss), device=target)(x)[1],
+            qb.jit(lambda a: qb.jvp(loss, (a,), (a,))[1], device=target)(x),
+            qb.jit(lambda a: qb.grad(lambda b: qb.grad(loss)(b).sum())(a), device=target)(x),
+            qb.jit(qb.vmap(qb.grad(lambda r: qb.where(qb.any(r > 0.0), r * r, r).sum())), device=target)(x),
+            qb.jit(lambda a: qb.scan(lambda c, i: (c, qb.any(c > 0.0).astype(qb.float32)), a, length=2)[1], device=target)(x),
+            qb.jit(qb.grad(lambda a: qb.fori_loop(0, 2, lambda i, c: qb.where(qb.any(c > 0.0), c * 2.0, c), a).sum()), device=target)(x),
+        ):
+            assert gradient.dtype == qb.float32, (target, gradient.dtype)
+        # The dtype is unchanged where the program is genuinely float64.
+        wide = qb.jit(lambda a: qb.any(a > 0.0))(x.astype(qb.float64))
+        assert wide.tolist() is True
+
+
 if __name__ == "__main__":
     run(globals())
