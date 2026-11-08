@@ -181,9 +181,14 @@ qb.eye(n, m=None, dtype=None)
     relative accuracy where `1 + erf` would cancel to zero; what remains is
     the conditioning of the tail itself (in `float32`, a relative error of
     about `x^2 eps` from the rounding of `x`).
-  - `clip(x, lo=None, hi=None)` is `minimum(maximum(x, lo), hi)`: NaN
-    propagates, and at a bound the derivative goes to the bound, so `x`
-    gets zero there. `sign(x)` is -1, 0, or +1 (NaN for NaN) with derivative
+  - `maximum(x, y)` and `minimum(x, y)` follow JAX: NaN in either operand
+    propagates, a tie shares the derivative equally between the operands,
+    and signed zeros are ordered as in IEEE 754-2019 (`maximum(+0, -0)` is
+    `+0` and `minimum` is `-0` in either order), as the `max`/`min`
+    reductions are. `clip(x, lo=None, hi=None)` is
+    `minimum(maximum(x, lo), hi)`: NaN propagates, and at a bound `x` and the
+    bound share the derivative, as in `jnp.clip`. `sqrt(-0.0)` is `-0.0`
+    (IEEE 754); its derivative is 0 at both zeros. `sign(x)` is -1, 0, or +1 (NaN for NaN) with derivative
     zero. `square(x)` is `x * x` and `reciprocal(x)` is `1 / x`.
   - The max shift of `softmax`, `log_softmax`, and `logsumexp` is
     differentiated through; its contribution cancels to rounding.
@@ -1206,7 +1211,7 @@ the dtype rules below.
   to LAPACK `getrf` on MLX's CPU stream with a Metal substitution kernel. `sigmoid` is
   `where(x > 0, 1 / (1 + z), z / (1 + z))` with `z = exp(-|x|)`, so neither
   branch overflows and its gradient stays finite for every finite `x`;
-  `softplus` is `maximum(x, 0) + log1p(exp(-|x|))`. Eager `Tensor` evaluates
+  `softplus` is `relu(x) + log1p(exp(-|x|))`, with derivative `1/2` at 0. Eager `Tensor` evaluates
   both with the same per-op rounding as CPU `jit`, so the two agree bitwise.
 - Element dtypes `quabla.float32` and `quabla.float64` (dtype phase D1).
   `Tensor(shape, data, dtype=quabla.float32)` rounds `data` to `f32`, and

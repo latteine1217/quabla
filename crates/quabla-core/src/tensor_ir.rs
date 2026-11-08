@@ -15315,14 +15315,20 @@ fn remap_tensor_op(
 /// The `order`-th derivative of `sqrt` (order 0 is `sqrt` itself), the CPU
 /// reference that the CUDA and MLX lowerings reproduce.
 ///
-/// Every order is `0` at `+-0`, the zero subgradient that keeps higher-order
-/// AD away from `0 * inf` at the origin. A negative input, `-inf` included, is
+/// `sqrt` itself keeps the sign of zero, `sqrt(-0) == -0`, as IEEE 754
+/// requires; every derivative order is `0` at `+-0`, the zero subgradient
+/// that keeps higher-order AD away from `0 * inf` at the origin. A negative
+/// input, `-inf` included, is
 /// outside the domain and gives NaN as IEEE `sqrt` does; the explicit branch
 /// is needed because `powf(-inf, y)` is `inf` or `0` rather than NaN. NaN
 /// propagates through `powf`.
 fn sqrt_derivative_value(value: f64, order: u32) -> f64 {
     if value == 0.0 {
-        0.0
+        if order == 0 {
+            value
+        } else {
+            0.0
+        }
     } else if value < 0.0 {
         f64::NAN
     } else {
@@ -15336,8 +15342,10 @@ fn sqrt_derivative_value(value: f64, order: u32) -> f64 {
 fn cuda_sqrt_derivative_expression(input: &str, order: u32) -> String {
     let coefficient = cuda_scalar_literal(sqrt_derivative_coefficient(order));
     let exponent = cuda_scalar_literal(0.5 - order as f64);
+    // `sqrt` returns its signed zero; derivative orders return +0.
+    let zero = if order == 0 { input } else { "0.0f" };
     format!(
-        "(({input} == 0.0f) ? 0.0f : (({input} < 0.0f) ? __int_as_float(0x7fc00000) : \
+        "(({input} == 0.0f) ? {zero} : (({input} < 0.0f) ? __int_as_float(0x7fc00000) : \
          ({coefficient} * powf({input}, {exponent}))))"
     )
 }

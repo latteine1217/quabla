@@ -772,5 +772,28 @@ def test_python_operators_on_devices_match_cpu():
             assert all(math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-6) for a, b in zip(got, want)), (device, values)
 
 
+def test_maximum_minimum_ties_on_devices_match_cpu():
+    # Ties share the derivative and signed zeros follow IEEE on every backend.
+    x = qb.asarray([0.0, -0.0, 2.0, 3.0, -1.0], dtype=qb.float32)
+    y = qb.asarray([-0.0, 0.0, 2.0, 1.0, 4.0], dtype=qb.float32)
+
+    def program(a, b):
+        return qb.stack([qb.maximum(a, b), qb.minimum(a, b), qb.maximum(a, 2.0), qb.clip(a, -1.0, 2.0)])
+
+    def loss(a, b):
+        return qb.sum(program(a, b) * qb.asarray([[1.0], [2.0], [3.0], [4.0]], dtype=qb.float32))
+
+    expected = qb.jit(program)(x, y).tolist()
+    gradients = [g.tolist() for g in qb.jit(qb.grad(loss, argnums=(0, 1)))(x, y)]
+    for device in devices():
+        values = qb.jit(program, device=device)(x, y).tolist()
+        assert [[math.copysign(1.0, v) for v in row] for row in values] == [
+            [math.copysign(1.0, v) for v in row] for row in expected
+        ], (device, values)
+        assert values == expected, (device, values)
+        got = [g.tolist() for g in qb.jit(qb.grad(loss, argnums=(0, 1)), device=device)(x, y)]
+        assert got == gradients, (device, got)
+
+
 if __name__ == "__main__":
     run(globals())

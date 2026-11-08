@@ -59,47 +59,113 @@ fn nan_or<T: Primitives>(x: &T, ordered: T) -> Result<T, String> {
     x.isnan()?.logical_or(&ordered)
 }
 
-/// `where(isnan(x) | (x > y), x, y)`: ties select `y`, and NaN in either
-/// operand propagates. A `bool` left operand cannot be NaN; it keeps the
-/// legacy `greater` mask so its promotion and errors stay unchanged.
+/// The value of floating `maximum`/`minimum` where `x == y`, with JAX's
+/// derivative there: half to each operand. It equals the common value, and
+/// between `+0` and `-0` it is IEEE 754-2019's `maximum` (`+0`) or `minimum`
+/// (`-0`), as the `max`/`min` reductions are, so the result does not
+/// depend on the operand order.
+///
+/// For `|x| <= 1`, `(x + y) / 2` is exact, and `+0 + -0 == +0` gives the
+/// maximum's zero; the minimum negates both operands around the sum so its
+/// zero is `-0`. Larger values use `x / 2 + y / 2`, which cannot overflow,
+/// is exact for normal numbers, and keeps equal infinities.
+fn tie<T: Primitives>(x: &T, y: &T, maximum: bool) -> Result<T, String> {
+    let big = x
+        .compare_scalar(1.0, TensorComparison::Greater)?
+        .logical_or(&x.compare_scalar(-1.0, TensorComparison::Less)?)?;
+    let halves = x
+        .scalar_binary(0.5, "mul")?
+        .binary(&y.scalar_binary(0.5, "mul")?, "add")?;
+    let small = if maximum {
+        x.binary(y, "add")?.scalar_binary(0.5, "mul")?
+    } else {
+        x.scalar_binary(-1.0, "mul")?
+            .binary(&y.scalar_binary(-1.0, "mul")?, "add")?
+            .scalar_binary(-0.5, "mul")?
+    };
+    big.select(&halves, &small)
+}
+
+/// [`tie`] against the Python number `y`, whose branch is known in advance.
+fn tie_scalar<T: Primitives>(x: &T, y: f64, maximum: bool) -> Result<T, String> {
+    if y.abs() > 1.0 {
+        return x.scalar_binary(0.5, "mul")?.scalar_binary(0.5 * y, "add");
+    }
+    if maximum {
+        x.scalar_binary(y, "add")?.scalar_binary(0.5, "mul")
+    } else {
+        x.scalar_binary(-1.0, "mul")?
+            .scalar_binary(-y, "add")?
+            .scalar_binary(-0.5, "mul")
+    }
+}
+
+/// Floating `maximum` (`maximum == true`) or `minimum` with JAX's rules: a
+/// NaN in either operand propagates, the larger (smaller) operand is
+/// selected and takes the whole derivative, and ties are [`tie`]. Ties used
+/// to select `y` with its whole derivative, so `maximum(+0, -0)` was `-0`.
+fn extremum<T: Primitives>(x: &T, y: &T, maximum: bool) -> Result<T, String> {
+    let (first, second) = if maximum {
+        (TensorComparison::Greater, TensorComparison::Less)
+    } else {
+        (TensorComparison::Less, TensorComparison::Greater)
+    };
+    let take_x = nan_or(x, x.compare(y, first)?)?;
+    let take_y = nan_or(y, x.compare(y, second)?)?;
+    take_x.select(x, &take_y.select(y, &tie(x, y, maximum)?)?)
+}
+
+/// [`extremum`] against the Python number `y`.
+fn extremum_scalar<T: Primitives>(x: &T, y: f64, maximum: bool) -> Result<T, String> {
+    let (first, second) = if maximum {
+        (TensorComparison::Greater, TensorComparison::Less)
+    } else {
+        (TensorComparison::Less, TensorComparison::Greater)
+    };
+    let constant = x.scalar(y)?;
+    let take_x = nan_or(x, x.compare_scalar(y, first)?)?;
+    // A NaN `y` fails both comparisons and reaches the tie, whose value is
+    // then NaN as well.
+    let take_y = x.compare_scalar(y, second)?;
+    take_x.select(x, &take_y.select(&constant, &tie_scalar(x, y, maximum)?)?)
+}
+
+/// A `bool` left operand cannot be NaN or tie with a derivative; it keeps
+/// the legacy `greater` mask so its promotion and errors stay unchanged.
 pub(crate) fn maximum<T: Primitives>(x: &T, y: &T) -> Result<T, String> {
     if !x.dtype()?.is_floating() {
         return x.binary(y, "greater")?.select(x, y);
     }
-    nan_or(x, x.compare(y, TensorComparison::Greater)?)?.select(x, y)
+    extremum(x, y, true)
 }
 
 pub(crate) fn maximum_scalar<T: Primitives>(x: &T, y: f64) -> Result<T, String> {
-    let mask = if x.dtype()?.is_floating() {
-        nan_or(x, x.compare_scalar(y, TensorComparison::Greater)?)?
-    } else {
-        x.scalar_binary(y, "greater")?
-    };
-    mask.select(x, &x.scalar(y)?)
+    if !x.dtype()?.is_floating() {
+        return x.scalar_binary(y, "greater")?.select(x, &x.scalar(y)?);
+    }
+    extremum_scalar(x, y, true)
 }
 
-/// `where(isnan(x) | (y > x), x, y)`: ties select `y`, and NaN in either
-/// operand propagates.
 pub(crate) fn minimum<T: Primitives>(x: &T, y: &T) -> Result<T, String> {
     if !x.dtype()?.is_floating() {
         return y.binary(x, "greater")?.select(x, y);
     }
-    nan_or(x, y.compare(x, TensorComparison::Greater)?)?.select(x, y)
+    extremum(x, y, false)
 }
 
 pub(crate) fn minimum_scalar<T: Primitives>(x: &T, y: f64) -> Result<T, String> {
-    let mask = if x.dtype()?.is_floating() {
-        nan_or(x, x.compare_scalar(y, TensorComparison::Less)?)?
-    } else {
-        x.scalar_left_binary(y, "greater")?
-    };
-    mask.select(x, &x.scalar(y)?)
+    if !x.dtype()?.is_floating() {
+        return x.scalar_left_binary(y, "greater")?.select(x, &x.scalar(y)?);
+    }
+    extremum_scalar(x, y, false)
 }
 
-/// `maximum(x, 0)`, with a zero subgradient at zero.
+/// `max(x, 0)`, with a zero subgradient at zero.
 pub(crate) fn relu<T: Primitives>(x: &T) -> Result<T, String> {
     x.ensure_not_bool("relu")?;
-    maximum_scalar(x, 0.0)
+    // Not `maximum(x, 0)`, whose tie at zero shares the derivative: JAX's
+    // `relu` has derivative 0 at 0, and both zeros map to `+0`.
+    nan_or(x, x.compare_scalar(0.0, TensorComparison::Greater)?)?.select(x, &x.scalar(0.0)?)
 }
 
 /// `where(x > 0, x, 0 - x)`: zero takes the `0 - x` branch, which gives
@@ -131,11 +197,12 @@ pub(crate) fn sigmoid<T: Primitives>(x: &T) -> Result<T, String> {
         .select(&positive, &negative)
 }
 
-/// `maximum(x, 0) + log1p(exp(-|x|))`; `log1p` keeps the correction
-/// accurate where `exp(-|x|)` is below the dtype epsilon.
+/// `relu(x) + log1p(exp(-|x|))`; `log1p` keeps the correction accurate
+/// where `exp(-|x|)` is below the dtype epsilon. `relu`'s zero derivative
+/// at 0 and the `-1` that `abs` takes there sum to `sigmoid(0) = 1/2`.
 pub(crate) fn softplus<T: Primitives>(x: &T) -> Result<T, String> {
     x.ensure_not_bool("softplus")?;
-    let linear = maximum_scalar(x, 0.0)?;
+    let linear = relu(x)?;
     let correction = exp_negative_abs(x)?.log1p()?;
     linear.binary(&correction, "add")
 }

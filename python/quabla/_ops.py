@@ -462,8 +462,8 @@ def clip(
 ) -> Array:
     """`x` limited to `[lo, hi]` elementwise as `minimum(maximum(x, lo), hi)`;
     either bound may be `None`. A NaN in `x` or in a bound propagates, and at
-    a bound the derivative goes to the bound (`maximum`/`minimum` route ties
-    to their right operand), so `x` gets zero there."""
+    a bound the derivative is shared equally between `x` and the bound, as
+    `maximum`/`minimum` share a tie (JAX's rule)."""
     x = _array(x)
     if lo is not None:
         x = maximum(x, lo)

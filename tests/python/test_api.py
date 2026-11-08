@@ -749,7 +749,9 @@ def test_eager_ops_match_jit_bitwise():
     assert_raises(ValueError, asymmetric.cholesky, match="symmetric")
     zeros = qb.array([0.0, -0.0])
     assert float_bits(zeros.abs().tolist()) == float_bits([0.0, 0.0])
-    assert float_bits(zeros.sqrt().tolist()) == float_bits([0.0, 0.0])
+    # IEEE 754 sqrt keeps the sign of zero.
+    assert float_bits(zeros.sqrt().tolist()) == float_bits([0.0, -0.0])
+    assert float_bits(qb.jit(lambda v: v.sqrt())(zeros).tolist()) == float_bits([0.0, -0.0])
 
 
 def test_fused_elementwise_regions_match_their_ops_one_by_one():
@@ -839,22 +841,38 @@ def test_maximum_minimum_keep_nan_free_values_and_tie_gradients():
     assert float_bits(qb.jit(qb.maximum)(x, y).tolist()) == float_bits(
         [0.0, 0.0, 2.0, 0.0, 3.0]
     )
+    # Signed zeros are ordered as in IEEE 754-2019 (and the max/min
+    # reductions), whatever the operand order: min(-0, +0) is -0.
     assert float_bits(qb.minimum(x, y).tolist()) == float_bits(
-        [-1.0, 0.0, 1.0, 0.0, 3.0]
+        [-1.0, 0.0, 1.0, -0.0, 3.0]
     )
+    for a, b in ((0.0, -0.0), (-0.0, 0.0)):
+        pair = (qb.array(a), qb.array(b))
+        assert float_bits([qb.maximum(*pair).item(), qb.jit(qb.maximum)(*pair).item()]) == float_bits([0.0, 0.0])
+        assert float_bits([qb.minimum(*pair).item(), qb.jit(qb.minimum)(*pair).item()]) == float_bits([-0.0, -0.0])
+        assert float_bits([qb.maximum(qb.array(a), b).item(), qb.minimum(qb.array(a), b).item()]) == float_bits([0.0, -0.0])
     signed_zeros = qb.array([-0.0, 0.0])
     assert float_bits([qb.max(signed_zeros).item()]) == float_bits([0.0])
     assert float_bits([qb.jit(qb.max)(signed_zeros).item()]) == float_bits([0.0])
-    # Ties route the whole subgradient to the right operand, as before.
+    # Ties share the derivative equally (JAX's rule), including against a
+    # Python number and at infinities, which stay exact.
     for function in [qb.maximum, qb.minimum]:
         dx, dy = qb.grad(lambda a, b: qb.sum(function(a, b)), argnums=(0, 1))(x, y)
         mask = (
-            [0.0, 0.0, 1.0, 0.0, 0.0]
+            [0.0, 0.5, 1.0, 0.5, 0.5]
             if function is qb.maximum
-            else [1.0, 0.0, 0.0, 0.0, 0.0]
+            else [1.0, 0.5, 0.0, 0.5, 0.5]
         )
         assert dx.tolist() == mask, (function, dx.tolist())
         assert dy.tolist() == [1.0 - m for m in mask], (function, dy.tolist())
+        assert qb.grad(lambda a: qb.sum(function(a, 3.0)))(qb.array([3.0, 1e308])).tolist() == (
+            [0.5, 1.0] if function is qb.maximum else [0.5, 0.0]
+        )
+    big = qb.array([1e308, math.inf, -math.inf])
+    assert qb.maximum(big, big).tolist() == [1e308, math.inf, -math.inf]
+    assert qb.minimum(big, big).tolist() == [1e308, math.inf, -math.inf]
+    # clip shares a tie with its bound, as jnp.clip does.
+    assert qb.grad(lambda t: qb.sum(qb.clip(t, 1.0, 2.0)))(qb.array([1.0, 2.0, 1.5])).tolist() == [0.5, 0.5, 1.0]
     relu_gradient = qb.grad(lambda t: qb.sum(qb.relu(t)))(qb.array([-1.0, 0.0, 2.0]))
     assert relu_gradient.tolist() == [0.0, 0.0, 1.0]
     # A max reduction splits a tie equally (JAX's chooser rule).

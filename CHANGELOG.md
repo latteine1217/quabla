@@ -102,6 +102,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
 - `grad`, `value_and_grad`, `hessian`, `vjp`, and CPU and device `Trainer`
   return zero gradients for a value that does not depend on the arguments,
   as `jvp` and `jacobian` already did, instead of raising `ValueError`.
+- `maximum` and `minimum` follow JAX: a tie shares the derivative equally
+  between the operands, where it went entirely to the right operand, and
+  signed zeros follow IEEE 754-2019 in either operand order
+  (`maximum(+0, -0)` was `-0`), as the `max`/`min` reductions already did.
+  `clip` therefore shares the derivative with its bound at the bound, as
+  `jnp.clip` does; `relu` keeps its zero derivative at 0 and `softplus` its
+  `1/2`. `sqrt(-0.0)` returns `-0.0` as IEEE 754 requires.
 - `svd`, and the `pinv` and `norm(a, 2)` built on it, converge on
   rank-deficient matrices on the CPU. A column of the one-sided Jacobi
   iteration that was rounding noise of another never became orthogonal and
