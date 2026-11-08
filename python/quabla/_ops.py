@@ -301,12 +301,59 @@ def mod(x1: ArrayLike, x2: ArrayLike) -> Array:
     y_negative = y < 0.0
     adjust = ((r < 0.0) & (y > 0.0)) | ((r > 0.0) & y_negative)
     floored = _where(adjust, r + y, r)
-    # `r * r` is +0 for either zero, so the zero result takes the sign of `x2`.
-    zero = r * r
-    return _where(r.equal(0.0), _where(y_negative, -zero, zero), floored)
+    # A zero result takes the sign of `x2`. `r + r * r` is +0 for either zero
+    # of `r` (`-0 + +0 == +0`) and `-((-r) + r * r)` is -0, and both keep the
+    # derivative of `r` (1 in `x1`, `-trunc(x1 / x2)` in `x2`), which a zero
+    # built from `r * r` alone would drop at the exact multiples of `x2`.
+    square = r * r
+    zero = _where(y_negative, -((-r) + square), r + square)
+    return _where(r.equal(0.0), zero, floored)
 
 
 remainder = mod
+
+
+def _floor_divide(x1: ArrayLike, x2: ArrayLike) -> Array:
+    """`x1 // x2` with NumPy's `floor_divide`: the quotient matching `mod`,
+    so `x1 == (x1 // x2) * x2 + x1 % x2` up to rounding. As in NumPy it is
+    formed from the exact `fmod` remainder `r` as `(x1 - r) / x2`, lowered
+    by one where `r` and `x2` differ in sign and rounded to the nearest
+    integer, rather than as `floor(x1 / x2)`, which rounds the quotient
+    first and gives `1.0 // 0.1 == 10`. A zero quotient keeps the sign of
+    `x1 / x2`, and `x2 == 0` gives `x1 / x2`. The derivative is zero."""
+    r = fmod(x1, x2)
+    a = asarray(x1, dtype=r.dtype) if _is_number(x1) else _array(x1)
+    b = asarray(x2, dtype=r.dtype) if _is_number(x2) else _array(x2)
+    quotient = (a - r) / b
+    adjust = ((r < 0.0) & (b > 0.0)) | ((r > 0.0) & (b < 0.0))
+    quotient = _where(adjust, quotient - 1.0, quotient)
+    floored = floor(quotient)
+    floored = _where(quotient - floored > 0.5, floored + 1.0, floored)
+    # `(a / b) * 0` is a zero with the quotient's sign.
+    floored = _where(quotient.equal(0.0), (a / b) * 0.0, floored)
+    return _where(b.equal(0.0), a / b, floored)
+
+
+def _round_digits(x: ArrayLike, ndigits: int | None = None) -> Array:
+    """Python's `round(x, ndigits)` for a tensor, elementwise and keeping
+    the dtype: `round(x)` without `ndigits`, otherwise NumPy's
+    `round(x, decimals)`, which rounds `x * 10**ndigits` half to even and
+    divides back. Unlike NumPy, a finite `x` stays finite: where the scaled
+    value overflows, `x` has no digits below `10**-ndigits` and is returned
+    unchanged, and rounding to a power of ten beyond the float range gives a
+    zero of `x`'s sign."""
+    x = _array(x)
+    if ndigits is None:
+        return round(x)
+    ndigits = operator.index(ndigits)
+    if ndigits >= 0:
+        scale = 10.0**ndigits if ndigits <= 308 else math.inf
+        scaled = x * scale
+        return _where(scaled.isfinite(), round(scaled) / scale, x)
+    if -ndigits > 308:
+        return _where(x.isfinite(), x * 0.0, x)
+    scale = 10.0**-ndigits
+    return round(x / scale) * scale
 
 
 def cumsum(x: ArrayLike, axis: int | None = None, reverse: bool = False) -> Array:

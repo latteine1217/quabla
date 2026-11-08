@@ -8,6 +8,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
 
 ## [Unreleased]
 
+### Added
+
+- `Tensor` and `TraceTensor` support `abs(x)`, `+x`, `x % y` (`qb.mod`),
+  `x // y` (NumPy's `floor_divide`, so `1.0 // 0.1 == 9.0`), `round(x)` and
+  `round(x, ndigits)`, `len(x)`, and `format(x, spec)` for a 0-d tensor,
+  eagerly, under `jit` and `vmap`, and on every device.
+
 ### Fixed
 
 - CPU, MLX and CUDA mean reductions retry finite-input overflow at a safe
@@ -85,6 +92,18 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
   `ValueError` instead of `BufferError`. Initializers do so for an empty shape
   instead of `ZeroDivisionError`, and `quabla.random` samplers accept NumPy
   integers as a shape. `pinv` rejects a NaN `rtol`, which returned zeros.
+- Iterating a 0-d tensor raises `TypeError`, as in NumPy. Python fell back
+  to `__getitem__` and treated it as an empty sequence, so `sum(x)` silently
+  returned 0. `value in x` compares elements, as in NumPy; the same fallback
+  compared slices by identity and always returned `False`.
+- `np.sum`, `np.mean`, `np.max`, `np.min`, `np.prod`, `np.any`, and `np.all`
+  on a tensor delegate to its method instead of raising `TypeError` over the
+  `dtype`/`out` keywords NumPy passes; values other than `None` are rejected.
+- `grad`, `value_and_grad`, `hessian`, `vjp`, and CPU and device `Trainer`
+  return zero gradients for a value that does not depend on the arguments,
+  as `jvp` and `jacobian` already did, instead of raising `ValueError`.
+- `mod` keeps its derivative (1 in `x1`, `-floor(x1 / x2)` in `x2`) at exact
+  multiples of `x2`, where the signed zero result dropped it to 0.
 
 ## [1.0.3] - 2026-11-07
 

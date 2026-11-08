@@ -758,5 +758,19 @@ def test_any_and_all_keep_a_float32_program_on_the_device():
         assert wide.tolist() is True
 
 
+def test_python_operators_on_devices_match_cpu():
+    # %, //, abs, unary +, round, len, and iteration lower to ordinary ops.
+    def program(x):
+        rows = sum(row for row in x) * len(x)
+        return abs(x) + (+x) + x % 1.5 + x // 0.75 + round(x, 1) + rows
+
+    x = qb.asarray([[1.25, -2.5, 3.0], [-0.75, 4.5, 0.1]], dtype=qb.float32)
+    expected = qb.jit(program)(x).tolist()
+    for device in devices():
+        values = qb.jit(program, device=device)(x).tolist()
+        for got, want in zip(values, expected):
+            assert all(math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-6) for a, b in zip(got, want)), (device, values)
+
+
 if __name__ == "__main__":
     run(globals())

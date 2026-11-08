@@ -1665,7 +1665,9 @@ def test_grad_errors_and_python_scalar_arguments():
         ValueError, qb.grad(lambda x: qb.sum(x) > 1.0), x, match="bool output"
     )
     assert_raises(TypeError, qb.grad(lambda x: (x, x)), x, match="single scalar array")
-    assert_raises(ValueError, qb.grad(lambda x: 3.0), x, match="constant")
+    assert_raises(ValueError, qb.grad(lambda x: qb.asarray(True)), x, match="bool output")
+    # A constant value has zero gradients (test_constant_values_have_zero_gradients).
+    assert_tensor(qb.grad(lambda x: 3.0)(x), [0.0, 0.0], qb.float64)
     # A differentiated Python scalar becomes a float64 array ...
     derivative = qb.grad(lambda x: x**3)(2.0)
     assert_tensor(derivative, 12.0, qb.float64)
@@ -4418,6 +4420,131 @@ def test_python_bool_is_not_a_reduction_axis():
     assert_raises(TypeError, qb.linalg.norm, x, None, True)
     assert_raises(TypeError, x.sum, True)
     assert_raises(TypeError, qb.any, x > 0.0, True)
+
+
+def test_zero_dimensional_tensors_are_not_iterable():
+    # Without `__iter__`, Python iterated through `__getitem__` until an
+    # IndexError, so a 0-d tensor was an empty sequence and `sum` gave 0.
+    for value in (qb.asarray(2.5), qb.asarray(True), qb.asarray(1.5, dtype=qb.float32)):
+        assert_raises(TypeError, list, value)
+        assert_raises(TypeError, sum, value)
+        assert_raises(TypeError, len, value)
+        assert_raises(TypeError, qb.jit(lambda v: list(v)), value)
+        assert_raises(TypeError, qb.jit(lambda v: len(v)), value)
+    matrix = qb.asarray([[1.0, -2.0], [3.0, 4.5]])
+    assert len(matrix) == 2 and len(matrix[0]) == 2
+    assert [row.tolist() for row in matrix] == [[1.0, -2.0], [3.0, 4.5]]
+    assert [item.item() for item in qb.asarray([True, False])] == [True, False]
+    assert sum(qb.asarray([1.0, 2.0, 3.5])).item() == 6.5
+    traced = qb.jit(lambda v: sum(row.sum() for row in v) * len(v))(matrix)
+    assert traced.item() == 13.0
+    # Under vmap the traced function sees the unbatched shape.
+    batched = qb.vmap(lambda row: sum(row) + len(row))(matrix)
+    assert batched.tolist() == [1.0, 9.5]
+    # `in` compares elements; the fallback through iteration compared slices
+    # by identity and was always False.
+    assert 3.0 in matrix and 5.0 not in matrix and qb.asarray(-2.0) in matrix
+    assert 2.5 in qb.asarray(2.5) and True in qb.asarray([False, True])
+    assert math.nan not in qb.asarray([math.nan])
+    assert_raises(qb.TracerError, qb.jit(lambda v: 3.0 in v), matrix)
+
+
+def test_python_number_protocol_operators():
+    x = qb.asarray([[1.25, -2.5], [3.0, -0.0]])
+    assert abs(x).tolist() == qb.abs(x).tolist()
+    assert +x is x
+    assert round(qb.asarray(2.5)).item() == 2.0
+    assert round(qb.asarray([0.5, 1.5, -2.5])).tolist() == [0.0, 2.0, -2.0]
+    assert round(qb.asarray(2.675), 2).item() == 2.68  # NumPy's scaled rounding
+    assert round(qb.asarray([15.0, 25.0, -149.0]), -1).tolist() == [20.0, 20.0, -150.0]
+    # A finite value stays finite where NumPy overflows or returns NaN.
+    assert round(qb.asarray(1e300), 15).item() == 1e300
+    assert round(qb.asarray([2.5, 1e300]), 400).tolist() == [2.5, 1e300]
+    ends = round(qb.asarray([123.0, -4.0]), -400).tolist()
+    assert ends == [0.0, 0.0] and math.copysign(1.0, ends[1]) == -1.0
+    assert_raises(TypeError, round, x, 1.5)
+    assert format(qb.asarray(2.5), ".3f") == "2.500"
+    assert f"{qb.asarray(2.5, dtype=qb.float32):>6.1f}" == "   2.5"
+    assert format(x) == str(x)
+    assert_raises(TypeError, format, x, ".2f")
+    assert_raises(qb.TracerError, qb.jit(lambda v: format(v.sum(), ".2f")), x)
+    for op in ("%", "//"):
+        assert_raises(TypeError, eval, f"x {op} 'a'", {"x": x})
+
+
+def test_mod_and_floor_divide_operators_follow_numpy():
+    a = [7.0, -7.0, 7.0, -7.0, 1.0, 0.0, -0.0, 5.0, math.inf, 1.0, 1.0, -1.0, 2.9]
+    b = [2.0, 2.0, -2.0, -2.0, 0.1, 3.0, 3.0, 0.0, 2.0, math.inf, -math.inf, math.inf, 1.0]
+    # Python's own float operators, with x / 0 where Python raises.
+    floors = [3.0, -4.0, -4.0, 3.0, 9.0, 0.0, -0.0, math.inf, math.nan, 0.0, -1.0, -1.0, 2.0]
+    remainders = [1.0, 1.0, -1.0, -1.0, 0.09999999999999995, 0.0, 0.0, math.nan, math.nan, 1.0, -math.inf, math.inf, 0.8999999999999999]
+
+    def same(actual, expected):
+        return all(
+            (u != u and v != v) or (u == v and math.copysign(1.0, u) == math.copysign(1.0, v))
+            for u, v in zip(actual, expected)
+        )
+
+    x, y = qb.asarray(a), qb.asarray(b)
+    for floor_divide in (lambda u, v: u // v, qb.jit(lambda u, v: u // v)):
+        assert same(floor_divide(x, y).tolist(), floors), floor_divide(x, y).tolist()
+    assert same((x % y).tolist(), remainders), (x % y).tolist()
+    assert same(qb.jit(lambda u, v: u % v)(x, y).tolist(), remainders)
+    # Python numbers are weak operands on either side.
+    assert (qb.asarray([7.0, -7.0]) // 2).tolist() == [3.0, -4.0]
+    assert (7.0 // qb.asarray([2.0, -2.0])).tolist() == [3.0, -4.0]
+    assert (7 % qb.asarray([2.0, -2.0])).tolist() == [1.0, -1.0]
+    assert (qb.asarray([7.0], dtype=qb.float32) // 2.0).dtype == qb.float32
+    # floor division is piecewise constant; mod has derivative 1 in x1.
+    gradient = qb.grad(lambda u: (u // 1.5).sum() + (u % 1.5).sum())(qb.asarray([3.0, -1.0, 0.25]))
+    assert gradient.tolist() == [1.0, 1.0, 1.0]
+
+
+@requires_numpy
+def test_numpy_reductions_delegate_to_tensor_methods():
+    # np.sum(x) calls x.sum(axis=None, dtype=None, out=None).
+    x = qb.asarray([[1.0, -2.0], [3.0, 4.5]])
+    mask = x > 0.0
+    assert np.sum(x).item() == 6.5 and np.mean(x).item() == 1.625
+    assert np.max(x).item() == 4.5 and np.min(x).item() == -2.0
+    assert np.prod(x).item() == -27.0 and np.amax(x, axis=0).tolist() == [3.0, 4.5]
+    assert np.sum(x, axis=1, keepdims=True).tolist() == [[-1.0], [7.5]]
+    assert np.any(mask).item() is True and np.all(mask).item() is False
+    traced = qb.jit(lambda v: np.sum(v) + np.max(v, axis=0).sum())(x)
+    assert traced.item() == 14.0
+    assert_raises(TypeError, np.sum, x, out=np.zeros(()), match="out=")
+    assert_raises(TypeError, np.mean, x, dtype=np.float32, match="dtype=")
+
+
+def test_constant_values_have_zero_gradients():
+    # A value that does not depend on the arguments differentiates to zero,
+    # as in JAX and as jvp/jacobian already gave.
+    x = qb.asarray([1.0, 2.0])
+    for fun in (lambda v: qb.asarray(3.0), lambda v: 3.0, lambda v: qb.ones_like(v).sum()):
+        for transform in (qb.grad(fun), qb.jit(qb.grad(fun))):
+            assert_tensor(transform(x), [0.0, 0.0], qb.float64)
+        value, gradient = qb.value_and_grad(fun)(x)
+        assert value.item() in (2.0, 3.0) and gradient.tolist() == [0.0, 0.0]
+        assert qb.hessian(fun)(x).tolist() == [[0.0, 0.0], [0.0, 0.0]]
+        assert qb.vmap(qb.grad(fun))(qb.stack([x, x])).tolist() == [[0.0, 0.0]] * 2
+    # The zero survives infinite and NaN inputs and keeps each leaf's dtype.
+    assert qb.grad(lambda v: qb.ones_like(v).sum())(qb.asarray([math.inf, math.nan])).tolist() == [0.0, 0.0]
+    gradients = qb.grad(lambda v, t: qb.asarray(1.0), argnums=(0, 1))(
+        x, {"f32": qb.asarray([1.0], dtype=qb.float32), "mask": qb.asarray([True])}
+    )
+    assert gradients[0].tolist() == [0.0, 0.0]
+    assert_tensor(gradients[1]["f32"], [0.0], qb.float32)
+    assert gradients[1]["mask"] is None
+    assert qb.grad(lambda mask, v: qb.asarray(1.0))(qb.asarray([True]), x) is None
+    gradient, aux = qb.grad(lambda v: (qb.asarray(1.0), v * 2.0), has_aux=True)(x)
+    assert gradient.tolist() == [0.0, 0.0] and aux.tolist() == [2.0, 4.0]
+    assert qb.grad(lambda s: qb.grad(lambda t: t * 0.0 + 1.0)(s))(qb.asarray(2.0)).item() == 0.0
+    out, pullback = qb.vjp(lambda v: qb.ones_like(v), x)
+    assert out.tolist() == [1.0, 1.0] and pullback(qb.asarray([1.0, 1.0]))[0].tolist() == [0.0, 0.0]
+    # Values that are not floating scalars are still rejected.
+    assert_raises(ValueError, qb.grad(lambda v: qb.asarray(True)), x, match="bool output")
+    assert_raises(ValueError, qb.grad(lambda v: qb.asarray([1.0, 2.0])), x)
+    assert_raises(ValueError, qb.vjp, lambda v: v > 0.0, x)
 
 
 if __name__ == "__main__":

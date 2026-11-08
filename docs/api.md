@@ -60,7 +60,11 @@ qb.eye(n, m=None, dtype=None)
   when every element is a Python `bool`. Pass `dtype=qb.float32` to convert.
 - Export: `Tensor.numpy()`, `tolist()`, `item()`, `float(t)`, `np.asarray(t)`
   (through `__array__`), and the buffer protocol. `to_flat_list()` keeps
-  working. `qb.Array` is an abstract base class that `Tensor`, `TensorView`,
+  working. `np.sum`, `np.mean`, `np.max`, `np.min`, `np.prod`, `np.any`,
+  and `np.all` delegate to the tensor method of the same name and return a
+  tensor (under `jit`, a traced one); the `dtype` and `out` keywords that
+  NumPy passes are accepted as `None`, and any other value raises
+  `TypeError`. `qb.Array` is an abstract base class that `Tensor`, `TensorView`,
   and `TraceTensor` are registered with.
 - NumPy is optional: importing `quabla` never imports it.
 - `repr` of an eager `Tensor` shows its values, following NumPy's default
@@ -188,7 +192,11 @@ qb.eye(n, m=None, dtype=None)
   - `x.reshape(3, 2)`, `x.reshape((3, 2))`, and `quabla.reshape(x, shape)`
     accept one `-1` extent, inferred from the size. `x.T` reverses the axes
     (`x.transpose()`). Indexing takes `None`, `...`, and strided slices
-    (`x[None]`, `x[..., 0]`, `x[:, None]`, `x[::-1]`).
+    (`x[None]`, `x[..., 0]`, `x[:, None]`, `x[::-1]`). `len(x)` is the
+    leading extent and iteration yields `x[0], x[1], ...`; both raise
+    `TypeError` for a 0-d tensor, as in NumPy. Under `vmap` they see the
+    unbatched shape. `value in x` is `equal(x, value).any()`, as in NumPy
+    (a traced `x` raises `quabla.TracerError`).
   - `squeeze(x, axis=None)`, `expand_dims(x, axis)`,
     `split(x, indices_or_sections, axis=0)` (a list; pieces may not be
     empty), and `meshgrid(*xs, indexing="xy")` (a list; `"ij"` keeps the
@@ -232,10 +240,17 @@ qb.eye(n, m=None, dtype=None)
     for integer `x`; `isinf(x)`; and `nan_to_num(x, copy=True, nan=0.0,
     posinf=None, neginf=None)`, whose defaults are the dtype's finite
     limits.
-- Operators: `-x` and `x ** y` work on traced values as on eager ones;
+- Operators: `-x`, `+x`, `abs(x)`, `x ** y`, `x % y`, `x // y`, and
+  `round(x, ndigits=None)` work on traced values as on eager ones;
   `x ** y` with a non-integer or tensor exponent is the differentiable
   elementwise `pow` op (`qb.power`), described under
-  [Tensor Reference](#tensor-reference).
+  [Tensor Reference](#tensor-reference). `%` is `qb.mod`; `//` is NumPy's
+  `floor_divide`, the quotient that matches `mod` (`1.0 // 0.1 == 9.0`, as
+  in Python), with derivative zero. `round(x)` rounds half to even and
+  `round(x, n)` rounds `x * 10**n` as NumPy does, except that a finite `x`
+  stays finite where the scaled value would overflow. `format(x, spec)`
+  applies a non-empty spec to the element of a 0-d tensor (a traced value
+  raises `quabla.TracerError`).
 - The dtype rules, bool masks, and the operation set are those of the
   [Tensor Reference](#tensor-reference).
 
@@ -272,7 +287,10 @@ decorator: `@qb.jit(device="mlx", static_argnums=1)`, `@qb.grad(argnums=1)`.
   Python values read from closures are fixed at trace time; tracers of an
   enclosing trace read from closures are not (see "Closures over tracers").
 - Gradients mirror the pytree of the selected arguments and keep their
-  dtypes; `bool_` leaves get `None`. Transforms compose when passed to each
+  dtypes; `bool_` leaves get `None`. A value that does not depend on the
+  arguments (a constant, or `ones_like(x).sum()`) has zero gradients, as in
+  JAX, for `grad`, `value_and_grad`, `hessian`, `vjp`, and `Trainer`; a
+  `bool` value still raises `ValueError`. Transforms compose when passed to each
   other directly (`grad(grad(f))`, `jvp(grad(f), (x,), (v,))`,
   `jit(value_and_grad(f))`) and when a transformed function is called
   inside a function that another transform traces: `grad`,

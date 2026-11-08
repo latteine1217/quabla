@@ -798,6 +798,23 @@ def test_interp_knots_ignore_a_nonfinite_neighbour():
     assert qb.grad(lambda u: qb.interp(u, xp, fp))(qb.asarray(2.0)).item() == 1.0
 
 
+def test_mod_differentiates_at_exact_multiples():
+    # The zero result at an exact multiple of x2 kept the sign of x2 but
+    # dropped the derivative: it is 1 in x1 and -floor(x1 / x2) in x2.
+    a = qb.asarray([3.0, -3.0, 4.5, 0.0, -0.0, -4.5, 2.9])
+    b = qb.asarray([1.5, 1.5, -1.5, 2.0, 2.0, -1.5, 1.0])
+    values = qb.mod(a, b).tolist()
+    assert [math.copysign(1.0, v) for v in values[:6]] == [1.0, 1.0, -1.0, 1.0, 1.0, -1.0]
+    assert all(v == 0.0 for v in values[:6]) and math.isclose(values[6], 0.9, rel_tol=1e-12)
+    da, db = qb.grad(lambda x, y: qb.mod(x, y).sum(), argnums=(0, 1))(a, b)
+    assert da.tolist() == [1.0] * 7
+    assert db.tolist() == [-2.0, 2.0, 3.0, 0.0, 0.0, -3.0, -2.0]
+    for device in devices():
+        f32 = [qb.asarray(t.tolist(), dtype=qb.float32) for t in (a, b)]
+        g = qb.jit(qb.grad(lambda x, y: qb.mod(x, y).sum(), argnums=(0, 1)), device=device)(*f32)
+        assert g[0].tolist() == [1.0] * 7 and g[1].tolist() == db.tolist(), (device, g)
+
+
 if __name__ == "__main__":
     if np is None:
         print("note: numpy is not installed; NumPy comparisons are skipped")

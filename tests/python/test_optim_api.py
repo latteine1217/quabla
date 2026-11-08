@@ -1302,5 +1302,33 @@ def test_device_clip_keeps_finite_gradients_when_only_their_norm_overflows():
         assert all(math.isclose(a, b, rel_tol=1e-5) for a, b in zip(cpu, values)), (device, values)
 
 
+def test_trainer_loss_that_ignores_the_parameters_keeps_them():
+    # A loss independent of the parameters has zero gradients, so Adam and
+    # SGD leave them unchanged, on the CPU and on the devices.
+    def check(device, dtype):
+        params = {"w": qb.asarray([1.0, -2.0], dtype=dtype)}
+        losses = (
+            lambda p: qb.asarray(1.5, dtype=dtype),
+            lambda p: qb.ones_like(p["w"]).sum(),
+            lambda p: 1.5,
+        )
+        for loss in losses:
+            for optimizer in (Adam(0.1, clip_norm=1.0), SGD(0.1)):
+                trainer = Trainer(loss, params, optimizer, device=device)
+                for _ in range(3):
+                    trainer.step()
+                assert trainer.params["w"].tolist() == [1.0, -2.0], (device, trainer.params)
+        # A bool loss is still rejected: when the CPU trainer first steps, and
+        # when a device trainer builds its plan.
+        if device == "cpu":
+            raises(ValueError, Trainer(lambda p: True, params, SGD(0.1)).step)
+        else:
+            raises(ValueError, Trainer, lambda p: True, params, SGD(0.1), device=device)
+
+    check("cpu", qb.float64)
+    for device in devices():
+        check(device, qb.float32)
+
+
 if __name__ == "__main__":
     run(globals())

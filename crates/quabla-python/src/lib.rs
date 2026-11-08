@@ -12,6 +12,7 @@ mod composite;
 mod dtype;
 mod errors;
 mod interop;
+mod protocol;
 mod repr;
 mod safe_extract;
 mod tensor;

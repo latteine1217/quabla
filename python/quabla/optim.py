@@ -430,11 +430,19 @@ class Trainer:
             names[i] = name
             occupied.add(name)
         staged = _trace(loss, definition._node, leaves, names)
-        if len(staged.outputs) != 1 or not isinstance(
-            staged.outputs[0], _quabla.TraceTensor
-        ):
+        if len(staged.outputs) != 1:
             raise ValueError("Trainer loss must return one scalar Tensor")
-        if _math.prod(staged.outputs[0].shape) != 1:
+        output = staged.outputs[0]
+        if not isinstance(output, _quabla.TraceTensor):
+            # A loss that does not depend on the parameters has zero gradients,
+            # as on the CPU; the device plan needs it as a graph node. A Python
+            # number is a weak scalar and takes the parameters' dtype.
+            if isinstance(output, bool) or not isinstance(output, (_Tensor, float, int)):
+                raise ValueError("Trainer loss must return one scalar Tensor")
+            if not isinstance(output, _Tensor):
+                output = _asarray(output, dtype=leaves[0].dtype)
+            output = staged.graph._constant(output)
+        if _math.prod(output.shape) != 1:
             raise ValueError("Trainer loss must be scalar")
         self._parameter_names = names[: len(parameters)]
         self._batch_names = []
@@ -468,7 +476,7 @@ class Trainer:
         if target == "cuda":
             rule.update(precision=precision, device_ordinal=ordinal)
         self._executor = factory(
-            staged.outputs[0],
+            output,
             self._parameter_names,
             dict(zip(names, leaves)),
             retained,

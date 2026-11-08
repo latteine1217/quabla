@@ -809,6 +809,19 @@ class _Transform:
         return name
 
 
+def _zero_seed(graph, leaves, names, positions):
+    """A traced scalar whose derivative in every input is exactly zero, to
+    seed the reverse pass of an output that does not depend on the
+    arguments: `sum(x * 0)` of the first floating input `x` among the leaf
+    `positions`. Its derivative is the constant 0 even where `x` is infinite
+    or NaN. `None` when none of them is floating."""
+    for position in positions:
+        leaf = leaves[position]
+        if type(leaf) in _ARRAY_LEAVES and leaf.dtype != bool_:
+            return (graph.input(names[position]) * 0.0).sum()
+    return None
+
+
 def _stage_value_and_grad(staged, in_node, leaves, names, argnums, has_aux, what):
     """Reverse mode over a staged scalar function: returns the value part
     (`value` or `(value, aux)`) and the gradients of the `argnums` leaves."""
@@ -829,24 +842,40 @@ def _stage_value_and_grad(staged, in_node, leaves, names, argnums, has_aux, what
             f"{what} requires fun to return a single scalar array as its value"
         )
     value = outputs[0]
-    if not _is_traced(value):
-        raise ValueError(
-            f"{what} requires the value to be computed from the arguments, got a constant "
-            f"{type(value).__name__}"
-        )
+    # A value that does not depend on the arguments (a constant, or an
+    # expression such as `ones_like(x).sum()`) has zero gradients, as in JAX
+    # and as `jvp`/`jacobian` already give.
+    traced = _is_traced(value)
+    if not traced:
+        value = asarray(value)
     if value.shape != []:
         raise ValueError(
             f"{what} requires a scalar output, got shape {value.shape}; use jacobian or vjp "
             "for non-scalar outputs"
         )
-    aux = outputs[1:]
-    retained = [value] + [leaf for leaf in aux if _is_traced(leaf)]
-    graph, rebuilt, gradients = staged.graph._symbolic_vjp([value], [None], retained)
-    rebuilt = iter(rebuilt)
-    value = next(rebuilt)
-    aux = [next(rebuilt) if _is_traced(leaf) else leaf for leaf in aux]
-
+    if not traced and value.dtype == bool_:
+        # The message of a traced bool value, raised by the reverse pass.
+        raise ValueError("cannot differentiate a bool output; convert it explicitly with astype")
     ranges = _argument_ranges(in_node)
+    aux = outputs[1:]
+    seed = (
+        value
+        if traced
+        else _zero_seed(
+            staged.graph, leaves, names, [p for a in argnums for p in ranges[a]]
+        )
+    )
+    retained = ([value] if traced else []) + [leaf for leaf in aux if _is_traced(leaf)]
+    if seed is None:
+        # No floating argument is differentiated: every gradient is None.
+        graph, gradients = staged.graph, {}
+    else:
+        graph, rebuilt, gradients = staged.graph._symbolic_vjp([seed], [None], retained)
+        rebuilt = iter(rebuilt)
+        if traced:
+            value = next(rebuilt)
+        aux = [next(rebuilt) if _is_traced(leaf) else leaf for leaf in aux]
+
     grad_leaves = []
     for argnum in argnums:
         for position in ranges[argnum]:
@@ -1497,14 +1526,26 @@ class _Vjp(_Transform):
             if _is_traced(output) and output.dtype != bool_:
                 seeded.append(output)
                 cotangent_specs.append((position, output.shape, output.dtype))
-        if not seeded:
-            raise ValueError(
-                "vjp requires a floating-point output computed from the primals"
-            )
         cotangent_names = [
             f"{_COTANGENT_PREFIX}{index}" for index in range(len(seeded))
         ]
+        if not seeded:
+            # Floating outputs that do not depend on the primals pull back to
+            # zero, as in JAX; only outputs with no floating leaf are rejected.
+            if not any(
+                type(output) in _ARRAY_LEAVES and output.dtype != bool_
+                or isinstance(output, float)
+                for output in outputs
+            ):
+                raise ValueError(
+                    "vjp requires a floating-point output computed from the primals"
+                )
+            seed = _zero_seed(staged.graph, leaves, names, range(len(leaves)))
+            if seed is None:
+                raise ValueError("vjp requires a floating-point primal")
+            seeded, cotangent_names = [seed], [None]
         graph, _, gradients = staged.graph._symbolic_vjp(seeded, cotangent_names, [])
+        cotangent_names = [name for name in cotangent_names if name is not None]
         grad_outputs = [
             gradients[name]
             if type(leaf) in _ARRAY_LEAVES and leaf.dtype != bool_

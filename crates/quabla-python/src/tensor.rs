@@ -2,7 +2,7 @@ use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::{
-    PyAny, PyBool, PyEllipsis, PyFloat, PyMemoryView, PySlice, PySliceMethods, PyTuple,
+    PyAny, PyBool, PyEllipsis, PyFloat, PyIterator, PyMemoryView, PySlice, PySliceMethods, PyTuple,
 };
 use quabla_core::tensor_ir::{
     BinaryMathKind, EagerKernel, EagerOperand, FusedKernel, HostTensorStorage, TensorComparison,
@@ -1926,14 +1926,28 @@ impl PyTensor {
         self.try_transpose(None).map_err(PyValueError::new_err)
     }
 
-    #[pyo3(signature = (axis = None, keepdims = false))]
-    fn sum(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+    #[pyo3(signature = (axis = None, keepdims = false, *, dtype = None, out = None))]
+    fn sum(
+        &self,
+        axis: Option<&Bound<'_, PyAny>>,
+        keepdims: bool,
+        dtype: Option<&Bound<'_, PyAny>>,
+        out: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        crate::protocol::numpy_reduction_keywords(dtype, out)?;
         self.try_sum_axes(extract_reduction_axes(axis)?, keepdims)
             .map_err(PyValueError::new_err)
     }
 
-    #[pyo3(signature = (axis = None, keepdims = false))]
-    fn mean(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+    #[pyo3(signature = (axis = None, keepdims = false, *, dtype = None, out = None))]
+    fn mean(
+        &self,
+        axis: Option<&Bound<'_, PyAny>>,
+        keepdims: bool,
+        dtype: Option<&Bound<'_, PyAny>>,
+        out: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        crate::protocol::numpy_reduction_keywords(dtype, out)?;
         self.try_mean_axes(extract_reduction_axes(axis)?, keepdims)
             .map_err(PyValueError::new_err)
     }
@@ -1944,20 +1958,41 @@ impl PyTensor {
             .map_err(PyValueError::new_err)
     }
 
-    #[pyo3(signature = (axis = None, keepdims = false))]
-    fn prod(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+    #[pyo3(signature = (axis = None, keepdims = false, *, dtype = None, out = None))]
+    fn prod(
+        &self,
+        axis: Option<&Bound<'_, PyAny>>,
+        keepdims: bool,
+        dtype: Option<&Bound<'_, PyAny>>,
+        out: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        crate::protocol::numpy_reduction_keywords(dtype, out)?;
         self.try_prod_axes(extract_reduction_axes(axis)?, keepdims)
             .map_err(PyValueError::new_err)
     }
 
-    #[pyo3(signature = (axis = None, keepdims = false))]
-    fn max(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+    #[pyo3(signature = (axis = None, keepdims = false, *, dtype = None, out = None))]
+    fn max(
+        &self,
+        axis: Option<&Bound<'_, PyAny>>,
+        keepdims: bool,
+        dtype: Option<&Bound<'_, PyAny>>,
+        out: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        crate::protocol::numpy_reduction_keywords(dtype, out)?;
         self.try_max_axes(extract_reduction_axes(axis)?, keepdims)
             .map_err(PyValueError::new_err)
     }
 
-    #[pyo3(signature = (axis = None, keepdims = false))]
-    fn min(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+    #[pyo3(signature = (axis = None, keepdims = false, *, dtype = None, out = None))]
+    fn min(
+        &self,
+        axis: Option<&Bound<'_, PyAny>>,
+        keepdims: bool,
+        dtype: Option<&Bound<'_, PyAny>>,
+        out: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        crate::protocol::numpy_reduction_keywords(dtype, out)?;
         self.try_min_axes(extract_reduction_axes(axis)?, keepdims)
             .map_err(PyValueError::new_err)
     }
@@ -2312,6 +2347,69 @@ impl PyTensor {
         self.try_negative().map_err(PyValueError::new_err)
     }
 
+    /// `+x` is `x`: tensors are immutable, so no copy is needed.
+    fn __pos__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __abs__(&self) -> PyResult<Self> {
+        self.abs()
+    }
+
+    fn __len__(&self) -> PyResult<usize> {
+        crate::protocol::length(&self.shape)
+    }
+
+    fn __iter__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyIterator>> {
+        let shape = slf.borrow().shape.clone();
+        crate::protocol::iterate(slf.as_any(), &shape)
+    }
+
+    fn __contains__(slf: &Bound<'_, Self>, value: &Bound<'_, PyAny>) -> PyResult<bool> {
+        crate::protocol::contains(slf.as_any(), value)
+    }
+
+    #[pyo3(signature = (ndigits = None))]
+    fn __round__<'py>(
+        slf: &Bound<'py, Self>,
+        ndigits: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        crate::protocol::round(slf.as_any(), ndigits)
+    }
+
+    fn __format__<'py>(slf: &Bound<'py, Self>, spec: &str) -> PyResult<Bound<'py, PyAny>> {
+        let rank = slf.borrow().shape.len();
+        crate::protocol::format(slf.as_any(), rank, spec)
+    }
+
+    fn __mod__<'py>(
+        slf: &Bound<'py, Self>,
+        rhs: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        crate::protocol::binary("mod", slf.as_any(), rhs, rhs)
+    }
+
+    fn __rmod__<'py>(
+        slf: &Bound<'py, Self>,
+        lhs: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        crate::protocol::binary("mod", lhs, slf.as_any(), lhs)
+    }
+
+    fn __floordiv__<'py>(
+        slf: &Bound<'py, Self>,
+        rhs: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        crate::protocol::binary("_floor_divide", slf.as_any(), rhs, rhs)
+    }
+
+    fn __rfloordiv__<'py>(
+        slf: &Bound<'py, Self>,
+        lhs: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        crate::protocol::binary("_floor_divide", lhs, slf.as_any(), lhs)
+    }
+
     fn __pow__(
         &self,
         exponent: &Bound<'_, PyAny>,
@@ -2459,14 +2557,28 @@ impl PyTensor {
         self.try_classify(false).map_err(PyValueError::new_err)
     }
 
-    #[pyo3(signature = (axis = None, keepdims = false))]
-    fn any(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+    #[pyo3(signature = (axis = None, keepdims = false, *, dtype = None, out = None))]
+    fn any(
+        &self,
+        axis: Option<&Bound<'_, PyAny>>,
+        keepdims: bool,
+        dtype: Option<&Bound<'_, PyAny>>,
+        out: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        crate::protocol::numpy_reduction_keywords(dtype, out)?;
         self.try_any_all(extract_reduction_axes(axis)?, keepdims, true)
             .map_err(PyValueError::new_err)
     }
 
-    #[pyo3(signature = (axis = None, keepdims = false))]
-    fn all(&self, axis: Option<&Bound<'_, PyAny>>, keepdims: bool) -> PyResult<Self> {
+    #[pyo3(signature = (axis = None, keepdims = false, *, dtype = None, out = None))]
+    fn all(
+        &self,
+        axis: Option<&Bound<'_, PyAny>>,
+        keepdims: bool,
+        dtype: Option<&Bound<'_, PyAny>>,
+        out: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        crate::protocol::numpy_reduction_keywords(dtype, out)?;
         self.try_any_all(extract_reduction_axes(axis)?, keepdims, false)
             .map_err(PyValueError::new_err)
     }
