@@ -102,6 +102,14 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
 - `grad`, `value_and_grad`, `hessian`, `vjp`, and CPU and device `Trainer`
   return zero gradients for a value that does not depend on the arguments,
   as `jvp` and `jacobian` already did, instead of raising `ValueError`.
+- `svd`, and the `pinv` and `norm(a, 2)` built on it, converge on
+  rank-deficient matrices on the CPU. A column of the one-sided Jacobi
+  iteration that was rounding noise of another never became orthogonal and
+  ended flipping sign at the smallest subnormal, so the sweeps ran out and
+  about 3% of random rank-deficient matrices, such as one with two equal
+  rows, gave NaN. Such a column is now zeroed, which perturbs the matrix by
+  less than `2^-1022` of the other column; orthogonal graded columns keep
+  their tiny singular values, and full-rank results are unchanged.
 - `mod` keeps its derivative (1 in `x1`, `-floor(x1 / x2)` in `x2`) at exact
   multiples of `x2`, where the signed zero result dropped it to 0.
 

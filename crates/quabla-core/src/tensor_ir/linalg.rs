@@ -636,17 +636,33 @@ fn hestenes(mut g: Vec<Vec<f64>>, rows: usize) -> Option<HestenesFactors> {
                 if gamma.abs() <= tolerance {
                     continue;
                 }
+                if norm_p.min(norm_q) < f64::MIN_POSITIVE * norm_p.max(norm_q).max(1.0) {
+                    // The smaller column is rounding noise of the larger (a
+                    // rank-deficient `G`): each rotation shrinks it by about
+                    // `eps` without making it orthogonal, until its norm
+                    // ratio reaches the smallest subnormal, or the column
+                    // itself turns subnormal and loses its precision, and the
+                    // rotation only flips its sign; the sweeps never converged
+                    // and the result was NaN. Zeroing it perturbs `G` by less
+                    // than `2^-1022` of the larger column (or than `2^-1022`
+                    // absolutely); its singular value is then 0 and
+                    // `complete_basis` supplies its left vector. An orthogonal
+                    // pair (`gamma == 0`) never gets here, so graded matrices
+                    // keep their tiny singular values.
+                    let small = if norm_p < norm_q { gp } else { gq };
+                    small.iter_mut().for_each(|value| *value = 0.0);
+                    continue;
+                }
+                let t = rotation_tangent(norm_p, norm_q, gamma);
+                if t == 0.0 {
+                    // The rotation is the identity in floating point, so no
+                    // further sweep can change this pair: a column that is
+                    // rounding noise of another (a rank-deficient `G`) has
+                    // shrunk until its angle no longer moves. Counting it as
+                    // unconverged exhausted the sweeps and returned NaN.
+                    continue;
+                }
                 converged = false;
-                // Rutishauser's rotation that zeroes the off-diagonal entry of
-                // the pair's Gram matrix: `t` is the smaller root of
-                // `t^2 + 2 zeta t - 1 = 0`, with `t ~ 1 / (2 zeta)` for huge
-                // `zeta` to avoid squaring it.
-                let zeta = (norm_q / norm_p - norm_p / norm_q) / (2.0 * gamma);
-                let t = if zeta.abs() > 1e150 {
-                    0.5 / zeta
-                } else {
-                    zeta.signum() / (zeta.abs() + (zeta * zeta + 1.0).sqrt())
-                };
                 let c = 1.0 / (t * t + 1.0).sqrt();
                 let s = c * t;
                 rotate(gp, gq, c, s);
@@ -669,6 +685,32 @@ fn hestenes(mut g: Vec<Vec<f64>>, rows: usize) -> Option<HestenesFactors> {
         .collect();
     let right = order.iter().map(|&index| v[index].clone()).collect();
     Some((values, left, right))
+}
+
+/// Rutishauser's rotation that zeroes the off-diagonal entry of the Gram
+/// matrix of two columns with norms `norm_p`, `norm_q` and cosine `gamma`:
+/// `t` is the smaller root of `t^2 + 2 zeta t - 1 = 0` with
+/// `zeta = (norm_q / norm_p - norm_p / norm_q) / (2 gamma)`. For huge
+/// `|zeta|`, `t = 1 / (2 zeta)`, which is `gamma r` (or `-gamma r` when
+/// `norm_p` is the larger) for the ratio `r <= 1` of the smaller norm to the
+/// larger, up to a relative `r^2`; it is formed from `r` because the
+/// reciprocal ratio overflows once one column is many orders of magnitude
+/// smaller, where `0.5 / zeta` gave `t = 0` while the angle was still large.
+fn rotation_tangent(norm_p: f64, norm_q: f64, gamma: f64) -> f64 {
+    let (ratio, sign) = if norm_p <= norm_q {
+        (norm_p / norm_q, 1.0)
+    } else {
+        (norm_q / norm_p, -1.0)
+    };
+    if ratio < 1e-150 {
+        return sign * gamma * ratio;
+    }
+    let zeta = (norm_q / norm_p - norm_p / norm_q) / (2.0 * gamma);
+    if zeta.abs() > 1e150 {
+        // A tiny cosine: `zeta^2` would overflow.
+        return 0.5 / zeta;
+    }
+    zeta.signum() / (zeta.abs() + (zeta * zeta + 1.0).sqrt())
 }
 
 /// Extends the orthonormal vectors `basis` (each of length `dimension`) to

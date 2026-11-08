@@ -8,6 +8,7 @@ eigenvalue gaps above ~0.3, so a float64 solve is accurate to ~1e-13 and a
 central difference with step 1e-6 to ~1e-8.
 """
 
+import math
 
 try:
     import numpy as np
@@ -814,6 +815,41 @@ def test_factorizations_are_homogeneous_at_extreme_scales():
 
 def test_pinv_rejects_a_nan_cutoff():
     raises(ValueError, qb.linalg.pinv, qb.eye(2), float("nan"))
+
+
+def test_svd_of_rank_deficient_matrices_converges():
+    # A column of the one-sided Jacobi iteration that is rounding noise of
+    # another shrank by eps per sweep without becoming orthogonal, until it
+    # only flipped sign at the smallest subnormal; the sweeps never converged
+    # and svd, pinv, and norm(a, 2) returned NaN for these matrices.
+    dup = [[1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [0.0, 1.0, 4.0]]
+    u = [3.0, -1.0, 2.0, 5.0, -4.0, 1.0, 2.0]
+    v = [1.0, 2.0, -3.0, 1.0, 4.0, -2.0, 1.0]
+    w = [2.0, 0.0, 1.0, -1.0, 3.0, 1.0, -2.0]
+    rank1 = [[a * b for b in v] for a in u]
+    rank2 = [[a * b + c * d for b, d in zip(v, u)] for a, c in zip(u, w)]
+    for base, rank in ((dup, 2), (rank1, 1), (rank2, 2), ([row[:5] for row in rank2[:6]], 2)):
+        for scale in (1.0, 1.1, 3.0, 1e-21, 1e-58, 1e50, 1e180):
+            a = qb.asarray([[x * scale for x in row] for row in base])
+            left, values, right = qb.linalg.svd(a)
+            s = values.tolist()
+            assert all(math.isfinite(x) for x in s), (scale, s)
+            assert sum(x > 1e-12 * s[0] for x in s) == rank, (scale, s)
+            for basis in (qb.transpose(left) @ left, right @ qb.transpose(right)):
+                n = basis.shape[0]
+                assert max(abs(basis[i, j].item() - (i == j)) for i in range(n) for j in range(n)) < 1e-12
+            rebuilt = (left * values) @ right
+            assert all(
+                abs(x - y) <= 1e-12 * s[0]
+                for row_x, row_y in zip(rebuilt.tolist(), a.tolist())
+                for x, y in zip(row_x, row_y)
+            ), scale
+            assert math.isfinite(qb.linalg.norm(a, 2).item())
+            assert all(math.isfinite(x) for row in qb.linalg.pinv(a).tolist() for x in row)
+    # Orthogonal graded columns keep their tiny singular values.
+    assert qb.linalg.svd(qb.asarray([[1e50, 0.0], [0.0, 1e-270]]), compute_uv=False).tolist() == [1e50, 1e-270]
+    values = qb.linalg.svd(qb.asarray([[1.0, 1e-20], [0.0, 1e-20]]), compute_uv=False).tolist()
+    assert values[0] == 1.0 and math.isclose(values[1], 1e-20, rel_tol=1e-14), values
 
 
 if __name__ == "__main__":
