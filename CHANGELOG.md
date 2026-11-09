@@ -8,6 +8,17 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-09
+
+The bug-fix release of the v1.1.0 plan in `docs/jax_like_roadmap.md`:
+numerical boundaries, input validation, serialization, control flow,
+solvers, linear algebra, and the Python protocols of tensors are repaired
+while public signatures stay compatible. A few results change where the
+previous behaviour was wrong: `arange` with a fractional step can have a
+different length, ties of `maximum`, `minimum`, and `clip` share the
+derivative as in JAX, and constant values get zero gradients instead of an
+error.
+
 ### Added
 
 - `Tensor` and `TraceTensor` support `abs(x)`, `+x`, `x % y` (`qb.mod`),
@@ -1214,7 +1225,8 @@ package, import name, crates, types (`Quabla*`), and environment variables
 See the README's Known Limitations section and `docs/jax_like_roadmap.md` for
 details and planned work.
 
-[Unreleased]: https://github.com/latteine1217/quabla/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/latteine1217/quabla/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/latteine1217/quabla/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/latteine1217/quabla/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/latteine1217/quabla/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/latteine1217/quabla/compare/v1.0.0...v1.0.1

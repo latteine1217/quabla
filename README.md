@@ -1,37 +1,160 @@
 # Quabla
 
-Patch 1.0.3 fixes native stack exhaustion, cyclic and inconsistent sequence
-inputs, unaddressable allocations, and trace error propagation while preserving
-public signatures and dtype behavior. It adds reproducible property and crash
-regressions. See the [release notes](CHANGELOG.md#103---2026-11-07).
+Release 1.1.0 is a bug-fix release that preserves the public API. It repairs
+numerical boundaries, input validation, serialization, control flow, solvers
+and linear algebra, and completes the Python protocols of tensors. See the
+[release notes](CHANGELOG.md#110---2026-11-09).
 
-Package and GPU verification are indexed in the
-[release acceptance record](docs/benchmarks/v103-release-20261107-01/README.md).
+CPU, MLX and CUDA/NCCL acceptance is recorded in the
+[roadmap](docs/jax_like_roadmap.md#v110-plan-bug-fixes-and-robustness-2026-11-08);
+the [1.1.0 audit](docs/benchmarks/v110-audit-20261108-04/README.md) records
+its evidence and performance limitations.
 
-The upcoming 1.1.0 release focuses on bug fixes while preserving the public
-API. Numerical boundary, serialization, control-flow and solver repairs are
-covered by CPU, MLX and CUDA/NCCL acceptance. See the [current audit and its
-performance limitations](docs/benchmarks/v110-audit-20261108-04/README.md).
-Package metadata remains 1.0.3 until release preparation.
-
-**Differentiable scientific computing for physics-informed neural networks
-(PINNs): a Rust compiler and runtime with a JAX-style Python API that runs one
-traced program on CPU, CUDA, and Apple silicon.**
+Differentiable scientific computing in Python, powered by Rust. Quabla
+provides higher-order automatic differentiation for physics-informed neural
+networks (PINNs), with CPU, CUDA, and Apple silicon backends.
 
 [![CI](https://github.com/latteine1217/quabla/actions/workflows/ci.yml/badge.svg)](https://github.com/latteine1217/quabla/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](#installation)
-[![Release v1.0.3](https://img.shields.io/badge/release-v1.0.3-orange)](https://github.com/latteine1217/quabla/releases/tag/v1.0.3)
 [![PyPI](https://img.shields.io/pypi/v/quabla)](https://pypi.org/project/quabla/)
-[![Docs](https://img.shields.io/badge/docs-developer%20guide-blue)](https://latteine1217.github.io/quabla/guide/)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-**Documentation: [Developer Guide](https://latteine1217.github.io/quabla/guide/)
-· [API Reference](https://latteine1217.github.io/quabla/api.html)**
+[User guide](https://latteine1217.github.io/quabla/guide/)
+· [API reference](https://latteine1217.github.io/quabla/api.html)
+· [Release notes](CHANGELOG.md)
+
+## Why Quabla
+
+A PINN loss can depend on derivatives of a model with respect to its inputs.
+Training then requires differentiating that loss with respect to the model
+parameters. Quabla lets you express these nested derivatives as Python
+function transforms:
+
+- Compose `grad`, `jvp`, `vjp`, `jacobian`, `hessian`, and `vmap` to build
+  derivatives and evaluate them over batches.
+- Use `jit` to trace a function into an execution plan and select a backend.
+  The CPU interprets that plan; CUDA and MLX execute device operations.
+- Train with Adam, AdamW, SGD, or L-BFGS. For GPU training,
+  `optim.Trainer` keeps parameters and optimizer state on the device.
+
+The API will look familiar to JAX users, but Quabla does not depend on JAX
+and is not a drop-in replacement. Check the [limitations](#known-limitations)
+before porting a program.
+
+## Installation
+
+Use Python 3.10–3.14. Choose one distribution for your environment:
+
+| Platform and backend | Install |
+| --- | --- |
+| Linux x86_64 or aarch64, CPU or CUDA | `python -m pip install quabla` |
+| macOS arm64, CPU | `python -m pip install quabla` |
+| macOS 14+ on Apple silicon, CPU or MLX | `python -m pip install quabla-mlx` |
+
+Both distributions provide the `quabla` import. Install only one per
+virtual environment; uninstall it before switching to the other.
+On platforms without a wheel, installation builds from source and requires
+Rust 1.88 or newer; that build enables only the CPU backend.
+
+Linux wheels do not bundle CUDA libraries. CPU execution needs no CUDA
+installation; GPU execution additionally needs an NVIDIA driver and
+`libnvrtc`. Some operations need cuBLAS or cuSOLVER, and data parallelism
+needs NCCL. See the [runtime requirements](docs/guide/10-devices.md#103-cuda-runtime-requirements).
+
+Verify the installation:
 
 ```sh
-pip install quabla       # Linux x86_64/aarch64: CPU + CUDA; macOS arm64: CPU
-pip install quabla-mlx   # macOS 14+ on Apple silicon: CPU + MLX
+python -c "import quabla as qb; print(qb.__version__); print(qb.devices())"
 ```
+
+`devices()` lists backends compiled into the package, not detected hardware.
+A listed CUDA backend does not confirm that a GPU or its libraries are
+available.
+
+## Quickstart
+
+This example runs on the CPU and needs only Quabla:
+
+```python
+import quabla as qb
+
+
+def loss(x):
+    return qb.sum(x ** 2)
+
+
+x = qb.array([1.0, 2.0, 3.0])
+step = qb.jit(qb.value_and_grad(loss))
+value, gradient = step(x)
+print(value.item())
+print(gradient.tolist())
+```
+
+```text
+14.0
+[2.0, 4.0, 6.0]
+```
+
+`value_and_grad` returns the function value and its gradient with respect
+to the first argument. `jit` traces and compiles on the first call, then
+reuses the plan for matching shapes, dtypes, and parameter structure.
+
+To compute a second derivative at several points, compose `grad` with `vmap`:
+
+```python
+def u(x):
+    return qb.sin(x)
+
+
+u_xx = qb.vmap(qb.grad(qb.grad(u)))
+print(u_xx(qb.array([0.0, 0.5, 1.0])).tolist())
+```
+
+The result is `-sin(x)` at each point, up to floating-point rounding.
+The [getting started guide](docs/guide/01-getting-started.md) explains
+tracing, arrays, and transforms. For named input specifications and explicit
+IR inspection, see the [compiler facade](docs/guide/10-devices.md#107-the-compiler-facade).
+
+## Backend Support
+
+Select a backend per compiled function. Using the `loss` above:
+
+```python
+x = qb.array([1.0, 2.0, 3.0], dtype=qb.float32)
+step = qb.jit(qb.value_and_grad(loss), device="cuda:0")  # or "mlx", "cpu"
+value, gradient = step(x)
+```
+
+| Backend | Platform | Floating-point types | Main constraints |
+| --- | --- | --- | --- |
+| CPU | macOS, Linux | `float32`, `float64` | Interprets execution plans; `float32` operations use the `float64` reference rounded to `float32` |
+| CUDA | Linux, NVIDIA GPU | `float32`, `float64` | Requires CUDA runtime libraries; each program uses one floating-point dtype |
+| MLX | macOS 14+, Apple silicon | `float32` | Rejects `float64`; some matrix factorizations run on MLX's CPU stream |
+| CUDA + NCCL | Linux, 2+ GPUs on one node | `float32` | Experimental data parallelism; equal batch shards and host optimizer updates |
+
+Arrays default to `float64`; create `float32` arrays for MLX. Mixing
+`float32` and `float64` arrays requires an explicit `astype`. Unsupported
+operations raise an error rather than silently selecting another backend.
+
+See [Devices and Compilation](docs/guide/10-devices.md) for control-flow
+support, library requirements, precision, and backend-specific limitations.
+
+## PINN Example
+
+The [PINN tutorial](docs/guide/11-pinn-tutorial.md) builds a neural network
+for a 1D Poisson problem. It explains the differential equation, boundary
+conditions, nested derivatives, training loop, and comparison with an
+analytical solution.
+
+From a source checkout with Quabla installed, run:
+
+```sh
+python examples/pinn_poisson.py                 # one-parameter model, CPU
+python examples/pinn_mlp.py --device cpu        # neural network, CPU
+```
+
+For GPU runs, select `--device mlx` or `--device cuda` with the corresponding
+build and runtime libraries. See [examples](examples/README.md) for setup,
+benchmarks, and multi-GPU validation commands.
 
 ![A tanh MLP trained with Quabla matches the exact solution of a 1D Poisson problem; its training loss falls from about 50 to 2.5e-4.](docs/assets/pinn_poisson.png)
 
@@ -39,122 +162,27 @@ pip install quabla-mlx   # macOS 14+ on Apple silicon: CPU + MLX
 matches the exact solution `sin(πx)` to a max abs error of 2.4e-4.
 Reproduce with `python examples/plot_readme_figure.py`.*
 
-## Why Quabla
+## Known Limitations
 
-- **One program, three backends.** Trace once, then compile for the `f64` CPU
-  reference, CUDA (Linux), or MLX (Apple silicon); device backends are
-  validated operation by operation against the CPU reference.
-- **Exact higher-order derivatives.** JVP, VJP, Jacobians, Hessians, and
-  Hessian-vector products compose with each other and with `vmap`, so a PINN
-  residual uses an exact `u_xx` that is itself differentiable in the weights.
-- **Differentiable control flow.** `cond`, `fori_loop`, and `scan` are IR
-  regions, not traced Python branches, with VJP and forward-over-reverse HVP
-  on CPU and MLX and, for elementwise loop bodies, on CUDA.
-- **Explicit rather than silent.** Mixing `float32` and `float64` arrays
-  requires an explicit `astype`, and an operation a backend does not support
-  raises an error instead of falling back to the host.
+- Shapes are static. Changing input shapes, dtypes, or parameter structure
+  requires a new trace. Shapes must fit addressable F64 CPU workspace;
+  invalid or unaddressable sizes are rejected during construction or tracing.
+- Dtypes are limited to `float32`, `float64`, and `bool`; there is no integer
+  array dtype. Indexing uses static Python integers, not dynamic index
+  tensors or boolean masks.
+- The CPU has no machine-code JIT. CUDA loops with non-elementwise bodies
+  run from the host; MLX has no fused Metal loop kernels or `vmap` HVP
+  lowering.
+- `while_loop` has no reverse-mode derivative. Jacobians and Hessians are
+  dense arrays, and third or higher Cholesky derivatives use scalar
+  expansion, which is slow beyond small matrices.
+- Data parallelism is limited to CUDA + NCCL on a single node.
 
-## At a Glance
-
-`grad(grad(u))` gives an exact `u_xx` at one point, `vmap` maps it over the
-collocation points, and the PDE-residual loss built from it is compiled once
-and trained with reverse-mode gradients and Adam:
-
-```python
-import math
-import quabla as qb
-
-def u(x, w):  # the model at one collocation point x
-    return qb.sin(w * x)
-
-u_xx = qb.vmap(qb.grad(qb.grad(u)), in_axes=(0, None))  # exact d2u/dx2 per point
-
-def loss(params, x):  # residual of u'' = -pi^2 sin(pi x), solved by w = pi
-    return qb.mean((u_xx(x, params["w"]) + math.pi**2 * qb.sin(math.pi * x)) ** 2)
-
-x = qb.linspace(0.05, 0.95, 8)
-params, adam = {"w": qb.array(2.5)}, qb.optim.Adam(learning_rate=0.05)
-step = qb.jit(qb.value_and_grad(loss))  # traced and compiled on the first call
-for _ in range(300):
-    value, grads = step(params, x)
-    params = adam.step(params, grads)
-print(f"w = {params['w'].item():.6f}, loss = {value.item():.1e}")
-```
-
-```text
-w = 3.141593, loss = 1.5e-13
-```
-
-The [Quickstart](#quickstart) covers arrays, dtypes, masks, `vmap`, and
-running on CUDA or MLX.
-
-## Status
-
-The latest release is **v1.0.3**, on PyPI as
-[`quabla`](https://pypi.org/project/quabla/) and
-[`quabla-mlx`](https://pypi.org/project/quabla-mlx/). Beyond the transforms
-above, it provides optimizers (Adam, AdamW, SGD, L-BFGS) with a device
-`Trainer`, `quabla.linalg` and iterative solvers, `quabla.ode.odeint` with
-adaptive and stiff integrators, `custom_vjp`/`custom_jvp`, keyed
-`quabla.random`, and experimental single-node CUDA/NCCL data parallelism.
-The [compatibility policy](CONTRIBUTING.md#scope-and-status) describes what
-1.x keeps stable, the [migration guide](docs/guide/15-migration.md) maps the
-removed 0.x call forms to the current API, and the
-[CHANGELOG](CHANGELOG.md) records every release.
-
-"JAX-style" describes the API only: Quabla does not depend on JAX and is not
-affiliated with JAX or with the `nabla-ml` project. It was formerly named
-Nabla and was renamed to Quabla (after □, the d'Alembert operator) before
-v0.1.
-
-## Backend Support
-
-CUDA runs every value in its own dtype: a `float64` program in double
-precision, a `float32` one in single precision, and a program that mixes the
-two raises `UnsupportedOperationError` instead of converting. MLX runs
-`float32` only: Apple GPUs have no double-precision arithmetic, so a
-`float64` program raises `UnsupportedOperationError` there (create MLX
-arrays with `dtype=qb.float32`). `bool`
-values are held as `f32` `0`/`1` on both devices. The v0.2 API inherits the backend limits below; it does not widen
-the supported loop bodies or derivatives. The per-feature status and validation
-records are in [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md).
-
-| Backend | Platform | Build feature | Execution dtype | Autodiff | Control flow | Notable limitations |
-| --- | --- | --- | --- | --- | --- | --- |
-| CPU | macOS, Linux | default | `f64` reference; each `float32` op is the `f64` result rounded to `f32` | Runtime and symbolic JVP/VJP, dense Jacobian and Hessian, HVP, `vmap` JVP/VJP/HVP | `cond`, `fori`, `scan` regions with JVP, VJP, and forward-over-reverse HVP | Interprets frozen plans (no machine-code JIT) |
-| CUDA | Linux, NVIDIA driver | `cuda` | `f32` and `f64`, each in its own dtype | Symbolic JVP/VJP plans, multi-output value-and-gradient, `vmap` JVP/VJP/HVP, device `Trainer` with SGD/Adam/AdamW and global-norm clipping | `cond` via one host predicate readback; `fori`/`scan` as fused kernels for pure-elementwise bodies and as host-driven region loops otherwise; `while_loop` with one predicate readback per iteration | Host-driven loops cost one CUDA graph launch per iteration (eager launches for bodies with `cond`, nested loops, or cuSOLVER); requires `libnvrtc` at runtime (cuBLAS optional, cuSOLVER for `solve` and the decompositions) |
-| CUDA + NCCL | Linux, two or more GPUs on one node | `cuda-nccl` | `f32` | Scalar value-and-gradient with all-reduced replicated parameter gradients | As CUDA | Single node; equal axis-zero batch shards; mapped-input gradients rejected; optimizer update on the host; requires a loadable `libnccl.so` |
-| MLX | macOS, Apple silicon | `mlx` | `f32` | Symbolic JVP/VJP, multi-output value-and-gradient, `vmap` JVP/VJP, device `Trainer` with SGD/Adam/AdamW and global-norm clipping | `cond` via one host predicate readback; `fori`/`scan` dispatched from the host on device-resident arrays, with first-order VJP and forward-over-reverse HVP | LU, `eigh`, QR, and SVD factorizations run with LAPACK on MLX's CPU stream (MLX 0.32.2 has no GPU kernels for them), and `solve` reads one pivot flag back; `vmap` HVP not lowered; no fused Metal loop kernels |
-
-Staged Cholesky uses a native operation on CPU, CUDA, and Metal. `float32`
-and `float64` JVP, VJP, and second derivatives use bounded IR and O(n²)
-numerical workspace with O(n³) arithmetic, and the CPU rounds every `float32`
-jet operation to `f32`; `vmap`, Jacobian, and Hessian composition preserve
-their existing call forms. Third or higher derivatives retain scalar
-expansion to preserve rounding and composition. Non-finite and extreme-scale CPU symbolic derivatives retain the reference path.
-Eager Cholesky keeps its strict symmetric positive-definite validation;
-staged Cholesky keeps its lower-triangle recurrence and existing exceptional
-value behavior. CUDA axis sums and means use a block reduction for axes of
-length at least 256, with bounded shared memory and no global scratch buffer.
-GPU results are checked with absolute and relative tolerances of `1e-5`;
-finite CPU derivative results use `1e-12`.
-
-## Installation
-
-```sh
-pip install quabla       # Linux x86_64/aarch64: CPU + CUDA; macOS arm64: CPU
-pip install quabla-mlx   # macOS 14+ on Apple silicon: CPU + MLX
-```
-
-Both distributions provide the same `quabla` package, so install one of them
-per environment and uninstall it before switching to the other. Wheels cover
-CPython 3.10 to 3.14; on other platforms pip builds the source distribution,
-which needs Rust 1.88 or newer and enables the CPU backend only.
-
-The Linux wheel does not bundle CUDA. The CPU backend works on any host, and
-`device="cuda"` needs an NVIDIA driver and the CUDA libraries listed under
-CUDA builds below; without them it raises an error naming the missing
-library.
+See the [API limitations](docs/api.md#known-limitations) for the full
+contract. The [compatibility policy](CONTRIBUTING.md#scope-and-status)
+defines the public Python API guarantees for 1.x; internal Rust APIs and
+backends are outside that policy. Use the [migration guide](docs/guide/15-migration.md)
+when updating code written for 0.x.
 
 ## Installation From Source
 
@@ -223,146 +251,24 @@ macOS arm64 (`mlx` feature). Version tags publish them to TestPyPI and then PyPI
 trusted publishing, each upload after approval; a manual run builds them and
 can publish to TestPyPI only.
 
-## Quickstart
-
-The snippets below run in sequence in one session. Arrays come from Python
-lists, scalars, or NumPy arrays (NumPy is optional), with dtype `float32`,
-`float64`, or `bool`. Host arrays use immutable shared buffers with 4 bytes per
-`float32` element, 8 per `float64` element, and 1 per `bool` element, excluding
-metadata. Shape-only views share storage, and matching-dtype buffer exports
-are read-only and zero-copy. CPU/MLX Fori and Scan gradients use block
-checkpoints to reduce carry-tape storage from O(TC) to O(sqrt(T)C), with a
-measured replay cost. CUDA uses this path for independent lanes and same-shape
-captures; other captures keep the full tape. Public Scan outputs remain O(TY).
-Reproducible optimization results and limitations are recorded in the
-[roadmap](docs/jax_like_roadmap.md#integrated-optimization-status-2026-10-05).
-
-`grad` and `value_and_grad` differentiate with respect to the first argument
-(or `argnums`), and gradients mirror its pytree, here a dict of `float32`
-parameters:
-
-```python
-import numpy as np
-import quabla as qb
-
-x = qb.array([-1.0, 0.5, 1.0, 2.0], dtype=qb.float32)  # from a list
-w = qb.asarray(np.array([0.3, -0.2, 0.1, 0.4], dtype=np.float32))  # dtype from NumPy
-mask = x > 0.0  # comparisons return bool masks
-print(x.dtype, w.dtype, mask.dtype, mask.tolist())
-print(qb.sin(x).numpy())
-
-def loss(params, x):
-    y = qb.tanh(x * params["w"] + params["b"])
-    return qb.sum(qb.where(x > 0.0, y, 0.0) ** 2)  # masked entries contribute 0
-
-params = {"w": w, "b": qb.array(0.2, dtype=qb.float32)}
-value, grads = qb.value_and_grad(loss)(params, x)  # gradients mirror the dict
-print(value.dtype, value.item())
-print(grads["w"].tolist(), grads["b"].item())
-print(qb.grad(loss, argnums=1)(params, x).tolist())  # d loss / d x
-```
-
-```text
-f32 f32 bool [False, True, True, True]
-[-0.84147096  0.47942555  0.84147096  0.9092974 ]
-f32 0.6748224496841431
-[-0.0, 0.09867792576551437, 0.53318190574646, 1.2793999910354614] 1.3702377080917358
-[0.0, -0.03947117179632187, 0.053318191319704056, 0.2558799982070923]
-```
-
-The masked coordinate has a zero gradient: `where` routes no derivative
-through the unselected branch or its predicate. `vmap` vectorizes a function
-written for one example, and `jit` compiles once per argument signature
-(shapes, dtypes, pytree structure) and reuses the frozen plan:
-
-```python
-xs = qb.array([[0.5, 1.0, 2.0, -1.0], [1.0, 1.0, 1.0, 1.0]], dtype=qb.float32)
-per_example = qb.vmap(loss, in_axes=(None, 0))  # params shared, rows of xs mapped
-print(per_example(params, xs).tolist())
-
-step = qb.jit(qb.value_and_grad(loss))  # traced and compiled on the first call
-value, grads = step(params, x)  # later calls with the same shapes reuse the plan
-print(value.item(), grads["b"].item())
-```
-
-```text
-[0.2575097382068634, 0.5868375897407532]
-0.6748224496841431 1.3702377080917358
-```
-
-To run this transformed step on a device, use
-`qb.jit(qb.value_and_grad(loss), device="cuda:0")` or `device="mlx"`.
-`qb.devices()` reports built targets, rather than enumerating hardware.
-The compiler facade remains available for named input specs:
-
-```python
-compiler = qb.Compiler()
-print(compiler.capabilities())
-specs = [("x", [4], qb.float32), ("w", [4], qb.float32), ("b", [], qb.float32)]
-program = compiler.trace(lambda x, w, b: loss({"w": w, "b": b}, x), specs)
-grad_w = program.vjp("loss_bar")["w"]  # symbolic reverse mode, also a Program
-inputs = {"x": x, **params}
-seed = {"loss_bar": qb.array(1.0, dtype=qb.float32)}  # d loss / d loss
-for target in ("cpu", "mlx", "cuda"):
-    if compiler.capability(target):
-        value = program.compile(target)(inputs).item()
-        print(target, value, grad_w.compile(target)({**inputs, **seed}).tolist())
-```
-
-Output of an MLX build on Apple silicon (a CUDA build prints a `cuda` line
-instead of the `mlx` line). The device executes in `f32` and agrees with the
-CPU `float32` reference up to rounding:
-
-```text
-{'cpu': True, 'cuda': False, 'mlx': True}
-cpu 0.6748224496841431 [-0.0, 0.09867792576551437, 0.53318190574646, 1.2793999910354614]
-mlx 0.6748223900794983 [-0.0, 0.09867792576551437, 0.53318190574646, 1.279400110244751]
-```
-
-For device training, `qb.optim.Trainer(loss, params, optimizer, *data,
-device="cuda:0")` keeps parameters and optimizer moments on the device; see
-[docs/api.md](docs/api.md#device-execution) and the PINN examples in
-[examples/README.md](examples/README.md).
-
-## Known Limitations
-
-- The CPU backend interprets frozen plans; there is no machine-code JIT.
-- Shapes are static (one trace per shape, no symbolic dimensions), and dtypes are limited to `float32`, `float64`, and `bool`.
-- Indexing takes static Python integers; dynamic index tensors and
-  boolean-mask indexing are unsupported.
-- CUDA runs loop bodies that are not purely elementwise as host-driven loops,
-  one CUDA graph launch per iteration (about 30 µs for a small `fori_loop`
-  body on a GTX 1660 SUPER). MLX factors matrices on its CPU stream and has
-  no `vmap` HVP lowering. Third and higher Cholesky
-  derivatives use a scalar expansion that is slow beyond small matrices.
-- Data parallelism is single-node CUDA + NCCL only.
-- `while_loop` has no
-  reverse-mode derivative, as in JAX. `jacobian` selects reverse mode for fewer floating output than
-  input elements, and forward mode otherwise; direction changes can affect
-  final rounding. Mixed precision graphs with F64 output blocks keep forward
-  mode. `jacobian`/`hessian` still return dense arrays.
-
-The full list is in [docs/api.md](docs/api.md#known-limitations).
-
 ## Documentation
 
-- [Developer Guide](https://latteine1217.github.io/quabla/guide/) (source in
-  [docs/guide/](docs/guide/README.md)): a chapter-by-chapter walkthrough of
-  the API, a PINN tutorial, and the architecture for contributors.
-- [docs/api.md](docs/api.md): function transforms, device execution, the
-  compiler facade, the tensor reference, and the full list of known
-  limitations.
-- [docs/api_v0_2_design.md](docs/api_v0_2_design.md): the accepted v0.2 API
-  design and its implementation status.
-- [examples/README.md](examples/README.md): PINN examples and benchmarks.
-- [docs/jax_like_roadmap.md](docs/jax_like_roadmap.md): roadmap, per-phase
-  status (P0-P7, dtype phases D1-D6), validation records, and open items.
-- [docs/design.md](docs/design.md): original core design notes.
-- [CHANGELOG.md](CHANGELOG.md): release notes.
-- [CONTRIBUTING.md](CONTRIBUTING.md): how to propose changes and which
-  [development gates](CONTRIBUTING.md#development-gates) to run.
-- [SECURITY.md](SECURITY.md): how to report a vulnerability.
-- [CITATION.cff](CITATION.cff): citation metadata for academic use.
+| Task | Document |
+| --- | --- |
+| Install and write your first program | [Getting Started](docs/guide/01-getting-started.md) |
+| Learn the Python API | [User guide](docs/guide/README.md) |
+| Train a PINN | [PINN tutorial](docs/guide/11-pinn-tutorial.md) |
+| Look up signatures and behavior | [API reference](docs/api.md) |
+| Diagnose tracing or device errors | [Performance and debugging](docs/guide/12-performance-debugging.md) |
+| Run examples and benchmarks | [Examples](examples/README.md) |
+| Propose a change or run development checks | [Contributing](CONTRIBUTING.md) |
+| Review feature status and validation records | [Roadmap](docs/jax_like_roadmap.md) |
+
+Implementation history is documented in the [core design notes](docs/design.md)
+and [v0.2 API design](docs/api_v0_2_design.md). Quabla was formerly named
+Nabla; it is not affiliated with JAX or the `nabla-ml` project.
+For vulnerability reports, see [SECURITY.md](SECURITY.md). Citation metadata
+is in [CITATION.cff](CITATION.cff).
 
 ## License
 

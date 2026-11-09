@@ -5,9 +5,10 @@
 The owner designated 1.1.0 as the bug-fix release on 2026-11-07. This is
 the current plan; the 1.0.x planning and release records below are history.
 Public signatures and supported successful behaviour remain compatible.
-Package metadata stays at 1.0.3 until release preparation; 1.1.0 is not
-published. Functional acceptance below is scoped to its recorded snapshot,
-platforms and checks.
+The release commit after bd47809 sets the package metadata to 1.1.0 and
+dates its `CHANGELOG.md` section 2026-11-09; publication (tag, GitHub
+Release, PyPI) is run by the owner. Functional acceptance below is scoped
+to its recorded snapshot, platforms and checks.
 
 The audit repeats reproduction, a failing regression, a local fix, and
 regression verification. Acceptance requires normal, invalid, and extreme
@@ -20,22 +21,37 @@ explicit validation gaps rather than passing results.
 | --- | --- |
 | Krylov solvers, L-BFGS, schedules | Extreme-scale, true-residual, homogeneous-system, interpolation and exponent regressions pass in the full local suites and independent probes. |
 | Serialization | Partial writes, malformed metadata, duplicate keys, invalid bool bytes and excessive nesting reproduced and fixed; local full suites pass. |
-| Array operations and linear algebra | Mean overflow, spread precision and standard-deviation gradient overflow repaired in snapshot 20261108-04. Full local/CUDA suites and independent Decimal/derivative probes pass. Earlier interpolation/integration/GELU regressions remain covered. |
-| Control flow | Python/Tensor non-finite cond validation and eager/traced while-loop predicate dtype checks repaired; local full suites pass. |
-| ODE, transforms, custom derivatives, pytrees, random, devices, optimizers | Fixed-step extreme time grids and time derivatives at internal `saveat` mesh knots repaired. Full local suites and 140 analytical CPU/MLX probes pass. |
-| Python 3.10–3.14 installation matrix | Snapshot 20261108-04: all five macOS arm64 CPU wheels pass full suites, each 377 passed, 48 skipped. Local Python 3.13 with MLX: 415 passed, 10 skipped. |
-| CUDA/NCCL | Jobs 6947–6950 COMPLETED, exit 0: Rust 382 passed/14 ignored plus three isolated NCCL cases; Python 418 passed/7 skipped; 732 independent CUDA checks and eight two-GPU parity cases pass. Maximum loss/gradient error 1.49e-8, tolerance 1e-5. Failed/cancelled jobs 6944–6946 remain rejected evidence. |
+| Array operations and linear algebra | Mean overflow, spread precision and standard-deviation gradient overflow repaired in snapshot 20261108-04. Commit fc52400 repairs `arccosh` below 1, NumPy `arange` counts and exact `linspace` endpoints, extreme-scale `qr`/`eigh`/`svd`, `interp` beside non-finite neighbours, `concat` negative axes, `int(Tensor)`, empty buffers and a NaN `pinv` `rtol`, checked against NumPy, SciPy, JAX and PyTorch oracles. Commit 633c4c9 makes 0-d iteration raise, adds `len`, `in`, `abs`, `+`, `%`, `//`, `round` and `format`, lets NumPy reductions delegate to tensor methods, and keeps the `mod` derivative at exact multiples. Commit 9845fc4 makes the CPU `svd` (and `pinv`, `norm(a, 2)`) converge on rank-deficient matrices, which gave NaN for about 3% of them; 24000 random rank-deficient matrices now pass. Commit bd47809 makes `maximum`/`minimum` follow JAX (ties share the derivative, IEEE 754-2019 signed zeros in either order), so `clip` shares the derivative with its bound as `jnp.clip` does, keeps the `relu` and `softplus` derivatives at 0, and returns `-0.0` for `sqrt(-0.0)`. |
+| Control flow | Python/Tensor non-finite cond validation and eager/traced while-loop predicate dtype checks repaired. fc52400 reads list, tuple, buffer and NumPy `cond` predicates by value on every supported Python, and rejects a Python `bool` as an index or reduction axis. |
+| ODE, transforms, custom derivatives, pytrees, random, devices, optimizers | Fixed-step extreme time grids and time derivatives at internal `saveat` mesh knots repaired. fc52400 repairs adaptive `odeint` with `atol=0`, `clip_by_global_norm` and CPU/MLX/CUDA `clip_norm` when only the norm overflows, float32 `any`/`all` on MLX including derivative plans, and initializer and random shape validation. 633c4c9 returns zero gradients for values that do not depend on the arguments in `grad`, `value_and_grad`, `hessian`, `vjp` and CPU/device `Trainer`. |
+| Python 3.10–3.14 installation matrix | Commit bd47809: all five macOS arm64 CPU wheels pass the 20 suites, 403 passed each. Local Python 3.13 with MLX: 447 passed. |
+| CUDA/NCCL | Commit fc52400: home-gpu GTX 1660 SUPER passes Rust 379 and Python 406 with CUDA. lab-server job 6951 (2x RTX 3090, NVRTC 12.6) COMPLETED, exit 0: Rust 383 with CUDA/NCCL, Python 440, and both data-parallel validations. Snapshot 20261108-04 jobs 6947–6950 and rejected jobs 6944–6946 remain recorded in its audit. Commit bd47809 (which contains 633c4c9 and 9845fc4): lab-server job 6952 (2x RTX 3090 on acmt20, driver 560.35.05, CUDA 12.6, source exported with `git archive`) COMPLETED, exit 0 in 17:28: Rust 383 passed, 14 ignored with CUDA/NCCL; Python 450 passed, 0 failed, 7 skipped (six MLX-only, one NCCL-enabled skip), including the device `Trainer` constant-loss path, the operator device test and the `maximum`/`minimum` tie device test on CUDA; both data-parallel validations passed. The single-GPU home-gpu run was not repeated for these commits. |
 
-The fixes and durable reproductions live in `CHANGELOG.md` (Unreleased),
+The fixes and durable reproductions live in `CHANGELOG.md` (1.1.0),
 the affected modules, and `tests/python/test_*.py`; do not put execution
 logs into this protocol or replace older release evidence with this audit.
 Raw evidence, source identity, current limitations and remaining checks are
 indexed by [the latest 1.1.0 audit](benchmarks/v110-audit-20261108-04/README.md).
 The 2026-11-08 snapshot repairs finite-input mean overflow, variance
-precision/overflow, and standard-deviation value/gradient overflow. Current
-functional acceptance is complete within its recorded scope, including
-source and terminal-job checks. Rejected intermediate candidates remain
-linked from the audit. Release preparation/publication is separate.
+precision/overflow, and standard-deviation value/gradient overflow; commits
+fc52400, 633c4c9, 9845fc4 and bd47809 add the fixes named in the table, and the
+probes rerun with new seeds after each found no further failures. Current functional acceptance is complete
+within its recorded scope, including source and terminal-job checks.
+Rejected intermediate candidates remain linked from the audit. Kept as
+documented behaviour pending an
+owner decision: `Tensor` is not picklable or deep-copyable, `@` rejects
+one-dimensional operands, `cholesky` (and `lstsq` for a rank-deficient
+matrix) raises eagerly but returns NaN or an unchecked value under `jit` and
+on devices, MLX flushes a subnormal intermediate of `silu` near -88 to
+zero, the `abs` derivative at 0 is -1 where JAX gives +1, an index with
+both an empty slice and an out-of-range integer raises the empty-slice
+`ValueError` where NumPy raises `IndexError`, and `logaddexp(inf, inf)` has
+a NaN derivative where JAX gives 1 to each operand. A later probe round
+(edge-point gradients of elementwise, reduction, structural and linalg ops
+against JAX x64; MLX against CPU gradients; custom rules under `jit`,
+`vmap`, control flow and MLX; 17000 random basic-indexing values and
+gradients; the `Compiler` facade; infinite reduction rows) found no other
+failures.
 Host-returning reduction timing regressions are recorded; resident PINN
 training performance has not been remeasured. Linux aarch64 and the full
 Linux wheel/Python matrix remain unverified.
@@ -877,7 +893,7 @@ rounding at the original boundaries. Reverse tapes keep required aliases alive.
 
 | Candidates | Current executed scope | Remaining work or decision |
 | --- | --- | --- |
-| A1 | Flat CUDA SSA emission includes control-flow regions. | Integrated release CUDA tests and Linux CUDA/NCCL compilation pass; no current two-GPU parity claim. |
+| A1 | Flat CUDA SSA emission includes control-flow regions. | Integrated release CUDA tests and Linux CUDA/NCCL compilation pass; the October 5 snapshot also passes the C6 two-GPU validation below. |
 | A2/A3/A4/A6/A8 | Earlier higher-order, triangular, fusion-user, and Scan changes remain integrated. | Preserve numerical fallbacks; do not multiply local ratios. |
 | A5/A7 | Constant folding releases last-use values; single symbolic transforms prune unused nodes before differentiation. | Full multi-VJP primal-map contract still retains all requested primals. |
 | A9/B1/B2/B12 | Typed immutable shared storage, consuming outputs, and shape-only aliases. | Metadata copies and transient conversion buffers are separate costs. |
@@ -889,7 +905,7 @@ rounding at the original boundaries. Reverse tapes keep required aliases alive.
 | C2 | Approved SumAxis/MeanAxis block reduction is integrated for axis length >=256. Each output uses 256 threads, 2,052 shared bytes, and no global scratch. | Work stays O(N); normal per-block dependency depth becomes O(axis_length/256 + log 256). Small reductions and finite overflow-risk inputs preserve the serial path. Full CUDA gates pass; complete upload/execute/export speedups are 1.032–6.050x on the measured long-axis fixtures. |
 | C3 | Bounded CUDA free-buffer pool adopted for memory priority. | Eight balanced release rounds: pooled bytes 10,321,920 to 782,336, latency 0.900 to 1.495 ms. This memory saving has a measured latency cost. |
 | C5 | Pure MLX loop windows profiled; per-step evaluation remains the default. | Window 16 speeds the fixtures by 3.7–9.1x but fresh-process peak RSS rises by 974,848 bytes. Batching is not adopted for the memory target. |
-| C6 | Existing distributed execution preserved. | Packed collectives add a packed buffer and can change reduction order; current one-GPU validation cannot establish two-GPU numerical parity. |
+| C6 | The October 5 integrated snapshot passes real two-GPU NCCL validation: Slurm 6096 completed with exit 0 on two RTX 3090 GPUs. | All 16 cases / 80 calls pass sum/mean loss and two-parameter gradient checks at 1e-5. Mixed schedules, failed-call communicator recovery, and 50 compile/execute/drop cycles pass with zero GPU allocation drift. Packed collectives were not adopted because of their additional buffer and reduction-order costs. This is snapshot validation, not a later-release or collective-speedup claim. |
 | D1 | Approved adaptive Jacobian selects reverse mode for eligible Q<P outputs, with bounded output seed batches. F64 outputs in graphs containing F32 nodes keep forward mode. | Pytree, dtype, nested-transform, and analytic regressions pass. Approved tolerances: F64 1e-12 + 1e-12*abs(reference); F32 1e-5 + 1e-5*abs(reference). Dense O(PQ) result storage remains. |
 | D2/D3 | VJP recomputation and snapshot-local caches retained for memory and correctness. | Sixteen pullbacks cost approximately sixteen single calls; caching residuals would retain extra buffers. Same-signature snapshots with different captured constants produce different values, so signature-only cache sharing is unsafe. |
 | D4/D5/D6/D9 | Shared immutable graph snapshots, Adam initialization leaf-structure reuse, fused SGD, and input-name index. Trainer batch specifications retain shape/dtype metadata rather than the initial Tensor. | Additional mutable-pytree caches would retain metadata and require container revalidation; no unmeasured cache is adopted. |
@@ -1017,14 +1033,49 @@ CUDA/NCCL all-target Clippy also passes after the final legacy test additions.
 The first Linux gate exposed two-NaN payload differences in owned addition;
 NaN operands now use the original kernel and the full gate passes. Those October 4 gates did not establish NCCL numerical parity for that snapshot.
 
-The October 4 adoptable checklist changes were integrated and measured.
-The October 5 continuation explicitly approves C2 tree-reduction numerical
-order, B8 native Cholesky IR/schema changes, and C6 two-GPU validation.
-Two-GPU NCCL parity has not been rerun on the final integrated source; the
-earlier two-GPU results remain valid only for their recorded source snapshots.
-Candidates rejected for extra retained memory, contract changes or missing
-two-GPU validation remain documented above. No globally optimal
-memory/scheduling claim is made.
+The October 5 continuation completed the approved C2 tree reduction, B8 native
+Cholesky, and C6 validation for its integrated source snapshot. Twelve balanced
+fresh-process rounds of a fixed 15-workload CPU mix, including Cholesky
+primal/JVP/value-and-gradient/HVP construction, compilation, execution and
+export, measure 190.191781 to 81.055094 ms (2.346x). Peak process RSS falls
+from 457,400,320 to 53,198,848 bytes (88.37 percent); maximum output error is
+4.44e-16. The retained October 3 baseline already contains prior optimizations.
+These are whole-mix measurements, not products of local speedups.
+
+Against the pre-B8 October 5 extension, the n=32 Python F64 Cholesky HVP
+including staging/compilation/execution/export improves from 170.361521 to
+0.102240 ms (1666.298x); execution/export alone improves 200.683x. The
+independent same-binary Rust scalar-reference/native n=32 HVP comparison
+reduces peak heap from 294,099,698 to 182,238 bytes. CUDA n=16 VJP improves
+249.044x including upload/execution/export, excluding compilation. Metal n=16
+VJP improves 20.585x including construction/execution/export with resident
+inputs, excluding initial shader compilation; active-array peak falls 85.60
+percent. CPU heap, process RSS, and Metal active-array memory are distinct
+measurements. C2 long-axis sum reaches 6.050x including upload/export, with
+zero global scratch. Ratios from different hosts are reported separately.
+
+The snapshot passes 279 default Rust tests, 311 MLX workspace tests, 346 CUDA
+workspace tests, default/MLX/CUDA-NCCL Clippy, fmt, Ruff, the required Python
+suites and additional Cholesky/legacy regressions. All 28 Python Metal
+Cholesky composition cases match the retained extension within tolerance.
+The final Linux gate also identified an abs NaN-bit regression; NaN inputs
+now use the original kernels and strict bit assertions pass.
+
+C6 job 6096 completed in 68 seconds with maximum loss error 1.49e-8 and
+gradient error 2.36e-8. Its source manifests match between local and remote
+checkouts, and the parity JSON identifies the rebuilt native extension.
+The preserved, locally ignored evidence is under
+`logs/v02-final-candidates-20261005/`: `expanded-suite-final.json`,
+`b8-complete-measurements.json`, the `b8/`, `b8-cuda/`, `b8-metal/`, `c2/`
+measurements, and `c6/quabla_c6_6096{.out,.err,_parity.json}`.
+
+Closure verification on November 6 confirmed the archived accounting, source
+identities, numerical results and lifecycle logs. The working tree has since
+changed substantially, including the later device-precision policy; these
+October 5 results do not validate the current 1.0.x source. The separate
+release-validation items at the start of this roadmap remain open. Candidates
+rejected for extra retained memory or compatibility costs remain documented
+above. No globally optimal memory/scheduling claim is made.
 
 JAX can be summarized as:
 
