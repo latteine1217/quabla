@@ -11,13 +11,15 @@
 //! - its identity for common-subexpression elimination
 //!   ([`TensorOp::cse_key`]);
 //! - how its builder rebuilds it on new operands
-//!   (`TensorIr::rebuild_like`, in [`rebuild`]).
+//!   (`TensorIr::rebuild_like`, in [`rebuild`]);
+//! - its forward-mode derivative (`TensorIr::push_jvp_pair`, in [`jvp`]).
 //!
 //! The program text (`TensorIr::lower_text`) keeps its own exhaustive match,
 //! because its format is public and pinned by golden baselines. Lowering an
 //! op stays in each backend, whose exhaustive matches keep the bit-for-bit
 //! concerns of that backend in one place.
 
+mod jvp;
 mod rebuild;
 
 use super::{TensorExtremum, TensorNodeId, TensorOp};
