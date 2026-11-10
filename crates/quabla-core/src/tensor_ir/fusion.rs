@@ -189,6 +189,11 @@ impl CpuFusionPlan {
 
 /// Whether the CPU evaluator's value of `node` is elementwise in its
 /// operands, so a region can compute it per element.
+///
+/// This is the CPU rule only. CUDA fusion admits a narrower, opt-in set
+/// (`is_fusable_elementwise_compute_op` in `tensor_ir.rs`, which explains
+/// the difference), and which ops a CUDA graph capture may record is a
+/// separate question (`cuda_graph_capturable` in the CUDA host loop).
 fn is_fusable(node: &TensorNode) -> bool {
     match &node.op {
         TensorOp::Add { .. }

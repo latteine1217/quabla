@@ -12695,9 +12695,8 @@ impl TensorExecutionPlan {
 
     /// Lowers a fused rank-N elementwise plan to one CUDA C kernel.
     ///
-    /// The generated kernel deliberately excludes operations whose current CPU
-    /// semantics need host-side validation or separate lowering: reductions,
-    /// matmul, reshape, transpose, division, and log.
+    /// The generated kernel covers the ops that `is_fusable_elementwise_compute_op`
+    /// admits; reductions, matmul, reshape, and transpose need separate lowering.
     pub fn cuda_source(&self) -> Result<String, String> {
         if !self.fused_elementwise_output {
             return Err(
@@ -13489,7 +13488,19 @@ fn is_fusable_elementwise_subgraph(nodes: &[TensorNode], node_id: TensorNodeId) 
 }
 
 /// Whether whole-plan and region fusion inline `op` into one CUDA
-/// elementwise kernel; an elementwise math op answers through its kind.
+/// elementwise kernel; an elementwise math op answers through its kind
+/// (`UnaryMathKind::cuda_fusable`, `BinaryMathKind::cuda_fusable`).
+///
+/// This is an opt-in list, narrower than the CPU evaluator's rule
+/// (`fusion::is_fusable`): an op is fused on CUDA only once it is added here,
+/// because admitting one changes which neighbouring ops share a kernel and so
+/// how their results round.
+///
+/// TODO: decide whether to admit division. It was left out while the CPU
+/// evaluator rejected a zero divisor, which a fused kernel cannot report;
+/// since a257f5f the CPU evaluator returns IEEE values instead, so admitting
+/// it is a matter of checking the fused results bit for bit against the
+/// golden baselines.
 fn is_fusable_elementwise_compute_op(op: &TensorOp) -> bool {
     match op {
         TensorOp::UnaryMath { kind, .. } => kind.cuda_fusable(),
