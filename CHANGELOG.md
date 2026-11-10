@@ -10,8 +10,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
 
 ### Changed
 
-- Internal: the name, operands, remapping, and CSE key of every tensor op
-  are answered in one module (`tensor_ir/op.rs`); program text, results,
+- Internal: the name, operands, remapping, CSE key, symbolic JVP and VJP,
+  vmap batching, and sharding placement of every tensor op are answered in
+  one module (`tensor_ir/op.rs` and `tensor_ir/op/`); program text, results,
   and public interfaces are unchanged.
 
 ## [1.1.0] - 2026-11-09
