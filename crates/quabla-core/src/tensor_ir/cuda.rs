@@ -25,8 +25,8 @@ use cudarc::nccl::{group_end, group_start, Comm as NcclComm, ReduceOp as NcclRed
 use super::region::{evaluator_region_plans, RegionPlan};
 use super::{
     contiguous_strides, cuda_elementwise_formula, cuda_scalar_literal, element_count,
-    tensor_op_inputs, DynamicTensor, LinalgKind, RegionKind, RegionNode, TensorBackend,
-    TensorDType, TensorDeviceBackend, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan,
+    DynamicTensor, LinalgKind, RegionKind, RegionNode, TensorBackend, TensorDType,
+    TensorDeviceBackend, TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan,
     TensorForiVjpJvpExecutionPlan, TensorForiVjpTarget, TensorFusionRegion, TensorNodeId, TensorOp,
     TensorReplicaReduction, TensorScanExecutionPlan, TensorScanTarget,
     TensorScanVjpJvpExecutionPlan, TensorScanVjpTarget, TensorShardingPlan, UnaryMathKind,
@@ -270,7 +270,7 @@ fn cuda_pool_frontier_budget(plan: &TensorExecutionPlan) -> Result<usize, String
     for (id, node) in plan.nodes.iter().enumerate() {
         live = live.saturating_add(counts[id]);
         peak = peak.max(live);
-        for input in tensor_op_inputs(&node.op) {
+        for input in node.op.inputs() {
             uses[input] -= 1;
             if uses[input] == 0 && !pinned(input) {
                 live -= counts[input];
@@ -1620,7 +1620,7 @@ struct CudaProgramRuntime<'a, T: CudaReal> {
 fn cuda_remaining_use_counts(plan: &TensorExecutionPlan) -> Vec<usize> {
     let mut counts = vec![0; plan.nodes.len()];
     for node in plan.nodes.iter() {
-        for input in tensor_op_inputs(&node.op) {
+        for input in node.op.inputs() {
             counts[input] += 1;
         }
     }
@@ -1768,7 +1768,7 @@ fn release_dead_cuda_values<T: CudaReal>(
     retained_inputs: &BTreeSet<String>,
     remaining_uses: &mut [usize],
 ) -> Result<(), String> {
-    for input_id in tensor_op_inputs(&plan.nodes[node_id].op) {
+    for input_id in plan.nodes[node_id].op.inputs() {
         let remaining = remaining_uses
             .get_mut(input_id)
             .ok_or_else(|| format!("CUDA input node {input_id} does not exist"))?;

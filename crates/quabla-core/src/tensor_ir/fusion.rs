@@ -39,9 +39,9 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use super::{
-    advance_broadcast_offsets, contiguous_strides, sqrt_derivative_value, tensor_op_inputs,
-    BinaryMathKind, DynamicTensor, EagerOperand, HostTensorStorage, TensorComparison, TensorDType,
-    TensorIr, TensorNode, TensorNodeId, TensorOp, UnaryMathKind,
+    advance_broadcast_offsets, contiguous_strides, sqrt_derivative_value, BinaryMathKind,
+    DynamicTensor, EagerOperand, HostTensorStorage, TensorComparison, TensorDType, TensorIr,
+    TensorNode, TensorNodeId, TensorOp, UnaryMathKind,
 };
 
 /// Elements per instruction dispatch. 256 `f64` lanes are 2 KiB per
@@ -95,7 +95,7 @@ impl CpuFusionPlan {
             if !live[node_id] {
                 continue;
             }
-            for input in tensor_op_inputs(&node.op) {
+            for input in node.op.inputs() {
                 // Nodes are visited in order, so a repeated operand can only
                 // repeat the most recently recorded user.
                 if users[input].last() != Some(&node_id) {
@@ -121,7 +121,7 @@ impl CpuFusionPlan {
             let mut members = vec![root];
             member[root] = root;
             let mut candidates = BinaryHeap::new();
-            for input in tensor_op_inputs(&nodes[root].op) {
+            for input in nodes[root].op.inputs() {
                 if queued[input] != root {
                     queued[input] = root;
                     candidates.push(input);
@@ -140,7 +140,7 @@ impl CpuFusionPlan {
                 }
                 member[candidate] = root;
                 members.push(candidate);
-                for input in tensor_op_inputs(&node.op) {
+                for input in node.op.inputs() {
                     if queued[input] != root {
                         queued[input] = root;
                         candidates.push(input);
@@ -161,7 +161,7 @@ impl CpuFusionPlan {
             };
             let consumed = members
                 .iter()
-                .flat_map(|id| tensor_op_inputs(&nodes[*id].op))
+                .flat_map(|id| nodes[*id].op.inputs())
                 .collect();
             for id in &members {
                 roles[*id] = FusionRole::Member;
@@ -224,7 +224,7 @@ fn live_nodes(nodes: &[TensorNode], outputs: &[TensorNodeId]) -> Vec<bool> {
     }
     for node_id in (0..nodes.len()).rev() {
         if live[node_id] {
-            for input in tensor_op_inputs(&nodes[node_id].op) {
+            for input in nodes[node_id].op.inputs() {
                 live[input] = true;
             }
         }

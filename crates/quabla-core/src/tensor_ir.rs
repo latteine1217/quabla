@@ -2654,10 +2654,7 @@ impl TensorIr {
                     .ok_or_else(|| format!("inline leaves callee input {name:?} unbound"))?;
                 mapped[id] = is_mapped;
                 binding
-            } else if tensor_op_inputs(&node.op)
-                .iter()
-                .any(|input| mapped[*input])
-            {
+            } else if node.op.inputs().iter().any(|input| mapped[*input]) {
                 let (spliced, is_mapped) = self.push_batched(
                     callee,
                     node,
@@ -2685,7 +2682,7 @@ impl TensorIr {
         while let Some(id) = pending.pop() {
             let node = self.node(id)?;
             if !std::mem::replace(&mut reachable[id], true) {
-                pending.extend(tensor_op_inputs(&node.op));
+                pending.extend(node.op.inputs());
             }
         }
         Ok(reachable)
@@ -2699,7 +2696,7 @@ impl TensorIr {
         remap: &HashMap<TensorNodeId, TensorNodeId>,
         groups: &mut HashMap<usize, usize>,
     ) -> Result<TensorNodeId, String> {
-        let mut op = remap_tensor_op(&node.op, &|id| remap.get(&id).copied())?;
+        let mut op = node.op.remap(&|id| remap.get(&id).copied())?;
         if let Some(group) = tensor_op_group_mut(&mut op) {
             *group = *groups.entry(*group).or_insert(self.nodes.len());
         }
@@ -2742,7 +2739,7 @@ impl TensorIr {
             | TensorOp::StopGradient { .. }
             | TensorOp::Triangular { .. }
             | TensorOp::Linalg { .. }
-            | TensorOp::Reshape { .. } => remap_tensor_op(&node.op, &|id| remap.get(&id).copied())?,
+            | TensorOp::Reshape { .. } => node.op.remap(&|id| remap.get(&id).copied())?,
             TensorOp::Add { .. }
             | TensorOp::Sub { .. }
             | TensorOp::Div { .. }
@@ -2754,7 +2751,7 @@ impl TensorIr {
             | TensorOp::Matmul { .. }
             | TensorOp::Broadcast { .. } => {
                 let mut local = HashMap::new();
-                for operand in tensor_op_inputs(&node.op) {
+                for operand in node.op.inputs() {
                     let spliced = target(operand)?;
                     let spliced = if mapped[operand] {
                         self.pad_batched(spliced, rank)?
@@ -2763,7 +2760,7 @@ impl TensorIr {
                     };
                     local.insert(operand, spliced);
                 }
-                remap_tensor_op(&node.op, &|id| local.get(&id).copied())?
+                node.op.remap(&|id| local.get(&id).copied())?
             }
             TensorOp::Sum { input } | TensorOp::Mean { input } => {
                 let count = element_count(&callee.node(*input)?.shape)?;
@@ -3249,9 +3246,7 @@ impl TensorIr {
                 continue;
             }
             if !matches!(node.op, TensorOp::Input { .. }) {
-                active[node_index] = tensor_op_inputs(&node.op)
-                    .iter()
-                    .any(|input| active[*input]);
+                active[node_index] = node.op.inputs().iter().any(|input| active[*input]);
             }
             let pair = match &node.op {
                 TensorOp::Input { name } => {
@@ -6857,7 +6852,7 @@ impl TensorIr {
                 let inputs = inputs.iter().map(|id| mapped[*id]).collect::<Vec<_>>();
                 graph.expanded_cholesky_ad(&inputs, *kind)?
             } else {
-                let op = remap_tensor_op(&node.op, &|id| mapped.get(id).copied())?;
+                let op = node.op.remap(&|id| mapped.get(id).copied())?;
                 graph.push_node(op, node.shape.clone(), node.dtype, node.weak)
             };
             mapped.push(id);
@@ -7365,7 +7360,7 @@ impl TensorIr {
             if !keep {
                 continue;
             }
-            for input in tensor_op_inputs(&self.nodes[node_id].op) {
+            for input in self.nodes[node_id].op.inputs() {
                 source_uses[input] += 1;
             }
         }
@@ -7375,9 +7370,9 @@ impl TensorIr {
             if !reachable[old_id] {
                 continue;
             }
-            let source_inputs = tensor_op_inputs(&node.op);
+            let source_inputs = node.op.inputs();
             let compiled_id = (|| -> Result<TensorNodeId, String> {
-                let mut op = remap_tensor_op(&node.op, &|id| remap.get(id))?;
+                let mut op = node.op.remap(&|id| remap.get(id))?;
                 let retained_custom = keep_custom && matches!(op, TensorOp::Custom { .. });
                 if !retained_custom {
                     if let Some(alias) =
@@ -7420,7 +7415,7 @@ impl TensorIr {
                 }
                 // A surviving operation pins its operands for execution. Folded constants
                 // have no runtime dependencies and may release their temporary inputs.
-                for input in tensor_op_inputs(&op) {
+                for input in op.inputs() {
                     retained[input] = true;
                 }
                 let compiled_id = nodes.len();
@@ -8140,7 +8135,7 @@ impl TensorIr {
     fn push_derived(&mut self, op: TensorOp, shape: Vec<usize>) -> Result<TensorNodeId, String> {
         // Shape inference can overflow even when each operand shape is valid.
         element_count(&shape)?;
-        let operands = tensor_value_operands(&op);
+        let operands = op.value_operands();
         let first = *operands
             .first()
             .ok_or_else(|| format!("{} has no value operand to derive a dtype from", op.name()))?;
@@ -8912,12 +8907,7 @@ impl TensorIr {
                 CPU_FORWARD_PEAK_ELEMENTS.with(|peak| peak.set(peak.get().max(elements)));
             }
             if let Some(last_uses) = &mut last_uses {
-                release_consumed_values(
-                    last_uses,
-                    &mut values,
-                    node_id,
-                    &tensor_op_inputs(&node.op),
-                );
+                release_consumed_values(last_uses, &mut values, node_id, &node.op.inputs());
                 // Region siblings share one evaluation, but its cached tensors need not outlive
                 // the final sibling. Node values above protect any requested output separately.
                 if let Some(group) = tensor_op_group(&node.op) {
@@ -9349,7 +9339,7 @@ fn symbolic_clone_with_input_replacements(
                 format!("symbolic Fori JVP is missing input replacement {name:?}")
             })?,
             _ => {
-                let mut op = remap_tensor_op(&node.op, &|id| remap.get(&id).copied())?;
+                let mut op = node.op.remap(&|id| remap.get(&id).copied())?;
                 if let TensorOp::Custom { group, .. } = &mut op {
                     *group = *custom_groups
                         .entry(*group)
@@ -12403,7 +12393,7 @@ impl TensorExecutionPlan {
                         TensorOp::Reshape { input } => Some(input),
                         _ => None,
                     },
-                    inputs: tensor_op_inputs(&node.op),
+                    inputs: node.op.inputs(),
                     name: match &node.op {
                         TensorOp::Input { name } => Some(name.clone()),
                         _ => None,
@@ -12581,7 +12571,7 @@ impl TensorExecutionPlan {
         let consumed = self
             .nodes
             .iter()
-            .flat_map(|node| tensor_op_inputs(&node.op))
+            .flat_map(|node| node.op.inputs())
             .collect::<HashSet<_>>();
         let mut collectives = Vec::with_capacity(sharding.all_reduces.len());
         for collective in &sharding.all_reduces {
@@ -12621,7 +12611,7 @@ impl TensorExecutionPlan {
             .zip(self.nodes.iter())
             .zip(&sharding.program.nodes)
         {
-            if tensor_op_inputs(&local.op) != tensor_op_inputs(&node.op) {
+            if local.op.inputs() != node.op.inputs() {
                 return Err(format!(
                     "CUDA data-parallel replica specialization changed the inputs of node {}",
                     placed.id
@@ -13251,7 +13241,7 @@ fn cuda_dag_statements(
         }
         reachable[id] = true;
         if !region_leaves.is_some_and(|leaves| leaves.contains(&id)) {
-            pending.extend(tensor_op_inputs(&node.op));
+            pending.extend(node.op.inputs());
         }
     }
     let reference = |id| format!("quabla_value_{id}");
@@ -13487,7 +13477,8 @@ fn is_fusable_elementwise_subgraph(nodes: &[TensorNode], node_id: TensorNodeId) 
     for (id, node) in nodes.iter().enumerate().take(node_id + 1) {
         eligible[id] = match &node.op {
             TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } => true,
-            op if is_fusable_elementwise_compute_op(op) => tensor_op_inputs(op)
+            op if is_fusable_elementwise_compute_op(op) => op
+                .inputs()
                 .into_iter()
                 .all(|input| input < id && eligible[input]),
             // Array constants and non-elementwise operators use the per-node program.
@@ -13516,76 +13507,6 @@ fn is_fusable_elementwise_compute_op(op: &TensorOp) -> bool {
                 | TensorOp::Powi { .. }
                 | TensorOp::Cast { .. }
         ),
-    }
-}
-
-fn tensor_op_inputs(op: &TensorOp) -> Vec<TensorNodeId> {
-    match op {
-        TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } | TensorOp::Constant { .. } => {
-            Vec::new()
-        }
-        TensorOp::Add { lhs, rhs }
-        | TensorOp::Sub { lhs, rhs }
-        | TensorOp::Div { lhs, rhs }
-        | TensorOp::Mul { lhs, rhs }
-        | TensorOp::Greater { lhs, rhs }
-        | TensorOp::Compare { lhs, rhs, .. }
-        | TensorOp::Matmul { lhs, rhs } => {
-            vec![*lhs, *rhs]
-        }
-        TensorOp::BinaryMath { lhs, rhs, .. } => vec![*lhs, *rhs],
-        TensorOp::Solve { matrix, rhs } => vec![*matrix, *rhs],
-        TensorOp::CholeskyAd { inputs, .. } => inputs.clone(),
-        TensorOp::Cholesky { input }
-        | TensorOp::Triangular { input, .. }
-        | TensorOp::Linalg { input, .. } => vec![*input],
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => vec![*condition, *on_true, *on_false],
-        TensorOp::Region(region) => region.operands(),
-        TensorOp::Sum { input }
-        | TensorOp::SumAxis { input, .. }
-        | TensorOp::ExtremumAxis { input, .. }
-        | TensorOp::Sqrt { input }
-        | TensorOp::SqrtDerivative { input, .. }
-        | TensorOp::Reshape { input }
-        | TensorOp::Mean { input }
-        | TensorOp::MeanAxis { input, .. }
-        | TensorOp::Powi { input, .. }
-        | TensorOp::Transpose { input, .. }
-        | TensorOp::UnaryMath { input, .. }
-        | TensorOp::StopGradient { input }
-        | TensorOp::CumSum { input, .. }
-        | TensorOp::Slice { input, .. }
-        | TensorOp::PadSlice { input, .. }
-        | TensorOp::Gather { input, .. }
-        | TensorOp::Broadcast { input }
-        | TensorOp::Cast { input } => {
-            vec![*input]
-        }
-        TensorOp::ScatterAdd { base, updates, .. } => vec![*base, *updates],
-        TensorOp::Concat { inputs, .. } => inputs.clone(),
-        // The operands are inputs for reachability and inlining, so a rule
-        // can still be applied to them after the node is spliced.
-        TensorOp::Custom {
-            value, operands, ..
-        } => std::iter::once(*value)
-            .chain(operands.iter().copied())
-            .collect(),
-    }
-}
-
-/// Operands whose dtype an ordinary op's result inherits. A `where` mask
-/// is only tested for non-zero values and therefore does not participate.
-fn tensor_value_operands(op: &TensorOp) -> Vec<TensorNodeId> {
-    match op {
-        TensorOp::Where {
-            on_true, on_false, ..
-        } => vec![*on_true, *on_false],
-        TensorOp::Custom { value, .. } => vec![*value],
-        _ => tensor_op_inputs(op),
     }
 }
 
@@ -13927,7 +13848,7 @@ fn tensor_forward_last_uses(
     let mut retained = vec![false; nodes.len()];
     let mut group_last_nodes = HashMap::new();
     for (id, node) in nodes.iter().enumerate() {
-        for input in tensor_op_inputs(&node.op) {
+        for input in node.op.inputs() {
             remaining[input] += 1;
         }
         if let Some(group) = tensor_op_group(&node.op) {
@@ -14519,7 +14440,7 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
 /// evaluator rejects (a zero divisor, a non-positive logarithm) stays unfolded
 /// and still fails at execution.
 fn fold_tensor_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<DynamicTensor> {
-    let operands = tensor_op_inputs(op);
+    let operands = op.inputs();
     let is_array = |id: &TensorNodeId| {
         matches!(
             nodes.get(*id).map(|node| &node.op),
@@ -14605,7 +14526,7 @@ fn canonicalize_tensor_op(
 fn build_tensor_fusion_regions(nodes: &[TensorNode]) -> Vec<TensorFusionRegion> {
     let mut users = vec![Vec::new(); nodes.len()];
     for (node_id, node) in nodes.iter().enumerate() {
-        for input in tensor_op_inputs(&node.op) {
+        for input in node.op.inputs() {
             if let Some(input_users) = users.get_mut(input) {
                 // Nodes are visited in order, so duplicate operands can only
                 // repeat the most recently recorded user.
@@ -14671,7 +14592,7 @@ fn collect_fusion_region_nodes(
     if !region_nodes.insert(node_id) {
         return;
     }
-    for input in tensor_op_inputs(&node.op) {
+    for input in node.op.inputs() {
         collect_fusion_region_nodes(nodes, users, root, input, region_nodes, inputs);
     }
 }
@@ -14691,7 +14612,7 @@ fn tensor_output_reachability(nodes: &[TensorNode], outputs: &[TensorNodeId]) ->
             continue;
         }
         reachable[id] = true;
-        pending.extend(tensor_op_inputs(&nodes[id].op));
+        pending.extend(nodes[id].op.inputs());
     }
     reachable
 }
@@ -14715,7 +14636,7 @@ fn prune_unreachable_tensor_nodes(
         }
         remap.insert(old_id, compacted.len());
         compacted.push(TensorNode {
-            op: remap_tensor_op(&node.op, &|id| remap.get(id))?,
+            op: node.op.remap(&|id| remap.get(id))?,
             shape: node.shape.clone(),
             dtype: node.dtype,
             weak: node.weak,
@@ -14746,7 +14667,7 @@ fn build_tensor_buffer_plan(
         .collect::<Result<BTreeSet<_>, _>>()?;
     let mut remaining_uses = vec![0usize; nodes.len()];
     for node in nodes {
-        for input in tensor_op_inputs(&node.op) {
+        for input in node.op.inputs() {
             let root = tensor_storage_root(nodes, input)?;
             remaining_uses[root] = remaining_uses[root]
                 .checked_add(1)
@@ -14781,7 +14702,7 @@ fn build_tensor_buffer_plan(
             node_slots[node_id] = Some(slot);
         }
 
-        for input in tensor_op_inputs(&node.op) {
+        for input in node.op.inputs() {
             let root = tensor_storage_root(nodes, input)?;
             let uses = remaining_uses
                 .get_mut(root)
@@ -15054,212 +14975,6 @@ impl TensorNodeRemap {
             Self::Dense(values) => values.get(source).copied().filter(|id| *id != usize::MAX),
             Self::Sparse(values) => values.get(&source).copied(),
         }
-    }
-}
-
-fn remap_tensor_op(
-    op: &TensorOp,
-    remap: &impl Fn(TensorNodeId) -> Option<TensorNodeId>,
-) -> Result<TensorOp, String> {
-    let remap_node = |node_id: TensorNodeId| {
-        remap(node_id).ok_or_else(|| format!("node {node_id} is missing from execution plan remap"))
-    };
-    match op {
-        TensorOp::Input { name } => Ok(TensorOp::Input { name: name.clone() }),
-        TensorOp::ScalarConstant { value } => Ok(TensorOp::ScalarConstant { value: *value }),
-        TensorOp::Constant { value } => Ok(TensorOp::Constant {
-            value: value.clone(),
-        }),
-        TensorOp::Cast { input } => Ok(TensorOp::Cast {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::Add { lhs, rhs } => Ok(TensorOp::Add {
-            lhs: remap_node(*lhs)?,
-            rhs: remap_node(*rhs)?,
-        }),
-        TensorOp::Sub { lhs, rhs } => Ok(TensorOp::Sub {
-            lhs: remap_node(*lhs)?,
-            rhs: remap_node(*rhs)?,
-        }),
-        TensorOp::Div { lhs, rhs } => Ok(TensorOp::Div {
-            lhs: remap_node(*lhs)?,
-            rhs: remap_node(*rhs)?,
-        }),
-        TensorOp::Mul { lhs, rhs } => Ok(TensorOp::Mul {
-            lhs: remap_node(*lhs)?,
-            rhs: remap_node(*rhs)?,
-        }),
-        TensorOp::Greater { lhs, rhs } => Ok(TensorOp::Greater {
-            lhs: remap_node(*lhs)?,
-            rhs: remap_node(*rhs)?,
-        }),
-        TensorOp::Compare { lhs, rhs, kind } => Ok(TensorOp::Compare {
-            lhs: remap_node(*lhs)?,
-            rhs: remap_node(*rhs)?,
-            kind: *kind,
-        }),
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => Ok(TensorOp::Where {
-            condition: remap_node(*condition)?,
-            on_true: remap_node(*on_true)?,
-            on_false: remap_node(*on_false)?,
-        }),
-        TensorOp::Region(region) => {
-            let mut region = region.clone();
-            for operand in region.operands_mut() {
-                *operand = remap_node(*operand)?;
-            }
-            Ok(TensorOp::Region(region))
-        }
-        TensorOp::Sum { input } => Ok(TensorOp::Sum {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::SumAxis { input, axis } => Ok(TensorOp::SumAxis {
-            input: remap_node(*input)?,
-            axis: *axis,
-        }),
-        TensorOp::ExtremumAxis { input, axis, kind } => Ok(TensorOp::ExtremumAxis {
-            input: remap_node(*input)?,
-            axis: *axis,
-            kind: *kind,
-        }),
-        TensorOp::Matmul { lhs, rhs } => Ok(TensorOp::Matmul {
-            lhs: remap_node(*lhs)?,
-            rhs: remap_node(*rhs)?,
-        }),
-        TensorOp::Solve { matrix, rhs } => Ok(TensorOp::Solve {
-            matrix: remap_node(*matrix)?,
-            rhs: remap_node(*rhs)?,
-        }),
-        TensorOp::Linalg { input, kind } => Ok(TensorOp::Linalg {
-            input: remap_node(*input)?,
-            kind: *kind,
-        }),
-        TensorOp::Cholesky { input } => Ok(TensorOp::Cholesky {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::CholeskyAd { inputs, kind } => Ok(TensorOp::CholeskyAd {
-            inputs: inputs
-                .iter()
-                .map(|id| remap_node(*id))
-                .collect::<Result<Vec<_>, _>>()?,
-            kind: *kind,
-        }),
-        TensorOp::Triangular { input, lower } => Ok(TensorOp::Triangular {
-            input: remap_node(*input)?,
-            lower: *lower,
-        }),
-        TensorOp::Sqrt { input } => Ok(TensorOp::Sqrt {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::SqrtDerivative { input, order } => Ok(TensorOp::SqrtDerivative {
-            input: remap_node(*input)?,
-            order: *order,
-        }),
-        TensorOp::Reshape { input } => Ok(TensorOp::Reshape {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::Mean { input } => Ok(TensorOp::Mean {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::MeanAxis { input, axis } => Ok(TensorOp::MeanAxis {
-            input: remap_node(*input)?,
-            axis: *axis,
-        }),
-        TensorOp::Powi { input, exponent } => Ok(TensorOp::Powi {
-            input: remap_node(*input)?,
-            exponent: *exponent,
-        }),
-        TensorOp::BinaryMath { lhs, rhs, kind } => Ok(TensorOp::BinaryMath {
-            lhs: remap_node(*lhs)?,
-            rhs: remap_node(*rhs)?,
-            kind: *kind,
-        }),
-        TensorOp::Transpose { input, axes } => Ok(TensorOp::Transpose {
-            input: remap_node(*input)?,
-            axes: axes.clone(),
-        }),
-        TensorOp::UnaryMath { input, kind } => Ok(TensorOp::UnaryMath {
-            input: remap_node(*input)?,
-            kind: *kind,
-        }),
-        TensorOp::StopGradient { input } => Ok(TensorOp::StopGradient {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::CumSum {
-            input,
-            axis,
-            reverse,
-        } => Ok(TensorOp::CumSum {
-            input: remap_node(*input)?,
-            axis: *axis,
-            reverse: *reverse,
-        }),
-        TensorOp::Concat { inputs, axis } => Ok(TensorOp::Concat {
-            inputs: inputs
-                .iter()
-                .map(|input| remap_node(*input))
-                .collect::<Result<Vec<_>, _>>()?,
-            axis: *axis,
-        }),
-        TensorOp::Slice {
-            input,
-            axis,
-            start,
-            length,
-        } => Ok(TensorOp::Slice {
-            input: remap_node(*input)?,
-            axis: *axis,
-            start: *start,
-            length: *length,
-        }),
-        TensorOp::PadSlice { input, axis, start } => Ok(TensorOp::PadSlice {
-            input: remap_node(*input)?,
-            axis: *axis,
-            start: *start,
-        }),
-        TensorOp::Gather {
-            input,
-            indices,
-            axis,
-        } => Ok(TensorOp::Gather {
-            input: remap_node(*input)?,
-            indices: indices.clone(),
-            axis: *axis,
-        }),
-        TensorOp::ScatterAdd {
-            base,
-            updates,
-            indices,
-            axis,
-        } => Ok(TensorOp::ScatterAdd {
-            base: remap_node(*base)?,
-            updates: remap_node(*updates)?,
-            indices: indices.clone(),
-            axis: *axis,
-        }),
-        TensorOp::Broadcast { input } => Ok(TensorOp::Broadcast {
-            input: remap_node(*input)?,
-        }),
-        TensorOp::Custom {
-            value,
-            operands,
-            rule,
-            output,
-            group,
-        } => Ok(TensorOp::Custom {
-            value: remap_node(*value)?,
-            operands: operands
-                .iter()
-                .map(|operand| remap_node(*operand))
-                .collect::<Result<_, _>>()?,
-            rule: rule.clone(),
-            output: *output,
-            group: *group,
-        }),
     }
 }
 
