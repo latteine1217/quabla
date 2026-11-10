@@ -8,6 +8,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
 
 ## [Unreleased]
 
+### Changed
+
+- Internal: the name, operands, remapping, and CSE key of every tensor op
+  are answered in one module (`tensor_ir/op.rs`); program text, results,
+  and public interfaces are unchanged.
+
 ## [1.1.0] - 2026-11-09
 
 The bug-fix release of the v1.1.0 plan in `docs/jax_like_roadmap.md`:
