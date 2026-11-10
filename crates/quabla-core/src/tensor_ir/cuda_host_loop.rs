@@ -590,7 +590,7 @@ fn host_loop_ir(op: &TensorOp) -> Result<(HostLoopKind, Vec<TensorExecutionPlan>
         }
         _ => Err(format!(
             "{} has no host-driven CUDA loop lowering",
-            super::cuda_op_name(op)
+            op.name()
         )),
     }
 }

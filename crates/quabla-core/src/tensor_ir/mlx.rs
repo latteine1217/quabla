@@ -1400,12 +1400,7 @@ impl MlxBackend {
                     &stream,
                 ),
             }
-            .map_err(|error| {
-                format!(
-                    "MLX node {node_id} {} failed: {error}",
-                    mlx_op_name(&node.op)
-                )
-            })?;
+            .map_err(|error| format!("MLX node {node_id} {} failed: {error}", node.op.name()))?;
             values.push(value);
         }
 
@@ -2491,53 +2486,6 @@ fn mlx_value(values: &[Array], node_id: usize) -> Result<&Array, String> {
     values
         .get(node_id)
         .ok_or_else(|| format!("MLX operand node {node_id} is missing"))
-}
-
-fn mlx_op_name(op: &TensorOp) -> &'static str {
-    match op {
-        TensorOp::Input { .. } => "input",
-        TensorOp::ScalarConstant { .. } => "constant",
-        TensorOp::Constant { .. } => "tensor_constant",
-        TensorOp::Cast { .. } => "cast",
-        TensorOp::Add { .. } => "add",
-        TensorOp::Sub { .. } => "sub",
-        TensorOp::Div { .. } => "div",
-        TensorOp::Mul { .. } => "mul",
-        TensorOp::Greater { .. } => "greater",
-        TensorOp::Compare { kind, .. } => kind.name(),
-        TensorOp::Where { .. } => "where",
-        TensorOp::Region(region) => region.name(),
-        TensorOp::Sum { .. } => "sum",
-        TensorOp::SumAxis { .. } => "sum_axis",
-        TensorOp::ExtremumAxis { kind, .. } => match kind {
-            TensorExtremum::Max => "max_axis",
-            TensorExtremum::Min => "min_axis",
-        },
-        TensorOp::Matmul { .. } => "matmul",
-        TensorOp::Solve { .. } => "solve",
-        TensorOp::Linalg { kind, .. } => kind.name(),
-        TensorOp::Cholesky { .. } => "cholesky",
-        TensorOp::CholeskyAd { .. } => "cholesky_ad",
-        TensorOp::Triangular { .. } => "triangular",
-        TensorOp::Sqrt { .. } => "sqrt",
-        TensorOp::SqrtDerivative { .. } => "sqrt_derivative",
-        TensorOp::Reshape { .. } => "reshape",
-        TensorOp::Mean { .. } => "mean",
-        TensorOp::MeanAxis { .. } => "mean_axis",
-        TensorOp::Powi { .. } => "powi",
-        TensorOp::BinaryMath { kind, .. } => kind.name(),
-        TensorOp::Transpose { .. } => "transpose",
-        TensorOp::UnaryMath { kind, .. } => kind.name(),
-        TensorOp::StopGradient { .. } => "stop_gradient",
-        TensorOp::Custom { .. } => "custom",
-        TensorOp::CumSum { .. } => "cumsum",
-        TensorOp::Concat { .. } => "concat",
-        TensorOp::Slice { .. } => "slice",
-        TensorOp::PadSlice { .. } => "pad_slice",
-        TensorOp::Gather { .. } => "gather",
-        TensorOp::ScatterAdd { .. } => "scatter_add",
-        TensorOp::Broadcast { .. } => "broadcast",
-    }
 }
 
 #[cfg(test)]

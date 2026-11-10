@@ -26,6 +26,7 @@ pub use fusion::FusedKernel;
 use fusion::{CpuFusionPlan, FusionStep};
 mod host_storage;
 pub use host_storage::HostTensorStorage;
+mod op;
 mod region;
 use region::{RegionKind, RegionNode};
 mod region_batching;
@@ -3018,7 +3019,7 @@ impl TensorIr {
             | TensorOp::Constant { .. } => {
                 return Err(BatchingError::Invalid(format!(
                     "{} has no operand and cannot depend on a mapped input",
-                    tensor_op_name(&node.op)
+                    node.op.name()
                 )))
             }
         };
@@ -8008,7 +8009,7 @@ impl TensorIr {
                 _ => {
                     return Err(format!(
                         "StableHLO export does not yet support {}",
-                        tensor_op_name(&node.op)
+                        node.op.name()
                     ))
                 }
             };
@@ -8140,12 +8141,9 @@ impl TensorIr {
         // Shape inference can overflow even when each operand shape is valid.
         element_count(&shape)?;
         let operands = tensor_value_operands(&op);
-        let first = *operands.first().ok_or_else(|| {
-            format!(
-                "{} has no value operand to derive a dtype from",
-                tensor_op_name(&op)
-            )
-        })?;
+        let first = *operands
+            .first()
+            .ok_or_else(|| format!("{} has no value operand to derive a dtype from", op.name()))?;
         let dtype = self.node(first)?.dtype;
         // Bool only allows data movement and select; arithmetic, reductions and math functions need
         // an explicit cast first.
@@ -8167,7 +8165,7 @@ impl TensorIr {
             return Err(format!(
                 "{} is not defined for bool tensors; use logical_and/logical_or/logical_not \
                  (& | ~) or convert explicitly with astype",
-                tensor_op_name(&op)
+                op.name()
             ));
         }
         let mut weak = true;
@@ -8177,7 +8175,7 @@ impl TensorIr {
                 return Err(format!(
                     "{} operands have mismatched dtypes {dtype} and {}; \
                      convert one of them explicitly with astype",
-                    tensor_op_name(&op),
+                    op.name(),
                     node.dtype
                 ));
             }
@@ -12387,7 +12385,7 @@ impl TensorExecutionPlan {
                 .enumerate()
                 .map(|(id, node)| TensorKernelNode {
                     id,
-                    op: tensor_op_name(&node.op).to_string(),
+                    op: node.op.name().to_string(),
                     shape: node.shape.clone(),
                     dtype: node.dtype,
                     layout: if node.shape.is_empty() {
@@ -13278,7 +13276,7 @@ fn cuda_dag_statements(
             {
                 return Err(format!(
                     "CUDA fusion region cannot inline {} node {id}",
-                    tensor_op_name(&node.op)
+                    node.op.name()
                 ));
             }
             cuda_scalar_expression(nodes, id, |child| Ok(reference(child)))?
@@ -13327,7 +13325,7 @@ fn cuda_scalar_expression(
         TensorOp::Cast { input } | TensorOp::StopGradient { input } => child(*input),
         _ => Err(format!(
             "CUDA lowering does not yet support {}",
-            tensor_op_name(&node.op)
+            node.op.name()
         )),
     }
 }
@@ -14028,7 +14026,7 @@ fn infer_tensor_placement(
         } => merge(&[*condition, *on_true, *on_false]),
         TensorOp::Region(_) | TensorOp::Custom { .. } => Err(format!(
             "kernel node {node_id} contains {} regions; placement propagation requires explicit region lowering",
-            tensor_op_name(&node.op)
+            node.op.name()
         )),
         TensorOp::Sqrt { input }
         | TensorOp::SqrtDerivative { input, .. }
@@ -14469,53 +14467,6 @@ fn remap_broadcast_placement(
             mesh_axis,
         },
     })
-}
-
-fn tensor_op_name(op: &TensorOp) -> &'static str {
-    match op {
-        TensorOp::Input { .. } => "input",
-        TensorOp::ScalarConstant { .. } => "constant",
-        TensorOp::Constant { .. } => "tensor_constant",
-        TensorOp::Cast { .. } => "cast",
-        TensorOp::Add { .. } => "add",
-        TensorOp::Sub { .. } => "sub",
-        TensorOp::Div { .. } => "div",
-        TensorOp::Mul { .. } => "mul",
-        TensorOp::Greater { .. } => "greater",
-        TensorOp::Compare { kind, .. } => kind.name(),
-        TensorOp::Where { .. } => "where",
-        TensorOp::Region(region) => region.name(),
-        TensorOp::Sum { .. } => "sum",
-        TensorOp::SumAxis { .. } => "sum_axis",
-        TensorOp::ExtremumAxis { kind, .. } => match kind {
-            TensorExtremum::Max => "max_axis",
-            TensorExtremum::Min => "min_axis",
-        },
-        TensorOp::Matmul { .. } => "matmul",
-        TensorOp::Solve { .. } => "solve",
-        TensorOp::Linalg { kind, .. } => kind.name(),
-        TensorOp::Cholesky { .. } => "cholesky",
-        TensorOp::CholeskyAd { .. } => "cholesky_ad",
-        TensorOp::Triangular { .. } => "triangular",
-        TensorOp::Sqrt { .. } => "sqrt",
-        TensorOp::SqrtDerivative { .. } => "sqrt_derivative",
-        TensorOp::Reshape { .. } => "reshape",
-        TensorOp::Mean { .. } => "mean",
-        TensorOp::MeanAxis { .. } => "mean_axis",
-        TensorOp::Powi { .. } => "powi",
-        TensorOp::BinaryMath { kind, .. } => kind.name(),
-        TensorOp::Transpose { .. } => "transpose",
-        TensorOp::UnaryMath { kind, .. } => kind.name(),
-        TensorOp::StopGradient { .. } => "stop_gradient",
-        TensorOp::CumSum { .. } => "cumsum",
-        TensorOp::Concat { .. } => "concat",
-        TensorOp::Slice { .. } => "slice",
-        TensorOp::PadSlice { .. } => "pad_slice",
-        TensorOp::Gather { .. } => "gather",
-        TensorOp::ScatterAdd { .. } => "scatter_add",
-        TensorOp::Broadcast { .. } => "broadcast",
-        TensorOp::Custom { .. } => "custom",
-    }
 }
 
 fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {

@@ -713,7 +713,7 @@ impl TensorIr {
             }
             _ => Err(BatchingError::Invalid(format!(
                 "{} is not a loop region node",
-                super::tensor_op_name(&node.op)
+                node.op.name()
             ))),
         }
     }
@@ -843,7 +843,7 @@ impl TensorIr {
         else {
             return Err(BatchingError::Invalid(format!(
                 "{} is not a cond region node",
-                super::tensor_op_name(&node.op)
+                node.op.name()
             )));
         };
         let operand = |id: TensorNodeId| -> Result<(TensorNodeId, bool), BatchingError> {

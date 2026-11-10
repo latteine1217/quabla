@@ -1020,7 +1020,7 @@ pub(super) fn validate_cuda_float64_plan(
                         "CUDA cannot run float32 node {node_id} ({}) in a program with float64 \
                          values: a CUDA program computes in one floating dtype, and quabla does \
                          not convert between them; cast the arrays to one dtype with astype",
-                        cuda_op_name(&node.op)
+                        node.op.name()
                     ),
                 ));
             }
@@ -3623,12 +3623,7 @@ fn launch_cuda_node<T: CudaReal>(
             launch.arg(output);
             launch.arg(&count);
         }
-        _ => {
-            return Err(format!(
-                "invalid CUDA device-program op {}",
-                cuda_op_name(op)
-            ))
-        }
+        _ => return Err(format!("invalid CUDA device-program op {}", op.name())),
     }
     // Reductions, tiled matmul, and Cholesky fix their block shape; every other
     // node kernel computes one element per thread.
@@ -3697,7 +3692,7 @@ fn launch_cuda_node<T: CudaReal>(
         _ => None,
     };
     let config = match fixed_block {
-        Some(config) => cuda_fixed_block_launch(kernel, config, cuda_op_name(op))?,
+        Some(config) => cuda_fixed_block_launch(kernel, config, op.name())?,
         None => cuda_elementwise_launch(kernel, launch_count)?,
     };
     // SAFETY: the argument pushes above follow the per-op signatures emitted by
@@ -3713,9 +3708,9 @@ fn launch_cuda_node<T: CudaReal>(
     // by `blockIdx.x` matrices, which stays in bounds because the grid above launches exactly
     // one block per matrix of the batch.
     unsafe {
-        launch.launch(config).map_err(|error| {
-            format!("failed to launch CUDA node {}: {error:?}", cuda_op_name(op))
-        })?;
+        launch
+            .launch(config)
+            .map_err(|error| format!("failed to launch CUDA node {}: {error:?}", op.name()))?;
     }
     Ok(())
 }
@@ -5129,7 +5124,7 @@ fn cuda_fori_body_is_lowerable(loop_plan: &TensorForiExecutionPlan) -> Result<()
             _ => {
                 return Err(format!(
                     "body node {node_id} uses unsupported {} operation",
-                    cuda_op_name(&node.op)
+                    node.op.name()
                 ))
             }
         }
@@ -5261,7 +5256,7 @@ fn cuda_scan_body_is_lowerable(scan_plan: &TensorScanExecutionPlan) -> Result<()
             _ => {
                 return Err(format!(
                     "Scan body node {node_id} uses unsupported {} operation with shape {:?}: {:?}",
-                    cuda_op_name(&node.op), node.shape, node.op
+                    node.op.name(), node.shape, node.op
                 ))
             }
         }
@@ -5430,12 +5425,8 @@ fn cuda_fori_body_expression_inner(
         | TensorOp::Cast { input }
         | TensorOp::StopGradient { input }
         | TensorOp::Custom { value: input, .. } => child(*input),
-        op => cuda_loop_formula(op, child)?.ok_or_else(|| {
-            format!(
-                "CUDA Fori body {} is not elementwise-lowerable",
-                cuda_op_name(op)
-            )
-        }),
+        op => cuda_loop_formula(op, child)?
+            .ok_or_else(|| format!("CUDA Fori body {} is not elementwise-lowerable", op.name())),
     }?;
     Ok(builder.emit(node_id, None, expression))
 }
@@ -5582,12 +5573,8 @@ fn cuda_scan_body_expression_in_half_inner(
             }
             in_half(inputs[half], packed_half)
         }
-        op => cuda_loop_formula(op, child)?.ok_or_else(|| {
-            format!(
-                "CUDA Scan body {} is not elementwise-lowerable",
-                cuda_op_name(op)
-            )
-        }),
+        op => cuda_loop_formula(op, child)?
+            .ok_or_else(|| format!("CUDA Scan body {} is not elementwise-lowerable", op.name())),
     }?;
     Ok(builder.emit(node_id, packed_half, expression))
 }
@@ -5673,7 +5660,7 @@ fn cuda_elementwise_plan_expression_with_index_inner(
         op => cuda_loop_formula(op, child)?.ok_or_else(|| {
             format!(
                 "CUDA Fori VJP body uses unsupported {} operation",
-                cuda_op_name(op)
+                op.name()
             )
         }),
     }?;
@@ -8809,53 +8796,6 @@ fn cuda_scatter_tables(indices: &[usize], extent: usize) -> (Vec<usize>, Vec<usi
     (offsets, sources)
 }
 
-fn cuda_op_name(op: &TensorOp) -> &'static str {
-    match op {
-        TensorOp::Input { .. } => "input",
-        TensorOp::ScalarConstant { .. } => "constant",
-        TensorOp::Constant { .. } => "tensor_constant",
-        TensorOp::Cast { .. } => "cast",
-        TensorOp::Add { .. } => "add",
-        TensorOp::Sub { .. } => "sub",
-        TensorOp::Div { .. } => "div",
-        TensorOp::Mul { .. } => "mul",
-        TensorOp::Greater { .. } => "greater",
-        TensorOp::Compare { kind, .. } => kind.name(),
-        TensorOp::Where { .. } => "where",
-        TensorOp::Region(region) => region.name(),
-        TensorOp::Sum { .. } => "sum",
-        TensorOp::SumAxis { .. } => "sum_axis",
-        TensorOp::ExtremumAxis { kind, .. } => match kind {
-            TensorExtremum::Max => "max_axis",
-            TensorExtremum::Min => "min_axis",
-        },
-        TensorOp::Matmul { .. } => "matmul",
-        TensorOp::Solve { .. } => "solve",
-        TensorOp::Linalg { kind, .. } => kind.name(),
-        TensorOp::Cholesky { .. } => "cholesky",
-        TensorOp::CholeskyAd { .. } => "cholesky_ad",
-        TensorOp::Triangular { .. } => "triangular",
-        TensorOp::Sqrt { .. } => "sqrt",
-        TensorOp::SqrtDerivative { .. } => "sqrt_derivative",
-        TensorOp::Reshape { .. } => "reshape",
-        TensorOp::Mean { .. } => "mean",
-        TensorOp::MeanAxis { .. } => "mean_axis",
-        TensorOp::Powi { .. } => "powi",
-        TensorOp::BinaryMath { kind, .. } => kind.name(),
-        TensorOp::Transpose { .. } => "transpose",
-        TensorOp::UnaryMath { kind, .. } => kind.name(),
-        TensorOp::StopGradient { .. } => "stop_gradient",
-        TensorOp::Custom { .. } => "custom",
-        TensorOp::CumSum { .. } => "cumsum",
-        TensorOp::Concat { .. } => "concat",
-        TensorOp::Slice { .. } => "slice",
-        TensorOp::PadSlice { .. } => "pad_slice",
-        TensorOp::Gather { .. } => "gather",
-        TensorOp::ScatterAdd { .. } => "scatter_add",
-        TensorOp::Broadcast { .. } => "broadcast",
-    }
-}
-
 fn direct_rank_two_matmul_inputs(
     plan: &TensorExecutionPlan,
 ) -> Result<Option<(&str, &str)>, String> {
@@ -10168,7 +10108,7 @@ mod region_batching_tests {
                         .iter()
                         .map(|id| {
                             (
-                                cuda_op_name(&plan.nodes[*id].op),
+                                plan.nodes[*id].op.name(),
                                 host_loop::cuda_loop_fused_error(&plan, *id),
                             )
                         })
