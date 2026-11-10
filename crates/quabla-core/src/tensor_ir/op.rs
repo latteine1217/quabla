@@ -12,7 +12,9 @@
 //!   ([`TensorOp::cse_key`]);
 //! - how its builder rebuilds it on new operands
 //!   (`TensorIr::rebuild_like`, in [`rebuild`]);
-//! - its forward-mode derivative (`TensorIr::push_jvp_pair`, in [`jvp`]).
+//! - its forward-mode derivative (`TensorIr::push_jvp_pair`, in [`jvp`]);
+//! - its reverse-mode derivative (`TensorIr::push_vjp_contributions`, in
+//!   [`vjp`]).
 //!
 //! The program text (`TensorIr::lower_text`) keeps its own exhaustive match,
 //! because its format is public and pinned by golden baselines. Lowering an
@@ -21,6 +23,7 @@
 
 mod jvp;
 mod rebuild;
+mod vjp;
 
 use super::{TensorExtremum, TensorNodeId, TensorOp};
 
