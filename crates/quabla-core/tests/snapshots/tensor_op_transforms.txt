@@ -1,0 +1,731 @@
+=== input+scalar_constant
+--- vmap
+%0 = input[name=x] : tensor<2x2x3xf64>
+%1 = constant[value=0.75] : tensor<f64>
+%2 = mul(%0, %1) : tensor<2x2x3xf64>
+%3 = constant[value=0.75] : tensor<f64>
+%4 = mul(%0, %3) : tensor<2x2x3xf64>
+%5 = add(%2, %4) : tensor<2x2x3xf64>
+results: [(5, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 constant: unplaced
+%2 mul: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%4 sum: mesh[cuda:0]{replicated}
+all-reduce %4 Sum over data
+replica:
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = constant[value=0.75] : tensor<f64>
+%2 = mul(%0, %1) : tensor<2x3xf64>
+%3 = add(%2, %2) : tensor<2x3xf64>
+%4 = sum(%3) : tensor<f64>
+--- sharding axis 1
+%0 input: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%1 constant: unplaced
+%2 mul: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%3 add: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%4 sum: mesh[cuda:0]{replicated}
+all-reduce %4 Sum over data
+replica error: CUDA data-parallel input "x" is sharded on axis 1; only axis-zero batch sharding is supported
+=== constant
+--- vmap
+%0 = input[name=x] : tensor<2x2xf64>
+%1 = constant[dense] : tensor<2xf64>
+%2 = mul(%0, %1) : tensor<2x2xf64>
+%3 = constant[dense] : tensor<2xf64>
+%4 = mul(%0, %3) : tensor<2x2xf64>
+%5 = add(%2, %4) : tensor<2x2xf64>
+results: [(5, true)]
+--- sharding axis 0
+error: kernel node 2 mixes placed input 1 with unplaced non-scalar input; explicit placement is required
+=== cast
+--- vmap
+%0 = input[name=x] : tensor<2x2x2xf64>
+%1 = cast(%0) : tensor<2x2x2xf32>
+%2 = cast(%0) : tensor<2x2x2xf32>
+%3 = add(%1, %2) : tensor<2x2x2xf32>
+results: [(3, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 cast: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica:
+%0 = input[name=x] : tensor<2x2xf64>
+%1 = cast(%0) : tensor<2x2xf32>
+%2 = add(%1, %1) : tensor<2x2xf32>
+%3 = sum(%2) : tensor<f32>
+--- sharding axis 1
+%0 input: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%1 cast: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica error: CUDA data-parallel input "x" is sharded on axis 1; only axis-zero batch sharding is supported
+=== add
+--- vmap
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = add(%0, %1) : tensor<2x3xf64>
+%3 = add(%0, %1) : tensor<2x3xf64>
+%4 = add(%2, %3) : tensor<2x3xf64>
+results: [(4, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%4 sum: mesh[cuda:0]{replicated}
+all-reduce %4 Sum over data
+replica:
+%0 = input[name=x] : tensor<3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = add(%0, %1) : tensor<3xf64>
+%3 = add(%2, %2) : tensor<3xf64>
+%4 = sum(%3) : tensor<f64>
+=== sub
+--- vmap
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = sub(%0, %1) : tensor<2x3xf64>
+%3 = sub(%0, %1) : tensor<2x3xf64>
+%4 = add(%2, %3) : tensor<2x3xf64>
+results: [(4, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 sub: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%4 sum: mesh[cuda:0]{replicated}
+all-reduce %4 Sum over data
+replica:
+%0 = input[name=x] : tensor<3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = sub(%0, %1) : tensor<3xf64>
+%3 = add(%2, %2) : tensor<3xf64>
+%4 = sum(%3) : tensor<f64>
+=== mul
+--- vmap
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = mul(%0, %1) : tensor<2x3xf64>
+%3 = mul(%0, %1) : tensor<2x3xf64>
+%4 = add(%2, %3) : tensor<2x3xf64>
+results: [(4, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 mul: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%4 sum: mesh[cuda:0]{replicated}
+all-reduce %4 Sum over data
+replica:
+%0 = input[name=x] : tensor<3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = mul(%0, %1) : tensor<3xf64>
+%3 = add(%2, %2) : tensor<3xf64>
+%4 = sum(%3) : tensor<f64>
+=== div
+--- vmap
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = div(%0, %1) : tensor<2x3xf64>
+%3 = div(%0, %1) : tensor<2x3xf64>
+%4 = add(%2, %3) : tensor<2x3xf64>
+results: [(4, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 div: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%4 sum: mesh[cuda:0]{replicated}
+all-reduce %4 Sum over data
+replica:
+%0 = input[name=x] : tensor<3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = div(%0, %1) : tensor<3xf64>
+%3 = add(%2, %2) : tensor<3xf64>
+%4 = sum(%3) : tensor<f64>
+=== greater
+--- vmap
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = greater(%0, %1) : tensor<2x3xf64>
+%3 = mul(%2, %0) : tensor<2x3xf64>
+%4 = greater(%0, %1) : tensor<2x3xf64>
+%5 = mul(%4, %0) : tensor<2x3xf64>
+%6 = add(%3, %5) : tensor<2x3xf64>
+results: [(6, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 greater: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 mul: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%4 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%5 sum: mesh[cuda:0]{replicated}
+all-reduce %5 Sum over data
+replica:
+%0 = input[name=x] : tensor<3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = greater(%0, %1) : tensor<3xf64>
+%3 = mul(%2, %0) : tensor<3xf64>
+%4 = add(%3, %3) : tensor<3xf64>
+%5 = sum(%4) : tensor<f64>
+=== compare+where
+--- vmap
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = compare(%0, %1, kind=less_equal) : tensor<2x3xi1>
+%3 = where(%2, %0, %1) : tensor<2x3xf64>
+%4 = compare(%0, %1, kind=less_equal) : tensor<2x3xi1>
+%5 = where(%4, %0, %1) : tensor<2x3xf64>
+%6 = add(%3, %5) : tensor<2x3xf64>
+results: [(6, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 less_equal: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 where: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%4 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%5 sum: mesh[cuda:0]{replicated}
+all-reduce %5 Sum over data
+replica:
+%0 = input[name=x] : tensor<3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = compare(%0, %1, kind=less_equal) : tensor<3xi1>
+%3 = where(%2, %0, %1) : tensor<3xf64>
+%4 = add(%3, %3) : tensor<3xf64>
+%5 = sum(%4) : tensor<f64>
+=== sum
+--- vmap
+%0 = input[name=x] : tensor<2x2x3xf64>
+%1 = reshape(%0) : tensor<2x6xf64>
+%2 = sum(%1, axis=1) : tensor<2xf64>
+%3 = reshape(%0) : tensor<2x6xf64>
+%4 = sum(%3, axis=1) : tensor<2xf64>
+%5 = add(%2, %4) : tensor<2xf64>
+results: [(5, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 sum: mesh[cuda:0]{replicated}
+%2 add: mesh[cuda:0]{replicated}
+all-reduce %1 Sum over data
+replica error: sharding plan all-reduces node 1 before a consumer; CUDA data-parallel execution only all-reduces unconsumed retained outputs, so this mid-graph collective is unsupported
+--- sharding axis 1
+%0 input: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%1 sum: mesh[cuda:0]{replicated}
+%2 add: mesh[cuda:0]{replicated}
+all-reduce %1 Sum over data
+replica error: CUDA data-parallel input "x" is sharded on axis 1; only axis-zero batch sharding is supported
+=== sum_axis
+--- vmap
+%0 = input[name=x] : tensor<2x2x3xf64>
+%1 = sum(%0, axis=2) : tensor<2x2xf64>
+%2 = sum(%0, axis=2) : tensor<2x2xf64>
+%3 = add(%1, %2) : tensor<2x2xf64>
+results: [(3, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 sum_axis: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica:
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = sum(%0, axis=1) : tensor<2xf64>
+%2 = add(%1, %1) : tensor<2xf64>
+%3 = sum(%2) : tensor<f64>
+--- sharding axis 1
+%0 input: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%1 sum_axis: mesh[cuda:0]{replicated}
+%2 add: mesh[cuda:0]{replicated}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %1 Sum over data
+replica error: CUDA data-parallel input "x" is sharded on axis 1; only axis-zero batch sharding is supported
+=== mean
+--- vmap
+%0 = input[name=x] : tensor<2x2x3xf64>
+%1 = reshape(%0) : tensor<2x6xf64>
+%2 = mean(%1, axis=1) : tensor<2xf64>
+%3 = reshape(%0) : tensor<2x6xf64>
+%4 = mean(%3, axis=1) : tensor<2xf64>
+%5 = add(%2, %4) : tensor<2xf64>
+results: [(5, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 mean: mesh[cuda:0]{replicated}
+%2 add: mesh[cuda:0]{replicated}
+all-reduce %1 Mean over data
+replica error: sharding plan all-reduces node 1 before a consumer; CUDA data-parallel execution only all-reduces unconsumed retained outputs, so this mid-graph collective is unsupported
+--- sharding axis 1
+%0 input: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%1 mean: mesh[cuda:0]{replicated}
+%2 add: mesh[cuda:0]{replicated}
+all-reduce %1 Mean over data
+replica error: CUDA data-parallel input "x" is sharded on axis 1; only axis-zero batch sharding is supported
+=== mean_axis
+--- vmap
+%0 = input[name=x] : tensor<2x2x3xf64>
+%1 = mean(%0, axis=1) : tensor<2x3xf64>
+%2 = mean(%0, axis=1) : tensor<2x3xf64>
+%3 = add(%1, %2) : tensor<2x3xf64>
+results: [(3, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 mean_axis: mesh[cuda:0]{replicated}
+%2 add: mesh[cuda:0]{replicated}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %1 Mean over data
+replica error: sharding plan all-reduces node 1 before a consumer; CUDA data-parallel execution only all-reduces unconsumed retained outputs, so this mid-graph collective is unsupported
+--- sharding axis 1
+%0 input: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%1 mean_axis: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica error: CUDA data-parallel input "x" is sharded on axis 1; only axis-zero batch sharding is supported
+=== extremum_axis
+--- vmap
+%0 = input[name=x] : tensor<2x2x3xf64>
+%1 = max(%0, axis=2) : tensor<2x2xf64>
+%2 = max(%0, axis=2) : tensor<2x2xf64>
+%3 = add(%1, %2) : tensor<2x2xf64>
+results: [(3, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 max_axis: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica:
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = max(%0, axis=1) : tensor<2xf64>
+%2 = add(%1, %1) : tensor<2xf64>
+%3 = sum(%2) : tensor<f64>
+--- sharding axis 1
+error: kernel node 1 reduces a max/min along a sharded axis; explicit redistribution is required
+=== matmul
+--- vmap
+%0 = input[name=x] : tensor<2x2x3xf64>
+%1 = input[name=y] : tensor<3x2xf64>
+%2 = matmul(%0, %1) : tensor<2x2x2xf64>
+%3 = matmul(%0, %1) : tensor<2x2x2xf64>
+%4 = add(%2, %3) : tensor<2x2x2xf64>
+results: [(4, true)]
+--- sharding axis 0
+error: kernel node 2 requires a collective or redistribution for matmul/solve lowering
+--- sharding axis 1
+error: kernel node 2 requires a collective or redistribution for matmul/solve lowering
+=== solve
+--- vmap
+%0 = input[name=x] : tensor<2x3x3xf64>
+%1 = input[name=y] : tensor<3x2xf64>
+%2 = broadcast(%1) : tensor<2x3x2xf64>
+%3 = solve(%0, %2) : tensor<2x3x2xf64>
+%4 = broadcast(%1) : tensor<2x3x2xf64>
+%5 = solve(%0, %4) : tensor<2x3x2xf64>
+%6 = add(%3, %5) : tensor<2x3x2xf64>
+results: [(6, true)]
+--- sharding axis 0
+error: kernel node 2 requires a collective or redistribution for matmul/solve lowering
+--- sharding axis 1
+error: kernel node 2 requires a collective or redistribution for matmul/solve lowering
+=== cholesky
+--- vmap
+%0 = input[name=x] : tensor<2x3x3xf64>
+%1 = cholesky(%0) : tensor<2x3x3xf64>
+%2 = cholesky(%0) : tensor<2x3x3xf64>
+%3 = add(%1, %2) : tensor<2x3x3xf64>
+results: [(3, true)]
+--- sharding axis 0
+error: kernel node 1 requires a collective or redistribution for triangular lowering
+--- sharding axis 1
+error: kernel node 1 requires a collective or redistribution for triangular lowering
+=== triangular
+--- vmap
+%0 = input[name=x] : tensor<2x3x3xf64>
+%1 = tril(%0) : tensor<2x3x3xf64>
+%2 = tril(%0) : tensor<2x3x3xf64>
+%3 = add(%1, %2) : tensor<2x3x3xf64>
+results: [(3, true)]
+--- sharding axis 0
+error: kernel node 1 requires a collective or redistribution for triangular lowering
+--- sharding axis 1
+error: kernel node 1 requires a collective or redistribution for triangular lowering
+=== linalg:eigh_values
+--- vmap
+%0 = input[name=x] : tensor<2x3x3xf64>
+%1 = eigh_values(%0) : tensor<2x3xf64>
+%2 = eigh_values(%0) : tensor<2x3xf64>
+%3 = add(%1, %2) : tensor<2x3xf64>
+results: [(3, true)]
+--- sharding axis 0
+error: kernel node 1 requires a collective or redistribution for linalg lowering
+--- sharding axis 1
+error: kernel node 1 requires a collective or redistribution for linalg lowering
+=== linalg:svd_s
+--- vmap
+%0 = input[name=x] : tensor<2x3x2xf64>
+%1 = svd_s(%0) : tensor<2x2xf64>
+%2 = svd_s(%0) : tensor<2x2xf64>
+%3 = add(%1, %2) : tensor<2x2xf64>
+results: [(3, true)]
+--- sharding axis 0
+error: kernel node 1 requires a collective or redistribution for linalg lowering
+--- sharding axis 1
+error: kernel node 1 requires a collective or redistribution for linalg lowering
+=== sqrt
+--- vmap
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = sqrt(%0) : tensor<2x3xf64>
+%2 = sqrt(%0) : tensor<2x3xf64>
+%3 = add(%1, %2) : tensor<2x3xf64>
+results: [(3, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 sqrt: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica:
+%0 = input[name=x] : tensor<3xf64>
+%1 = sqrt(%0) : tensor<3xf64>
+%2 = add(%1, %1) : tensor<3xf64>
+%3 = sum(%2) : tensor<f64>
+=== reshape
+--- vmap
+%0 = input[name=x] : tensor<2x2x3xf64>
+%1 = reshape(%0) : tensor<2x3x2xf64>
+%2 = reshape(%0) : tensor<2x3x2xf64>
+%3 = add(%1, %2) : tensor<2x3x2xf64>
+results: [(3, true)]
+--- sharding axis 0
+error: kernel node 1 reshape changes a sharded tensor shape; explicit redistribution is required
+--- sharding axis 1
+error: kernel node 1 reshape changes a sharded tensor shape; explicit redistribution is required
+=== powi
+--- vmap
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = powi(%0, 3) : tensor<2x3xf64>
+%2 = powi(%0, 3) : tensor<2x3xf64>
+%3 = add(%1, %2) : tensor<2x3xf64>
+results: [(3, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 powi: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica:
+%0 = input[name=x] : tensor<3xf64>
+%1 = powi(%0, 3) : tensor<3xf64>
+%2 = add(%1, %1) : tensor<3xf64>
+%3 = sum(%2) : tensor<f64>
+=== transpose
+--- vmap
+%0 = input[name=x] : tensor<2x2x3xf64>
+%1 = transpose(%0, axes=[0, 2, 1]) : tensor<2x3x2xf64>
+%2 = transpose(%0, axes=[0, 2, 1]) : tensor<2x3x2xf64>
+%3 = add(%1, %2) : tensor<2x3x2xf64>
+results: [(3, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 transpose: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica:
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = transpose(%0, axes=[1, 0]) : tensor<3x2xf64>
+%2 = add(%1, %1) : tensor<3x2xf64>
+%3 = sum(%2) : tensor<f64>
+--- sharding axis 1
+%0 input: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%1 transpose: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica error: CUDA data-parallel input "x" is sharded on axis 1; only axis-zero batch sharding is supported
+=== unary_math:tanh
+--- vmap
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = tanh(%0) : tensor<2x3xf64>
+%2 = tanh(%0) : tensor<2x3xf64>
+%3 = add(%1, %2) : tensor<2x3xf64>
+results: [(3, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 tanh: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica:
+%0 = input[name=x] : tensor<3xf64>
+%1 = tanh(%0) : tensor<3xf64>
+%2 = add(%1, %1) : tensor<3xf64>
+%3 = sum(%2) : tensor<f64>
+=== unary_math:erf
+--- vmap
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = erf(%0) : tensor<2x3xf64>
+%2 = erf(%0) : tensor<2x3xf64>
+%3 = add(%1, %2) : tensor<2x3xf64>
+results: [(3, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 erf: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica:
+%0 = input[name=x] : tensor<3xf64>
+%1 = erf(%0) : tensor<3xf64>
+%2 = add(%1, %1) : tensor<3xf64>
+%3 = sum(%2) : tensor<f64>
+=== binary_math:pow
+--- vmap
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = pow(%0, %1) : tensor<2x3xf64>
+%3 = pow(%0, %1) : tensor<2x3xf64>
+%4 = add(%2, %3) : tensor<2x3xf64>
+results: [(4, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 pow: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%4 sum: mesh[cuda:0]{replicated}
+all-reduce %4 Sum over data
+replica:
+%0 = input[name=x] : tensor<3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = pow(%0, %1) : tensor<3xf64>
+%3 = add(%2, %2) : tensor<3xf64>
+%4 = sum(%3) : tensor<f64>
+=== binary_math:atan2
+--- vmap
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = atan2(%0, %1) : tensor<2x3xf64>
+%3 = atan2(%0, %1) : tensor<2x3xf64>
+%4 = add(%2, %3) : tensor<2x3xf64>
+results: [(4, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 atan2: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%4 sum: mesh[cuda:0]{replicated}
+all-reduce %4 Sum over data
+replica:
+%0 = input[name=x] : tensor<3xf64>
+%1 = input[name=y] : tensor<3xf64>
+%2 = atan2(%0, %1) : tensor<3xf64>
+%3 = add(%2, %2) : tensor<3xf64>
+%4 = sum(%3) : tensor<f64>
+=== stop_gradient
+--- vmap
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = stop_gradient(%0) : tensor<2x3xf64>
+%2 = mul(%1, %0) : tensor<2x3xf64>
+%3 = stop_gradient(%0) : tensor<2x3xf64>
+%4 = mul(%3, %0) : tensor<2x3xf64>
+%5 = add(%2, %4) : tensor<2x3xf64>
+results: [(5, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 stop_gradient: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 mul: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%4 sum: mesh[cuda:0]{replicated}
+all-reduce %4 Sum over data
+replica:
+%0 = input[name=x] : tensor<3xf64>
+%1 = stop_gradient(%0) : tensor<3xf64>
+%2 = mul(%1, %0) : tensor<3xf64>
+%3 = add(%2, %2) : tensor<3xf64>
+%4 = sum(%3) : tensor<f64>
+=== cumsum
+--- vmap
+%0 = input[name=x] : tensor<2x2x3xf64>
+%1 = cumsum(%0, axis=2, reverse=false) : tensor<2x2x3xf64>
+%2 = cumsum(%0, axis=2, reverse=false) : tensor<2x2x3xf64>
+%3 = add(%1, %2) : tensor<2x2x3xf64>
+results: [(3, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 cumsum: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica:
+%0 = input[name=x] : tensor<2x3xf64>
+%1 = cumsum(%0, axis=1, reverse=false) : tensor<2x3xf64>
+%2 = add(%1, %1) : tensor<2x3xf64>
+%3 = sum(%2) : tensor<f64>
+--- sharding axis 1
+error: kernel node 1 scans along a sharded axis; explicit redistribution is required
+=== concat
+--- vmap
+%0 = input[name=x] : tensor<2x2xf64>
+%1 = input[name=y] : tensor<2xf64>
+%2 = broadcast(%1) : tensor<2x2xf64>
+%3 = concat(%0, %2, %0) axis=1 : tensor<2x6xf64>
+%4 = broadcast(%1) : tensor<2x2xf64>
+%5 = concat(%0, %4, %0) axis=1 : tensor<2x6xf64>
+%6 = add(%3, %5) : tensor<2x6xf64>
+results: [(6, true)]
+--- sharding axis 0
+error: kernel node 2 concatenates along a sharded axis; explicit redistribution is required
+=== slice_axis
+--- vmap
+%0 = input[name=x] : tensor<2x2x4xf64>
+%1 = slice(%0, axis=2, start=1, length=2) : tensor<2x2x2xf64>
+%2 = slice(%0, axis=2, start=1, length=2) : tensor<2x2x2xf64>
+%3 = add(%1, %2) : tensor<2x2x2xf64>
+results: [(3, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 slice: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica:
+%0 = input[name=x] : tensor<2x4xf64>
+%1 = slice(%0, axis=1, start=1, length=2) : tensor<2x2xf64>
+%2 = add(%1, %1) : tensor<2x2xf64>
+%3 = sum(%2) : tensor<f64>
+--- sharding axis 1
+error: kernel node 1 slices along a sharded axis; explicit redistribution is required
+=== gather
+--- vmap
+%0 = input[name=x] : tensor<2x4x2xf64>
+%1 = gather(%0, axis=1, indices=[2, 0, 2]) : tensor<2x3x2xf64>
+%2 = gather(%0, axis=1, indices=[2, 0, 2]) : tensor<2x3x2xf64>
+%3 = add(%1, %2) : tensor<2x3x2xf64>
+results: [(3, true)]
+--- sharding axis 0
+error: kernel node 1 slices along a sharded axis; explicit redistribution is required
+--- sharding axis 1
+%0 input: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%1 gather: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica error: CUDA data-parallel input "x" is sharded on axis 1; only axis-zero batch sharding is supported
+=== scatter_add
+--- vmap
+%0 = input[name=x] : tensor<2x4x2xf64>
+%1 = input[name=y] : tensor<3x2xf64>
+%2 = broadcast(%1) : tensor<2x3x2xf64>
+%3 = scatter_add(%0, %2, axis=1, indices=[1, 3, 1]) : tensor<2x4x2xf64>
+%4 = broadcast(%1) : tensor<2x3x2xf64>
+%5 = scatter_add(%0, %4, axis=1, indices=[1, 3, 1]) : tensor<2x4x2xf64>
+%6 = add(%3, %5) : tensor<2x4x2xf64>
+results: [(6, true)]
+--- sharding axis 0
+error: kernel node 2 scatters along a sharded axis; explicit redistribution is required
+--- sharding axis 1
+%0 input: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%1 input: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%2 scatter_add: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%3 add: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%4 sum: mesh[cuda:0]{replicated}
+all-reduce %4 Sum over data
+replica error: CUDA data-parallel input "x" is sharded on axis 1; only axis-zero batch sharding is supported
+=== broadcast
+--- vmap
+%0 = input[name=x] : tensor<2x1x3xf64>
+%1 = broadcast(%0) : tensor<2x2x3xf64>
+%2 = broadcast(%0) : tensor<2x2x3xf64>
+%3 = add(%1, %2) : tensor<2x2x3xf64>
+results: [(3, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 broadcast: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica:
+%0 = input[name=x] : tensor<1x3xf64>
+%1 = broadcast(%0) : tensor<2x3xf64>
+%2 = add(%1, %1) : tensor<2x3xf64>
+%3 = sum(%2) : tensor<f64>
+--- sharding axis 1
+%0 input: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%1 broadcast: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=1,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica error: CUDA data-parallel input "x" is sharded on axis 1; only axis-zero batch sharding is supported
+=== region:fori
+--- vmap
+%0 = input[name=s] : tensor<2xf64>
+%1 = input[name=x] : tensor<2x2xf64>
+%2 = fori(carry=%1, lower=0, upper=3, captures=[("scale", 0)], body_nodes=5) : tensor<2x2xf64>
+%3 = fori(carry=%1, lower=0, upper=3, captures=[("scale", 0)], body_nodes=5) : tensor<2x2xf64>
+%4 = add(%2, %3) : tensor<2x2xf64>
+results: [(4, true)]
+--- sharding axis 0
+error: kernel node 2 contains fori regions; placement propagation requires explicit region lowering
+=== region:scan
+--- vmap
+%0 = input[name=s] : tensor<2xf64>
+%1 = input[name=x] : tensor<2x2xf64>
+%2 = scan(group=2, target=Carry, lower=0, upper=3, captures=[("scale", 0)], body_nodes=5) : tensor<2x2xf64>
+%3 = scan(group=2, target=Outputs, lower=0, upper=3, captures=[("scale", 0)], body_nodes=5) : tensor<3x2x2xf64>
+%4 = transpose(%3, axes=[1, 0, 2]) : tensor<2x3x2xf64>
+%5 = reshape(%4) : tensor<2x6xf64>
+%6 = sum(%5, axis=1) : tensor<2xf64>
+%7 = scan(group=7, target=Carry, lower=0, upper=3, captures=[("scale", 0)], body_nodes=5) : tensor<2x2xf64>
+%8 = scan(group=7, target=Outputs, lower=0, upper=3, captures=[("scale", 0)], body_nodes=5) : tensor<3x2x2xf64>
+%9 = transpose(%8, axes=[1, 0, 2]) : tensor<2x3x2xf64>
+%10 = reshape(%9) : tensor<2x6xf64>
+%11 = sum(%10, axis=1) : tensor<2xf64>
+%12 = add(%6, %11) : tensor<2xf64>
+results: [(12, true)]
+--- sharding axis 0
+error: kernel node 2 contains scan regions; placement propagation requires explicit region lowering
+=== region:cond
+--- vmap
+%0 = input[name=x] : tensor<2x2xf64>
+%1 = input[name=y] : tensor<2xf64>
+%2 = constant[value=1] : tensor<f64>
+%3 = cond(%2, captures=[("a", 0), ("b", 1)], true_nodes=3, false_nodes=3) : tensor<2x2xf64>
+%4 = cond(%2, captures=[("a", 0), ("b", 1)], true_nodes=3, false_nodes=3) : tensor<2x2xf64>
+%5 = add(%3, %4) : tensor<2x2xf64>
+results: [(5, true)]
+--- sharding axis 0
+error: kernel node 3 contains cond regions; placement propagation requires explicit region lowering
+=== region:while
+--- vmap
+%0 = input[name=x] : tensor<2x2xf64>
+%1 = while(carry=%0, captures=[], predicate_nodes=9, body_nodes=9) : tensor<2x2xf64>
+%2 = while(carry=%0, captures=[], predicate_nodes=9, body_nodes=9) : tensor<2x2xf64>
+%3 = add(%1, %2) : tensor<2x2xf64>
+results: [(3, true)]
+--- sharding axis 0
+error: kernel node 1 contains while regions; placement propagation requires explicit region lowering
+=== custom
+--- vmap
+%0 = input[name=x] : tensor<2x2xf64>
+%1 = mul(%0, %0) : tensor<2x2xf64>
+%2 = custom(%1) {rule = "custom_square", output = 0, group = 2, operands = [%0]} : tensor<2x2xf64>
+%3 = mul(%0, %0) : tensor<2x2xf64>
+%4 = custom(%3) {rule = "custom_square", output = 0, group = 4, operands = [%0]} : tensor<2x2xf64>
+%5 = add(%2, %4) : tensor<2x2xf64>
+results: [(5, true)]
+--- sharding axis 0
+%0 input: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%1 mul: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%2 add: mesh[cuda:0]{sharded:tensor_axis=0,mesh_axis=data}
+%3 sum: mesh[cuda:0]{replicated}
+all-reduce %3 Sum over data
+replica:
+%0 = input[name=x] : tensor<2xf64>
+%1 = mul(%0, %0) : tensor<2xf64>
+%2 = add(%1, %1) : tensor<2xf64>
+%3 = sum(%2) : tensor<f64>

@@ -9,7 +9,12 @@
 //! Every row builds its op twice and adds the copies, so common-subexpression
 //! elimination has a duplicate to merge.
 //!
-//! Regenerate the snapshot after an intended change with
+//! A second snapshot records the same rows under the other program
+//! transforms: the `vmap` program of each row, and the sharding placement of
+//! its compiled plan with the CUDA data-parallel replica that specialization
+//! derives from it.
+//!
+//! Regenerate the snapshots after an intended change with
 //! `QUABLA_BLESS=1 cargo test -p quabla-core --test tensor_op_table` and
 //! review the diff.
 
@@ -19,13 +24,19 @@ use std::sync::Arc;
 
 use quabla_core::tensor_ir::{
     BinaryMathKind, DynamicTensor, LinalgKind, TensorComparison, TensorCondExecutionPlan,
-    TensorCustomRule, TensorDType, TensorExtremum, TensorForiExecutionPlan, TensorIr, TensorNodeId,
-    TensorScanExecutionPlan, TensorWhileExecutionPlan, UnaryMathKind,
+    TensorCustomRule, TensorDType, TensorDeviceBackend, TensorDeviceId, TensorDeviceMesh,
+    TensorExtremum, TensorForiExecutionPlan, TensorIr, TensorNodeId, TensorPartitionSpec,
+    TensorPlacement, TensorScanExecutionPlan, TensorWhileExecutionPlan, UnaryMathKind,
 };
 
 const SNAPSHOT_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/snapshots/tensor_op_table.txt"
+);
+
+const TRANSFORMS_SNAPSHOT_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/snapshots/tensor_op_transforms.txt"
 );
 
 /// A program under construction together with the values of its inputs.
@@ -516,19 +527,154 @@ fn render_row(out: &mut String, name: &str, built: Built) {
     }
 }
 
-#[test]
-fn every_op_matches_the_recorded_snapshot() {
-    let mut actual = String::new();
-    for (name, built) in rows() {
-        render_row(&mut actual, name, built);
+/// The node id of input `name` in a compiled plan, read from its program text.
+fn plan_input(plan_text: &str, name: &str) -> Option<TensorNodeId> {
+    let marker = format!(" = input[name={name}]");
+    plan_text.lines().find_map(|line| {
+        let (id, _) = line.split_once(&marker)?;
+        id.strip_prefix('%')?.parse().ok()
+    })
+}
+
+/// A placement sharded along `tensor_axis` over a one-device CUDA mesh,
+/// which divides every extent, so each op's placement rule runs on every row.
+fn sharded(tensor_axis: usize) -> TensorPlacement {
+    TensorPlacement::Mesh {
+        mesh: TensorDeviceMesh {
+            devices: vec![TensorDeviceId {
+                backend: TensorDeviceBackend::Cuda,
+                ordinal: 0,
+            }],
+            axis_names: vec!["data".to_string()],
+            shape: vec![1],
+        },
+        partition: TensorPartitionSpec::Sharded {
+            tensor_axis,
+            mesh_axis: "data".to_string(),
+        },
     }
+}
+
+/// The sharding schedule of the compiled `graph` with every input of rank
+/// above `tensor_axis` sharded along it, and its CUDA data-parallel replica
+/// when one exists.
+fn sharding_section(
+    out: &mut String,
+    graph: &TensorIr,
+    output: TensorNodeId,
+    inputs: &BTreeMap<String, DynamicTensor>,
+    tensor_axis: usize,
+) {
+    let plan = match graph.compile_cpu(output) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let _ = writeln!(out, "error: {error}");
+            return;
+        }
+    };
+    let text = plan.lower_text();
+    let placements = inputs
+        .iter()
+        .filter(|(_, value)| value.shape().len() > tensor_axis)
+        .filter_map(|(name, _)| plan_input(&text, name))
+        .map(|id| (id, sharded(tensor_axis)))
+        .collect();
+    let sharding = match plan.sharding_plan(&placements) {
+        Ok(sharding) => sharding,
+        Err(error) => {
+            let _ = writeln!(out, "error: {error}");
+            return;
+        }
+    };
+    for node in &sharding.program.nodes {
+        let _ = writeln!(out, "%{} {}: {}", node.id, node.op, node.placement);
+    }
+    for all_reduce in &sharding.all_reduces {
+        let _ = writeln!(
+            out,
+            "all-reduce %{} {:?} over {}",
+            all_reduce.node_id, all_reduce.reduction, all_reduce.mesh_axis
+        );
+    }
+    match plan.cuda_data_parallel_program(&sharding, &[0]) {
+        Ok(program) => {
+            let _ = writeln!(out, "replica:\n{}", program.replica_plan.lower_text());
+        }
+        Err(error) => {
+            let _ = writeln!(out, "replica error: {error}");
+        }
+    }
+}
+
+/// The batching and sharding transforms of one row: `vmap` with `x` mapped
+/// (and every other input unmapped) over a batch of two, and the placement
+/// of the row's scalar sum with its inputs sharded along each of the first
+/// two axes of `x`.
+fn render_transforms(out: &mut String, name: &str, built: Built) {
+    let _ = writeln!(out, "=== {name}");
+    let (row, output) = match built {
+        Ok(built) => built,
+        Err(error) => {
+            let _ = writeln!(out, "build error: {error}");
+            return;
+        }
+    };
+    let Row { mut graph, inputs } = row;
+
+    out.push_str("--- vmap\n");
+    let mut outer = TensorIr::new();
+    let bindings = inputs
+        .iter()
+        .map(|(input, value)| {
+            let mapped = input == "x";
+            let mut shape = value.shape().to_vec();
+            if mapped {
+                shape.insert(0, 2);
+            }
+            Ok((input.clone(), (outer.input(input.clone(), shape)?, mapped)))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>();
+    match bindings.map(|bindings| outer.inline_batched(&graph, &bindings, 2, &[output])) {
+        Ok(Ok(results)) => {
+            let _ = writeln!(out, "{}\nresults: {results:?}", outer.lower_text());
+        }
+        Ok(Err(error)) => {
+            let _ = writeln!(out, "error: {error}");
+        }
+        Err(error) => {
+            let _ = writeln!(out, "error: {error}");
+        }
+    }
+
+    let rank = inputs.get("x").map_or(0, |value| value.shape().len());
+    let loss = match graph.node_shape(output) {
+        Ok(shape) if shape.is_empty() => Ok(output),
+        Ok(_) => graph.sum(output),
+        Err(error) => Err(error),
+    };
+    let loss = match loss {
+        Ok(loss) => loss,
+        Err(error) => {
+            let _ = writeln!(out, "--- sharding\nerror: {error}");
+            return;
+        }
+    };
+    for tensor_axis in 0..rank.min(2) {
+        let _ = writeln!(out, "--- sharding axis {tensor_axis}");
+        sharding_section(out, &graph, loss, &inputs, tensor_axis);
+    }
+}
+
+/// Compares `actual` with the snapshot at `path`, or records it when
+/// `QUABLA_BLESS=1`.
+fn check_snapshot(path: &str, actual: &str) {
     if std::env::var("QUABLA_BLESS").as_deref() == Ok("1") {
         std::fs::create_dir_all(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/snapshots"))
             .expect("create the snapshot directory");
-        std::fs::write(SNAPSHOT_PATH, &actual).expect("write the snapshot");
+        std::fs::write(path, actual).expect("write the snapshot");
         return;
     }
-    let expected = std::fs::read_to_string(SNAPSHOT_PATH).unwrap_or_default();
+    let expected = std::fs::read_to_string(path).unwrap_or_default();
     if actual != expected {
         let first = actual
             .lines()
@@ -543,11 +689,29 @@ fn every_op_matches_the_recorded_snapshot() {
                 .join("\n")
         };
         panic!(
-            "the op table differs from {SNAPSHOT_PATH} at line {}; rerun with QUABLA_BLESS=1 \
+            "the op table differs from {path} at line {}; rerun with QUABLA_BLESS=1 \
              only if the change is intended\n--- expected\n{}\n--- actual\n{}",
             first + 1,
             context(&expected),
-            context(&actual)
+            context(actual)
         );
     }
+}
+
+#[test]
+fn every_op_matches_the_recorded_snapshot() {
+    let mut actual = String::new();
+    for (name, built) in rows() {
+        render_row(&mut actual, name, built);
+    }
+    check_snapshot(SNAPSHOT_PATH, &actual);
+}
+
+#[test]
+fn every_op_batches_and_shards_as_recorded() {
+    let mut actual = String::new();
+    for (name, built) in rows() {
+        render_transforms(&mut actual, name, built);
+    }
+    check_snapshot(TRANSFORMS_SNAPSHOT_PATH, &actual);
 }
