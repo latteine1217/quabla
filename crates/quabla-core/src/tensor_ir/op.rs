@@ -9,12 +9,16 @@
 //!   rewriting them ([`TensorOp::remap`]) and the dtype operands
 //!   ([`TensorOp::value_operands`]) follow;
 //! - its identity for common-subexpression elimination
-//!   ([`TensorOp::cse_key`]).
+//!   ([`TensorOp::cse_key`]);
+//! - how its builder rebuilds it on new operands
+//!   (`TensorIr::rebuild_like`, in [`rebuild`]).
 //!
 //! The program text (`TensorIr::lower_text`) keeps its own exhaustive match,
 //! because its format is public and pinned by golden baselines. Lowering an
 //! op stays in each backend, whose exhaustive matches keep the bit-for-bit
 //! concerns of that backend in one place.
+
+mod rebuild;
 
 use super::{TensorExtremum, TensorNodeId, TensorOp};
 

@@ -3951,37 +3951,6 @@ impl TensorIr {
                 TensorOp::Input { name } => {
                     transformed.input_typed(name.clone(), node.shape.clone(), node.dtype)?
                 }
-                TensorOp::ScalarConstant { value } => {
-                    transformed.constant_like(*value, node.dtype, node.weak)
-                }
-                TensorOp::Constant { .. } => transformed.push_node(
-                    node.op.clone(),
-                    node.shape.clone(),
-                    node.dtype,
-                    node.weak,
-                ),
-                TensorOp::Cast { input } => {
-                    transformed.rebuild_cast(values[*input], node.dtype, node.weak)?
-                }
-                TensorOp::Add { lhs, rhs } => transformed.add(values[*lhs], values[*rhs])?,
-                TensorOp::Sub { lhs, rhs } => transformed.sub(values[*lhs], values[*rhs])?,
-                TensorOp::Div { lhs, rhs } => transformed.div(values[*lhs], values[*rhs])?,
-                TensorOp::Mul { lhs, rhs } => transformed.mul(values[*lhs], values[*rhs])?,
-                TensorOp::Greater { lhs, rhs } => {
-                    transformed.greater(values[*lhs], values[*rhs])?
-                }
-                TensorOp::Compare { lhs, rhs, kind } => {
-                    transformed.compare(values[*lhs], values[*rhs], *kind)?
-                }
-                TensorOp::Where {
-                    condition,
-                    on_true,
-                    on_false,
-                } => transformed.where_select(
-                    values[*condition],
-                    values[*on_true],
-                    values[*on_false],
-                )?,
                 TensorOp::Region(RegionNode {
                     kind:
                         RegionKind::Cond {
@@ -4077,87 +4046,6 @@ impl TensorIr {
                         "symbolic VJP through a Scan VJP JVP result is not implemented".to_string(),
                     );
                 }
-                TensorOp::Sum { input } => transformed.sum(values[*input])?,
-                TensorOp::SumAxis { input, axis } => {
-                    transformed.sum_axis(values[*input], *axis as isize)?
-                }
-                TensorOp::ExtremumAxis { input, axis, kind } => {
-                    transformed.extremum_axis(values[*input], *axis as isize, *kind)?
-                }
-                TensorOp::Matmul { lhs, rhs } => transformed.matmul(values[*lhs], values[*rhs])?,
-                TensorOp::Cholesky { input } => transformed.cholesky(values[*input])?,
-                TensorOp::CholeskyAd { inputs, kind } => {
-                    transformed.cholesky_ad(inputs.iter().map(|id| values[*id]).collect(), *kind)?
-                }
-                TensorOp::Solve { matrix, rhs } => {
-                    transformed.solve(values[*matrix], values[*rhs])?
-                }
-                TensorOp::Linalg { input, kind } => transformed.linalg(values[*input], *kind)?,
-                TensorOp::Triangular { input, lower } => {
-                    transformed.triangular(values[*input], *lower)?
-                }
-                TensorOp::Sqrt { input } => transformed.sqrt(values[*input])?,
-                TensorOp::SqrtDerivative { input, order } => {
-                    transformed.sqrt_derivative(values[*input], *order)?
-                }
-                TensorOp::Reshape { input } => {
-                    transformed.reshape(values[*input], node.shape.clone())?
-                }
-                TensorOp::Mean { input } => transformed.mean(values[*input])?,
-                TensorOp::MeanAxis { input, axis } => {
-                    transformed.mean_axis(values[*input], *axis as isize)?
-                }
-                TensorOp::Powi { input, exponent } => {
-                    transformed.powi(values[*input], *exponent)?
-                }
-                TensorOp::BinaryMath { lhs, rhs, kind } => {
-                    transformed.binary_math(values[*lhs], values[*rhs], *kind)?
-                }
-                TensorOp::Transpose { input, axes } => transformed.transpose(
-                    values[*input],
-                    Some(axes.iter().map(|axis| *axis as isize).collect()),
-                )?,
-                TensorOp::UnaryMath { input, kind } => {
-                    transformed.unary_math(values[*input], *kind)?
-                }
-                TensorOp::StopGradient { input } => transformed.stop_gradient(values[*input])?,
-                TensorOp::CumSum {
-                    input,
-                    axis,
-                    reverse,
-                } => transformed.cumsum(values[*input], *axis as isize, *reverse)?,
-                TensorOp::Concat { inputs, axis } => transformed.concat(
-                    inputs.iter().map(|input| values[*input]).collect(),
-                    *axis as isize,
-                )?,
-                TensorOp::Slice {
-                    input,
-                    axis,
-                    start,
-                    length,
-                } => transformed.slice(values[*input], *axis, *start, *length)?,
-                TensorOp::PadSlice { input, axis, start } => {
-                    transformed.pad_slice(values[*input], node.shape.clone(), *axis, *start)?
-                }
-                TensorOp::Gather {
-                    input,
-                    indices,
-                    axis,
-                } => transformed.gather(values[*input], indices.clone(), *axis)?,
-                TensorOp::ScatterAdd {
-                    base,
-                    updates,
-                    indices,
-                    axis,
-                } => transformed.scatter_add(
-                    values[*base],
-                    values[*updates],
-                    indices.clone(),
-                    *axis,
-                )?,
-                TensorOp::Broadcast { input } => {
-                    transformed.broadcast_to(values[*input], node.shape.clone())?
-                }
                 // Under reverse mode the primal comes from the rule's forward
                 // graph, which also computes the residuals, as in JAX.
                 TensorOp::Custom {
@@ -4177,6 +4065,7 @@ impl TensorIr {
                     }
                     custom_forward[group][*output]
                 }
+                _ => transformed.rebuild_like(node, |input| Ok(values[input]))?,
             };
             debug_assert_eq!(values.len(), node_index);
             if transformed.node(value)?.dtype != node.dtype {
@@ -13071,128 +12960,6 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                     }
                     specialized.input_typed(name.clone(), shape, node.dtype)?
                 }
-                TensorOp::ScalarConstant { value } => {
-                    specialized.constant_like(*value, node.dtype, node.weak)
-                }
-                // Constants are replicated: only mapped inputs are sharded.
-                TensorOp::Constant { .. } => specialized.push_node(
-                    node.op.clone(),
-                    node.shape.clone(),
-                    node.dtype,
-                    node.weak,
-                ),
-                TensorOp::Cast { input } => {
-                    specialized.rebuild_cast(mapped(*input)?, node.dtype, node.weak)?
-                }
-                TensorOp::Add { lhs, rhs } => specialized.add(mapped(*lhs)?, mapped(*rhs)?)?,
-                TensorOp::Sub { lhs, rhs } => specialized.sub(mapped(*lhs)?, mapped(*rhs)?)?,
-                TensorOp::Div { lhs, rhs } => specialized.div(mapped(*lhs)?, mapped(*rhs)?)?,
-                TensorOp::Mul { lhs, rhs } => specialized.mul(mapped(*lhs)?, mapped(*rhs)?)?,
-                TensorOp::Greater { lhs, rhs } => {
-                    specialized.greater(mapped(*lhs)?, mapped(*rhs)?)?
-                }
-                TensorOp::Compare { lhs, rhs, kind } => {
-                    specialized.compare(mapped(*lhs)?, mapped(*rhs)?, *kind)?
-                }
-                TensorOp::Where {
-                    condition,
-                    on_true,
-                    on_false,
-                } => specialized.where_select(
-                    mapped(*condition)?,
-                    mapped(*on_true)?,
-                    mapped(*on_false)?,
-                )?,
-                TensorOp::Sum { input } => specialized.sum(mapped(*input)?)?,
-                TensorOp::SumAxis { input, axis } => {
-                    specialized.sum_axis(mapped(*input)?, *axis as isize)?
-                }
-                TensorOp::ExtremumAxis { input, axis, kind } => {
-                    specialized.extremum_axis(mapped(*input)?, *axis as isize, *kind)?
-                }
-                TensorOp::Matmul { lhs, rhs } => {
-                    specialized.matmul(mapped(*lhs)?, mapped(*rhs)?)?
-                }
-                TensorOp::CholeskyAd { inputs, kind } => specialized.cholesky_ad(
-                    inputs
-                        .iter()
-                        .map(|id| mapped(*id))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    *kind,
-                )?,
-                TensorOp::Cholesky { input } => specialized.cholesky(mapped(*input)?)?,
-                TensorOp::Solve { matrix, rhs } => {
-                    specialized.solve(mapped(*matrix)?, mapped(*rhs)?)?
-                }
-                TensorOp::Linalg { input, kind } => specialized.linalg(mapped(*input)?, *kind)?,
-                TensorOp::Triangular { input, lower } => {
-                    specialized.triangular(mapped(*input)?, *lower)?
-                }
-                TensorOp::Sqrt { input } => specialized.sqrt(mapped(*input)?)?,
-                TensorOp::SqrtDerivative { input, order } => {
-                    specialized.sqrt_derivative(mapped(*input)?, *order)?
-                }
-                TensorOp::Reshape { input } => {
-                    specialized.reshape(mapped(*input)?, node.shape.clone())?
-                }
-                TensorOp::Mean { input } => specialized.mean(mapped(*input)?)?,
-                TensorOp::MeanAxis { input, axis } => {
-                    specialized.mean_axis(mapped(*input)?, *axis as isize)?
-                }
-                TensorOp::Powi { input, exponent } => {
-                    specialized.powi(mapped(*input)?, *exponent)?
-                }
-                TensorOp::BinaryMath { lhs, rhs, kind } => {
-                    specialized.binary_math(mapped(*lhs)?, mapped(*rhs)?, *kind)?
-                }
-                TensorOp::Transpose { input, axes } => specialized.transpose(
-                    mapped(*input)?,
-                    Some(axes.iter().map(|axis| *axis as isize).collect()),
-                )?,
-                TensorOp::UnaryMath { input, kind } => {
-                    specialized.unary_math(mapped(*input)?, *kind)?
-                }
-                TensorOp::StopGradient { input } => specialized.stop_gradient(mapped(*input)?)?,
-                TensorOp::CumSum {
-                    input,
-                    axis,
-                    reverse,
-                } => specialized.cumsum(mapped(*input)?, *axis as isize, *reverse)?,
-                TensorOp::Concat { inputs, axis } => specialized.concat(
-                    inputs
-                        .iter()
-                        .map(|input| mapped(*input))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    *axis as isize,
-                )?,
-                TensorOp::Slice {
-                    input,
-                    axis,
-                    start,
-                    length,
-                } => specialized.slice(mapped(*input)?, *axis, *start, *length)?,
-                TensorOp::PadSlice { input, axis, start } => {
-                    specialized.pad_slice(mapped(*input)?, node.shape.clone(), *axis, *start)?
-                }
-                TensorOp::Gather {
-                    input,
-                    indices,
-                    axis,
-                } => specialized.gather(mapped(*input)?, indices.clone(), *axis)?,
-                TensorOp::ScatterAdd {
-                    base,
-                    updates,
-                    indices,
-                    axis,
-                } => specialized.scatter_add(
-                    mapped(*base)?,
-                    mapped(*updates)?,
-                    indices.clone(),
-                    *axis,
-                )?,
-                TensorOp::Broadcast { input } => {
-                    specialized.broadcast_to(mapped(*input)?, node.shape.clone())?
-                }
                 TensorOp::Region(region) => {
                     return Err(format!(
                         "batch specialization does not yet transform {} regions",
@@ -13206,6 +12973,8 @@ extern \"C\" __global__ void quabla_fused_elementwise({parameters}) {{\n\
                             .to_string(),
                     )
                 }
+                // Constants are replicated: only mapped inputs are sharded.
+                _ => specialized.rebuild_like(node, mapped)?,
             };
             if specialized.node(node_id)?.dtype != node.dtype {
                 return Err(format!(
