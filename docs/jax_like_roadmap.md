@@ -5,9 +5,11 @@
 The owner designated 1.1.0 as the bug-fix release on 2026-11-07. This is
 the current plan; the 1.0.x planning and release records below are history.
 Public signatures and supported successful behaviour remain compatible.
-The release commit after bd47809 sets the package metadata to 1.1.0 and
-dates its `CHANGELOG.md` section 2026-11-09; publication (tag, GitHub
-Release, PyPI) is run by the owner. Functional acceptance below is scoped
+Release commit deb82ed sets the package metadata to 1.1.0 and dates its
+`CHANGELOG.md` section 2026-11-09. Tag `v1.1.0` points to it, and
+[quabla 1.1.0](https://pypi.org/project/quabla/1.1.0/) and
+[quabla-mlx 1.1.0](https://pypi.org/project/quabla-mlx/1.1.0/) are
+published (see the publication row). Functional acceptance below is scoped
 to its recorded snapshot, platforms and checks.
 
 The audit repeats reproduction, a failing regression, a local fix, and
@@ -26,6 +28,7 @@ explicit validation gaps rather than passing results.
 | ODE, transforms, custom derivatives, pytrees, random, devices, optimizers | Fixed-step extreme time grids and time derivatives at internal `saveat` mesh knots repaired. fc52400 repairs adaptive `odeint` with `atol=0`, `clip_by_global_norm` and CPU/MLX/CUDA `clip_norm` when only the norm overflows, float32 `any`/`all` on MLX including derivative plans, and initializer and random shape validation. 633c4c9 returns zero gradients for values that do not depend on the arguments in `grad`, `value_and_grad`, `hessian`, `vjp` and CPU/device `Trainer`. |
 | Python 3.10–3.14 installation matrix | Commit bd47809: all five macOS arm64 CPU wheels pass the 20 suites, 403 passed each. Local Python 3.13 with MLX: 447 passed. |
 | CUDA/NCCL | Commit fc52400: home-gpu GTX 1660 SUPER passes Rust 379 and Python 406 with CUDA. lab-server job 6951 (2x RTX 3090, NVRTC 12.6) COMPLETED, exit 0: Rust 383 with CUDA/NCCL, Python 440, and both data-parallel validations. Snapshot 20261108-04 jobs 6947–6950 and rejected jobs 6944–6946 remain recorded in its audit. Commit bd47809 (which contains 633c4c9 and 9845fc4): lab-server job 6952 (2x RTX 3090 on acmt20, driver 560.35.05, CUDA 12.6, source exported with `git archive`) COMPLETED, exit 0 in 17:28: Rust 383 passed, 14 ignored with CUDA/NCCL; Python 450 passed, 0 failed, 7 skipped (six MLX-only, one NCCL-enabled skip), including the device `Trainer` constant-loss path, the operator device test and the `maximum`/`minimum` tie device test on CUDA; both data-parallel validations passed. The single-GPU home-gpu run was not repeated for these commits. |
+| Publication | On deb82ed, [CI 42560362579](https://github.com/latteine1217/quabla/actions/runs/42560362579) (gates and MSRV on Linux) and the dependency audit pass. [Wheels 42560372987](https://github.com/latteine1217/quabla/actions/runs/42560372987) builds Linux x86_64 and aarch64 (CPU/CUDA/NCCL), macOS arm64 CPU, macOS arm64 MLX and the sdist, and its owner-approved TestPyPI and PyPI jobs pass. PyPI holds 16 `quabla` and five `quabla-mlx` files, with filenames and SHA-256 digests identical to TestPyPI. On 2026-11-10 both packages, installed from PyPI into fresh environments on macOS arm64 with Python 3.13, import as 1.1.0 and evaluate a reduction. The registry files were not hashed against the GitHub artifacts, and published Linux wheels were not installed on GPU hardware. |
 
 The fixes and durable reproductions live in `CHANGELOG.md` (1.1.0),
 the affected modules, and `tests/python/test_*.py`; do not put execution
