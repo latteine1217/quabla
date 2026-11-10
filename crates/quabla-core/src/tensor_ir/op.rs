@@ -14,13 +14,15 @@
 //!   (`TensorIr::rebuild_like`, in [`rebuild`]);
 //! - its forward-mode derivative (`TensorIr::push_jvp_pair`, in [`jvp`]);
 //! - its reverse-mode derivative (`TensorIr::push_vjp_contributions`, in
-//!   [`vjp`]).
+//!   [`vjp`]);
+//! - its batching rule under `vmap` (`TensorIr::batched_op`, in [`batch`]).
 //!
 //! The program text (`TensorIr::lower_text`) keeps its own exhaustive match,
 //! because its format is public and pinned by golden baselines. Lowering an
 //! op stays in each backend, whose exhaustive matches keep the bit-for-bit
 //! concerns of that backend in one place.
 
+mod batch;
 mod jvp;
 mod rebuild;
 mod vjp;
