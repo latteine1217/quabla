@@ -1,5 +1,6 @@
 //! One row per `TensorOp` variant (and per region kind): the program text,
-//! the compiled CPU plan, its kernel op names and fusion regions, the value,
+//! the compiled CPU plan, its kernel op names and fusion regions, the value
+//! (to ten significant digits, see `values`),
 //! and the symbolic VJP and JVP of each row are compared with a recorded
 //! snapshot. The rows go through the public `TensorIr` interface only, so the
 //! snapshot pins what callers observe of each op: its name, its operands, how
@@ -403,8 +404,17 @@ fn rows() -> Vec<(&'static str, Built)> {
     ]
 }
 
+/// The shape and the elements to ten significant digits. Transcendental
+/// functions round through the platform's libm, whose last bit differs
+/// between macOS and Linux, so the snapshot stops short of bit equality;
+/// per-backend bit-for-bit results are the golden baselines' job.
 fn values(tensor: &DynamicTensor) -> String {
-    format!("{:?} {:?}", tensor.shape(), tensor.data().as_ref())
+    let elements: Vec<_> = tensor
+        .data()
+        .iter()
+        .map(|value| format!("{value:.9e}"))
+        .collect();
+    format!("{:?} [{}]", tensor.shape(), elements.join(", "))
 }
 
 /// The cotangent of `output`: distinct non-zero entries of its shape.
