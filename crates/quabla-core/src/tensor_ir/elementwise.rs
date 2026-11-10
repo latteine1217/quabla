@@ -9,8 +9,7 @@
 //! - its derivatives: the symbolic rules (`TensorIr::unary_math_chain`,
 //!   `TensorIr::binary_math_jvp`, `TensorIr::binary_math_vjp`), written with
 //!   IR ops so that every derivative order is again an ordinary graph on
-//!   every backend, and the numeric rules of the CPU evaluator's AD paths
-//!   (`numeric_chain`, `numeric_partial`, `numeric_mixed`);
+//!   every backend;
 //! - its CUDA spelling (`cuda_function`) and which CUDA paths admit it
 //!   (`cuda_fusable`, `cuda_loop_lowerable`); the MLX lowering is the
 //!   exhaustive `mlx_unary_math` / `mlx_binary_math` of the MLX backend;

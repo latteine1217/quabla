@@ -818,8 +818,9 @@ impl PyTensor {
         })
     }
 
-    /// `where(isnan(x) | (x > y), x, y)`: ties select `y`, and NaN in either
-    /// operand propagates.
+    /// Elementwise maximum with JAX's rules (`composite::maximum`): NaN in
+    /// either operand propagates, and floating ties give the common value
+    /// (`+0` between `+0` and `-0`) with half the derivative to each operand.
     pub fn try_maximum(&self, rhs: &Self) -> Result<Self, String> {
         Self::composite(Composite::Maximum, [self, rhs], |x| {
             composite::maximum(&x[0], &x[1])
@@ -832,8 +833,9 @@ impl PyTensor {
         })
     }
 
-    /// `where(isnan(x) | (y > x), x, y)`: ties select `y`, and NaN in either
-    /// operand propagates.
+    /// Elementwise minimum with JAX's rules (`composite::minimum`): NaN in
+    /// either operand propagates, and floating ties give the common value
+    /// (`-0` between `+0` and `-0`) with half the derivative to each operand.
     pub fn try_minimum(&self, rhs: &Self) -> Result<Self, String> {
         Self::composite(Composite::Minimum, [self, rhs], |x| {
             composite::minimum(&x[0], &x[1])
