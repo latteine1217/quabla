@@ -15,7 +15,8 @@
 //! - its forward-mode derivative (`TensorIr::push_jvp_pair`, in [`jvp`]);
 //! - its reverse-mode derivative (`TensorIr::push_vjp_contributions`, in
 //!   [`vjp`]);
-//! - its batching rule under `vmap` (`TensorIr::batched_op`, in [`batch`]).
+//! - its batching rule under `vmap` (`TensorIr::batched_op`, in [`batch`]);
+//! - how a device placement flows through it ([`TensorOp::placement_rule`]).
 //!
 //! The program text (`TensorIr::lower_text`) keeps its own exhaustive match,
 //! because its format is public and pinned by golden baselines. Lowering an
@@ -24,8 +25,11 @@
 
 mod batch;
 mod jvp;
+mod placement;
 mod rebuild;
 mod vjp;
+
+pub(super) use placement::PlacementRule;
 
 use super::{TensorExtremum, TensorNodeId, TensorOp};
 

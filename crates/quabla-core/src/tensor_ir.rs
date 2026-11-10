@@ -28,6 +28,7 @@ mod host_storage;
 pub use host_storage::HostTensorStorage;
 mod op;
 mod region;
+use op::PlacementRule;
 use region::{RegionKind, RegionNode};
 mod region_batching;
 #[cfg(test)]
@@ -12700,37 +12701,33 @@ fn infer_tensor_placement(
     let merge =
         |input_ids: &[TensorNodeId]| merge_tensor_placements(node_id, input_ids, kernel_nodes);
 
-    match &node.op {
-        TensorOp::Input { .. } | TensorOp::ScalarConstant { .. } | TensorOp::Constant { .. } => {
-            Ok(TensorPlacement::Unplaced)
+    let inputs = node.op.inputs();
+    // The placement of the only input, or with `merge` of all inputs.
+    let source = |merge_inputs: bool| {
+        if merge_inputs {
+            merge(&inputs)
+        } else {
+            unary(inputs[0])
         }
-        TensorOp::Add { lhs, rhs }
-        | TensorOp::Sub { lhs, rhs }
-        | TensorOp::Div { lhs, rhs }
-        | TensorOp::Mul { lhs, rhs }
-        | TensorOp::Greater { lhs, rhs }
-        | TensorOp::Compare { lhs, rhs, .. } => merge(&[*lhs, *rhs]),
-        TensorOp::BinaryMath { lhs, rhs, .. } => merge(&[*lhs, *rhs]),
-        TensorOp::Where {
-            condition,
-            on_true,
-            on_false,
-        } => merge(&[*condition, *on_true, *on_false]),
-        TensorOp::Region(_) | TensorOp::Custom { .. } => Err(format!(
+    };
+
+    match node.op.placement_rule() {
+        PlacementRule::Unplaced => Ok(TensorPlacement::Unplaced),
+        PlacementRule::Unsupported => Err(format!(
             "kernel node {node_id} contains {} regions; placement propagation requires explicit region lowering",
             node.op.name()
         )),
-        TensorOp::Sqrt { input }
-        | TensorOp::SqrtDerivative { input, .. }
-        | TensorOp::Powi { input, .. }
-        | TensorOp::UnaryMath { input, .. }
-        | TensorOp::StopGradient { input }
-        | TensorOp::Cast { input } => unary(*input),
-        TensorOp::CumSum { input, axis, .. } => {
-            let placement = unary(*input)?;
-            if sharded_tensor_axis(&placement) == Some(*axis) {
+        PlacementRule::Follow => source(false),
+        PlacementRule::Merge => source(true),
+        PlacementRule::LocalAlongAxis {
+            merge,
+            axis,
+            action,
+        } => {
+            let placement = source(merge)?;
+            if sharded_tensor_axis(&placement) == Some(axis) {
                 return Err(format!(
-                    "kernel node {node_id} scans along a sharded axis; explicit redistribution is required"
+                    "kernel node {node_id} {action} along a sharded axis; explicit redistribution is required"
                 ));
             }
             Ok(placement)
@@ -12738,7 +12735,7 @@ fn infer_tensor_placement(
         // There is no max/min replica reduction: a sharded reduced axis needs explicit
         // redistribution, as the per-element slices of the former traced chain did. Another
         // sharded axis keeps its shard and shifts down past the removed axis.
-        TensorOp::ExtremumAxis { input, axis, .. } => match unary(*input)? {
+        PlacementRule::ExtremumAxis { axis } => match source(false)? {
             TensorPlacement::Mesh {
                 mesh,
                 partition:
@@ -12747,7 +12744,7 @@ fn infer_tensor_placement(
                         mesh_axis,
                     },
             } => {
-                if tensor_axis == *axis {
+                if tensor_axis == axis {
                     return Err(format!(
                         "kernel node {node_id} reduces a max/min along a sharded axis; explicit redistribution is required"
                     ));
@@ -12755,129 +12752,51 @@ fn infer_tensor_placement(
                 Ok(TensorPlacement::Mesh {
                     mesh,
                     partition: TensorPartitionSpec::Sharded {
-                        tensor_axis: tensor_axis - usize::from(tensor_axis > *axis),
+                        tensor_axis: tensor_axis - usize::from(tensor_axis > axis),
                         mesh_axis,
                     },
                 })
             }
             placement => Ok(placement),
         },
-        TensorOp::Sum { input } => {
-            let placement = unary(*input)?;
-            plan_full_reduction_placement(
-                node_id,
-                placement,
-                TensorReplicaReduction::Sum,
-                collective_mode,
-                all_reduces,
-            )
-        }
-        TensorOp::Mean { input } => {
-            let placement = unary(*input)?;
-            plan_full_reduction_placement(
-                node_id,
-                placement,
-                TensorReplicaReduction::Mean,
-                collective_mode,
-                all_reduces,
-            )
-        }
-        TensorOp::SumAxis { input, axis } => {
-            let placement = unary(*input)?;
-            plan_reduced_axis_placement(
-                node_id,
-                placement,
-                *axis,
-                TensorReplicaReduction::Sum,
-                collective_mode,
-                all_reduces,
-            )
-        }
-        TensorOp::MeanAxis { input, axis } => {
-            let placement = unary(*input)?;
-            plan_reduced_axis_placement(
-                node_id,
-                placement,
-                *axis,
-                TensorReplicaReduction::Mean,
-                collective_mode,
-                all_reduces,
-            )
-        }
-        TensorOp::Matmul { lhs, rhs } | TensorOp::Solve { matrix: lhs, rhs } => {
-            let placement = merge(&[*lhs, *rhs])?;
-            reject_sharded_placement(node_id, &placement, "matmul/solve lowering")?;
+        PlacementRule::FullReduction(reduction) => plan_full_reduction_placement(
+            node_id,
+            source(false)?,
+            reduction,
+            collective_mode,
+            all_reduces,
+        ),
+        PlacementRule::AxisReduction { axis, reduction } => plan_reduced_axis_placement(
+            node_id,
+            source(false)?,
+            axis,
+            reduction,
+            collective_mode,
+            all_reduces,
+        ),
+        PlacementRule::Unsharded { merge, lowering } => {
+            let placement = source(merge)?;
+            reject_sharded_placement(node_id, &placement, lowering)?;
             Ok(placement)
         }
-        TensorOp::CholeskyAd { inputs, .. } => { let placement = merge(inputs)?; reject_sharded_placement(node_id, &placement, "cholesky AD lowering")?; Ok(placement) },
-        TensorOp::Cholesky { input } | TensorOp::Triangular { input, .. } => {
-            let placement = unary(*input)?;
-            reject_sharded_placement(node_id, &placement, "triangular lowering")?;
-            Ok(placement)
-        }
-        TensorOp::Linalg { input, .. } => {
-            let placement = unary(*input)?;
-            reject_sharded_placement(node_id, &placement, "linalg lowering")?;
-            Ok(placement)
-        }
-        TensorOp::Reshape { input } => {
-            let placement = unary(*input)?;
-            if is_sharded_placement(&placement) && input_node(*input)?.shape != node.shape {
+        PlacementRule::Reshape => {
+            let placement = source(false)?;
+            if is_sharded_placement(&placement) && input_node(inputs[0])?.shape != node.shape {
                 return Err(format!(
                     "kernel node {node_id} reshape changes a sharded tensor shape; explicit redistribution is required"
                 ));
             }
             Ok(placement)
         }
-        TensorOp::Transpose { input, axes } => {
-            let placement = unary(*input)?;
-            remap_transpose_placement(node_id, placement, axes)
+        PlacementRule::Transpose(axes) => {
+            remap_transpose_placement(node_id, source(false)?, axes)
         }
-        TensorOp::Concat { inputs, axis } => {
-            let placement = merge(inputs)?;
-            // Local shard concatenation interleaves operands instead of
-            // producing a contiguous shard of the global result.
-            if sharded_tensor_axis(&placement) == Some(*axis) {
-                return Err(format!(
-                    "kernel node {node_id} concatenates along a sharded axis; explicit redistribution is required"
-                ));
-            }
-            Ok(placement)
-        }
-        TensorOp::Slice { input, axis, .. }
-        | TensorOp::PadSlice { input, axis, .. }
-        | TensorOp::Gather { input, axis, .. } => {
-            let placement = unary(*input)?;
-            if sharded_tensor_axis(&placement) == Some(*axis) {
-                return Err(format!(
-                    "kernel node {node_id} slices along a sharded axis; explicit redistribution is required"
-                ));
-            }
-            Ok(placement)
-        }
-        TensorOp::ScatterAdd {
-            base,
-            updates,
-            axis,
-            ..
-        } => {
-            let placement = merge(&[*base, *updates])?;
-            if sharded_tensor_axis(&placement) == Some(*axis) {
-                return Err(format!(
-                    "kernel node {node_id} scatters along a sharded axis; explicit redistribution is required"
-                ));
-            }
-            Ok(placement)
-        }
-        TensorOp::Broadcast { input } => {
-            let placement = unary(*input)?;
-            remap_broadcast_placement(
-                node_id,
-                placement,
-                input_node(*input)?.shape.len(),
-                node.shape.len(),
-            )
-        }
+        PlacementRule::Broadcast => remap_broadcast_placement(
+            node_id,
+            source(false)?,
+            input_node(inputs[0])?.shape.len(),
+            node.shape.len(),
+        ),
     }
 }
 
