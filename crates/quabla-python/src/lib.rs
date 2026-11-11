@@ -12,6 +12,7 @@ mod composite;
 mod dtype;
 mod errors;
 mod interop;
+mod operand;
 mod protocol;
 mod repr;
 mod safe_extract;
@@ -102,9 +103,7 @@ fn compare_function(
     if is_tensor(rhs) {
         return Ok(rhs.call_method1(reflected, (lhs,))?.unbind());
     }
-    Err(pyo3::exceptions::PyTypeError::new_err(format!(
-        "{name} expects a Tensor or TraceTensor operand"
-    )))
+    Err(operand::array_operand_error(name, lhs))
 }
 
 fn tensor_method<'py>(
@@ -113,9 +112,7 @@ fn tensor_method<'py>(
     args: impl pyo3::call::PyCallArgs<'py>,
 ) -> PyResult<Py<PyAny>> {
     if !is_tensor(value) {
-        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-            "{name} expects a Tensor or TraceTensor operand"
-        )));
+        return Err(operand::array_operand_error(name, value));
     }
     Ok(value.call_method1(name, args)?.unbind())
 }

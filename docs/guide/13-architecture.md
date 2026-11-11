@@ -78,6 +78,8 @@ so the rest of the code compiles unchanged.
 | --- | --- |
 | `tensor.rs` | Eager `Tensor` and `TensorView`; methods dispatch to the tracer when an operand is traced |
 | `tensor_trace.rs` | `TensorTraceGraph`, `TraceTensor`, the bridge methods used by `_transforms.py`, region builders, staged executables, the data-parallel executor, and the device trainer executors |
+| `operand.rs` | The operands that `Tensor` and `TraceTensor` methods accept (a tracer, a `Tensor` or `TensorView`, or a Python number) and the one `TypeError` text for an unsupported operand |
+| `composite.rs` | Composite ops (`relu`, `sigmoid`, `maximum`, ...) defined once over the primitives a tracer records, which eager code runs as a cached fused kernel |
 | `compiler.rs` | The Python `Compiler`/`Program`/`Executable` facade |
 | `interop.rs` | Construction from sequences and the buffer protocol, `tolist`, read-only buffer export (never links NumPy) |
 | `repr.rs` | NumPy-style printing |
@@ -348,6 +350,22 @@ extension's region builders (`tensor_cond`, `tensor_fori_loop_region`,
 
 `_custom.py` traces `fun` and the rule functions and records them with
 `TensorTraceGraph._custom_rule` and `_custom_call`.
+
+An op made of other ops lives at the lowest layer that its rules need:
+
+- **The tensor IR builder** (`TensorIr` in `quabla-core`) when the core
+  itself uses it or every backend and transform should see one node
+  pattern, such as `logical_and` as a `where` or `isnan` as `x != x`.
+- **`composite.rs`** when eager calls need a cached fused kernel or exact
+  JAX rules for ties, NaN, signed zeros, and derivatives, as for
+  `maximum`, `relu`, and `softplus`.
+- **`_ops.py`** for any other composition of public methods, such as
+  `softmax`, `clip`, `var`, and `roll`.
+
+Eager `Tensor` and `TraceTensor` methods parse their operands through
+`operand.rs`, so eager code and its `jit` accept the same operands and
+raise the same errors; `tests/python/test_operand_api.py` checks every
+binary method and operator for this.
 
 The libraries (`optim.py`, `linalg.py`, `ode.py`, `_krylov.py`,
 `_newton.py`, `_lbfgs.py`) are ordinary Python over these primitives. For

@@ -14,6 +14,21 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
   vmap batching, and sharding placement of every tensor op are answered in
   one module (`tensor_ir/op.rs` and `tensor_ir/op/`); program text, results,
   and public interfaces are unchanged.
+- `Tensor` and `TraceTensor` methods parse their operands in one place and
+  raise one `TypeError` text for an unsupported operand:
+  "expected a Tensor, TraceTensor, or numeric scalar operand", or
+  "{op} expects a Tensor or TraceTensor operand, got {type}" for an op
+  without a scalar form (`matmul`, `solve`, the logical ops). The texts used
+  to differ between eager and traced code and between ops (divisor,
+  dividend, base, exponent); the exception types are unchanged.
+
+### Fixed
+
+- Eager `Tensor` arithmetic, comparisons, `**`, `maximum`/`minimum`,
+  `atan2`, `fmod`, `@`, `&`, and `|` accept a `TensorView` operand on either
+  side, as traced code already did; they used to raise `TypeError`.
+- Traced `@`, `&`, and `|` return `NotImplemented` for an operand that is
+  not an array, as eager tensors do, so Python raises its usual `TypeError`.
 
 ## [1.1.0] - 2026-11-09
 
