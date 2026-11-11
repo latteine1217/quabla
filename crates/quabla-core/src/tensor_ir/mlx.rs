@@ -18,8 +18,8 @@ use mlx_rs::{ops, transforms, Array, Dtype, StreamOrDevice};
 
 use super::{
     adam_element, sgd_element, sqrt_derivative_coefficient, AdamArith, AdamCoefficients,
-    BinaryMathKind, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, RegionKind, RegionNode,
-    TensorBackend, TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend,
+    BinaryMathKind, CarryTape, DeviceOptimizerConfig, DeviceUpdateRule, DynamicTensor, RegionKind,
+    RegionNode, TensorBackend, TensorComparison, TensorConstant, TensorDType, TensorDeviceBackend,
     TensorExecutionPlan, TensorExtremum, TensorForiExecutionPlan, TensorOp, UnaryMathKind,
 };
 
@@ -1470,24 +1470,9 @@ fn mlx_fori_value_and_vjp(
             .ok_or_else(|| "MLX Fori forward body produced no carry output".to_string())?;
         Ok(carry)
     };
-    let mut checkpoints = None;
-    let mut full_tape = None;
-    if let Some(block) = super::TensorCarryCheckpoints::<Array>::block_size(steps) {
-        let (_, tape) =
-            super::TensorCarryCheckpoints::forward(initial_carry, steps, block, evaluate)?;
-        checkpoints = Some(tape);
-    } else {
-        let mut carry = initial_carry;
-        let mut carries = Vec::with_capacity(steps);
-        for offset in 0..steps {
-            carries.push(carry.clone());
-            carry = evaluate(offset, carry)?;
-        }
-        full_tape = Some(carries);
-    }
+    let (_, tape) = CarryTape::record(initial_carry, steps, evaluate)?;
 
-    let mut carry_gradient = output_cotangent;
-    let mut external_gradients = loop_plan
+    let external_gradients = loop_plan
         .external_captures
         .iter()
         .map(|(name, shape)| {
@@ -1496,17 +1481,10 @@ fn mlx_fori_value_and_vjp(
                 .map(|value| (name.clone(), value))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    loop {
-        let block = if let Some(checkpoints) = &mut checkpoints {
-            checkpoints.pop_block(evaluate)?
-        } else {
-            full_tape.take().map(|states| (0, states))
-        };
-        let Some((start, carries)) = block else {
-            break;
-        };
-        for (local_offset, carry) in carries.into_iter().enumerate().rev() {
-            let offset = start + local_offset;
+    let accumulated = tape.reverse(
+        (output_cotangent, external_gradients),
+        evaluate,
+        |offset, carry, (carry_gradient, mut external_gradients)| {
             let mut body_inputs = external_captures.clone();
             body_inputs.insert(loop_plan.carry_name.clone(), carry);
             body_inputs.insert(
@@ -1518,7 +1496,7 @@ fn mlx_fori_value_and_vjp(
             );
             let gradients =
                 mlx_region_vjp_gradients(backend, vjp, &body_inputs, vec![carry_gradient])?;
-            carry_gradient = gradients
+            let carry_gradient = gradients
                 .get(&loop_plan.carry_name)
                 .cloned()
                 .ok_or_else(|| "MLX Fori VJP body has no carry gradient".to_string())?;
@@ -1534,13 +1512,15 @@ fn mlx_fori_value_and_vjp(
                     .add_device(contribution, &stream)
                     .map_err(|error| error.to_string())?;
             }
-        }
-        if checkpoints.is_some() {
+            Ok((carry_gradient, external_gradients))
+        },
+        |(carry_gradient, external_gradients)| {
             // Bound lazy accumulation history to the replay block without changing sums.
-            transforms::eval(std::iter::once(&carry_gradient).chain(external_gradients.values()))
-                .map_err(|error| error.to_string())?;
-        }
-    }
+            transforms::eval(std::iter::once(carry_gradient).chain(external_gradients.values()))
+                .map_err(|error| error.to_string())
+        },
+    )?;
+    let (carry_gradient, external_gradients) = accumulated;
     Ok(MlxForiVjpEvaluation {
         carry_gradient,
         external_gradients,
@@ -1648,25 +1628,10 @@ fn mlx_fori_vjp_jvp(
             .ok_or_else(|| "MLX Fori JVP forward body has no tangent output".to_string())?;
         Ok((carry, tangent))
     };
-    let mut checkpoints = None;
-    let mut full_tape = None;
     let initial = (initial_carry, initial_tangent);
-    if let Some(block) = super::TensorCarryCheckpoints::<Array>::block_size(steps) {
-        let (_, tape) = super::TensorCarryCheckpoints::forward(initial, steps, block, evaluate)?;
-        checkpoints = Some(tape);
-    } else {
-        let mut state = initial;
-        let mut states = Vec::with_capacity(steps);
-        for offset in 0..steps {
-            states.push(state.clone());
-            state = evaluate(offset, state)?;
-        }
-        full_tape = Some(states);
-    }
+    let (_, tape) = CarryTape::record(initial, steps, evaluate)?;
 
-    let mut carry_cotangent = output_cotangent;
-    let mut carry_cotangent_tangent = output_cotangent_tangent;
-    let mut gradients = loop_plan
+    let gradients = loop_plan
         .external_captures
         .iter()
         .map(|(name, shape)| {
@@ -1675,17 +1640,10 @@ fn mlx_fori_vjp_jvp(
                 .map(|value| (name.clone(), value))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    loop {
-        let block = if let Some(checkpoints) = &mut checkpoints {
-            checkpoints.pop_block(evaluate)?
-        } else {
-            full_tape.take().map(|states| (0, states))
-        };
-        let Some((start, states)) = block else {
-            break;
-        };
-        for (local_offset, (carry, tangent)) in states.into_iter().enumerate().rev() {
-            let offset = start + local_offset;
+    let accumulated = tape.reverse(
+        (output_cotangent, output_cotangent_tangent, gradients),
+        evaluate,
+        |offset, (carry, tangent), (carry_cotangent, carry_cotangent_tangent, mut gradients)| {
             let mut inputs = external_captures.clone();
             inputs.insert(loop_plan.carry_name.clone(), carry);
             inputs.insert(
@@ -1734,21 +1692,22 @@ fn mlx_fori_vjp_jvp(
                     .add_device(&contribution, &stream)
                     .map_err(|error| error.to_string())?;
             }
-            carry_cotangent = body_gradients
+            let carry_cotangent = body_gradients
                 .get(&loop_plan.carry_name)
                 .cloned()
                 .ok_or_else(|| "MLX Fori VJP JVP body has no carry gradient".to_string())?;
-            carry_cotangent_tangent = next_carry_cotangent_tangent;
-        }
-        if checkpoints.is_some() {
+            Ok((carry_cotangent, next_carry_cotangent_tangent, gradients))
+        },
+        |(carry_cotangent, carry_cotangent_tangent, gradients)| {
             transforms::eval(
-                [&carry_cotangent, &carry_cotangent_tangent]
+                [carry_cotangent, carry_cotangent_tangent]
                     .into_iter()
                     .chain(gradients.values()),
             )
-            .map_err(|error| error.to_string())?;
-        }
-    }
+            .map_err(|error| error.to_string())
+        },
+    )?;
+    let (_, carry_cotangent_tangent, mut gradients) = accumulated;
     gradients.insert(loop_plan.carry_name.clone(), carry_cotangent_tangent);
     Ok(gradients)
 }
@@ -1820,27 +1779,12 @@ fn mlx_scan_vjp_jvp(
             .ok_or_else(|| "MLX Scan JVP forward body has no tangent output".to_string())?;
         Ok((carry, tangent))
     };
-    let mut checkpoints = None;
-    let mut full_tape = None;
     let initial = (initial_carry, initial_tangent);
-    if let Some(block) = super::TensorCarryCheckpoints::<Array>::block_size(steps) {
-        let (_, tape) = super::TensorCarryCheckpoints::forward(initial, steps, block, evaluate)?;
-        checkpoints = Some(tape);
-    } else {
-        let mut state = initial;
-        let mut states = Vec::with_capacity(steps);
-        for offset in 0..steps {
-            states.push(state.clone());
-            state = evaluate(offset, state)?;
-        }
-        full_tape = Some(states);
-    }
+    let (_, tape) = CarryTape::record(initial, steps, evaluate)?;
 
     let vjp = scan_plan.vjp_plan()?;
     let output_step_shape = scan_plan.body.output_shapes()[1].clone();
-    let mut carry_cotangent = final_carry_cotangent;
-    let mut carry_cotangent_tangent = final_carry_cotangent_tangent;
-    let mut gradients = scan_plan
+    let gradients = scan_plan
         .external_captures
         .iter()
         .map(|(name, shape)| {
@@ -1849,17 +1793,16 @@ fn mlx_scan_vjp_jvp(
                 .map(|value| (name.clone(), value))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    loop {
-        let block = if let Some(checkpoints) = &mut checkpoints {
-            checkpoints.pop_block(evaluate)?
-        } else {
-            full_tape.take().map(|states| (0, states))
-        };
-        let Some((start, states)) = block else {
-            break;
-        };
-        for (local_offset, (carry, tangent)) in states.into_iter().enumerate().rev() {
-            let offset = start + local_offset;
+    let accumulated = tape.reverse(
+        (
+            final_carry_cotangent,
+            final_carry_cotangent_tangent,
+            gradients,
+        ),
+        evaluate,
+        |offset,
+         (carry, tangent),
+         (carry_cotangent, mut carry_cotangent_tangent, mut gradients)| {
             let mut inputs = external_captures.clone();
             inputs.insert(scan_plan.carry_name.clone(), carry);
             inputs.insert(
@@ -1936,20 +1879,22 @@ fn mlx_scan_vjp_jvp(
                     .add_device(&contribution, &stream)
                     .map_err(|error| error.to_string())?;
             }
-            carry_cotangent = primal_gradients
+            let carry_cotangent = primal_gradients
                 .get(&scan_plan.carry_name)
                 .cloned()
                 .ok_or_else(|| "MLX Scan VJP has no carry gradient".to_string())?;
-        }
-        if checkpoints.is_some() {
+            Ok((carry_cotangent, carry_cotangent_tangent, gradients))
+        },
+        |(carry_cotangent, carry_cotangent_tangent, gradients)| {
             transforms::eval(
-                [&carry_cotangent, &carry_cotangent_tangent]
+                [carry_cotangent, carry_cotangent_tangent]
                     .into_iter()
                     .chain(gradients.values()),
             )
-            .map_err(|error| error.to_string())?;
-        }
-    }
+            .map_err(|error| error.to_string())
+        },
+    )?;
+    let (_, carry_cotangent_tangent, mut gradients) = accumulated;
     gradients.insert(scan_plan.carry_name.clone(), carry_cotangent_tangent);
     Ok(gradients)
 }
@@ -1985,24 +1930,9 @@ fn mlx_scan_value_and_vjp(
             .ok_or_else(|| "MLX Scan forward body has no carry output".to_string())?;
         Ok(carry)
     };
-    let mut checkpoints = None;
-    let mut full_tape = None;
-    if let Some(block) = super::TensorCarryCheckpoints::<Array>::block_size(steps) {
-        let (_, tape) =
-            super::TensorCarryCheckpoints::forward(initial_carry, steps, block, evaluate)?;
-        checkpoints = Some(tape);
-    } else {
-        let mut carry = initial_carry;
-        let mut carries = Vec::with_capacity(steps);
-        for offset in 0..steps {
-            carries.push(carry.clone());
-            carry = evaluate(offset, carry)?;
-        }
-        full_tape = Some(carries);
-    }
+    let (_, tape) = CarryTape::record(initial_carry, steps, evaluate)?;
 
-    let mut carry_gradient = final_carry_cotangent;
-    let mut external_gradients = scan_plan
+    let external_gradients = scan_plan
         .external_captures
         .iter()
         .map(|(name, shape)| {
@@ -2012,17 +1942,10 @@ fn mlx_scan_value_and_vjp(
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     let output_step_shape = scan_plan.body.output_shapes()[1].clone();
-    loop {
-        let block = if let Some(checkpoints) = &mut checkpoints {
-            checkpoints.pop_block(evaluate)?
-        } else {
-            full_tape.take().map(|states| (0, states))
-        };
-        let Some((start, carries)) = block else {
-            break;
-        };
-        for (local_offset, carry) in carries.into_iter().enumerate().rev() {
-            let offset = start + local_offset;
+    let accumulated = tape.reverse(
+        (final_carry_cotangent, external_gradients),
+        evaluate,
+        |offset, carry, (carry_gradient, mut external_gradients)| {
             let mut body_inputs = external_captures.clone();
             body_inputs.insert(scan_plan.carry_name.clone(), carry);
             body_inputs.insert(
@@ -2045,7 +1968,7 @@ fn mlx_scan_value_and_vjp(
                 &body_inputs,
                 vec![carry_gradient, output_gradient],
             )?;
-            carry_gradient = gradients
+            let carry_gradient = gradients
                 .get(&scan_plan.carry_name)
                 .cloned()
                 .ok_or_else(|| "MLX Scan VJP has no carry gradient".to_string())?;
@@ -2061,13 +1984,15 @@ fn mlx_scan_value_and_vjp(
                     .add_device(contribution, &stream)
                     .map_err(|error| error.to_string())?;
             }
-        }
-        if checkpoints.is_some() {
+            Ok((carry_gradient, external_gradients))
+        },
+        |(carry_gradient, external_gradients)| {
             // Bound lazy accumulation history to the replay block without changing sums.
-            transforms::eval(std::iter::once(&carry_gradient).chain(external_gradients.values()))
-                .map_err(|error| error.to_string())?;
-        }
-    }
+            transforms::eval(std::iter::once(carry_gradient).chain(external_gradients.values()))
+                .map_err(|error| error.to_string())
+        },
+    )?;
+    let (carry_gradient, external_gradients) = accumulated;
     Ok(MlxScanVjpEvaluation {
         carry_gradient,
         external_gradients,

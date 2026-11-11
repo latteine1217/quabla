@@ -64,6 +64,7 @@ so the rest of the code compiles unchanged.
 | `tensor_ir/linalg.rs` | Host kernels for the decompositions (`LinalgKind`): LU sign/log-determinant, Jacobi `eigh`, Householder QR, Jacobi SVD |
 | `tensor_ir/cholesky.rs` | Cholesky derivative kinds and the jet-based higher-order expansion |
 | `tensor_ir/custom.rs` | `TensorCustomRule`: the payload behind `custom_vjp`, `custom_jvp`, and `checkpoint` |
+| `tensor_ir/carry_tape.rs` | `CarryTape`: the checkpoint policy and reverse walk shared by every loop reverse pass |
 | `tensor_ir/region_batching.rs` | `vmap` rules for region nodes (`Cond`, `Fori`, `Scan`, `While`, and their derivative variants) |
 | `tensor_ir/host_storage.rs` | `HostTensorStorage { F64, F32, Bool }`: immutable `Arc` storage sized to the dtype |
 | `tensor_ir/device_optimizer.rs` | Optimizer hyperparameters shared by the CUDA and MLX trainers |
@@ -188,10 +189,14 @@ evaluator.)
 
 ### Loop derivatives and checkpointing
 
-The reverse pass of a loop needs every carry. `TensorCarryCheckpoints` stores
-one carry per block of about `sqrt(T)` iterations during the forward pass,
-then re-runs each block forward and consumes it in reverse. Short loops keep
-the full tape. Reverse mode through `While` is rejected because its trip
+The reverse pass of a loop needs every carry. `CarryTape`
+(`tensor_ir/carry_tape.rs`) stores one carry per block of about `sqrt(T)`
+iterations during the forward pass, then re-runs each block forward and
+consumes it in reverse. Short loops keep the full tape. Every Fori and Scan
+reverse pass on the CPU and MLX records its forward pass with `CarryTape` and
+folds its cotangents over the reversed steps, so the region kinds and backends
+supply only what one step computes; the CUDA host loop keeps its own device
+tape under the same `checkpoint_block_size` rule. Reverse mode through `While` is rejected because its trip
 count is not fixed. Forward-over-reverse is `ForiVjpJvp`/`ScanVjpJvp`.
 Reverse mode over a `ForiVjp` group, the gradient `G(x, g) = J(x)^T g` of
 `g . Phi(x)`, needs no new kind: for cotangents `u` on the gradients,

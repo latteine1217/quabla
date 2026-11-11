@@ -6397,7 +6397,7 @@ fn cuda_loop_checkpoint_block(
     {
         return None;
     }
-    super::TensorCarryCheckpoints::<DynamicTensor>::block_size(upper.checked_sub(lower)?)
+    super::checkpoint_block_size(upper.checked_sub(lower)?)
 }
 
 fn cuda_loop_tape_states(lower: usize, upper: usize, block: Option<usize>) -> Option<usize> {
@@ -9443,7 +9443,7 @@ mod loop_checkpoint_tests {
                         let block = if full {
                             None
                         } else {
-                            super::super::TensorCarryCheckpoints::<DynamicTensor>::block_size(steps)
+                            super::super::checkpoint_block_size(steps)
                         };
                         let states =
                             cuda_loop_tape_states(3, 3 + steps, block).ok_or("invalid tape")?;

@@ -2,6 +2,19 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+mod carry_tape;
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+use carry_tape::checkpoint_block_size;
+use carry_tape::CarryTape;
+// The MLX and CUDA tests force the complete tape through this hook.
+#[cfg(all(
+    test,
+    any(
+        all(feature = "mlx", target_os = "macos"),
+        all(feature = "cuda", target_os = "linux")
+    )
+))]
+use carry_tape::LOOP_CHECKPOINT_TEST_FULL_TAPE;
 mod cholesky;
 #[cfg(test)]
 mod cholesky_tests;
@@ -9628,84 +9641,6 @@ impl TensorRegionJvpPlan {
     }
 }
 
-// VJP consumers need block boundaries rather than the public complete carry tape.
-// Rematerialize each block in forward order, then consume it in reverse order.
-#[cfg(test)]
-thread_local! {
-    // Tests compare replay with the complete-tape fallback on the same long loop.
-    static LOOP_CHECKPOINT_TEST_FULL_TAPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-struct TensorCarryCheckpoints<T = DynamicTensor> {
-    carries: Vec<T>,
-    block: usize,
-    steps: usize,
-}
-
-impl<T: Clone> TensorCarryCheckpoints<T> {
-    fn block_size(steps: usize) -> Option<usize> {
-        #[cfg(test)]
-        if LOOP_CHECKPOINT_TEST_FULL_TAPE.with(|value| value.get()) {
-            return None;
-        }
-        if steps == 0 {
-            return None;
-        }
-        let root = steps.isqrt();
-        let block = root + usize::from(root * root < steps);
-        // Include both checkpoint and block entries conservatively. Short loops
-        // retain the complete tape when separate workspace would not shrink it.
-        steps
-            .div_ceil(block)
-            .checked_add(block)
-            .filter(|&states| states < steps)?;
-        Some(block)
-    }
-
-    fn forward(
-        initial: T,
-        steps: usize,
-        block: usize,
-        mut evaluate: impl FnMut(usize, T) -> Result<T, String>,
-    ) -> Result<(T, Self), String> {
-        let mut checkpoints = Vec::with_capacity(steps.div_ceil(block));
-        let mut carry = initial;
-        checkpoints.push(carry.clone());
-        for offset in 0..steps {
-            carry = evaluate(offset, carry)?;
-            if (offset + 1).is_multiple_of(block) && offset + 1 < steps {
-                checkpoints.push(carry.clone());
-            }
-        }
-        Ok((
-            carry,
-            Self {
-                carries: checkpoints,
-                block,
-                steps,
-            },
-        ))
-    }
-
-    fn pop_block(
-        &mut self,
-        mut evaluate: impl FnMut(usize, T) -> Result<T, String>,
-    ) -> Result<Option<(usize, Vec<T>)>, String> {
-        let Some(mut carry) = self.carries.pop() else {
-            return Ok(None);
-        };
-        let start = self.carries.len() * self.block;
-        let length = self.block.min(self.steps - start);
-        let mut carries = Vec::with_capacity(length);
-        carries.push(carry.clone());
-        for offset in start..start + length - 1 {
-            carry = evaluate(offset, carry)?;
-            carries.push(carry.clone());
-        }
-        Ok(Some((start, carries)))
-    }
-}
-
 impl TensorForiExecutionPlan {
     pub fn new(
         lower: usize,
@@ -9963,26 +9898,14 @@ impl TensorForiExecutionPlan {
             ));
         }
         let steps = self.upper - self.lower;
-        let mut checkpoints = None;
-        let mut full_tape = None;
-        let output = if let Some(block) = TensorCarryCheckpoints::<DynamicTensor>::block_size(steps)
-        {
-            let (output, tape) =
-                TensorCarryCheckpoints::forward(initial_carry, steps, block, |offset, carry| {
-                    self.body.plan.evaluate(&self.body_inputs(
-                        carry,
-                        self.lower + offset,
-                        external_inputs,
-                    )?)
-                })?;
-            checkpoints = Some(tape);
-            output
-        } else {
-            let (output, tape) = self.evaluate_with_tape(initial_carry, external_inputs)?;
-            full_tape = Some(tape);
-            output
+        let evaluate = |offset, carry| {
+            self.body.plan.evaluate(&self.body_inputs(
+                carry,
+                self.lower + offset,
+                external_inputs,
+            )?)
         };
-        let mut carry_cotangent = output_cotangent;
+        let (output, tape) = CarryTape::record(initial_carry, steps, evaluate)?;
         let mut external_gradients = self
             .external_captures
             .iter()
@@ -9990,32 +9913,16 @@ impl TensorForiExecutionPlan {
                 DynamicTensor::filled(shape.clone(), 0.0).map(|value| (name.clone(), value))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        loop {
-            let block = if let Some(checkpoints) = &mut checkpoints {
-                checkpoints.pop_block(|offset, carry| {
-                    self.body.plan.evaluate(&self.body_inputs(
-                        carry,
-                        self.lower + offset,
-                        external_inputs,
-                    )?)
-                })?
-            } else {
-                full_tape.take().map(|mut tape| {
-                    tape.carries.pop();
-                    (0, tape.carries)
-                })
-            };
-            let Some((start, carries)) = block else {
-                break;
-            };
-            for (local_offset, carry) in carries.into_iter().enumerate().rev() {
-                let offset = start + local_offset;
+        let carry_cotangent = tape.reverse(
+            output_cotangent,
+            evaluate,
+            |offset, carry, carry_cotangent| {
                 let index = self.lower + offset;
                 let gradients = step(
                     self.body_inputs(carry, index, external_inputs)?,
                     carry_cotangent,
                 )?;
-                carry_cotangent = gradients
+                let carry_cotangent = gradients
                     .get(&self.carry_name)
                     .cloned()
                     .ok_or_else(|| "fori loop body did not return a carry gradient".to_string())?;
@@ -10028,8 +9935,10 @@ impl TensorForiExecutionPlan {
                     })?;
                     accumulated.add_assign(contribution)?;
                 }
-            }
-        }
+                Ok(carry_cotangent)
+            },
+            |_| Ok(()),
+        )?;
         Ok((output, carry_cotangent, external_gradients))
     }
 
@@ -10315,24 +10224,8 @@ impl TensorForiVjpJvpExecutionPlan {
                 external_tangents,
             )
         };
-        let mut checkpoints = None;
-        let mut full_tape = None;
         let initial = (initial_carry, initial_tangent);
-        if let Some(block) = TensorCarryCheckpoints::<DynamicTensor>::block_size(steps) {
-            let (_, tape) = TensorCarryCheckpoints::forward(initial, steps, block, evaluate)?;
-            checkpoints = Some(tape);
-        } else {
-            let mut state = initial;
-            let mut states = Vec::with_capacity(steps);
-            for offset in 0..steps {
-                states.push(state.clone());
-                state = evaluate(offset, state)?;
-            }
-            full_tape = Some(states);
-        }
-
-        let mut carry_cotangent = output_cotangent;
-        let mut carry_cotangent_tangent = output_cotangent_tangent;
+        let (_, tape) = CarryTape::record(initial, steps, evaluate)?;
         let mut gradients = self
             .loop_plan
             .external_captures
@@ -10341,17 +10234,10 @@ impl TensorForiVjpJvpExecutionPlan {
                 DynamicTensor::filled(shape.clone(), 0.0).map(|value| (name.clone(), value))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        loop {
-            let block = if let Some(checkpoints) = &mut checkpoints {
-                checkpoints.pop_block(evaluate)?
-            } else {
-                full_tape.take().map(|states| (0, states))
-            };
-            let Some((start, states)) = block else {
-                break;
-            };
-            for (local_offset, (carry, tangent)) in states.into_iter().enumerate().rev() {
-                let offset = start + local_offset;
+        let (_, carry_cotangent_tangent) = tape.reverse(
+            (output_cotangent, output_cotangent_tangent),
+            evaluate,
+            |offset, (carry, tangent), (carry_cotangent, carry_cotangent_tangent)| {
                 let inputs = self.loop_plan.body_inputs(
                     carry,
                     self.loop_plan.lower + offset,
@@ -10404,13 +10290,14 @@ impl TensorForiVjpJvpExecutionPlan {
                         .ok_or_else(|| format!("Fori VJP JVP gradient {name:?} is missing"))?;
                     accumulated.add_assign(&contribution)?;
                 }
-                carry_cotangent = body_gradients
+                let carry_cotangent = body_gradients
                     .get(&self.loop_plan.carry_name)
                     .cloned()
                     .ok_or_else(|| "Fori body VJP has no carry gradient".to_string())?;
-                carry_cotangent_tangent = next_carry_cotangent_tangent;
-            }
-        }
+                Ok((carry_cotangent, next_carry_cotangent_tangent))
+            },
+            |_| Ok(()),
+        )?;
         gradients.insert(self.loop_plan.carry_name.clone(), carry_cotangent_tangent);
         Ok(gradients)
     }
@@ -10555,25 +10442,10 @@ impl TensorScanVjpJvpExecutionPlan {
                 external_tangents,
             )
         };
-        let mut checkpoints = None;
-        let mut full_tape = None;
         let initial = (initial_carry, initial_tangent);
-        if let Some(block) = TensorCarryCheckpoints::<DynamicTensor>::block_size(steps) {
-            let (_, tape) = TensorCarryCheckpoints::forward(initial, steps, block, evaluate)?;
-            checkpoints = Some(tape);
-        } else {
-            let mut state = initial;
-            let mut states = Vec::with_capacity(steps);
-            for offset in 0..steps {
-                states.push(state.clone());
-                state = evaluate(offset, state)?;
-            }
-            full_tape = Some(states);
-        }
+        let (_, tape) = CarryTape::record(initial, steps, evaluate)?;
 
         let output_step_shape = self.scan_plan.body.output_shapes()[1].clone();
-        let mut carry_cotangent = final_carry_cotangent;
-        let mut carry_cotangent_tangent = final_carry_cotangent_tangent;
         let mut gradients = self
             .scan_plan
             .external_captures
@@ -10582,17 +10454,10 @@ impl TensorScanVjpJvpExecutionPlan {
                 DynamicTensor::filled(shape.clone(), 0.0).map(|value| (name.clone(), value))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        loop {
-            let block = if let Some(checkpoints) = &mut checkpoints {
-                checkpoints.pop_block(evaluate)?
-            } else {
-                full_tape.take().map(|states| (0, states))
-            };
-            let Some((start, states)) = block else {
-                break;
-            };
-            for (local_offset, (carry, tangent)) in states.into_iter().enumerate().rev() {
-                let offset = start + local_offset;
+        let (_, carry_cotangent_tangent) = tape.reverse(
+            (final_carry_cotangent, final_carry_cotangent_tangent),
+            evaluate,
+            |offset, (carry, tangent), (carry_cotangent, mut carry_cotangent_tangent)| {
                 let inputs =
                     self.scan_plan
                         .inputs(carry, self.scan_plan.lower + offset, external_inputs)?;
@@ -10669,12 +10534,14 @@ impl TensorScanVjpJvpExecutionPlan {
                         .ok_or_else(|| format!("Scan VJP JVP gradient {name:?} is missing"))?;
                     accumulated.add_assign(&contribution)?;
                 }
-                carry_cotangent = primal_gradients
+                let carry_cotangent = primal_gradients
                     .get(&self.scan_plan.carry_name)
                     .cloned()
                     .ok_or_else(|| "Scan body VJP has no carry gradient".to_string())?;
-            }
-        }
+                Ok((carry_cotangent, carry_cotangent_tangent))
+            },
+            |_| Ok(()),
+        )?;
         gradients.insert(self.scan_plan.carry_name.clone(), carry_cotangent_tangent);
         Ok(gradients)
     }
@@ -10918,41 +10785,15 @@ impl TensorScanExecutionPlan {
         } else {
             Vec::new()
         };
-        let mut checkpoints = None;
-        let mut full_tape = None;
-        let final_carry = if let Some(block) =
-            TensorCarryCheckpoints::<DynamicTensor>::block_size(steps)
-        {
-            let (carry, tape) =
-                TensorCarryCheckpoints::forward(initial_carry, steps, block, |offset, carry| {
-                    let values = self.body.evaluate(&self.inputs(
-                        carry,
-                        self.lower + offset,
-                        external_inputs,
-                    )?)?;
-                    if keep_outputs {
-                        outputs.push(values[1].clone());
-                    }
-                    Ok(values[0].clone())
-                })?;
-            checkpoints = Some(tape);
-            carry
-        } else {
-            let mut carry = initial_carry;
-            let mut carries = vec![carry.clone()];
-            for index in self.lower..self.upper {
-                let values = self
-                    .body
-                    .evaluate(&self.inputs(carry, index, external_inputs)?)?;
-                carry = values[0].clone();
-                if keep_outputs {
-                    outputs.push(values[1].clone());
-                }
-                carries.push(carry.clone());
+        let (final_carry, tape) = CarryTape::record(initial_carry, steps, |offset, carry| {
+            let values =
+                self.body
+                    .evaluate(&self.inputs(carry, self.lower + offset, external_inputs)?)?;
+            if keep_outputs {
+                outputs.push(values[1].clone());
             }
-            full_tape = Some(carries);
-            carry
-        };
+            Ok(values[0].clone())
+        })?;
         let outputs = if keep_outputs {
             Some(stack_scan_outputs(outputs)?)
         } else {
@@ -10963,7 +10804,6 @@ impl TensorScanExecutionPlan {
         {
             return Err("scan cotangent shapes do not match outputs".to_string());
         }
-        let mut carry_cotangent = final_carry_cotangent;
         let mut external_gradients = self
             .external_captures
             .iter()
@@ -10972,33 +10812,23 @@ impl TensorScanExecutionPlan {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let output_shape = self.body.output_shapes()[1].clone();
-        loop {
-            let block = if let Some(checkpoints) = &mut checkpoints {
-                checkpoints.pop_block(|offset, carry| {
-                    let values = self.body.evaluate(&self.inputs(
-                        carry,
-                        self.lower + offset,
-                        external_inputs,
-                    )?)?;
-                    Ok(values[0].clone())
-                })?
-            } else {
-                full_tape.take().map(|mut carries| {
-                    carries.pop();
-                    (0, carries)
-                })
-            };
-            let Some((start, carries)) = block else {
-                break;
-            };
-            for (local_offset, carry) in carries.into_iter().enumerate().rev() {
-                let offset = start + local_offset;
+        let carry_cotangent = tape.reverse(
+            final_carry_cotangent,
+            |offset, carry| {
+                let values = self.body.evaluate(&self.inputs(
+                    carry,
+                    self.lower + offset,
+                    external_inputs,
+                )?)?;
+                Ok(values[0].clone())
+            },
+            |offset, carry, carry_cotangent| {
                 let output_gradient = output_cotangent
                     .slice_axis(0, offset, 1)?
                     .reshape(output_shape.clone())?;
                 let inputs = self.inputs(carry, self.lower + offset, external_inputs)?;
                 let gradients = step(inputs, carry_cotangent, output_gradient)?;
-                carry_cotangent = gradients
+                let carry_cotangent = gradients
                     .get(&self.carry_name)
                     .cloned()
                     .ok_or_else(|| "scan body has no carry gradient".to_string())?;
@@ -11011,8 +10841,10 @@ impl TensorScanExecutionPlan {
                         .ok_or_else(|| format!("scan gradient {name:?} is missing"))?;
                     accumulated.add_assign(contribution)?;
                 }
-            }
-        }
+                Ok(carry_cotangent)
+            },
+            |_| Ok(()),
+        )?;
         Ok((final_carry, outputs, carry_cotangent, external_gradients))
     }
 

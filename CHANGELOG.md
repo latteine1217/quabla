@@ -14,6 +14,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
   vmap batching, and sharding placement of every tensor op are answered in
   one module (`tensor_ir/op.rs` and `tensor_ir/op/`); program text, results,
   and public interfaces are unchanged.
+- Internal: every Fori and Scan reverse pass on the CPU and MLX (VJP and
+  VJP-JVP) records and replays its loop through one carry tape
+  (`tensor_ir/carry_tape.rs`) instead of its own copy of the checkpoint
+  walk; results are unchanged.
 - `Tensor` and `TraceTensor` methods parse their operands in one place and
   raise one `TypeError` text for an unsupported operand:
   "expected a Tensor, TraceTensor, or numeric scalar operand", or

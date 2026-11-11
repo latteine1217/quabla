@@ -14,7 +14,7 @@
 //! per iteration except kernel launches, apart from the scalar `While`
 //! predicate, which is read back once per iteration exactly like `Cond`.
 //! Reverse passes follow the CPU scheme: the carry tape is kept on the device
-//! in full for short loops and as `TensorCarryCheckpoints` blocks (one stored
+//! in full for short loops and as `CarryTape` checkpoint blocks (one stored
 //! carry per block, replayed per block in reverse) otherwise, and each capture
 //! gradient is accumulated once per iteration in reverse iteration order, its
 //! broadcast axes reduced inside the body VJP. The reductions themselves use
@@ -45,9 +45,9 @@ use cudarc::driver::{
 };
 
 use super::super::{
-    element_count, DynamicTensor, RegionKind, RegionNode, SymbolicCotangent,
-    TensorCarryCheckpoints, TensorExecutionPlan, TensorForiVjpTarget, TensorIr, TensorNodeId,
-    TensorOp, TensorScanTarget, TensorScanVjpTarget,
+    checkpoint_block_size, element_count, RegionKind, RegionNode, SymbolicCotangent,
+    TensorExecutionPlan, TensorForiVjpTarget, TensorIr, TensorNodeId, TensorOp, TensorScanTarget,
+    TensorScanVjpTarget,
 };
 use super::{
     cuda_fori_jvp_tangent_names, cuda_fused_loop_lowering, cuda_scalar_predicate, cuda_value,
@@ -2097,7 +2097,7 @@ type StepFn<'a, 'r, T> = dyn FnMut(&mut HostRun<'r, T>, usize, &[CudaSlice<T>]) 
     + 'a;
 
 /// Device carry tape for reverse passes, using the CPU checkpoint scheme:
-/// `TensorCarryCheckpoints::block_size` decides between keeping every state
+/// `checkpoint_block_size` decides between keeping every state
 /// and keeping one state per block, replayed per block in reverse.
 struct DeviceTape<T: CudaReal> {
     /// Full tape (`block == None`): the state before every step. Otherwise
@@ -2114,7 +2114,7 @@ impl<T: CudaReal> DeviceTape<T> {
         initial: Vec<CudaSlice<T>>,
         step: &mut StepFn<'_, 'r, T>,
     ) -> Result<Self, String> {
-        let block = TensorCarryCheckpoints::<DynamicTensor>::block_size(steps);
+        let block = checkpoint_block_size(steps);
         let mut states = vec![initial];
         // The latest state when it is not itself a stored checkpoint.
         let mut current: Option<Vec<CudaSlice<T>>> = None;

@@ -31,6 +31,12 @@ An op that owns nested tensor programs and runs them under control flow:
 a conditional, a loop, a scan, or one of their derivatives.
 _Avoid_: block, subgraph, control-flow node
 
+**Carry tape**:
+The loop states a region's reverse pass reads back, from the last step to the
+first: the state before every step, or one checkpoint per block of steps that
+is replayed forward when its block is reached; its Rust type is `CarryTape`.
+_Avoid_: checkpoint list, tape (alone)
+
 **Region kind**:
 Which control flow a region performs, including the derivative it was
 built for, such as `Fori`, `ForiVjp`, or `ScanVjpJvp`.
