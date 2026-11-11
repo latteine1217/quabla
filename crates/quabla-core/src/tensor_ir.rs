@@ -13127,8 +13127,11 @@ fn fold_scalar_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<f64> {
 /// covering the same ops. It evaluates with the CPU evaluator's own kernels on
 /// operands rounded to their dtypes, so the caller only rounds the result to
 /// the node dtype to get what per-node execution computes. An op that the
-/// evaluator rejects (a zero divisor, a non-positive logarithm) stays unfolded
-/// and still fails at execution.
+/// kernels reject (operands that do not broadcast, a `powi` exponent beyond
+/// `i32`) stays unfolded and still fails at execution. Division by zero and
+/// the logarithm of a non-positive value fold to their IEEE results, the
+/// values the CPU evaluator computes; `fold_scalar_constant_op` still leaves
+/// those two unfolded, which changes the program text but not the results.
 fn fold_tensor_constant_op(op: &TensorOp, nodes: &[TensorNode]) -> Option<DynamicTensor> {
     let operands = op.inputs();
     let is_array = |id: &TensorNodeId| {
