@@ -2098,7 +2098,9 @@ type StepFn<'a, 'r, T> = dyn FnMut(&mut HostRun<'r, T>, usize, &[CudaSlice<T>]) 
 
 /// Device carry tape for reverse passes, using the CPU checkpoint scheme:
 /// `checkpoint_block_size` decides between keeping every state
-/// and keeping one state per block, replayed per block in reverse.
+/// and keeping one state per block, replayed per block in reverse. It stays
+/// apart from `CarryTape` because device states are owned, pooled buffers
+/// that it borrows per step (docs/adr/0002).
 struct DeviceTape<T: CudaReal> {
     /// Full tape (`block == None`): the state before every step. Otherwise
     /// the state at the start of every block.

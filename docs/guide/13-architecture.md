@@ -195,8 +195,9 @@ iterations during the forward pass, then re-runs each block forward and
 consumes it in reverse. Short loops keep the full tape. Every Fori and Scan
 reverse pass on the CPU and MLX records its forward pass with `CarryTape` and
 folds its cotangents over the reversed steps, so the region kinds and backends
-supply only what one step computes; the CUDA host loop keeps its own device
-tape under the same `checkpoint_block_size` rule. Reverse mode through `While` is rejected because its trip
+supply only what one step computes. The CUDA host loop keeps its own device
+tape under the same `checkpoint_block_size` rule, because device states are
+owned, pooled buffers (`docs/adr/0002`). Reverse mode through `While` is rejected because its trip
 count is not fixed. Forward-over-reverse is `ForiVjpJvp`/`ScanVjpJvp`.
 Reverse mode over a `ForiVjp` group, the gradient `G(x, g) = J(x)^T g` of
 `g . Phi(x)`, needs no new kind: for cotangents `u` on the gradients,
