@@ -7,6 +7,7 @@
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
+use quabla_core::compiler::QuablaCompileError;
 
 /// A `quabla.TracerError` carrying `message`.
 ///
@@ -24,6 +25,31 @@ pub(crate) fn tracer_error(py: Python<'_>, message: impl Into<String>) -> PyErr 
         Some(class) => PyErr::from_type(class, message),
         None => PyTypeError::new_err(message),
     }
+}
+
+/// Marks a failure at the foreign-trace check, preserving its public class.
+/// Region adapters add context from this category, never from its message.
+fn mark_foreign_trace(py: Python<'_>, error: PyErr) -> PyErr {
+    let category = py
+        .import("quabla._errors")
+        .and_then(|module| module.getattr("_BridgeFailure"))
+        .and_then(|class| class.getattr("FOREIGN_TRACE"));
+    // As with `tracer_error`, a broken installation keeps the builtin error.
+    let Ok(category) = category else {
+        return error;
+    };
+    match error.value(py).setattr("_quabla_failure", category) {
+        Ok(()) => error,
+        Err(classification_error) => classification_error,
+    }
+}
+
+pub(crate) fn foreign_tracer_error(py: Python<'_>, message: impl Into<String>) -> PyErr {
+    mark_foreign_trace(py, tracer_error(py, message))
+}
+
+pub(crate) fn foreign_region_error(py: Python<'_>, message: impl Into<String>) -> PyErr {
+    mark_foreign_trace(py, PyValueError::new_err(message.into()))
 }
 
 /// The `TracerError` of a traced value that Python code needs as a concrete
@@ -83,5 +109,21 @@ pub(crate) fn device_operation_error(
     match error {
         Ok(error) => PyErr::from_value(error),
         Err(_) => PyValueError::new_err(message),
+    }
+}
+
+/// The distributed adapter keeps invalid programs and backend execution
+/// failures as `ValueError`; only unavailable execution gets device metadata.
+pub(crate) fn data_parallel_compile_error(py: Python<'_>, error: QuablaCompileError) -> PyErr {
+    match error {
+        QuablaCompileError::Unavailable(message) => {
+            device_operation_error(py, message, "distributed.value_and_grad", "cuda")
+        }
+        QuablaCompileError::Unsupported { op, message } => {
+            device_operation_error(py, message, &op, "cuda")
+        }
+        QuablaCompileError::InvalidProgram(message) | QuablaCompileError::Backend(message) => {
+            PyValueError::new_err(message)
+        }
     }
 }

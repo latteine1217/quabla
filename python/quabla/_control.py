@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import _quabla
 from ._array import asarray
-from ._errors import TracerError
+from ._errors import TracerError, _BridgeFailure
 from ._quabla import TensorTraceGraph, TraceTensor
 
 if TYPE_CHECKING:
@@ -23,34 +23,12 @@ if TYPE_CHECKING:
 
 __all__ = ["cond", "fori_loop", "scan", "while_loop"]
 
-_FOREIGN_OUTPUT_ERRORS = {
-    f"{name} body returned a TraceTensor from a different graph"
-    for name in (
-        "tensor_fori_loop",
-        "tensor_fori_loop_region",
-        "tensor_scan",
-        "tensor_scan_region",
-        "tensor_while_loop_region",
-    )
-} | {"trace_tensor function returned a tensor from a different graph"}
-
 
 def _region_call(function, *args):
     try:
         return function(*args)
     except (TypeError, ValueError) as error:
-        message = str(error)
-        if (
-            message in _FOREIGN_OUTPUT_ERRORS
-            or message == "cannot combine TraceTensor values from different graphs"
-            or (
-                isinstance(error, TracerError)
-                and message.startswith(
-                    "a TraceTensor of another trace was combined with this trace"
-                )
-                and "tensor_* helper or region trace" in message
-            )
-        ):
+        if getattr(error, "_quabla_failure", None) is _BridgeFailure.FOREIGN_TRACE:
             raise TracerError(
                 "control-flow regions cannot close over an outer tracer; "
                 "pass it explicitly using operands= (cond takes positional operands)"

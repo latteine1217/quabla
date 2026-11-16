@@ -292,6 +292,50 @@ def test_implicit_tracer_capture_errors_name_explicit_operands():
     )
 
 
+def test_region_user_exceptions_are_not_classified_by_their_message():
+    errors = [
+        ValueError("trace_tensor function returned a tensor from a different graph"),
+        TypeError("cannot combine TraceTensor values from different graphs"),
+        qb.TracerError(
+            "a TraceTensor of another trace was combined with this trace; "
+            "user diagnostic mentioning tensor_* helper or region trace"
+        ),
+    ]
+    for original in errors:
+        def body(index, carry):
+            raise original
+
+        def function(x):
+            return fori_loop(0, 2, body, x)
+
+        error = assert_raises(type(original), qb.jit(function), qb.array(1.0))
+        assert error is original
+
+
+def test_region_capture_classification_does_not_depend_on_diagnostic_text():
+    original = qb._quabla.tensor_fori_loop_region
+
+    def translated(*args):
+        try:
+            return original(*args)
+        except (TypeError, ValueError) as error:
+            error.args = ("translated bridge diagnostic",)
+            raise
+
+    qb._quabla.tensor_fori_loop_region = translated
+    try:
+        for function in (
+            lambda x: fori_loop(0, 2, lambda i, c: c + x, x),
+            lambda x: fori_loop(0, 2, lambda i, c: x, x),
+            lambda x: fori_loop(0, 2, lambda i, c: qb.jit(lambda: x)(), x),
+        ):
+            error = assert_raises(qb.TracerError, qb.jit(function), qb.array(1.0), match="operands=")
+            assert type(error) is qb.TracerError
+            assert str(error.__cause__) == "translated bridge diagnostic"
+    finally:
+        qb._quabla.tensor_fori_loop_region = original
+
+
 def test_rejections_preserve_user_exceptions_and_single_array_scope():
     x = qb.array(1.0)
     assert_raises(ValueError, scan, lambda c, i: (c, c), x, length=0, match="positive")

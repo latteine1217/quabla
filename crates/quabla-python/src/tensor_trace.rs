@@ -21,11 +21,13 @@ use quabla_core::{
 
 use crate::composite::{self, Primitives};
 use crate::dtype::PyDType;
-use crate::errors::{concrete_value_error, tracer_error, unsupported_operation_error};
+use crate::errors::{
+    concrete_value_error, foreign_region_error, foreign_tracer_error, tracer_error,
+    unsupported_operation_error,
+};
 use crate::tensor::bool_operation_error;
 use crate::tensor::{
-    extract_scalar, parse_axis_indices, parse_index_plan, parse_reshape_args, PyTensor,
-    PyTensorView, TensorIndex,
+    extract_scalar, parse_axis_indices, parse_index_plan, parse_reshape_args, PyTensor, TensorIndex,
 };
 
 /// One traced input declaration: `(name, shape)` for `float64`, or
@@ -730,6 +732,11 @@ const UNLIFTABLE_TRACER: &str =
      ended, or it meets a tensor_* helper or region trace, which cannot capture it; return the \
      value from the transformed function, or pass it as an argument";
 
+enum TraceLiftError {
+    ForeignTrace,
+    Capture(String),
+}
+
 /// A trace of a v0.2 transform in progress (`quabla._transforms._trace`).
 ///
 /// A function staged by an inner transform may close over tracers of the
@@ -893,6 +900,13 @@ impl TensorTraceGraph {
     /// `tensor` as a tracer of this graph, a trace in progress: itself, or a
     /// capture input when it belongs to an enclosing trace.
     pub fn lift(&self, tensor: &TraceTensor) -> Result<TraceTensor, String> {
+        self.lift_checked(tensor).map_err(|error| match error {
+            TraceLiftError::ForeignTrace => UNLIFTABLE_TRACER.to_string(),
+            TraceLiftError::Capture(message) => message,
+        })
+    }
+
+    fn lift_checked(&self, tensor: &TraceTensor) -> Result<TraceTensor, TraceLiftError> {
         if Arc::ptr_eq(&self.ir, &tensor.graph.ir) {
             return Ok(tensor.clone());
         }
@@ -902,8 +916,10 @@ impl TensorTraceGraph {
                 frame_position(&frames, self),
                 frame_position(&frames, &tensor.graph),
             ) {
-                (Some(home), Some(source)) if source < home => frames[home].capture(tensor),
-                _ => Err(UNLIFTABLE_TRACER.to_string()),
+                (Some(home), Some(source)) if source < home => frames[home]
+                    .capture(tensor)
+                    .map_err(TraceLiftError::Capture),
+                _ => Err(TraceLiftError::ForeignTrace),
             }
         })
     }
@@ -1240,29 +1256,6 @@ impl TraceTensor {
     /// its dtype and (rare) weak type, so eager and traced code promote alike.
     pub(crate) fn capture(&self, eager: &PyTensor) -> Result<Self, String> {
         self.constant_tensor(eager.to_dynamic_tensor()?, eager.is_weak())
-    }
-
-    /// `operand` as a value of this tracer's graph: a tracer as is, and an
-    /// eager `Tensor` or `TensorView` captured as a constant. Anything else is
-    /// `None`, for the caller to try a Python number or raise its `TypeError`.
-    pub(crate) fn traced_operand(&self, operand: &Bound<'_, PyAny>) -> Option<PyResult<Self>> {
-        if let Ok(tracer) = operand.extract::<PyRef<'_, TraceTensor>>() {
-            // A tracer of an enclosing trace is lifted when the op is built;
-            // any other tracer of another graph escaped its trace.
-            return Some(
-                Self::ensure_liftable(&[self, &tracer])
-                    .map(|()| tracer.clone())
-                    .map_err(|message| tracer_error(operand.py(), message)),
-            );
-        }
-        let captured = if let Ok(tensor) = operand.extract::<PyRef<'_, PyTensor>>() {
-            self.capture(&tensor)
-        } else if let Ok(view) = operand.extract::<PyRef<'_, PyTensorView>>() {
-            view.materialize().and_then(|tensor| self.capture(&tensor))
-        } else {
-            return None;
-        };
-        Some(captured.map_err(PyValueError::new_err))
     }
 
     /// [`Self::traced_operand`] for an operand that must be an array.
@@ -2500,7 +2493,8 @@ impl TensorTraceGraph {
                 InlineBinding::Scalar(_) | InlineBinding::Constant(_) => None,
             })
             .collect::<Vec<_>>();
-        TraceTensor::ensure_liftable(&traced).map_err(|message| tracer_error(py, message))?;
+        TraceTensor::ensure_liftable(&traced)
+            .map_err(|message| foreign_tracer_error(py, message))?;
         self.inline_into(&input_names, &bindings, &outputs)
             .map_err(PyValueError::new_err)
     }
@@ -2542,7 +2536,8 @@ impl TensorTraceGraph {
                 InlineBinding::Scalar(_) | InlineBinding::Constant(_) => None,
             })
             .collect::<Vec<_>>();
-        TraceTensor::ensure_liftable(&traced).map_err(|message| tracer_error(py, message))?;
+        TraceTensor::ensure_liftable(&traced)
+            .map_err(|message| foreign_tracer_error(py, message))?;
         let rule = rule.rule.clone();
         self.inline_into_with(&input_names, &bindings, &outputs, |ir, bound, spliced| {
             ir.custom(rule, &spliced, bound)
@@ -2675,8 +2670,10 @@ impl TensorTraceGraph {
     /// other graph raises `TracerError`.
     #[pyo3(name = "_lift")]
     fn py_lift(&self, py: Python<'_>, tensor: TraceTensor) -> PyResult<TraceTensor> {
-        self.lift(&tensor)
-            .map_err(|message| tracer_error(py, message))
+        self.lift_checked(&tensor).map_err(|error| match error {
+            TraceLiftError::ForeignTrace => foreign_tracer_error(py, UNLIFTABLE_TRACER),
+            TraceLiftError::Capture(message) => tracer_error(py, message),
+        })
     }
 
     /// Whether a trace of a v0.2 transform is in progress on this thread.
@@ -3580,63 +3577,6 @@ impl TraceTensor {
     }
 }
 
-/// A binary operation of two traced values, which an eager `Tensor` method
-/// forwards to its traced operand after capturing itself as a constant.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum TracedBinary {
-    /// An op name of [`TraceTensor::binary`].
-    Arithmetic(&'static str),
-    Compare(TensorComparison),
-    Maximum,
-    Minimum,
-    Matmul,
-    Solve,
-    SolveTriangular {
-        lower: bool,
-        transpose: bool,
-    },
-    Logical {
-        and: bool,
-    },
-}
-
-impl TracedBinary {
-    pub(crate) fn apply(self, lhs: &TraceTensor, rhs: &TraceTensor) -> Result<TraceTensor, String> {
-        match self {
-            Self::Arithmetic(op) => lhs.binary(rhs, op),
-            Self::Compare(kind) => lhs.compare_tensor(rhs, kind),
-            Self::Maximum => lhs.maximum_tensor(rhs),
-            Self::Minimum => lhs.minimum_tensor(rhs),
-            Self::Matmul => lhs.matmul_tensor(rhs),
-            Self::Solve => lhs.solve_tensor(rhs),
-            Self::SolveTriangular { lower, transpose } => {
-                lhs.solve_triangular_tensor(rhs, lower, transpose)
-            }
-            Self::Logical { and } => lhs.logical_tensor(rhs, and),
-        }
-    }
-}
-
-/// `eager op tracer` (or `tracer op eager` when `eager_first` is false) for
-/// an eager `Tensor` method whose `operand` is a tracer: the tensor becomes a
-/// constant of the tracer's graph. `None` when `operand` is not a tracer.
-pub(crate) fn eager_traced_binary(
-    eager: &PyTensor,
-    operand: &Bound<'_, PyAny>,
-    op: TracedBinary,
-    eager_first: bool,
-) -> Option<PyResult<TraceTensor>> {
-    let tracer = operand.extract::<PyRef<'_, TraceTensor>>().ok()?;
-    let result = tracer.capture(eager).and_then(|constant| {
-        if eager_first {
-            op.apply(&constant, &tracer)
-        } else {
-            op.apply(&tracer, &constant)
-        }
-    });
-    Some(result.map_err(PyValueError::new_err))
-}
-
 fn trace_tensor_or_scalar_operand(
     lhs: &TraceTensor,
     rhs: &Bound<'_, PyAny>,
@@ -3780,7 +3720,8 @@ pub fn trace_tensor_python_function(
         .extract()
         .map_err(|_| PyTypeError::new_err("trace_tensor function must return a TraceTensor"))?;
     if !Arc::ptr_eq(&graph.ir, &output.graph.ir) {
-        return Err(PyValueError::new_err(
+        return Err(foreign_region_error(
+            py,
             "trace_tensor function returned a tensor from a different graph",
         ));
     }
@@ -3850,7 +3791,7 @@ pub fn tensor_cond(
     for operand in &operands {
         predicate
             .same_graph(operand)
-            .map_err(PyValueError::new_err)?;
+            .map_err(|message| foreign_region_error(py, message))?;
     }
 
     let input_specs = operands
@@ -3950,7 +3891,8 @@ pub fn tensor_fori_loop(
             .extract::<PyRef<'_, TraceTensor>>()
             .map_err(|_| PyTypeError::new_err("tensor_fori_loop body must return a TraceTensor"))?;
         if !Arc::ptr_eq(&expected_graph.ir, &next.graph.ir) {
-            return Err(PyValueError::new_err(
+            return Err(foreign_region_error(
+                py,
                 "tensor_fori_loop body returned a TraceTensor from a different graph",
             ));
         }
@@ -4007,7 +3949,8 @@ pub fn tensor_fori_loop_region(
         }
     }
     for operand in &operands {
-        init.same_graph(operand).map_err(PyValueError::new_err)?;
+        init.same_graph(operand)
+            .map_err(|message| foreign_region_error(py, message))?;
     }
 
     let body_graph = TensorTraceGraph::new();
@@ -4053,7 +3996,8 @@ pub fn tensor_fori_loop_region(
             PyTypeError::new_err("tensor_fori_loop_region body must return a TraceTensor")
         })?;
     if !Arc::ptr_eq(&body_graph.ir, &output.graph.ir) {
-        return Err(PyValueError::new_err(
+        return Err(foreign_region_error(
+            py,
             "tensor_fori_loop_region body returned a TraceTensor from a different graph",
         ));
     }
@@ -4171,9 +4115,12 @@ fn trace_while_region(
             ))
         })?;
     if !Arc::ptr_eq(&graph.ir, &output.graph.ir) {
-        return Err(PyValueError::new_err(format!(
-            "tensor_while_loop_region {label} returned a TraceTensor from a different graph"
-        )));
+        return Err(foreign_region_error(
+            py,
+            format!(
+                "tensor_while_loop_region {label} returned a TraceTensor from a different graph"
+            ),
+        ));
     }
     Ok((graph, output))
 }
@@ -4198,7 +4145,8 @@ pub fn tensor_while_loop_region(
         ));
     }
     for operand in &operands {
-        init.same_graph(operand).map_err(PyValueError::new_err)?;
+        init.same_graph(operand)
+            .map_err(|message| foreign_region_error(py, message))?;
     }
     let (predicate_graph, predicate) = trace_while_region(py, cond, &init, &operands, "cond_fun")?;
     if !predicate.shape.is_empty()
@@ -4288,7 +4236,8 @@ pub fn tensor_scan_region(
         }
     }
     for operand in &operands {
-        init.same_graph(operand).map_err(PyValueError::new_err)?;
+        init.same_graph(operand)
+            .map_err(|message| foreign_region_error(py, message))?;
     }
 
     let body_graph = TensorTraceGraph::new();
@@ -4347,7 +4296,8 @@ pub fn tensor_scan_region(
     if !Arc::ptr_eq(&body_graph.ir, &next.graph.ir)
         || !Arc::ptr_eq(&body_graph.ir, &output.graph.ir)
     {
-        return Err(PyValueError::new_err(
+        return Err(foreign_region_error(
+            py,
             "tensor_scan_region body returned a TraceTensor from a different graph",
         ));
     }
@@ -4487,7 +4437,8 @@ pub fn tensor_scan(
             .extract::<PyRef<'_, TraceTensor>>()
             .map_err(|_| PyTypeError::new_err("tensor_scan output must be a TraceTensor"))?;
         if !Arc::ptr_eq(&graph.ir, &next.graph.ir) || !Arc::ptr_eq(&graph.ir, &output.graph.ir) {
-            return Err(PyValueError::new_err(
+            return Err(foreign_region_error(
+                py,
                 "tensor_scan body returned a TraceTensor from a different graph",
             ));
         }
@@ -4731,8 +4682,8 @@ pub fn tensor_value_and_grad_data_parallel_cuda_fn(
     let (loss_node_id, gradient_node_ids) =
         value_and_named_outputs(plan.output_node_ids(), parameter_names);
     let plan = CudaBackend::new(device_ordinals[0])
-        .compile_data_parallel(plan, device_ordinals)
-        .map_err(PyValueError::new_err)?;
+        .compile_data_parallel_checked(plan, device_ordinals)
+        .map_err(|error| crate::errors::data_parallel_compile_error(py, error))?;
     Ok(TensorCudaDataParallelValueAndGradFunction {
         plan,
         input_shapes,

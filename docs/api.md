@@ -441,7 +441,9 @@ decorator: `@qb.jit(device="mlx", static_argnums=1)`, `@qb.grad(argnums=1)`.
   `ValueError` and `NotImplementedError` with `.op` and `.device`). Trace
   caches no longer raise `RetraceLimitError`; it remains for existing
   handlers. `quabla.RetraceWarning` (a `UserWarning`) reports an evicted
-  trace.
+  trace. Region and distributed adapters classify bridge failures at their
+  source; a user callback's exception is not reclassified because its message
+  resembles an internal diagnostic.
 
 ### Custom Differentiation Rules
 
@@ -1093,8 +1095,10 @@ are rejected. Optimizer updates stay on the host. The cache retains at most
 eight signatures; changed static values, shapes or dtypes specialize it.
 A build without NCCL, or a host without the CUDA driver, the NCCL library, or
 the named GPUs, raises `UnsupportedOperationError` with
-`op="distributed.value_and_grad"`. A build with NCCL runs `float32` programs
-only and rejects a `float64` one with `op="float64"`.
+`op="distributed.value_and_grad"` and `device="cuda"`. A build with NCCL runs
+`float32` programs only and rejects a `float64` one with `op="float64"`.
+Invalid programs and exceptions raised by the loss retain their original
+error categories, even when their diagnostics mention CUDA or NCCL.
 
 Explicit compilation for a device goes through the
 [Compiler Facade](#compiler-facade): `Compiler().trace(fn, specs).compile("cuda")`

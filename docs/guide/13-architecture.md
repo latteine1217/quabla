@@ -77,11 +77,28 @@ so the rest of the code compiles unchanged.
 | Module | Responsibility |
 | --- | --- |
 | `tensor.rs` | Eager `Tensor` and `TensorView`; methods dispatch to the tracer when an operand is traced |
+| `operands.rs` | Shared operand binding: Tracer selection, Eager constant capture, sequence dispatch, and mixed Eager/Trace binary dispatch |
 | `tensor_trace.rs` | `TensorTraceGraph`, `TraceTensor`, the bridge methods used by `_transforms.py`, region builders, staged executables, the data-parallel executor, and the device trainer executors |
 | `compiler.rs` | The Python `Compiler`/`Program`/`Executable` facade |
 | `interop.rs` | Construction from sequences and the buffer protocol, `tolist`, read-only buffer export (never links NumPy) |
 | `repr.rs` | NumPy-style printing |
-| `dtype.rs`, `errors.rs` | dtype objects; raising the Python exception classes from Rust |
+| `dtype.rs`, `errors.rs` | dtype objects; translating source-classified failures into Python exceptions |
+
+Operation adapters share operand binding through `operands.rs`, while each
+keeps its accepted operand types and diagnostics. Binding checks Tracer
+liftability and captures Eager arrays or views without creating a new Trace;
+the traced operation still lifts active enclosing Tracers into the innermost
+Trace. Scalar support stays with each adapter, preserving weak typing and
+the distinction between array-only operations and scalar-aware branches.
+
+Bridge failure classification lives in `errors.rs`. Foreign-trace checks mark
+their exception with a private category; Region adapters use that category to
+add the explicit-operands guidance. CUDA data-parallel compilation has a
+checked path returning the existing `QuablaCompileError`; availability failures
+become `UnsupportedOperationError` with operation and device metadata, while
+invalid programs and other backend failures stay `ValueError`. The original
+Rust compilation method still returns the same diagnostic strings. Neither
+Python adapter classifies failures by diagnostic text.
 
 ## 13.3 The Tensor IR
 
@@ -177,6 +194,16 @@ There are two families of differentiation in the core.
 Since derivative graphs are ordinary IR, applying a transform again needs no
 special support; `grad(grad(f))` is two symbolic VJPs, `hessian` is a
 symbolic JVP of a VJP vectorized with `vmap`.
+
+VJP copies ordinary primal nodes through `TensorIr::push_copied`, also used
+by inlining. It uses the operand remapping in `op.rs`, retains the validated
+shape, dtype, and weak flag, and gives copied multi-result groups one fresh
+identity per source group. Adding an ordinary op therefore requires no new
+primal-reconstruction branch. Custom calls still splice their forward rule,
+and regions keep their specialized construction and derivative restrictions.
+Packed loop-derivative input replacement retains its separate sharing policy:
+Region group ids stay unchanged across output copies, while Custom call ids
+are renewed.
 
 `TensorIr::vjp`, `value_and_vjp_many`, `jvp`, `hessian_scalar`, and
 `hvp_scalar` evaluate derivatives directly for tests and Rust callers: each

@@ -147,31 +147,14 @@ class _DistributedValueAndGrad:
             specs = [
                 (names[p], leaves[p].shape, leaves[p].dtype) for p in array_positions
             ]
-            try:
-                return _quabla.tensor_value_and_grad_data_parallel_cuda_fn(
-                    flat_loss,
-                    specs,
-                    [names[p] for p in active_parameters],
-                    [names[p] for p in mapped],
-                    self._devices,
-                    self._reduction,
-                )
-            except ValueError as error:
-                # A build without NCCL and a host without the driver, NCCL, or
-                # enough GPUs raise the same error type, so callers can tell
-                # "cannot run here" from a bad program with one except clause.
-                message = str(error).lower()
-                if (
-                    "cuda-nccl" in message
-                    or "data-parallel backend is unavailable" in message
-                    or "cuda driver library is unavailable" in message
-                    or "nccl library is unavailable" in message
-                    or "data-parallel device ordinal" in message
-                ):
-                    raise _UnsupportedOperationError(
-                        str(error), op="distributed.value_and_grad", device="cuda"
-                    ) from error
-                raise
+            return _quabla.tensor_value_and_grad_data_parallel_cuda_fn(
+                flat_loss,
+                specs,
+                [names[p] for p in active_parameters],
+                [names[p] for p in mapped],
+                self._devices,
+                self._reduction,
+            )
 
         executable = self._cache.lookup(key, build, self)
         inputs = dict(

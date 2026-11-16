@@ -6,6 +6,8 @@ keep catching it. The extension raises `TracerError` by importing it from
 this module, so the class is the same object in Python and Rust.
 """
 
+from enum import Enum, auto
+
 __all__ = [
     "QuablaError",
     "RetraceLimitError",
@@ -13,6 +15,12 @@ __all__ = [
     "TracerError",
     "UnsupportedOperationError",
 ]
+
+
+class _BridgeFailure(Enum):
+    """Private source classification, independent of diagnostic wording."""
+
+    FOREIGN_TRACE = auto()
 
 
 class QuablaError(Exception):

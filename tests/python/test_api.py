@@ -2393,6 +2393,122 @@ def test_eager_arrays_meeting_tracers_are_captured_as_constants():
     assert_raises(TypeError, lambda: data.matmul("a"), match="matmul expects a Tensor")
 
 
+def test_sequence_operand_binding_preserves_order_dtype_and_views():
+    for dtype in (qb.float32, qb.float64, qb.bool_):
+        data = qb.array([0.0, 1.0, 0.0, 0.0], dtype=dtype)
+        view = data.slice(0, 1, 2, step=2)
+        x = qb.array([0.0, 1.0], dtype=dtype)
+        for operation in (qb.concat, qb.stack):
+            for constant_first in (False, True):
+                def function(t):
+                    operands = [view, t] if constant_first else [t, view]
+                    return operation(operands, axis=-1)
+
+                eager_operands = [view.to_tensor(), x] if constant_first else [x, view.to_tensor()]
+                expected = operation(eager_operands, axis=-1)
+                assert type(expected) is qb.Tensor
+                actual = qb.jit(function)(x)
+                assert actual.dtype == dtype
+                assert actual.shape == expected.shape
+                assert_close(actual, expected, 0)
+                batch = qb.stack([x, x], 0)
+                assert_close(qb.jit(qb.vmap(function))(batch), qb.stack([expected, expected], 0), 0)
+            # A view is currently supported only when a Tracer supplies its Trace.
+            assert_raises(TypeError, operation, [view, x], axis=0)
+
+
+def test_sequence_operand_binding_preserves_nested_derivatives_and_parameter_gradients():
+    constant = qb.array([3.0])
+    for operation in (qb.concat, qb.stack):
+        def value(x, w):
+            return qb.sum(operation([constant, (w * x**3).reshape([1])], axis=0))
+
+        second_derivative = qb.grad(qb.grad(value, argnums=0), argnums=0)
+
+        def loss(w, x):
+            return second_derivative(x, w) ** 2
+
+        value_and_gradient = qb.jit(qb.value_and_grad(loss))
+        x, w = qb.array(0.5), qb.array(2.0)
+        value_result, gradient = value_and_gradient(w, x)
+        assert_close(value_result, 36.0, 0)
+        assert_close(gradient, 36.0, 0)
+
+
+def test_sequence_operand_binding_rejects_scalars_and_escaped_tracers():
+    x = qb.array([1.0, 2.0])
+    leaked = []
+    qb.jit(lambda t: leaked.append(t) or t)(x)
+    for operation in (qb.concat, qb.stack):
+        for constant_first in (False, True):
+            def escaped(t):
+                operands = [leaked[0], t] if constant_first else [t, leaked[0]]
+                return operation(operands, axis=0)
+
+            assert_raises(qb.TracerError, qb.jit(escaped), x, match="escaped")
+            for invalid in (1.0, "invalid", None):
+                def unsupported(t):
+                    operands = [invalid, t] if constant_first else [t, invalid]
+                    return operation(operands, axis=0)
+
+                error = assert_raises(TypeError, qb.jit(unsupported), x)
+                assert not isinstance(error, qb.TracerError)
+                assert_raises(TypeError, unsupported, x)
+
+
+def test_operand_binding_keeps_active_nested_traces_in_both_orders():
+    x = qb.array([1.0, 2.0])
+    for operation in (qb.concat, qb.stack):
+        for outer_first in (False, True):
+            def loss(outer):
+                def inner(value):
+                    operands = [outer, value] if outer_first else [value, outer]
+                    return qb.sum(operation(operands, axis=0) ** 2)
+
+                return qb.jit(inner)(outer)
+
+            assert_close(qb.jit(loss)(x), 10.0, 0)
+            assert_close(qb.jit(qb.grad(loss))(x), [4.0, 8.0], 0)
+
+
+def test_selection_operand_binding_preserves_scalar_policy_and_dtype():
+    for dtype in (qb.float32, qb.float64):
+        x = qb.array([1.0, 2.0], dtype=dtype)
+        mask = qb.array([True, False])
+        for function, expected, expected_dtype in (
+            (lambda t: qb.where(mask, t, 0.5), [1.0, 0.5], dtype),
+            (lambda t: qb.where(mask, 0.5, t), [0.5, 2.0], dtype),
+            (lambda t: qb.where(t > 1.0, 0.5, -0.5), [-0.5, 0.5], qb.float64),
+        ):
+            result = qb.jit(function)(x)
+            assert result.dtype == expected_dtype
+            assert_close(result, expected, 0)
+        for function in (
+            lambda t: qb.where(1.0, t, 0.0),
+            lambda t: qb.where(mask, t, "invalid"),
+        ):
+            error = assert_raises(TypeError, qb.jit(function), x)
+            assert not isinstance(error, qb.TracerError)
+
+
+def test_einsum_operand_binding_preserves_order_and_captured_views():
+    x = qb.array([[1.0, 2.0], [3.0, 4.0]])
+    constant = qb.array([[2.0, 0.0], [1.0, 3.0]])
+    view = constant.slice(0, 0, 2)
+    for constant_first in (False, True):
+        def function(t):
+            operands = [view, t] if constant_first else [t, view]
+            return qb.einsum("ij,jk->ik", operands)
+
+        expected = constant @ x if constant_first else x @ constant
+        assert_close(qb.jit(function)(x), expected, 0)
+        expected_gradient = (
+            [[3.0, 3.0], [3.0, 3.0]] if constant_first else [[2.0, 4.0], [2.0, 4.0]]
+        )
+        assert_close(qb.grad(lambda t: qb.sum(function(t)))(x), expected_gradient, 0)
+    assert_raises(TypeError, qb.einsum, "ij,jk->ik", [view, x])
+
+
 # -- vmap (slice S4) -------------------------------------------------------------------
 
 

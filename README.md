@@ -262,6 +262,7 @@ can publish to TestPyPI only.
 | Diagnose tracing or device errors | [Performance and debugging](docs/guide/12-performance-debugging.md) |
 | Run examples and benchmarks | [Examples](examples/README.md) |
 | Propose a change or run development checks | [Contributing](CONTRIBUTING.md) |
+| Understand tracing, transforms, and execution | [Architecture](docs/guide/13-architecture.md) |
 | Review feature status and validation records | [Roadmap](docs/jax_like_roadmap.md) |
 
 Implementation history is documented in the [core design notes](docs/design.md)

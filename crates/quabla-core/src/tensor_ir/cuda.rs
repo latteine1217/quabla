@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::compiler::QuablaCompileError;
+
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -381,22 +383,24 @@ impl CudaBackend {
     /// Compiles one identical retained-output plan per explicitly selected GPU
     /// and creates the plan's NCCL communicators once, for its lifetime.
     ///
-    /// This API is available in all CUDA builds so callers get a deterministic
-    /// feature error instead of an implicit single-device fallback. Actual
-    /// collective execution requires the optional `cuda-nccl` feature.
+    /// Availability failures retain their category rather than requiring
+    /// callers to infer it from diagnostic text. Actual collective execution
+    /// requires the optional `cuda-nccl` feature.
     #[cfg(feature = "cuda-nccl")]
-    pub fn compile_data_parallel(
+    pub fn compile_data_parallel_checked(
         &self,
         plan: TensorExecutionPlan,
         device_ordinals: Vec<usize>,
-    ) -> Result<CudaDataParallelExecutionPlan, String> {
+    ) -> Result<CudaDataParallelExecutionPlan, QuablaCompileError> {
         validate_cuda_data_parallel_devices(&device_ordinals)?;
         let output_node_ids = plan.output_node_ids().to_vec();
         let replicas = device_ordinals
             .into_iter()
             .map(|ordinal| CudaBackend::new(ordinal).compile(plan.clone()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let communicators = create_nccl_communicators(&replicas)?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(QuablaCompileError::Backend)?;
+        let communicators =
+            create_nccl_communicators(&replicas).map_err(QuablaCompileError::Backend)?;
         Ok(CudaDataParallelExecutionPlan {
             replicas,
             output_node_ids,
@@ -406,12 +410,14 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "cuda-nccl"))]
-    pub fn compile_data_parallel(
+    pub fn compile_data_parallel_checked(
         &self,
         _plan: TensorExecutionPlan,
         _device_ordinals: Vec<usize>,
-    ) -> Result<CudaDataParallelExecutionPlan, String> {
-        Err("CUDA data-parallel execution requires the optional cuda-nccl feature".to_string())
+    ) -> Result<CudaDataParallelExecutionPlan, QuablaCompileError> {
+        Err(QuablaCompileError::Unavailable(
+            "CUDA data-parallel execution requires the optional cuda-nccl feature".to_string(),
+        ))
     }
 
     /// Compiles the replica-local program of a sharding schedule derived from
@@ -1030,39 +1036,45 @@ pub(super) fn validate_cuda_float64_plan(
 }
 
 #[cfg(feature = "cuda-nccl")]
-fn validate_cuda_data_parallel_devices(device_ordinals: &[usize]) -> Result<(), String> {
+fn validate_cuda_data_parallel_devices(
+    device_ordinals: &[usize],
+) -> Result<(), QuablaCompileError> {
     if device_ordinals.len() < 2 {
-        return Err(
+        return Err(QuablaCompileError::InvalidProgram(
             "CUDA data-parallel execution requires at least two device ordinals".to_string(),
-        );
+        ));
     }
     let mut unique = BTreeSet::new();
     if device_ordinals
         .iter()
         .any(|ordinal| !unique.insert(*ordinal))
     {
-        return Err("CUDA data-parallel device ordinals must be unique".to_string());
+        return Err(QuablaCompileError::InvalidProgram(
+            "CUDA data-parallel device ordinals must be unique".to_string(),
+        ));
     }
-    ensure_cuda_driver_available()?;
+    ensure_cuda_driver_available().map_err(QuablaCompileError::Unavailable)?;
     // SAFETY: probing for the NCCL library only dlopens fixed sonames and drops the handles,
     // as `ensure_cuda_driver_available` does for the driver.
     if !unsafe { cudarc::nccl::sys::is_culib_present() } {
-        return Err(
+        return Err(QuablaCompileError::Unavailable(
             "NCCL library is unavailable. Install NCCL and add the directory that provides libnccl.so to LD_LIBRARY_PATH".to_string(),
-        );
+        ));
     }
-    let available = CudaContext::device_count()
-        .map_err(|error| format!("failed to query CUDA device count: {error:?}"))?;
-    let available = usize::try_from(available)
-        .map_err(|_| "CUDA driver reported a negative device count".to_string())?;
+    let available = CudaContext::device_count().map_err(|error| {
+        QuablaCompileError::Backend(format!("failed to query CUDA device count: {error:?}"))
+    })?;
+    let available = usize::try_from(available).map_err(|_| {
+        QuablaCompileError::Backend("CUDA driver reported a negative device count".to_string())
+    })?;
     if let Some(ordinal) = device_ordinals
         .iter()
         .copied()
         .find(|ordinal| *ordinal >= available)
     {
-        return Err(format!(
+        return Err(QuablaCompileError::Unavailable(format!(
             "CUDA data-parallel device ordinal {ordinal} is unavailable; CUDA reports {available} device(s)"
-        ));
+        )));
     }
     Ok(())
 }

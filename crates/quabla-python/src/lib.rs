@@ -12,6 +12,7 @@ mod composite;
 mod dtype;
 mod errors;
 mod interop;
+mod operands;
 mod protocol;
 mod repr;
 mod safe_extract;
@@ -20,6 +21,7 @@ mod tensor_trace;
 
 pub use compiler::{PyQuablaCompiler, PyQuablaExecutable, PyQuablaProgram};
 pub use dtype::PyDType;
+use operands::{trace_anchor, ArrayOperands};
 pub use tensor::{PyTensor, PyTensorView};
 pub use tensor_trace::{
     InlineBinding, StagedExecutable, TensorCudaAdamOptimizer, TensorMlxAdamOptimizer,
@@ -53,9 +55,7 @@ fn py_where(
 
     // A traced operand anywhere traces the selection: eager arrays become constants of its
     // graph and scalar branches stay weak.
-    let tracer = [mask, on_true, on_false]
-        .into_iter()
-        .find_map(|value| value.extract::<TraceTensor>().ok());
+    let tracer = trace_anchor([mask, on_true, on_false]);
     if let Some(tracer) = tracer {
         let traced_branch = |value: &Bound<'_, PyAny>| -> Option<PyResult<TraceTensor>> {
             tracer.traced_operand(value).or_else(|| {
@@ -197,29 +197,18 @@ fn py_concat(py: Python<'_>, matrices: &Bound<'_, PySequence>, axis: isize) -> P
     let len = matrices.len()?;
     let axis = concat_axis(matrices, len, axis)?;
 
-    let mut eager_tensors = safe_extract::buffer(len)?;
-    let mut all_tensors = true;
-    for index in 0..len {
-        let item = matrices.get_item(index)?;
-        match item.extract::<PyRef<'_, PyTensor>>() {
-            Ok(tensor) => eager_tensors.push(tensor.clone()),
-            Err(_) => {
-                all_tensors = false;
-                break;
-            }
+    match ArrayOperands::extract(matrices, len)? {
+        Some(ArrayOperands::Eager(tensors)) => {
+            let output = PyTensor::try_concat(&tensors, axis)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            return Ok(output.into_pyobject(py)?.into_any().unbind());
         }
-    }
-
-    if all_tensors {
-        let output = PyTensor::try_concat(&eager_tensors, axis)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        return Ok(output.into_pyobject(py)?.into_any().unbind());
-    }
-
-    if let Some(trace_tensors) = traced_sequence(matrices)? {
-        let output = TraceTensor::try_concat(&trace_tensors, axis)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        return Ok(output.into_pyobject(py)?.into_any().unbind());
+        Some(ArrayOperands::Traced(tensors)) => {
+            let output = TraceTensor::try_concat(&tensors, axis)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            return Ok(output.into_pyobject(py)?.into_any().unbind());
+        }
+        None => {}
     }
 
     Err(pyo3::exceptions::PyTypeError::new_err(
@@ -230,48 +219,21 @@ fn py_concat(py: Python<'_>, matrices: &Bound<'_, PySequence>, axis: isize) -> P
 #[pyfunction(name = "stack")]
 #[pyo3(signature = (tensors, axis=0))]
 fn py_stack(py: Python<'_>, tensors: &Bound<'_, PySequence>, axis: isize) -> PyResult<Py<PyAny>> {
-    let len = tensors.len()?;
-    let mut eager = safe_extract::buffer(len)?;
-    let mut all_eager = true;
-    for index in 0..len {
-        match tensors.get_item(index)?.extract::<PyRef<'_, PyTensor>>() {
-            Ok(tensor) => eager.push(tensor.clone()),
-            Err(_) => {
-                all_eager = false;
-                break;
-            }
+    match ArrayOperands::extract(tensors, tensors.len()?)? {
+        Some(ArrayOperands::Eager(tensors)) => {
+            let output = PyTensor::try_stack(&tensors, axis)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok(output.into_pyobject(py)?.into_any().unbind())
         }
+        Some(ArrayOperands::Traced(tensors)) => {
+            let output = TraceTensor::try_stack(&tensors, axis)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            Ok(output.into_pyobject(py)?.into_any().unbind())
+        }
+        None => Err(pyo3::exceptions::PyTypeError::new_err(
+            "stack expects only Tensor or TraceTensor operands",
+        )),
     }
-    if all_eager {
-        let output =
-            PyTensor::try_stack(&eager, axis).map_err(pyo3::exceptions::PyValueError::new_err)?;
-        return Ok(output.into_pyobject(py)?.into_any().unbind());
-    }
-
-    let traced = traced_sequence(tensors)?.ok_or_else(|| {
-        pyo3::exceptions::PyTypeError::new_err("stack expects only Tensor or TraceTensor operands")
-    })?;
-    let output =
-        TraceTensor::try_stack(&traced, axis).map_err(pyo3::exceptions::PyValueError::new_err)?;
-    Ok(output.into_pyobject(py)?.into_any().unbind())
-}
-
-/// The items of a sequence holding at least one tracer as values of that
-/// tracer's graph, with eager `Tensor` and `TensorView` items captured as
-/// constants. `None` when there is no tracer or another kind of item.
-fn traced_sequence(items: &Bound<'_, PySequence>) -> PyResult<Option<Vec<TraceTensor>>> {
-    let items = safe_extract::vec::<Bound<'_, PyAny>>(items.as_any())?;
-    let Some(tracer) = items
-        .iter()
-        .find_map(|item| item.extract::<TraceTensor>().ok())
-    else {
-        return Ok(None);
-    };
-    items
-        .iter()
-        .map(|item| tracer.traced_operand(item))
-        .collect::<Option<PyResult<Vec<_>>>>()
-        .transpose()
 }
 
 #[pyfunction(name = "einsum")]
@@ -306,9 +268,7 @@ fn py_einsum(
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
         return Ok(output.into_pyobject(py)?.into_any().unbind());
     }
-    let tracer = [&lhs, &rhs]
-        .into_iter()
-        .find_map(|value| value.extract::<TraceTensor>().ok());
+    let tracer = trace_anchor([&lhs, &rhs]);
     if let Some(tracer) = tracer {
         if let (Some(lhs), Some(rhs)) = (tracer.traced_operand(&lhs), tracer.traced_operand(&rhs)) {
             let output = lhs?

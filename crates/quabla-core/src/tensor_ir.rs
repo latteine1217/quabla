@@ -241,15 +241,16 @@ impl CudaBackend {
         ))
     }
 
-    pub fn compile_data_parallel(
+    /// A typed unavailable failure on builds without the CUDA backend.
+    pub fn compile_data_parallel_checked(
         &self,
         _plan: TensorExecutionPlan,
         _device_ordinals: Vec<usize>,
-    ) -> Result<CudaDataParallelExecutionPlan, String> {
-        Err(format!(
+    ) -> Result<CudaDataParallelExecutionPlan, crate::compiler::QuablaCompileError> {
+        Err(crate::compiler::QuablaCompileError::Unavailable(format!(
             "CUDA data-parallel backend is unavailable for device {}: build Quabla on Linux with --features cuda-nccl",
             self.device_ordinal
-        ))
+        )))
     }
 
     pub fn compile_data_parallel_sharded(
@@ -427,6 +428,25 @@ impl TensorBackend for CudaBackend {
             "CUDA backend is unavailable for device {}: build Quabla on Linux with --features cuda",
             self.device_ordinal
         ))
+    }
+}
+
+impl CudaBackend {
+    /// Legacy text errors; use [`Self::compile_data_parallel_checked`] when
+    /// the caller must distinguish availability from invalid programs.
+    pub fn compile_data_parallel(
+        &self,
+        plan: TensorExecutionPlan,
+        device_ordinals: Vec<usize>,
+    ) -> Result<CudaDataParallelExecutionPlan, String> {
+        use crate::compiler::QuablaCompileError;
+        self.compile_data_parallel_checked(plan, device_ordinals)
+            .map_err(|error| match error {
+                QuablaCompileError::Unavailable(message)
+                | QuablaCompileError::InvalidProgram(message)
+                | QuablaCompileError::Backend(message)
+                | QuablaCompileError::Unsupported { message, .. } => message,
+            })
     }
 }
 
@@ -2555,7 +2575,7 @@ impl TensorIr {
                     .get(name)
                     .ok_or_else(|| format!("inline leaves callee input {name:?} unbound"))?
             } else {
-                self.push_spliced(node, &remap, &mut groups)?
+                self.push_copied(node, &|id| remap.get(&id).copied(), &mut groups)?
             };
             remap.insert(id, spliced);
         }
@@ -2665,7 +2685,7 @@ impl TensorIr {
                 mapped[id] = is_mapped;
                 spliced
             } else {
-                self.push_spliced(node, &remap, &mut groups)?
+                self.push_copied(node, &|id| remap.get(&id).copied(), &mut groups)?
             };
             remap.insert(id, spliced);
         }
@@ -2688,15 +2708,16 @@ impl TensorIr {
         Ok(reachable)
     }
 
-    /// Appends a copy of a callee node with its operands remapped; a group id
-    /// becomes the id of the group's first spliced node (see [`Self::inline`]).
-    fn push_spliced(
+    /// Copies an already validated node without changing its shape, dtype,
+    /// or weakness. Each multi-result group receives one fresh identity in
+    /// the destination, so separate copies never share execution by accident.
+    fn push_copied(
         &mut self,
         node: &TensorNode,
-        remap: &HashMap<TensorNodeId, TensorNodeId>,
+        remap: &impl Fn(TensorNodeId) -> Option<TensorNodeId>,
         groups: &mut HashMap<usize, usize>,
     ) -> Result<TensorNodeId, String> {
-        let mut op = node.op.remap(&|id| remap.get(&id).copied())?;
+        let mut op = node.op.remap(remap)?;
         if let Some(group) = tensor_op_group_mut(&mut op) {
             *group = *groups.entry(*group).or_insert(self.nodes.len());
         }
@@ -3948,40 +3969,6 @@ impl TensorIr {
                 continue;
             }
             let value = match &node.op {
-                TensorOp::Input { name } => {
-                    transformed.input_typed(name.clone(), node.shape.clone(), node.dtype)?
-                }
-                TensorOp::ScalarConstant { value } => {
-                    transformed.constant_like(*value, node.dtype, node.weak)
-                }
-                TensorOp::Constant { .. } => transformed.push_node(
-                    node.op.clone(),
-                    node.shape.clone(),
-                    node.dtype,
-                    node.weak,
-                ),
-                TensorOp::Cast { input } => {
-                    transformed.rebuild_cast(values[*input], node.dtype, node.weak)?
-                }
-                TensorOp::Add { lhs, rhs } => transformed.add(values[*lhs], values[*rhs])?,
-                TensorOp::Sub { lhs, rhs } => transformed.sub(values[*lhs], values[*rhs])?,
-                TensorOp::Div { lhs, rhs } => transformed.div(values[*lhs], values[*rhs])?,
-                TensorOp::Mul { lhs, rhs } => transformed.mul(values[*lhs], values[*rhs])?,
-                TensorOp::Greater { lhs, rhs } => {
-                    transformed.greater(values[*lhs], values[*rhs])?
-                }
-                TensorOp::Compare { lhs, rhs, kind } => {
-                    transformed.compare(values[*lhs], values[*rhs], *kind)?
-                }
-                TensorOp::Where {
-                    condition,
-                    on_true,
-                    on_false,
-                } => transformed.where_select(
-                    values[*condition],
-                    values[*on_true],
-                    values[*on_false],
-                )?,
                 TensorOp::Region(RegionNode {
                     kind:
                         RegionKind::Cond {
@@ -4007,21 +3994,6 @@ impl TensorIr {
                     captures,
                     ..
                 }) => symbolic_clone_while(&mut transformed, *carry, loop_plan, captures, &values)?,
-                TensorOp::Region(
-                    region @ RegionNode {
-                        kind:
-                            RegionKind::ForiVjp { .. }
-                            | RegionKind::ForiJvp { .. }
-                            | RegionKind::ScanVjp { .. },
-                        ..
-                    },
-                ) => symbolic_clone_region(
-                    &mut transformed,
-                    node,
-                    region,
-                    &values,
-                    &mut cloned_region_groups,
-                )?,
                 TensorOp::Region(RegionNode {
                     kind: RegionKind::ForiVjpJvp { .. },
                     ..
@@ -4077,87 +4049,6 @@ impl TensorIr {
                         "symbolic VJP through a Scan VJP JVP result is not implemented".to_string(),
                     );
                 }
-                TensorOp::Sum { input } => transformed.sum(values[*input])?,
-                TensorOp::SumAxis { input, axis } => {
-                    transformed.sum_axis(values[*input], *axis as isize)?
-                }
-                TensorOp::ExtremumAxis { input, axis, kind } => {
-                    transformed.extremum_axis(values[*input], *axis as isize, *kind)?
-                }
-                TensorOp::Matmul { lhs, rhs } => transformed.matmul(values[*lhs], values[*rhs])?,
-                TensorOp::Cholesky { input } => transformed.cholesky(values[*input])?,
-                TensorOp::CholeskyAd { inputs, kind } => {
-                    transformed.cholesky_ad(inputs.iter().map(|id| values[*id]).collect(), *kind)?
-                }
-                TensorOp::Solve { matrix, rhs } => {
-                    transformed.solve(values[*matrix], values[*rhs])?
-                }
-                TensorOp::Linalg { input, kind } => transformed.linalg(values[*input], *kind)?,
-                TensorOp::Triangular { input, lower } => {
-                    transformed.triangular(values[*input], *lower)?
-                }
-                TensorOp::Sqrt { input } => transformed.sqrt(values[*input])?,
-                TensorOp::SqrtDerivative { input, order } => {
-                    transformed.sqrt_derivative(values[*input], *order)?
-                }
-                TensorOp::Reshape { input } => {
-                    transformed.reshape(values[*input], node.shape.clone())?
-                }
-                TensorOp::Mean { input } => transformed.mean(values[*input])?,
-                TensorOp::MeanAxis { input, axis } => {
-                    transformed.mean_axis(values[*input], *axis as isize)?
-                }
-                TensorOp::Powi { input, exponent } => {
-                    transformed.powi(values[*input], *exponent)?
-                }
-                TensorOp::BinaryMath { lhs, rhs, kind } => {
-                    transformed.binary_math(values[*lhs], values[*rhs], *kind)?
-                }
-                TensorOp::Transpose { input, axes } => transformed.transpose(
-                    values[*input],
-                    Some(axes.iter().map(|axis| *axis as isize).collect()),
-                )?,
-                TensorOp::UnaryMath { input, kind } => {
-                    transformed.unary_math(values[*input], *kind)?
-                }
-                TensorOp::StopGradient { input } => transformed.stop_gradient(values[*input])?,
-                TensorOp::CumSum {
-                    input,
-                    axis,
-                    reverse,
-                } => transformed.cumsum(values[*input], *axis as isize, *reverse)?,
-                TensorOp::Concat { inputs, axis } => transformed.concat(
-                    inputs.iter().map(|input| values[*input]).collect(),
-                    *axis as isize,
-                )?,
-                TensorOp::Slice {
-                    input,
-                    axis,
-                    start,
-                    length,
-                } => transformed.slice(values[*input], *axis, *start, *length)?,
-                TensorOp::PadSlice { input, axis, start } => {
-                    transformed.pad_slice(values[*input], node.shape.clone(), *axis, *start)?
-                }
-                TensorOp::Gather {
-                    input,
-                    indices,
-                    axis,
-                } => transformed.gather(values[*input], indices.clone(), *axis)?,
-                TensorOp::ScatterAdd {
-                    base,
-                    updates,
-                    indices,
-                    axis,
-                } => transformed.scatter_add(
-                    values[*base],
-                    values[*updates],
-                    indices.clone(),
-                    *axis,
-                )?,
-                TensorOp::Broadcast { input } => {
-                    transformed.broadcast_to(values[*input], node.shape.clone())?
-                }
                 // Under reverse mode the primal comes from the rule's forward
                 // graph, which also computes the residuals, as in JAX.
                 TensorOp::Custom {
@@ -4177,6 +4068,13 @@ impl TensorIr {
                     }
                     custom_forward[group][*output]
                 }
+                // Ordinary ops and unchanged derivative regions retain the
+                // source metadata; copying does not re-run their builders.
+                _ => transformed.push_copied(
+                    node,
+                    &|id| values.get(id).copied().filter(|value| *value != usize::MAX),
+                    &mut cloned_region_groups,
+                )?,
             };
             debug_assert_eq!(values.len(), node_index);
             if transformed.node(value)?.dtype != node.dtype {
@@ -9742,36 +9640,6 @@ fn symbolic_vjp_fori(
         symbolic_accumulate(transformed, cotangents, *parent_node_id, gradient)?;
     }
     Ok(())
-}
-
-/// A copy of the region node `region` (of `node`) in `transformed` with
-/// each operand replaced by its rebuilt value. The members of a
-/// multi-result group share one new group, the id of the first member
-/// copied, as `inline` gives them.
-fn symbolic_clone_region(
-    transformed: &mut TensorIr,
-    node: &TensorNode,
-    region: &RegionNode,
-    values: &[TensorNodeId],
-    groups: &mut HashMap<usize, usize>,
-) -> Result<TensorNodeId, String> {
-    let mut region = region.clone();
-    for operand in region.operands_mut() {
-        *operand = values
-            .get(*operand)
-            .copied()
-            .filter(|value| *value != usize::MAX)
-            .ok_or_else(|| format!("region operand node {operand} has no symbolic value"))?;
-    }
-    if let Some(group) = region.group_mut() {
-        *group = *groups.entry(*group).or_insert(transformed.nodes.len());
-    }
-    Ok(transformed.push_node(
-        TensorOp::Region(region),
-        node.shape.clone(),
-        node.dtype,
-        node.weak,
-    ))
 }
 
 /// The source graph and rebuilt values of a reverse-mode pass over a group

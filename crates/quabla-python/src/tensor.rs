@@ -17,7 +17,8 @@ use std::sync::Arc;
 use crate::composite;
 use crate::dtype::PyDType;
 use crate::interop;
-use crate::tensor_trace::{eager_traced_binary, TraceTensor, TracedBinary};
+use crate::operands::{eager_traced_binary, TracedBinary};
+use crate::tensor_trace::TraceTensor;
 
 /// The result of an eager `Tensor` operation. It is traced when the other
 /// operand is a tracer: the tensor is then captured as a constant of the

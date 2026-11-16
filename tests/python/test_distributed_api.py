@@ -237,6 +237,28 @@ def test_adapter_structure_signatures_and_cache_bound():
         qb._quabla.tensor_value_and_grad_data_parallel_cuda_fn = original
 
 
+def test_loss_errors_are_not_classified_by_backend_diagnostic_words():
+    for message in (
+        "cuda-nccl",
+        "data-parallel backend is unavailable",
+        "CUDA driver library is unavailable",
+        "NCCL library is unavailable",
+        "data-parallel device ordinal",
+    ):
+        original = ValueError(f"user loss diagnostic: {message}")
+
+        def invalid_loss(params, batch):
+            raise original
+
+        try:
+            transform(invalid_loss)(*arguments(dtype=qb.float32))
+        except ValueError as error:
+            assert error is original
+            assert not isinstance(error, qb.UnsupportedOperationError)
+        else:
+            raise AssertionError("the user loss exception was swallowed")
+
+
 def test_feature_unavailable_contract():
     if enabled("nccl"):
         skip("NCCL runtime validation enabled")
