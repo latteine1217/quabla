@@ -1,18 +1,8 @@
 # Quabla
 
-Release 1.1.0 is a bug-fix release that preserves the public API. It repairs
-numerical boundaries, input validation, serialization, control flow, solvers
-and linear algebra, and completes the Python protocols of tensors. See the
-[release notes](CHANGELOG.md#110---2026-11-09).
-
-CPU, MLX and CUDA/NCCL acceptance is recorded in the
-[roadmap](docs/jax_like_roadmap.md#v110-plan-bug-fixes-and-robustness-2026-11-08);
-the [1.1.0 audit](docs/benchmarks/v110-audit-20261108-04/README.md) records
-its evidence and performance limitations.
-
-Differentiable scientific computing in Python, powered by Rust. Quabla
-provides higher-order automatic differentiation for physics-informed neural
-networks (PINNs), with CPU, CUDA, and Apple silicon backends.
+Quabla is a Python automatic differentiation library for physics-informed
+neural networks (PINNs), with composable higher-order derivatives powered
+by a Rust core and CPU, CUDA, and Apple silicon backends.
 
 [![CI](https://github.com/latteine1217/quabla/actions/workflows/ci.yml/badge.svg)](https://github.com/latteine1217/quabla/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/quabla)](https://pypi.org/project/quabla/)
@@ -22,23 +12,24 @@ networks (PINNs), with CPU, CUDA, and Apple silicon backends.
 · [API reference](https://latteine1217.github.io/quabla/api.html)
 · [Release notes](CHANGELOG.md)
 
-## Why Quabla
+![A tanh MLP trained with Quabla matches the exact solution of a 1D Poisson problem; its training loss falls from about 50 to 2.5e-4.](docs/assets/pinn_poisson.png)
 
-A PINN loss can depend on derivatives of a model with respect to its inputs.
-Training then requires differentiating that loss with respect to the model
-parameters. Quabla lets you express these nested derivatives as Python
-function transforms:
+*A 16-unit tanh MLP trained as a PINN on the CPU backend (3,000 Adam steps)
+matches the exact solution `sin(πx)` to a max abs error of 2.4e-4.
+Reproduce with `python examples/plot_readme_figure.py`.*
 
-- Compose `grad`, `jvp`, `vjp`, `jacobian`, `hessian`, and `vmap` to build
-  derivatives and evaluate them over batches.
-- Use `jit` to trace a function into an execution plan and select a backend.
-  The CPU interprets that plan; CUDA and MLX execute device operations.
-- Train with Adam, AdamW, SGD, or L-BFGS. For GPU training,
-  `optim.Trainer` keeps parameters and optimizer state on the device.
+- **Composable derivatives:** combine `grad`, `jvp`, `vjp`, `jacobian`,
+  `hessian`, and `vmap` to build derivatives and evaluate them over batches.
+- **CPU, CUDA, and MLX:** use `jit` to trace a function into an execution
+  plan and select a backend. The CPU interprets that plan; CUDA and MLX
+  execute device operations.
+- **Device-resident training:** train with Adam, AdamW, SGD, or L-BFGS.
+  For GPU training, `optim.Trainer` keeps parameters and optimizer state
+  on the device.
 
-The API will look familiar to JAX users, but Quabla does not depend on JAX
-and is not a drop-in replacement. Check the [limitations](#known-limitations)
-before porting a program.
+Start with the [PINN tutorial](docs/guide/11-pinn-tutorial.md) to build a
+Poisson solver with nested derivatives and compare it with the analytical
+solution.
 
 ## Installation
 
@@ -69,6 +60,17 @@ python -c "import quabla as qb; print(qb.__version__); print(qb.devices())"
 `devices()` lists backends compiled into the package, not detected hardware.
 A listed CUDA backend does not confirm that a GPU or its libraries are
 available.
+
+## Why Quabla
+
+A PINN loss can depend on derivatives of a model with respect to its inputs.
+Training then requires differentiating that loss with respect to the model
+parameters. Quabla lets you express these nested derivatives as Python
+function transforms.
+
+The API will look familiar to JAX users, but Quabla does not depend on JAX
+and is not a drop-in replacement. Check the [limitations](#known-limitations)
+before porting a program.
 
 ## Quickstart
 
@@ -156,12 +158,6 @@ For GPU runs, select `--device mlx` or `--device cuda` with the corresponding
 build and runtime libraries. See [examples](examples/README.md) for setup,
 benchmarks, and multi-GPU validation commands.
 
-![A tanh MLP trained with Quabla matches the exact solution of a 1D Poisson problem; its training loss falls from about 50 to 2.5e-4.](docs/assets/pinn_poisson.png)
-
-*A 16-unit tanh MLP trained as a PINN on the CPU backend (3,000 Adam steps)
-matches the exact solution `sin(πx)` to a max abs error of 2.4e-4.
-Reproduce with `python examples/plot_readme_figure.py`.*
-
 ## Known Limitations
 
 - Shapes are static. Changing input shapes, dtypes, or parameter structure
@@ -183,6 +179,18 @@ contract. The [compatibility policy](CONTRIBUTING.md#scope-and-status)
 defines the public Python API guarantees for 1.x; internal Rust APIs and
 backends are outside that policy. Use the [migration guide](docs/guide/15-migration.md)
 when updating code written for 0.x.
+
+## Release and Validation
+
+Release 1.1.0 is a bug-fix release that preserves the public API. It repairs
+numerical boundaries, input validation, serialization, control flow, solvers
+and linear algebra, and completes the Python protocols of tensors. See the
+[release notes](CHANGELOG.md#110---2026-11-09).
+
+CPU, MLX and CUDA/NCCL acceptance is recorded in the
+[roadmap](docs/jax_like_roadmap.md#v110-plan-bug-fixes-and-robustness-2026-11-08);
+the [1.1.0 audit](docs/benchmarks/v110-audit-20261108-04/README.md) records
+its evidence and performance limitations.
 
 ## Installation From Source
 
