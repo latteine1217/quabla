@@ -18,6 +18,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
   VJP-JVP) records and replays its loop through one carry tape
   (`tensor_ir/carry_tape.rs`) instead of its own copy of the checkpoint
   walk; results are unchanged.
+- Internal: two architecture decisions are recorded in `docs/adr/`. The
+  CUDA host loop keeps its own device tape under the same checkpoint rule,
+  because its states are pooled device buffers that it borrows per step
+  (ADR 0002). The CPU, CUDA, and MLX backends each keep their own execution
+  plan interpreter, because their value lifetimes differ, and share the
+  last-use rules instead (ADR 0003).
 - `Tensor` and `TraceTensor` methods parse their operands in one place and
   raise one `TypeError` text for an unsupported operand:
   "expected a Tensor, TraceTensor, or numeric scalar operand", or
@@ -38,6 +44,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
   carry until it finished: a chain of twelve loops over 4 MiB carries peaked
   at 60 MiB forward and 196 MiB for its gradient, and now peaks at 16 MiB
   and 68 MiB. Results are unchanged.
+- Internal: `cargo clippy -- -D warnings` passes on Rust 1.100, whose
+  `needless_range_loop` lint rejected the register allocation of fused CPU
+  programs; the allocation is unchanged.
 
 ## [1.1.0] - 2026-11-09
 
