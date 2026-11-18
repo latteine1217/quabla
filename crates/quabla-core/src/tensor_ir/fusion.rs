@@ -721,14 +721,14 @@ impl ProgramBuilder<'_> {
         let mut physical = vec![usize::MAX; self.registers];
         let mut count = 0;
         let mut free = Vec::new();
-        for position in 0..self.body.len() {
-            if let Target::Register(destination) = self.body[position].destination() {
+        for (position, instruction) in self.body.iter().enumerate() {
+            if let Target::Register(destination) = instruction.destination() {
                 physical[destination] = free.pop().unwrap_or_else(|| {
                     count += 1;
                     count - 1
                 });
             }
-            let sources = self.body[position].sources();
+            let sources = instruction.sources();
             for (index, source) in sources.iter().enumerate() {
                 if let Source::Register(register) = *source {
                     // A register read twice by one instruction is freed once.
