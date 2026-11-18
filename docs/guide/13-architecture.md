@@ -305,7 +305,10 @@ loaded dynamically):
 `crates/quabla-core/src/tensor_ir/mlx.rs` (via `mlx-rs`):
 
 - Lowers plans to MLX operations on the GPU stream; intermediates stay on
-  the device.
+  the device. Values and cached region results are released after their
+  last use with the CPU's last-use analysis; since MLX arrays are lazy, this
+  frees the arrays that are already evaluated, such as loop carries. Each
+  backend keeps its own interpreter (`docs/adr/0003`).
 - `mlx_linalg.rs` builds LU, `eigh`, QR, and SVD on MLX's CPU stream, since
   MLX has GPU kernels for none of them; custom Metal kernels cover Cholesky
   and a deterministic `scatter_add`.

@@ -33,6 +33,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html). From
   side, as traced code already did; they used to raise `TypeError`.
 - Traced `@`, `&`, and `|` return `NotImplemented` for an operand that is
   not an array, as eager tensors do, so Python raises its usual `TypeError`.
+- The MLX backend releases each value and cached region result after its
+  last use, as the CPU does. Before, a program kept every evaluated loop
+  carry until it finished: a chain of twelve loops over 4 MiB carries peaked
+  at 60 MiB forward and 196 MiB for its gradient, and now peaks at 16 MiB
+  and 68 MiB. Results are unchanged.
 
 ## [1.1.0] - 2026-11-09
 

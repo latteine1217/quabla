@@ -12197,9 +12197,9 @@ struct TensorForwardLastUses {
 /// Counts the uses `consumed` made by the node (or fused region) evaluated
 /// at `node_id` and drops every value, that node's included, with no use
 /// left that is not retained.
-fn release_consumed_values(
+fn release_consumed_values<T>(
     last_uses: &mut TensorForwardLastUses,
-    values: &mut [Option<DynamicTensor>],
+    values: &mut [Option<T>],
     node_id: TensorNodeId,
     consumed: &[TensorNodeId],
 ) {

@@ -657,7 +657,11 @@ impl MlxBackend {
             return Err("MLX execution requires at least one output node".to_string());
         }
         let stream = StreamOrDevice::gpu();
-        let mut values = Vec::with_capacity(plan.nodes.len());
+        let mut values: Vec<Option<Array>> = Vec::with_capacity(plan.nodes.len());
+        // Released after their last use, as on the CPU: a lazy array keeps its own operands
+        // alive, so dropping a handle only frees arrays that are already evaluated, such as
+        // loop carries and cached region results.
+        let mut last_uses = super::tensor_forward_last_uses(&plan.nodes, output_node_ids);
         let mut fori_vjp_cache: HashMap<usize, MlxForiVjpEvaluation> = HashMap::new();
         let mut fori_vjp_jvp_cache: HashMap<usize, MlxForiVjpJvpEvaluation> = HashMap::new();
         let mut scan_cache: HashMap<usize, (Array, Array)> = HashMap::new();
@@ -1401,7 +1405,18 @@ impl MlxBackend {
                 ),
             }
             .map_err(|error| format!("MLX node {node_id} {} failed: {error}", node.op.name()))?;
-            values.push(value);
+            values.push(Some(value));
+            super::release_consumed_values(&mut last_uses, &mut values, node_id, &node.op.inputs());
+            // Region siblings share one evaluation that need not outlive the final sibling.
+            if let Some(group) = super::tensor_op_group(&node.op) {
+                if last_uses.group_last_nodes.get(&group) == Some(&node_id) {
+                    fori_vjp_cache.remove(&group);
+                    fori_vjp_jvp_cache.remove(&group);
+                    scan_cache.remove(&group);
+                    scan_vjp_cache.remove(&group);
+                    scan_vjp_jvp_cache.remove(&group);
+                }
+            }
         }
 
         output_node_ids
@@ -2407,10 +2422,11 @@ fn mlx_extremum_axis(
     )
 }
 
-fn mlx_value(values: &[Array], node_id: usize) -> Result<&Array, String> {
+fn mlx_value(values: &[Option<Array>], node_id: usize) -> Result<&Array, String> {
     values
         .get(node_id)
-        .ok_or_else(|| format!("MLX operand node {node_id} is missing"))
+        .and_then(Option::as_ref)
+        .ok_or_else(|| format!("MLX operand node {node_id} is missing or was released"))
 }
 
 #[cfg(test)]
